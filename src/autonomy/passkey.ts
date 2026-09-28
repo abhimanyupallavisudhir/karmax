@@ -42,7 +42,9 @@ export class PasskeyManager {
   private held = new Map<string, { session: CdpSession; origin: string; timer: NodeJS.Timeout;
     owner: string; authenticatorId: string; mode: 'enroll' | 'login';
     onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }>();
-  constructor(private ttlMs = 180_000) {}
+  /** Each held session keeps a browser session (in a remote world, also a
+   * terminal and the world itself) open until it is released or expires. */
+  constructor(private ttlMs = 180_000, private limits = { perOwner: 3, total: 64 }) {}
 
 
   /**
@@ -53,6 +55,7 @@ export class PasskeyManager {
    */
   async begin(page: string | PageOpener, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }): Promise<{ authenticatorId: string; origin: string }> {
     if (!opts.owner || !opts.expectDomains?.length) throw new Error('passkey sessions require an owner and target domains');
+    this.assertRoom(opts.owner);
     const { session, origin } = typeof page === 'string'
       ? await openPage(page, { expectDomains: opts.expectDomains })
       : await page(opts.expectDomains);
@@ -77,6 +80,14 @@ export class PasskeyManager {
       (await session.close());
       throw e;
     }
+  }
+
+  /** Throw unless `owner` may hold one more session. */
+  assertRoom(owner: string): void {
+    const owned = [...this.held.values()].filter((held) => held.owner === owner).length;
+    if (owned >= this.limits.perOwner)
+      throw new Error(`this task already has ${owned} passkey sessions open; save or release one first`);
+    if (this.held.size >= this.limits.total) throw new Error('too many passkey sessions are open; try again in a few minutes');
   }
 
   /** Read the credential(s) the site just wrote into the authenticator, then

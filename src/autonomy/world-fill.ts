@@ -55,6 +55,7 @@ export async function fillInWorld(world: World, args: {
   return { origin: parsed.origin };
 }
 
+const HOST_NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
 
 /**
@@ -73,6 +74,10 @@ export async function openWorldPage(world: World, opts: {
   onClose?: () => void | Promise<void>;
 }): Promise<{ session: CdpSession; origin: string }> {
   if (!opts.expectDomains.length) throw new Error('a browser session requires target domains');
+  // Some providers type the command into an interactive shell, where a newline
+  // or control character in a domain would run as a command.
+  for (const domain of opts.expectDomains)
+    if (!HOST_NAME.test(domain)) throw new Error(`${JSON.stringify(domain)} is not a host name`);
   const timeoutMs = opts.timeoutMs ?? 30_000;
   await world.writeFile(HELPER_REL, HELPER_SOURCE);
   const nonce = crypto.randomBytes(16).toString('hex');

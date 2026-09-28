@@ -126,6 +126,13 @@ describe('credential selection ranking through HTTP', () => {
       await store.saveView(task.id, { ...view, world: { kind: 'container', id: task.id, root: home, branch: 'karmax/fill', base: 'main' } });
       expect(await enroll()).toBe('world page opened');
       expect(opened).toEqual([[task.id, expect.objectContaining({ kind: 'container' }), ['example.com']]]);
+      // …nor does a world browser without the page (#367 review item 16).
+      const worldLogin = await fetch(`${running.url}/api/vault/passkey/login`, {
+        method: 'POST', headers: { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ itemId: passkey.id }),
+      });
+      expect((await worldLogin.json() as any).error).toBe('world page opened');
+      expect((await vault.access([], task.id, passkey, 'use')).status).toBe('granted');
 
 
     } finally {

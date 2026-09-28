@@ -78,6 +78,34 @@ describe('agent-enrolled passkeys over CDP (§8)', () => {
     }
   });
 
+  // #367 review item 16: each held session keeps a browser session (and, in a
+  // remote world, a terminal and the world) open, so there are only so many.
+  it('holds only a few sessions per task and overall', async () => {
+    const b = await mockBrowser();
+    const mgr = new PasskeyManager(180_000, { perOwner: 2, total: 3 });
+    let opened = 0;
+    const open = `http://127.0.0.1:${b.port}`;
+    const counted = async (domains: string[]) => { opened++; return (await import('../src/autonomy/cdp.js')).openPage(open, { expectDomains: domains }); };
+    const held: Array<[string, string]> = [];
+    const begin = async (owner: string) => {
+      const { authenticatorId } = await mgr.begin(counted, { expectDomains: ['github.com'], mode: 'enroll', owner });
+      held.push([authenticatorId, owner]);
+    };
+    try {
+      await begin('task:a');
+      await begin('task:a');
+      await expect(begin('task:a')).rejects.toThrow(/2 passkey sessions open/);
+      await begin('task:b');
+      await expect(begin('task:c')).rejects.toThrow(/too many passkey sessions/);
+      expect(opened).toBe(3);
+      await mgr.release(...held.shift()!);
+      await begin('task:c');
+    } finally {
+      for (const [id, owner] of held) await mgr.release(id, owner);
+      await b.close();
+    }
+  });
+
   it('refuses enrollment when the page origin does not match the target domain', async () => {
     const b = await mockBrowser('https://evil.com');
     const mgr = new PasskeyManager();
@@ -130,6 +158,18 @@ describe('passkeys in a remote world’s browser', () => {
       await b.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  // The domains are typed into a shell in some worlds: a control character or
+  // newline there could run a command, so only host names get that far.
+  it('types only host names into the world terminal', async () => {
+    let terminals = 0;
+    const world = { handle: { kind: 'e2b', id: 'task', root: '/tmp', branch: 'b', base: 'main' },
+      writeFile: async () => {}, openPty: async () => { terminals++; throw new Error('opened'); } } as any;
+    for (const domain of ["github.com'\x03\nrm -rf ~\n", 'github.com com', '-github.com', 'a..b'])
+      await expect(openWorldPage(world, { expectDomains: [domain], cdpUrl: 'http://127.0.0.1:9222' })).rejects.toThrow(/not a host name/);
+    expect(terminals).toBe(0);
+    await expect(openWorldPage(world, { expectDomains: ['login.github.com', 'localhost'], cdpUrl: 'http://127.0.0.1:9222' })).rejects.toThrow('opened');
   });
 
   it('checks the live origin, not the target list', async () => {

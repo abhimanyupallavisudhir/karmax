@@ -64,3 +64,37 @@ it.each([
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// #367 review item 16: a fill attempt (three per reservation) is counted only
+// once there is a browser of the task's own to type into.
+it('finds the task\'s browser before counting a fill attempt', async () => {
+  vi.spyOn(connectionRuntime, 'prepareConnections').mockResolvedValue([]);
+  vi.spyOn(taskBrowser, 'localTaskBrowserUrl').mockImplementation(() => { throw new Error('this task has no browser of its own open'); });
+  const claimFill = vi.spyOn(BudgetService.prototype, 'claimFill').mockResolvedValue({ request: { id: 'request', cardId: 'card' }, domain: 'shop.example.com' });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-card-attempt-'));
+  vi.stubEnv('KARMAX_HOME', dir);
+  vi.stubEnv('KARMAX_AGENT_MIN_FREE_MB', '0');
+  vi.stubEnv('KARMAX_AGENT_MAX_LOAD_FACTOR', '0');
+  const store = await Store.create(':memory:');
+  const worlds = new WorldRegistry();
+  const project = await store.createProject('Card attempts');
+  const task = await store.createTask({ projectId: project.id, title: 'Fill', workflow: 'just-do', workflowVersion: '1', params: { prompt: '' } });
+  let failure: unknown;
+  const core = makeCoreActivities({ store, worlds, profiles: new ProfileResolver(store, 'mock'),
+    payments: {} as any, paymentRegistry: { forCard: () => ({ retrieveCardDetails: async () => ({}) }) } as any,
+    adapters: new Map([['mock', { provider: 'mock', runTurn: async (_input: any, ctx: any) => {
+      failure = await ctx.fillPaymentCard({ requestId: 'request', selectors: { number: '#number', expiry: '#expiry', cvc: '#cvc' } }).catch((e: unknown) => e);
+      return { termination: { kind: 'success', status: 'mock.completed' }, output: 'done' };
+    } }]]) });
+  const handle = await core.createWorld({ taskId: task.id, projectId: project.id, kind: 'memory', base: 'main' });
+  try {
+    await core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: handle, messages: [],
+      task: { projectId: project.id, title: task.title, prompt: '', project: {}, workflow: 'just-do' } as any });
+    expect(String(failure)).toMatch(/no browser of its own/);
+    expect(claimFill).not.toHaveBeenCalled();
+  } finally {
+    await core.destroyWorld(handle);
+    await store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

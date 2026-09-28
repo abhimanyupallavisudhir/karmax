@@ -2710,6 +2710,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   requestId: string;
                   selectors: import('../autonomy/card-fill.js').CardFillSelectors;
                 }) => {
+                  // Fill the browser the agent's MCP drives: inside the world whenever
+                  // the agent itself runs there (cloud sandboxes and containers), else
+                  // the one this task's agent launched on the host (AU-32). Found
+                  // before a fill attempt is counted against the reservation.
+                  const cdpUrl = isRemoteAgentWorld(world) ? WORLD_CDP_URL : localTaskBrowserUrl(args.taskId);
                   const { request, domain } = await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).claimFill({
                     projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
                   }, fill.requestId);
@@ -2729,15 +2734,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   const details = await provider.retrieveCardDetails(card.id);
                   const expected = [domain];
                   let origin: string;
-                  // Fill the browser the agent's MCP drives: inside the world whenever
-                  // the agent itself runs there (cloud sandboxes and containers), else
-                  // the one this task's agent launched on the host (AU-32).
                   if (isRemoteAgentWorld(world)) {
                     origin = (await fillCardInWorld(world, {
-                      cdpUrl: WORLD_CDP_URL, domain, selectors: fill.selectors, details,
+                      cdpUrl, domain, selectors: fill.selectors, details,
                     })).origin;
                   } else {
-                    const cdpUrl = localTaskBrowserUrl(args.taskId);
                     origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.number,
                       text: details.number, expectDomains: expected })).origin;
                     const month = String(details.expMonth).padStart(2, '0');

@@ -6751,27 +6751,37 @@ export class Gateway {
             }
             if (p === '/api/vault/passkey/login' && method === 'POST') {
               if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no passkey item — enroll one first' });
-              const decision = (await vault.access(caps, callerTaskId, item, 'use', { consume: true }));
-              if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
-              const creds = JSON.parse((await vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' }))) as any[];
+              const checked = (await vault.access(caps, callerTaskId, item, 'use'));
+              if (checked.status !== 'granted') return this.json(res, 200, { ...checked, itemId: item.id });
+              // Open the page before a one-shot grant is spent on a ceremony that cannot run.
               const domains = item.domains;
-              const started = await this.passkeys.begin(passkeyPage, { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner,
-                onCredentials: async updated => {
-                  await store.transaction(async () => {
-                    const current = await vault.get(item.id);
-                    if (!current || current.type !== 'passkey') return;
-                    const secret = await vault.readSecret(current, 'passkey');
-                    if (secret === undefined) return;
-                    const saved = JSON.parse(secret) as any[];
-                    for (const credential of saved) {
-                      const next = updated.find(c => c.credentialId === credential.credentialId && c.privateKey === credential.privateKey);
-                      if (next && Number.isSafeInteger(next.signCount) && next.signCount! > (credential.signCount ?? 0))
-                        credential.signCount = next.signCount;
-                    }
-                    await vault.save({ id: current.id, type: 'passkey', secrets: { passkey: JSON.stringify(saved) } });
-                  });
-                } });
-              return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
+              if (!domains?.length) return this.json(res, 400, { error: 'this passkey item has no domains' });
+              this.passkeys.assertRoom(passkeyOwner);
+              const page = await passkeyPage(domains);
+              let handedOff = false;
+              try {
+                const decision = (await vault.access(caps, callerTaskId, item, 'use', { consume: true }));
+                if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+                const creds = JSON.parse((await vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' }))) as any[];
+                const started = await this.passkeys.begin(async () => page, { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner,
+                  onCredentials: async updated => {
+                    await store.transaction(async () => {
+                      const current = await vault.get(item.id);
+                      if (!current || current.type !== 'passkey') return;
+                      const secret = await vault.readSecret(current, 'passkey');
+                      if (secret === undefined) return;
+                      const saved = JSON.parse(secret) as any[];
+                      for (const credential of saved) {
+                        const next = updated.find(c => c.credentialId === credential.credentialId && c.privateKey === credential.privateKey);
+                        if (next && Number.isSafeInteger(next.signCount) && next.signCount! > (credential.signCount ?? 0))
+                          credential.signCount = next.signCount;
+                      }
+                      await vault.save({ id: current.id, type: 'passkey', secrets: { passkey: JSON.stringify(saved) } });
+                    });
+                  } });
+                handedOff = true; // held now; closing it twice on a failed begin is harmless
+                return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
+              } finally { if (!handedOff) await page.session.close(); }
             }
             if (p === '/api/vault/passkey/release' && method === 'POST') {
               (await this.passkeys.release(String(b.authenticatorId ?? ''), passkeyOwner));

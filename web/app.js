@@ -14992,7 +14992,9 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <button class="btn sm" data-vreq-act="task">This task</button>
           <button class="btn sm" data-vreq-act="always">Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
-          ${policyTip(`Once: Approves one credential operation, consumed when used, not at the next agent turn.
+          ${policyTip(`Once: ${items.find((item) => item.id === request.itemId)?.type === 'passkey'
+            ? 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.'
+            : 'Approves one credential operation, consumed when used, not at the next agent turn.'}
 
 This task: Approves the operation and grants this task the credential across turns. Its policy stays unchanged, so “ask” can prompt again.
 
