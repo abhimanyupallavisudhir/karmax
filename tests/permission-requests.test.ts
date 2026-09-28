@@ -162,6 +162,62 @@ describe('agent permission approval requests', () => {
     });
   });
 
+  // PL-10: a finished task's pending request stayed in its recipients' inbox
+  // and approval lists (#400), although nothing could act on a decision.
+  describe('when the task settles', () => {
+    async function asked() {
+      const store = (await Store.create(':memory:'));
+      const organization = (await store.createOrganization({ name: 'Settle', ownerUserId: 'owner' }));
+      const project = (await store.createProject('P', {}, organization.id));
+      const task = (await store.createTask({ projectId: project.id, title: 'Asks', workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
+      const service = new PermissionRequests(store, organization.id);
+      const ask = { taskId: task.id, projectId: project.id, role: 'do', audience: ['@owners'], recipients: ['owner'],
+        reason: 'Inspect settings.', requestedBy: `task-agent:${task.id}:do` };
+      const granted = (await service.request({ ...ask, capabilities: ['settings:read'] }));
+      (await service.resolve(granted.id, { action: 'approve', by: 'user:owner' }));
+      const pending = (await service.request({ ...ask, capabilities: ['settings:write'] }));
+      (await store.appendEvent({ taskId: task.id, type: 'permission.approval-requested', ts: Date.now(),
+        payload: { requestId: pending.id, recipients: ['owner'] } }));
+      expect((await store.listInbox('owner', organization.id)).map((item) => item.kind)).toContain('approval-requested');
+      const view = (status: 'active' | 'done' | 'failed' | 'cancelled') => ({ taskId: task.id, title: task.title,
+        workflow: task.workflow, stage: status === 'active' ? 'do' as const : status, status, messages: [], actions: [],
+        state: {}, updatedAt: 1 });
+      return { store, organization, task, service, granted, pending, view };
+    }
+
+    it.each(['done', 'failed', 'cancelled'] as const)('withdraws its pending requests when it is %s', async (status) => {
+      const f = (await asked());
+      try {
+        (await f.store.saveView(f.task.id, f.view('active')));
+        expect((await f.service.requests({ status: 'pending' }))).toHaveLength(1);
+        // A status-only save, as a manual Done makes, records no view.updated event.
+        (await f.store.saveView(f.task.id, f.view(status)));
+        const requests = (await f.service.requests({ taskId: f.task.id }));
+        expect(requests.find((request) => request.id === f.pending.id))
+          .toMatchObject({ status: 'withdrawn', withdrawn: { at: expect.any(Number), reason: `task ${status}` } });
+        expect(requests.find((request) => request.id === f.granted.id)).toMatchObject({ status: 'granted' });
+        expect((await f.store.eventsSince(f.task.id, 0)).filter((event) => event.type === 'permission.approval-resolved')
+          .map((event) => event.payload)).toEqual([{ requestId: f.pending.id, action: 'withdraw', reason: `task ${status}` }]);
+        expect((await f.store.listInbox('owner', f.organization.id)).map((item) => item.kind)).not.toContain('approval-requested');
+        await expect(f.service.resolve(f.pending.id, { action: 'approve', by: 'user:owner' })).rejects.toThrow(/already withdrawn/);
+      } finally { (await f.store.close()); }
+    });
+
+    it('withdraws requests of tasks that settled before withdrawal existed', async () => {
+      const f = (await asked());
+      try {
+        (await f.store.saveView(f.task.id, f.view('done')));
+        // As if the task had settled before this change.
+        (await f.store.kvSet(`permission:request:${f.organization.id}:${f.task.id}:${f.pending.id}`, JSON.stringify(f.pending)));
+        expect((await f.store.retentionSweep()).permissionRequests).toBe(0);
+        expect((await f.service.requests({ status: 'pending' }))).toEqual([]);
+        expect((await f.service.requests({ taskId: f.task.id })).find((request) => request.id === f.pending.id))
+          .toMatchObject({ status: 'withdrawn' });
+      } finally { (await f.store.close()); }
+    });
+  });
+
   it('removes pending requests and approved extensions with their task', async () => {
     const store = (await Store.create(':memory:'));
     (await store.claimPersonalOrganization('owner'));

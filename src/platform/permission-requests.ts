@@ -22,8 +22,10 @@ export interface PermissionRequest {
   avatarRecipients?: string[];
   reason: string;
   requestedBy: string;
-  status: 'pending' | 'granted' | 'denied';
+  status: 'pending' | 'granted' | 'denied' | 'withdrawn';
   dismissed?: { by: string; at: number };
+  /** The task settled while this was pending, so no decision can act (PL-10). */
+  withdrawn?: { at: number; reason: string };
   resolution?: { action: 'approve' | 'deny'; by: string; at: number };
   createdAt: number;
   /** Human-facing metadata projected by the gateway, never persisted. */
@@ -251,6 +253,24 @@ export class PermissionRequests {
       scopeKey: `project:${request.projectId}`, detail: { requestId: id } }));
     return request;
 
+    });
+  }
+
+  /** Withdraw every pending request of a task that has settled: a decision
+   * could no longer reach its agent. Returns the requests it withdrew. */
+  async withdrawForTask(taskId: string, reason: string): Promise<PermissionRequest[]> {
+    return this.store.transaction(async () => {
+      const withdrawn: PermissionRequest[] = [];
+      for (const request of (await this.requests({ taskId, status: 'pending' }))) {
+        request.status = 'withdrawn';
+        request.withdrawn = { at: Date.now(), reason };
+        (await this.save(request));
+        (await this.store.kvDelete(claimKey(request.id)));
+        (await this.store.appendAudit({ principalId: 'system:task-settled', action: 'permission.request.withdrawn',
+          scopeKey: `project:${request.projectId}`, detail: { requestId: request.id, taskId, reason } }));
+        withdrawn.push(request);
+      }
+      return withdrawn;
     });
   }
 

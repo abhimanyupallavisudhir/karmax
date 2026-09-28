@@ -78,6 +78,7 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
+import { PermissionRequests } from '../platform/permission-requests.js';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -134,6 +135,9 @@ const AUTO_ARCHIVE_STATUS = new Set<string>(['done', 'cancelled']);
  * mid-flight, destroying the only record of what the agent was doing when it broke.
  */
 const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
+
+/** Statuses a task settles in: no further turn will run unless it is resumed. */
+const SETTLED_STATUS = new Set<string>(['done', 'cancelled', 'failed']);
 
 /**
  * Does an event type mean "a human is being asked to review this"? Such events
@@ -3811,6 +3815,16 @@ export class Store {
     return true;
   }
 
+  /** PL-10: a settled task's pending permission requests are withdrawn, and
+   * their withdrawal discharges the recipients' inbox like a decision would. */
+  private async withdrawPermissionRequests(projectId: string, taskId: string, status: string): Promise<void> {
+    const organizationId = (await this.getProject(projectId))?.organizationId ?? 'org_personal';
+    const reason = `task ${status}`;
+    for (const request of (await new PermissionRequests(this, organizationId).withdrawForTask(taskId, reason)))
+      (await this.appendEvent({ taskId, type: 'permission.approval-resolved', ts: Date.now(),
+        payload: { requestId: request.id, action: 'withdraw', reason } }));
+  }
+
   /** Returns false, and changes nothing, for a publication `order` shows is stale. */
   async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder): Promise<boolean> {
     return this.db.transaction(async () => {
@@ -3879,6 +3893,8 @@ export class Store {
     // an already-finished task is not a repeated delete over the same rows.
     const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
     if (settledNow) (await this.pruneAgentOutput(taskId));
+    if (prev && SETTLED_STATUS.has(view.status) && !SETTLED_STATUS.has(prev.lastView?.status ?? ''))
+      (await this.withdrawPermissionRequests(prev.projectId, taskId, view.status));
     // `retentionSweep` measures its window from here: a workflow's `updatedAt`
     // is its history length, not a time. Resuming the task restarts the clock.
     if (['done', 'cancelled', 'failed'].includes(view.status))
@@ -7648,13 +7664,20 @@ export class Store {
     // Decided permission requests outlive their decision events by nothing: both
     // go after the event window. Pending ones stay until decided or withdrawn.
     let permissionRequests = 0;
+    const pendingTasks = new Map<string, string>();
     for (const { key, value } of (await this.kvEntries('permission:request:'))) {
-      let request: { status?: string; createdAt?: number; resolution?: { at?: number }; withdrawn?: { at?: number } };
+      let request: { status?: string; taskId?: string; projectId?: string; createdAt?: number; resolution?: { at?: number }; withdrawn?: { at?: number } };
       try { request = JSON.parse(value); } catch { continue; }
+      if (request.status === 'pending' && request.taskId && request.projectId) pendingTasks.set(request.taskId, request.projectId);
       const decidedAt = request.resolution?.at ?? request.withdrawn?.at ?? request.createdAt;
       if (request.status === 'pending' || !(Number(decidedAt) < now - 90 * 86400_000)) continue;
       (await this.db.prepare('DELETE FROM kv WHERE k=?').run(key));
       permissionRequests++;
+    }
+    // Tasks that settled before settling withdrew their requests (#400).
+    for (const [taskId, projectId] of pendingTasks) {
+      const row = (await this.db.prepare("SELECT json_extract(lastView, '$.status') status FROM tasks WHERE id=?").get(taskId)) as { status?: string } | undefined;
+      if (SETTLED_STATUS.has(row?.status ?? '')) (await this.withdrawPermissionRequests(projectId, taskId, String(row!.status)));
     }
 
     return {
