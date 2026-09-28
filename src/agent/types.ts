@@ -1,4 +1,4 @@
-import { AgentActivity, AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
@@ -20,7 +20,7 @@ export interface PlatformToolContext {
   createReviewInfo(info: ReviewInfo): void | Promise<void>;
   /** Spawn a child task the parent manages (branches off + merges back into the
    *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). */
-  createSubTask(t: { title: string; prompt: string }): void | Promise<void>;
+  createSubTask(t: SubTaskRequest): void | Promise<void>;
   /** Parent-agent ONLY: answer a child that raised to you (open_pr/comment/retry/
    *  cancel; `confirm` is a replay-compatible alias). */
   respondToSubTask(r: SubTaskResponse): void | Promise<void>;
@@ -200,7 +200,7 @@ export interface TurnResult {
   /** Provider timeline item carrying `output`, when the adapter emitted one. */
   finalActivity?: NonNullable<Message['sourceActivity']>;
   reviewInfo?: ReviewInfo;
-  subTasks?: { title: string; prompt: string }[];
+  subTasks?: SubTaskRequest[];
   /** Parent-agent responses to child raises this turn (SPEC §5.3). */
   subTaskResponses?: SubTaskResponse[];
   /** Child-agent request up to its parent this turn (SPEC §5.3). */
