@@ -125,8 +125,10 @@ describe('agent permission approval requests', () => {
       expect(written).toEqual([`permission:request:org_personal:task_a:${third.id}`,
         `permission:request:org_personal:task_a:${first.id}`]);
       expect((await service.requests()).map((request) => request.id)).toHaveLength(3);
+      // Asks made in the same millisecond have no defined order.
       expect((await service.requests({ taskId: 'task_a' })).map((request) => [request.id, request.status]))
-        .toEqual([[first.id, 'denied'], [third.id, 'pending']]);
+        .toEqual(expect.arrayContaining([[first.id, 'denied'], [third.id, 'pending']]));
+      expect((await service.requests({ taskId: 'task_a' }))).toHaveLength(2);
       expect((await new PermissionRequests(store, 'org_other').requests())).toEqual([]);
     });
 
