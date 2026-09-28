@@ -573,6 +573,8 @@ interface Session {
   user: string;
   apiToken: string;
   userId?: string;
+  /** The browser (identity) session this one stands for, when it does. */
+  identitySessionId?: string;
   email?: string;
   expiresAt?: number;
 }
@@ -585,7 +587,7 @@ export class Gateway {
   private terminalStops = new Set<() => Promise<void>>();
   private requestGuards = new WeakMap<http.IncomingMessage, () => Promise<void>>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
-  private personDecisions = new Map<string, { allowed: Promise<boolean>; until: number }>();
+  private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number }>();
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
    *  directly, so without this a password could be guessed online. */
@@ -1316,7 +1318,8 @@ export class Gateway {
       ? ticketRecord.session
       : await this.socketAuth(req, url, task?.projectId);
     if (!auth) { ws.close(4401, 'unauthorized'); return; }
-    if (!(await this.deps.tokens.check(auth.apiToken, 'task:edit', { projectId: task?.projectId, taskId })).ok) {
+    // The same decision the open shell is re-checked with (keepAuthorized below).
+    if (!(task && await this.sessionMay(auth, 'task:edit', task.projectId, taskId))) {
       ws.close(4403, 'forbidden'); return;
     }
     const projectRecord = task ? (await this.deps.store.getProject(task.projectId)) : undefined;
@@ -1433,7 +1436,11 @@ export class Gateway {
     const lifetime = socketLifetime(ws);
     lifetime.add(() => stopTerminal());
     keepAuthorized(ws, lifetime, async () => {
-      const current = await this.socketAuth(req, url, task.projectId) ?? ticketRecord?.session;
+      // The ticket's session when it authorised the connection, and only while
+      // it is still signed in; otherwise the request's own.
+      const current = auth === ticketRecord?.session
+        ? (await this.sessionLive(auth) ? auth : undefined)
+        : await this.socketAuth(req, url, task.projectId);
       return !!current && await this.sessionMay(current, 'task:edit', task.projectId, taskId);
     });
     if (this.closing || ws.readyState !== 1) await stopTerminal();
@@ -8487,33 +8494,50 @@ export class Gateway {
   private async sessionMay(session: Session, capability: Capability, projectId: string | undefined, taskId: string): Promise<boolean> {
     if (!session.userId || !this.deps.authorization || !projectId)
       return (await this.deps.tokens.check(session.apiToken, capability, { projectId, taskId })).ok;
-    const key = `${authorizationEpoch()}\0${session.userId}\0${projectId}\0${capability}`;
+    const userId = session.userId;
+    // Shared: what the person may do in the project. Per call: the task.
+    const caps = await this.personCapabilities(userId, session.email, projectId);
+    if (!caps) return false;
+    if (['task:edit', 'task:review:execute'].includes(capability) && await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
+      return false; // as tokens.check: history from before a project move
+    if (allows(caps, capability)) return true;
+    // `task:manage-own` covers the tasks this person created, and their sub-tasks.
+    if (!OWN_TASK_CAPABILITIES.has(capability) || !allows(caps, 'task:manage-own')) return false;
+    for (let id: string | undefined = taskId, seen = new Set<string>(); id && !seen.has(id);) {
+      seen.add(id);
+      const record = await this.deps.store.taskMetadataAsync(id);
+      if (record?.createdBy?.kind === 'user' && record.createdBy.userId === userId) return true;
+      id = record?.parentTaskId;
+    }
+    return false;
+  }
+
+  /** A person's capabilities in a project, or undefined when their account is
+   * closed or SSO no longer admits them; shared across their sockets for a
+   * second within one authorization epoch. */
+  private personCapabilities(userId: string, email: string | undefined, projectId: string): Promise<Capability[] | undefined> {
+    const key = `${authorizationEpoch()}\0${userId}\0${projectId}`;
     const now = Date.now();
     const cached = this.personDecisions.get(key);
-    if (cached && cached.until > now) return cached.allowed;
+    if (cached && cached.until > now) return cached.caps;
     if (this.personDecisions.size > 1024) this.personDecisions.clear();
-    const userId = session.userId;
-    const allowed = (async () => {
-      if (await this.deps.store.kvGet(`account-closed:${userId}`)) return false;
+    const caps = (async () => {
+      if (await this.deps.store.kvGet(`account-closed:${userId}`)) return undefined;
       const organizationId = await this.deps.store.projectOrganizationAsync(projectId);
-      if (organizationId && !(await this.ssoAdmits(userId, session.email, organizationId))) return false;
-      if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`) && ['task:edit', 'task:review:execute'].includes(capability))
-        return false; // as tokens.check: history from before a project move
-      const caps = await this.deps.authorization!.capabilitiesAsync(`user:${userId}`, projectId, organizationId);
-      if (allows(caps, capability)) return true;
-      // `task:manage-own` covers the tasks this person created, and their sub-tasks.
-      if (!OWN_TASK_CAPABILITIES.has(capability) || !allows(caps, 'task:manage-own')) return false;
-      for (let id: string | undefined = taskId, seen = new Set<string>(); id && !seen.has(id);) {
-        seen.add(id);
-        const record = await this.deps.store.taskMetadataAsync(id);
-        if (record?.createdBy?.kind === 'user' && record.createdBy.userId === userId) return true;
-        id = record?.parentTaskId;
-      }
-      return false;
+      if (organizationId && !(await this.ssoAdmits(userId, email, organizationId))) return undefined;
+      return this.deps.authorization!.capabilitiesAsync(`user:${userId}`, projectId, organizationId);
     })();
-    allowed.catch(() => this.personDecisions.delete(key));
-    this.personDecisions.set(key, { allowed, until: now + 1_000 });
-    return allowed;
+    caps.catch(() => this.personDecisions.delete(key));
+    this.personDecisions.set(key, { caps, until: now + 1_000 });
+    return caps;
+  }
+
+  /** Is the session a ticket was issued for still signed in? A browser
+   * session can sign out, a local password session log out or expire. */
+  private async sessionLive(session: Session): Promise<boolean> {
+    if (session.identitySessionId && session.userId) return this.deps.tokens.identitySessionLive(session.identitySessionId, session.userId);
+    if ([...this.sessions.values()].includes(session)) return (session.expiresAt ?? Infinity) > Date.now();
+    return !!(await this.deps.tokens.verify(session.apiToken)); // an API token: until it is revoked or expires
   }
 
   /** SCIM 2.0 provisioning boundary. A tenant-scoped bearer token is stored only
@@ -8932,7 +8956,8 @@ export class Gateway {
         resolvedOrganizationId, identity.session.id)).token, fingerprint, expiresAt: now + ttl, userId: identity.user.id };
       this.identityTokens.set(cacheKey, cached);
     }
-    return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken };
+    return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken,
+      identitySessionId: identity.session.id };
   }
   /** Browser sockets use HttpOnly cookies; API clients use Authorization. */
   private async socketAuth(req: http.IncomingMessage, _url: URL, projectId?: string): Promise<Session | undefined> {

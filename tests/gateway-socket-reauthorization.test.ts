@@ -163,7 +163,8 @@ it('decides a ticket terminal from the person’s current grants', async () => {
       createdBy: { kind: 'user', userId: 'dev' } } as any);
     await gateway.deps.authorization.grant('user:owner', { principalId: 'user:dev', scopeKey: `organization:${project.organizationId}`, profileId: 'developer' });
     const minted = await h.tokens.mintPrincipal('user:dev', ['task:edit'], project.id, 300, project.organizationId);
-    gateway.terminalTickets.set('ticket', { taskId: task.id, session: { user: 'dev', userId: 'dev', apiToken: minted.token }, expiresAt: Date.now() + 60_000 });
+    // As auth() returns it for a browser session: its identity session stays signed in.
+    gateway.terminalTickets.set('ticket', { taskId: task.id, session: { user: 'dev', userId: 'dev', apiToken: minted.token, identitySessionId: 'browser' }, expiresAt: Date.now() + 60_000 });
     vi.spyOn(gateway, 'socketAuth').mockResolvedValue(undefined); // the CLI sends no cookie
     const handle = { id: task.id, kind: 'memory', root: '/tmp', branch: 'b', base: 'main' };
     await h.store.saveView(task.id, { taskId: task.id, stage: 'do', status: 'active', actions: [], state: {}, world: handle } as any);
@@ -211,5 +212,74 @@ describe('the cost of re-deciding', () => {
       expect(checks.mock.calls.length).toBeGreaterThanOrEqual(5);
       for (const ws of sockets) ws.close();
     } finally { await f.h.close(); }
+  });
+});
+
+// Round 3, item 8: the owned-task check depends on the task, so a person's
+// decision for one task is never reused for another.
+it('decides each task on its own for a person who owns only some', async () => {
+  const h = await stubGateway();
+  try {
+    const gateway = h.gateway as any;
+    gateway.deps.authorization = await AuthorizationService.create(h.store);
+    const project = await h.store.createProject('Owned');
+    await h.store.setOrganizationMembership(project.organizationId!, 'dev', 'member');
+    await h.store.setOrganizationMembership(project.organizationId!, 'other', 'member');
+    await gateway.deps.authorization.grant('user:owner', { principalId: 'user:dev', scopeKey: `organization:${project.organizationId}`, profileId: 'developer' });
+    const task = (createdBy: string) => h.store.createTask({ projectId: project.id, title: createdBy, workflow: 'just-do', workflowVersion: '1.0.0',
+      params: {} as any, createdBy: { kind: 'user', userId: createdBy } } as any);
+    const own = await task('dev');
+    const theirs = await task('other');
+    const session = { user: 'dev', userId: 'dev', apiToken: 'unused' };
+    expect(await gateway.sessionMay(session, 'task:edit', project.id, own.id)).toBe(true);
+    expect(await gateway.sessionMay(session, 'task:edit', project.id, theirs.id)).toBe(false);
+    expect(await gateway.sessionMay(session, 'task:edit', project.id, own.id)).toBe(true);
+  } finally { await h.close(); }
+});
+
+// Item 9: a ticket's shell lasts only as long as the session that asked for it.
+describe('a ticket terminal ends with the session that asked for it', () => {
+  async function attached(session: any, gatewaySetup: (gateway: any, h: any) => void) {
+    const h = await stubGateway();
+    const gateway = h.gateway as any;
+    gateway.deps.authorization = await AuthorizationService.create(h.store);
+    const project = await h.store.createProject('Attach');
+    await h.store.setOrganizationMembership(project.organizationId!, 'dev', 'member');
+    const task = await h.store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1.0.0', params: {} as any,
+      createdBy: { kind: 'user', userId: 'dev' } } as any);
+    await gateway.deps.authorization.grant('user:owner', { principalId: 'user:dev', scopeKey: `organization:${project.organizationId}`, profileId: 'developer' });
+    gatewaySetup(gateway, h);
+    gateway.terminalTickets.set('ticket', { taskId: task.id, session, expiresAt: Date.now() + 60_000 });
+    vi.spyOn(gateway, 'socketAuth').mockResolvedValue(undefined);
+    const handle = { id: task.id, kind: 'memory', root: '/tmp', branch: 'b', base: 'main' };
+    await h.store.saveView(task.id, { taskId: task.id, stage: 'do', status: 'active', actions: [], state: {}, world: handle } as any);
+    const pty = { pid: undefined, onData: vi.fn(), onExit: vi.fn(), write: vi.fn(), resize: vi.fn(), close: vi.fn(async () => {}) };
+    gateway.deps.worlds = { get: () => ({ capabilities: {} }), open: async () => ({ handle, openPty: async () => pty }) };
+    const ws = socket();
+    await gateway.terminal(ws, { headers: {}, url: `/ws/terminal?taskId=${task.id}&ticket=ticket` });
+    expect(ws.close).not.toHaveBeenCalled();
+    return { h, ws };
+  }
+
+  it('closes when the browser session signs out', async () => {
+    let live = true;
+    const { h, ws } = await attached({ user: 'dev', userId: 'dev', apiToken: 'unused', identitySessionId: 'browser-session' },
+      (_gateway, harness) => harness.tokens.connectIdentitySessions(async (id: string, user: string) => live && id === 'browser-session' && user === 'dev'));
+    try {
+      live = false;
+      authorizationChanged();
+      await vi.waitFor(() => expect(closedWith(ws)).toBe(4403), { timeout: 3_000 });
+    } finally { await h.close(); }
+  });
+
+  it('closes when a local password session logs out', async () => {
+    const session = { user: 'dev', userId: 'dev', apiToken: 'unused', expiresAt: Date.now() + 60_000 };
+    let sessions: Map<string, unknown>;
+    const { h, ws } = await attached(session, (gateway) => { sessions = gateway.sessions; sessions.set('sid', session); });
+    try {
+      sessions!.delete('sid');
+      authorizationChanged();
+      await vi.waitFor(() => expect(closedWith(ws)).toBe(4403), { timeout: 3_000 });
+    } finally { await h.close(); }
   });
 });
