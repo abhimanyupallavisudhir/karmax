@@ -277,10 +277,6 @@ describe('account coordinator — quota engine', () => {
     await coord.signal('leaseAccount', { taskId: quota.id, turnId: 'quota', allowed: ['A'] });
     await expect.poll(async () => (await accounts()).waiting, { timeout: 10_000 }).toBe(2);
 
-    // An existing credential re-registering is not news; a new one is.
-    await coord.signal('registerAccounts', { accounts: [{ id: 'A', configHome: '/tmp/A', provider: 'claude', kind: 'login' }] });
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    expect((await accounts()).waiting).toBe(2);
     await coord.signal('registerAccounts', { accounts: [
       { id: 'A', configHome: '/tmp/A', provider: 'claude', kind: 'login' },
       { id: 'B', configHome: '/tmp/B', provider: 'claude', kind: 'login' },
@@ -289,8 +285,33 @@ describe('account coordinator — quota engine', () => {
     await expect.poll(() => grants(walled.id), { timeout: 10_000 }).toEqual(['(relist)']);
     await expect.poll(() => grants(quota.id), { timeout: 10_000 }).toEqual(['(relist)']);
     expect((await acct('B')).inUse).toBe(0); // policy decides; the coordinator never guesses
+
+    // Re-resolved against today's credentials, the quota wait takes the new login.
+    await coord.signal('leaseAccount', { taskId: quota.id, turnId: 'quota', allowed: ['A', 'B'] });
+    await expect.poll(() => grants(quota.id), { timeout: 10_000 }).toEqual(['(relist)', 'B']);
     await walled.h.signal('finish');
     await quota.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  // Ids alone cannot tell the coordinator a parked allow-list is stale: a login
+  // signed back in keeps its id, and one added before a deploy is already known.
+  it('re-lists parked requests on every credential sync, even of known credentials', async () => {
+    const coord = await startCoord([A({ id: 'A' }), A({ id: 'B', status: 'exhausted', resetAt: Date.now() + 3_600_000 })]);
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', allowed: ['B'] });
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 10_000 }).toBe(1);
+    await coord.signal('registerAccounts', { accounts: [
+      { id: 'A', configHome: '/tmp/A', provider: 'claude', kind: 'login' },
+      { id: 'B', configHome: '/tmp/B', provider: 'claude', kind: 'login' },
+    ] });
+    await expect.poll(() => grants(g.id), { timeout: 10_000 }).toEqual(['(relist)']);
+    expect((await accounts()).waiting).toBe(0);
+    // With nothing parked, a sync sends nothing.
+    await coord.signal('registerAccounts', { accounts: [{ id: 'A', configHome: '/tmp/A', provider: 'claude', kind: 'login' }] });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(await grants(g.id)).toEqual(['(relist)']);
+    await g.h.signal('finish');
     await coord.terminate('done');
   });
 
