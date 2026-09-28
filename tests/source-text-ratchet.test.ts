@@ -14,7 +14,6 @@ const REMAINING: Record<string, number> = {
   'tests/gateway-safe-mode.test.ts': 1,
   'tests/github-reauthorize-ui.test.ts': 29,
   'tests/google-signin.test.ts': 2,
-  'tests/hosted-onboarding-ui.test.ts': 29,
   'tests/memory-guard.test.ts': 1,
   'tests/provider-connections-ui.test.ts': 9,
   'tests/task-picker-ui.test.ts': 1,
