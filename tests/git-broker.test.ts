@@ -695,12 +695,12 @@ describe('cloud Git broker', () => {
       expect(commands.filter((argv) => argv.includes('ls-remote') && argv.includes(f.sshRemote)).length).toBeGreaterThanOrEqual(4);
       expect(mirrors().filter((name) => name.endsWith('.git'))).toHaveLength(1);
       expect((await git(f.remote, ['show', 'main:two.txt'])).stdout).toBe('two.txt\n');
-      expect((await git(f.remote, ['rev-parse', 'refs/heads/karmax/mirrored-task'])).stdout.trim())
-        .toBe((await git(world.handle.root, ['rev-parse', 'karmax/mirrored-task'])).stdout.trim());
+      expect((await git(f.remote, ['rev-parse', 'refs/heads/tavya/mirrored-task'])).stdout.trim())
+        .toBe((await git(world.handle.root, ['rev-parse', 'tavya/mirrored-task'])).stdout.trim());
       // Nothing a world produced is written into the shared mirror.
       const mirror = path.join(process.env.KARMAX_HOME!, 'cache', 'git-mirrors', mirrors().find((name) => name.endsWith('.git'))!);
       expect((await git(mirror, ['for-each-ref', '--format=%(refname)'])).stdout.split('\n').filter(Boolean).sort())
-        .toEqual(['refs/heads/karmax/mirrored-task', 'refs/heads/main']);
+        .toEqual(['refs/heads/main', 'refs/heads/tavya/mirrored-task']);
       const unpushed = (await git(world.handle.root, ['commit-tree', '-m', 'local only', 'HEAD^{tree}'])).stdout.trim();
       expect((await git(mirror, ['cat-file', '-e', unpushed])).code).not.toBe(0);
       await f.destroy(world);
