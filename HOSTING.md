@@ -356,6 +356,12 @@ entitlements with the private-install default of 8. Operators may set
 `KARMAX_MAX_ACT` as an explicit fleet-capacity guard and scale workers when
 aggregate tenant demand approaches it.
 
+The hosted sticky workflow cache defaults to 250 (private installs: 20). A query
+or task for a workflow outside the cache replays its whole history, and the
+console and every running turn query their task's workflow. Raise
+`KARMAX_MAX_CACHED_WORKFLOWS` when a cell keeps more tasks open, as long as the
+worker's heap has room for their conversations.
+
 ## Payment rails
 
 Karmax has three rails, in increasing order of setup cost. **Only the first two

@@ -1,10 +1,13 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { brokerEnrollRepository, brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerPushBranches, brokerRefreshUpstream } from '../src/world/git-broker.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
+import { acquireFileLock } from '../src/util/file-lock.js';
+import { mirroredClone } from '../src/world/git-mirror.js';
 
 describe('cloud Git broker', () => {
   const cleanups: string[] = [];
@@ -602,5 +605,295 @@ describe('cloud Git broker', () => {
     expect(refreshed.skipped).toEqual(['wiki']);
     expect(refreshed.errors?.wiki).toMatch(/SSH remote/);
     expect(calls.some((call) => call.startsWith('/workspace/app:git fetch'))).toBe(true);
+  });
+
+  describe('repository mirror cache (WD-17, LT-10)', () => {
+    let previousHome: string | undefined;
+    beforeEach(() => {
+      previousHome = process.env.KARMAX_HOME;
+      process.env.KARMAX_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-home-'));
+      cleanups.push(process.env.KARMAX_HOME);
+    });
+    afterEach(() => {
+      if (previousHome === undefined) delete process.env.KARMAX_HOME;
+      else process.env.KARMAX_HOME = previousHome;
+    });
+    async function cloudFixture(name: string) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-broker-${name}-`));
+      cleanups.push(root);
+      const source = path.join(root, 'source');
+      fs.mkdirSync(source);
+      await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+      await ensureIdentity(source);
+      // History worth caching: a fresh clone transfers it on every operation.
+      fs.writeFileSync(path.join(source, 'history.bin'), crypto.randomBytes(256 * 1024));
+      await gitOrThrow(source, ['add', '-A']);
+      await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+      await gitOrThrow(root, ['clone', '-q', '--bare', source, path.join(root, `${name}.git`)]);
+      const sshRemote = `git@example:${name}.git`;
+      const env = {
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`,
+        GIT_CONFIG_VALUE_0: 'git@example:',
+      };
+      const provider = new WorktreeProvider(path.join(root, 'worlds'));
+      const world = async (taskId: string) => {
+        const created = await provider.create({ taskId, repo: source, base: 'main' });
+        created.handle.repo = sshRemote;
+        created.handle.repos![0]!.repo = sshRemote;
+        return created;
+      };
+      const commit = async (target: Awaited<ReturnType<typeof world>>, file: string) => {
+        await target.writeFile(file, `${file}\n`);
+        await gitOrThrow(target.handle.root, ['add', '-A']);
+        await gitOrThrow(target.handle.root, ['commit', '-q', '-m', file]);
+      };
+      // Restore the host path first: destroying a worktree world locks its
+      // repository, and an SSH-shaped `repo` would be taken as a relative path.
+      const destroy = async (target: Awaited<ReturnType<typeof world>>) => {
+        target.handle.repo = source;
+        target.handle.repos![0]!.repo = source;
+        await target.destroy();
+      };
+      return { root, remote: path.join(root, `${name}.git`), sshRemote, env, world, commit, destroy };
+    }
+    const mirrors = () => {
+      const dir = path.join(process.env.KARMAX_HOME!, 'cache', 'git-mirrors');
+      return fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+    };
+    async function traced<T>(root: string, action: () => Promise<T>) {
+      const trace = path.join(root, `trace-${crypto.randomUUID()}.json`);
+      const previous = process.env.GIT_TRACE2_EVENT;
+      process.env.GIT_TRACE2_EVENT = trace;
+      try { await action(); }
+      finally {
+        if (previous === undefined) delete process.env.GIT_TRACE2_EVENT;
+        else process.env.GIT_TRACE2_EVENT = previous;
+      }
+      return fs.readFileSync(trace, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+        .filter((event) => event.event === 'start').map((event) => event.argv.slice(1) as string[]);
+    }
+
+    it('serves publish, merge and refresh from one mirror instead of cloning origin each time', async () => {
+      const f = await cloudFixture('mirrored');
+      const world = await f.world('mirrored-task');
+      const commands = await traced(f.root, async () => {
+        await f.commit(world, 'one.txt');
+        expect(await brokerPushBranches(world, f.env)).toEqual({ pushed: ['source'], skipped: [] });
+        // A push names no branch: origin's default branch still seeds the
+        // mirror, so the world's bundle carries only the new commit.
+        const [cached] = mirrors().filter((name) => name.endsWith('.git'));
+        expect((await git(path.join(process.env.KARMAX_HOME!, 'cache', 'git-mirrors', cached!), ['rev-parse', 'main'])).stdout.trim())
+          .toBe((await git(f.remote, ['rev-parse', 'main'])).stdout.trim());
+        await f.commit(world, 'two.txt');
+        expect(await brokerPushBranches(world, f.env)).toEqual({ pushed: ['source'], skipped: [] });
+        expect((await brokerFinalizeMerge(world, 'main', { name: 'Karmax Test', email: 'karmax@example.com' }, f.env)).merged).toBe(true);
+        expect((await brokerRefreshUpstream(world, f.env, 'main')).skipped).toEqual([]);
+      });
+      // Origin is only ever asked for tips and missing objects.
+      expect(commands.filter((argv) => argv.includes('clone') && argv.includes(f.sshRemote))).toEqual([]);
+      expect(commands.filter((argv) => argv.includes('ls-remote') && argv.includes(f.sshRemote)).length).toBeGreaterThanOrEqual(4);
+      expect(mirrors().filter((name) => name.endsWith('.git'))).toHaveLength(1);
+      expect((await git(f.remote, ['show', 'main:two.txt'])).stdout).toBe('two.txt\n');
+      expect((await git(f.remote, ['rev-parse', 'refs/heads/karmax/mirrored-task'])).stdout.trim())
+        .toBe((await git(world.handle.root, ['rev-parse', 'karmax/mirrored-task'])).stdout.trim());
+      // Nothing a world produced is written into the shared mirror.
+      const mirror = path.join(process.env.KARMAX_HOME!, 'cache', 'git-mirrors', mirrors().find((name) => name.endsWith('.git'))!);
+      expect((await git(mirror, ['for-each-ref', '--format=%(refname)'])).stdout.split('\n').filter(Boolean).sort())
+        .toEqual(['refs/heads/karmax/mirrored-task', 'refs/heads/main']);
+      const unpushed = (await git(world.handle.root, ['commit-tree', '-m', 'local only', 'HEAD^{tree}'])).stdout.trim();
+      expect((await git(mirror, ['cat-file', '-e', unpushed])).code).not.toBe(0);
+      await f.destroy(world);
+    });
+
+    it('serializes concurrent operations on one repository', async () => {
+      const f = await cloudFixture('concurrent');
+      const worlds = await Promise.all(['first', 'second', 'third'].map((id) => f.world(`concurrent-${id}`)));
+      for (const world of worlds) await f.commit(world, `${world.handle.id}.txt`);
+      const results = await Promise.all(worlds.map((world) => brokerPushBranches(world, f.env)));
+      expect(results.every((result) => result.skipped.length === 0)).toBe(true);
+      for (const world of worlds) expect((await git(f.remote, ['rev-parse', '--verify', `refs/heads/${world.handle.branch}`])).code).toBe(0);
+      for (const world of worlds) await f.destroy(world);
+    });
+
+    it.each(['0', '1'])('keeps the cache within KARMAX_GIT_MIRROR_MAX_BYTES=%s', async (limit) => {
+      const previous = process.env.KARMAX_GIT_MIRROR_MAX_BYTES;
+      process.env.KARMAX_GIT_MIRROR_MAX_BYTES = limit;
+      try {
+        const f = await cloudFixture(`bounded-${limit}`);
+        const world = await f.world(`bounded-${limit}`);
+        await f.commit(world, 'bounded.txt');
+        expect(await brokerPushBranches(world, f.env)).toEqual({ pushed: ['source'], skipped: [] });
+        expect(mirrors().filter((name) => name.endsWith('.git'))).toEqual([]);
+        await f.destroy(world);
+      } finally {
+        if (previous === undefined) delete process.env.KARMAX_GIT_MIRROR_MAX_BYTES;
+        else process.env.KARMAX_GIT_MIRROR_MAX_BYTES = previous;
+      }
+    });
+
+    it('never evicts a mirror another process still borrows', async () => {
+      const busy = await cloudFixture('busy');
+      const busyWorld = await busy.world('busy-task');
+      await busy.commit(busyWorld, 'busy.txt');
+      expect(await brokerPushBranches(busyWorld, busy.env)).toEqual({ pushed: ['source'], skipped: [] });
+      const [busyMirror] = mirrors().filter((name) => name.endsWith('.git'));
+      // A scratch clone in another process (the API server or a worker) holds
+      // the mirror's use lock shared for as long as it lives.
+      const release = await acquireFileLock(path.join(process.env.KARMAX_HOME!, 'cache', 'git-mirrors',
+        busyMirror!.replace(/\.git$/, '.use')), { shared: true });
+      const previous = process.env.KARMAX_GIT_MIRROR_MAX_BYTES;
+      process.env.KARMAX_GIT_MIRROR_MAX_BYTES = '1';
+      try {
+        const idle = await cloudFixture('idle');
+        const idleWorld = await idle.world('idle-task');
+        await idle.commit(idleWorld, 'idle.txt');
+        expect(await brokerPushBranches(idleWorld, idle.env)).toEqual({ pushed: ['source'], skipped: [] });
+        expect(mirrors().filter((name) => name.endsWith('.git'))).toEqual([busyMirror]);
+        release!();
+        await idle.commit(idleWorld, 'again.txt');
+        expect(await brokerPushBranches(idleWorld, idle.env)).toEqual({ pushed: ['source'], skipped: [] });
+        expect(mirrors().filter((name) => name.endsWith('.git'))).toEqual([]);
+        await idle.destroy(idleWorld);
+      } finally {
+        release?.();
+        if (previous === undefined) delete process.env.KARMAX_GIT_MIRROR_MAX_BYTES;
+        else process.env.KARMAX_GIT_MIRROR_MAX_BYTES = previous;
+      }
+      await busy.destroy(busyWorld);
+    });
+
+    it('reports a missing remote branch the way a clone would', async () => {
+      const f = await cloudFixture('missing');
+      const world = await f.world('missing-task');
+      const result = await brokerRefreshUpstream(world, f.env, 'no-such-branch');
+      expect(result.errors?.source).toMatch(/could not fetch branch "no-such-branch"[\s\S]*not found/);
+      await f.destroy(world);
+    });
+
+    it('keeps no persistent mirror off Linux, where host file locks are unavailable', async () => {
+      const f = await cloudFixture('portable');
+      const world = await f.world('portable-task');
+      await f.commit(world, 'portable.txt');
+      const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+      Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+      try {
+        expect(await brokerPushBranches(world, f.env)).toEqual({ pushed: ['source'], skipped: [] });
+        expect((await brokerFinalizeMerge(world, 'main', { name: 'Karmax Test', email: 'karmax@example.com' }, f.env)).merged).toBe(true);
+      } finally { Object.defineProperty(process, 'platform', platform); }
+      expect((await git(f.remote, ['show', 'main:portable.txt'])).stdout).toBe('portable.txt\n');
+      expect(mirrors()).toEqual([]);
+      await f.destroy(world);
+    });
+
+    it('drops mirrored branches whose names conflict with a branch origin now has', async () => {
+      const f = await cloudFixture('renamed');
+      const seed = path.join(f.root, 'seed');
+      await gitOrThrow(f.root, ['clone', '-q', f.remote, seed]);
+      await ensureIdentity(seed);
+      const publish = async (to: string, file: string) => {
+        await gitOrThrow(seed, ['checkout', '-q', '-B', to, 'main']);
+        fs.writeFileSync(path.join(seed, file), `${file}\n`);
+        await gitOrThrow(seed, ['add', '-A']);
+        await gitOrThrow(seed, ['commit', '-q', '-m', file]);
+        await gitOrThrow(seed, ['push', '-q', 'origin', to]);
+        return (await git(seed, ['rev-parse', 'HEAD'])).stdout.trim();
+      };
+      const checkout = async (branch: string) => {
+        const dir = fs.mkdtempSync(path.join(f.root, 'scratch-'));
+        const cloned = await mirroredClone(f.sshRemote, path.join(dir, 'repo'), f.env, { branch, scratch: dir });
+        const head = (await git(cloned.clone, ['rev-parse', `refs/heads/${branch}`])).stdout.trim();
+        await cloned.release();
+        return head;
+      };
+      await publish('feature', 'feature.txt');
+      await publish('topic/x', 'topic.txt');
+      await checkout('feature');
+      await checkout('topic/x');
+      // Origin replaced `feature` with `feature/x` and `topic/x` with `topic`;
+      // the mirror still holds the old names.
+      await gitOrThrow(seed, ['checkout', '-q', 'main']);
+      await gitOrThrow(seed, ['push', '-q', 'origin', ':feature', ':topic/x']);
+      await gitOrThrow(seed, ['branch', '-q', '-D', 'feature', 'topic/x']);
+      const nested = await publish('feature/x', 'nested.txt');
+      const flat = await publish('topic', 'flat.txt');
+      expect(await checkout('feature/x')).toBe(nested);
+      expect(await checkout('topic')).toBe(flat);
+      expect(mirrors().filter((name) => name.endsWith('.git'))).toHaveLength(1);
+    });
+
+    it('never lets one tenant\'s operation read objects another tenant fetched', async () => {
+      const f = await cloudFixture('tenants');
+      const seed = path.join(f.root, 'seed');
+      await gitOrThrow(f.root, ['clone', '-q', f.remote, seed]);
+      await ensureIdentity(seed);
+      await gitOrThrow(seed, ['checkout', '-q', '-b', 'private']);
+      fs.writeFileSync(path.join(seed, 'private.txt'), 'only tenant A fetched this\n');
+      await gitOrThrow(seed, ['add', '-A']);
+      await gitOrThrow(seed, ['commit', '-q', '-m', 'private']);
+      await gitOrThrow(seed, ['push', '-q', 'origin', 'private']);
+      const secret = (await git(seed, ['rev-parse', 'HEAD'])).stdout.trim();
+      const scratch = () => { const dir = fs.mkdtempSync(path.join(f.root, 'scratch-')); return { dir, clone: path.join(dir, 'repo') }; };
+      const open = async (scope: string, branch: string) => {
+        const target = scratch();
+        const cloned = await mirroredClone(f.sshRemote, target.clone, f.env, { branch, scratch: target.dir, scope });
+        return { ...cloned, has: async (sha: string) => (await git(cloned.clone, ['cat-file', '-e', `${sha}^{commit}`])).code === 0 };
+      };
+      const a = await open('repository-a', 'private');
+      expect(await a.has(secret)).toBe(true);
+      await a.release();
+      // Origin deleted the branch; the object survives only in A's mirror.
+      await gitOrThrow(seed, ['push', '-q', 'origin', ':private']);
+      const again = await open('repository-a', 'main');
+      expect(await again.has(secret)).toBe(true);
+      await again.release();
+      const b = await open('repository-b', 'main');
+      expect(await b.has(secret)).toBe(false);
+      await b.release();
+      expect(mirrors().filter((name) => name.endsWith('.git'))).toHaveLength(2);
+    });
+
+    it('partitions mirrors by broker credential scope and SSH identity', async () => {
+      const f = await cloudFixture('scoped');
+      const world = await f.world('scoped-task');
+      await f.commit(world, 'scoped.txt');
+      for (const mirrorScope of ['repository-a', 'repository-b'])
+        expect(await brokerPushBranches(world, async () => ({ env: f.env, mirrorScope }))).toEqual({ pushed: ['source'], skipped: [] });
+      expect(mirrors().filter((name) => name.endsWith('.git'))).toHaveLength(2);
+      for (const key of ['alice', 'bob'])
+        expect(await brokerPushBranches(world, async () => ({ env: { ...f.env, GIT_SSH_COMMAND: `ssh -i /keys/${key}` } })))
+          .toEqual({ pushed: ['source'], skipped: [] });
+      expect(mirrors().filter((name) => name.endsWith('.git'))).toHaveLength(4);
+      await f.destroy(world);
+    });
+
+    it('keeps repositories that differ only by SSH user apart', async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-users-'));
+      cleanups.push(root);
+      const commits: Record<string, string> = {};
+      for (const user of ['alice', 'bob']) {
+        const work = path.join(root, `${user}-work`);
+        fs.mkdirSync(work);
+        await gitOrThrow(work, ['init', '-q', '-b', 'main']);
+        await ensureIdentity(work);
+        fs.writeFileSync(path.join(work, 'owner.txt'), `${user}\n`);
+        await gitOrThrow(work, ['add', '-A']);
+        await gitOrThrow(work, ['commit', '-q', '-m', user]);
+        await gitOrThrow(root, ['clone', '-q', '--bare', work, path.join(root, user, 'repo.git')]);
+        commits[user] = (await git(work, ['rev-parse', 'HEAD'])).stdout.trim();
+      }
+      // `~/repo` on one host names a different repository for each user.
+      const env = { GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: `url.file://${root}/alice/.insteadOf`, GIT_CONFIG_VALUE_0: 'ssh://alice@example/~/',
+        GIT_CONFIG_KEY_1: `url.file://${root}/bob/.insteadOf`, GIT_CONFIG_VALUE_1: 'ssh://bob@example/~/' };
+      for (const user of ['alice', 'bob']) {
+        const dir = fs.mkdtempSync(path.join(root, 'scratch-'));
+        const cloned = await mirroredClone(`ssh://${user}@example/~/repo.git`, path.join(dir, 'repo'), env, { scratch: dir });
+        expect((await git(cloned.clone, ['rev-parse', 'refs/heads/main'])).stdout.trim()).toBe(commits[user]);
+        const other = user === 'alice' ? 'bob' : 'alice';
+        expect((await git(cloned.clone, ['cat-file', '-e', `${commits[other]}^{commit}`])).code).not.toBe(0);
+        await cloned.release();
+      }
+    });
   });
 });

@@ -847,8 +847,8 @@ function provisionTarget(sandbox: E2BSandboxLike, signal?: AbortSignal): Provisi
 function defaultE2BFactory(): E2BFactory {
   const sdk = async (): Promise<any> => {
     try {
-      // Avoid loading the optional cloud SDK on local-only boots.
-      return await (new Function('return import("e2b")')() as Promise<any>);
+      // Loaded on first use so local-only boots never pay for the cloud SDK.
+      return await import('e2b');
     } catch (error) {
       throw new Error(`E2B world requested but the e2b SDK is unavailable: ${String(error)}`);
     }
