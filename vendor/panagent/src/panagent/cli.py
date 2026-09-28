@@ -12,7 +12,7 @@ from uuid import UUID
 from . import __version__
 from .browser import fetch_share_browser
 from .detect import FORMAT_ALIASES, canonical_format, detect_text, url_format
-from .errors import AcquisitionError, PanagentError
+from .errors import AcquisitionError, BrowserRequired, PanagentError
 from .model import validate_conversation
 from .readers import READERS, read_file
 from .web import WEB_READERS, fetch_share
@@ -113,7 +113,7 @@ def _load(args: argparse.Namespace, *, allow_url: bool) -> tuple[dict[str, Any],
             text = fetch_share(source, timeout=args.timeout)
             return reader(text, source_uri=source), source_format
         except AcquisitionError as exc:
-            retryable = "anti-bot challenge" in str(exc) or "HTTP 403" in str(exc) or "HTTP 429" in str(exc)
+            retryable = isinstance(exc, BrowserRequired) or "HTTP 403" in str(exc) or "HTTP 429" in str(exc)
             if args.browser == "never" or not retryable:
                 raise
             text = fetch_share_browser(

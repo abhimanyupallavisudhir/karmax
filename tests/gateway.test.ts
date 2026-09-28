@@ -209,6 +209,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
         { id: 'a1', role: 'agent', text: 'It is still portable.', ts: Date.parse('2026-08-25T11:00:01Z') },
       ],
       transcripts: [{ role: 'do', label: 'Agent', messages: [
+        { id: 's1', role: 'system', text: 'Task started.', ts: Date.parse('2026-08-25T10:59:59Z') },
         { id: 'u1', role: 'user', text: 'This came through the API rail.', ts: Date.parse('2026-08-25T11:00:00Z') },
         { id: 'a1', role: 'agent', text: 'It is still portable.', ts: Date.parse('2026-08-25T11:00:01Z') },
       ] }],
@@ -222,6 +223,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
     expect(response.status).toBe(200);
     expect(response.headers.get('x-karmax-conversation-source')).toBe('generated');
+    // PA-6: conversion warnings recorded with the frozen export travel with its download.
+    expect(JSON.parse(decodeURIComponent(response.headers.get('x-karmax-conversation-warnings') ?? '[]')))
+      .toEqual([{ code: 'codex_system_role_mapped', message: 'System messages were mapped to Codex developer messages.' }]);
     expect(response.headers.get('content-disposition')).toContain(sessions.do.filename);
     const data = Buffer.from(await response.arrayBuffer());
     expect(detectConversationImport(data)).toBe('codex');

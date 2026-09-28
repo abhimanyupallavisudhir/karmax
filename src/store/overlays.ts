@@ -9,6 +9,10 @@
  *   while the rest of the customization keeps working.
  *
  * Boundary (§9): safe mode reverts code/behavior, not state.
+ *
+ * Not wired: main.ts hands an instance to the gateway, but nothing resolves
+ * through it, and the inert installation safe-mode control was removed (GW-11).
+ * Until a caller consumes it, this is a tested library, not a recovery path.
  */
 export type Layer = 'bundled' | 'user' | 'project';
 
