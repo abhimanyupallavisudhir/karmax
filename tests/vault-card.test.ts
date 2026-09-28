@@ -220,6 +220,54 @@ describe('BudgetService over the vault-card rail', () => {
     expect((await store.getPaymentSpendRequest(pending.requestId!)).status).toBe('denied');
     expect((await store.paymentSpent(task.id))).toBe(0);
   });
+
+  // #367 review item 13: the ended-task check and the claim are one decision.
+  it('refuses approval when the task ends while the card is being checked', async () => {
+    const card = await provision(50_000);
+    (await store.setSettings(projectId, 'payments', { budget: 1_000 }));
+    const task = await store.createTask({ projectId, title: 'buyer', workflow: 'just-do', workflowVersion: '1',
+      params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+    const pending = await budget.request({ projectId, taskId: task.id, capabilities: ['use-card:*'] }, { amount: 5_000, cardId: card.id });
+    const getCard = provider.getCard.bind(provider);
+    vi.spyOn(provider, 'getCard').mockImplementation(async (id: string) => {
+      // The task is cancelled while approval waits on the rail.
+      (await store.saveView(task.id, { taskId: task.id, stage: 'done', status: 'done', actions: [], state: {} } as any));
+      return getCard(id);
+    });
+    expect(await budget.approve(pending.requestId!, 'user:owner')).toMatchObject({ status: 'denied' });
+    expect((await store.paymentSpent(task.id))).toBe(0);
+  });
+
+  it('never overwrites a request another approval already resolved', async () => {
+    const card = await provision(50_000);
+    (await store.setSettings(projectId, 'payments', { budget: 1_000 }));
+    const task = await store.createTask({ projectId, title: 'buyer', workflow: 'just-do', workflowVersion: '1',
+      params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+    const pending = await budget.request({ projectId, taskId: task.id, capabilities: ['use-card:*'] }, { amount: 5_000, cardId: card.id });
+    const getTask = store.getTask.bind(store);
+    vi.spyOn(store, 'getTask').mockImplementationOnce(async (id: string) => {
+      // A concurrent approval settles it, and then the task ends.
+      (await store.updatePaymentSpendRequest(pending.requestId!, { status: 'settled', resolvedBy: 'user:other' }));
+      (await store.saveView(task.id, { taskId: task.id, stage: 'done', status: 'done', actions: [], state: {} } as any));
+      return getTask(id);
+    });
+    await budget.approve(pending.requestId!, 'user:owner');
+    expect((await store.getPaymentSpendRequest(pending.requestId!))).toMatchObject({ status: 'settled', resolvedBy: 'user:other' });
+  });
+
+  // #367 review item 14: a request that waited without a card takes the
+  // currency of the card approval assigns.
+  it('records the currency of the card an approval assigns', async () => {
+    (await store.setSettings(projectId, 'payments', { budget: 1_000, currency: 'eur' }));
+    const task = await store.createTask({ projectId, title: 'buyer', workflow: 'just-do', workflowVersion: '1',
+      params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+    const pending = await budget.request({ projectId, taskId: task.id, capabilities: ['use-card:*'] }, { amount: 5_000 });
+    expect((await store.getPaymentSpendRequest(pending.requestId!))).toMatchObject({ cardId: null });
+    const euros = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Euro card', cap: 50_000,
+      currency: 'EUR', details } as any);
+    await budget.approve(pending.requestId!, 'user:owner');
+    expect((await store.getPaymentSpendRequest(pending.requestId!))).toMatchObject({ cardId: euros.id, currency: 'eur' });
+  });
 });
 
 describe('secure fill is provider-agnostic', () => {

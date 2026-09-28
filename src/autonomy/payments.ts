@@ -1172,11 +1172,20 @@ export class BudgetService {
     if (!request) return { status: 'denied', reason: 'spend request not found' };
     if (!['pending_approval', 'needs_funding'].includes(request.status)) return this.result(request);
     // Spend belongs to the task that asked for it (AU-35); an ended task's
-    // request is retired, not charged to a card nobody will use.
-    const task = await this.store.getTask(request.taskId);
-    if (!task || ['done', 'failed', 'cancelled'].includes(task.lastView?.status ?? ''))
-      return this.result((await this.store.updatePaymentSpendRequest(request.id,
-        { status: 'denied', reason: 'the task has ended', resolvedBy })));
+    // request is retired, not charged to a card nobody will use. Checked
+    // again inside the claim, since the task can end while the rail answers.
+    const ended = async () => {
+      const task = await this.store.getTask(request.taskId);
+      return !task || ['done', 'failed', 'cancelled'].includes(task.lastView?.status ?? '');
+    };
+    // A refusal decided outside the claim applies only while the request is
+    // still waiting: a concurrent approval may have authorized or settled it.
+    const refuse = (reason: string) => this.store.paymentTransaction(async () => {
+      const current = (await this.store.getPaymentSpendRequest(requestId))!;
+      return ['pending_approval', 'needs_funding'].includes(current.status)
+        ? this.store.updatePaymentSpendRequest(request.id, { status: 'denied', reason, resolvedBy }) : current;
+    });
+    if (await ended()) return this.result(await refuse('the task has ended'));
     const card = request.cardId
       ? (await this.store.getCard(request.cardId)) as Card | undefined
       : (await this.cards({
@@ -1186,17 +1195,18 @@ export class BudgetService {
       }))[0];
     if (card && !(await this.cards({ projectId: request.projectId, taskId: request.taskId, organizationId: request.organizationId })).some(c => c.id === card.id))
       return { status: 'denied', reason: 'card is no longer selected for this task', requestId };
-    if (!card) return this.result((await this.store.updatePaymentSpendRequest(request.id,
-      { status: 'denied', reason: 'card no longer exists', resolvedBy })));
-    if (!request.cardId) (await this.store.setPaymentSpendRequestCard(request.id, card.id));
+    if (!card) return this.result(await refuse('card no longer exists'));
+    if (!request.cardId) (await this.store.setPaymentSpendRequestCard(request.id, card.id, cardCurrency(card)));
     const provider = this.provider(card);
     const refreshed = await provider.getCard(card.id) ?? card;
     let wonClaim = false;
     const claimed = (await this.store.paymentTransaction(async () => {
       const current = (await this.store.getPaymentSpendRequest(requestId))!;
       if (!['pending_approval', 'needs_funding'].includes(current.status)) return current;
+      if (await ended())
+        return (await this.store.updatePaymentSpendRequest(request.id, { status: 'denied', reason: 'the task has ended', resolvedBy }));
       const policy = (await this.policy(request.projectId, request.taskId));
-      if (onlyWithinBudget && !withinBudget(policy, request, await this.spent(request.taskId, policy.currency))) return current;
+      if (onlyWithinBudget && !withinBudget(policy, current, await this.spent(request.taskId, policy.currency))) return current;
       if (!(await this.cards({ projectId: request.projectId, taskId: request.taskId })).some(c => c.id === card.id)) return current;
       if (refreshed.status === 'canceled' || refreshed.status === 'inactive')
         return (await this.store.updatePaymentSpendRequest(request.id,

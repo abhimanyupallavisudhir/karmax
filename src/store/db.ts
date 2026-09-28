@@ -7159,11 +7159,12 @@ export class Store {
   async getPaymentSpendRequest(id: string): Promise<any> {
     return (await this.db.prepare('SELECT * FROM payment_spend_requests WHERE id=?').get(id)) as any;
   }
-  async setPaymentSpendRequestCard(id: string, cardId: string): Promise<void> {
+  /** Assign the card an approval chose, with its currency (AU-36). */
+  async setPaymentSpendRequestCard(id: string, cardId: string, currency?: string): Promise<void> {
     return this.db.transaction(async () => {
 
-    (await this.db.prepare('UPDATE payment_spend_requests SET cardId=?, updatedAt=? WHERE id=?')
-      .run(cardId, Date.now(), id));
+    (await this.db.prepare('UPDATE payment_spend_requests SET cardId=?, currency=COALESCE(?, currency), updatedAt=? WHERE id=?')
+      .run(cardId, currency ?? null, Date.now(), id));
   
     });
   }
