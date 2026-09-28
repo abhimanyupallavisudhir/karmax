@@ -11,7 +11,7 @@ import { WorktreeProvider } from '../src/world/worktree.js';
 import { WorldCheckpointService } from '../src/world/checkpoint.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { gitOrThrow, ensureIdentity } from '../src/world/git.js';
-import { forkWorldSource } from '../src/world/fork.js';
+import { forkRecordedAuthority, forkWorldSource } from '../src/world/fork.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import type { WorldHandle } from '../src/world/types.js';
@@ -255,6 +255,20 @@ describe('fork world initialization', () => {
       (await store.close());
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('leaves the authority of a checkpoint that predates recording it to the current policy (WD-11)', () => {
+    const entry = { repositoryId: 'r', source: 'git@github.com:acme/app.git', checkoutPath: '.', baseSha: 'a', branch: 'karmax/source' };
+    const checkpoint = (repo: Record<string, unknown>) => ({ repos: [{ ...entry, ...repo }] }) as any;
+    // Before authorities were recorded an 'origin' checkout looked exactly like
+    // a 'project' one, so neither may be forced to 'project'.
+    expect(forkRecordedAuthority(checkpoint({}), [entry.source])).toEqual([undefined]);
+    // Entries that record authorities omit only 'project'; they also carry the
+    // commit identity (and a local checkout's path).
+    const identity = { gitIdentity: { name: 'Agent', email: 'agent@example.com' } };
+    expect(forkRecordedAuthority(checkpoint(identity), [entry.source])).toEqual(['project']);
+    expect(forkRecordedAuthority(checkpoint({ localPath: '/srv/app' }), [entry.source])).toEqual(['project']);
+    expect(forkRecordedAuthority(checkpoint({ ...identity, sourceAuthority: 'origin' }), [entry.source])).toEqual(['origin']);
   });
 
   it('preserves separate repository branches and commits', async () => {

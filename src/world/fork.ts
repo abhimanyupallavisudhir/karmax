@@ -57,10 +57,13 @@ export function forkDevelopmentSources(requested: string[], checkpoint: WorldChe
 
 /** Which repository owns each fork checkout's base history: the authority its
  * checkpoint recorded, since the fork's base is the source's own task branch
- * and lives only there. Undefined for a repository the source never had. */
+ * and lives only there. Undefined, leaving the current policy in charge, for a
+ * repository the source never had and for a checkpoint written before
+ * authorities were recorded. Such entries lack the commit identity and local
+ * path recorded alongside, and omit 'origin' as well as 'project'. */
 export function forkRecordedAuthority(checkpoint: WorldCheckpoint | undefined, sources: string[]): Array<'project' | 'origin' | undefined> {
   return sources.map((source) => {
     const repo = checkpoint && recordedRepo(checkpoint, source);
-    return repo ? repo.sourceAuthority ?? 'project' : undefined;
+    return repo?.sourceAuthority ?? (repo?.gitIdentity || repo?.localPath ? 'project' : undefined);
   });
 }
