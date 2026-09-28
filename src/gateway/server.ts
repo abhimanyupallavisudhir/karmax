@@ -6703,14 +6703,21 @@ export class Gateway {
         if (p.startsWith('/api/vault/passkey')) {
           // A passkey ceremony runs in the calling task's own browser (AU-12,
           // AU-14): its world's, relayed over a world terminal, or on this host
-          // the one its agent launched.
-          const passkeyWorld = await this.taskWorldHandle(callerTaskId);
-          if (!passkeyWorld) return this.json(res, 400, { error: 'passkeys run in a task\'s own browser; call this from a task that has a world' });
-          const inWorld = this.agentRunsInWorld(passkeyWorld);
-          if (this.deps.hosted && !inWorld) return this.json(res, 400, { error: 'hosted passkeys run in the task\'s remote world' });
-          const passkeyPage = inWorld
-            ? (domains: string[]) => this.openTaskWorldPage(callerTaskId!, passkeyWorld, domains)
-            : async (domains: string[]) => (await import('../autonomy/cdp.js')).openPage(localTaskBrowserUrl(callerTaskId), { expectDomains: domains });
+          // the one its agent launched. Found before a one-shot grant is spent.
+          let passkeyPage: (domains: string[]) => Promise<{ session: import('../autonomy/cdp.js').CdpSession; origin: string }> = async () => { throw new Error('no browser session'); };
+          if (p === '/api/vault/passkey/enroll' || p === '/api/vault/passkey/login') {
+            const passkeyWorld = await this.taskWorldHandle(callerTaskId);
+            if (!passkeyWorld) return this.json(res, 400, { error: 'passkeys run in a task\'s own browser; call this from a task that has a world' });
+            const inWorld = this.agentRunsInWorld(passkeyWorld);
+            if (this.deps.hosted && !inWorld) return this.json(res, 400, { error: 'hosted passkeys run in the task\'s remote world' });
+            if (inWorld) passkeyPage = (domains) => this.openTaskWorldPage(callerTaskId!, passkeyWorld, domains);
+            else {
+              let browser: string;
+              try { browser = localTaskBrowserUrl(callerTaskId); }
+              catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
+              passkeyPage = async (domains) => (await import('../autonomy/cdp.js')).openPage(browser, { expectDomains: domains });
+            }
+          }
           const passkeyOwner = JSON.stringify([organizationId, principal, callerTaskId]);
           if (!this.passkeys) {
             const { PasskeyManager } = await import('../autonomy/passkey.js');

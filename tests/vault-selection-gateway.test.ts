@@ -107,6 +107,18 @@ describe('credential selection ranking through HTTP', () => {
       const view = { taskId: task.id, title: 'Fill', workflow: 'just-do', stage: 'do', status: 'active' } as any;
       await store.saveView(task.id, { ...view, worldPath: home, branch: 'karmax/fill' });
       expect(await enroll()).toMatch(/no agent of this task is running/);
+      // Finding no browser does not spend a one-shot grant.
+      const passkey = await vault.save({ type: 'passkey', label: 'Key', domains: ['example.com'], policy: { use: 'ask', reveal: 'ask' },
+        secrets: { passkey: JSON.stringify([{ credentialId: 'c', rpId: 'example.com', privateKey: 'k' }]) } });
+      const once = await vault.request({ taskId: task.id, caps: [], itemId: passkey.id, mode: 'use', why: 'sign in' });
+      await vault.resolve(once.requestId!, { action: 'once', by: 'user:test' });
+      const passkeyLogin = await fetch(`${running.url}/api/vault/passkey/login`, {
+        method: 'POST', headers: { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ itemId: passkey.id }),
+      });
+      expect(passkeyLogin.status).toBe(400);
+      expect((await passkeyLogin.json() as any).error).toMatch(/no agent of this task is running/);
+      expect((await vault.access([], task.id, passkey, 'use')).status).toBe('granted');
       (gateway as any).deps.hosted = true;
       expect(await enroll()).toMatch(/hosted passkeys run in the task's remote world/);
       const opened: any[] = [];
