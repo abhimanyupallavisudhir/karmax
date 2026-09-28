@@ -61,8 +61,9 @@ These boot a Temporal dev server (heavier, one at a time):
 
 CI (`.github/workflows/ci.yml`) splits the suite across parallel runners with
 Vitest's `--shard`; each runner still runs its files one at a time. The
-required `typecheck + tests` check passes only when the typecheck and every
-shard pass. To reproduce a failing shard, run the same slice locally:
+required `typecheck + tests` check passes only when the typecheck, every
+shard and `deploy artifacts` pass. To reproduce a failing shard, run the same
+slice locally:
 
 ```bash
 npx vitest run --shard=2/5
@@ -81,6 +82,14 @@ gh run view <run-id> --log | npm run test:durations
 No shard can finish faster than the slowest single file (`pipeline.test.ts`,
 about 6.5 minutes in CI). Adding a number to the `test` job's `shard` list helps
 only while the shards are well above that; past it, split the slowest file.
+
+`deploy artifacts` installs the turnkey stack exactly as an operator does
+(`./deploy/karmax up karmax.localhost`), then checks the booted hosted cell:
+the edge routes to it, and the app reaches PostgreSQL only as its own role.
+Pull requests that change only tests, docs or other workflows skip it.
+`tests/hosted-main.test.ts` boots `src/main.ts` as a hosted cell on the
+shards' PostgreSQL and a Temporal dev server; it needs
+`KARMAX_TEST_POSTGRES_URL`, like every PostgreSQL test.
 
 ## The live-agent test
 

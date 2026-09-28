@@ -63,7 +63,7 @@ describe('post-push deployment to the public instance', () => {
 
   it('requires deployment artifacts to build before the required CI check succeeds', () => {
     expect(ci.jobs.required.needs).toContain('deploy-artifacts');
-    expect(JSON.stringify(ci.jobs['deploy-artifacts'].steps)).toContain('docker run --rm karmax:ci');
+    expect(JSON.stringify(ci.jobs['deploy-artifacts'].steps)).toContain('docker run --rm karmax-app');
   });
 
   it('runs the actual Docker integration suites on CI test shards', () => {

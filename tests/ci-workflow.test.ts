@@ -1,5 +1,6 @@
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -54,5 +55,83 @@ describe('CI workflow', () => {
   it('covers the standalone UI and browser regressions through the sharded suite', () => {
     expect(fs.readdirSync(path.join(repoRoot, 'web')).some((name) => name.endsWith('.test.cjs'))).toBe(true);
     expect(fs.existsSync(path.join(repoRoot, 'tests', 'web-regressions.test.ts'))).toBe(true);
+  });
+});
+
+describe('deploy artifacts', () => {
+  type Step = { id?: string; name?: string; if?: string; run?: string; env?: Record<string, string> };
+  const steps: Step[] = ci.jobs['deploy-artifacts'].steps;
+  const runs = steps.map((step) => step.run ?? '').join('\n');
+  const scope = steps.find((step) => step.id === 'scope')!;
+
+  // CI-13: the image used to be built and never started, so nothing proved a
+  // hosted cell boots on PostgreSQL and Temporal the way operators install it.
+  it('installs the turnkey stack with the operator command and routes the edge to it', () => {
+    expect(runs).toContain('./deploy/karmax up karmax.localhost preview.karmax.localhost');
+    expect(runs).toContain("[ \"$redirect\" = '308 https://karmax.localhost/api/health/ready' ]");
+    expect(runs).toContain('docker compose exec -T caddy wget -qO- http://app:4505/api/health/ready');
+  });
+
+  it('proves the booted app uses its own database role and never sees the superuser password (CI-7)', () => {
+    expect(runs).toContain("[ \"$sessions\" = 'karmax superuser=false' ]");
+    expect(runs).toContain("tableowner <> 'karmax'");
+    expect(runs).toContain('grep -qF "$password"');
+  });
+
+  it('checks every artifact only when the change can affect one', () => {
+    for (const step of steps.slice(steps.indexOf(scope) + 1))
+      expect(step.if, step.name).toContain("steps.scope.outputs.artifacts == 'true'");
+  });
+
+  describe('decides the scope from the pull request\'s changed paths', () => {
+    /** Run the scope step on a merge commit that changes `files`. */
+    function decide(event: string, files: string[]): string {
+      const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-ci-scope-'));
+      try {
+        const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=ci', '-c', 'user.email=ci@example.test',
+          '-c', 'commit.gpgsign=false', ...args], { cwd: repo });
+        git('init', '-q');
+        git('commit', '-q', '--allow-empty', '-m', 'base');
+        for (const file of files) {
+          fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+          fs.writeFileSync(path.join(repo, file), 'changed\n');
+        }
+        git('add', '-A');
+        git('commit', '-q', '--allow-empty', '-m', 'change');
+        const output = path.join(repo, 'output');
+        const result = spawnSync('bash', ['-e', '-c', scope.run!], {
+          cwd: repo, encoding: 'utf8', env: { ...process.env, EVENT: event, GITHUB_OUTPUT: output },
+        });
+        expect(result.status, result.stderr).toBe(0);
+        return fs.readFileSync(output, 'utf8');
+      } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+    }
+
+    it.each([
+      [['src/main.ts']],
+      [['web/app.js', 'tests/gateway.test.ts']],
+      [['deploy/README.md']],
+      [['package-lock.json']],
+      [['.dockerignore']],
+      [['.github/workflows/ci.yml']],
+      [['environments/browser/Dockerfile']],
+      [['a new top-level file']],
+    ])('builds when %j changes', (files) => {
+      expect(decide('pull_request', files)).toBe('artifacts=true\n');
+    });
+
+    it.each([
+      [['tests/gateway.test.ts', 'tests/helpers/harness.ts']],
+      [['docs/response-timing.md', 'README.md', 'TESTING.md']],
+      [['web/lists.test.cjs', 'web/sub/deep.test.cjs']],
+      [['design/logo.svg', 'benchmarks/results/README.md', 'scripts/lint.ts']],
+      [['.github/workflows/live.yml', '.github/CODEOWNERS']],
+    ])('skips when only %j changes', (files) => {
+      expect(decide('pull_request', files)).toBe('artifacts=false\n');
+    });
+
+    it.each(['push', 'merge_group', 'workflow_dispatch'])('always builds on %s', (event) => {
+      expect(decide(event, ['tests/gateway.test.ts'])).toBe('artifacts=true\n');
+    });
   });
 });
