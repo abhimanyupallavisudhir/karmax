@@ -3621,7 +3621,7 @@ export class Store {
    * Sub-tasks panel (`TaskView.subTaskSummaries`). */
   async childTaskSummaries(parentTaskId: string): Promise<ChildTaskSummary[]> {
     const rows = await this.readRows<{ id: string; num: number | null; title: string; workflow: string; lastView: string | null }>(
-      'SELECT id, num, title, workflow, lastView FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, id', [parentTaskId]);
+      'SELECT id, num, title, workflow, lastView FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, num, id', [parentTaskId]);
     return rows.map((row) => {
       const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
       return {

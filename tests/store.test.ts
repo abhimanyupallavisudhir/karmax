@@ -37,6 +37,21 @@ describe('Store', () => {
     expect(await store.childTaskSummaries(first.id)).toEqual([]);
   });
 
+  it('lists children created in the same millisecond in creation order', async () => {
+    const project = await store.createProject('Burst');
+    const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'p' } });
+    // A parent fanning out sub-tasks creates several within one clock tick;
+    // their random ids must not decide the panel's order.
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 8, 28));
+    const children = [];
+    try {
+      for (let i = 0; i < 6; i++) children.push(await store.createTask({ projectId: project.id, title: `Child ${i}`,
+        workflow: 'just-do', workflowVersion: '1', params: { prompt: `c${i}` }, parentTaskId: parent.id }));
+    } finally { now.mockRestore(); }
+    expect((await store.childTaskSummaries(parent.id)).map((summary) => summary.title))
+      .toEqual(children.map((child) => child.title));
+  });
+
   it('finds a merged result without loading the task event history', async () => {
     const project = await store.createProject('Merge');
     const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
