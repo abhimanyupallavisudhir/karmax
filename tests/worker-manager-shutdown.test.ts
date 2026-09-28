@@ -83,12 +83,17 @@ it('WF-15: refresh finishes while the retired worker drains, and stop awaits tha
   await manager.start();
   let refreshed = false;
   const refresh = manager.refresh([]).then(() => { refreshed = true; });
-  await new Promise(resolve => setTimeout(resolve, 10));
   try {
-    expect(refreshed).toBe(true);
+    // The retired worker never finishes on its own, so waiting for it would time out.
+    await vi.waitFor(() => expect(refreshed).toBe(true));
     let stopped = false;
     const stop = manager.stop().then(() => { stopped = true; });
-    await new Promise(resolve => setTimeout(resolve, 10));
+    // Stop has shut the current worker down and seen it finish; from here only
+    // promise callbacks remain, and a macrotask turn runs all of them, so a stop
+    // that skipped the retired worker's drain would have resolved.
+    await vi.waitFor(() => expect(next.shutdown).toHaveBeenCalled());
+    await next.run.mock.results[0]!.value;
+    await new Promise(resolve => setImmediate(resolve));
     expect(stopped).toBe(false);
     completion.resolve();
     await stop;

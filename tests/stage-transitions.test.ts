@@ -142,7 +142,8 @@ describe('task stage transitions', () => {
     const restore = f.api.moveTaskStage(f.token, f.task.id, 'review');
     // Attach the assertion immediately so the pre-fix rejection is observed.
     const restored = restore.then(value => ({ value }), error => ({ error }));
-    await new Promise(resolve => setTimeout(resolve, 50));
+    // A second look at the still-running run means the restore chose to wait.
+    await vi.waitFor(() => expect(descriptions.length).toBeGreaterThanOrEqual(2));
     expect(start).not.toHaveBeenCalled();
     expect((await f.store.getTask(f.task.id))?.lastView?.status).toBe('cancelled');
     closed = true;
@@ -584,6 +585,36 @@ describe('task stage transitions', () => {
     expect(f.starts[0]!.type).toBe(`softwareDev@${bundledVersion('software-dev')}`);
     expect(f.starts[0]!.options.args[0].recovery).toMatchObject({ resumeStage: 'do', messages: f.view.messages });
     expect(restored).toMatchObject({ stage: 'do', status: 'active' });
+  });
+
+  // WF-27: the run a Done stops has no successor to supersede it, so a
+  // publication of it that lands late must not reopen the task.
+  it('ignores a late publication from the run a manual Done stopped', async () => {
+    const f = (await fixture());
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'stopped-run' }));
+    (await f.store.saveView(f.task.id, f.view, undefined, { runId: 'stopped-run', seq: 40 }));
+    await f.api.moveTaskStage(f.token, f.task.id, 'done');
+    expect((await f.store.saveView(f.task.id, { ...f.view, updatedAt: 90 }, undefined, { runId: 'stopped-run', seq: 90 }))).toBe(false);
+    expect((await f.store.getTask(f.task.id))?.lastView).toMatchObject({ stage: 'done', status: 'done' });
+  });
+
+  // WF-32 (#396): a Done took its pull requests from the live view it read
+  // before the stop, so one merged or closed on GitHub still showed as open.
+  it('keeps the pull request states GitHub reported when a person marks a task done', async () => {
+    const f = (await fixture());
+    const pr = { repo: 'app', slug: 'o/app', number: 7, url: 'https://github.com/o/app/pull/7', state: 'open' as const };
+    const other = { ...pr, number: 8, url: 'https://github.com/o/app/pull/8' };
+    const review = { ...f.view, stage: 'review' as const, status: 'waiting' as const, pr, prs: [pr, other] };
+    (await f.store.saveView(f.task.id, review));
+    f.setLiveView(review);
+    // What the GitHub webhook records on the stored view.
+    (await f.store.saveView(f.task.id, { ...review, pr: { ...pr, state: 'closed', merged: true },
+      prs: [{ ...pr, state: 'closed', merged: true }, { ...other, state: 'closed' }] }));
+    const done = await f.api.moveTaskStage(f.token, f.task.id, 'done');
+    const expected = { pr: { number: 7, state: 'closed', merged: true },
+      prs: [{ number: 7, state: 'closed', merged: true }, { number: 8, state: 'closed', merged: false }] };
+    expect(done).toMatchObject({ stage: 'done', ...expected });
+    expect((await f.store.getTask(f.task.id))?.lastView).toMatchObject(expected);
   });
 
   it('tells the parent when a person marks its sub-task done', async () => {

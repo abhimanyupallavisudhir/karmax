@@ -178,3 +178,37 @@ it('retries explicitly pending teardown for terminal tasks (WD-14)', async () =>
   expect(f.destroy).toHaveBeenCalledOnce();
   expect(await f.store.worldState(f.handle.id)).toBe('released');
 });
+
+it('backs off a parked world whose checkpoint keeps failing (WD-2)', async () => {
+  const f = await fixture();
+  vi.spyOn(f.store, 'latestWorldCheckpoint').mockResolvedValue(undefined);
+  f.checkpointWorld.mockRejectedValue(new Error('checkpoint file limit exceeded'));
+  const start = Date.now() + 1;
+  const minute = 60_000;
+  // Every attempt opens (and so resumes and bills) the provider sandbox. A
+  // 60 s sweep must not repeat it every tick: attempts are spaced 5, 10, 20 min.
+  for (let at = start; at <= start + 40 * minute; at += minute) await f.lifecycle.sweep(at);
+  expect(f.checkpointWorld).toHaveBeenCalledTimes(4);
+  const failures = await f.store.eventsOfType(f.handle.id, 'world.hibernate_failed');
+  expect(failures).toHaveLength(4);
+  expect((failures.at(-1) as any).payload).toMatchObject({ attempts: 4, retryAt: start + 75 * minute });
+
+  // Using the world is new evidence: the next idle period starts afresh.
+  await f.store.setWorldState(f.handle, 'parked');
+  f.checkpointWorld.mockClear();
+  f.checkpointWorld.mockResolvedValue({ id: 'checkpoint-2', worldId: f.handle.id, generation: 1,
+    projectId: f.project.id, runnerPoolId: 'local', environmentDigest: 'test', repos: [], createdAt: Date.now() });
+  expect(await f.lifecycle.sweep(Date.now() + 1)).toBe(1);
+  expect(f.checkpointWorld).toHaveBeenCalledOnce();
+});
+
+it('backs off provider teardown failures the same way (WD-2)', async () => {
+  const f = await fixture();
+  f.destroy.mockRejectedValue(new Error('provider timeout'));
+  const start = Date.now() + 1;
+  await f.lifecycle.sweep(start);
+  await f.lifecycle.sweep(start + 60_000);
+  expect(f.destroy).toHaveBeenCalledOnce();
+  await f.lifecycle.sweep(start + 5 * 60_000);
+  expect(f.destroy).toHaveBeenCalledTimes(2);
+});

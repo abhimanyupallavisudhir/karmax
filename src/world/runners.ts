@@ -150,6 +150,11 @@ export class WorldLifecycleManager {
   /** Last provider probe per world generation, so reconciliation does not hit
    * the provider control plane on every sweep tick. */
   private probedAt = new Map<string, number>();
+  /** Failed hibernation attempts of one parked snapshot (generation and
+   * updatedAt). Each attempt reopens, and so resumes and bills, the provider
+   * sandbox, so a persistent failure must not repeat on every sweep (WD-2).
+   * Touching the world starts a fresh idle period and so a fresh schedule. */
+  private hibernateFailures = new Map<string, { generation: number; updatedAt: number; attempts: number; retryAt: number }>();
   constructor(private store: Store, private worlds: WorldRegistry, private checkpoints: WorldCheckpointService,
     private intervalMs = 60_000, private objects?: ObjectStore, private runners?: RunnerPoolService,
     private access?: import('./access.js').WorldAccessService) {}
@@ -250,7 +255,23 @@ export class WorldLifecycleManager {
       if (probedAt < now - Math.max(2 * reconcileAfter, 60_000)) this.probedAt.delete(key);
     await this.reapOrphanSandboxes();
     let hibernated = 0;
-    for (const candidate of (await this.store.listWorldInstances('parked'))) {
+    const parked = await this.store.listWorldInstances('parked');
+    const parkedIds = new Set(parked.map(candidate => candidate.handle.id));
+    for (const id of this.hibernateFailures.keys()) if (!parkedIds.has(id)) this.hibernateFailures.delete(id);
+    for (const candidate of parked) {
+      const failed = this.hibernateFailures.get(candidate.handle.id);
+      const sameSnapshot = failed?.generation === (candidate.handle.generation ?? 1)
+        && failed.updatedAt === Number(candidate.updatedAt);
+      if (failed && sameSnapshot && now < failed.retryAt) continue;
+      const attempts = sameSnapshot ? failed!.attempts + 1 : 1;
+      const hibernateFailed = (error: unknown) => {
+        const retryAt = now + Math.min(HIBERNATE_RETRY_MS * 2 ** (attempts - 1), HIBERNATE_RETRY_MAX_MS);
+        this.hibernateFailures.set(candidate.handle.id, { generation: candidate.handle.generation ?? 1,
+          updatedAt: Number(candidate.updatedAt), attempts, retryAt });
+        return this.recordLifecycle(candidate.handle, 'world.hibernate_failed', {
+          error: error instanceof Error ? error.message : String(error), attempts, retryAt,
+        });
+      };
       try {
       const projectId = String(candidate.handle.meta?.projectId ?? '');
       const project = (await this.store.getProject(projectId));
@@ -287,9 +308,7 @@ export class WorldLifecycleManager {
           // state and let the next sweep retry unless the provider proves loss.
           const state = await this.worlds.probe(candidate.handle as any).catch(() => undefined);
           if (state !== 'missing' || !(await eligible())) {
-            await this.recordLifecycle(candidate.handle, 'world.hibernate_failed', {
-              error: error instanceof Error ? error.message : String(error),
-            });
+            await hibernateFailed(error);
             return;
           }
           await this.store.setWorldState(candidate.handle, 'hibernated');
@@ -302,9 +321,7 @@ export class WorldLifecycleManager {
         hibernated++;
       }));
       } catch (error) {
-        await this.recordLifecycle(candidate.handle, 'world.hibernate_failed', {
-          error: error instanceof Error ? error.message : String(error),
-        });
+        await hibernateFailed(error);
       }
     }
     return hibernated;
@@ -451,6 +468,10 @@ export class WorldLifecycleManager {
     } }));
   }
 }
+
+/** First retry delay after a failed hibernation; doubles per failure up to the cap. */
+const HIBERNATE_RETRY_MS = 5 * 60_000;
+const HIBERNATE_RETRY_MAX_MS = 6 * 60 * 60_000;
 
 /** How long a ready world may go untouched before its provider is probed.
  * `0` disables reconciliation entirely. */
