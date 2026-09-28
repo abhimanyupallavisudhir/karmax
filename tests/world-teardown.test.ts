@@ -38,7 +38,7 @@ async function fixture() {
 
 it('refuses cleanup from a replaced workflow run', async () => {
   const f = await fixture();
-  await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'replacement' });
+  await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'replacement' });
   await f.core.destroyWorld(f.handle);
   expect(f.destroy).not.toHaveBeenCalled();
   expect(f.resources.release).not.toHaveBeenCalled();
@@ -77,7 +77,7 @@ it('does not reopen a released world when retrying lease cleanup', async () => {
 it('rechecks ownership after resource cleanup before touching the provider', async () => {
   const f = await fixture();
   f.resources.release.mockImplementation(async () => {
-    await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'replacement' });
+    await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'replacement' });
   });
   await f.core.destroyWorld(f.handle);
   expect(f.destroy).not.toHaveBeenCalled();
