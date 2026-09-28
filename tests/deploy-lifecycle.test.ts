@@ -337,6 +337,20 @@ function checkout() {
   return { ...h, git, previous, target };
 }
 
+// The image copies the checkout with its modes and runs as the app user, so no
+// private umask may reach the checkout, including a staged domain move's.
+it('checks out a release readable by the app, even while moving domains', () => {
+  const h = checkout();
+  fs.appendFileSync(path.join(h.deploy, '.turnkey.env'), 'KARMAX_PENDING_DOMAIN=moved.example.com\n');
+  const result = spawnSync('sh', ['-c', `umask 022; exec sh ${JSON.stringify(path.join(h.deploy, 'karmax'))} update ${h.target}`], {
+    encoding: 'utf8', timeout: 30_000,
+    env: { ...process.env, PATH: `${path.join(h.root, 'bin')}:${process.env.PATH}`, FAKE_LOG: path.join(h.root, 'docker.jsonl'), FAKE_FAIL: '' } });
+  expect(result.status, result.stderr).toBe(0);
+  expect(fs.readFileSync(path.join(h.deploy, '.turnkey.env'), 'utf8')).toContain('KARMAX_DOMAIN=moved.example.com');
+  expect(fs.statSync(path.join(h.root, 'release')).mode & 0o044).toBe(0o044);
+  expect(fs.statSync(path.join(h.deploy, '.turnkey.env')).mode & 0o077).toBe(0);
+});
+
 it('updates an exact master revision', () => {
   const h = checkout();
   const result = h.run(['update', h.target]);

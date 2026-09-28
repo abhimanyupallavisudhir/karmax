@@ -29,7 +29,11 @@ case "$command" in
     ;;
   run)
     code=0
-    ( flock -n 9 || exit 73; KARMAX_DEPLOY_DIR="$DEPLOY_DIR" "$run/karmax" update "$sha" ) 9>"$UPDATES/host.lock" || code=$?
+    # The runner's own files are private (start's umask 077), but the updater
+    # checks out the release the image copies with its modes and runs as the
+    # app user: under 077 every source it changed became unreadable to the app,
+    # and so did the rollback's. Its secrets set their own umask.
+    ( flock -n 9 || exit 73; umask 022; KARMAX_DEPLOY_DIR="$DEPLOY_DIR" "$run/karmax" update "$sha" ) 9>"$UPDATES/host.lock" || code=$?
     if [ "$code" -eq 0 ]; then printf 'success\n' > "$run/status.next"
     else printf 'failed:%s\n' "$code" > "$run/status.next"; fi
     mv "$run/status.next" "$run/status"

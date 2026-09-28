@@ -184,8 +184,11 @@ configure() {
       }' "$ENV_FILE")
   fi
 
-  umask 077
   ensure_secrets
+  # Only the file itself is private: a bare umask here would outlive this
+  # function, and an update that stages a domain move checks out the release
+  # next, which the app (another uid) must be able to read.
+  ( umask 077
   {
     printf 'KARMAX_DOMAIN=%s\n' "$domain"
     printf 'KARMAX_PREVIEW_DOMAIN=%s\n' "$preview"
@@ -198,7 +201,7 @@ configure() {
     printf 'TEMPORAL_VERSION=%s\n' "$temporal"
     printf 'POSTGRES_VERSION=%s\n' "$postgres"
     [ -z "$carried" ] || printf '%s\n' "$carried"
-  } > "$ENV_FILE"
+  } > "$ENV_FILE" )
   chmod 600 "$ENV_FILE"
 }
 
