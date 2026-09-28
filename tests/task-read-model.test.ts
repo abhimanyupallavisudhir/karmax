@@ -82,7 +82,7 @@ it('queries the replacement run if it changes while the async snapshot is loadin
   const snapshot = store.taskSnapshotAsync.bind(store);
   vi.spyOn(store, 'taskSnapshotAsync').mockImplementation(async id => {
     const result = await snapshot(id);
-    (await store.updateTaskParams(task.id, { ...task.params, _workflowRunId: 'replacement-run' }));
+    (await store.patchTaskParams(task.id, { _workflowRunId: 'replacement-run' }));
     return result;
   });
   await api.getTaskView(token, task.id, { live: true });

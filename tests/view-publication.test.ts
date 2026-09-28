@@ -4,7 +4,7 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
-import { conversationPublisher, type PublishedView } from '../src/domain/view-publication.js';
+import { conversationPage, conversationPublisher, type PublishedView } from '../src/domain/view-publication.js';
 import type { TaskView } from '../src/domain/types.js';
 import { reconcilePullRequestView } from '../src/integrations/github-pr.js';
 
@@ -37,7 +37,8 @@ describe('durable conversation publication', () => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Retention');
     const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
-    const old = `view-conversation:${task.id}:run:0`;
+    // A replaced run's snapshot; the run's own older ones go when superseded.
+    const old = `view-conversation:${task.id}:earlier:0`;
     const current = `view-conversation:${task.id}:run:1`;
     await store.kvSet(old, JSON.stringify({ messages: [{ id: 'old', role: 'agent', text: 'old', ts: 1 }] }));
     await store.kvSet(current, JSON.stringify({ messages: [{ id: 'new', role: 'agent', text: 'new', ts: 2 }] }));
@@ -63,7 +64,7 @@ describe('durable conversation publication', () => {
     const project = await store.createProject('Retention');
     const task = await store.createTask({ projectId: project.id, title: 'Settled', workflow: 'software-dev',
       workflowVersion: '1.26.0', params: { prompt: 'fixture' } });
-    const old = `view-conversation:${task.id}:run:0`;
+    const old = `view-conversation:${task.id}:earlier:0`;
     const fence = `view-publication-fence:${task.id}:run:activity`;
     const day = 24 * 60 * 60 * 1000;
     try {
@@ -94,8 +95,8 @@ describe('durable conversation publication', () => {
     const other = await store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
       workflowVersion: '1.20.0', params: { prompt: 'fixture', _workflowRunId: 'live-run' } });
     const day = 24 * 60 * 60 * 1000;
-    const stale = [`turnsession:${task.id}:run#1`, `turnresult:${task.id}:do:${task.id}:run#1`, `turnspawns:${task.id}#0`,
-      `task-create:${task.id}:run:child`, 'turnsession:legacy:last-run:activity', 'turnspawns:legacy:last-run:activity',
+    const stale = [`turnsession:${task.id}:run#1`, `turnsession:${task.id}:run#1:journal`, `turnresult:${task.id}:do:${task.id}:run#1`,
+      `task-create:${task.id}:run:child`, 'turnsession:legacy:last-run:activity',
       ...(history === 'unswept' ? ['turnsession:legacy:earlier-run:activity'] : [])];
     const kept = [`session:${task.id}:do`, `turnsession:${other.id}:run#1`, `turnresult:${other.id}:do:${other.id}:run#1`,
       'turnsession:legacy:live-run:activity'];
@@ -193,6 +194,65 @@ describe('durable conversation publication', () => {
       (await store.deleteTask(task.id));
       expect((await store.db.prepare('SELECT k FROM kv WHERE k LIKE ?').all(`view-conversation:${task.id}:%`))).toEqual([]);
     } finally { (await store.close()); }
+  });
+
+  it('WF-4: writes a grown or edited conversation as a delta of its acknowledged snapshot', async () => {
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Publication', {}));
+    const task = (await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x' } }));
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    const writes: PublishedView[] = [];
+    const publish = conversationPublisher('run', async (view, reference) => {
+      writes.push(view);
+      await core.publishView(task.id, view, reference);
+    }, { patches: () => true });
+    const messages: TaskView['messages'] = [{ id: 'm0', role: 'user', text: 'CI log '.repeat(25_000), ts: 0 }];
+    const view: TaskView = { taskId: task.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'active',
+      messages, transcripts: [{ role: 'do', label: 'Do', messages }], actions: [], state: {}, updatedAt: 1 };
+    const saved = async () => (await store.getTask(task.id))?.lastView;
+    try {
+      await publish(view);
+      messages.push({ id: 'a1', role: 'agent', text: 'Fixed.', ts: 1 });
+      view.transcripts!.push({ role: 'confirm', label: 'Confirm', messages: [{ id: 'c0', role: 'user', text: 'Review', ts: 0 }] });
+      await publish({ ...view, updatedAt: 2 });
+      expect(writes[1]!.messages).toBeUndefined();
+      expect(JSON.stringify(writes[1]).length).toBeLessThan(1_000);
+      expect((await saved())?.messages).toEqual(messages);
+      expect((await saved())?.transcripts).toEqual(view.transcripts);
+      messages[0]!.text = 'edited in place';
+      await publish({ ...view, updatedAt: 3 });
+      expect(writes[2]!.conversationPatch?.messages).toMatchObject({ keep: 0 });
+      expect((await saved())?.messages.map(m => m.text)).toEqual(['edited in place', 'Fixed.']);
+      await expect(core.publishView(task.id, { ...writes[2]!, conversationPatch: { ...writes[2]!.conversationPatch!, base: 'gone' } },
+        'run:9')).rejects.toThrow('snapshot is missing');
+    } finally { (await store.close()); }
+  });
+
+  it('WF-4: a turn reads the transcript it references from the acknowledged snapshot', async () => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Turns');
+    const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'fixture' } });
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    vi.spyOn(worlds, 'open').mockResolvedValue(world);
+    let delivered: string[] = [];
+    const core = makeCoreActivities({ store, worlds, profiles: new ProfileResolver(store, 'mock'),
+      adapters: new Map([['mock', { provider: 'mock', runTurn: async (input: any) => {
+        delivered = input.messages.map((m: any) => m.text);
+        return { output: 'done', termination: { kind: 'success', status: 'fixture' } };
+      } }]]) as any });
+    try {
+      await store.kvSet(`view-conversation:${task.id}:run:3`, JSON.stringify({
+        messages: [{ id: 'm0', role: 'user', text: 'first', ts: 0 }, { id: 'a1', role: 'agent', text: 'second', ts: 1 },
+          { id: 'x', role: 'user', text: 'not part of this turn', ts: 2 }] }));
+      await core.runAgentTurn({ taskId: task.id, role: 'do', agentSlotGranted: true, worldHandle: world.handle,
+        messagesBase: { reference: 'run:3', role: 'do', count: 2 }, messages: [{ id: 'u2', role: 'user', text: 'third', ts: 2 }],
+        task: { taskId: task.id, projectId: project.id, title: 'Work', prompt: 'work', project: {}, agents: { do: { provider: 'mock' } } } } as any);
+      expect(delivered).toEqual(['first', 'second', 'third']);
+    } finally { vi.restoreAllMocks(); await world.destroy(); await store.close(); }
   });
 
   it.each(['before', 'after'])('keeps critical escalation intact when replacement bootstrap publishes %s the ask', async (order) => {
@@ -388,6 +448,111 @@ describe('durable conversation publication', () => {
           .toEqual([`view-conversation:${f.task.id}:run-one:1`, `view-conversation:${f.task.id}:run-one:2`]);
       } finally { await f.close(); }
     });
+
+    // A delta names its base snapshot and a turn names the snapshot its
+    // transcript starts from; each is read again on a retry. The store may drop
+    // a superseded snapshot only once nothing the run holds can read it.
+    const snapshots = async (f: Awaited<ReturnType<typeof publisher>>) =>
+      (await f.store.kvEntries(`view-conversation:${f.task.id}:`)).map(({ key }) => key.split(':').slice(2).join(':'));
+    // `after` holds a reference's write until another has landed.
+    const deltas = (f: Awaited<ReturnType<typeof publisher>>, after: Record<string, string> = {}) => {
+      const landed = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+      const landing = (reference: string) => {
+        if (!landed.has(reference)) {
+          let resolve!: () => void;
+          landed.set(reference, { promise: new Promise<void>((done) => { resolve = done; }), resolve });
+        }
+        return landed.get(reference)!;
+      };
+      const writes: { view: PublishedView; reference: string }[] = [];
+      const publish = conversationPublisher('run-one', async (view, reference) => {
+        writes.push({ view, reference });
+        if (after[reference]) await landing(after[reference]).promise;
+        try { await f.core.publishView(f.task.id, view, reference); } finally { landing(reference).resolve(); }
+      }, { patches: () => true });
+      return { publish, writes };
+    };
+
+    it('keeps the snapshot a running turn started from until its role starts another turn', async () => {
+      const f = await publisher();
+      const { publish } = deltas(f);
+      try {
+        await publish(f.view('do', 1, 'first'));
+        expect(publish.turnBase(f.view('do', 1, 'first').messages, 'do').base?.reference).toBe('run-one:0');
+        // A follow-up republishes twice while the turn runs; its retry re-reads run-one:0.
+        await publish(f.view('do', 2, 'second'));
+        await publish(f.view('do', 3, 'third'));
+        expect((await f.core.readConversationPage(f.task.id, 'run-one:0', 0)).roles[0]!.messages[0]!.text).toBe('first');
+        publish.turnBase(f.view('do', 3, 'third').messages, 'do');
+        await publish(f.view('do', 4, 'fourth'));
+        expect(await snapshots(f)).toEqual(['run-one:2', 'run-one:3']);
+      } finally { await f.close(); }
+    });
+
+    it('keeps the base of overlapping deltas until both have landed', async () => {
+      const f = await publisher();
+      // The main loop's delta waits until an update handler's has saved.
+      const { publish } = deltas(f, { 'run-one:2': 'run-one:1' });
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await Promise.all([publish(f.view('do', 2, 'second')), publish(f.view('do', 2, 'third'))]);
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'third' }] });
+        await publish(f.view('do', 3, 'fourth'));
+        expect(await snapshots(f)).toEqual(['run-one:2', 'run-one:3']);
+      } finally { await f.close(); }
+    });
+
+    it('retries a delta whose save committed after its base was dropped', async () => {
+      const f = await publisher();
+      const { publish, writes } = deltas(f);
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await publish(f.view('do', 2, 'second'));
+        await f.store.kvDelete(`view-conversation:${f.task.id}:run-one:0`);
+        // An attempt of run-one:1 that timed out after its save committed.
+        await f.core.publishView(f.task.id, writes[1]!.view, writes[1]!.reference);
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'second' }] });
+      } finally { await f.close(); }
+    });
+
+    // At a deploy, a publication the old code scheduled completes on the new
+    // worker without saying what the run still reads; the new code's delta
+    // against the previous snapshot must still find it.
+    it('drops no snapshot for a publication that names none it keeps', async () => {
+      const f = await publisher();
+      let released!: () => void;
+      const oldWriteLanded = new Promise<void>((resolve) => { released = resolve; });
+      const publish = conversationPublisher('run-one', async (view, reference) => {
+        if (reference === 'run-one:2') {
+          // Scheduled before the deploy: a full conversation and no list.
+          const { conversationRetain: _, conversationPatch: __, ...old } = view;
+          await f.core.publishView(f.task.id, { ...old, messages: f.view('do', 3, 'third').messages }, reference);
+          released();
+        } else {
+          if (reference === 'run-one:3') await oldWriteLanded;
+          await f.core.publishView(f.task.id, view, reference);
+        }
+      }, { patches: () => true });
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await publish(f.view('do', 2, 'second'));
+        await Promise.all([publish(f.view('do', 3, 'third')), publish(f.view('do', 4, 'fourth'))]);
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'fourth' }] });
+      } finally { await f.close(); }
+    });
+
+    it('records the snapshot of a delta it drops as stale', async () => {
+      const f = await publisher();
+      // The newer delta lands first; the publisher then acknowledges the older one last.
+      const { publish } = deltas(f, { 'run-one:1': 'run-one:2' });
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await Promise.all([publish(f.view('do', 2, 'second')), publish(f.view('do', 3, 'third'))]);
+        // The publisher acknowledged run-one:1 last, so its next delta builds on it.
+        await publish({ ...f.view('do', 4, 'fourth'), status: 'waiting' });
+        expect(await f.stored()).toMatchObject({ status: 'waiting', messages: [{ text: 'fourth' }] });
+      } finally { await f.close(); }
+    });
   });
 
   it('does not reference an unacknowledged write', async () => {
@@ -426,4 +591,25 @@ describe('durable conversation publication', () => {
       expect((await store.kvGet('view-conversation:other-task:run:0'))).toBe('preserve');
     } finally { (await store.close()); }
   });
+});
+
+// A continued run reads its predecessor's transcripts in pages, each well
+// inside Temporal's payload limit, and rebuilds them exactly (WF-4).
+it('pages a conversation across transcripts and rebuilds it exactly', () => {
+  const message = (id: string, bytes = 100) => ({ id, role: 'agent' as const, text: 'x'.repeat(bytes), ts: 1 });
+  const messages = [message('d1'), message('d2', 5_000), message('d3')];
+  const conversation = { messages, transcripts: [{ role: 'do', label: 'Do agent', messages },
+    { role: 'merge', label: 'Merge agent', messages: [message('m1'), message('m2')] }] };
+  const rebuilt = new Map<string, string[]>();
+  let offset: number | undefined = 0, pages = 0;
+  while (offset !== undefined) {
+    const page = conversationPage(conversation, offset, 1_000);
+    for (const { role, messages: part } of page.roles) rebuilt.set(role, [...(rebuilt.get(role) ?? []), ...part.map(m => m.id)]);
+    expect(page.roles.flatMap(role => role.messages).length).toBeGreaterThan(0);
+    offset = page.next;
+    pages++;
+  }
+  expect(Object.fromEntries(rebuilt)).toEqual({ do: ['d1', 'd2', 'd3'], merge: ['m1', 'm2'] });
+  // The oversized message is a page on its own rather than a stall.
+  expect(pages).toBe(3);
 });

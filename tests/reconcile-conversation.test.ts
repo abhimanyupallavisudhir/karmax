@@ -51,3 +51,31 @@ describe('reconcile keeps stored conversations', () => {
     } finally { await store.close(); }
   });
 });
+
+// WF-3/WF-4: a parent that continued as new has no handle to see its child's
+// execution fail or be terminated; the settled durable view must tell it.
+it('tells a parent when reconcile settles its child', async () => {
+  const store = await Store.create(':memory:');
+  try {
+    const project = await store.createProject('Reconcile');
+    const parent = await activeTask(store, project.id, 'Parent');
+    const children: { id: string }[] = [];
+    for (const title of ['Terminated child', 'Lost child']) {
+      const child = await store.createTask({ projectId: project.id, title, workflow: 'software-dev', workflowVersion: '1.26.0',
+        params: { prompt: title }, parentTaskId: parent.id });
+      await store.saveView(child.id, { taskId: child.id, title, workflow: 'software-dev', stage: 'do', status: 'active',
+        messages: [], actions: [], state: {}, updatedAt: 1 });
+      children.push(child);
+    }
+    const signals: unknown[][] = [];
+    const client = { workflow: { getHandle: (id: string) => ({
+      describe: async () => id === parent.id ? { status: { name: 'RUNNING' }, runId: 'p' }
+        : id === children[0]!.id ? { status: { name: 'TERMINATED' }, runId: 'c' } : Promise.reject(new Error('workflow not found')),
+      result: async () => undefined,
+      signal: async (...args: unknown[]) => { signals.push([id, ...args]); },
+    }) } } as any;
+    await reconcileTasks(store, client);
+    expect(signals).toEqual(expect.arrayContaining(children.map((child) =>
+      [parent.id, 'childSettled', { childTaskId: child.id, stage: 'failed' }])));
+  } finally { await store.close(); }
+});

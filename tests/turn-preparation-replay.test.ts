@@ -7,6 +7,23 @@ import { NativeConnection, Worker, bundleWorkflowCode } from '@temporalio/worker
 import { startDevServer } from '../src/temporal/dev-server.js';
 import { makeClient } from '../src/temporal/client.js';
 
+// A leased turn's first `agent-turn-run-identity-v1` marker is a command, so its
+// position relative to resolveCredentialOrder is part of the history. Before
+// credential re-listing (334680f3) the allow-list was resolved first; since then
+// the marker comes first. All three orders recorded in the wild must replay:
+// this branch's pre-change code, the revision production ran until 2026-09-28
+// (recorded at 334680f3^ by master's hotfix #417), and master's re-listing (3ac2913b).
+const replayBundle = bundleWorkflowCode({ workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)) });
+it.each([
+  ['resolved before the turn id, by this branch before re-listing', 'turn-preparation-prechange-history.json'],
+  ['resolved before the turn id, by production until 2026-09-28', 'turn-preparation-production-history.json'],
+  ['resolved after the turn id', 'turn-preparation-relist-history.json'],
+])('replays a leased turn whose allow-list was %s', async (_order, fixture) => {
+  const { temporal } = createRequire(import.meta.url)('@temporalio/proto');
+  await Worker.runReplayHistory({ workflowBundle: await replayBundle }, temporal.api.history.v1.History.fromObject(
+    JSON.parse(fs.readFileSync(new URL(`./fixtures/${fixture}`, import.meta.url), 'utf8'))));
+}, 60_000);
+
 it('prepares one leased turn with one Starting agent publication', async () => {
   const server = await startDevServer({ headless: true, logLevel: 'never' });
   const native = await NativeConnection.connect({ address: server.address });
@@ -15,14 +32,7 @@ it('prepares one leased turn with one Starting agent publication', async () => {
   const views: any[] = [];
   let running = false, release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  const bundle = await bundleWorkflowCode({ workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)) });
-  const { temporal } = createRequire(import.meta.url)('@temporalio/proto');
-  // A leased turn recorded before credential re-listing resolved its allow-list
-  // before the turn's id; one recorded by master's re-listing code (334680f3)
-  // resolves it after. Both orders must replay.
-  for (const fixture of ['turn-preparation-prechange-history.json', 'turn-preparation-relist-history.json'])
-    await Worker.runReplayHistory({ workflowBundle: bundle }, temporal.api.history.v1.History.fromObject(
-      JSON.parse(fs.readFileSync(new URL(`./fixtures/${fixture}`, import.meta.url), 'utf8'))));
+  const bundle = await replayBundle;
   const preparation = makeTurnPreparationActivities({ resolveProvider: async () => 'claude', resolveCredentialOrder: async () => ['fixture'] },
     { accountPoolSize: async () => 1 });
   const worker = await Worker.create({ connection: native, namespace: server.namespace, taskQueue, workflowBundle: bundle,

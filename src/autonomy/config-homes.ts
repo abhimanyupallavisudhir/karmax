@@ -442,11 +442,21 @@ export function claudeAccessTokenExpiresAt(home: string): number | undefined {
  * lifetime (about four weeks from sign-in, not extended by refreshes); after it
  * Anthropic signs the login out and only signing in again restores it. */
 export function claudeSignInExpiresAt(home: string): number | undefined {
+  const state = claudeSignIn(home);
+  return state && !state.signedOut ? state.expiresAt : undefined;
+}
+
+/** A Claude login that has ever signed in: when its sign-in lapses (or lapsed),
+ * and whether Anthropic has already signed it out (Claude Code blanks the tokens
+ * but keeps the rest of the record). A home that never signed in has no record. */
+export function claudeSignIn(home: string): { signedOut: boolean; expiresAt: number } | undefined {
   for (const rel of ['.credentials.json', '.claude/.credentials.json']) {
     try {
       const oauth = JSON.parse(fs.readFileSync(path.join(home, rel), 'utf8'))?.claudeAiOauth;
-      const value = Number(oauth?.refreshTokenExpiresAt);
-      if (typeof oauth?.refreshToken === 'string' && oauth.refreshToken && Number.isFinite(value) && value > 0) return value;
+      const expiresAt = Number(oauth?.refreshTokenExpiresAt);
+      if (!oauth || !Number.isFinite(expiresAt) || expiresAt <= 0) continue;
+      const token = (value: unknown) => typeof value === 'string' && value.length > 0;
+      return { signedOut: !token(oauth.accessToken) && !token(oauth.refreshToken), expiresAt };
     } catch {
       /* try the other native credential location */
     }

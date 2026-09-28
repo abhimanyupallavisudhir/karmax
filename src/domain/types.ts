@@ -230,7 +230,18 @@ export interface InboxItem {
   readAt?: number;
   /** Resource-backed asks use the inbox without manufacturing a task merely to
    * carry a notification. */
-  subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string };
+  subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string }
+    | CredentialNotice;
+}
+
+/** A login only a person can restore: its sign-in lapses soon, or already did. */
+export interface CredentialNotice {
+  kind: 'credential';
+  credentialKey: string;
+  provider: string;
+  account: string;
+  reason: 'expiring' | 'signed-out';
+  expiresAt: number;
 }
 
 export interface DeliveryPreferences {
@@ -1748,6 +1759,53 @@ export interface TaskRecoveryCheckpoint {
   /** The preserved intent-authorized proposal changed in Do and needs an
    * automatic integration review before provider re-admission. */
   repairValidationPending?: boolean;
+  /** Set when the run continued as new to bound its history. */
+  continued?: TaskContinuation;
+}
+
+/** What a software-dev run that continued as new at the top of Do carries
+ * besides the checkpoint: the in-flight state a replacement would rebuild or
+ * drop, so the next run resumes exactly where this one stopped. Transcripts
+ * are by reference: together they may exceed Temporal's 2 MB payload limit. */
+export interface TaskContinuation {
+  /** The acknowledged view publication that holds every visible transcript. */
+  conversation: string;
+  /** The Merge transcript when the view hides it (explicit PR cycles). */
+  mergeMessages?: Message[];
+  /** The run held the task's run pin, which the next run takes over. */
+  runPinned: boolean;
+  /** Keeps `TaskView.updatedAt` increasing across runs. */
+  updatedAtBase: number;
+  goalMode: boolean;
+  confirmLayers: ConfirmLayer[];
+  subTasks: {
+    ids: string[];
+    outstanding: string[];
+    awaitingResponse: string[];
+    raises: ChildRaise[];
+    settled: { childTaskId: string; stage: string; detail?: string }[];
+  };
+  collaborations: { pending: string[]; settled: string[] };
+  consumed: string[];
+  checkoutHeads: Record<string, string>;
+  accountPool: number;
+  flags: {
+    targetLocked: boolean;
+    pointOfNoReturnPassed: boolean;
+    branchPreparedForPr: boolean;
+    forceHumanRepairReview: boolean;
+    providerQueueAccepted: boolean;
+    prRequested: boolean;
+    confirmed: boolean;
+    retryRequested: boolean;
+    manualEscalationRequested: boolean;
+    resourcesApplied: boolean;
+  };
+  manualPrConfirmer?: string;
+  escalationAction?: 'openPr' | 'confirm';
+  error?: string;
+  counters: { responderRounds: number; subtaskNags: number; subagentNudges: number; shellNudges: number;
+    landingWatchSequence: number; resourceReviewSequence: number };
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────

@@ -24,6 +24,7 @@
     "reset": "tsx src/scripts/reset.ts",
     "backup": "tsx src/scripts/backup.ts",
     "restore": "tsx src/scripts/restore.ts",
+    "replay-check": "tsx src/scripts/replay-check.ts",
     "benchmark:latency": "tsx benchmarks/latency.ts",
     "timing:report": "tsx src/scripts/timing-report.ts"
   },

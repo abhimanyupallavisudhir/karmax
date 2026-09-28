@@ -77,12 +77,27 @@ describe('GitHub PR client', () => {
   });
 
   it('replaces a closed PR GitHub cannot reopen, but surfaces any other update failure', async () => {
+    // GitHub refuses a base change on a closed PR (task 387), so it is reopened on its own first.
+    const reopened = github(on('GET', /\/pulls\?state=all/, () => json(200, [pr(1, { state: 'closed' })])),
+      on('PATCH', '/repos/acme/app/pulls/1', (body) => json(200, pr(1, { state: 'open', ...(body.title ? { title: body.title } : {}) }))));
+    expect(await reopened.api.openOrUpdate(SLUG, { head: 'karmax/t', base: 'main', title: 'T', body: 'B' }))
+      .toMatchObject({ created: false, pr: { number: 1, state: 'open' } });
+    expect(reopened.calls.filter((call) => call.method === 'PATCH').map((call) => call.body))
+      .toEqual([{ state: 'open' }, { title: 'T', body: 'B', base: 'main' }]);
+
     const closed = github(on('GET', /\/pulls\?state=all/, () => json(200, [pr(1, { state: 'closed' })])),
       on('PATCH', '/repos/acme/app/pulls/1', () => json(422, { message: 'state cannot be changed' })),
       on('POST', '/repos/acme/app/pulls', () => json(201, pr(3))));
     expect(await closed.api.openOrUpdate(SLUG, { head: 'karmax/t', base: 'main', title: 'T', body: 'B' }))
       .toMatchObject({ created: true, pr: { number: 3 } });
-    expect(closed.calls.find((call) => call.method === 'PATCH')?.body).toMatchObject({ state: 'open', base: 'main' });
+    expect(closed.calls.filter((call) => call.method === 'PATCH').map((call) => call.body)).toEqual([{ state: 'open' }]);
+
+    // Only GitHub's refusal means "cannot reopen": a transient failure must not duplicate the PR.
+    const flaky = github(on('GET', /\/pulls\?state=all/, () => json(200, [pr(1, { state: 'closed' })])),
+      on('PATCH', '/repos/acme/app/pulls/1', () => json(502, { message: 'bad gateway' })));
+    await expect(flaky.api.openOrUpdate(SLUG, { head: 'karmax/t', base: 'main', title: 'T', body: 'B' }))
+      .rejects.toMatchObject({ name: 'GithubApiError', status: 502 });
+    expect(flaky.calls.some((call) => call.method === 'POST')).toBe(false);
 
     const outage = github(on('GET', /\/pulls\?state=all/, () => json(200, [pr(1)])),
       on('PATCH', '/repos/acme/app/pulls/1', () => json(502, { message: 'bad gateway' })));

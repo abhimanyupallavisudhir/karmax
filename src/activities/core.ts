@@ -14,12 +14,12 @@ import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
-import { hasLiveWorldWork, type PublishedView, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
+import { applyConversationPatch, conversationPage, hasLiveWorldWork, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
-import type { Client } from '@temporalio/client';
+import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -36,7 +36,7 @@ import {
   modelProviderFromModel,
 } from '../agent/provider-registry.js';
 import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
-import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn, type QueuedDelegation } from '../agent/runtime.js';
+import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { SecretScrubber } from '../agent/activity.js';
 import { gateFollowUps } from './follow-up-gate.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
@@ -146,7 +146,8 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
   // Admission happens before a provider process exists. Temporal coordinator
   // backpressure/outages therefore cannot be an agent error and must retain
   // their retryable infrastructure classification through this outer boundary.
-  if (err instanceof AdmissionBackpressureError || err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError) {
+  if (err instanceof AdmissionBackpressureError || err instanceof AgentAdmissionInfrastructureError
+    || err instanceof AgentResourcesUnavailableError || err instanceof AgentChannelLost) {
     return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   }
   if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) {
@@ -387,11 +388,18 @@ async function acquireWorkflowAgentSlot(args: {
   };
 }
 
+/** A page of a continued run's transcripts: far below the 2 MB payload limit
+ * (one message may exceed it only if it already entered history by value). */
+const CONVERSATION_PAGE_BYTES = 512 * 1024;
+
 export interface RunAgentTurnArgs {
   taskId: string;
   role: AgentRole;
   worldHandle: WorldHandle;
   messages: Message[];
+  /** `messages` continue this acknowledged conversation snapshot, so a turn's
+   * input costs its new messages rather than the whole transcript (WF-4). */
+  messagesBase?: TurnConversationBase;
   session?: string;
   /** How many leading `messages` the resumed `session` already holds — forwarded to
    *  the adapter so a resumed turn sends only the delta, not the whole transcript. */
@@ -524,6 +532,28 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const seq = (await store.appendEvent(ev));
     deps.bus?.emit({ ...ev, seq });
     return seq;
+  }
+
+  /** The task's pin when it names a run of the task that is no longer running
+   * (an older whole-params write restored it): the live run may replace it.
+   * Only one run of a workflow id runs at a time, so that run is this one. */
+  async function closedRunPin(taskId: string): Promise<string | undefined> {
+    const pinned = (await store.taskMetadata(taskId))?.params?._workflowRunId;
+    if (typeof pinned !== 'string' || !pinned || !deps.client) return undefined;
+    try {
+      return (await deps.client.workflow.getHandle(taskId, pinned).describe()).status.name === 'RUNNING' ? undefined : pinned;
+    } catch (error) {
+      return error instanceof WorkflowNotFoundError ? pinned : undefined;
+    }
+  }
+
+  /** An acknowledged conversation publication; patches and turn transcripts
+   * are expressed against one, so it must exist while the task is live. */
+  async function conversationSnapshot(taskId: string, reference: string): Promise<ViewConversation> {
+    const json = (await store.kvGet(`view-conversation:${taskId}:${reference}`));
+    if (json === undefined)
+      throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+    return JSON.parse(json);
   }
 
   /** JIT env for remote git/gh operations in this world (wiki plans/PLAN-git-config §4B):
@@ -1712,7 +1742,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : [`missing:${organizationId}:${missingNamespace}`];
     },
 
-    async runAgentTurn(args: RunAgentTurnArgs) {
+    async runAgentTurn({ messagesBase: base, ...input }: RunAgentTurnArgs) {
+      const args: RunAgentTurnArgs = base ? { ...input, messages: [
+        ...transcriptOf((await conversationSnapshot(input.taskId, base.reference)), base.role).slice(0, base.count),
+        ...input.messages] } : input;
       const attemptStarted = Date.now();
       let timingAttempt = 1, timingTurnId = args.agentTurnId;
       let timingSignal: AbortSignal | undefined;
@@ -1789,9 +1822,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let signal: AbortSignal | undefined;
       let legacyAgentTurnId: string | undefined;
       let turnSessionKey: string | undefined;
-      let delegationKey: string | undefined;
       let resumedActivityAttempt = false;
       let activityAttempt = 1;
+      // What earlier attempts of THIS turn recorded (open_pr, sub-tasks, decisions,
+      // mid-turn deliveries). Restored so a retry never drops them.
+      let restoredJournal: import('../agent/runtime.js').TurnJournal | undefined;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -1811,8 +1846,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
         turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
-        // Queued sub-task spawns/answers survive a retry of the same turn.
-        delegationKey = stableTurnId ? `turnspawns:${stableTurnId}` : undefined;
+        if (actx.info.attempt > 1 && turnSessionKey) {
+          try { restoredJournal = JSON.parse((await store.kvGet(`${turnSessionKey}:journal`)) ?? 'null') ?? undefined; }
+          catch { restoredJournal = undefined; }
+        }
         // Heartbeat details are Temporal's primary retry checkpoint. The per-turn
         // SQLite key closes the small hard-kill window before a heartbeat reaches the
         // service; unlike session:<task>:<role>, it cannot accidentally pick up a
@@ -2644,6 +2681,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal,
           heartbeat,
           pullFollowUps,
+          ...(turnSessionKey ? { journal: {
+            restored: restoredJournal,
+            save: async (journal: import('../agent/runtime.js').TurnJournal) => {
+              (await store.kvSet(`${turnSessionKey}:journal`, JSON.stringify(journal)));
+            },
+          } } : {}),
           pullSecretEnv: () => pullSecretEnv?.() ?? Promise.resolve({}),
           // Coalesce the live-output stream: adapters re-emit the growing *cumulative*
           // message text, so consecutive identical/prefix emits carry no new info.
@@ -2660,10 +2703,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const event = { type: 'agent.output', taskId: args.taskId, ts: Date.now(), payload };
             deps.bus?.emit({ ...event, seq: (await store.appendLiveOutput(event)) });
           },
-          ...(delegationKey ? {
-            queuedDelegation: await store.kvGet(delegationKey).then(raw => raw ? JSON.parse(raw) : undefined),
-            onDelegation: async (queued: QueuedDelegation) => { (await store.kvSet(delegationKey!, JSON.stringify(queued))); },
-          } : {}),
           subTaskParams: (params: unknown) => subTaskParams(store, { projectId: args.task.projectId, parentTaskId: args.taskId, params }),
           onReviewInfo: async (info, supplied) => {
             signal?.throwIfAborted();
@@ -2790,8 +2829,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (resultKey) {
           await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));
           resultCheckpointed = true;
-          // The checkpointed result now carries every queued spawn and answer.
-          if (delegationKey) (await store.kvDelete(delegationKey));
         }
         }
         // Defence in depth around the activity boundary. `runTurn` rejects an
@@ -2804,6 +2841,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         await finishUsage(true);
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
+        }
+        // A resumed attempt was handed only a continuation notice, so its adapter's
+        // count is not in the workflow's index space. The replaced attempt already
+        // delivered the scheduled batch plus whatever it injected mid-turn.
+        if (resumedActivityAttempt && args.role !== 'confirm') {
+          result.delivered = Math.max(restoredJournal?.delivered ?? 0, args.messages.length);
         }
         if (args.role === 'confirm' && result.confirmDecision?.action === 'confirm' && result.confirmDecision.otherAttempts) {
           (await store.kvSet(`attempt-choice:${args.taskId}`, result.confirmDecision.otherAttempts));
@@ -2829,6 +2872,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : err;
         }
+        // Tell the resumed attempt why it was interrupted, as for a sandbox freeze.
+        if (err instanceof AgentChannelLost && turnSessionKey)
+          (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify({ summary: err.summary })));
         const failure = classifyTurnError(err, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else
         // in a remote world may be the sandbox's fault, which its metrics can show.
@@ -3764,14 +3810,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }));
           recordedCurrents.add(observation);
         };
-        const externalWait = async (key: string, detail: string): Promise<GitHubMergeAuthorization> => {
+        const externalWait = async (key: string, detail: string, exhausted?: string): Promise<GitHubMergeAuthorization> => {
           const previous = events.filter((event) => event.type === 'github.ci.external-wait'
             && event.payload?.key === key).length;
           (await record(handle.id, 'github.ci.external-wait', { key, slug: ref.slug, number: ref.number,
             candidateHead: ref.headSha, poll: previous + 1 }));
           if (previous + 1 >= MAX_SUPERSEDED_CI_POLLS) return {
             status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
-            detail: `${detail}\n\nGitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry. The task owns no admission slot while parked.`,
+            detail: `${detail}\n\n${exhausted ?? `GitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry.`} The task owns no admission slot while parked.`,
             eligibleUserIds: [actorUserId],
           };
           return { status: 'waiting', prs: current, actorUserId, releaseAdmission: true, detail };
@@ -5128,7 +5174,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return true;
     },
 
-    async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
+    /** A run about to continue as new unpins itself, so the platform addresses
+     * the workflow id's live run meanwhile. 'foreign': another run holds the
+     * pin (a replacement is starting), so this run must not continue. */
+    async releaseTaskRun(taskId: string): Promise<'released' | 'unpinned' | 'foreign'> {
+      const runId = activityContext.current().info.workflowExecution?.runId ?? '';
+      if (!(await store.taskMetadata(taskId))?.params?._workflowRunId) return 'unpinned';
+      if (await store.swapTaskRun(taskId, runId, '')) return 'released';
+      const stale = (await closedRunPin(taskId));
+      return stale && (await store.swapTaskRun(taskId, stale, '')) ? 'released' : 'foreign';
+    },
+
+    /** The next run takes the pin its predecessor released, unless another
+     * run claimed the task in between. */
+    async adoptTaskRun(taskId: string): Promise<boolean> {
+      const runId = activityContext.current().info.workflowExecution?.runId ?? '';
+      if (await store.swapTaskRun(taskId, '', runId)) return true;
+      const stale = (await closedRunPin(taskId));
+      return !!stale && (await store.swapTaskRun(taskId, stale, runId));
+    },
+
+    /** A continued run's transcripts, in pages well inside Temporal's 2 MB
+     * payload limit (see conversationPage). */
+    async readConversationPage(taskId: string, reference: string, offset: number) {
+      return conversationPage((await conversationSnapshot(taskId, reference)), offset, CONVERSATION_PAGE_BYTES);
+    },
+
+    async publishView(taskId: string, { conversationRetain: retain, ...publication }: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
       // WF-27: an attempt that timed out still completes, and a stopped run's
       // last publication can land after its successor's. Drop what the task has
       // already moved past, before it can rewrite the view. A full publication
@@ -5142,12 +5214,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           order = { runId, seq: publication.updatedAt, ...(Number.isSafeInteger(revision) ? { revision } : {}) };
       } catch { /* direct invocation has no run to order by */ }
       const stale = order !== undefined && (await store.viewPublicationStale(taskId, order));
-      if (stale && !(conversationReference && publication.messages !== undefined)) return;
+      if (stale && !(conversationReference && (publication.messages !== undefined || publication.conversationPatch))) return;
       let view: TaskView;
+      // Immutable, task-scoped snapshots survive worker restarts and activity
+      // retries, including retries after another publication has completed.
+      const key = `view-conversation:${taskId}:${conversationReference}`;
+      if (publication.conversationPatch) {
+        const { conversationPatch: patch, ...rest } = publication;
+        // A retry whose snapshot is already saved needs no base: the save
+        // may have superseded it since. A stale delta still records its
+        // snapshot, which the run's next frames may refer to.
+        if (conversationReference && (await store.kvHas(key))) publication = rest;
+        else {
+          const base = (await store.kvGet(`view-conversation:${taskId}:${patch.base}`));
+          if (base === undefined && stale) return;
+          if (base === undefined) throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+          publication = { ...rest, ...applyConversationPatch(JSON.parse(base), patch) };
+        }
+      }
       if (conversationReference) {
-        // Immutable, task-scoped snapshots survive worker restarts and activity
-        // retries, including retries after another publication has completed.
-        const key = `view-conversation:${taskId}:${conversationReference}`;
         if (publication.messages !== undefined) {
           const json = JSON.stringify({ messages: publication.messages, transcripts: publication.transcripts });
           const existing = (await store.kvGet(key));
@@ -5217,7 +5302,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await trace.mark(`queue.observed.${after?.state ?? 'released'}`));
         }
       }
-      if (!(await store.saveView(taskId, view, conversationReference, order))) return;
+      if (!(await store.saveView(taskId, view, conversationReference, order, retain))) return;
       await notifyChildSettlement(store, deps.client, view);
       if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
         let runId: string | undefined;

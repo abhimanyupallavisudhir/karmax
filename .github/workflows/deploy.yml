@@ -81,7 +81,7 @@ jobs:
             case "$state" in
               success)
                 ssh -o StrictHostKeyChecking=yes "$TARGET" \
-                  "tail -n 100 '/opt/karmax/deploy/.updates/$RUN_KEY/log'; find /opt/karmax/deploy/backups -mindepth 1 -maxdepth 1 -type d -name 'predeploy-*' -mtime +14 -exec rm -rf {} + 2>/dev/null || true"
+                  "tail -n 100 '/opt/karmax/deploy/.updates/$RUN_KEY/log'"
                 exit 0 ;;
               failed:*)
                 ssh -o StrictHostKeyChecking=yes "$TARGET" \

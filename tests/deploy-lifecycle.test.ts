@@ -57,6 +57,33 @@ it('publishes a complete backup atomically and verifies its checksums (CI-37)', 
   expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
 });
 
+// Every deploy snapshots fresh database dumps and agent transcripts. Kept
+// forever they filled tavya.io's disk: 84 snapshots, 144 GB of 193 GB, in 15 days.
+it('keeps the newest predeploy snapshots and two weeks of scheduled ones, never an operator\'s', () => {
+  const h = deployment();
+  const backups = path.join(h.deploy, 'backups');
+  const make = (name: string, daysOld = 0) => {
+    const dir = path.join(backups, name);
+    fs.mkdirSync(path.join(dir, 'control-plane'), { recursive: true });
+    const when = new Date(Date.now() - daysOld * 86_400_000);
+    fs.utimesSync(dir, when, when);
+  };
+  const predeploy = Array.from({ length: 12 }, (_, i) => `predeploy-202609${String(10 + i)}T000000Z`);
+  // Creation order must not matter: names carry the time.
+  [...predeploy].reverse().forEach(name => make(name));
+  const kept = ['20260913T132143Z', 'incident-20260919-page-latency', 'predeploy-20260901T000000Z.partial.7',
+    'scheduled-20260925T021700Z'];
+  make(kept[0]!, 30); make(kept[1]!, 30); make(kept[2]!, 30); make(kept[3]!, 3);
+  make('scheduled-20260901T021700Z', 20);
+  const result = h.run(['prune-backups']);
+  expect(result.status, result.stderr).toBe(0);
+  expect(fs.readdirSync(backups).sort()).toEqual([...kept, ...predeploy.slice(2)].sort());
+  // Nothing to prune is not an error.
+  expect(h.run(['prune-backups']).status).toBe(0);
+  fs.rmSync(backups, { recursive: true });
+  expect(h.run(['prune-backups']).status).toBe(0);
+});
+
 it('starts only after configuration validates, preserves secrets, and waits for readiness', () => {
   const h = deployment();
   const result = h.run(['up', 'example.com']);
@@ -233,6 +260,43 @@ it('updates an exact master revision', () => {
   expect(result.status, result.stderr).toBe(0);
   expect(h.git('rev-parse', 'HEAD')).toBe(h.target);
   expect(result.stdout).toContain(`Update complete at ${h.target}`);
+});
+
+// A running workflow replays its recorded history under whatever code is
+// loaded, so a release that cannot replay one wedges it at its next event
+// (WF-34 would have wedged every task on tavya.io). The candidate replays them
+// all before anything is backed up or restarted.
+it('replays the running workflows under the candidate before backing up or restarting', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target]);
+  expect(result.status, result.stderr).toBe(0);
+  const calls = h.calls().map(args => args.join(' '));
+  const check = calls.findIndex(call => call.includes('run --rm --no-deps -T app npm run --silent replay-check'));
+  expect(check).toBeGreaterThan(calls.findIndex(call => call.includes('build --pull app')));
+  expect(check).toBeLessThan(calls.findIndex(call => call.includes('pg_dump')));
+  expect(check).toBeLessThan(calls.findIndex(call => call.includes('up -d')));
+});
+
+it('refuses a release that cannot replay a running workflow, leaving production as it was', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target], 'replay-check');
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('cannot replay');
+  expect(result.stderr).toContain(`production remains at ${h.previous}`);
+  expect(h.git('rev-parse', 'HEAD')).toBe(h.previous);
+  const calls = h.calls().map(args => args.join(' '));
+  const check = calls.findIndex(call => call.includes('replay-check'));
+  expect(calls.some(call => call.includes('pg_dump') || call.includes('up -d'))).toBe(false);
+  // The Compose tag points at the running code again for the next restart.
+  expect(calls.slice(check + 1).some(call => call.endsWith(' build app'))).toBe(true);
+});
+
+it('lets an operator skip the replay check explicitly, and says so', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target], 'replay-check', '', { KARMAX_SKIP_REPLAY_CHECK: '1' });
+  expect(result.status, result.stderr).toBe(0);
+  expect(h.calls().some(args => args.join(' ').includes('replay-check'))).toBe(false);
+  expect(result.stderr).toContain('replay check skipped');
 });
 
 // HEAD is the running revision: a failure before the new release starts must

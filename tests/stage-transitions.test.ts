@@ -261,7 +261,7 @@ describe('task stage transitions', () => {
 
   it('keeps the winning run reachable when an overlapping resume finishes preparing too late', async () => {
     const f = (await fixture());
-    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'old-run' }));
     (await f.store.saveView(f.task.id, {
       ...f.view, status: 'waiting', waitingFor: { kind: 'human' },
       state: { ...f.view.state, humanPauseOrigin: 'do' },
@@ -318,7 +318,7 @@ describe('task stage transitions', () => {
 
   it('does not roll back a run reference when an authorization update completes late', async () => {
     const f = (await fixture());
-    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'old-run' }));
     vi.spyOn(f.client.workflow, 'getHandle').mockReturnValue({
       async executeUpdate() {
         (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'new-run', priority: 4 }));
@@ -548,7 +548,7 @@ describe('task stage transitions', () => {
   it('interlocks a graceful old-run shutdown until its replacement is durable', async () => {
     const f = (await fixture());
     (await f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev')));
-    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'old-run' }));
     let markedRun: string | undefined;
     f.setGracefulResult(async () => {
       const raw = (await f.store.kvGet(lifecycleReplacementKey(f.task.id)));
@@ -629,6 +629,108 @@ describe('task stage transitions', () => {
     expect((await f.store.getTask(f.task.id))?.lastView).toMatchObject(expected);
   });
 
+  // WF-3/WF-4: continue-as-new moves the run pin, so a stop must name the run
+  // it actually signals, not the one an earlier read of the task named.
+  it('marks and retires the run a Done stops, read when it stops', async () => {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, '1.26.0'));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'run-1' }));
+    f.setGracefulResult(async () => ({}));
+    const api = f.api as any;
+    const checkpoint = api.transitionCheckpoint.bind(api);
+    vi.spyOn(api, 'transitionCheckpoint').mockImplementation(async (...args: unknown[]) => {
+      // The run continues as new while the Done is being prepared.
+      (await f.store.swapTaskRun(f.task.id, 'run-1', 'run-2'));
+      return checkpoint(...args);
+    });
+    const markers: string[] = [];
+    const kvSet = f.store.kvSet.bind(f.store);
+    vi.spyOn(f.store, 'kvSet').mockImplementation(async (key, value) => {
+      if (key.startsWith('task-lifecycle-replacement:')) markers.push(value);
+      return kvSet(key, value);
+    });
+    await f.api.moveTaskStage(f.token, f.task.id, 'done');
+    expect(f.signalled).toContainEqual(expect.objectContaining({ signal: 'prepareLifecycleReplacement', runId: 'run-2' }));
+    expect(markers.map((marker) => JSON.parse(marker).runId)).toEqual(['run-2']);
+    expect(JSON.parse((await f.store.kvGet(`view-order:${f.task.id}`))!).retired).toEqual(['run-2']);
+  });
+
+  // A run can continue as new between resolving it and signalling it. The
+  // closed run then answers not-found; the stop must act on the live run.
+  it.each([['pinned', 'run-1'], ['unpinned', undefined]] as const)(
+    'stops and retires the live run when a %s run continued as new just before', async (_kind, pin) => {
+      const f = (await fixture());
+      (await f.store.setTaskWorkflowVersion(f.task.id, '1.26.0'));
+      if (pin) (await f.store.patchTaskParams(f.task.id, { _workflowRunId: pin }));
+      let live = 'run-1';
+      const getHandle = f.client.workflow.getHandle.bind(f.client.workflow);
+      vi.spyOn(f.client.workflow, 'getHandle').mockImplementation((id: string, runId?: string) => {
+        const handle = getHandle(id, runId);
+        if (id !== f.task.id) return handle;
+        return { ...handle,
+          describe: async () => ({ runId: runId ?? live, status: { name: (runId ?? live) === live ? 'RUNNING' : 'CONTINUED_AS_NEW' } }),
+          async signal(signal: string, ...args: unknown[]) {
+            if (runId === 'run-1' && signal === 'prepareLifecycleReplacement') {
+              // run-1 hands its pin to run-2 as it continues as new.
+              live = 'run-2';
+              if (pin) { (await f.store.swapTaskRun(f.task.id, 'run-1', '')); (await f.store.swapTaskRun(f.task.id, '', 'run-2')); }
+              throw new WorkflowNotFoundError('workflow execution already completed', f.task.id, runId);
+            }
+            return handle.signal(signal, ...args);
+          },
+          result: async () => ({}),
+          async terminate(reason: string) {
+            if (runId === 'run-1') throw new WorkflowNotFoundError('workflow execution already completed', f.task.id, runId);
+            return handle.terminate(reason);
+          } };
+      });
+      const markers: string[] = [];
+      const kvSet = f.store.kvSet.bind(f.store);
+      vi.spyOn(f.store, 'kvSet').mockImplementation(async (key, value) => {
+        if (key.startsWith('task-lifecycle-replacement:')) markers.push(value);
+        return kvSet(key, value);
+      });
+      await f.api.moveTaskStage(f.token, f.task.id, 'done');
+      expect(f.signalled).toContainEqual(expect.objectContaining({ signal: 'prepareLifecycleReplacement', runId: 'run-2' }));
+      expect(markers.map((marker) => JSON.parse(marker).runId)).toEqual(['run-1', 'run-2']);
+      // A late copy of run-1's last publication must not overwrite the Done either.
+      expect(JSON.parse((await f.store.kvGet(`view-order:${f.task.id}`))!).retired).toEqual(['run-1', 'run-2']);
+    });
+
+  it('refuses a Done whose run keeps continuing as new under it', async () => {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, '1.26.0'));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'run-1' }));
+    const getHandle = f.client.workflow.getHandle.bind(f.client.workflow);
+    vi.spyOn(f.client.workflow, 'getHandle').mockImplementation((id: string, runId?: string) => {
+      const handle = getHandle(id, runId);
+      if (id !== f.task.id || !runId) return handle;
+      // Each run hands its pin to the next as it is reached.
+      const moved = async () => {
+        const next = `run-${Number(runId.slice(4)) + 1}`;
+        (await f.store.swapTaskRun(f.task.id, runId, next));
+        throw new WorkflowNotFoundError('workflow execution already completed', f.task.id, runId);
+      };
+      return { ...handle, signal: moved, terminate: moved, result: async () => ({}) };
+    });
+    await expect(f.api.moveTaskStage(f.token, f.task.id, 'done')).rejects.toThrow(/try again/i);
+    expect((await f.store.getTask(f.task.id))?.lastView?.status).not.toBe('done');
+  });
+
+  it('unpins the run a move back to Draft stopped, read when it stops', async () => {
+    const f = (await fixture());
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'run-1' }));
+    const api = f.api as any;
+    const cleanup = api.waitForTerminalCleanup.bind(api);
+    vi.spyOn(api, 'waitForTerminalCleanup').mockImplementation(async (...args: unknown[]) => {
+      (await f.store.swapTaskRun(f.task.id, 'run-1', 'run-2'));
+      return cleanup(...args);
+    });
+    await f.api.moveTaskStage(f.token, f.task.id, 'draft');
+    expect(f.terminated).toEqual([expect.stringContaining('Task moved back to Draft')]);
+    expect((await f.store.taskMetadata(f.task.id))?.params._workflowRunId).toBe('');
+  });
+
   it('tells the parent when a person marks its sub-task done', async () => {
     const f = (await fixture());
     const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
@@ -641,6 +743,19 @@ describe('task stage transitions', () => {
     // settles a child; without this the parent would wait for it forever.
     expect(f.signalled).toContainEqual(expect.objectContaining({ id: f.task.id, signal: 'childSettled',
       args: [{ childTaskId: child.id, stage: 'done' }] }));
+  });
+
+  // WF-3/WF-4: a parent that continued as new has no handle on its child's
+  // execution; a platform-side settlement must reach it like a published one.
+  it('tells the parent when a person cancels its failed sub-task', async () => {
+    const f = (await fixture());
+    const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
+      workflowVersion: f.task.workflowVersion, params: { prompt: 'part' }, parentTaskId: f.task.id }));
+    (await f.store.saveView(child.id, { ...f.view, taskId: child.id, title: 'Child', stage: 'failed', status: 'failed' }));
+    await f.api.signalTask(f.token, child.id, 'cancel');
+    expect((await f.store.getTask(child.id))?.lastView?.status).toBe('cancelled');
+    expect(f.signalled).toContainEqual(expect.objectContaining({ id: f.task.id, signal: 'childSettled',
+      args: [{ childTaskId: child.id, stage: 'cancelled' }] }));
   });
 
   // Task #367: the parent's Sub-tasks panel showed every finished child as

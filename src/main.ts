@@ -433,6 +433,13 @@ async function main() {
   inboxCleanup.unref();
   startupJobs.push(() => inboxCleanup.run());
 
+  // Claude sign-ins lapse about four weeks after sign-in and only a person can
+  // renew them: warn owners critically three days ahead, and when one lapses.
+  const { notifyCredentialAttention } = await import('./agent/credential-health.js');
+  const credentialAttentionTimer = new AsyncInterval(() => notifyCredentialAttention({ store, configHomes }), 3600_000);
+  credentialAttentionTimer.unref();
+  void credentialAttentionTimer.run();
+
   // Re-derive effective plans from the last signed provider state at boot and
   // throughout the process lifetime. In particular, this closes past-due grace
   // even when Stripe sends no later event.
@@ -667,7 +674,8 @@ async function main() {
     // process-exit backstop bounds shutdown; do not close Store under these jobs.
     const maintenanceDrain = Promise.allSettled([
       startupMaintenance,
-      retentionTimer.stop(), inboxCleanup.stop(), subscriptionEntitlementTimer.stop(), subscriptionSeatTimer.stop(),
+      retentionTimer.stop(), inboxCleanup.stop(), credentialAttentionTimer.stop(), subscriptionEntitlementTimer.stop(),
+      subscriptionSeatTimer.stop(),
       reconcileSweep.stop(), deploymentSweep.stop(),
       triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(),
     ]);

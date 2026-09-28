@@ -53,10 +53,12 @@ describe('single-stage Responder form behavior', () => {
     await box.locator('.rf-kind').selectOption('agent');
     expect([await box.locator('.rf-agent').isVisible(), await box.locator('.rf-human').isVisible()]).toEqual([true, false]);
     await box.locator('.rf-kind').selectOption('human');
-    // The Responder is edited among the common defaults shared by every workflow.
+    // The Responder is edited in the Agent card beside the Review route, not
+    // among the common task defaults, though both are stored as shared values.
     expect(await ui.run(`S.schema = [{ name: 'software-dev', params: [${JSON.stringify(responder)},
-      { name: 'prompt', type: 'text', scopes: ['task', 'project'] }] }]; commonSettingsFields('project').map((field) => field.name)`))
-      .toEqual(['responder']);
+      { name: 'prompt', type: 'text', scopes: ['task', 'project'] }] }];
+      [agentRouteSettingsFields('project').map((field) => field.name), commonSettingsFields('project').map((field) => field.name)]`))
+      .toEqual([['responder'], []]);
   });
 
   it('collects the composite Responder from the live parameters form', async () => {

@@ -263,6 +263,7 @@ export class GithubPrApi {
   async openOrUpdate(slug: string, input: { head: string; base: string; title: string; body: string }):
   Promise<{ pr: GithubPullRequest; created: boolean }> {
     const existing = await this.findByHead(slug, input.head);
+    let reopenRefused = false;
     if (existing?.merged) {
       const comparison = await this.request<{ ahead_by: number }>(
         `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(input.base)}...${encodeURIComponent(input.head)}`);
@@ -270,15 +271,23 @@ export class GithubPrApi {
       if (!Number.isSafeInteger(comparison.ahead_by) || comparison.ahead_by < 0)
         throw new Error('GitHub did not report whether the branch contains new commits');
     } else if (existing) {
-      try {
+      let current = existing;
+      // A PR closed without merging is reopened: the task is live again. GitHub
+      // refuses a base change on a closed PR (task 387), so reopen on its own
+      // first. If GitHub cannot reopen it (a recreated or force-pushed head), open
+      // anew; any other failure is retried rather than duplicating the PR.
+      if (existing.state === 'closed') {
+        try { current = await this.update(slug, existing.number, { state: 'open' }); }
+        catch (error) {
+          if (!(error instanceof GithubApiError) || error.status !== 422) throw error;
+          reopenRefused = true;
+        }
+      }
+      if (!reopenRefused) {
         const pr = await this.update(slug, existing.number, {
-          title: input.title, body: input.body, base: input.base,
-          ...(existing.state === 'closed' ? { state: 'open' as const } : {}),
+          title: input.title, body: input.body, ...(current.state === 'open' ? { base: input.base } : {}),
         });
         return { pr, created: false };
-      } catch (error) {
-        // GitHub cannot reopen some force-pushed heads. Create a replacement.
-        if (existing.state !== 'closed' || !(error instanceof GithubApiError) || error.status !== 422) throw error;
       }
     }
     try {
@@ -288,7 +297,7 @@ export class GithubPrApi {
       })), created: true };
     } catch (error) {
       // Lost a race (or GitHub indexed the head late) — adopt the existing PR.
-      const raced = await this.findByHead(slug, input.head).catch(() => undefined);
+      const raced = reopenRefused ? undefined : await this.findByHead(slug, input.head).catch(() => undefined);
       if (!raced || raced.state !== 'open' || raced.merged) throw error;
       return { pr: raced, created: false };
     }
