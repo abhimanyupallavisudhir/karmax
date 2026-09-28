@@ -22,8 +22,45 @@ const ENTRY_FILE = /^[a-f0-9]{64}\.json$/;
 const PRE_V2 = 'entries.pre-v2';
 const PRE_V2_RETENTION_MS = 14 * 86_400_000;
 
+/** Which entries directory the canary bound, authenticated under the vault
+ * key: `bound` for the directory binding produced, `pre-v2` for the copy kept
+ * for a manual rollback. Putting that copy back is recognised from its marker. */
+const GENERATION_FILE = '.generation';
+const GENERATION_HANDLE = '\0generation';
+/** A card's secret half (payments.ts `cardSecretHandle`) and its separate CVC. */
+const CARD_SECRET = /^payment:card:[^:]+$/;
+const CARD_CVC = /^payment:card:[^:]+:cvc$/;
+
 /** An entry `migrate` moved to `entries/quarantine/` because it would not open. */
 export interface QuarantinedEntry { file: string; handle?: string; reason: string }
+
+/** What opening and migrating a vault would do, found without writing (`inspectVault`). */
+export interface VaultInspection {
+  key: 'accepted' | 'refused';
+  refusal?: string;
+  /** Binding still to run: unbound ciphertext is accepted until it does. */
+  bound: boolean;
+  /** Entries binding would re-encrypt. */
+  rebind: number;
+  /** Entries binding would move (or, for a damaged older revision, copy) to quarantine. */
+  quarantine: QuarantinedEntry[];
+  /** Entry files that cannot be read (permissions, I/O): binding stops on them. */
+  unreadable: Array<{ file: string; error: string }>;
+}
+
+/** One entry file as binding sees it. */
+type PlannedEntry =
+  | { kind: 'unreadable'; file: string; error: string }
+  | { kind: 'damaged'; file: string; raw: string; handle?: string; reason: string }
+  | { kind: 'entry'; file: string; raw: string; handle: string; current: string; kept: string[]; dropped: number };
+
+/** Open the vault in `dir` read-only and report what `migrate` would do. */
+export function inspectVault(dir: string): VaultInspection {
+  let vault: Vault;
+  try { vault = new Vault(dir, { readOnly: true }); }
+  catch (error) { return { key: 'refused', refusal: (error as Error).message, bound: false, rebind: 0, quarantine: [], unreadable: [] }; }
+  return vault.inspect();
+}
 
 /** Publish `data` at `file` only once it and the rename are on disk. */
 function writeDurably(file: string, data: string | Buffer): void {
@@ -49,69 +86,148 @@ export class Vault {
   private bound = false;
   private quarantined: QuarantinedEntry[] = [];
   private reported = new Set<string>();
+  private readOnly: boolean;
 
-  constructor(dir: string) {
+  /** `readOnly` opens without creating or recording anything (a preflight, a
+   * restore drill); anything that would write throws. */
+  constructor(dir: string, options: { readOnly?: boolean } = {}) {
+    this.readOnly = options.readOnly === true;
     // The vault holds encrypted secrets and its key; keep the directory private
     // (0700) so the 0600 files inside aren't reachable via a traversable dir.
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (!this.readOnly) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     this.keyPath = path.join(dir, 'vault.key');
     this.dbPath = path.join(dir, 'secrets.json');
     this.key = this.loadOrCreateKey();
     this.entriesPath = path.join(dir, 'entries');
-    fs.mkdirSync(this.entriesPath, { recursive: true, mode: 0o700 });
+    if (!this.readOnly) fs.mkdirSync(this.entriesPath, { recursive: true, mode: 0o700 });
     this.canaryPath = path.join(dir, 'vault.canary');
     this.checkCanary();
   }
 
-  private mismatch(detail = ''): Error {
-    return new Error(`the vault key does not open this vault${detail}: KARMAX_VAULT_KEY (or vault.key) `
-      + 'differs from the key it was created with; restore the original key');
+  /** Names this key without revealing it, for `KARMAX_VAULT_ACCEPT_KEY`. */
+  private keyId(): string {
+    return `vk-${crypto.createHash('sha256').update('karmax-vault-key-id\0').update(this.key).digest('hex').slice(0, 16)}`;
+  }
+  /** The operator's explicit word that this key is the vault's, whatever the checks found. */
+  private overridden(): boolean {
+    return process.env.KARMAX_VAULT_ACCEPT_KEY === this.keyId();
+  }
+  private refuse(detail: string): Error {
+    return new Error(`the vault key does not open this vault: ${detail}. Restore the key the vault was created with. `
+      + `If you are certain this key is the vault's, start once with KARMAX_VAULT_ACCEPT_KEY=${this.keyId()}; `
+      + 'entries it cannot open are then quarantined (deploy/README.md, "Rollback compatibility")');
   }
 
   /**
    * A known ciphertext under the vault key (AU-27). A wrong `KARMAX_VAULT_KEY`
    * otherwise surfaces only as per-entry authentication failures, while every
    * new secret is quietly written under the wrong key, splitting the vault in
-   * two. The canary also records, authenticated, whether the vault is bound,
-   * so deleting a file cannot make it accept unbound ciphertext again.
+   * two. The canary also records, authenticated, whether the vault is bound and
+   * which entries directory it bound, so neither deleting a file nor swapping
+   * `entries/` makes it accept unbound ciphertext again.
    *
    * Only a well-formed canary that fails authentication refuses the key. A
-   * missing one (a vault from before the canary) or a damaged one (a crash, a
-   * bad disk) is re-derived from the entries: the key must open most of them,
-   * so a key that wrote only a few entries of a split vault is not recorded.
+   * missing or damaged one (a vault from before the canary, a crash, a bad
+   * disk) is re-derived from the entries. The key must open at least one, and
+   * no other key this vault knows (`vault.key` beside `KARMAX_VAULT_KEY`) may
+   * open more; entries no known key opens are stale or damaged, not votes.
+   * `KARMAX_VAULT_ACCEPT_KEY` overrides either refusal.
    */
   private checkCanary(): void {
     const recorded = this.readCanary();
-    if (recorded !== undefined) { this.bound = recorded; return; }
-    let opened = 0, refused = 0, bound = false;
+    const generation = this.readGeneration();
+    if (recorded && (!recorded.bound || generation?.kind === 'bound' && generation.id === recorded.generation)) {
+      this.bound = recorded.bound;
+      return;
+    }
+    if (!recorded) this.checkKeyAgainstEntries();
+    // The canary is missing, or bound another entries directory (a restored,
+    // swapped or copied-over entries/). The pre-binding copy, put back for a
+    // rollback, is bound again, entries the previous release wrote included;
+    // anything else is bound if it holds bound entries.
+    this.bound = generation?.kind === 'pre-v2' ? false : this.holdsBoundEntries();
+    if (this.bound) this.recordGeneration();
+    else this.writeCanary();
+  }
+
+  private checkKeyAgainstEntries(): void {
+    const others = this.otherKnownKeys();
+    let opened = 0, total = 0, elsewhere = 0;
     for (const handle of this.list()) {
       let blob: string | undefined;
       try { blob = this.readEntry(handle); } catch { continue; }
       if (blob === undefined) continue;
-      try { this.decrypt(blob, handle); opened++; bound ||= blob.startsWith('v2.'); } catch { refused++; }
+      total++;
+      if (this.opens(blob, handle, this.key)) opened++;
+      else if (others.some((key) => this.opens(blob!, handle, key))) elsewhere++;
     }
-    if (refused && opened <= refused) throw this.mismatch(` (it opens ${opened} of ${opened + refused} entries)`);
-    // Bound entries mean this vault was bound; its canary was lost, not absent.
-    this.bound = bound;
-    this.writeCanary();
+    if (this.overridden()) {
+      if (total && (!opened || elsewhere > opened))
+        console.error(`[vault] KARMAX_VAULT_ACCEPT_KEY: accepting a key that opens ${opened} of ${total} entries`);
+      return;
+    }
+    if (total && !opened) throw this.refuse(`vault/vault.canary is missing or damaged, and the key opens none of the ${total} entries`);
+    if (elsewhere > opened)
+      throw this.refuse(`vault/vault.canary is missing or damaged, and the key opens ${opened} of ${total} entries while vault/vault.key opens ${elsewhere}`);
   }
 
-  /** The recorded bound state, or undefined when there is no usable canary. */
-  private readCanary(): boolean | undefined {
+  /** `vault.key` when `KARMAX_VAULT_KEY` supplies another key. */
+  private otherKnownKeys(): Buffer[] {
+    if (!process.env.KARMAX_VAULT_KEY) return [];
+    try {
+      const file = fs.readFileSync(this.keyPath);
+      return file.equals(this.key) ? [] : [file];
+    } catch { return []; }
+  }
+
+  private opens(blob: string, handle: string, key: Buffer): boolean {
+    try { this.decrypt(blob, handle, key, true); return true; } catch { return false; }
+  }
+
+  private holdsBoundEntries(): boolean {
+    return this.list().some((handle) => { try { return this.readEntry(handle)?.startsWith('v2.') === true; } catch { return false; } });
+  }
+
+  /** The recorded state, or undefined when there is no usable canary. */
+  private readCanary(): { bound: boolean; generation?: string } | undefined {
     let blob: unknown;
     try { blob = JSON.parse(fs.readFileSync(this.canaryPath, 'utf8')).blob; } catch { return undefined; }
     const parts = typeof blob === 'string' ? blob.split('.') : [];
     if (parts.length !== 4 || parts[0] !== 'v2' || Buffer.from(parts[1]!, 'base64').length !== 12
       || Buffer.from(parts[2]!, 'base64').length !== 16) return undefined;
-    let state: { canary?: string; bound?: unknown };
-    try { state = JSON.parse(this.decrypt(blob as string, CANARY_HANDLE)); } catch { throw this.mismatch(); }
-    if (state?.canary !== CANARY) throw this.mismatch();
-    return state.bound === true;
+    let state: { canary?: string; bound?: unknown; generation?: unknown } | undefined;
+    try { state = JSON.parse(this.decrypt(blob as string, CANARY_HANDLE)); } catch { state = undefined; }
+    if (state?.canary !== CANARY) {
+      if (this.overridden()) { console.error('[vault] KARMAX_VAULT_ACCEPT_KEY: replacing a canary this key does not open'); return undefined; }
+      throw this.refuse('vault/vault.canary fails to authenticate under KARMAX_VAULT_KEY (or vault.key)');
+    }
+    return { bound: state.bound === true, ...(typeof state.generation === 'string' ? { generation: state.generation } : {}) };
   }
 
-  /** Best effort: a vault opened read-only (a restore drill) is checked, not recorded. */
-  private writeCanary(): void {
-    const blob = this.encrypt(JSON.stringify({ canary: CANARY, bound: this.bound }), CANARY_HANDLE);
+  /** The authenticated marker in `entries/`, if there is one this key opens. */
+  private readGeneration(): { id: string; kind: 'bound' | 'pre-v2' } | undefined {
+    try {
+      const marker = JSON.parse(this.decrypt(JSON.parse(fs.readFileSync(path.join(this.entriesPath, GENERATION_FILE), 'utf8')).blob, GENERATION_HANDLE));
+      return typeof marker?.id === 'string' && ['bound', 'pre-v2'].includes(marker.kind) ? marker : undefined;
+    } catch { return undefined; }
+  }
+  private generationMarker(id: string, kind: 'bound' | 'pre-v2'): string {
+    return `${JSON.stringify({ format: 'karmax-vault-generation', blob: this.encrypt(JSON.stringify({ id, kind }), GENERATION_HANDLE) })}\n`;
+  }
+
+  /** Mark `entries/` as the directory this canary binds. */
+  private recordGeneration(): void {
+    if (this.readOnly) return;
+    const id = crypto.randomUUID();
+    try { writeDurably(path.join(this.entriesPath, GENERATION_FILE), this.generationMarker(id, 'bound')); }
+    catch (error) { if (cannotWrite(error)) return; throw error; }
+    this.writeCanary(id);
+  }
+
+  /** Best effort: a vault it cannot write (a restore drill) is checked, not recorded. */
+  private writeCanary(generation?: string): void {
+    if (this.readOnly) return;
+    const blob = this.encrypt(JSON.stringify({ canary: CANARY, bound: this.bound, ...(generation ? { generation } : {}) }), CANARY_HANDLE);
     try { writeDurably(this.canaryPath, `${JSON.stringify({ format: CANARY, blob })}\n`); }
     catch (error) { if (!cannotWrite(error)) throw error; }
   }
@@ -142,6 +258,7 @@ export class Vault {
       return crypto.createHash('sha256').update(supplied).digest();
     }
     if (fs.existsSync(this.keyPath)) return fs.readFileSync(this.keyPath);
+    if (this.readOnly) throw new Error('the vault has no key: set KARMAX_VAULT_KEY or restore vault/vault.key');
     const key = crypto.randomBytes(32);
     // Publish only a complete key, without replacing a concurrently created one.
     const temporary = `${this.keyPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -173,25 +290,26 @@ export class Vault {
   /** `v2.` ciphertext authenticates its handle as additional data (AU-27), so
    * a blob copied onto another handle's entry fails to open instead of
    * handing that handle's reader a different secret. */
-  private encrypt(plain: string, handle: string): string {
+  private encrypt(plain: string, handle: string, unbound = false): string {
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
-    cipher.setAAD(boundTo(handle));
+    if (!unbound) cipher.setAAD(boundTo(handle));
     const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
-    return `v2.${iv.toString('base64')}.${tag.toString('base64')}.${enc.toString('base64')}`;
+    return `${unbound ? '' : 'v2.'}${iv.toString('base64')}.${tag.toString('base64')}.${enc.toString('base64')}`;
   }
-  /** Unbound (pre-v2) ciphertext opens only until `migrate` has bound the vault. */
-  private decrypt(blob: string, handle: string): string {
+  /** Unbound (pre-v2) ciphertext opens only until `migrate` has bound the vault
+   * (or, `anyFormat`, to recognise which key wrote it). */
+  private decrypt(blob: string, handle: string, key = this.key, anyFormat = false): string {
     const parts = typeof blob === 'string' ? blob.split('.') : [];
     const bound = parts[0] === 'v2';
     if (bound) parts.shift();
-    else if (this.bound)
+    else if (this.bound && !anyFormat)
       throw new Error(`vault entry for ${handle} is not bound to its handle; restore it from a backup`);
     const iv = parts.length === 3 ? Buffer.from(parts[0]!, 'base64') : Buffer.alloc(0);
     const tag = parts.length === 3 ? Buffer.from(parts[1]!, 'base64') : Buffer.alloc(0);
     if (iv.length !== 12 || tag.length !== 16) throw new Error('vault entry is corrupt (malformed ciphertext)');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', this.key, iv);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(tag);
     if (bound) decipher.setAAD(boundTo(handle));
     try {
@@ -236,6 +354,7 @@ export class Vault {
   }
 
   private async mutate<T>(operation: () => T): Promise<T> {
+    if (this.readOnly) throw new Error('this vault was opened read-only');
     const release = process.platform === 'linux'
       ? await acquireFileLock(`${this.dbPath}.lock`) : undefined;
     try {
@@ -263,39 +382,24 @@ export class Vault {
   }
 
   /**
-   * Re-encrypt every entry and its history under its handle (AU-27), then
-   * record in the canary that unbound ciphertext is no longer accepted. This
-   * is one-way: the previous release cannot read `v2.` entries, so the
-   * unbound ones are first copied to `entries.pre-v2/` (deploy/README.md,
-   * "Rollback compatibility"). An entry that will not open under the proven
-   * key is damaged or foreign; it moves to `entries/quarantine/` instead of
-   * refusing every other secret. Rewriting a bound blob is harmless, so a
-   * crash midway simply redoes the rest.
+   * What binding would do to each entry file, read once. A file that cannot be
+   * read (permissions, I/O) is reported, never taken for corruption; one that
+   * does not parse, is not an entry, or does not authenticate under the proven
+   * key is damaged or foreign.
    */
-  private bind(): void {
-    // Another process may have bound the vault while this one waited.
-    if (this.readCanary()) { this.bound = true; return; }
-    const aside = path.join(path.dirname(this.entriesPath), PRE_V2);
-    if (!fs.existsSync(aside)) {
-      const staging = `${aside}.${process.pid}.${crypto.randomUUID()}.tmp`;
-      fs.mkdirSync(staging, { mode: 0o700 });
-      for (const file of fs.readdirSync(this.entriesPath).filter(file => ENTRY_FILE.test(file))) {
-        fs.copyFileSync(path.join(this.entriesPath, file), path.join(staging, file));
-        const fd = fs.openSync(path.join(staging, file), 'r');
-        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-      }
-      syncDirectory(staging);
-      fs.renameSync(staging, aside);
-      syncDirectory(path.dirname(aside));
-    }
-    for (const file of fs.readdirSync(this.entriesPath).filter(file => ENTRY_FILE.test(file))) {
-      let entry: { handle: string; blob: string; previous?: unknown };
-      try {
-        entry = JSON.parse(fs.readFileSync(path.join(this.entriesPath, file), 'utf8'));
-        if (typeof entry?.handle !== 'string' || typeof entry.blob !== 'string'
-          || this.entryPath(entry.handle) !== path.join(this.entriesPath, file)) throw new Error('not a vault entry');
-      } catch { this.quarantine(file, undefined, 'unreadable entry file'); continue; }
-      const { handle } = entry;
+  private plan(): PlannedEntry[] {
+    let files: string[];
+    try { files = fs.readdirSync(this.entriesPath).filter(file => ENTRY_FILE.test(file)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+    return files.map((file): PlannedEntry => {
+      let raw: string;
+      try { raw = fs.readFileSync(path.join(this.entriesPath, file), 'utf8'); }
+      catch (error) { return { kind: 'unreadable', file, error: (error as NodeJS.ErrnoException).code ?? (error as Error).message }; }
+      let entry: { handle?: unknown; blob?: unknown; previous?: unknown };
+      try { entry = JSON.parse(raw); } catch { return { kind: 'damaged', file, raw, reason: 'unreadable entry file' }; }
+      if (typeof entry?.handle !== 'string' || typeof entry.blob !== 'string' || this.entryPath(entry.handle) !== path.join(this.entriesPath, file))
+        return { kind: 'damaged', file, raw, reason: 'not a vault entry' };
+      const handle = entry.handle;
       const rebind = (blob: unknown) => {
         if (typeof blob !== 'string') throw new Error('not a ciphertext');
         const plain = this.decrypt(blob, handle);
@@ -303,15 +407,100 @@ export class Vault {
       };
       let current: string;
       try { current = rebind(entry.blob); }
-      catch (error) { this.quarantine(file, handle, (error as Error).message); continue; }
+      catch (error) { return { kind: 'damaged', file, raw, handle, reason: (error as Error).message }; }
       const history = Array.isArray(entry.previous) ? entry.previous : [];
       const kept = history.flatMap(blob => { try { return [rebind(blob)]; } catch { return []; } });
-      if (kept.length < history.length)
-        this.quarantine(file, handle, `${history.length - kept.length} earlier revision(s) would not open`, true);
-      this.writeEntry(handle, current, kept);
+      return { kind: 'entry', file, raw, handle, current, kept, dropped: history.length - kept.length };
+    });
+  }
+
+  /** What `migrate` would do, without writing (see `inspectVault`). */
+  inspect(): VaultInspection {
+    const planned = this.bound ? [] : this.plan();
+    const report: VaultInspection = { key: 'accepted', bound: this.bound, rebind: 0, quarantine: [], unreadable: [] };
+    // A bound vault is not rewritten, but an unreadable entry still fails its reads.
+    if (this.bound) for (const file of fs.readdirSync(this.entriesPath).filter(file => ENTRY_FILE.test(file))) {
+      try { fs.accessSync(path.join(this.entriesPath, file), fs.constants.R_OK); }
+      catch (error) { report.unreadable.push({ file, error: (error as NodeJS.ErrnoException).code ?? String(error) }); }
+    }
+    for (const entry of planned) {
+      if (entry.kind === 'unreadable') report.unreadable.push({ file: entry.file, error: entry.error });
+      else if (entry.kind === 'damaged') report.quarantine.push({ file: entry.file, ...(entry.handle ? { handle: entry.handle } : {}), reason: entry.reason });
+      else {
+        if (!entry.raw.includes('"v2.') || entry.kept.length || entry.dropped) report.rebind++;
+        if (entry.dropped) report.quarantine.push({ file: entry.file, handle: entry.handle, reason: `${entry.dropped} earlier revision(s) would not open` });
+      }
+    }
+    return report;
+  }
+
+  /**
+   * Re-encrypt every entry and its history under its handle (AU-27), then
+   * record in the canary that unbound ciphertext is no longer accepted. This
+   * is one-way: the previous release cannot read `v2.` entries, so the
+   * unbound ones are first copied to `entries.pre-v2/` (deploy/README.md,
+   * "Rollback compatibility"). Every file is read before anything changes: one
+   * that cannot be read stops binding with a report, leaving the vault as it
+   * was. An entry that will not open under the proven key is damaged or
+   * foreign; it moves to `entries/quarantine/` instead of refusing every other
+   * secret. Rewriting a bound blob is harmless, so a crash midway simply
+   * redoes the rest.
+   */
+  private bind(): void {
+    // Another process may have bound the vault while this one waited.
+    const recorded = this.readCanary();
+    const generation = this.readGeneration();
+    if (recorded?.bound && generation?.kind === 'bound' && generation.id === recorded.generation) { this.bound = true; return; }
+    const planned = this.plan();
+    const unreadable = planned.filter((entry): entry is Extract<PlannedEntry, { kind: 'unreadable' }> => entry.kind === 'unreadable');
+    if (unreadable.length)
+      throw new Error(`cannot read ${unreadable.length} vault entr${unreadable.length === 1 ? 'y' : 'ies'} in ${this.entriesPath} `
+        + `(${unreadable.map(entry => `${entry.file}: ${entry.error}`).join(', ')}); nothing was changed. `
+        + 'Make them readable by the app, or restore them from a backup, then restart');
+    const parent = path.dirname(this.entriesPath);
+    for (const name of fs.readdirSync(parent))
+      if (name.startsWith(`${PRE_V2}.`) && name.endsWith('.tmp')) fs.rmSync(path.join(parent, name), { recursive: true, force: true });
+    const aside = path.join(parent, PRE_V2);
+    if (!fs.existsSync(aside)) this.copyAside(planned, aside);
+    for (const entry of planned) {
+      if (entry.kind === 'damaged') this.quarantine(entry.file, entry.handle, entry.reason);
+      else if (entry.kind === 'entry') {
+        if (entry.dropped) this.quarantine(entry.file, entry.handle, `${entry.dropped} earlier revision(s) would not open`, true);
+        this.writeEntry(entry.handle, entry.current, entry.kept);
+      }
     }
     this.bound = true;
-    this.writeCanary();
+    this.recordGeneration();
+  }
+
+  /**
+   * The entries as binding found them, for a manual rollback, marked as the
+   * pre-binding copy. A card keeps no CVC here (item 7 of the #367 review):
+   * the copy outlives the migration by 14 days, and backups of it by longer.
+   * After a rollback, cards need their CVC entered again.
+   */
+  private copyAside(planned: PlannedEntry[], aside: string): void {
+    const staging = `${aside}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    fs.mkdirSync(staging, { mode: 0o700 });
+    try {
+      for (const entry of planned) {
+        if (entry.kind === 'unreadable') continue;
+        if (entry.kind === 'entry' && CARD_CVC.test(entry.handle)) continue;
+        let raw = entry.raw;
+        if (entry.kind === 'entry' && CARD_SECRET.test(entry.handle)) {
+          const original = JSON.parse(entry.raw).blob as string;
+          const { cvc: _cvc, ...card } = JSON.parse(this.decrypt(original, entry.handle));
+          raw = JSON.stringify({ handle: entry.handle, blob: this.encrypt(JSON.stringify(card), entry.handle, !original.startsWith('v2.')) });
+        }
+        writeDurably(path.join(staging, entry.file), raw);
+      }
+      writeDurably(path.join(staging, GENERATION_FILE), this.generationMarker(crypto.randomUUID(), 'pre-v2'));
+      fs.renameSync(staging, aside);
+    } catch (error) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      throw error;
+    }
+    syncDirectory(path.dirname(aside));
   }
 
   /** Move an entry aside, or copy it when its current secret survives. */

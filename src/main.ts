@@ -178,7 +178,7 @@ async function main() {
   for (const entry of (await vault.migrate()).quarantined)
     (await store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
   const broker = new CredentialBroker(vault);
-  await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker, path.join(p.state, 'migrations', 'card-cvc-split')); // AU-31
+  await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker); // AU-31
   (await import('./autonomy/vault-items.js')).removeLegacyKeyCopies(p.state); // AU-33
   (await import('./autonomy/vault-items.js')).sweepTurnKeys(); // key files a crashed turn left behind
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');

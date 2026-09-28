@@ -76,13 +76,13 @@ describe('VaultCardProvider — the universal rail', () => {
     const card = await provision();
     (await broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details)));
     (await broker.deleteHandle(cardCvcHandle(card.id)));
-    const marker = path.join(dir, 'state', 'card-cvc-split.done');
-    expect(await separateStoredCardCvcs(broker, marker)).toBe(1);
-    expect(fs.existsSync(marker)).toBe(true);
-    // Done once: later boots neither list nor parse the vault again.
-    const listed = vi.spyOn(broker, 'listHandles');
-    expect(await separateStoredCardCvcs(broker, marker)).toBe(0);
-    expect(listed).not.toHaveBeenCalled();
+    expect(await separateStoredCardCvcs(broker)).toBe(1);
+    expect(await separateStoredCardCvcs(broker)).toBe(0);
+    // Every boot checks again: a vault put back from before the split (a
+    // manual rollback) is split too, which a marker outside it would miss.
+    const combined = JSON.stringify(details);
+    (await broker.registerHandle(cardSecretHandle(card.id), combined, { history: false }));
+    expect(await separateStoredCardCvcs(broker)).toBe(1);
     expect(JSON.parse(broker.resolve(cardSecretHandle(card.id), { caps: ['use-credential:*'] }))).not.toHaveProperty('cvc');
     // …nor in the card secret's history, where `put` keeps earlier revisions.
     expect(new Vault(dir).reveal(cardSecretHandle(card.id), 1)).toBeUndefined();

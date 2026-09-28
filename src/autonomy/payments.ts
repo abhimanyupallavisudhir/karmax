@@ -5,8 +5,6 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
 import { formatMinorUnits, minorUnitDigits } from '../util/currency.js';
 import type { CredentialBroker } from './broker.js';
 
@@ -76,10 +74,11 @@ export const cardSecretHandle = (cardId: string) => `payment:card:${cardId}`;
 export const cardCvcHandle = (cardId: string) => `payment:card:${cardId}:cvc`;
 
 /** Move the CVC of every card stored before AU-31 out of its card secret,
- * dropping the card secret's history, which still holds it. Runs once per
- * `marker`; returns how many cards it separated. */
-export async function separateStoredCardCvcs(broker: CredentialBroker, marker?: string): Promise<number> {
-  if (marker && fs.existsSync(marker)) return 0;
+ * dropping the card secret's history, which still holds it. Checked on every
+ * boot, since a vault put back from before the split (a manual rollback)
+ * holds combined secrets again; only card secrets are read. Returns how many
+ * cards it separated. */
+export async function separateStoredCardCvcs(broker: CredentialBroker): Promise<number> {
   let separated = 0;
   for (const handle of broker.listHandles()) {
     if (!/^payment:card:[^:]+$/.test(handle)) continue;
@@ -91,10 +90,6 @@ export async function separateStoredCardCvcs(broker: CredentialBroker, marker?: 
     (await broker.registerHandle(`${handle}:cvc`, String(cvc)));
     (await broker.registerHandle(handle, JSON.stringify(rest), { history: false }));
     separated++;
-  }
-  if (marker) {
-    fs.mkdirSync(path.dirname(marker), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(marker, '', { mode: 0o600 });
   }
   return separated;
 }

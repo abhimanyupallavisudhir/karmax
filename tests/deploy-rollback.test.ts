@@ -9,7 +9,7 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const operator = fs.readFileSync(new URL('../deploy/karmax', import.meta.url), 'utf8');
 
-function update(previousEpoch: string | undefined, targetEpoch: string, ready = false, failure = '') {
+function update(previousEpoch: string | undefined, targetEpoch: string, ready = false, failure = '', flags: string[] = []) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-rollback-')); roots.push(root);
   const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   git('init', '-q', '-b', 'master');
@@ -34,14 +34,18 @@ git() {
   case "$*" in *"fetch --prune origin master") return 0 ;; esac
   command git "$@"
 }
-dc() { printf '%s\\n' "$*" >> "$ROOT_DIR/operations"; [ "${failure}" != build ] || [ "$*" != "build --pull app" ]; }
+dc() {
+  printf '%s\\n' "$*" >> "$ROOT_DIR/operations"
+  case "$*" in *vault-preflight*) [ "${failure}" != vault ]; return ;; esac
+  [ "${failure}" != build ] || [ "$*" != "build --pull app" ]
+}
 cmd_backup_candidate() { destination="$DEPLOY_DIR/backups/fixture"; mkdir -p "$destination"; [ "${failure}" != backup ]; }
 ready_calls=0
 wait_ready() { ready_calls=$((ready_calls + 1)); [ "${ready ? '1' : '0'}" = 1 ] || [ "$ready_calls" -gt 1 ]; }
-cmd_update "$1"
+cmd_update "$@"
 `;
   const file = path.join(root, 'deploy/fixture-updater'); fs.writeFileSync(file, script);
-  const result = spawnSync('sh', [file, target], { cwd: root, encoding: 'utf8' });
+  const result = spawnSync('sh', [file, ...flags, target], { cwd: root, encoding: 'utf8' });
   const operations = fs.existsSync(path.join(root, 'operations')) ? fs.readFileSync(path.join(root, 'operations'), 'utf8') : '';
   return { ...result, operations, head: git('rev-parse', 'HEAD'), previous, target };
 }
@@ -122,4 +126,26 @@ it('puts the one-way vault migration behind its own data epoch', () => {
   const readme = fs.readFileSync(new URL('../deploy/README.md', import.meta.url), 'utf8');
   expect(readme).toMatch(/Epoch 3[^]*vault[^]*one-way/);
   expect(readme).toContain('entries.pre-v2');
+});
+
+// #367 review item 4: automatic rollback cannot cross epoch 3, so a first
+// boot that would refuse the vault key, stop on an unreadable entry or
+// quarantine one is caught with the new image before the switch.
+it('keeps the previous app serving when the vault preflight finds anything', () => {
+  const result = update('2\n', '3\n', true, 'vault');
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('vault preflight');
+  expect(result.stderr).toContain('--accept-vault-findings');
+  const operations = result.operations.split('\n');
+  const preflight = operations.findIndex(line => line.includes('vault-preflight'));
+  expect(preflight).toBeGreaterThan(operations.findIndex(line => line === 'build --pull app'));
+  expect(result.operations).not.toContain('up -d');
+  expect(result.head).toBe(result.previous);
+});
+
+it('proceeds past the vault preflight only when told to', () => {
+  const result = update('2\n', '3\n', true, 'vault', ['--accept-vault-findings']);
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.head).toBe(result.target);
+  expect(result.operations).toContain('vault-preflight');
 });
