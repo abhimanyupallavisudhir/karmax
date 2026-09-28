@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { expect, it } from 'vitest';
 import { parse } from 'yaml';
-import { anyCasts, budgetFailure } from '../scripts/lint.js';
+import { anyCasts, budgetCheck } from '../scripts/lint.js';
 
 const read = (file: string) => fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
 
@@ -17,10 +17,14 @@ it('counts casts to any, not annotations or the words in comments and strings (C
   ].join('\n'))).toBe(4);
 });
 
-it('fails a budget in both directions, so it can only ever go down', () => {
-  expect(budgetFailure('as any casts in src', 10, 10)).toBeUndefined();
-  expect(budgetFailure('as any casts in src', 11, 10)).toMatch(/11 as any casts in src; the budget is 10/);
-  expect(budgetFailure('as any casts in src', 9, 10)).toMatch(/npm run lint -- --update/);
+// Failing below budget too made two parallel pull requests that each removed
+// one cast pass on their own and fail master together once both merged.
+it('fails a budget only when a count is above it, and notes room to lower it', () => {
+  expect(budgetCheck('as any casts in src', 10, 10)).toEqual({});
+  expect(budgetCheck('as any casts in src', 11, 10).failure).toMatch(/11 as any casts in src; the budget is 10/);
+  const below = budgetCheck('as any casts in src', 9, 10);
+  expect(below.failure).toBeUndefined();
+  expect(below.notice).toMatch(/9 as any casts in src, below the budget of 10.*npm run lint -- --update/);
 });
 
 it('lints in the required checks job', () => {

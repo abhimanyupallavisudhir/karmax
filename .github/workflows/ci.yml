@@ -62,7 +62,7 @@ jobs:
       - uses: ./.github/actions/install
       - run: npm audit --audit-level=high
       - run: npm run typecheck
-      # No lint errors; warning and `as any` budgets only shrink (scripts/lint.ts).
+      # No lint errors, and no more warnings or `as any` casts than scripts/lint-budget.json allows.
       - run: npm run lint
 
   test:

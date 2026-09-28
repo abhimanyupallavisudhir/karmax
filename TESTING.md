@@ -3,7 +3,7 @@
 ```bash
 npm test            # full suite (sequential, resource-capped)
 npm run typecheck
-npm run lint        # oxlint + budgets that only shrink (scripts/lint.ts)
+npm run lint        # oxlint + warning and `as any` budgets that fail when exceeded (scripts/lint.ts)
 npm run test:coverage   # same suite, instrumented; coverage dependency is installed by npm ci
 ```
 

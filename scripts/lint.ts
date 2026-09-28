@@ -3,9 +3,10 @@
  *  oxlint's correctness rules (.oxlintrc.json) must report no errors. Two
  *  budgets in scripts/lint-budget.json cover what the code still breaks: the
  *  warnings of the rules it has not been cleaned of yet, and `as any` casts in
- *  src. Each may only shrink: above budget fails, and below it fails too until
- *  `npm run lint -- --update` records the lower number. Raising a budget is a
- *  hand edit that a reviewer sees.
+ *  src. Above budget fails. Below it only prints a notice: parallel pull
+ *  requests that each remove a cast would otherwise pass alone and fail master
+ *  together. `npm run lint -- --update` records the lower number, and raising
+ *  a budget is a hand edit that a reviewer sees.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -36,10 +37,10 @@ export function anyCasts(fileName: string, source: string): number {
   return count;
 }
 
-export function budgetFailure(what: string, actual: number, budget: number): string | undefined {
-  if (actual > budget) return `${actual} ${what}; the budget is ${budget}. Fix the new ones instead of raising it.`;
-  if (actual < budget) return `${actual} ${what}, below the budget of ${budget}: run \`npm run lint -- --update\` to lower it.`;
-  return undefined;
+export function budgetCheck(what: string, actual: number, budget: number): { failure?: string; notice?: string } {
+  if (actual > budget) return { failure: `${actual} ${what}; the budget is ${budget}. Fix the new ones instead of raising it.` };
+  if (actual < budget) return { notice: `${actual} ${what}, below the budget of ${budget}: run \`npm run lint -- --update\` to lower it.` };
+  return {};
 }
 
 function main(update: boolean): number {
@@ -65,12 +66,16 @@ function main(update: boolean): number {
     fs.writeFileSync(BUDGET_FILE, `${JSON.stringify(lowered, null, 2)}\n`);
     Object.assign(budget, lowered);
   }
+  const checks = [
+    budgetCheck('lint warnings (`npx oxlint` lists them)', warnings, budget.warnings),
+    budgetCheck('`as any` casts in src', casts, budget.anyCasts),
+  ];
   const failures = [
     errors.length ? `${errors.length} lint errors (listed above).` : undefined,
-    budgetFailure('lint warnings (`npx oxlint` lists them)', warnings, budget.warnings),
-    budgetFailure('`as any` casts in src', casts, budget.anyCasts),
+    ...checks.map((check) => check.failure),
   ].filter(Boolean);
   for (const failure of failures) console.error(failure);
+  for (const { notice } of checks) if (notice) console.log(notice);
   if (!failures.length) console.log(`lint: no errors; ${warnings} warnings and ${casts} \`as any\` casts, within budget.`);
   return failures.length ? 1 : 0;
 }
