@@ -296,6 +296,30 @@ describe('durable conversation publication', () => {
       } finally { await f.close(); }
     });
 
+    // Two publishers of one run (an update handler and the main loop) interleave,
+    // and the run keeps referring to the earlier revision after the later one
+    // replaced it and dropped its snapshot (DB-2). A workflow switch at Review
+    // failed this way ("Conversation publication snapshot is missing") and left
+    // the task stuck. The conversation follows revisions, the status follows
+    // the workflow's order: an older revision never moves the conversation back
+    // and never needs its replaced snapshot.
+    it('keeps the newer conversation when later frames refer to an older revision', async () => {
+      const f = await publisher();
+      try {
+        await f.core.publishView(f.task.id, f.view('review', 240, 'first'), 'run-one:3');
+        await f.core.publishView(f.task.id, f.view('do', 242, 'second'), 'run-one:4');
+        const { messages: _, ...status } = { ...f.view('do', 254), status: 'waiting' as const };
+        await f.core.publishView(f.task.id, status, 'run-one:3');
+        expect(await f.stored()).toMatchObject({ stage: 'do', status: 'waiting', messages: [{ text: 'second' }] });
+        // A full publication of the older revision at a later position updates
+        // the status alone, and the newer revision's frames keep working.
+        await f.core.publishView(f.task.id, { ...f.view('do', 266, 'first'), status: 'active' }, 'run-one:3');
+        expect(await f.stored()).toMatchObject({ status: 'active', messages: [{ text: 'second' }] });
+        await f.core.publishView(f.task.id, { ...status, updatedAt: 286, stage: 'review' }, 'run-one:4');
+        expect(await f.stored()).toMatchObject({ stage: 'review', status: 'waiting', messages: [{ text: 'second' }] });
+      } finally { await f.close(); }
+    });
+
     // Two publications of one workflow activation run concurrently (an update
     // handler's and the main loop's). The newer one replaces the conversation
     // and drops the older snapshot (DB-2) between the older one's order check
