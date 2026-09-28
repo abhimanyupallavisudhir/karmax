@@ -548,6 +548,10 @@ const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
 const SOCKET_DECISION_TTL_MS = 5_000;
 /** Past this much unsent data a socket gets only the latest streamed text. */
 const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
+/** A watching socket gets these only for the task it shows (RQ-16)… */
+const WATCHED_TASK_EVENTS = new Set(['agent.output', 'timing']);
+/** …and these only from its own project; lifecycle events still reach inbox and insights. */
+const TASK_DETAIL_EVENTS = new Set([...WATCHED_TASK_EVENTS, 'agent.activity', 'conversation.message', 'conversation.explanation']);
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -702,10 +706,23 @@ export class Gateway {
     const offTiming = (await this.watchTiming(syncTiming));
     lifetime.add(offTiming);
     if (lifetime.closed) return;
+    // What this tab shows (RQ-16). Until it says, it gets every readable event.
+    let watch: { projectId: string | null; taskId: string | null } | undefined;
     ws.on('message', async data => {
       if (data.toString().length > 1024) return;
-      try { (await delivery.acknowledge(JSON.parse(data.toString()))); } catch { /* invalid observation */ }
+      try {
+        const message = JSON.parse(data.toString());
+        if (message?.type === 'watch') {
+          const id = (value: unknown) => value == null ? null : typeof value === 'string' ? value : undefined;
+          const projectId = id(message.projectId), taskId = id(message.taskId);
+          if (projectId !== undefined && taskId !== undefined) watch = { projectId, taskId };
+          return;
+        }
+        (await delivery.acknowledge(message));
+      } catch { /* invalid observation */ }
     });
+    const watched = (ev: KarmaxEvent, projectId?: string) => !watch || ev.taskId === watch.taskId
+      || (projectId === watch.projectId ? !WATCHED_TASK_EVENTS.has(ev.type) : !TASK_DETAIL_EVENTS.has(ev.type));
     // Decide each task's visibility once and reuse it (LT-15): re-verifying the
     // token cost several store reads per event per socket, and a streaming agent
     // publishes several events a second. A decision lasts until this process
@@ -733,7 +750,7 @@ export class Gateway {
     // Streamed text supersedes itself, so a client that has fallen behind gets
     // only each agent's latest text once its buffer drains, never every window
     // (#396 review item 2). Everything else keeps its order and the hard bound.
-    const heldOutput = new Map<string, { ev: KarmaxEvent & { seq?: number }; projectId?: string }>();
+    const heldOutput = new Map<string, { ev: KarmaxEvent & { seq?: number }; projectId?: string; siblingAttempt?: boolean }>();
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
     const releaseHeld = () => {
       drainTimer ??= setTimeout(() => {
@@ -742,19 +759,20 @@ export class Gateway {
         if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { releaseHeld(); return; }
         const held = [...heldOutput.values()];
         heldOutput.clear();
-        for (const { ev, projectId } of held) void deliver(ev, projectId);
+        for (const { ev, projectId, siblingAttempt } of held) void deliver(ev, projectId, siblingAttempt);
       }, 100);
       drainTimer.unref?.();
     };
     lifetime.add(() => { if (drainTimer) clearTimeout(drainTimer); });
-    const deliver = async (ev: KarmaxEvent & { seq?: number }, projectId?: string) => {
+    const deliver = async (ev: KarmaxEvent & { seq?: number }, projectId?: string, siblingAttempt?: boolean) => {
       // Reconnect/backfill from durable state rather than allowing a slow
       // browser's send queue to grow without bound.
       if (ws.readyState !== WebSocketClient.OPEN) return;
+      if (!watched(ev, projectId)) return;
       if (ev.type === 'agent.output' && (ev.payload as { source?: unknown }).source === 'assistant') {
         const key = `${ev.taskId}\0${String((ev.payload as { role?: unknown }).role ?? '')}`;
         heldOutput.delete(key);
-        if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { heldOutput.set(key, { ev, projectId }); releaseHeld(); return; }
+        if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { heldOutput.set(key, { ev, projectId, siblingAttempt }); releaseHeld(); return; }
       }
       if (ws.bufferedAmount > 2 * 1024 * 1024) {
         ws.close(1013, 'Client fell behind; reconnect to refresh');
@@ -771,7 +789,8 @@ export class Gateway {
             workflowRunId: typeof payload.workflowRunId === 'string' ? payload.workflowRunId : undefined,
             attempt: typeof payload.attempt === 'number' ? payload.attempt : undefined })) : undefined;
         if (ws.readyState !== WebSocketClient.OPEN) return;
-        ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), projectId, ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
+        ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), projectId,
+          ...(siblingAttempt ? { siblingAttempt } : {}), ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
     };
     const off = this.fanout.on(deliver, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));

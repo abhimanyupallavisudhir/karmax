@@ -36,6 +36,7 @@ global.loadTasks = async () => { calls.push('loadTasks'); S.tasks = [{ id: 't_ne
 global.loadAvatars = async () => { calls.push('loadAvatars'); S.avatarProjectId = S.projectId; S.avatarAvailability = { effective: true }; };
 global.loadOrg = async () => { calls.push(`loadOrg:${S.projectId}`); S.orgProjectId = S.projectId; S.views = [{ id: 'vB' }]; };
 global.loadOrganizationRuntimeCatalog = async () => {};
+global.syncLiveWatch = () => {};
 global.loadCollaboration = async () => { calls.push(`loadCollaboration:${S.organizationId}`); };
 global.runSearch = async () => { calls.push('runSearch'); S.searchResult = { tasks: S.tasks }; };
 global.renderRail = () => { calls.push('renderRail'); };

@@ -539,6 +539,7 @@ async function applyRoute() {
       if (organizationChanged) {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+        syncLiveWatch();
         renderOnboarding();
         refreshOnboarding();
         renderRouteLoadingPage(org.name, 'Switching organization…');
@@ -624,6 +625,7 @@ async function applyRoute() {
     // view/cursor that doesn't exist here). The incoming URL's own ?q= is applied
     // below, so a link into another project's search still lands filtered.
     S.projectId = pid;
+    syncLiveWatch();
     S.avatarSelected = null;
     S.search = '';
     S.searchResult = null;
@@ -3417,7 +3419,7 @@ function connectWs() {
     if (S.tab === 'insights' && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleInsightsRefresh();
     const eventProject = ev.projectId || ev.payload?.projectId;
     const currentProject = !eventProject || eventProject === S.projectId;
-    const siblingAttempt = S.attemptGroup?.attempts?.some(a => a.id === ev.taskId)
+    const siblingAttempt = ev.siblingAttempt || S.attemptGroup?.attempts?.some(a => a.id === ev.taskId)
       && S.attemptGroup.principalAttemptId !== ev.taskId;
     const patchedList = currentProject && patchTaskListFromEvent(ev);
     if (ev.type === 'review.updated' || ev.type.startsWith('resource.')) {
@@ -3483,6 +3485,7 @@ function connectWs() {
   ws.onopen = () => {
     wsRetryMs = 1500;
     setWsOnline(true);
+    syncLiveWatch();
     if (wsHadDropped) checkConsoleRevision();
     if (wsHadDropped && document.hidden) S.liveUpdatesStale = true;
     else if (wsHadDropped) {
@@ -3500,6 +3503,17 @@ function connectWs() {
     connectWs.retryTimer = setTimeout(connectWs, wsRetryMs);
     wsRetryMs = Math.min(wsRetryMs * 2, 30_000);
   };
+}
+
+// Tell the gateway what this tab shows, so it streams agent output only for the
+// open task and only lifecycle events from other projects (RQ-16).
+function syncLiveWatch() {
+  const ws = S.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const watch = JSON.stringify({ type: 'watch', projectId: S.projectId || null, taskId: S.selected || null });
+  if (ws.sentWatch === watch) return;
+  ws.sentWatch = watch;
+  ws.send(watch);
 }
 
 let wsHadDropped = false;
@@ -6926,6 +6940,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // (edit its parameters + triggers, see its runs, run again).
   const rec = taskRecord(taskId);
   S.selected = taskId;
+  syncLiveWatch();
   S.viewingAttempt = explicitAttempt ? taskId : null;
   S.view = null;
   renderTaskLoadingPage(rec);
@@ -7115,6 +7130,7 @@ function closeTask() {
 function closeTaskDom() {
   if (!S.selected && !S.view) return;
   S.selected = null;
+  syncLiveWatch();
   S.viewingAttempt = null;
   S.view = null;
   S.attemptGroup = null;
