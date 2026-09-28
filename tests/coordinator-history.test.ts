@@ -51,6 +51,21 @@ it('LT-20: cancels the account park timer when a condition wakes it', async () =
   expect(state.sleep).not.toHaveBeenCalled();
 });
 
+it('parks a bounded-history credential wall instead of spinning on a request it will not deny', async () => {
+  // Credential waits never deny, so a request whose every credential needs a
+  // person must not wake the park: the loop would find nothing to do and repark
+  // at once, forever, without yielding a command.
+  state.condition.mockImplementation(async (predicate: () => boolean, timeout?: number) => {
+    if (timeout === undefined) { if (!predicate()) throw new Error('blocked'); return true; }
+    if (predicate()) throw new Error('woke without a serveable request');
+    throw stop;
+  });
+  await expect(accountCoordinator({ state: { accounts: [{ id: 'login', provider: 'mock', configHome: '/test',
+    status: 'needs-attention', inUse: 0, maxConcurrent: 1 }], queue: [{ taskId: 'waiting', turnId: 'turn', allowed: ['login'] }],
+    processed: 0, historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.signal).not.toHaveBeenCalled();
+});
+
 it('WF-24: rotates a merge queue with a current holder and waiting tasks', async () => {
   await expect(mergeQueue({ domain: 'repo', state: { domain: 'repo', current: 'holder', queue: ['waiting'], processed: 500,
     historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);

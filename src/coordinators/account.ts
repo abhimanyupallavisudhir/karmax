@@ -593,17 +593,19 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
         // singleton replaying marker-less history must not emit them.
         const sweepLeases = patched('account-coordinator-lease-sweep-v1');
         const parkMs = sweepLeases && granted.length ? Math.min(sleepMs, LEASE_TIMEOUT_MS) : sleepMs;
-        const wake = () => queue.length === 0 || queue.some((q) => serveable(q) || deniable(q));
+        // Cancellation of the last parked request must wake this branch too;
+        // otherwise the coordinator can remain asleep until the six-hour
+        // backstop despite its query already reporting an empty queue. Manual
+        // status changes that make a request deniable must wake it as well. A
+        // coordinator that waits for credentials never denies, so a deniable
+        // request must not wake it: the loop would spin without yielding.
+        const wake = () => queue.length === 0 || (waitForCredentials
+          ? relistRequested || queue.some((q) => serveable(q))
+          : queue.some((q) => serveable(q) || deniable(q)));
         const woke = boundedHistory
           ? await condition(() => wake() || historyFull(), parkMs)
           : await Promise.race([
-          // Cancellation of the last parked request must wake this branch too;
-          // otherwise the coordinator can remain asleep until the six-hour
-          // backstop despite its query already reporting an empty queue. Manual
-          // status changes that make a request deniable must wake it as well.
-          condition(() => queue.length === 0 || (waitForCredentials
-            ? relistRequested || queue.some((q) => serveable(q))
-            : queue.some((q) => serveable(q) || deniable(q)))).then(() => true),
+          condition(wake).then(() => true),
           sleep(parkMs).then(() => false),
         ]);
         if (sweepLeases && !woke && granted.length) await sweepDeadLeases();
