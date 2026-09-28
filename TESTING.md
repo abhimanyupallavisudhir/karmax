@@ -67,6 +67,14 @@ its test ends. Locally:
 KARMAX_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:5432/db npx vitest run tests/store.test.ts
 ```
 
+Console UI tests exercise the real console: `tests/helpers/console-page.ts`
+loads `web/` into Chromium with a scripted `/api`, so a test renders a
+component with the console's own functions and then clicks, types and reads
+the DOM and the requests made. (Chromium comes from `npx playwright install
+chromium`, as in CI.) Do not assert on the text of `web/` or `src/` files:
+`tests/source-text-ratchet.test.ts` fails on a new such assertion and lists
+the files that still have them.
+
 ## CI
 
 CI (`.github/workflows/ci.yml`) splits the suite across parallel runners with
