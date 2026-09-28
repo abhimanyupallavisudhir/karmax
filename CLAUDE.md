@@ -70,7 +70,7 @@ Layers around that core:
 
 **Host admission control for agent turns** (memory-based backpressure, karmax#4 — prevents the OOM killer from SIGKILLing an agent under memory pressure; see `src/activities/agent-slots.ts`):
 
-- **Global settings → Host capacity → Concurrent agent turns** (default `3`) — max concurrent agent-turn model subprocesses, enforced by the durable/reorderable `agent-queue` coordinator. This is a dedicated cap *distinct* from the worker's `KARMAX_MAX_ACT` (which gates all activities together and scales with cores) and per-login concurrency. `KARMAX_MAX_AGENT_SLOTS` is retained only for replay-compatible admission of historical workflow executions that predate stable turn IDs.
+- **Installation → Host capacity → Concurrent agent turns** (default `3`, self-hosted; hosted organizations get plan-derived capacity on their own `agent-queue:<orgId>`) — max concurrent agent-turn model subprocesses, enforced by the durable/reorderable `agent-queue` coordinator. This is a dedicated cap *distinct* from the worker's `KARMAX_MAX_ACT` (which gates all activities together and scales with cores) and per-login concurrency. `KARMAX_MAX_AGENT_SLOTS` is retained only for replay-compatible admission of historical workflow executions that predate stable turn IDs.
 - `KARMAX_AGENT_MIN_FREE_MB` (default `512`) — admission backs off (a new turn waits, heartbeating) while free host memory is below this floor. `0` disables the check.
 - `KARMAX_AGENT_MAX_LOAD_FACTOR` (default `1.0`) — admission also backs off while the 1-minute load average exceeds `cores × factor`. `0` disables the check (and it is naturally inert on platforms that report loadavg `0`, e.g. Windows).
 

@@ -48,6 +48,13 @@ describe('repository guidance', () => {
     expect(cites).toEqual([]);
   });
 
+  it('names host capacity where the console shows it (WK-2j)', () => {
+    expect(read('web/app.js')).toContain('id="installation-capacity"><div>Host capacity');
+    expect(read('CLAUDE.md')).toContain('**Installation → Host capacity → Concurrent agent turns**');
+    expect(read('CLAUDE.md')).not.toContain('Global settings');
+    expect(read('src/activities/core.ts')).toContain('Reduce Concurrent agent turns under Installation → Host capacity');
+  });
+
   it('links every tracked benchmark result from a repository doc', () => {
     const ls = (...args: string[]) => execFileSync('git', ['ls-files', ...args], {
       cwd: new URL('..', import.meta.url), encoding: 'utf8',
