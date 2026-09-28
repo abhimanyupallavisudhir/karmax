@@ -55,16 +55,27 @@ export class PasskeyManager {
    * the stored credential is loaded so the agent can immediately sign in. The
    * session stays open (held under TTL) until `harvest`/`release`.
    */
-  async begin(page: string | PageOpener, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }): Promise<{ authenticatorId: string; origin: string }> {
+  async begin(page: string | PageOpener, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void>; reserved?: boolean }): Promise<{ authenticatorId: string; origin: string }> {
     if (!opts.owner || !opts.expectDomains?.length) throw new Error('passkey sessions require an owner and target domains');
-    // Take the slot before the first await, so parallel requests cannot all pass the check.
-    this.assertRoom(opts.owner);
-    this.reserved.set(opts.owner, (this.reserved.get(opts.owner) ?? 0) + 1);
+    // Take the slot before the first await, so parallel requests cannot all pass
+    // the check; a caller that reserved one already (to open the page, or spend a
+    // grant, only when a session can be held) passes `reserved`.
+    const release = opts.reserved ? () => {} : this.reserve(opts.owner);
     try { return await this.open(page, opts); }
-    finally {
-      const left = (this.reserved.get(opts.owner) ?? 1) - 1;
-      if (left) this.reserved.set(opts.owner, left); else this.reserved.delete(opts.owner);
-    }
+    finally { release(); }
+  }
+
+  /** Hold one of `owner`'s session slots until the returned release is called. */
+  reserve(owner: string): () => void {
+    this.assertRoom(owner);
+    this.reserved.set(owner, (this.reserved.get(owner) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const left = (this.reserved.get(owner) ?? 1) - 1;
+      if (left) this.reserved.set(owner, left); else this.reserved.delete(owner);
+    };
   }
 
   private async open(page: string | PageOpener, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }): Promise<{ authenticatorId: string; origin: string }> {
