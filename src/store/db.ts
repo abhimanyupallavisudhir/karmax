@@ -7399,7 +7399,8 @@ export class Store {
     return this.db.transaction(async () => {
 
     const waiting = await this.db.prepare(`SELECT id, projectId, cardId, amount, status FROM payment_spend_requests
-      WHERE taskId=? AND status IN ('pending_approval', 'needs_funding')`).all(taskId) as any[];
+      WHERE taskId=? AND status IN ('pending_approval', 'needs_funding')`).all(taskId) as Array<{
+        id: string; projectId: string; cardId: string | null; amount: number; status: string }>;
     const now = Date.now();
     for (const request of waiting) {
       await this.db.prepare(`UPDATE payment_spend_requests SET status='denied', reason=?, resolvedBy='system:payments', updatedAt=?
