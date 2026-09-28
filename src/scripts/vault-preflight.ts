@@ -9,10 +9,12 @@ import { inspectVault } from '../autonomy/vault.js';
 // exit 3 (a secret the boot would quarantine) keeps the previous app serving
 // unless the operator passes --accept-vault-findings; exit 4 (a refused key, a
 // file it cannot read, a vault it cannot open: the boot would fail) always does.
-// The key the app will use: $KARMAX_HOME/karmax.env, then NAME_FILE secrets
-// (the turnkey app has only KARMAX_VAULT_KEY_FILE), exactly as main.ts reads them.
+// The key the app will use: $KARMAX_HOME/karmax.env, then KARMAX_VAULT_KEY_FILE
+// (all the turnkey app has), exactly as main.ts reads it. Only that secret: this
+// runs before the release has started, when others it never reads (the app's
+// database URL) may not exist yet.
 hydrateEnvFile(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
-hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
+hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'), ['KARMAX_VAULT_KEY']);
 const dir = process.argv[2] ?? paths().vault;
 let report: ReturnType<typeof inspectVault>;
 try { report = inspectVault(dir); }

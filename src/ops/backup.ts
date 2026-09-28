@@ -255,7 +255,18 @@ export function signChecksums(bytes: Buffer, home = paths().home): string {
 export function verifyDeploymentBackup(source: string, options: BackupTrust & { home?: string } = {}): { manifest: BackupManifest; signedBy?: string } {
   const directory = path.resolve(source);
   const home = path.resolve(options.home ?? paths().home);
-  const sums = fs.readFileSync(path.join(directory, 'SHA256SUMS'));
+  let sums: Buffer;
+  try { sums = fs.readFileSync(path.join(directory, 'SHA256SUMS')); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    // Every snapshot the previous release's updater took has neither checksums
+    // nor signatures. Only its control plane can be checked, against its own
+    // manifest; the dumps are checked when PostgreSQL reads them.
+    if (!options.acceptUnsignedV1)
+      throw new Error('this backup has no checksums (it predates them). Restore it only if you know it has stayed '
+        + 'in trusted storage, with `--accept-unsigned-v1`; the restore is recorded in the audit log');
+    return { manifest: verifyBackup(path.join(directory, 'control-plane'), { ...options, home }) };
+  }
   let signature: string | undefined;
   try { signature = fs.readFileSync(path.join(directory, 'SHA256SUMS.sig'), 'utf8'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
