@@ -30,7 +30,8 @@ describe('organization cloud provider connections', () => {
       config: { template: 'node-22' } }));
     expect(saved).toMatchObject({ provider: 'e2b', credentialConfigured: true, config: { template: 'node-22' } });
     expect(JSON.stringify((await service.list(organization.id)))).not.toContain('e2b-secret-one');
-    expect(fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8')).not.toContain('e2b-secret-one');
+    for (const file of fs.readdirSync(dir, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile()))
+      expect(fs.readFileSync(path.join(file.parentPath, file.name), 'utf8')).not.toContain('e2b-secret-one');
     expect((await service.resolve(organization.id, 'e2b')).apiKey).toBe('e2b-secret-one');
 
     // Omitting both key and template preserves them; sending a new key rotates
