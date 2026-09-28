@@ -4,8 +4,21 @@ import type { Transition } from '../resolve/transitions.js';
 import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
 import { AgentActivity, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
+import { formatMinorUnits } from '../util/currency.js';
 
-const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
+/** An amount in minor units of `currency`, as the approver reads it: 1250 JPY, 12.500 KWD. */
+const money = (minor: number | undefined, currency = 'usd') => `${formatMinorUnits(minor ?? 0, currency)} ${currency.toUpperCase()}`;
+
+/** The Review note for a spend that was not granted (SPEC §7.6). */
+export function spendReviewSummary(outcome: { status: string; reason?: string; shortfall?: number; currency?: string },
+  args: { amount: number; merchant?: string; why?: string }): string {
+  const at = args.merchant ? ` at ${args.merchant}` : '';
+  return outcome.status === 'needs_funding'
+    ? `Funding needed: add ${money(outcome.shortfall ?? args.amount, outcome.currency)} to the card to pay ${money(args.amount, outcome.currency)}${at}. ${args.why ?? ''}`
+    : outcome.status === 'needs_approval'
+      ? `Approval needed to spend ${money(args.amount, outcome.currency)}${at} (${outcome.reason}). ${args.why ?? ''}`
+      : `Spend denied: ${outcome.reason}.`;
+}
 
 export interface QueuedDelegation {
   subTasks?: { title: string; prompt: string }[];
@@ -285,12 +298,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       await deps.onSpend?.(args, outcome);
       // surface a pending spend at the Review gate so the human can fund/approve
       if (outcome.status !== 'granted') {
-        const note =
-          outcome.status === 'needs_funding'
-            ? `Funding needed: add ${fmt(outcome.shortfall ?? args.amount)} to the card to pay ${fmt(args.amount)}${args.merchant ? ' at ' + args.merchant : ''}. ${args.why ?? ''}`
-            : outcome.status === 'needs_approval'
-              ? `Approval needed to spend ${fmt(args.amount)}${args.merchant ? ' at ' + args.merchant : ''} (${outcome.reason}). ${args.why ?? ''}`
-              : `Spend denied: ${outcome.reason}.`;
+        const note = spendReviewSummary(outcome, args);
         const actions = outcome.requestId && (outcome.status === 'needs_approval' || outcome.status === 'needs_funding')
           ? [
               { kind: 'payment' as const, label: outcome.status === 'needs_funding' ? 'Retry after funding' : 'Approve spend',

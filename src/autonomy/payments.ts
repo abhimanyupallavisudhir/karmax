@@ -892,6 +892,8 @@ export interface SpendInputs {
   hardCap: number;
   merchant?: string;
   merchantLock?: string[];
+  /** The budget's currency, for the reason an approver reads (amounts are its minor units). */
+  currency?: string;
 }
 
 /**
@@ -908,7 +910,9 @@ export function evaluateSpend(i: SpendInputs): SpendDecision {
   }
   if (i.amount > i.hardCap) return { status: 'denied', reason: 'exceeds the card hard cap' };
   if (i.allowance !== undefined && i.spent + i.amount > i.allowance) {
-    return { status: 'needs_approval', reason: `over the task budget (${i.spent}+${i.amount} > ${i.allowance})` };
+    const code = (i.currency ?? 'usd').toUpperCase();
+    const money = (minor: number) => `${formatMinorUnits(minor, code)} ${code}`;
+    return { status: 'needs_approval', reason: `over the task budget (${money(i.spent)} spent + ${money(i.amount)} > ${money(i.allowance)})` };
   }
   if (i.amount > i.available) {
     return { status: 'needs_funding', reason: 'insufficient funds on the card', shortfall: i.amount - i.available };
@@ -937,6 +941,8 @@ export interface SpendArgs {
 }
 export interface SpendResult extends SpendDecision {
   cardId?: string;
+  /** Lowercase ISO 4217 code of the request's amount (minor units). */
+  currency?: string;
   transactionId?: string;
   requestId?: string;
   fundingUrl?: string;
@@ -1047,7 +1053,7 @@ export class BudgetService {
       : ['authorized', 'consumed', 'settled'].includes(request.status) ? 'granted'
         : request.status === 'needs_funding' ? 'needs_funding' : 'denied';
     return { status, reason: request.reason ?? undefined, shortfall: request.shortfall ?? undefined,
-      cardId: request.cardId ?? undefined, requestId: request.id,
+      cardId: request.cardId ?? undefined, requestId: request.id, ...(request.currency ? { currency: String(request.currency).toLowerCase() } : {}),
       transactionId: request.providerAuthorizationId ?? undefined };
   }
 
@@ -1056,7 +1062,7 @@ export class BudgetService {
    * settle immediately. */
   async request(ctx: SpendCtx, args: SpendArgs): Promise<SpendResult> {
     if (!Number.isSafeInteger(args.amount) || args.amount <= 0)
-      return { status: 'denied', reason: 'amount must be a positive number of cents' };
+      return { status: 'denied', reason: 'amount must be a positive whole number in the smallest unit of the card currency' };
     if (args.cardName) {
       const matches = (await this.cards(ctx)).filter(card => card.label.trim().toLowerCase() === args.cardName!.trim().toLowerCase());
       if (matches.length !== 1 || (args.cardId && args.cardId !== matches[0]!.id))
@@ -1093,7 +1099,7 @@ export class BudgetService {
       // A budget is an amount of one currency (AU-36); spend on a card in
       // another cannot be counted against it without a rate, so it asks.
       const comparable = budget === null || cardCurrency(refreshed) === currency;
-      const evaluated = evaluateSpend({ amount: args.amount, allowance: comparable ? budget ?? undefined : undefined,
+      const evaluated = evaluateSpend({ amount: args.amount, allowance: comparable ? budget ?? undefined : undefined, currency,
         spent: (await this.spent(ctx.taskId, currency)), available: refreshed.available,
         hardCap: (await this.remainingCap(provider, refreshed)), merchant: args.merchant,
         merchantLock: refreshed.merchantLock });
