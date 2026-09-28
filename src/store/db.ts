@@ -7226,14 +7226,16 @@ export class Store {
     return { taskIds: rows.filter(row => ancestors(row.id).includes(root)).map(row => row.id), ancestorIds: lineage.slice(1) };
   }
 
-  async paymentSpent(taskId: string, family = false): Promise<number> {
+  /** Minor units spent or reserved; pass `currency` to count one currency only (AU-36). */
+  async paymentSpent(taskId: string, family = false, currency?: string): Promise<number> {
     return this.db.transaction(async () => {
 
     (await this.expirePaymentSpendRequests());
     const ids = family ? (await this.paymentBudgetFamily(taskId)).taskIds : [taskId];
     const row = (await this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
       WHERE taskId IN (${ids.map(() => '?').join(',')}) AND (status IN ('authorizing','consumed','settled')
-        OR (status='authorized' AND expiresAt>?))`).get(...ids, Date.now())) as any;
+        OR (status='authorized' AND expiresAt>?))${currency ? ' AND LOWER(currency)=?' : ''}`)
+      .get(...ids, Date.now(), ...(currency ? [currency] : []))) as any;
     return Number(row?.amount ?? 0);
   
     });

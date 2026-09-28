@@ -1,5 +1,5 @@
 import * as __asyncCollections from '../util/async-collections.js';
-import { resolvePaymentPolicy, validatePaymentPolicy } from '../autonomy/payments.js';
+import { resolvePaymentPolicy, validatePaymentPolicy, withPolicyCurrency } from '../autonomy/payments.js';
 import { randomUUID } from 'node:crypto';
 import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
 import { requireHumanSubject } from './identity.js';
@@ -1162,12 +1162,14 @@ export class KarmaxApi {
     // Wiki context (which pages to inline) isn't a manifest param either; a
     // top-level arg (MCP/API) is folded in like the form sends it via `params`.
     if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
+    const paymentDefaults = (await resolvePaymentPolicy(this.deps.store, project.id));
     if (taskOverrides.paymentPolicy !== undefined) {
+      taskOverrides.paymentPolicy = withPolicyCurrency(taskOverrides.paymentPolicy, paymentDefaults.currency);
       (await validatePaymentPolicy(this.deps.store, project.id, project.organizationId ?? 'org_personal', taskOverrides.paymentPolicy));
-      if (JSON.stringify(taskOverrides.paymentPolicy) !== JSON.stringify((await resolvePaymentPolicy(this.deps.store, project.id))))
+      if (JSON.stringify(taskOverrides.paymentPolicy) !== JSON.stringify(paymentDefaults))
         (await this.require(token, 'manage_payments', { projectId: project.id }));
     }
-    taskOverrides.paymentPolicy ??= (await resolvePaymentPolicy(this.deps.store, project.id));
+    taskOverrides.paymentPolicy ??= paymentDefaults;
     this.assertBranchParams(taskOverrides);
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
@@ -2273,6 +2275,8 @@ export class KarmaxApi {
     const task = (await this.deps.store.getTask(taskId));
     (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
+    if (params.paymentPolicy !== undefined)
+      params = { ...params, paymentPolicy: withPolicyCurrency(params.paymentPolicy, (await resolvePaymentPolicy(this.deps.store, task.projectId, taskId)).currency) };
     if (params.paymentPolicy !== undefined && JSON.stringify(params.paymentPolicy) !== JSON.stringify((task.params as any).paymentPolicy)) {
       (await this.require(token, 'manage_payments', { projectId: task.projectId, taskId }));
       (await validatePaymentPolicy(this.deps.store, task.projectId, (await this.deps.store.getProject(task.projectId))!.organizationId ?? 'org_personal', params.paymentPolicy));
@@ -4876,6 +4880,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     (await this.require(token, 'manage_payments', { projectId: task.projectId, taskId }));
     if (['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')) throw new Error('Payments are read-only after a task finishes');
+    value = withPolicyCurrency(value, (await resolvePaymentPolicy(this.deps.store, task.projectId, taskId)).currency);
     (await validatePaymentPolicy(this.deps.store, task.projectId, (await this.deps.store.getProject(task.projectId))!.organizationId ?? 'org_personal', value));
     (await this.deps.store.updateTaskParams(taskId, { ...task.params, paymentPolicy: value } as any));
   }

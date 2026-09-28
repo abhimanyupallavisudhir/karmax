@@ -952,14 +952,18 @@ export class BudgetService {
     if (taskId) for (const ancestorId of (await this.store.paymentBudgetFamily(taskId)).ancestorIds) {
       const ancestor = await this.store.getTask(ancestorId);
       const inherited = await resolvePaymentPolicy(this.store, ancestor!.projectId, ancestorId);
-      if (inherited.budget !== null) policy.budget = policy.budget === null ? inherited.budget : Math.min(policy.budget, inherited.budget);
+      if (inherited.budget === null) {}
+      else if (policy.budget === null) Object.assign(policy, { budget: inherited.budget, currency: inherited.currency });
+      else if (inherited.currency === policy.currency) policy.budget = Math.min(policy.budget, inherited.budget);
+      // Budgets in two currencies cannot be compared: every spend asks.
+      else policy.budget = 0;
       if (inherited.cardIds) policy.cardIds = policy.cardIds ? policy.cardIds.filter(id => inherited.cardIds!.includes(id)) : inherited.cardIds;
     }
     return policy;
   }
 
-  private async spent(taskId: string): Promise<number> {
-    return (await this.store.paymentSpent(taskId, true));
+  private async spent(taskId: string, currency: string): Promise<number> {
+    return (await this.store.paymentSpent(taskId, true, currency));
   }
 
   /**
@@ -1081,11 +1085,16 @@ export class BudgetService {
         return { request: { status: 'denied', reason: 'card is no longer selected for this task' }, created: false };
       const duplicate = (await this.existing(ctx, args));
       if (duplicate) return { request: duplicate, created: false };
-      const { budget } = (await this.policy(ctx.projectId, ctx.taskId));
-      const decision = evaluateSpend({ amount: args.amount, allowance: budget ?? undefined,
-        spent: (await this.spent(ctx.taskId)), available: refreshed.available,
+      const { budget, currency } = (await this.policy(ctx.projectId, ctx.taskId));
+      // A budget is an amount of one currency (AU-36); spend on a card in
+      // another cannot be counted against it without a rate, so it asks.
+      const comparable = budget === null || cardCurrency(refreshed) === currency;
+      const evaluated = evaluateSpend({ amount: args.amount, allowance: comparable ? budget ?? undefined : undefined,
+        spent: (await this.spent(ctx.taskId, currency)), available: refreshed.available,
         hardCap: (await this.remainingCap(provider, refreshed)), merchant: args.merchant,
         merchantLock: refreshed.merchantLock });
+      const decision: SpendDecision = comparable || evaluated.status === 'denied' ? evaluated : { status: 'needs_approval',
+        reason: `a ${cardCurrency(refreshed).toUpperCase()} card cannot be counted against this ${currency.toUpperCase()} budget` };
       const status = decision.status === 'granted'
         ? provider.authorizationMode === 'webhook' ? 'authorized' : 'authorizing'
         : decision.status === 'needs_approval' ? 'pending_approval' : decision.status;
@@ -1141,7 +1150,7 @@ export class BudgetService {
       .filter(r => r.status === 'pending_approval').reverse();
     for (const request of pending) {
       const policy = (await this.policy(ctx.projectId, ctx.taskId));
-      if (policy.budget !== null && (await this.spent(ctx.taskId)) + request.amount > policy.budget) break;
+      if (!withinBudget(policy, request, await this.spent(ctx.taskId, policy.currency))) break;
       if (!(await this.cards(ctx)).some(card => card.id === request.cardId)) break;
       const result = await this.approve(request.id, 'system:task-budget', true);
       results.push(result);
@@ -1150,7 +1159,7 @@ export class BudgetService {
     return results;
   }
 
-  async approve(requestId: string, resolvedBy: string, withinBudget = false): Promise<SpendResult> {
+  async approve(requestId: string, resolvedBy: string, onlyWithinBudget = false): Promise<SpendResult> {
     const request = (await this.store.getPaymentSpendRequest(requestId));
     if (!request) return { status: 'denied', reason: 'spend request not found' };
     if (!['pending_approval', 'needs_funding'].includes(request.status)) return this.result(request);
@@ -1179,7 +1188,7 @@ export class BudgetService {
       const current = (await this.store.getPaymentSpendRequest(requestId))!;
       if (!['pending_approval', 'needs_funding'].includes(current.status)) return current;
       const policy = (await this.policy(request.projectId, request.taskId));
-      if (withinBudget && policy.budget !== null && (await this.spent(request.taskId)) + request.amount > policy.budget) return current;
+      if (onlyWithinBudget && !withinBudget(policy, request, await this.spent(request.taskId, policy.currency))) return current;
       if (!(await this.cards({ projectId: request.projectId, taskId: request.taskId })).some(c => c.id === card.id)) return current;
       if (refreshed.status === 'canceled' || refreshed.status === 'inactive')
         return (await this.store.updatePaymentSpendRequest(request.id,
@@ -1236,7 +1245,16 @@ export class BudgetService {
   }
 }
 
-export interface PaymentPolicy { cardIds: string[]; budget: number | null }
+/** `budget` is in minor units of `currency` (lowercase ISO 4217). */
+export interface PaymentPolicy { cardIds: string[]; budget: number | null; currency: string }
+
+const cardCurrency = (card: { currency?: string | null }) => (card.currency ?? 'usd').toLowerCase();
+
+/** Would this request keep the task inside a budget it can be counted against? */
+function withinBudget(policy: PaymentPolicy, request: { amount: number; currency?: string | null }, spent: number): boolean {
+  if (policy.budget === null) return true;
+  return cardCurrency(request) === policy.currency && spent + request.amount <= policy.budget;
+}
 
 /** Defaults apply to new tasks; an explicit empty selection permits no cards. */
 export async function resolvePaymentPolicy(store: Store, projectId: string, taskId?: string): Promise<PaymentPolicy> {
@@ -1246,9 +1264,23 @@ export async function resolvePaymentPolicy(store: Store, projectId: string, task
   const p = ((await store.getSettings(projectId, 'payments')) ?? {}) as any;
   const t = taskId ? ((await store.getTask(taskId))?.params as any)?.paymentPolicy : undefined;
   const layer = t ?? p;
+  // The currency travels with whichever layer set the budget; budgets saved
+  // before AU-36 were entered as USD.
+  const source = Object.hasOwn(layer, 'budget') || layer.allowance != null ? layer : g;
   return { cardIds: layer.cardIds ?? g.cardIds ?? (await store.listCards(projectId, org)).filter(c => c.status !== 'canceled').map(c => c.id),
-    budget: Object.hasOwn(layer, 'budget') ? layer.budget : layer.allowance
-      ?? (Object.hasOwn(g, 'budget') ? g.budget : g.allowance ?? 0) };
+    budget: Object.hasOwn(source, 'budget') ? source.budget : source.allowance ?? 0,
+    currency: typeof source.currency === 'string' ? source.currency.toLowerCase() : 'usd' };
+}
+
+/**
+ * A policy sent without a currency (an older console, an agent) keeps the
+ * currency of the budget it replaces, so an unchanged default still reads as
+ * unchanged and an amount is never silently reinterpreted.
+ */
+export function withPolicyCurrency(value: unknown, currency: string): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const p = value as Partial<PaymentPolicy>;
+  return { ...p, currency: typeof p.currency === 'string' ? p.currency.toLowerCase() : currency };
 }
 
 export async function validatePaymentPolicy(store: Store, projectId: string | undefined, organizationId: string, value: unknown): Promise<void> {
@@ -1256,6 +1288,8 @@ export async function validatePaymentPolicy(store: Store, projectId: string | un
   const p = value as PaymentPolicy;
   if (p.budget !== null && (!Number.isSafeInteger(p.budget) || p.budget < 0))
     throw new Error('Budget must be a non-negative amount in cents');
+  if (p.currency !== undefined && (typeof p.currency !== 'string' || !/^[a-z]{3}$/.test(p.currency)))
+    throw new Error('Budget currency must be a three-letter ISO 4217 code, e.g. "usd"');
   const cards = (await store.listCards(projectId, organizationId));
   if (!Array.isArray(p.cardIds) || p.cardIds.some(id => typeof id !== 'string' || !cards.some(c => c.id === id && c.status !== 'canceled' && c.status !== 'inactive')))
     throw new Error('Choose available cards from this organization');

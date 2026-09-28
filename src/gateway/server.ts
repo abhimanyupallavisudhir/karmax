@@ -4794,11 +4794,11 @@ export class Gateway {
         }
         const policy = (await resolvePaymentPolicy(store, task.projectId, task.id));
         const cards = (await store.listCards(task.projectId)).filter(card => policy.cardIds.includes(card.id))
-          .map(({ id, label, last4, status }) => ({ id, label, last4, status }));
+          .map(({ id, label, last4, status, currency }) => ({ id, label, last4, status, currency }));
         return this.json(res, 200, { ...policy, cards,
           canEdit: !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')
             && (await this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId })).ok,
-          spent: (await store.paymentSpent(task.id)), released });
+          spent: (await store.paymentSpent(task.id, false, policy.currency)), released });
       }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
       if (editMatch && method === 'PATCH') {

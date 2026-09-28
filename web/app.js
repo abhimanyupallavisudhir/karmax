@@ -12084,8 +12084,8 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     const payments = box.querySelector('.task-payments');
     await wireTaskPayments(payments, projectId, undefined, undefined, organizationId);
     if (!current()) return;
-    payments.onchange = event => { if (event.target === payments) paymentDirty.add('cardIds'); else if (event.target.matches('.payment-budget')) paymentDirty.add('budget'); };
-    payments.oninput = event => { if (event.target.matches('.payment-budget')) paymentDirty.add('budget'); };
+    payments.onchange = event => { if (event.target === payments) paymentDirty.add('cardIds'); else if (event.target.matches('.payment-budget, .payment-currency')) paymentDirty.add('budget').add('currency'); };
+    payments.oninput = event => { if (event.target.matches('.payment-budget')) paymentDirty.add('budget').add('currency'); };
     box.querySelector('.resource-save').disabled = false;
     box.querySelector('.resource-reset').disabled = false;
     box.querySelector('.resource-save').onclick = async event => {
@@ -12101,7 +12101,7 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     box.querySelector('.resource-reset').onclick = async () => {
       try {
         await api(`${base}/vault`, { method: 'PUT', body: JSON.stringify({ values: {} }) });
-        const { cardIds, budget, allowance, threshold, ...rest } = await api(`${base}/payments`);
+        const { cardIds, budget, currency, allowance, threshold, ...rest } = await api(`${base}/payments`);
         await api(`${base}/payments`, { method: 'PUT', body: JSON.stringify({ values: rest }) });
         await hydrateResourceDefaults(scope, projectId, organizationId);
       } catch (error) { box.querySelector('.resource-error').textContent = error.message; }
@@ -14646,6 +14646,8 @@ function parseExpiry(raw) {
   return { expMonth: Number(m[1]), expYear: year < 100 ? 2000 + year : year };
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
+const money = (cents, currency = 'usd') => currency.toLowerCase() === 'usd' ? usd(cents)
+  : new Intl.NumberFormat(undefined, { style: 'currency', currency }).format((cents || 0) / 100);
 async function wirePaymentProviders(box, organizationId, onChange) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
@@ -19747,7 +19749,8 @@ function taskPaymentsHtml(id, liveKey) {
       <button class="payment-caret" type="button" aria-label="Choose cards" disabled>▾</button></div>
       <div class="mcp-menu" hidden><div class="mcp-options" id="${id}-options" role="listbox" aria-multiselectable="true" aria-label="Cards"></div></div>
     </div>
-    <div class="payment-budget-row"><label for="${id}-budget" title="Payments above this task’s total budget ask for approval. Leave blank for no budget limit.">Budget (USD)</label>
+    <div class="payment-budget-row"><label for="${id}-budget" title="Payments above this task’s total budget ask for approval. Leave blank for no budget limit.">Budget <span class="payment-currency-code">(USD)</span></label>
+      <select class="payment-currency" aria-label="Budget currency" title="Only payments in this currency count toward the budget; others ask for approval." hidden disabled><option value="usd">USD</option></select>
       <input id="${id}-budget" class="payment-budget" type="number" min="0" step="0.01" placeholder="Unlimited" disabled>
       ${live ? '<span class="payment-spent" role="status" title="Includes payments reserved for checkout">Loading spent…</span>' : ''}</div>
     ${live ? '<button class="btn sm payment-save" type="button" disabled>Save payments</button>' : ''}
@@ -19757,10 +19760,10 @@ function taskPaymentsHtml(id, liveKey) {
 function readTaskPayments(box) {
   if (!box?.dataset.policy) return undefined;
   const budget = box.querySelector('.payment-budget');
-  if (!budget.checkValidity()) throw new Error('Enter a non-negative budget in USD');
+  if (!budget.checkValidity()) throw new Error('Enter a non-negative budget');
   const cents = budget.value === '' ? null : Math.round(Number(budget.value) * 100);
-  if (cents !== null && !Number.isSafeInteger(cents)) throw new Error('Enter a valid budget in USD');
-  return { cardIds: JSON.parse(box.dataset.policy).cardIds, budget: cents };
+  if (cents !== null && !Number.isSafeInteger(cents)) throw new Error('Enter a valid budget');
+  return { cardIds: JSON.parse(box.dataset.policy).cardIds, budget: cents, currency: box.querySelector('.payment-currency').value };
 }
 async function wireTaskPayments(box, projectId, initial, taskId, organizationId) {
   if (!box) return;
@@ -19768,6 +19771,7 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
   const query = projectId ? `projectId=${encodeURIComponent(projectId)}` : `organizationId=${encodeURIComponent(organizationId)}`;
   const input = box.querySelector('.payment-search'), menu = box.querySelector('.mcp-menu'), options = box.querySelector('.mcp-options');
   const budget = box.querySelector('.payment-budget'), save = box.querySelector('.payment-save');
+  const currency = box.querySelector('.payment-currency');
   try {
     const [cards0, org, project, live] = await Promise.all([
       api(`/api/cards?${query}`).catch(error => { if (taskId) return []; throw error; }),
@@ -19777,18 +19781,25 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
     ]);
     if (!box.isConnected) return;
     let cards = (cards0.length ? cards0 : live?.cards || []).filter(c => c.status !== 'canceled' && c.status !== 'inactive');
+    // A budget's currency comes from the layer that set it (see resolvePaymentPolicy).
+    const layer = Object.hasOwn(project, 'budget') || project.allowance != null ? project : org;
     const inherited = { cardIds: project.cardIds ?? org.cardIds,
-      budget: Object.hasOwn(project, 'budget') ? project.budget : project.allowance ?? (Object.hasOwn(org, 'budget') ? org.budget : org.allowance ?? 0) };
+      budget: Object.hasOwn(layer, 'budget') ? layer.budget : layer.allowance ?? 0, currency: layer.currency };
     const policy = (taskId && S.paymentEdits?.[taskId]) || live || initial || inherited;
     let selected = new Set(policy.cardIds ?? cards.map(c => c.id)), active = -1;
     budget.value = policy.budget == null ? '' : (policy.budget / 100).toFixed(2);
-    input.disabled = budget.disabled = box.querySelector('.payment-caret').disabled = false;
+    const codes = [...new Set([policy.currency || 'usd', ...cards.map(c => c.currency || 'usd')].map(c => c.toLowerCase()))];
+    currency.innerHTML = codes.map(c => `<option value="${esc(c)}">${esc(c.toUpperCase())}</option>`).join('');
+    currency.value = codes[0];
+    currency.hidden = codes.length < 2;
+    box.querySelector('.payment-currency-code').textContent = codes.length < 2 ? `(${codes[0].toUpperCase()})` : '';
+    input.disabled = budget.disabled = currency.disabled = box.querySelector('.payment-caret').disabled = false;
     input.placeholder = 'Choose cards…';
     if (live) {
-      box.querySelector('.payment-spent').textContent = `${usd(live.spent)} spent`;
+      box.querySelector('.payment-spent').textContent = `${money(live.spent, live.currency)} spent`;
       // A retained section still follows spending recorded while it is open.
       box.refreshSpent = () => api(`/api/tasks/${encodeURIComponent(taskId)}/payments`)
-        .then(({ spent }) => { box.querySelector('.payment-spent').textContent = `${usd(spent)} spent`; }).catch(() => {});
+        .then(({ spent, currency }) => { box.querySelector('.payment-spent').textContent = `${money(spent, currency)} spent`; }).catch(() => {});
     }
     function expand(open) { menu.hidden = !open; input.setAttribute('aria-expanded', String(open)); active = -1; input.removeAttribute('aria-activedescendant'); }
     function paint() {
@@ -19824,6 +19835,7 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
       if (event.key === 'Enter' && !menu.hidden) { event.preventDefault(); rows[active]?.click(); }
     };
     budget.addEventListener('input', () => { if (taskId && budget.checkValidity()) { (S.paymentEdits ||= {})[taskId] = readTaskPayments(box); save.disabled = false; } });
+    currency.addEventListener('change', () => { if (taskId && budget.checkValidity()) { (S.paymentEdits ||= {})[taskId] = readTaskPayments(box); save.disabled = false; } });
     paint();
     if (live && !live.canEdit) {
       box.querySelectorAll('input, button').forEach(control => { control.disabled = true; });
@@ -19838,7 +19850,7 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
           const policy = readTaskPayments(box);
           const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/payments`, { method: 'PUT', body: JSON.stringify(policy) });
           delete S.paymentEdits?.[taskId];
-          box.querySelector('.payment-spent').textContent = `${usd(result.spent)} spent`;
+          box.querySelector('.payment-spent').textContent = `${money(result.spent, result.currency)} spent`;
           // The box already shows what was saved; don't repaint it for that.
           const rec = taskRecord(taskId);
           if (rec) rec.params = { ...rec.params, paymentPolicy: policy };

@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { VaultCardProvider, PaymentRegistry, BudgetService, MockPaymentProvider,
-  StripeIssuingProvider, cardSecretHandle, cardCvcHandle, separateStoredCardCvcs, type PaymentProvider } from '../src/autonomy/payments.js';
+  StripeIssuingProvider, cardSecretHandle, cardCvcHandle, separateStoredCardCvcs, resolvePaymentPolicy, validatePaymentPolicy,
+  type PaymentProvider } from '../src/autonomy/payments.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { Store } from '../src/store/db.js';
@@ -171,6 +172,28 @@ describe('BudgetService over the vault-card rail', () => {
     await provider.fund(card.id, 3_000);
     const settled = await budget.settleApproved({ projectId, taskId: task_t2.id , capabilities: ['use-card:*'] }, { amount: 4_000, cardId: card.id });
     expect(settled.status).toBe('granted');
+  });
+
+  // AU-36: a budget is an amount of one currency. Spend on a card in another
+  // currency cannot be compared with it, and is never summed into it.
+  it('keeps budgets in their own currency', async () => {
+    const dollars = await provision(50_000);
+    const euros = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Euro card', cap: 50_000,
+      currency: 'EUR', details } as any);
+    (await store.setSettings(projectId, 'payments', { budget: 1_000, currency: 'eur' }));
+    expect(await resolvePaymentPolicy(store, projectId)).toMatchObject({ budget: 1_000, currency: 'eur' });
+    const task = await store.createTask({ projectId, title: 'buyer', workflow: 'just-do', workflowVersion: '1',
+      params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+    const ctx = { projectId, taskId: task.id, capabilities: ['use-card:*'] };
+    const unconvertible = await budget.request(ctx, { amount: 500, cardId: dollars.id });
+    expect(unconvertible).toMatchObject({ status: 'needs_approval', reason: 'a USD card cannot be counted against this EUR budget' });
+    (await budget.approve(unconvertible.requestId!, 'user:owner'));
+    expect((await store.getPaymentSpendRequest(unconvertible.requestId!)).status).toBe('settled');
+    // 500 USD settled; 900 EUR still fits the 1,000 EUR budget.
+    expect(await budget.request(ctx, { amount: 900, cardId: euros.id })).toMatchObject({ status: 'granted' });
+    expect(await budget.request(ctx, { amount: 200, cardId: euros.id })).toMatchObject({ status: 'needs_approval' });
+    await expect(validatePaymentPolicy(store, projectId, 'org_personal', { cardIds: [], budget: 1, currency: 'dollars' } as any))
+      .rejects.toThrow(/currency/i);
   });
 
   // AU-35: a spend waiting for a human belongs to the task that asked for it.

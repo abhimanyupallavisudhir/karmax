@@ -2296,8 +2296,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const paymentCards = (await paymentService?.cards({ projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant })) ?? [];
       const paymentPolicy = (await paymentService?.policy(args.task.projectId, args.taskId));
       const paymentContext = paymentCards.length ? `\n\nPayment cards available to this task: ${JSON.stringify(paymentCards.map(c => ({ name: c.label, id: c.id })))}. `
-        + `Task budget (USD): ${paymentPolicy?.budget == null ? 'unlimited' : (paymentPolicy.budget / 100).toFixed(2)}. `
-        + `Spent/reserved (USD): ${((await store.paymentSpent(args.taskId)) / 100).toFixed(2)}. `
+        + `Task budget (${(paymentPolicy?.currency ?? 'usd').toUpperCase()}): ${paymentPolicy?.budget == null ? 'unlimited' : (paymentPolicy.budget / 100).toFixed(2)}. `
+        + `Spent/reserved (${(paymentPolicy?.currency ?? 'usd').toUpperCase()}): ${((await store.paymentSpent(args.taskId, false, paymentPolicy?.currency)) / 100).toFixed(2)}. `
         + 'Use request_spend with card_name to choose a card. Follow the user’s restrictions on each card. Over-budget payments require approval.' : '';
       const systemPrompt = assemblePrompt({
         profile,
