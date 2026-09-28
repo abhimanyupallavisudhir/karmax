@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { Store } from '../../src/store/db.js';
 import { Gateway, type GatewayDeps } from '../../src/gateway/server.js';
@@ -145,4 +146,52 @@ export async function hostedGateway(extra: (fixture: { store: Store; broker: Cre
     await server.close(); await identity.close(); await store.close();
     fs.rmSync(directory, { recursive: true, force: true });
   } };
+}
+
+export interface AppProcess {
+  url: string;
+  /** Ctrl-C: the app exits and, as with `npm start`, the home's persistent
+   *  Temporal server keeps running for the next boot. */
+  stop(): Promise<void>;
+}
+
+/** The installed app itself — src/main.ts with its gateway, worker and
+ *  embedded Temporal on `home`, as `npm start` runs it — with the mock agent. */
+export async function launchApp(home: string): Promise<AppProcess> {
+  const port = await findFreePortFrom(48950);
+  const url = `http://127.0.0.1:${port}`;
+  const log = fs.openSync(path.join(home, 'main.log'), 'a');
+  const app = spawn(process.execPath, ['--import', 'tsx', '--max-old-space-size=512', 'src/main.ts'], {
+    cwd: path.resolve('.'), stdio: ['ignore', log, log],
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, KARMAX_HOME: home, KARMAX_HOST: '127.0.0.1', KARMAX_PORT: String(port),
+      KARMAX_AGENT_PROVIDER: 'mock', KARMAX_AGENT_MIN_FREE_MB: '0', KARMAX_AGENT_MAX_LOAD_FACTOR: '0',
+      ...(process.env.TEMPORAL_CLI ? { TEMPORAL_CLI: process.env.TEMPORAL_CLI } : {}) },
+  });
+  const exited = new Promise<void>((resolve) => app.once('exit', () => resolve()));
+  const stop = async () => { if (app.exitCode === null && app.signalCode === null) app.kill('SIGTERM'); await exited; fs.closeSync(log); };
+  const deadline = Date.now() + 90_000;
+  for (;;) {
+    if (app.exitCode !== null || Date.now() > deadline) {
+      await stop();
+      throw new Error(`the app did not become ready:\n${fs.readFileSync(path.join(home, 'main.log'), 'utf8').slice(-6000)}`);
+    }
+    const ready = await fetch(`${url}/api/health/ready`, { signal: AbortSignal.timeout(1000) }).then((r) => r.ok, () => false);
+    if (ready) return { url, stop };
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+
+/** Stops the persistent Temporal server a launched app left on `home`. */
+export async function stopEmbeddedTemporal(home: string): Promise<void> {
+  let pid: number | undefined;
+  try { pid = JSON.parse(fs.readFileSync(path.join(home, 'temporal', 'dev-server.json'), 'utf8')).pid; } catch { return; }
+  // A pidfile outlives its process; never signal a recycled pid.
+  const isTemporal = () => { try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('temporal'); } catch { return false; } };
+  if (!pid || !isTemporal()) return;
+  try { process.kill(pid, 'SIGTERM'); } catch { return; }
+  for (let waited = 0; waited < 10_000; waited += 100) {
+    if (!isTemporal()) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (isTemporal()) try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
 }
