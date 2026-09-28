@@ -721,9 +721,12 @@ export class Gateway {
       // Read before deciding: a change committed while the check runs moves it again.
       const epoch = authorizationEpoch();
       const allowed = (async () => {
-        if ((await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId } : undefined)).ok) return true;
-        const humanCaps = auth.userId && projectId ? (await this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId)) : [];
-        return allows(humanCaps ?? [], 'task:event:read');
+        // A person's socket decides from their grants as they stand now: its
+        // token keeps the capabilities it was minted with for ten minutes, so
+        // a narrowed grant would otherwise wait for it to rotate (GW-13).
+        if (auth.userId && this.deps.authorization)
+          return !!projectId && allows((await this.deps.authorization.capabilitiesAsync(`user:${auth.userId}`, projectId)), 'task:event:read');
+        return (await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId } : undefined)).ok;
       })();
       // A failed lookup is not a decision: the next event asks again.
       allowed.catch(() => { if (decisions.get(key)?.allowed === allowed) decisions.delete(key); });
