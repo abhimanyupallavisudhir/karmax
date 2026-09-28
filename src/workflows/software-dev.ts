@@ -257,10 +257,13 @@ const MAX_AUTOMATED_LANDING_REPAIRS = 5;
 /** A run continues as new at the top of Do once it has grown by this much since
  * it started (or loaded a predecessor's conversation), so however many turns a
  * task takes its history stays far inside Temporal's 51,200-event / 50 MB
- * limits. Long waits outside Do wake on signals, or on child watchers that
- * poll GitHub and the merge queue (githubLandingWatch, mergeQueueWatch) and
- * return only on a change. Pins before v1.21 still poll GitHub in the task,
- * backing off to ten minutes while nothing changes. */
+ * limits. That bounds Do, not every wait: on current pins long waits outside
+ * Do wake on signals, or on child watchers that poll GitHub and the merge
+ * queue (githubLandingWatch, mergeQueueWatch) and return only on a change.
+ * Older pins still grow without bound while they wait: before v1.21 a GitHub
+ * wait polls in the task at up to ten minutes (about 5,000 events a day, the
+ * limit in about ten days), and before v1.9 a merge-queue wait polls every
+ * 5 s. */
 const CONTINUE_AFTER_EVENTS = 4_000;
 const CONTINUE_AFTER_BYTES = 8 * 1024 * 1024;
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
