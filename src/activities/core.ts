@@ -14,9 +14,9 @@ import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
-import { hasLiveWorldWork, type PublishedView, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
+import { applyConversationPatch, conversationPage, hasLiveWorldWork, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
-import type { Client } from '@temporalio/client';
+import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
@@ -387,11 +387,18 @@ async function acquireWorkflowAgentSlot(args: {
   };
 }
 
+/** A page of a continued run's transcripts: far below the 2 MB payload limit
+ * (one message may exceed it only if it already entered history by value). */
+const CONVERSATION_PAGE_BYTES = 512 * 1024;
+
 export interface RunAgentTurnArgs {
   taskId: string;
   role: AgentRole;
   worldHandle: WorldHandle;
   messages: Message[];
+  /** `messages` continue this acknowledged conversation snapshot, so a turn's
+   * input costs its new messages rather than the whole transcript (WF-4). */
+  messagesBase?: TurnConversationBase;
   session?: string;
   /** How many leading `messages` the resumed `session` already holds — forwarded to
    *  the adapter so a resumed turn sends only the delta, not the whole transcript. */
@@ -524,6 +531,28 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const seq = (await store.appendEvent(ev));
     deps.bus?.emit({ ...ev, seq });
     return seq;
+  }
+
+  /** The task's pin when it names a run of the task that is no longer running
+   * (an older whole-params write restored it): the live run may replace it.
+   * Only one run of a workflow id runs at a time, so that run is this one. */
+  async function closedRunPin(taskId: string): Promise<string | undefined> {
+    const pinned = (await store.taskMetadata(taskId))?.params?._workflowRunId;
+    if (typeof pinned !== 'string' || !pinned || !deps.client) return undefined;
+    try {
+      return (await deps.client.workflow.getHandle(taskId, pinned).describe()).status.name === 'RUNNING' ? undefined : pinned;
+    } catch (error) {
+      return error instanceof WorkflowNotFoundError ? pinned : undefined;
+    }
+  }
+
+  /** An acknowledged conversation publication; patches and turn transcripts
+   * are expressed against one, so it must exist while the task is live. */
+  async function conversationSnapshot(taskId: string, reference: string): Promise<ViewConversation> {
+    const json = (await store.kvGet(`view-conversation:${taskId}:${reference}`));
+    if (json === undefined)
+      throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+    return JSON.parse(json);
   }
 
   /** JIT env for remote git/gh operations in this world (wiki plans/PLAN-git-config §4B):
@@ -1712,7 +1741,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : [`missing:${organizationId}:${missingNamespace}`];
     },
 
-    async runAgentTurn(args: RunAgentTurnArgs) {
+    async runAgentTurn({ messagesBase: base, ...input }: RunAgentTurnArgs) {
+      const args: RunAgentTurnArgs = base ? { ...input, messages: [
+        ...transcriptOf((await conversationSnapshot(input.taskId, base.reference)), base.role).slice(0, base.count),
+        ...input.messages] } : input;
       const attemptStarted = Date.now();
       let timingAttempt = 1, timingTurnId = args.agentTurnId;
       let timingSignal: AbortSignal | undefined;
@@ -5128,7 +5160,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return true;
     },
 
-    async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
+    /** A run about to continue as new unpins itself, so the platform addresses
+     * the workflow id's live run meanwhile. 'foreign': another run holds the
+     * pin (a replacement is starting), so this run must not continue. */
+    async releaseTaskRun(taskId: string): Promise<'released' | 'unpinned' | 'foreign'> {
+      const runId = activityContext.current().info.workflowExecution?.runId ?? '';
+      if (!(await store.taskMetadata(taskId))?.params?._workflowRunId) return 'unpinned';
+      if (await store.swapTaskRun(taskId, runId, '')) return 'released';
+      const stale = (await closedRunPin(taskId));
+      return stale && (await store.swapTaskRun(taskId, stale, '')) ? 'released' : 'foreign';
+    },
+
+    /** The next run takes the pin its predecessor released, unless another
+     * run claimed the task in between. */
+    async adoptTaskRun(taskId: string): Promise<boolean> {
+      const runId = activityContext.current().info.workflowExecution?.runId ?? '';
+      if (await store.swapTaskRun(taskId, '', runId)) return true;
+      const stale = (await closedRunPin(taskId));
+      return !!stale && (await store.swapTaskRun(taskId, stale, runId));
+    },
+
+    /** A continued run's transcripts, in pages well inside Temporal's 2 MB
+     * payload limit (see conversationPage). */
+    async readConversationPage(taskId: string, reference: string, offset: number) {
+      return conversationPage((await conversationSnapshot(taskId, reference)), offset, CONVERSATION_PAGE_BYTES);
+    },
+
+    async publishView(taskId: string, { conversationRetain: retain, ...publication }: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
       // WF-27: an attempt that timed out still completes, and a stopped run's
       // last publication can land after its successor's. Drop what the task has
       // already moved past, before it can rewrite the view. A full publication
@@ -5142,12 +5200,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           order = { runId, seq: publication.updatedAt, ...(Number.isSafeInteger(revision) ? { revision } : {}) };
       } catch { /* direct invocation has no run to order by */ }
       const stale = order !== undefined && (await store.viewPublicationStale(taskId, order));
-      if (stale && !(conversationReference && publication.messages !== undefined)) return;
+      if (stale && !(conversationReference && (publication.messages !== undefined || publication.conversationPatch))) return;
       let view: TaskView;
+      // Immutable, task-scoped snapshots survive worker restarts and activity
+      // retries, including retries after another publication has completed.
+      const key = `view-conversation:${taskId}:${conversationReference}`;
+      if (publication.conversationPatch) {
+        const { conversationPatch: patch, ...rest } = publication;
+        // A retry whose snapshot is already saved needs no base: the save
+        // may have superseded it since. A stale delta still records its
+        // snapshot, which the run's next frames may refer to.
+        if (conversationReference && (await store.kvHas(key))) publication = rest;
+        else {
+          const base = (await store.kvGet(`view-conversation:${taskId}:${patch.base}`));
+          if (base === undefined && stale) return;
+          if (base === undefined) throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+          publication = { ...rest, ...applyConversationPatch(JSON.parse(base), patch) };
+        }
+      }
       if (conversationReference) {
-        // Immutable, task-scoped snapshots survive worker restarts and activity
-        // retries, including retries after another publication has completed.
-        const key = `view-conversation:${taskId}:${conversationReference}`;
         if (publication.messages !== undefined) {
           const json = JSON.stringify({ messages: publication.messages, transcripts: publication.transcripts });
           const existing = (await store.kvGet(key));
@@ -5217,7 +5288,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await trace.mark(`queue.observed.${after?.state ?? 'released'}`));
         }
       }
-      if (!(await store.saveView(taskId, view, conversationReference, order))) return;
+      if (!(await store.saveView(taskId, view, conversationReference, order, retain))) return;
       await notifyChildSettlement(store, deps.client, view);
       if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
         let runId: string | undefined;

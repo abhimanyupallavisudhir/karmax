@@ -3742,6 +3742,18 @@ export class Store {
       .map(rowToTask);
   }
 
+  /** The status of some of a parent's children, without their conversations. */
+  async childTaskStates(parentTaskId: string, childTaskIds: string[]): Promise<
+    { id: string; status?: string; stage?: string; lifecycleReplacement: boolean }[]> {
+    if (!childTaskIds.length) return [];
+    const rows = (await this.db.prepare(`SELECT id, json_extract(lastView, '$.status') status,
+        json_extract(lastView, '$.stage') stage, json_extract(lastView, '$.state.lifecycleReplacement') replaced
+      FROM tasks WHERE parentTaskId = ? AND id IN (${childTaskIds.map(() => '?').join(', ')})`)
+      .all(parentTaskId, ...childTaskIds)) as { id: string; status?: string | null; stage?: string | null; replaced?: unknown }[];
+    return rows.map((row) => ({ id: row.id, status: row.status ?? undefined, stage: row.stage ?? undefined,
+      lifecycleReplacement: row.replaced === true || row.replaced === 1 || row.replaced === 'true' }));
+  }
+
   async childTasks(parentTaskId: string): Promise<TaskRecord[]> {
     const tasks = (
       (await this.db.prepare('SELECT * FROM tasks WHERE parentTaskId = ? ORDER BY createdAt').all(parentTaskId)) as any[]
@@ -3834,6 +3846,36 @@ export class Store {
     return true;
   }
 
+  /**
+   * DB-2: keeping each superseded full copy of a conversation until the task
+   * settled grew kv with the square of a long conversation's length. Once the
+   * task row holds `reference`, drop the snapshots nothing can read again:
+   * older ones of its run and those of runs a newer run has replaced, except
+   * what the run `retain`s (delta bases, turn transcripts and publications in
+   * flight, each read again on a retry). A newer snapshot of the run may be a
+   * concurrent publication's and is left alone.
+   */
+  private async dropSupersededSnapshots(taskId: string, reference: string, retain: string[]): Promise<void> {
+    const position = (candidate: string) => {
+      const split = candidate.lastIndexOf(':');
+      const revision = Number(candidate.slice(split + 1));
+      return split > 0 && Number.isSafeInteger(revision) ? { runId: candidate.slice(0, split), revision } : undefined;
+    };
+    const own = position(reference);
+    const raw = (await this.kvGet(`view-order:${taskId}`));
+    const retired = new Set(raw ? (JSON.parse(raw) as ViewOrderState).retired : []);
+    const prefix = `view-conversation:${taskId}:`;
+    const keys = (await this.db.prepare(`SELECT k FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
+      .all(prefix, `view-conversation:${taskId};`)) as Array<{ k: string }>;
+    for (const { k } of keys) {
+      const candidate = k.slice(prefix.length);
+      const held = position(candidate);
+      if (candidate === reference || retain.includes(candidate) || !held) continue;
+      if ((held.runId === own?.runId && held.revision < own.revision) || retired.has(held.runId))
+        (await this.db.prepare('DELETE FROM kv WHERE k=?').run(k));
+    }
+  }
+
   /** PL-10: a finished task's pending permission requests are withdrawn, and
    * their withdrawal discharges the recipients' inbox like a decision would. */
   private async withdrawPermissionRequests(projectId: string, taskId: string, status: string): Promise<void> {
@@ -3852,7 +3894,8 @@ export class Store {
   }
 
   /** Returns false, and changes nothing, for a publication `order` shows is stale. */
-  async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder): Promise<boolean> {
+  async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder,
+    retain?: string[]): Promise<boolean> {
     return this.db.transaction(async () => {
     if (order && !(await this.admitViewPublication(taskId, order))) return false;
 
@@ -3892,12 +3935,10 @@ export class Store {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
           .run(JSON.stringify(status), key, conversationReference, taskId));
         (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
-        // DB-2: the task row now holds this conversation, and a publication that
-        // still refers to the one it replaces is stale (`viewPublicationStale`).
-        // Keeping each superseded full copy until the task settled grew kv with
-        // the square of a long conversation's length.
-        if (current?.conversationRef)
-          (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`view-conversation:${taskId}:${current.conversationRef}`));
+        // Only a publisher that says what it still reads may drop snapshots:
+        // one the previous release scheduled before a deploy says nothing, and
+        // the run's next delta or turn may build on what it would drop.
+        if (retain) (await this.dropSupersededSnapshots(taskId, conversationReference, retain));
       }
     } else if (messages === undefined && transcripts === undefined) {
       // A status-only view (reconcile and lifecycle repairs read `lastView`
@@ -3948,11 +3989,19 @@ export class Store {
     });
   }
 
+  /** Replace a task's params, except its run pin: `params` is usually an
+   * earlier read, and only a start, recovery or continue-as-new moves the pin
+   * (patchTaskParams / swapTaskRun). Putting back a closed run's id would
+   * send every later signal, query and lifecycle action to that closed run. */
   async updateTaskParams(taskId: string, params: TaskParams) {
     return this.db.transaction(async () => {
 
     await this.trackTaskCredentialSelections(taskId, params);
-    (await this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId));
+    const { _workflowRunId: _read, ...rest } = params as Record<string, unknown>;
+    const pinned = ((await this.db.prepare(`SELECT json_extract(params, '$._workflowRunId') runId FROM tasks WHERE id = ?`)
+      .get(taskId)) as { runId?: unknown } | undefined)?.runId;
+    (await this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?')
+      .run(JSON.stringify(typeof pinned === 'string' ? { ...rest, _workflowRunId: pinned } : rest), taskId));
   
     });
   }
@@ -3974,6 +4023,15 @@ export class Store {
     }
   
     });
+  }
+
+  /** Moves the task's pinned workflow run from `from` to `to` ('' is unpinned)
+   * only while it is still `from`: continue-as-new hands the pin to the next
+   * run without overwriting a replacement that claimed the task meanwhile. */
+  async swapTaskRun(taskId: string, from: string, to: string): Promise<boolean> {
+    return Number((await this.db.prepare(`UPDATE tasks SET params = json_set(params, '$._workflowRunId', json(?))
+      WHERE id = ? AND COALESCE(json_extract(params, '$._workflowRunId'), '') = ?`)
+      .run(JSON.stringify(to), taskId, from)).changes) > 0;
   }
 
   /** Called inside the task write's transaction. Lock on PostgreSQL so two

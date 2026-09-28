@@ -6,7 +6,7 @@ import { NativeConnection, Worker, bundleWorkflowCode } from '@temporalio/worker
 import { startDevServer } from '../src/temporal/dev-server.js';
 import { makeClient } from '../src/temporal/client.js';
 
-it.each(['preflight', 'fallback'])('keeps unchanged %s waits out of task history and wakes for cancellation', async mode => {
+it.each(['preflight', 'fallback', 'repeated-failure'])('keeps unchanged %s waits out of task history and wakes for cancellation', async mode => {
   const server = await startDevServer({ headless: true, logLevel: 'never' });
   const native = await NativeConnection.connect({ address: server.address });
   const { client, close } = await makeClient({ address: server.address, namespace: server.namespace });
@@ -28,6 +28,10 @@ it.each(['preflight', 'fallback'])('keeps unchanged %s waits out of task history
       mergeGithubPrs: async (_world: unknown, _prs: unknown, options: { mode?: string }) => {
         if (options.mode === 'preflight') {
           polls++;
+          // An unchanged terminal failure on the head whose repair was already
+          // charged (LT-12): the ejected task waits for a new run/head/target.
+          if (mode === 'repeated-failure') return { status: 'needs-revision', prs, detail,
+            repair: { kind: 'ci', preserveAuthorization: true, fingerprint: 'test/repo#1:abc:ci' } };
           return mode === 'preflight' ? { status: 'waiting', prs, detail }
             : { status: 'planned', prs, observationKey: detail, participants: [{ key: 'test/repo#1', owner: 'karmax',
               state: 'ready', domain: 'github:test/repo:main', slug: 'test/repo', number: 1, target: 'main', headSha: 'abc' }] };
@@ -44,7 +48,9 @@ it.each(['preflight', 'fallback'])('keeps unchanged %s waits out of task history
   const handle = await client.workflow.start('softwareDev@1.26.0', { taskQueue, workflowId: 'landing-wait-fixture', args: [{
     taskId: 'landing-wait-fixture', projectId: 'fixture', title: 'Landing fixture', prompt: '',
     project: { repos: ['/fixture'], remote: 'pr' }, githubPollMs: 100,
-    recovery: { resumeStage: 'merge', messages: [], prs, world: { id: 'landing-wait-fixture', kind: 'memory', root: '/fixture', branch: 'task', base: 'main' } },
+    recovery: { resumeStage: 'merge', messages: [], prs, world: { id: 'landing-wait-fixture', kind: 'memory', root: '/fixture', branch: 'task', base: 'main' },
+      ...(mode === 'repeated-failure' ? { landing: { authorization: 'authorized', validation: 'pending', provider: 'admitting',
+        authorizedHeads: { 'test/repo#1': 'abc' }, lastRepairFingerprint: 'test/repo#1:abc:ci', repairAttempts: 1 } } : {}) },
   }] });
   try {
     await expect.poll(() => polls, { timeout: 20_000 }).toBeGreaterThanOrEqual(2);
