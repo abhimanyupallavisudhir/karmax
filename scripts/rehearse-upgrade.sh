@@ -352,15 +352,18 @@ wipe_project
 git clone -q "$WORK/origin.git" "$WORK/restore"
 git -C "$WORK/restore" checkout -q --detach "$DEPLOY_SHA"
 cd "$WORK/restore"
-restore() { printf 'RESTORE\n' | ./deploy/karmax restore "$1"; }
+restore() { printf 'RESTORE\n' | ./deploy/karmax restore "$@"; }
 # Releases before CI-37 wrote no SHA256SUMS, and a restore that requires one
-# refuses their backups. The refusal is recorded as a failure; the rest of the
-# restore is then still exercised the way an operator would get past it: on a
-# copy, with checksums written over the unchanged files.
+# refuses their backups; one that also verifies signatures refuses unsigned
+# checksums unless told --accept-unsigned-v1. The refusal is recorded as a
+# failure; the rest of the restore is then still exercised the way an operator
+# would get past it: on a copy, with checksums written over the unchanged files.
 with_checksums() {
+  local accept=()
   cp -a "$BACKUP" "$BACKUP-checksummed"
-  (cd "$BACKUP-checksummed" && sha256sum *.dump deployment-secrets/* > SHA256SUMS)
-  restore "$BACKUP-checksummed"
+  (cd "$BACKUP-checksummed" && sha256sum *.dump deployment-secrets/* control-plane/manifest.json > SHA256SUMS)
+  ! grep -q -- '--accept-unsigned-v1' ./deploy/karmax || accept=(--accept-unsigned-v1)
+  restore "${accept[@]}" "$BACKUP-checksummed"
 }
 restored=0
 if step 'f. Install a fresh TO stack (deploy/karmax up)' up-fresh.log ./deploy/karmax up "$DOMAIN"; then
