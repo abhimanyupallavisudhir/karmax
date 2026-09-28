@@ -25,7 +25,7 @@ import { ProfileResolver } from '../src/agent/profiles.js';
 function registerFakeWorld(opts: { kind: string; remote: boolean; hasBundle: boolean; execs: string[] }) {
   const worlds = new WorldRegistry();
   const world = {
-    handle: { kind: opts.kind, id: 'task', root: '/workspace', branch: 'karmax/task', base: 'main' },
+    handle: { kind: opts.kind, id: 'task', root: '/workspace', branch: 'tavya/task', base: 'main' },
     async exec(_cmd: string, argv: string[]) {
       const script = argv[argv.length - 1] ?? '';
       opts.execs.push(script);

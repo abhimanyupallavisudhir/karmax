@@ -136,7 +136,7 @@ describe('fork world initialization', () => {
     const source = (await store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'source' } }));
     const handle = (await store.registerWorld({ id: source.id, kind: 'worktree', root: '/unavailable',
-      branch: 'karmax/source', base: 'main', target: 'main' }, project.id)) as WorldHandle;
+      branch: 'tavya/source', base: 'main', target: 'main' }, project.id)) as WorldHandle;
     const plan = forkWorldSource(source, handle)!;
     (await store.saveView(source.id, { status: 'done' } as any));
     const task = (await store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',

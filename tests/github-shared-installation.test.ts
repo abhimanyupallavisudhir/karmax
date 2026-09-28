@@ -141,7 +141,7 @@ describe('shared GitHub installations', () => {
       for (const task of tasks) {
         const result = await deliver('pull_request', { action: 'opened', repository: { full_name: 'acme/app' },
           pull_request: { number: 1, state: 'open', html_url: 'https://github.com/acme/app/pull/1',
-            head: { ref: `karmax/${task.id}`, sha: 'head' }, base: { ref: 'main' } } });
+            head: { ref: `tavya/${task.id}`, sha: 'head' }, base: { ref: 'main' } } });
         expect(result.events).toHaveLength(1);
         expect(result.events![0]!.taskId).toBe(task.id);
       }

@@ -1,4 +1,5 @@
 import { domainMatches } from './vault-items.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Shared Chrome DevTools Protocol plumbing for the host-side credential paths
@@ -43,7 +44,7 @@ export async function listPages(cdpUrl: string, timeoutMs = 15_000): Promise<Cdp
   } catch (e) {
     throw new Error(
       `browser credential fill is unavailable: cannot reach Chrome DevTools at ${base.origin}. ` +
-      'Use the Karmax-managed chrome-devtools browser (which exposes a loopback CDP endpoint), ' +
+      `Use the ${BRAND}-managed chrome-devtools browser (which exposes a loopback CDP endpoint), ` +
       `or pass that browser's cdpUrl. ${e instanceof Error ? e.message : String(e)}`,
       { cause: e },
     );

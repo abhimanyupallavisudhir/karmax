@@ -65,7 +65,7 @@ export class ContainerWorldProvider implements WorldProvider {
 
   async create(spec: WorldSpec): Promise<World> {
     if (!(await dockerAvailable())) throw new Error('container world requested but Docker is not available');
-    const base = await this.worktrees.create(spec); // host worktree on karmax/<taskId>
+    const base = await this.worktrees.create(spec); // host worktree on tavya/<taskId>
     const name = `karmax-${spec.taskId}`.replace(/[^a-zA-Z0-9_.-]/g, '-');
     await docker(['rm', '-f', name]); // clear any stale container
     const image = spec.environment?.image ?? IMAGE;

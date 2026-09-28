@@ -149,6 +149,43 @@ describe('credential Retry end to end', () => {
     await coordinator.registerAccounts([{ id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 }]);
   }, 90_000);
 
+  // Task 385: parked on an exhausted login's quota window, it kept waiting for
+  // the reset although a second subscription had been connected meanwhile.
+  it('resumes a task waiting out a quota limit on a login connected meanwhile', async () => {
+    const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await coordinator.setAccountAvailability({ accountId, status: 'available' });
+    await coordinator.reportAccountExhausted({ accountId, window: '5h', resetHint: 'in 3h' });
+    healthy = true;
+    const before = turns;
+    const repo = await h.makeRepo('quota-new-login');
+    const project = (await h.store.createProject('Quota login', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    const task = await h.api.createTask(token, { projectId: project.id, title: 'Quota login task',
+      prompt: '@write quota-login.txt :: QUOTA LOGIN\n@run git add quota-login.txt && git commit -m login\n@review Quota login',
+      params: { 'agent:do': { provider: 'claude', model: 'claude-fable-5-1' } },
+    });
+    const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
+    await expect.poll(async () => (await view()).waitingFor, { timeout: 30_000 })
+      .toMatchObject({ kind: 'account', provider: 'claude', earliestResetAt: expect.any(Number) });
+    expect(turns).toBe(before);
+
+    const fresh = homes.ensure('claude', 'second');
+    fs.writeFileSync(path.join(fresh, 'karmax-oauth.json'), JSON.stringify({ token: 'second-setup-token' }));
+    expectedHome = fresh;
+    await coordinator.registerAccounts([
+      { id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 },
+      { id: 'login:claude:second', provider: 'claude', kind: 'login', configHome: fresh, maxConcurrent: 1 },
+    ]);
+    await expect.poll(async () => (await view()).stage, { timeout: 30_000 }).toBe('review');
+    expect(turns).toBe(before + 1);
+    expect(await status(accountId)).toBe('exhausted');
+    await h.api.signalTask(token, task.id, 'cancel');
+    expectedHome = home;
+    homes.remove('claude', 'second');
+    await coordinator.registerAccounts([{ id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 }]);
+    await coordinator.setAccountAvailability({ accountId, status: 'available' });
+  }, 90_000);
+
   // Task 381: each quota failure on a leased login parks until the reported
   // reset, so it is a wait, not a failed attempt to escalate after two retries.
   it('keeps waiting through repeated quota limits instead of escalating', async () => {

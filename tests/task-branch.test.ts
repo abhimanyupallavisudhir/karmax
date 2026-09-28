@@ -20,9 +20,9 @@ describe('task branch ancestry bookkeeping', () => {
     fs.writeFileSync(path.join(repo, 'base.txt'), 'common\n');
     await gitOrThrow(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'common base']);
-    await gitOrThrow(repo, ['branch', 'karmax/parent']);
+    await gitOrThrow(repo, ['branch', 'tavya/parent']);
     const parentTree = path.join(root, 'parent-tree');
-    await gitOrThrow(repo, ['worktree', 'add', '-q', parentTree, 'karmax/parent']);
+    await gitOrThrow(repo, ['worktree', 'add', '-q', parentTree, 'tavya/parent']);
     fs.writeFileSync(path.join(parentTree, 'parent.txt'), 'parent work\n');
     await gitOrThrow(parentTree, ['add', '-A']);
     await gitOrThrow(parentTree, ['commit', '-q', '-m', 'parent work']);
@@ -41,10 +41,10 @@ describe('task branch ancestry bookkeeping', () => {
     const { root, repo, parent } = await fixture('stack-parent');
     const provider = new WorktreeProvider(path.join(root, 'worlds'));
     const child = await provider.create({ taskId: 'stack-child', repo,
-      base: 'karmax/parent', target: 'karmax/parent' });
-    expect(child.handle).toMatchObject({ base: 'karmax/parent', target: 'karmax/parent' });
+      base: 'tavya/parent', target: 'tavya/parent' });
+    expect(child.handle).toMatchObject({ base: 'tavya/parent', target: 'tavya/parent' });
     expect(child.handle.repos?.[0]).toMatchObject({
-      base: 'karmax/parent', target: 'karmax/parent', baseSha: parent,
+      base: 'tavya/parent', target: 'tavya/parent', baseSha: parent,
     });
   });
 
@@ -61,7 +61,7 @@ describe('task branch ancestry bookkeeping', () => {
     await gitOrThrow(checkout.root, ['commit', '-q', '-m', 'recovered onboarding']);
     const beforeTree = (await gitOrThrow(checkout.root, ['rev-parse', 'HEAD^{tree}'])).trim();
 
-    const result = await ensureTaskBranchAncestry(world, 'karmax/parent');
+    const result = await ensureTaskBranchAncestry(world, 'tavya/parent');
     expect(result.errors).toEqual({});
     expect(result.repaired).toEqual([expect.objectContaining({ repo: 'repo', baseSha: provisioned, targetSha: parent })]);
     expect((await gitOrThrow(checkout.root, ['rev-parse', 'HEAD^{tree}'])).trim()).toBe(beforeTree);
@@ -74,7 +74,7 @@ describe('task branch ancestry bookkeeping', () => {
     const checkout = world.handle.repos![0]!;
     await gitOrThrow(checkout.root, ['merge', '-q', '--no-edit', parent]);
     const head = (await gitOrThrow(checkout.root, ['rev-parse', 'HEAD'])).trim();
-    expect(await ensureTaskBranchAncestry(world, 'karmax/parent')).toEqual({ repaired: [], errors: {} });
+    expect(await ensureTaskBranchAncestry(world, 'tavya/parent')).toEqual({ repaired: [], errors: {} });
     expect((await gitOrThrow(checkout.root, ['rev-parse', 'HEAD'])).trim()).toBe(head);
     expect((await git(checkout.root, ['merge-base', '--is-ancestor', provisioned, 'HEAD'])).code).toBe(0);
   });
@@ -90,7 +90,7 @@ describe('task branch ancestry bookkeeping', () => {
     await gitOrThrow(checkout.root, ['cherry-pick', feature]);
     const tree = (await gitOrThrow(checkout.root, ['rev-parse', 'HEAD^{tree}'])).trim();
 
-    const result = await ensureTaskBranchAncestry(world, 'karmax/parent');
+    const result = await ensureTaskBranchAncestry(world, 'tavya/parent');
     expect(result.errors).toEqual({});
     expect(result.repaired).toHaveLength(1);
     expect((await gitOrThrow(checkout.root, ['rev-parse', 'HEAD^{tree}'])).trim()).toBe(tree);
@@ -111,7 +111,7 @@ describe('task branch ancestry bookkeeping', () => {
     await gitOrThrow(checkout.root, ['reset', '--hard', '-q', parent]);
     await gitOrThrow(checkout.root, ['merge', '-q', '--allow-unrelated-histories', '--no-edit', foreign]);
 
-    const result = await ensureTaskBranchAncestry(world, 'karmax/parent');
+    const result = await ensureTaskBranchAncestry(world, 'tavya/parent');
     expect(result.repaired).toEqual([]);
     expect(result.errors.repo).toMatch(/local recorded-base ancestry violation.*contains history unrelated to the selected target/i);
   });
@@ -126,7 +126,7 @@ describe('task branch ancestry bookkeeping', () => {
     await gitOrThrow(checkout.root, ['commit', '-q', '-m', 'unrelated root']);
     await gitOrThrow(checkout.root, ['branch', '-f', checkout.branch, 'HEAD']);
 
-    const result = await ensureTaskBranchAncestry(world, 'karmax/parent');
+    const result = await ensureTaskBranchAncestry(world, 'tavya/parent');
     expect(result.repaired).toEqual([]);
     expect(result.errors.repo).toMatch(/local recorded-base ancestry violation.*does not descend from selected target/i);
   });

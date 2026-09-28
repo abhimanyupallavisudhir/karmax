@@ -12,6 +12,7 @@ import {
   QRY_BUDGET,
   QRY_RESOURCE_PUBLISH,
 } from '../coordinators/names.js';
+import { BRAND } from '../domain/brand.js';
 
 /** Bound every probe: a wedged coordinator answers neither query nor history. */
 const PROBE_TIMEOUT_MS = 4000;
@@ -183,7 +184,7 @@ export async function healCoordinators(
       try {
         await client.workflow
           .getHandle(workflowId, runId)
-          .terminate('karmax: coordinator history is unreplayable by current code');
+          .terminate(`${BRAND}: coordinator history is unreplayable by current code`);
         await client.workflow.start(type, {
           workflowId,
           taskQueue,

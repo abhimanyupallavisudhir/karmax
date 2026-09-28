@@ -582,9 +582,9 @@ describe('GitHub App integration', () => {
     (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
       stage: 'review', status: 'waiting', messages: [], actions: [], state: {}, updatedAt: Date.now(),
       pr: taskPr, prs: [taskPr],
-      checkouts: [{ name: 'app', branch: `karmax/${task.id}`, base: 'main', pr: taskPr }] }));
+      checkouts: [{ name: 'app', branch: `tavya/${task.id}`, base: 'main', pr: taskPr }] }));
 
-    const merged = await deliver('pull_request', 'pr-1', pull(`karmax/${task.id}`));
+    const merged = await deliver('pull_request', 'pr-1', pull(`tavya/${task.id}`));
     expect(merged.events).toHaveLength(1);
     expect(merged.events![0]).toMatchObject({ taskId: task.id, type: 'github.pr.merged' });
     expect((await store.getTask(task.id))?.lastView?.pr).toMatchObject({ state: 'closed', merged: true });
@@ -593,25 +593,25 @@ describe('GitHub App integration', () => {
     const check = await deliver('check_run', 'check-1', {
       installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
       check_run: { id: 501, name: 'CI', status: 'completed', conclusion: 'failure',
-        check_suite: { head_branch: `karmax/${task.id}`, head_sha: 'head-1' },
+        check_suite: { head_branch: `tavya/${task.id}`, head_sha: 'head-1' },
         pull_requests: [{ number: 3 }] },
     });
     expect(check.events).toEqual([expect.objectContaining({ taskId: task.id, type: 'github.check.completed' })]);
     const duplicateCheck = await deliver('check_run', 'check-duplicate-delivery', {
       installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
       check_run: { id: 501, name: 'CI', status: 'completed', conclusion: 'failure',
-        check_suite: { head_branch: `karmax/${task.id}`, head_sha: 'head-1' },
+        check_suite: { head_branch: `tavya/${task.id}`, head_sha: 'head-1' },
         pull_requests: [{ number: 3 }] },
     });
     expect(duplicateCheck.events).toBeUndefined();
 
-    const synchronize = pull(`karmax/${task.id}`, { state: 'open', merged: false,
-      head: { ref: `karmax/${task.id}`, sha: 'head-2' } });
+    const synchronize = pull(`tavya/${task.id}`, { state: 'open', merged: false,
+      head: { ref: `tavya/${task.id}`, sha: 'head-2' } });
     synchronize.action = 'synchronize';
     expect((await deliver('pull_request', 'sync-1', synchronize)).events).toHaveLength(1);
     expect((await deliver('pull_request', 'sync-2', synchronize)).events).toBeUndefined();
-    const nextSynchronize = pull(`karmax/${task.id}`, { state: 'open', merged: false,
-      head: { ref: `karmax/${task.id}`, sha: 'head-3' } });
+    const nextSynchronize = pull(`tavya/${task.id}`, { state: 'open', merged: false,
+      head: { ref: `tavya/${task.id}`, sha: 'head-3' } });
     nextSynchronize.action = 'synchronize';
     expect((await deliver('pull_request', 'sync-3', nextSynchronize)).events).toHaveLength(1);
     const failedWorkflow = await deliver('workflow_run', 'workflow-1', {
@@ -619,7 +619,7 @@ describe('GitHub App integration', () => {
       repository: { id: 99, full_name: 'acme/app' },
       workflow_run: { id: 700, name: 'Deploy', run_attempt: 2, conclusion: 'failure',
         head_branch: 'main', head_sha: 'merged-sha', html_url: 'https://github.com/acme/app/actions/runs/700',
-        pull_requests: [{ head: { ref: `karmax/${task.id}` } }],
+        pull_requests: [{ head: { ref: `tavya/${task.id}` } }],
       },
     });
     expect(failedWorkflow.projectEvents).toEqual([expect.objectContaining({
@@ -662,11 +662,11 @@ describe('GitHub App integration', () => {
     expect(await deliver('pull_request', 'pr-2', pull('feature/manual'))).toEqual({ accepted: true });
     // Neither does a branch naming a task in an organization that did not install
     // this App — an installation drives only its own tenant's tasks.
-    expect(await deliver('pull_request', 'pr-3', pull(`karmax/${otherTask.id}`))).toEqual({ accepted: true });
+    expect(await deliver('pull_request', 'pr-3', pull(`tavya/${otherTask.id}`))).toEqual({ accepted: true });
     // …nor one naming a task that does not exist at all.
-    expect(await deliver('pull_request', 'pr-4', pull('karmax/task_ghost'))).toEqual({ accepted: true });
+    expect(await deliver('pull_request', 'pr-4', pull('tavya/task_ghost'))).toEqual({ accepted: true });
     // Deliveries are still de-duplicated by id.
-    expect((await deliver('pull_request', 'pr-1', pull(`karmax/${task.id}`))).accepted).toBe(false);
+    expect((await deliver('pull_request', 'pr-1', pull(`tavya/${task.id}`))).accepted).toBe(false);
     (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });

@@ -43,7 +43,7 @@ eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.UR
 eval(extractConst('NOTIFY_BEHAVIOURS').replace('const NOTIFY_BEHAVIOURS =', 'global.NOTIFY_BEHAVIOURS ='));
 eval(extractConst('NOTIFY_DEFAULTS', '\n};').replace('const NOTIFY_DEFAULTS =', 'global.NOTIFY_DEFAULTS ='));
 for (const name of ['urgencyRank', 'notifyPrefs', 'setNotifyPref', 'inboxArrivals', 'announceInbox',
-  'notificationSoundPrefs', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'inboxTitle', 'notificationsCard']) eval(extractFn(name));
+  'notificationSoundPrefs', 'siteName', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'inboxTitle', 'notificationsCard']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -115,7 +115,7 @@ ok(shown[0].body.startsWith('CRITICAL'), 'system notification names priority');
 ok(shown[0].tag === 'a', 'a popup is tagged with its ask, so a restatement replaces it');
 shown.length = 0;
 showSystemNotification({ id: 'z', urgency: 'critical', kind: 'escalated' });
-ok(shown[0].title === 'karmax', 'an ask with no task title falls back to the product name, spelled right');
+ok(shown[0].title === 'tavya', 'an ask with no task title falls back to the product name, spelled right');
 ok(blips.length === 2 && blips.every((tone) => tone === 880),
   `one sound per batch, at the loudest level that arrived (got ${blips.join(',')})`);
 

@@ -6,6 +6,7 @@
  * tied to the exact disclosure a person saw.
  */
 import { HOSTED_PLANS } from '../domain/entitlements.js';
+import { DEFAULT_SITE_NAME } from '../domain/brand.js';
 
 export const POLICY_VERSION = '2026-09-24.1';
 export const POLICY_EFFECTIVE_DATE = 'September 24, 2026';
@@ -25,15 +26,15 @@ export interface PolicyDocument {
 
 const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>> = {
   terms: {
-    slug: 'terms', title: 'Terms of Service', summary: 'The agreement for using krmax and its hosted agent-orchestration service.',
+    slug: 'terms', title: 'Terms of Service', summary: 'The agreement for using tavya and its hosted agent-orchestration service.',
     sections: [
       { heading: 'Agreement and operator', paragraphs: [
         'These Terms are an initial launch draft between you and the service operator identified in the launch configuration. Do not publish paid checkout until that identity and the governing-law fields are completed.',
-        'By creating an account or buying a subscription, you affirmatively accept the versions shown at that action. If you use krmax for an organization, you represent that you may accept for it.',
+        'By creating an account or buying a subscription, you affirmatively accept the versions shown at that action. If you use tavya for an organization, you represent that you may accept for it.',
         'Where the operator processes personal data on your behalf as a processor, the Data Processing Addendum linked with these Terms forms part of the agreement. It takes precedence over conflicting provisions of these Terms for that processing. It is not a certification that your particular use complies with data protection law.',
       ] },
       { heading: 'The service', paragraphs: [
-        'krmax coordinates AI agents, repositories, isolated workspaces, credentials, approvals, and related project records. Outputs can be incomplete or wrong. You remain responsible for reviewing work and choosing permissions, budgets, and deployment targets.',
+        'tavya coordinates AI agents, repositories, isolated workspaces, credentials, approvals, and related project records. Outputs can be incomplete or wrong. You remain responsible for reviewing work and choosing permissions, budgets, and deployment targets.',
         'Third-party services remain governed by their own terms. Availability can change when a repository host, model provider, cloud-workspace provider, payment provider, or customer-supplied integration changes or is unavailable.',
       ] },
       { heading: 'Your content and instructions', paragraphs: [
@@ -54,7 +55,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
   'acceptable-use': {
     slug: 'acceptable-use', title: 'Acceptable Use Policy', summary: 'Safety boundaries for people, agents, repositories, credentials, and spending.',
     sections: [
-      { heading: 'Use systems only with authority', paragraphs: ['Do not use krmax or an agent to access, test, alter, disrupt, purchase from, or communicate with systems or people unless you have authority to do so.'], bullets: [
+      { heading: 'Use systems only with authority', paragraphs: ['Do not use tavya or an agent to access, test, alter, disrupt, purchase from, or communicate with systems or people unless you have authority to do so.'], bullets: [
         'No credential theft, phishing, malware, destructive payloads, or bypassing access controls.',
         'No unlawful surveillance, exploitation, harassment, fraud, or deceptive impersonation.',
         'No unauthorized vulnerability testing, spam, denial of service, or attempts to evade provider safeguards.',
@@ -68,14 +69,14 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
     ],
   },
   privacy: {
-    slug: 'privacy', title: 'Privacy Policy', summary: 'What krmax processes, why, where providers fit, and the choices available to you.',
+    slug: 'privacy', title: 'Privacy Policy', summary: 'What tavya processes, why, where providers fit, and the choices available to you.',
     sections: [
       { heading: 'Roles and data categories', paragraphs: [
         'For account, authentication, support, product telemetry, and billing records, the configured service operator generally determines why and how data is processed.',
         'For repository, prompt, task, workspace, credential, and output data a customer submits under a controller/processor relationship, the customer determines the purpose and the operator processes that data on its behalf. The Data Processing Addendum applies to that processing, including where the customer is itself a processor for another controller. Roles depend on the actual processing, not just whose API key is used.',
       ], bullets: [
         'Account data: name, email, login providers, memberships, preferences, sessions, and security events.',
-        'Billing data: plan, price, renewal state, payment-provider customer/subscription references, acceptance evidence, refunds, and support history. The checkout payment provider handles subscription card details; krmax does not store full subscription payment-card numbers.',
+        'Billing data: plan, price, renewal state, payment-provider customer/subscription references, acceptance evidence, refunds, and support history. The checkout payment provider handles subscription card details; tavya does not store full subscription payment-card numbers.',
         'Customer workspace data: repository files and metadata, prompts, tasks, messages, outputs, environment state, attachments, connected-service data, and audit events.',
       ] },
       { heading: 'How data is used', paragraphs: ['Data is used to provide and secure the service, execute customer instructions, authenticate users, administer subscriptions, respond to support and legal requests, prevent abuse, and maintain reliable operations. This draft does not authorize selling personal data or using private customer repository/workspace content to train general-purpose models.'] },
@@ -88,8 +89,8 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'We receive information from you, your organization’s administrators and invited members, and the identity, repository, model and other services that you authorize us to connect. Those services may supply profile identifiers, access permissions and the records requested by your tasks. Payment providers supply subscription and transaction status. Service operation also generates security and diagnostic records.',
       ] },
       { heading: 'Model keys and usage modes', paragraphs: [
-        'With bring-your-own-key (BYOK), krmax stores the customer-supplied secret in its encrypted credential system and sends selected prompts, context, and files to the model provider the customer chose. Charges and provider data terms belong to that customer account.',
-        'With a customer-connected OpenAI, Anthropic, or other subscription login, krmax operates the provider client under that customer connection. With managed usage, the operator supplies the provider account and the provider acts as an applicable subprocessor. The UI must identify the active rail; no mode prevents the chosen provider from receiving the content needed for the request.',
+        'With bring-your-own-key (BYOK), tavya stores the customer-supplied secret in its encrypted credential system and sends selected prompts, context, and files to the model provider the customer chose. Charges and provider data terms belong to that customer account.',
+        'With a customer-connected OpenAI, Anthropic, or other subscription login, tavya operates the provider client under that customer connection. With managed usage, the operator supplies the provider account and the provider acts as an applicable subprocessor. The UI must identify the active rail; no mode prevents the chosen provider from receiving the content needed for the request.',
       ] },
       { heading: 'Sharing, transfers, and retention', paragraphs: [
         'Data is shared with subprocessors only for the service functions described on the Subprocessor list, with customer-selected integrations, when a customer directs, or when legally required. Providers may process data in the regions described by their own service terms and the applicable DPA.',
@@ -98,8 +99,8 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
       ] },
       { heading: 'Customer-connected services and MCP', paragraphs: [
         'When you connect a repository, model account, MCP server or other integration, your authorized tasks may send it tool arguments, files, prompts or other selected information and receive information in return. Review the destination, its permissions and its own terms before allowing access. A connection is not permission for unrelated actions.',
-        'A service you independently engage is not automatically an operator subprocessor merely because krmax can connect to it. Conversely, a provider engaged by the operator to deliver the service remains its responsibility even when you choose it from a menu. Any intermediary used by the operator to broker a connection must also be accounted for.',
-        'Information returned by an integration may be retained in krmax tasks, conversations, logs or artifacts under Data controls. Disconnecting an integration does not erase those copies or records already held by the destination. The operator remains responsible for its own copies and for processing within its role; it cannot promise deletion from every independent service.',
+        'A service you independently engage is not automatically an operator subprocessor merely because tavya can connect to it. Conversely, a provider engaged by the operator to deliver the service remains its responsibility even when you choose it from a menu. Any intermediary used by the operator to broker a connection must also be accounted for.',
+        'Information returned by an integration may be retained in tavya tasks, conversations, logs or artifacts under Data controls. Disconnecting an integration does not erase those copies or records already held by the destination. The operator remains responsible for its own copies and for processing within its role; it cannot promise deletion from every independent service.',
       ] },
       { heading: 'Your rights and complaints', paragraphs: [
         'Contact the privacy address shown on this page to request access, correction, erasure, restriction or portability where applicable. You may object to processing based on legitimate interests. Where we rely on consent, you may withdraw it at any time without affecting the lawfulness of processing before withdrawal. We may need proportionate information to verify your identity and authority; some rights depend on the purpose and legal basis of processing.',
@@ -120,7 +121,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'Deleting an account does not silently replace subscription cancellation. The account-deletion flow directs customers to cancel first and support must resolve any active billing relationship as part of deletion.',
       ] },
       { heading: 'Refunds and downgrades', paragraphs: [
-        'Request refunds or report duplicate or erroneous charges through the configured billing contact or the payment provider. Paddle purchases are subject to Paddle’s buyer terms and refund decisions. Statutory consumer rights are not excluded. Approved Paddle refunds are processed through Paddle, not by a separate direct payment from krmax.',
+        'Request refunds or report duplicate or erroneous charges through the configured billing contact or the payment provider. Paddle purchases are subject to Paddle’s buyer terms and refund decisions. Statutory consumer rights are not excluded. Approved Paddle refunds are processed through Paddle, not by a separate direct payment from tavya.',
         'Plan and active-user changes take effect after confirmation by the payment provider. Prorated adjustments are added to the next bill. A downgrade can reduce feature or usage limits when confirmed; cancellation at period end is a separate action.',
       ] },
     ],
@@ -137,7 +138,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'Resend — transactional account, verification, security and support-notification email where configured; receives recipient addresses and message contents, not unrestricted repository access.',
         'Composio — managed connection brokerage where configured; may handle connection credentials and tool requests/results. A broker engaged by the operator is distinct from the customer-selected destination service.',
         'Configured database, object-storage, hosting, email, monitoring, and support providers — account records, service metadata, stored objects, transactional messages, diagnostics, or support content as needed for their function.',
-        'Customer-selected repository hosts and integrations (for example GitHub) — data the customer directs krmax to read or write under the customer’s connection. These may be independent services as well as processors acting on the customer’s instructions.',
+        'Customer-selected repository hosts and integrations (for example GitHub) — data the customer directs tavya to read or write under the customer’s connection. These may be independent services as well as processors acting on the customer’s instructions.',
       ] },
       { heading: 'Roles, locations and changes', paragraphs: [
         'This list includes conditional providers and independent services, not a claim that every named company is a subprocessor for every customer. Providers engaged by the operator to process customer personal data are subject to the DPA; independently selected destinations and payment providers may have different roles. Neither BYOK nor customer selection alone determines the legal role.',
@@ -150,8 +151,8 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
     slug: 'security', title: 'Security & Contact', summary: 'Security posture, responsible disclosure, and incident contact.',
     sections: [
       { heading: 'Operational safeguards', paragraphs: [
-        'krmax uses scoped authorization, isolated execution worlds, encrypted credential storage, reviewed change flows, audit events, and provider-specific access boundaries. Customers remain responsible for repository permissions, connected accounts, agent grants, budgets, and reviewing proposed changes.',
-        'No SOC 2, ISO 27001, HIPAA, PCI, GDPR, or other certification or compliance status is claimed unless a separately signed document explicitly says so. The subscription payment provider handles payment-card entry; that fact alone is not a krmax certification.',
+        'tavya uses scoped authorization, isolated execution worlds, encrypted credential storage, reviewed change flows, audit events, and provider-specific access boundaries. Customers remain responsible for repository permissions, connected accounts, agent grants, budgets, and reviewing proposed changes.',
+        'No SOC 2, ISO 27001, HIPAA, PCI, GDPR, or other certification or compliance status is claimed unless a separately signed document explicitly says so. The subscription payment provider handles payment-card entry; that fact alone is not a tavya certification.',
       ] },
       { heading: 'Responsible disclosure', paragraphs: ['Send suspected vulnerabilities to the configured security contact with reproduction details, impact, and a safe way to reply. Do not access other customers’ data, degrade service, or publicly disclose an unresolved issue. The operator will acknowledge and coordinate in good faith; this draft does not invent a bounty or guaranteed response time.'] },
       { heading: 'Incidents', paragraphs: ['Customers should use the configured incident contact for suspected account compromise or exposure. The operator will investigate, contain, preserve relevant evidence, and notify affected customers as required by contract and applicable law.'] },
@@ -214,7 +215,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
   },
 };
 
-const withSiteName = (text: string, siteName: string) => text.replace(/krmax|Karmax/g, siteName);
+const withSiteName = (text: string, siteName: string) => text.replace(/\btavya\b/g, siteName);
 const namedPolicy = (document: Omit<PolicyDocument, 'version' | 'effectiveDate'>, siteName: string) => ({
   ...document,
   summary: withSiteName(document.summary, siteName),
@@ -322,7 +323,7 @@ export function launchConfig(env: NodeJS.ProcessEnv = process.env, stored?: Stor
 }
 
 export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig,
-  siteName = 'krmax') {
+  siteName = DEFAULT_SITE_NAME) {
   const config = launchConfig(env, stored);
   return {
     policyVersion: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE, draftNotice: POLICY_DRAFT_NOTICE,
@@ -349,7 +350,7 @@ export function assertPaidLaunchReady(env: NodeJS.ProcessEnv = process.env, stor
 }
 
 export function policyDocument(slug: string, env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig,
-  siteName = 'krmax'): (PolicyDocument & { draftNotice: string; operator: ReturnType<typeof publicLaunchInfo>['operator']; contacts: LaunchConfig['contacts'] }) | undefined {
+  siteName = DEFAULT_SITE_NAME): (PolicyDocument & { draftNotice: string; operator: ReturnType<typeof publicLaunchInfo>['operator']; contacts: LaunchConfig['contacts'] }) | undefined {
   if (!POLICY_SLUGS.includes(slug as PolicySlug)) return undefined;
   const info = publicLaunchInfo(env, stored, siteName);
   return { ...namedPolicy(docs[slug as PolicySlug], siteName), version: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE,

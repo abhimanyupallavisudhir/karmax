@@ -2,6 +2,7 @@ import { beforeAll, afterAll, describe, it, expect } from 'vitest';
 import { bootHarness, type Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
+import { temporal } from '@temporalio/proto';
 
 describe('service connection workflow wait (real Temporal)', () => {
   let h: Harness;
@@ -18,20 +19,23 @@ describe('service connection workflow wait (real Temporal)', () => {
       try {
         await expect.poll(async () => (await view()).waitingFor?.detail, { timeout: 25_000 }).toContain('Connect the requested app');
         expect((await view()).stage).toBe('do');
-        // The query answers from workflow memory before the wait is durably
-        // published and the world parked. Restarting mid-way strands that work until
-        // its timeout (parkWaitingWorld heartbeats every 30 s) and stalls the task
-        // past the limit below (task 389's CI flake). Restart once nothing is in flight.
-        await expect.poll(async () => {
-          const { raw } = await handle.describe();
-          return !raw.pendingWorkflowTask && !(raw.pendingActivities?.length);
-        }, { timeout: 25_000 }).toBe(true);
+        // Restart while the task is idle in its sign-in wait, as in production.
+        // Restarting mid workflow task abandons that task, and Temporal only
+        // reschedules it after its 10 s workflow-task timeout: a CI flake.
+        await expect.poll(async () => (await handle.fetchHistory()).events?.at(-1)?.eventType, { timeout: 25_000 })
+          .toBe(temporal.api.enums.v1.EventType.EVENT_TYPE_TIMER_STARTED);
         await h.restartWorker();
         expect((await view()).stage).toBe('do');
         (await h.store.kvSet(`service-connection:${taskId}`, JSON.stringify({ id: taskId, taskId, status: 'active', notifiedAt: Date.now() })));
         await handle.signal('followUp', { id: 'connected', role: 'user', text: 'Account connected. Continue.\n@openpr', ts: Date.now() }, 'do');
         await expect.poll(async () => (await view()).stage, { timeout: 25_000 }).toBe('review');
-      } finally { await handle.signal('cancel'); await handle.result().catch(() => {}); }
+      } finally {
+        // Bounded, so a failed assertion is reported rather than a test timeout.
+        await handle.signal('cancel');
+        const finished = await Promise.race([handle.result().then(() => true, () => true),
+          new Promise<false>((resolve) => setTimeout(() => resolve(false), 20_000))]);
+        if (!finished) await handle.terminate('test cleanup').catch(() => {});
+      }
     }, 90_000);
   }
 });

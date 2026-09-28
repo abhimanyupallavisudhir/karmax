@@ -40,6 +40,8 @@ let releaseFrontHeldRepair: (() => void) | undefined;
 let frontHeldRepairGate: Promise<void> = Promise.resolve();
 const exactCandidateTurns: { role: string; session?: string; messages: string[] }[] = [];
 let exactCandidateRevisions = 0;
+// Task 389: an integration turn does not make CI green; only a new run can.
+let ciStaysRedThroughIntegration = false;
 let actionsHaveSteps = true;
 let actionsRunAttempt = 1;
 let actionsReruns = 0;
@@ -245,7 +247,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
             .test(input.messages.at(-1)?.text ?? '')) {
           // The repaired proposal's external CI is green by the time the
           // independent integration reviewer admits it again.
-          githubReadiness = {};
+          if (!ciStaysRedThroughIntegration) githubReadiness = {};
           return mock.runTurn({
             ...input,
             messages: [...input.messages, {
@@ -263,7 +265,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
             session: input.session,
             messages: input.messages.map((message) => message.text),
           });
-          githubReadiness = {};
+          if (!ciStaysRedThroughIntegration) githubReadiness = {};
           const verdict = exactCandidateRevisions > 0
             ? (exactCandidateRevisions--, '@confirm revise :: Add the missing exact-candidate repair.')
             : '@confirm confirm';
@@ -343,6 +345,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     frontHeldRepairGate = Promise.resolve();
     exactCandidateTurns.length = 0;
     exactCandidateRevisions = 0;
+    ciStaysRedThroughIntegration = false;
     actionsHaveSteps = true;
     actionsRunAttempt = 1;
     actionsReruns = 0;
@@ -431,10 +434,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(prs).toHaveLength(1);
     expect(prs[0].title).toBe('Add a greeter');
     expect(prs[0].body).toContain('greet.js');
-    expect(prs[0].head.ref).toBe(`karmax/${taskId}`);
+    expect(prs[0].head.ref).toBe(`tavya/${taskId}`);
     // The branch reached origin, the merge landed, and the PR was reconciled.
     const origin = path.join(originDir, 'app.git');
-    expect((await git(origin, ['rev-parse', '--verify', `karmax/${taskId}`])).code).toBe(0);
+    expect((await git(origin, ['rev-parse', '--verify', `tavya/${taskId}`])).code).toBe(0);
     expect((await git(origin, ['show', 'main:greet.js'])).stdout).toContain('export const g');
     expect(prs[0].state).toBe('closed');
     expect(comments.map((c) => c.body).join('\n')).toContain('merged this branch into `main`');
@@ -472,11 +475,11 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect((await handle.result()).stage).toBe('done');
 
     expect(prs).toHaveLength(1);
-    expect(prs[0].head.ref).toBe(`karmax/${taskId}`);
+    expect(prs[0].head.ref).toBe(`tavya/${taskId}`);
     const origin = path.join(originDir, 'uncommitted.git');
     // The proposed remote branch already contains the Merge agent's commit;
     // preparation did not happen only after the PR had captured an empty head.
-    expect((await git(origin, ['show', `karmax/${taskId}:kablooga.md`])).stdout)
+    expect((await git(origin, ['show', `tavya/${taskId}:kablooga.md`])).stdout)
       .toContain('# Kablooga');
     expect((await git(origin, ['show', 'main:kablooga.md'])).stdout)
       .toContain('# Kablooga');
@@ -591,7 +594,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       expect(turns).toBe(scenario === 'recorded checkpoint' ? 1 : 2);
       expect((await h.store.eventsOfType(task.id, 'resolve.auto'))).toHaveLength(0);
       const origin = remoteBySlug.get(SLUG)!;
-      const head = (await git(origin, ['rev-parse', `karmax/${task.id}`])).stdout.trim();
+      const head = (await git(origin, ['rev-parse', `tavya/${task.id}`])).stdout.trim();
       expect(review.pr.headSha).toBe(head);
       expect((await git(origin, ['rev-parse', `${head}^{tree}`])).stdout.trim())
         .toBe((await git(repo, ['rev-parse', `${amendedHead}^{tree}`])).stdout.trim());
@@ -791,6 +794,109 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(actionsReruns).toBe(1);
   }, 120_000);
 
+  // Task 389: a failed step went to Do, which judged it unrelated and resubmitted
+  // the exact head. Only a new run could change GitHub's answer, yet nothing
+  // started one, so the task polled 20 times and handed a person the raw log.
+  it('reruns failed CI once when the CI repair resubmits the exact head, then lands', async () => {
+    const repo = await repoWithOrigin('github-unchanged-repair');
+    const project = (await h.store.createProject('Unchanged CI repair', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'unchanged-repair', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'unchanged-repair-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Unrelated CI failure', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write unrelated.md :: correct proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 10,
+      }],
+    });
+    ciStaysRedThroughIntegration = true;
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    actionsJobConclusion = 'failure';
+    actionsJobLog = 'FAIL tests/unrelated.test.ts > times out\nAssertionError: expected \'do\' to be \'review\'\n';
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    const head = prs[0].head.sha;
+    await handle.signal('confirm');
+
+    await expect.poll(() => actionsReruns, { timeout: 30_000 }).toBe(1);
+    const events = await h.store.eventsSince(task.id, 0);
+    expect(events.filter((event) => event.type === 'github.ci.repair-requested')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'github.ci.rerun-requested')).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ runId: 42, observedAttempt: 1, reason: 'unchanged-after-repair' }) }),
+    ]);
+    expect(prs[0].head.sha).toBe(head);
+    // The rerun passes on the same head.
+    actionsRunAttempt = 2;
+    actionsRunConclusion = 'success';
+    actionsJobConclusion = 'success';
+    githubReadiness = {};
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(actionsReruns).toBe(1);
+    // No person was asked anything after the initial Review.
+    expect((await h.store.eventsSince(task.id, 0)).filter((event) => event.type === 'view.updated'
+      && event.payload?.waitingFor === 'human' && event.payload?.stage !== 'review')).toHaveLength(0);
+  }, 120_000);
+
+  it('asks a person, briefly, only when CI fails again after that rerun', async () => {
+    const repo = await repoWithOrigin('github-unchanged-repair-refail');
+    const project = (await h.store.createProject('Unchanged CI repair fails again', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'unchanged-repair-refail', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'unchanged-repair-refail-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Reproducible CI failure', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write refail.md :: proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 10,
+      }],
+    });
+    ciStaysRedThroughIntegration = true;
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    actionsJobConclusion = 'failure';
+    actionsJobLog = `FAIL tests/unrelated.test.ts > times out\n${'noisy runner output\n'.repeat(2_000)}`;
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    await handle.signal('confirm');
+    await expect.poll(() => actionsReruns, { timeout: 30_000 }).toBe(1);
+    // The rerun fails the same way.
+    actionsRunAttempt = 2;
+
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
+    const waiting = (await view(handle)).waitingFor!;
+    expect(waiting.summary).toBe('CI failed again after a rerun');
+    expect(waiting.detail).toMatch(/failed again after an automatic rerun/i);
+    expect(waiting.detail).toContain(`https://github.com/${SLUG}/actions/runs/42`);
+    expect(waiting.detail).toContain('unit tests');
+    expect(waiting.detail).not.toContain('noisy runner output');
+    expect(waiting.detail!.length).toBeLessThan(1_000);
+    expect(actionsReruns).toBe(1);
+    await handle.signal('cancel');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
   it.each([
     ['action_required', 'GitHub Actions action required'],
     ['startup_failure', 'GitHub Actions failure needs inspection'],
@@ -831,8 +937,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 30_000 }).toMatchObject({
       kind: 'human',
       summary,
-      detail: expect.stringMatching(new RegExp(`run CI #1.*concluded ${conclusion}.*Classification: human`, 'is')),
+      detail: expect.stringMatching(new RegExp(`run CI #1.*concluded ${conclusion}.*Inspect`, 'is')),
     });
+    // Person-facing: the brief form, never the provider log.
+    expect((await view(handle)).waitingFor?.detail).not.toContain('billing issue');
     // The workflow query is live state; publishView persists the projection in
     // the following activity. Wait for that durable boundary instead of racing
     // the worker immediately after the query observes the hold.
@@ -1095,8 +1203,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       const survivorIndex = 1 - cancelledIndex;
       const cancelledTask = [first, second][cancelledIndex]!;
       const survivor = [first, second][survivorIndex]!;
-      const cancelledPr = prs.find((pr) => pr.head.ref === `karmax/${cancelledTask.id}`)!;
-      const survivingPr = prs.find((pr) => pr.head.ref === `karmax/${survivor.id}`)!;
+      const cancelledPr = prs.find((pr) => pr.head.ref === `tavya/${cancelledTask.id}`)!;
+      const survivingPr = prs.find((pr) => pr.head.ref === `tavya/${survivor.id}`)!;
       await handles[cancelledIndex]!.signal('cancel');
       expect(await handles[cancelledIndex]!.result()).toMatchObject({ stage: 'cancelled' });
       // Cancellation closes its PR; GitHub removes a closed PR from its queue.
@@ -1223,7 +1331,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => {
       const current = await view(handle);
       return `${current.stage}/${current.messages.at(-1)?.text ?? ''}`;
-    }, { timeout: 30_000 }).toMatch(/do\/.*released every Karmax admission slot/is);
+    }, { timeout: 30_000 }).toMatch(/do\/.*released every tavya admission slot/is);
     const repairing = await view(handle);
     expect(repairing.mergeQueue).toBeUndefined();
     expect(repairing.state.mergeDomains).toBeUndefined();
@@ -1596,7 +1704,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect((await handle.result()).stage).toBe('done');
 
     const origin = path.join(originDir, 'post-pr-conflict.git');
-    expect((await git(origin, ['show', `karmax/${taskId}:conflict.txt`])).stdout)
+    expect((await git(origin, ['show', `tavya/${taskId}:conflict.txt`])).stdout)
       .toBe('resolved after PR\n');
     expect((await git(origin, ['show', 'main:conflict.txt'])).stdout)
       .toBe('resolved after PR\n');
@@ -1630,7 +1738,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
     // The PR still opens — that half of the stage is version-independent.
     expect(prs).toHaveLength(1);
-    expect(prs[0].head.ref).toBe(`karmax/${taskId}`);
+    expect(prs[0].head.ref).toBe(`tavya/${taskId}`);
     // …but nothing reconciles it, exactly as this version's history recorded.
     expect(prs[0].state).toBe('open');
     expect(comments).toEqual([]);

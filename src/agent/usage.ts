@@ -14,6 +14,7 @@ import { withTimeout } from '../util/timeout.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { localProviderCli } from './provider-cli.js';
 import { createCustodyEnv, killAgent } from './custody.js';
+import { BRAND } from '../domain/brand.js';
 import { providerFailure } from './limits.js';
 
 /**
@@ -411,7 +412,7 @@ export async function refreshClaudeAccessToken(
 
 function claudeSignedOut(configHome: string) {
   const account = path.basename(configHome).replace(/^claude-/, '');
-  const message = `Claude login claude:${account} was signed out by Anthropic (its sign-in expired or was revoked); sign in again in Credentials`;
+  const message = `Claude login claude:${account} was signed out by Anthropic (its sign-in expired or was revoked); sign in again in Settings → Codex/Claude`;
   return providerFailure(message, {
     kind: 'credential',
     permanence: 'hard',
@@ -539,7 +540,7 @@ async function runCodexUsageCli(configHome: string | undefined, timeoutMs: numbe
   child.once('exit', untrack);
   try {
     await withTimeout(client.request('initialize', {
-      clientInfo: { name: 'karmax-usage-probe', title: 'karmax', version: '1.0.0' },
+      clientInfo: { name: `${BRAND}-usage-probe`, title: BRAND, version: '1.0.0' },
       capabilities: null,
     }), timeoutMs);
     client.notify('initialized');

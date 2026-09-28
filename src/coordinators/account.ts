@@ -213,17 +213,37 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   // marker lands in the first workflow task of a new run) and refreshed each loop
   // pass, so a coordinator that is already live escapes the buggy path at the live
   // edge rather than waiting for its next continue-as-new. Handlers read the
-  // variable, never `patched()` directly, which keeps their behavior a pure
-  // function of the reproduced activation order.
+  // variable, never `patched()` directly (`requestRelist` is the documented
+  // exception), which keeps their behavior a pure function of the reproduced
+  // activation order.
   let identifiedReturnsRelease = patched('account-coordinator-return-identity-v1');
   // A credential wall (every allowed credential needs a person) parks like a
   // quota wait instead of denying the turn, and parked requests re-resolve their
   // allow-lists when credentials change. Pre-marker histories keep denying.
-  // Refreshed each loop pass, like the marker above.
+  // Refreshed each loop pass, like the marker above, and adopted by a credential
+  // change (see `requestRelist`).
   let waitForCredentials = patched('account-coordinator-credential-wait-v1');
-  // Set when credentials changed under parked requests (a new credential or a
+  // Set when credentials changed under parked requests (a credential sync or a
   // policy edit); the loop then asks each parked owner to request again.
   let relistRequested = false;
+  /**
+   * Parked allow-lists were resolved against the credentials of their day. A
+   * sync is the only notice the coordinator gets that they changed, and only
+   * policy knows which credentials a request may use, so every sync re-lists
+   * rather than guessing from ids: a login signed back in keeps its id, and a
+   * login added before this code ran is already known (task 385 kept waiting on
+   * an exhausted login after a new one was added).
+   *
+   * The one handler that consults `patched()` directly: a coordinator parked
+   * before the marker waits on the legacy predicate until its wait ends, which
+   * for a quota wait is hours. Adopting the marker here wakes it now. Replay
+   * sees the marker in the same activation as the signal, so it is stable.
+   */
+  const requestRelist = () => {
+    if (!queue.length) return;
+    relistRequested = true;
+    if (!waitForCredentials) waitForCredentials = patched('account-coordinator-credential-wait-v1');
+  };
 
   /** Flip any exhausted account whose reset instant has passed back to available. */
   function refreshDue(): void {
@@ -298,8 +318,6 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
         existing.credentialProvider = a.credentialProvider || undefined;
         if (a.maxConcurrent != null) existing.maxConcurrent = a.maxConcurrent; // apply raises/lowers
       } else {
-        // A parked allow-list was computed before this credential existed.
-        if (queue.length) relistRequested = true;
         accounts.push({
           id: a.id,
           configHome: a.configHome,
@@ -320,10 +338,9 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     // still in-use; a later sync prunes them when their turn finishes.
     const live = new Set(incoming.map((a) => a.id));
     accounts = accounts.filter((a) => live.has(a.id) || a.inUse > 0);
+    requestRelist();
   });
-  setHandler(relistAccountLeasesSignal, () => {
-    if (queue.length) relistRequested = true;
-  });
+  setHandler(relistAccountLeasesSignal, requestRelist);
   setHandler(leaseAccountSignal, (req) => {
     if (!queue.find((q) => q.taskId === req.taskId && q.turnId === req.turnId)) {
       queue.push({ taskId: req.taskId, turnId: req.turnId, provider: req.provider, allowed: req.allowed });

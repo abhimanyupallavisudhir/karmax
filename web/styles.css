@@ -2612,11 +2612,11 @@ html[data-theme="dark"] .github-signin-btn:active,
 .wiki-nav a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wiki-page .settings-section-title .chip { vertical-align: 3px; margin-left: 6px; }
 .wiki-view-picker { display: flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: 11.5px; }
-.wiki-view-picker input {
-  width: min(330px, 36vw); padding: 7px 30px 7px 10px; border: 1px solid var(--line);
+.wiki-view-picker select {
+  width: min(330px, 36vw); padding: 7px 10px; border: 1px solid var(--line); text-overflow: ellipsis;
   border-radius: 8px; background: var(--surface); color: var(--ink); font: inherit;
 }
-.wiki-view-picker input:focus { outline: 2px solid var(--accent-weak); border-color: var(--accent); }
+.wiki-view-picker select:focus { outline: 2px solid var(--accent-weak); border-color: var(--accent); }
 .wiki-md { font-size: 13px; line-height: 1.55; }
 .wiki-uncond .wiki-uncond-head { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; padding-bottom: 9px; border-bottom: 1px solid var(--line); }
 .wiki-uncond .wiki-uncond-head b { font-size: 14px; letter-spacing: -.01em; }

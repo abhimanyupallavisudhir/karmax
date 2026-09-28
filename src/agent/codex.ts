@@ -40,6 +40,7 @@ import { readLocalCodexHistory, installLocalCodexSnapshot, publishLocalCodexHist
 import { localProviderCli } from './provider-cli.js';
 import { withTimeout } from '../util/timeout.js';
 import { ensureCodexLoginFresh, refreshCodexLogin } from './usage.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -227,7 +228,7 @@ export class CodexAdapter implements AgentAdapter {
         // the sandbox could only report that its inert refresh marker failed.
         if (ctx.signal?.aborted || !isRecoverableRemoteCodexCredentialFailure(retryError)) throw retryError;
         throw new ProviderOutage('OpenAI is rejecting Codex model requests even though this ChatGPT login is valid '
-          + '(it refreshed and read its account just now). This is an OpenAI-side outage; Karmax will keep retrying.',
+          + `(it refreshed and read its account just now). This is an OpenAI-side outage; ${BRAND} will keep retrying.`,
           { cause: retryError });
       }
     }
@@ -499,7 +500,7 @@ export class CodexAdapter implements AgentAdapter {
       if (method !== 'item/tool/call') return {};
       const tool = String(params?.tool ?? '');
       const handler = platformHandlers[tool];
-      if (!handler) return { contentItems: [{ type: 'inputText', text: `unknown Karmax tool ${tool}` }], success: false };
+      if (!handler) return { contentItems: [{ type: 'inputText', text: `unknown ${BRAND} tool ${tool}` }], success: false };
       const id = String(params?.callId ?? tool);
       // Credential-bearing tools never publish a detail (see SECRET_TOOL_NAMES).
       const startedDetail = toolActivityDetail(tool, params?.arguments);
@@ -760,7 +761,7 @@ export class CodexAdapter implements AgentAdapter {
 
     try {
       // ── Handshake ──
-      await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' },
+      await client.request('initialize', { clientInfo: { name: BRAND, title: BRAND, version: '1.0.0' },
         capabilities: { experimentalApi: true, requestAttestation: false } });
       client.notify('initialized');
       if (remote) child.startupComplete();

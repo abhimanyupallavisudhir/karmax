@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory } from './types.js';
 import { openLocalPty, startLocalProcess } from './local-execution.js';
+import { taskBranch } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
 
@@ -27,7 +28,7 @@ export class MemoryWorldProvider implements WorldProvider {
       kind: 'memory',
       id: spec.taskId,
       root,
-      branch: `karmax/${spec.taskId}`,
+      branch: taskBranch(spec.taskId),
       base: spec.base,
       target: spec.target,
     };
