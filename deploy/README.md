@@ -252,6 +252,16 @@ current Temporal schema and retains the destination's domain. It requires
 typing `RESTORE` and will not delete Docker volumes as part of ordinary `down`
 or `update` operations.
 
+### Replay check
+
+A running workflow replays its recorded history under whatever code the next
+worker loads, and one that cannot replay is stuck from its next event. Before
+`update` backs anything up or restarts, the new image replays every running
+workflow (`npm run replay-check`, coordinators included). If any fails, the
+update stops, lists them, and leaves the previous release running. Fix the
+release. `KARMAX_SKIP_REPLAY_CHECK=1 ./deploy/karmax update …` skips the check,
+for when the listed workflows are already broken or may break.
+
 ### Rollback compatibility
 
 `deploy/data-epoch` marks compatibility for automatic code-only rollback. Builds

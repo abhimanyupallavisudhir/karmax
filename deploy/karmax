@@ -554,6 +554,22 @@ cmd_update() {
     migration_backup=''
     die "deployment $target could not be built; production remains at $previous"
   fi
+  # A running workflow replays its history under whatever code the next worker
+  # loads, and one that cannot is wedged at its next event (WF-34 would have
+  # wedged every task on tavya.io). The candidate replays them all first.
+  if [ "${KARMAX_SKIP_REPLAY_CHECK:-}" = 1 ]; then
+    echo 'karmax: warning: replay check skipped (KARMAX_SKIP_REPLAY_CHECK=1); running workflows may not survive this release' >&2
+  else
+    note 'Replaying the running workflows under the candidate…'
+    if ! dc run --rm --no-deps -T app npm run --silent replay-check; then
+      git -C "$ROOT_DIR" checkout --detach "$previous"
+      restore_migration
+      dc build app || true
+      cleanup_migration
+      migration_backup=''
+      die "deployment $target cannot replay the workflows running now; production remains at $previous. Fix the release, or rerun with KARMAX_SKIP_REPLAY_CHECK=1 only if the workflows listed above may break"
+    fi
+  fi
   if ! cmd_backup_candidate; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
