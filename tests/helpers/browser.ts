@@ -13,7 +13,12 @@ import { WorldRegistry } from '../../src/world/registry.js';
 import { Overlays } from '../../src/store/overlays.js';
 import { IdentityService } from '../../src/auth/identity.js';
 import { findFreePortFrom } from '../../src/util/ports.js';
+import { CredentialBroker } from '../../src/autonomy/broker.js';
+import { Vault } from '../../src/autonomy/vault.js';
+import { policyVersions } from '../../src/launch/legal.js';
+import { hostedOnboardingKey } from '../../src/gateway/hosted-onboarding.js';
 import type { EmailMessage } from '../../src/autonomy/email.js';
+import type { Organization } from '../../src/domain/types.js';
 
 // Reusable fixtures for browser journeys that drive the shipped console
 // (web/) against a real Gateway. Each journey still owns its assertions; these
@@ -94,8 +99,12 @@ export interface HostedGateway {
   identity: IdentityService;
   tokens: TokenAuthority;
   authorization: AuthorizationService;
+  broker: CredentialBroker;
   mailer: CapturingMailer;
   directory: string;
+  /** An existing account owning a fresh organization, as signup or an
+   *  operator would have left it (signup policies accepted, setup guide closed). */
+  owner(input: { name: string; email: string; password: string; organization: string }): Promise<{ user: { id: string; email: string }; organization: Organization }>;
   close(): Promise<void>;
 }
 
@@ -103,7 +112,7 @@ export interface HostedGateway {
  *  capturing mailer. There is no Temporal behind it: the journeys that use it
  *  (accounts, organizations, billing) never start a workflow, and a stub client
  *  answers the few read-only queries the console makes. */
-export async function hostedGateway(extra: (fixture: { store: Store; directory: string; url: string }) =>
+export async function hostedGateway(extra: (fixture: { store: Store; broker: CredentialBroker; directory: string; url: string }) =>
   Promise<Partial<GatewayDeps>> | Partial<GatewayDeps> = () => ({})): Promise<HostedGateway> {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-hosted-journey-'));
   const port = await findFreePortFrom(48900);
@@ -115,15 +124,24 @@ export async function hostedGateway(extra: (fixture: { store: Store; directory: 
   identity.connectOrganizationNames(async () => store.organizationNameReservations());
   store.connectUserNames(async () => identity.listUsers());
   const tokens = new TokenAuthority(store), worlds = new WorldRegistry();
+  const broker = new CredentialBroker(new Vault(path.join(directory, 'vault')));
   const authorization = await AuthorizationService.create(store);
   const client = { workflow: { getHandle: () => ({ query: async () => [] }) } } as any;
   const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: directory, authorization, hosted: true });
   const gateway = await Gateway.create({ store, tokens, worlds, client, api, authorization, identity, hosted: true,
-    email: mailer as any, taskQueue: 'test', staticDir: path.resolve('web'), bus: new KarmaxBus(),
+    broker, email: mailer as any, taskQueue: 'test', staticDir: path.resolve('web'), bus: new KarmaxBus(),
     contributions: new ContributionRegistry(), overlays: new Overlays(),
-    agentInfo: { provider: 'mock', reason: 'hosted browser journey' }, ...(await extra({ store, directory, url })) });
+    agentInfo: { provider: 'mock', reason: 'hosted browser journey' }, ...(await extra({ store, broker, directory, url })) });
   const server = await gateway.listen(port);
-  return { url: server.url, store, identity, tokens, authorization, mailer, directory, async close() {
+  return { url: server.url, store, identity, tokens, authorization, broker, mailer, directory, async owner(input) {
+    const user = await identity.createUser({ name: input.name, email: input.email, password: input.password });
+    const organization = await store.createOrganization({ name: input.organization, ownerUserId: user.id });
+    await authorization.bootstrapOrganizationOwner('system:test', user.id, organization.id);
+    await store.recordPolicyAcceptance({ userId: user.id, context: 'signup', versions: policyVersions('signup') });
+    // An established owner has put the setup guide away.
+    await store.kvSet(hostedOnboardingKey(user.id, organization.id), JSON.stringify({ display: 'closed' }));
+    return { user, organization };
+  }, async close() {
     await server.close(); await identity.close(); await store.close();
     fs.rmSync(directory, { recursive: true, force: true });
   } };
