@@ -5676,13 +5676,20 @@ export class Store {
 
   /** Event routing needs ownership, never a conversation or reviewer expansion. */
   async taskProjectIds(taskIds: readonly string[]): Promise<Map<string, string>> {
-    const result = new Map<string, string>();
+    return new Map([...(await this.taskEventRoutes(taskIds))].map(([id, route]) => [id, route.projectId]));
+  }
+
+  /** Each task's project, and whether it is an attempt other than its intent's
+   *  principal: task lists show only principals, so live events say so (RQ-3). */
+  async taskEventRoutes(taskIds: readonly string[]): Promise<Map<string, { projectId: string; siblingAttempt: boolean }>> {
+    const result = new Map<string, { projectId: string; siblingAttempt: boolean }>();
     const ids = [...new Set(taskIds)];
     for (let offset = 0; offset < ids.length; offset += 500) {
       const batch = ids.slice(offset, offset + 500);
-      const rows = await this.readRows<{ id: string; projectId: string }>(
-        `SELECT id, projectId FROM tasks WHERE id IN (${batch.map(() => '?').join(',')})`, batch);
-      for (const row of rows) result.set(row.id, row.projectId);
+      const rows = await this.readRows<{ id: string; projectId: string; principalAttemptId: string | null }>(
+        `SELECT t.id, t.projectId, i.principalAttemptId FROM tasks t LEFT JOIN task_intents i ON i.id=t.intentId
+         WHERE t.id IN (${batch.map(() => '?').join(',')})`, batch);
+      for (const row of rows) result.set(row.id, { projectId: row.projectId, siblingAttempt: !!row.principalAttemptId && row.principalAttemptId !== row.id });
     }
     return result;
   }

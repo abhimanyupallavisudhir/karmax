@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const deployDir = path.join(repoRoot, 'deploy');
@@ -29,15 +30,19 @@ function generateSecrets(): string {
     '#!/bin/sh\nfor a in "$@"; do [ "$a" = up ] && exit 1; done\nexit 0\n',
     { mode: 0o755 },
   );
+  rerunUp(sandbox);
+  return path.join(sandbox, '.secrets');
+}
+
+function rerunUp(sandbox: string) {
   try {
     execFileSync('sh', [path.join(sandbox, 'karmax'), 'up', 'karmax.example.com'], {
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      env: { ...process.env, PATH: `${path.join(sandbox, '..', 'bin')}:${process.env.PATH ?? ''}` },
       stdio: 'ignore',
     });
   } catch {
     // Expected: the stub fails the build step once configuration has happened.
   }
-  return path.join(sandbox, '.secrets');
 }
 
 describe('turnkey update deploys an exact validated revision', () => {
@@ -64,10 +69,21 @@ describe('turnkey update deploys an exact validated revision', () => {
     expect(script).toContain('dc run --rm --no-deps app npm run backup');
   });
 
+  // An update never runs `configure`, so a secret a new release mounts would be
+  // missing and Compose would refuse to start it; so would a restore of an
+  // older backup's secrets directory.
+  it('creates any missing secret before building an update or starting a restore', () => {
+    expect(update.indexOf('ensure_secrets')).toBeGreaterThan(update.indexOf('checkout --detach "$target"'));
+    expect(update.indexOf('ensure_secrets')).toBeLessThan(update.indexOf('dc build --pull app'));
+    const restore = script.split('cmd_restore() {')[1]?.split('\n}')[0] ?? '';
+    expect(restore.indexOf('ensure_secrets')).toBeGreaterThan(restore.indexOf('mv "$staged_secrets" "$SECRETS_DIR"'));
+    expect(restore.indexOf('ensure_secrets')).toBeLessThan(restore.lastIndexOf('dc up -d postgresql'));
+  });
+
   it('backs up and restores the PostgreSQL application database', () => {
     expect(script).toContain('pg_dump -U temporal -Fc karmax');
-    expect(script).toContain('pg_restore -U temporal -d karmax');
-    expect(script).toContain('for database in karmax temporal temporal_visibility');
+    expect(script).toContain('for dump in karmax temporal temporal-visibility');
+    expect(script).toContain('pg_restore -U temporal --no-owner --no-privileges -d "$database"');
   });
 
   it('applies a staged domain migration transactionally with the validated update', () => {
@@ -155,7 +171,13 @@ describe('turnkey deployment secrets', () => {
   const secretsDir = generateSecrets();
   const secrets = ['auth_secret', 'vault_key', 'world_ref_key'];
 
-  it('generates every secret the compose profile mounts', () => {
+  // An update runs the installed release's script, which cannot generate a
+  // host secret a newer release adds; Compose would refuse to mount it. So
+  // new credentials come from a job instead (postgres/karmax-role.sh).
+  it('generates every secret the compose profile mounts, and mounts no new one', () => {
+    const compose = fs.readFileSync(path.join(deployDir, 'compose.turnkey.yml'), 'utf8');
+    const mounted = Object.keys(parse(compose).secrets as Record<string, unknown>);
+    expect(mounted.sort()).toEqual([...secrets].sort());
     for (const name of secrets) {
       expect(fs.existsSync(path.join(secretsDir, name)), `${name} was not generated`).toBe(true);
     }

@@ -22,6 +22,7 @@ npm run dev                                   # same, with tsx watch
 npm run preview:landing                       # public landing/pricing/policies only, no Temporal (port 4173)
 npm test                                      # full suite — sequential by design, see below
 npm run typecheck
+npm run lint                                  # oxlint; fails above its warning and `as any` budgets
 npx vitest run tests/store.test.ts            # one file
 npx vitest run tests/pipeline.test.ts -t "merge queue"   # one test
 npm run reset                                 # wipe Temporal durable state + karmax local state (worlds/worktrees preserved)

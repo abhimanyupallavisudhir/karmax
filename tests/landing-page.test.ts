@@ -1,6 +1,9 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import { closeConsoleBrowser, consolePage } from './helpers/console-page.js';
 
+// Bodies passed to page.evaluate run in the page; this file has no DOM lib.
+declare const document: any, getComputedStyle: any;
+
 afterAll(closeConsoleBrowser);
 
 /** The public landing page, rendered by the console in a real browser. */
@@ -108,7 +111,7 @@ describe('public landing page', () => {
     await ui.run('labelLandingTheme(document.getElementById("landing-theme"))');
     expect(await toggle.getAttribute('aria-label')).toBe('Switch to light theme');
     await toggle.click();
-    expect(await page.evaluate("[document.documentElement.dataset.theme, localStorage.getItem('karmax-theme')]"))
+    expect(await page.evaluate(() => [document.documentElement.dataset.theme, localStorage.getItem('karmax-theme')]))
       .toEqual(['light', 'light']);
     expect(await toggle.getAttribute('aria-label')).toBe('Switch to dark theme');
     expect(await background()).toBe(light); // pinned light overrides the dark system theme
@@ -129,7 +132,7 @@ describe('public landing page', () => {
     expect(await skip.evaluate((element) => element === (globalThis as any).document.activeElement)).toBe(true);
     await expect.poll(top).toBeGreaterThan(0);
     await page.keyboard.press('Tab');
-    expect(await page.evaluate('getComputedStyle(document.activeElement).outlineStyle')).toBe('solid');
+    expect(await page.evaluate(() => getComputedStyle(document.activeElement).outlineStyle)).toBe('solid');
 
     const navHeight = () => page.locator('.landing-nav-inner').evaluate((element) => element.getBoundingClientRect().height);
     const wide = await navHeight();

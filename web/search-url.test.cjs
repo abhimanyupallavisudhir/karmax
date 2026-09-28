@@ -51,6 +51,7 @@ global.S = S;
 
 eval(extractConst('TASK_TABS'));
 eval(extractConst('ORG_VIEWS'));
+eval(extractConst('PROJECT_SCOPED_TABS'));
 eval(extractConst('BUILTIN_VIEWS'));
 eval(extractFn('slugify'));
 eval(extractFn('projectSlug'));

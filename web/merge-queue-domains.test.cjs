@@ -36,6 +36,7 @@ const ok = (condition, message) => condition ? pass++ : (fail++, console.error('
 global.esc = (s) => String(s == null ? '' : s);
 eval(extractFn('taskMergeDomains'));
 eval(extractFn('queueRank'));
+eval(extractFn('queueRowLabel'));
 eval(extractFn('mergeQueuePanel'));
 
 // ── the helper ───────────────────────────────────────────────────────────────
@@ -71,7 +72,7 @@ ok(!/data-domain=""/.test(html), 'no task is stranded in the unnamed domain grou
 ok(/data-domain="app:main"/.test(moTag), 'a merge-only task is grouped under its REAL domain');
 ok(/draggable="true"/.test(moTag), 'a merge-only task can be dragged, not just displayed');
 ok(html.includes('Two repos'), 'a multi-repo task appears in the merge queue');
-ok((html.match(/Two repos/g) || []).length === 2, 'a task holding two domains is listed once per domain');
+ok((html.match(/aria-label="[^"]*Two repos/g) || []).length === 2, 'a task holding two domains is listed once per domain');
 ok(html.includes('data-domain="app:main"'), 'the app domain is rendered');
 ok(html.includes('data-domain="wiki:main"'), 'the SECOND repo domain is rendered too');
 // Reorder controls must be offered in each domain, since each is a real queue.
@@ -113,7 +114,7 @@ global.S.tasks = [
   }) },
 ];
 const mixed = mergeQueuePanel();
-ok((mixed.match(/Mixed owners/g) || []).length === 2, 'mixed ownership renders one provider row and one fallback row');
+ok((mixed.match(/aria-label="[^"]*Mixed owners/g) || []).length === 2, 'mixed ownership renders one provider row and one fallback row');
 ok(mixed.includes('acme/a'), 'the provider row names its exact repository participant');
 ok(mixed.includes('data-domain="github:acme/b:main"'), 'only the fallback participant appears in the Karmax domain');
 ok(mixed.includes('provider queued'), 'the provider participant remains read-only and visibly owned');

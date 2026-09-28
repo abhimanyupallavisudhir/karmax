@@ -1,0 +1,179 @@
+name: Live
+
+# The live suites spend real model and sandbox credit and write to a real
+# GitHub account, so push and pull-request CI never runs them. Dispatch this
+# workflow to run them, or set the repository variable KARMAX_LIVE_SCHEDULE to
+# `true` to also run them every Monday; the schedule does nothing until then.
+# Each suite runs only when its secret is configured (TESTING.md, "Live tests"),
+# and only on master: a dispatch runs the chosen branch's tests with the secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Live suite to run
+        type: choice
+        default: all
+        options: [all, models, agent, claude, e2b, daytona, github]
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+# One run at a time: the GitHub suite reuses a single fixture repository.
+concurrency:
+  group: live
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: choose suites
+    # Defence in depth; the control is the live environment's branch rule.
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || vars.KARMAX_LIVE_SCHEDULE == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: live
+    outputs:
+      models: ${{ steps.plan.outputs.models }}
+      agent: ${{ steps.plan.outputs.agent }}
+      claude: ${{ steps.plan.outputs.claude }}
+      e2b: ${{ steps.plan.outputs.e2b }}
+      daytona: ${{ steps.plan.outputs.daytona }}
+      github: ${{ steps.plan.outputs.github }}
+    steps:
+      # Job conditions cannot read secrets, so their presence is decided here.
+      - name: Choose the selected suites whose secrets are configured
+        id: plan
+        env:
+          SELECTED: ${{ inputs.suite || 'all' }}
+          LIVE_ANTHROPIC_API_KEY: ${{ secrets.LIVE_ANTHROPIC_API_KEY }}
+          LIVE_OPENAI_API_KEY: ${{ secrets.LIVE_OPENAI_API_KEY }}
+          LIVE_CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.LIVE_CLAUDE_CODE_OAUTH_TOKEN }}
+          LIVE_E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}
+          LIVE_DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}
+          LIVE_GITHUB_TOKEN: ${{ secrets.LIVE_GITHUB_TOKEN }}
+        run: |
+          # decide SUITE SECRET...: the suite runs when selected and any of its secrets is set.
+          decide() {
+            suite=$1; shift
+            run=false; why="$* not set"
+            for secret in "$@"; do [ -z "$(printenv "$secret")" ] || run=true; done
+            if [ "$SELECTED" != all ] && [ "$SELECTED" != "$suite" ]; then run=false; why='not selected'; fi
+            echo "$suite=$run" >> "$GITHUB_OUTPUT"
+            if [ "$run" = true ]; then echo "$suite: runs"; else echo "$suite: skipped ($why)"; fi
+          }
+          decide models LIVE_ANTHROPIC_API_KEY LIVE_OPENAI_API_KEY
+          decide agent LIVE_OPENAI_API_KEY
+          decide claude LIVE_CLAUDE_CODE_OAUTH_TOKEN
+          decide e2b LIVE_E2B_API_KEY
+          decide daytona LIVE_DAYTONA_API_KEY
+          decide github LIVE_GITHUB_TOKEN
+
+  models:
+    name: model providers
+    needs: plan
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.models == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install
+      # Each provider's block skips itself when its key is absent.
+      - run: npx vitest run tests/live-providers.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          ANTHROPIC_API_KEY: ${{ secrets.LIVE_ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.LIVE_OPENAI_API_KEY }}
+
+  agent:
+    name: agent task on Temporal
+    needs: plan
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install
+      - uses: ./.github/actions/temporal-cli
+      - run: npx vitest run tests/live-agent.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          OPENAI_API_KEY: ${{ secrets.LIVE_OPENAI_API_KEY }}
+
+  claude:
+    name: Claude Code login
+    needs: plan
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.claude == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install
+      - run: npx vitest run tests/claude-permission.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.LIVE_CLAUDE_CODE_OAUTH_TOKEN }}
+
+  e2b:
+    name: E2B sandboxes
+    needs: plan
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.e2b == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install
+      - run: npx vitest run tests/cloud-live.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}
+
+  daytona:
+    name: Daytona sandboxes
+    needs: plan
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.daytona == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install
+      # The snapshot build stays behind its own KARMAX_DAYTONA_LIVE_BUILD switch.
+      - run: npx vitest run tests/daytona-live.test.ts tests/daytona-environment-live.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}
+
+  github:
+    name: GitHub pull requests
+    needs: plan
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.github == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install
+      - uses: ./.github/actions/temporal-cli
+      # A token for the fixture account: it owns the private karmax-e2e-tests
+      # repository, which the suite creates once and reuses.
+      - run: npx vitest run tests/github-live.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          GH_TOKEN: ${{ secrets.LIVE_GITHUB_TOKEN }}

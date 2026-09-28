@@ -207,7 +207,7 @@ release their execution lease when finished.
 ## Operations
 
 ```bash
-./deploy/karmax doctor              # Compose, secrets, containers, DNS/HTTPS
+./deploy/karmax doctor              # Compose, secrets, containers, database role, DNS/HTTPS
 ./deploy/karmax status
 ./deploy/karmax logs                # or: logs temporal
 ./deploy/karmax backup              # deploy/backups/<UTC timestamp>
@@ -232,10 +232,15 @@ copy files out before editing them. The live data volume is never linked to a
 backup. The release workflow also retains its existing 14-day age limit.
 
 `restore` verifies the control-plane payload, PostgreSQL dumps, and deployment
-secrets before stopping the running instance or changing data. It restores the
-Karmax and Temporal databases, reapplies the current Temporal schema, and retains the
-destination's domain. It requires typing `RESTORE` and will not delete Docker
-volumes as part of ordinary `down` or `update` operations.
+secrets, then restores every dump into a staging database (`karmax_restore`,
+…) beside the live ones. Only when all of them restored does it stop the
+instance, drop the live databases and rename the staged ones into place; a
+failure before that leaves the instance as it was. Dumps are restored without
+owners or grants, so a new host or an empty PostgreSQL volume works; the next
+start hands the karmax database back to the app's role. It reapplies the
+current Temporal schema and retains the destination's domain. It requires
+typing `RESTORE` and will not delete Docker volumes as part of ordinary `down`
+or `update` operations.
 
 ### Rollback compatibility
 
@@ -268,12 +273,43 @@ tracked and billable in diagnostics instead of being falsely reported as free.
 `compose.turnkey.yml` is deliberately a single active control-plane writer with
 durable local object storage and an embedded PostgreSQL-backed data/Temporal cluster.
 It is the clean choice for one VPS and can serve many users, but its availability
-is that VPS plus your backup/restore policy.
+is that VPS plus your backup/restore policy. The app connects as its own `karmax`
+role, which owns the `karmax` database and nothing else; Temporal and the
+backup commands keep the `temporal` superuser. On every start the one-shot
+`karmax-database` job (`postgres/karmax-role.sh`) re-applies the role, taking
+over anything an older release or a restore created as the superuser. It
+generates the app's URL once into the `karmax_database` Docker volume, which
+only it and the app mount; deleting that volume rotates the app's password at
+the next `up`. `./deploy/karmax doctor` reports which role the app is
+connected as, and warns if it is the superuser: a `KARMAX_DATABASE_URL` in
+the app's `/var/lib/karmax/karmax.env` overrides the role's URL.
+
+Releases before the `karmax` role gave the app the `temporal` superuser
+password. After the first update to a release with the role, confirm it with
+`./deploy/karmax doctor`, then rotate that password, since the old app
+process held it:
+
+```bash
+password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+./deploy/karmax backup
+docker compose --project-directory deploy --env-file deploy/.turnkey.env -f deploy/compose.turnkey.yml \
+  exec -T postgresql psql -U temporal -d postgres -v ON_ERROR_STOP=1 \
+  -c "ALTER ROLE temporal PASSWORD '$password'"
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$password/" deploy/.turnkey.env
+./deploy/karmax up
+./deploy/karmax doctor
+```
+
+The `postgresql` service reads `POSTGRES_PASSWORD` only when it initializes an
+empty volume, so the `ALTER ROLE` is what changes the password; `up` restarts
+Temporal and the jobs with the new value. Temporal is briefly unavailable
+between the two steps, and in-flight workflows resume once it reconnects.
 
 Larger installations can use `compose.hosted.yml` with managed PostgreSQL,
 managed Temporal, S3, and one active Karmax cell. Copy `.env.example`, provide
 the listed infrastructure secrets under `deploy/.secrets` (including a complete
-PostgreSQL connection string in `database_url`), and validate with:
+PostgreSQL connection string in `database_url` for a role that owns its database
+but is not a superuser), and validate with:
 
 ```bash
 docker compose --env-file deploy/.env.example \
