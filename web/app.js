@@ -15119,7 +15119,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   </div>`).join('');
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
-      `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+      `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(`Withdrawn: ${request.withdrawn.reason}`)}"` : ''}>${esc(request.status)}</span>
         <span class="mono">${request.capabilities.map(esc).join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.map(esc).join(', ')}` : ''}</span>
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';

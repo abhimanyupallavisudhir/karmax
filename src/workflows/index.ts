@@ -16,7 +16,6 @@ export { mergeQueue } from '../coordinators/merge-queue.js';
 export { agentQueue } from '../coordinators/agent-queue.js';
 export { resourcePublishCoordinator } from '../coordinators/resource-publish.js';
 export { accountCoordinator } from '../coordinators/account.js';
-export { budgetCoordinator } from '../coordinators/budget.js';
 
 /**
  * Version-qualified exports (PLAN-dynamic-repos §21b). Temporal registers a
