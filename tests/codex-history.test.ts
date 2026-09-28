@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { prepareCodexHistory, selectCodexHistoryCopy } from '../src/agent/codex-history.js';
 import { installLocalCodexSnapshot, publishLocalCodexHistory, readLocalCodexHistory } from '../src/agent/codex-history-files.js';
 import { createCodexConversationExport, readCodexConversationExport } from '../src/store/conversation-exports.js';
@@ -103,4 +103,43 @@ it('binds export downloads to frozen content and the task/role authorization sco
   expect((await readCodexConversationExport(objects, 'task_a', 'do', first.exportId)).data).toEqual(first.data);
   await expect(readCodexConversationExport(objects, 'task_b', 'do', first.exportId)).rejects.toThrow();
   await expect(readCodexConversationExport(objects, 'task_a', 'merge', first.exportId)).rejects.toThrow();
+});
+
+it('AD-13 validates only what a history gained since it was last validated', async () => {
+  const id = '33333333-3333-4333-8333-333333333333';
+  const file = `sessions/rollout-2026-09-09T00-00-00-${id}.jsonl`;
+  const records = [meta(id), ...Array.from({ length: 200 }, (_, i) => message(i + 1, `turn ${i} 1.5`))];
+  const read = (content: Buffer) => async () => ({ file, content });
+  expect(await prepareCodexHistory(id, read(jsonl(records)))).toBeUndefined();
+  const grown = [...records, message(201, 'next'), message(202, 'next')];
+  const parse = vi.spyOn(JSON, 'parse');
+  expect(await prepareCodexHistory(id, read(jsonl(grown)))).toBeUndefined();
+  expect(parse.mock.calls.length).toBeLessThanOrEqual(2);
+  parse.mockRestore();
+  // A new tool set still snapshots every record, not just the new ones.
+  const snapshot = (await prepareCodexHistory(id, read(jsonl(grown)), { dynamicTools: [{ name: 'new_tool' }] }))!;
+  expect(snapshot.content.toString().trim().split('\n').map((line) => JSON.parse(line).ordinal)).toEqual(grown.map((_, i) => i));
+  // A prefix that changed underneath is validated again from the start.
+  const rewritten = [...grown.slice(0, 100), message(150, 'rewritten'), ...grown.slice(101)];
+  await expect(prepareCodexHistory(id, read(jsonl(rewritten)))).rejects.toThrow('unsupported ordinal sequence');
+});
+
+it('AD-13 bounds what the validation cache holds by bytes, not only by entries', async () => {
+  // Each history leads with a 2 MiB session_meta record, which the cache keeps.
+  const history = (id: string, records = 3) => ({
+    file: `sessions/rollout-2026-09-09T00-00-00-${id}.jsonl`,
+    content: jsonl([{ ...meta(id), payload: { ...meta(id).payload, base_instructions: 'x'.repeat(2 * 1024 * 1024) } },
+      ...Array.from({ length: records }, (_, i) => message(i + 1, `turn ${i}`))]),
+  });
+  const ids = Array.from({ length: 9 }, (_, i) => `4444444${i}-4444-4444-8444-444444444444`);
+  for (const id of ids) expect(await prepareCodexHistory(id, async () => history(id))).toBeUndefined();
+  // The first one no longer fits beside the eight after it: validated again from its first record.
+  const parse = vi.spyOn(JSON, 'parse');
+  expect(await prepareCodexHistory(ids[0]!, async () => history(ids[0]!, 4))).toBeUndefined();
+  expect(parse.mock.calls.length).toBeGreaterThan(2);
+  parse.mockClear();
+  // The last one still fits: only its new record is parsed.
+  expect(await prepareCodexHistory(ids[8]!, async () => history(ids[8]!, 4))).toBeUndefined();
+  expect(parse.mock.calls.length).toBeLessThanOrEqual(2);
+  parse.mockRestore();
 });

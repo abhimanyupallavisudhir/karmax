@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
+import { Context } from '@temporalio/activity';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -69,8 +70,35 @@ it('RT-13 retains organization context if the remote wiki snapshot fails', async
 it('RT-14 shares a task read across prompt and authorization preparation', async () => {
   const { task, run } = await fixture();
   const get = vi.spyOn(store, 'getTask');
+  const attempts = vi.spyOn(store, 'attemptsOf');
   await run();
-  expect(get.mock.calls.filter(([id]) => id === task.id).length).toBeLessThanOrEqual(4);
+  expect(get.mock.calls.filter(([id]) => id === task.id)).toHaveLength(1);
+  expect(attempts).not.toHaveBeenCalled();
+});
+
+it('RT-14 queues a remote turn for its world lease without another task read', async () => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-review-'));
+  store = await Store.create(':memory:');
+  const project = await store.createProject('Remote');
+  const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
+  const handle = await store.registerWorld({ id: task.id, kind: 'e2b', root: '/workspace', branch: 'task', base: 'main' }, project.id) as any;
+  await store.createRunnerPool({ id: 'pool', organizationId: project.organizationId!, name: 'Pool', provider: 'e2b',
+    mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+  const worlds = new WorldRegistry();
+  world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+  world.handle = handle;
+  worlds.register({ kind: 'e2b', capabilities: { remote: true }, open: async () => world, status: async () => 'ready' } as any);
+  const runners = { acquire: vi.fn(async () => ({ leaseId: (await store.requestWorldLease({ runnerPoolId: 'pool',
+    organizationId: project.organizationId!, projectId: project.id, taskId: task.id, worldId: task.id })).id, runnerPoolId: 'pool' })) };
+  const core = makeCoreActivities({ store, worlds, runners: runners as any, contentDir: home, profiles: new ProfileResolver(store, 'mock'),
+    adapters: new Map([['mock', { provider: 'mock', runTurn: async () => ({ output: 'done', termination: { kind: 'success', status: 'fixture' } }) }]]) as any });
+  vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal,
+    info: { attempt: 1, workflowExecution: { runId: 'run', workflowId: task.id }, activityId: 'turn', currentAttemptScheduledTimestampMs: Date.now() } } as any);
+  const get = vi.spyOn(store, 'getTask');
+  await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#1`, agentSlotGranted: true, worldHandle: handle, messages: [],
+    task: { taskId: task.id, projectId: project.id, title: 'Work', prompt: 'work', project: {}, agents: { do: { provider: 'mock' } } } } as any);
+  expect(runners.acquire).toHaveBeenCalledOnce();
+  expect(get.mock.calls.filter(([id]) => id === task.id)).toHaveLength(1);
 });
 
 
