@@ -4,7 +4,8 @@ name: Live
 # GitHub account, so push and pull-request CI never runs them. Dispatch this
 # workflow to run them, or set the repository variable KARMAX_LIVE_SCHEDULE to
 # `true` to also run them every Monday; the schedule does nothing until then.
-# Each suite runs only when its secret is configured (TESTING.md, "Live tests").
+# Each suite runs only when its secret is configured (TESTING.md, "Live tests"),
+# and only on master: a dispatch runs the chosen branch's tests with the secrets.
 on:
   workflow_dispatch:
     inputs:
@@ -27,7 +28,8 @@ concurrency:
 jobs:
   plan:
     name: choose suites
-    if: github.event_name == 'workflow_dispatch' || vars.KARMAX_LIVE_SCHEDULE == 'true'
+    # Defence in depth; the control is the live environment's branch rule.
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || vars.KARMAX_LIVE_SCHEDULE == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: live
@@ -70,7 +72,7 @@ jobs:
   models:
     name: model providers
     needs: plan
-    if: needs.plan.outputs.models == 'true'
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.models == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: live
@@ -89,7 +91,7 @@ jobs:
   agent:
     name: agent task on Temporal
     needs: plan
-    if: needs.plan.outputs.agent == 'true'
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.agent == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: live
@@ -107,7 +109,7 @@ jobs:
   claude:
     name: Claude Code login
     needs: plan
-    if: needs.plan.outputs.claude == 'true'
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.claude == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: live
@@ -124,7 +126,7 @@ jobs:
   e2b:
     name: E2B sandboxes
     needs: plan
-    if: needs.plan.outputs.e2b == 'true'
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.e2b == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: live
@@ -141,7 +143,7 @@ jobs:
   daytona:
     name: Daytona sandboxes
     needs: plan
-    if: needs.plan.outputs.daytona == 'true'
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.daytona == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     environment: live
@@ -159,7 +161,7 @@ jobs:
   github:
     name: GitHub pull requests
     needs: plan
-    if: needs.plan.outputs.github == 'true'
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.github == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: live

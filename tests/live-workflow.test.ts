@@ -14,6 +14,10 @@ type Job = { needs?: string; if?: string; environment?: string; steps: Step[] };
 const jobs = live.jobs as Record<string, Job>;
 const suites = Object.entries(jobs).filter(([name]) => name !== 'plan');
 const plan = jobs.plan!.steps.find((step) => step.id === 'plan')!;
+// A dispatch runs the chosen ref's workflow and test code with the secrets.
+// The live environment restricted to master is the control; this guard means
+// a branch must also rewrite this workflow, not just its tests.
+const MASTER = "github.ref == 'refs/heads/master'";
 
 // CI-4: the paid live suites ran only when someone remembered KARMAX_RUN_LIVE=1,
 // so provider drift was found in production.
@@ -22,7 +26,7 @@ describe('live-test workflow', () => {
     expect(Object.keys(live.on).sort()).toEqual(['schedule', 'workflow_dispatch']);
     expect(live.on.schedule).toHaveLength(1);
     expect(live.on.workflow_dispatch.inputs.suite.options).toEqual(['all', ...suites.map(([name]) => name)]);
-    expect(jobs.plan!.if).toBe("github.event_name == 'workflow_dispatch' || vars.KARMAX_LIVE_SCHEDULE == 'true'");
+    expect(jobs.plan!.if).toBe(`${MASTER} && (github.event_name == 'workflow_dispatch' || vars.KARMAX_LIVE_SCHEDULE == 'true')`);
     expect(live.permissions).toEqual({ contents: 'read' });
   });
 
@@ -38,7 +42,7 @@ describe('live-test workflow', () => {
   it('starts each suite only when the plan chose it, with the live gate open', () => {
     for (const [name, job] of suites) {
       expect(job.needs, name).toBe('plan');
-      expect(job.if, name).toBe(`needs.plan.outputs.${name} == 'true'`);
+      expect(job.if, name).toBe(`${MASTER} && needs.plan.outputs.${name} == 'true'`);
       expect(live.jobs.plan.outputs[name], name).toBe(`\${{ steps.plan.outputs.${name} }}`);
       expect(job.steps.find((step) => step.run?.includes('npx vitest run'))?.env?.KARMAX_RUN_LIVE, name).toBe('1');
     }
@@ -47,6 +51,8 @@ describe('live-test workflow', () => {
   // Anyone who can push a branch can run a workflow; the environment lets the
   // owner restrict these secrets to master and require an approval to spend.
   it('keeps the secrets in the live environment and gives each suite only its own', () => {
+    for (const [name, job] of Object.entries(jobs))
+      if (JSON.stringify(job).includes('secrets.')) expect(job.if, name).toMatch(new RegExp(`^${MASTER.replace(/[.()]/g, '\\$&')} && `));
     for (const [name, job] of [['plan', jobs.plan!] as const, ...suites]) expect(job.environment, name).toBe('live');
     const own: Record<string, string[]> = {};
     for (const [name, job] of suites) own[name] = [...JSON.stringify(job).matchAll(/secrets\.(\w+)/g)].map((m) => m[1]!).sort();

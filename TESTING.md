@@ -111,9 +111,17 @@ KARMAX_RUN_LIVE=1 OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
 `.github/workflows/live.yml` runs every suite behind the live gate on demand
 (Actions → Live → Run workflow, optionally one suite), and every Monday once
 the repository variable `KARMAX_LIVE_SCHEDULE` is `true`; until then the
-schedule does nothing. Its jobs use the `live` environment, so its secrets can
-be restricted to master and gated on an approval. A suite whose secret is
-missing is skipped, and the `choose suites` log says why:
+schedule does nothing. A suite whose secret is missing is skipped, and the
+`choose suites` log says why.
+
+The `LIVE_*` secrets must be secrets of the `live` environment, restricted to
+the `master` branch and with a required reviewer, never repository secrets.
+A dispatch runs the chosen branch's workflow file and test code, so a
+repository secret would reach any branch someone can push. Every job also
+refuses to run off master, but a branch can edit that guard away; the
+environment's branch rule is the control.
+
+
 
 | Suite | Secret | Runs |
 | --- | --- | --- |
