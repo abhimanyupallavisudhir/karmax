@@ -32,7 +32,24 @@ export type PanagentImportResult =
   | { kind: 'native'; sessionId: string; warnings?: PanagentWarning[] }
   | { kind: 'context'; message: Message; warnings?: PanagentWarning[] };
 
-type PanagentWarning = { code: string; severity: string; message: string; path?: string };
+export type PanagentWarning = { code: string; severity: string; message: string; path?: string };
+
+/** The `x-karmax-conversation-warnings` value for a converted download: what
+ * the conversion changed, URI-encoded JSON. Info notes are not warnings.
+ * Readers warn once per affected record, so repeats collapse into one counted
+ * note per code, and the list is capped: browsers reject a response whose
+ * headers pass ~256 KB, which would lose the download itself. */
+export function conversionWarningsHeader(warnings: readonly PanagentWarning[] = []): string | undefined {
+  const notes = new Map<string, { code: string; message: string; count: number }>();
+  for (const { code, severity, message } of warnings) {
+    if (severity === 'info') continue;
+    const note = notes.get(code);
+    if (note) note.count++;
+    else if (notes.size < 8) notes.set(code, { code: code.slice(0, 80), message: message.slice(0, 300), count: 1 });
+  }
+  const listed = [...notes.values()].map(({ count, ...note }) => (count > 1 ? { ...note, count } : note));
+  return listed.length ? encodeURIComponent(JSON.stringify(listed)) : undefined;
+}
 
 /** Render Karmax's durable, provider-neutral transcript as a resumable native
  * CLI history. API-backed conversations have no file to copy, so this is the
@@ -43,7 +60,7 @@ export async function exportConversationWithPanagent(opts: {
   sessionId: string;
   title: string;
   cwd?: string;
-}): Promise<Buffer> {
+}): Promise<{ data: Buffer; warnings: PanagentWarning[] }> {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-panagent-export-'));
   try {
     const input = path.join(temporary, 'conversation.agent.json');
@@ -78,12 +95,12 @@ export async function exportConversationWithPanagent(opts: {
         message: 'Generated from Karmax durable messages because no native provider history was available.' }],
     };
     fs.writeFileSync(input, JSON.stringify(ir), { mode: 0o600 });
-    await runPanagent([
+    const warnings = await runPanagent([
       'convert', input, '--to', opts.provider === 'claude' ? 'claude-code' : 'codex',
       '--mode', 'transcript', '--session-id', opts.sessionId, '--cwd', opts.cwd ?? '.',
       '--browser', 'never', '--quiet', '-o', output,
     ], path.join(temporary, 'report.json'));
-    return fs.readFileSync(output);
+    return { data: fs.readFileSync(output), warnings };
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }
