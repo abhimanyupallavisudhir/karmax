@@ -2393,8 +2393,10 @@ export class KarmaxApi {
       } catch { /* Same malformed-snapshot fallback as readAgentSnapshot. */ }
       const task = await this.deps.store.taskMetadataAsync(taskId);
       const group = await this.deps.store.attemptCommitAsync(taskId);
+      const subTaskSummaries = await this.deps.store.childTaskSummaries(taskId);
       return {
         ...view,
+        ...(subTaskSummaries.length ? { subTaskSummaries } : {}),
         notes: task?.notes,
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),

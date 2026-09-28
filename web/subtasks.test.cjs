@@ -32,7 +32,7 @@ global.S = {
 global.stageLabel = (v) => v.stage || 'setup';
 global.pipeline = (v) => `<i class="test-pipeline">${esc(v.stage || 'setup')}</i>`;
 
-for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'subTaskState', 'subTasksSection']) eval(extractFn(name));
+for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'subTaskState', 'subTasksSection', 'patchSubTaskSummaryFromEvent']) eval(extractFn(name));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {
@@ -59,6 +59,37 @@ ok(panel.includes('<strong>1</strong> of 3 complete') && panel.includes('--subta
 ok((panel.match(/class="subtask-row"/g) || []).length === 3, 'every child is one large navigation row');
 ok(panel.includes('Ready to return') === false && panel.includes('Needs direction'), 'meaningful child state appears beside exact pipeline state');
 ok(panel.includes('role="progressbar"') && panel.includes('aria-valuenow="1"'), 'completion is exposed to assistive technology');
+
+// A finished child is archived out of the live task list, and a replaced parent
+// run forgets children that had already settled. Neither may fall back to
+// "In progress · setup" (task #367): the parent's view carries every child the
+// store records, and a child's own events keep that summary current.
+const summaries = {
+  taskId: 'parent',
+  workflow: 'software-dev',
+  subTasks: ['child-a'],
+  subTaskSummaries: [
+    { id: 'child-a', num: 11, title: 'Polish navigation', workflow: 'software-dev', lastView: { stage: 'do', status: 'active' } },
+    { id: 'archived-done', num: 14, title: 'Land the migration', workflow: 'software-dev', lastView: { stage: 'done', status: 'done' } },
+    { id: 'settled-before-replacement', num: 15, title: 'Tenant isolation', workflow: 'software-dev', lastView: { stage: 'cancelled', status: 'cancelled' } },
+  ],
+};
+const archived = subTasksSection(summaries);
+ok((archived.match(/class="subtask-row"/g) || []).length === 3, 'children missing from the run and the live list still appear');
+ok(archived.includes('Land the migration') && archived.includes('Complete') && archived.includes('test-pipeline">done'),
+  'an archived child shows its real finished state, not setup');
+ok(archived.includes('Cancelled') && !archived.includes('test-pipeline">setup'), 'no child falls back to the setup placeholder');
+ok(archived.includes('<strong>1</strong> of 3 complete'), 'archived children count towards completion');
+
+S.view = summaries;
+ok(patchSubTaskSummaryFromEvent({ type: 'view.updated', taskId: 'child-a', payload: { stage: 'review', status: 'waiting', waitingFor: 'parent' } }) === true,
+  "a child's event patches its summary in the open parent");
+ok(summaries.subTaskSummaries[0].lastView.stage === 'review' && summaries.subTaskSummaries[0].lastView.waitingFor?.kind === 'parent',
+  'the patched summary carries the new stage and wait');
+ok(patchSubTaskSummaryFromEvent({ type: 'view.updated', taskId: 'child-a', payload: { stage: 'review', status: 'waiting', waitingFor: 'parent' } }) === false,
+  'an unchanged event asks for no repaint');
+ok(patchSubTaskSummaryFromEvent({ type: 'view.updated', taskId: 'unrelated', payload: { stage: 'done', status: 'done' } }) === false,
+  'events of other tasks are ignored');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

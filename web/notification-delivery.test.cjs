@@ -35,7 +35,7 @@ function browser() {
     WebSocket: function () {},
     api: async () => { if (response instanceof Error) throw response; return response; },
     announceInbox: (items) => alerts.push(...items),
-    updateBell() {}, bgRenderMain() {}, patchTaskListFromEvent: () => false,
+    updateBell() {}, bgRenderMain() {}, patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false,
     LIST_RELOAD_EVENTS: new Set(), setWsOnline() {}, checkConsoleRevision() {},
     refreshTasks: async () => {},
     setTimeout: (fn) => { timers.push(fn); return timers.length; },

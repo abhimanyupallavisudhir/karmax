@@ -13,6 +13,30 @@ describe('Store', () => {
     store = (await Store.create(':memory:'));
   });
 
+  // A parent's Sub-tasks panel reads its children from here: a finished child is
+  // archived out of the live task list and a replaced parent run forgets settled
+  // children, so neither may be missing or fall back to "setup" (task #367).
+  it('summarizes every child of a parent with its list fields, archived ones included', async () => {
+    const project = await store.createProject('Children');
+    const make = (title: string, parentTaskId?: string) => store.createTask({ projectId: project.id, title, workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: title }, ...(parentTaskId ? { parentTaskId } : {}) });
+    const parent = await make('Parent');
+    const first = await make('First', parent.id);
+    const second = await make('Second', parent.id);
+    await make('Unrelated');
+    const view = (status: string, stage: string) => ({ taskId: first.id, title: 'First', workflow: 'software-dev', stage, status,
+      messages: [{ id: 'm', role: 'user', text: 'x'.repeat(10_000), ts: 1 }], actions: [], updatedAt: 1 }) as any;
+    await store.saveView(first.id, view('done', 'done'));
+    await store.saveView(second.id, { ...view('waiting', 'review'), taskId: second.id, title: 'Second', waitingFor: { kind: 'parent', detail: 'Review me' } });
+    expect((await store.getTask(first.id))?.params.archived).toBe(true);
+    const summaries = await store.childTaskSummaries(parent.id);
+    expect(summaries.map((summary) => summary.id)).toEqual([first.id, second.id]);
+    expect(summaries[0]).toMatchObject({ num: first.num, title: 'First', workflow: 'software-dev', lastView: { stage: 'done', status: 'done' } });
+    expect(summaries[1]!.lastView).toMatchObject({ stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' } });
+    expect(JSON.stringify(summaries)).not.toContain('x'.repeat(100));
+    expect(await store.childTaskSummaries(first.id)).toEqual([]);
+  });
+
   it('finds a merged result without loading the task event history', async () => {
     const project = await store.createProject('Merge');
     const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });

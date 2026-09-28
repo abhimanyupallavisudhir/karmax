@@ -3310,6 +3310,25 @@ const LIST_RELOAD_EVENTS = new Set([
 // view.updated already contains the compact fields shown by list rows. Apply that
 // projection locally instead of refetching every task (and re-running search) for
 // every event on the global stream.
+/** Keep the open parent's Sub-tasks panel current from its children's events;
+ * true when a visible field changed. */
+function patchSubTaskSummaryFromEvent(ev) {
+  if (ev.type !== 'view.updated' || !ev.taskId) return false;
+  const summary = (S.view?.subTaskSummaries || []).find((candidate) => candidate.id === ev.taskId);
+  if (!summary) return false;
+  const payload = ev.payload || {};
+  const previous = summary.lastView || {};
+  const next = {
+    ...previous,
+    ...(payload.stage ? { stage: payload.stage } : {}),
+    ...(payload.status ? { status: payload.status } : {}),
+    waitingFor: payload.waitingFor ? { kind: payload.waitingFor } : undefined,
+  };
+  summary.lastView = next;
+  return previous.stage !== next.stage || previous.status !== next.status
+    || previous.waitingFor?.kind !== next.waitingFor?.kind;
+}
+
 function patchTaskListFromEvent(ev) {
   if (ev.type !== 'view.updated' || !ev.taskId) return false;
   const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
@@ -3439,6 +3458,7 @@ function connectWs() {
         refreshTask(ev.type);
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
+    if (S.selected && ev.taskId !== S.selected && patchSubTaskSummaryFromEvent(ev)) scheduleTaskPageRender();
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
       && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask('attempt.sibling'); // its card, not our details
@@ -8503,9 +8523,14 @@ function subTaskState(rec) {
 }
 
 function subTasksSection(v) {
-  if (!v.subTasks?.length) return '';
-  const children = v.subTasks.map((id) => {
-    const rec = taskRecord(id);
+  // Every child the store records, not only those the current run spawned (a
+  // replaced run forgets children that had already settled). A finished child is
+  // archived out of the live list, so the parent's view carries its summary.
+  const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
+  const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])];
+  if (!ids.length) return '';
+  const children = ids.map((id) => {
+    const rec = taskRecord(id) || summaries.get(id);
     const state = subTaskState(rec);
     return { id, rec, state };
   });

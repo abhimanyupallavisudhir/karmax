@@ -8,7 +8,7 @@ test('RQ-3/UI-7: foreign projects and known sibling attempts do not reload the c
   let reloads = 0;
   const ctx = vm.createContext({ S: { projectId: 'p', selected: null, tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {}, attemptGroup: { principalAttemptId: 'a', attempts: [{ id: 'a' }, { id: 'b' }] } },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(['subtask.created']), inboxEventChanges: () => false, scheduleTaskListReload: () => reloads++ });
+    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(['subtask.created']), inboxEventChanges: () => false, scheduleTaskListReload: () => reloads++ });
   vm.runInContext(fn('connectWs'), ctx); ctx.connectWs();
   for (const event of [{ taskId: 'foreign', projectId: 'other', type: 'view.updated' }, { taskId: 'foreign', projectId: 'other', type: 'subtask.created' }, { taskId: 'b', projectId: 'p', type: 'view.updated' }]) ctx.S.ws.onmessage({ data: JSON.stringify(event) });
   assert.equal(reloads, 0);

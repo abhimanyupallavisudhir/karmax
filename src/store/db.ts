@@ -23,6 +23,7 @@ import {
   TaskParams,
   AgentProfile,
   TaskView,
+  ChildTaskSummary,
   ReviewInfo,
   KarmaxEvent,
   Tag,
@@ -767,6 +768,7 @@ export class Store {
         PRIMARY KEY(attachmentId, projectId)
       );
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
+      CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parentTaskId);
       CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_memberships(userId, organizationId);
       CREATE INDEX IF NOT EXISTS idx_project_members_principal ON project_memberships(principalKey, projectId);
       CREATE INDEX IF NOT EXISTS idx_inbox_user ON inbox(userId, unread, createdAt DESC);
@@ -3613,6 +3615,29 @@ export class Store {
     t.subscribers = (await this.subscribersFor(id));
     if (t.confirmationPolicy) t.reviewers = (await this.reviewAudience(t));
     return t;
+  }
+
+  /** Each child's list fields, archived children included, for its parent's
+   * Sub-tasks panel (`TaskView.subTaskSummaries`). */
+  async childTaskSummaries(parentTaskId: string): Promise<ChildTaskSummary[]> {
+    const rows = await this.readRows<{ id: string; num: number | null; title: string; workflow: string; lastView: string | null }>(
+      'SELECT id, num, title, workflow, lastView FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, id', [parentTaskId]);
+    return rows.map((row) => {
+      const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
+      return {
+        id: row.id,
+        ...(row.num != null ? { num: row.num } : {}),
+        title: row.title,
+        workflow: row.workflow,
+        ...(view ? { lastView: {
+          stage: view.stage,
+          status: view.status,
+          ...(view.waitingFor ? { waitingFor: view.waitingFor } : {}),
+          ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
+          ...(view.state?.draft ? { state: { draft: true } } : {}),
+        } } : {}),
+      };
+    });
   }
 
   /** Resolve a task by its per-project sequential number (SPEC §10.6). */

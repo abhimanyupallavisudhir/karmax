@@ -600,6 +600,25 @@ describe('task stage transitions', () => {
       args: [{ childTaskId: child.id, stage: 'done' }] }));
   });
 
+  // Task #367: the parent's Sub-tasks panel showed every finished child as
+  // "In progress · setup", because finished children are archived out of the
+  // live list the console resolved them from.
+  it('gives a parent every sub-task with its state, finished ones included', async () => {
+    const f = (await fixture());
+    const child = (title: string) => f.store.createTask({ projectId: f.project.id, title, workflow: 'software-dev',
+      workflowVersion: f.task.workflowVersion, params: { prompt: title }, parentTaskId: f.task.id });
+    const done = (await child('Finished'));
+    const live = (await child('Working'));
+    (await f.store.saveView(done.id, { ...f.view, taskId: done.id, title: 'Finished', stage: 'done', status: 'done' }));
+    (await f.store.saveView(live.id, { ...f.view, taskId: live.id, title: 'Working', stage: 'do', status: 'active' }));
+    const parent = await f.api.getTaskView(f.token, f.task.id);
+    expect(parent?.subTaskSummaries).toEqual([
+      expect.objectContaining({ id: done.id, title: 'Finished', lastView: expect.objectContaining({ stage: 'done', status: 'done' }) }),
+      expect.objectContaining({ id: live.id, title: 'Working', lastView: expect.objectContaining({ stage: 'do', status: 'active' }) }),
+    ]);
+    expect((await f.api.getTaskView(f.token, done.id))?.subTaskSummaries).toBeUndefined();
+  });
+
   it('restores cancellation to its remembered stage and supports a cross-cutting human hold', async () => {
     const f = (await fixture());
     (await f.store.saveView(f.task.id, {

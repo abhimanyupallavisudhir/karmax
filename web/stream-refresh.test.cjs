@@ -8,7 +8,7 @@ test('RQ-1: streaming output updates only its bubble and preserves activity hist
   let renders = 0, bubbles = 0;
   const ctx = vm.createContext({ S: { selected: 't', tab: 'tasks', tasks: [], taskEvents: [{ type: 'agent.activity' }], activity: [], meta: {}, liveOutput: {} },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, updateLiveBubble: () => bubbles++, scheduleTaskPageRender: () => renders++,
+    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, updateLiveBubble: () => bubbles++, scheduleTaskPageRender: () => renders++,
     LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false });
   vm.runInContext([fn('connectWs'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
   for (let i = 0; i < 500; i++) ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', type: 'agent.output', payload: { text: 'hello', source: 'assistant' } }) });
@@ -18,7 +18,7 @@ test('LT-5: the live bubble holds assistant text until its message completes or 
   let bubbles = 0;
   const ctx = vm.createContext({ S: { selected: 't', tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {}, liveOutput: {} },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, updateLiveBubble: () => bubbles++, scheduleTaskPageRender: () => {},
+    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, updateLiveBubble: () => bubbles++, scheduleTaskPageRender: () => {},
     LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false });
   vm.runInContext([fn('connectWs'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
   const send = (type, payload) => ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', type, payload }) });
@@ -39,7 +39,7 @@ test('LT-5: the live bubble holds assistant text until its message completes or 
 test('LT-5: each agent keeps its own live text; another agent\'s events never clear it', () => {
   const ctx = vm.createContext({ S: { selected: 't', tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {}, liveOutput: {} },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, updateLiveBubble: () => {}, scheduleTaskPageRender: () => {}, refreshTask: () => {},
+    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, updateLiveBubble: () => {}, scheduleTaskPageRender: () => {}, refreshTask: () => {},
     LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false });
   vm.runInContext([fn('connectWs'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
   const send = (type, payload) => ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', type, payload }) });
@@ -62,7 +62,7 @@ test('LT-5: streamed chunks stay out of the Activity feed', () => {
   let renders = 0;
   const ctx = vm.createContext({ S: { selected: null, tab: 'activity', projectId: 'p', tasks: [], taskEvents: [], activity: [], meta: {} },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, bgRenderMain: () => renders++, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false });
+    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, bgRenderMain: () => renders++, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false });
   vm.runInContext([fn('connectWs'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
   for (let i = 0; i < 50; i++) ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', projectId: 'p', type: 'agent.output', payload: { text: `x${i}`, source: 'assistant' } }) });
   ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', projectId: 'p', type: 'agent.activity', payload: { kind: 'message', phase: 'completed' } }) });

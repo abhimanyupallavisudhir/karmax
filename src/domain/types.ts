@@ -1502,6 +1502,15 @@ export interface DeclaredAction {
 }
 
 /** The typed projection of a task's state + allowed actions the UI renders. */
+/** A sub-task as its parent's Sub-tasks panel shows it. */
+export interface ChildTaskSummary {
+  id: string;
+  num?: number;
+  title: string;
+  workflow: string;
+  lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed'> & { state?: { draft?: boolean } };
+}
+
 export interface TaskView {
   taskId: string;
   /**
@@ -1573,6 +1582,9 @@ export interface TaskView {
   /** Separate proposal authorization and exact integration validation. */
   landing?: TaskLandingState;
   subTasks?: string[];
+  /** Every child the store records, with its list fields: finished children are
+   *  archived out of the live task list, and a replaced run forgets settled ones. */
+  subTaskSummaries?: ChildTaskSummary[];
   parentTaskId?: string;
   error?: string;
   /**
