@@ -95,8 +95,9 @@ async function open(url: string): Promise<Page> {
   return page;
 }
 
+type Outcome = { origin?: string; error?: string };
 /** The two fill paths, each resolving to what the fill reported. */
-const paths = {
+const paths: Record<'gateway' | 'world', (selector: string) => Promise<Outcome>> = {
   gateway: async (selector: string) => {
     try { return await fillViaCdp({ cdpUrl: devtools, selector, text: SECRET, expectDomains: ['example.test'] }); }
     catch (error) { return { error: (error as Error).message }; }
@@ -107,7 +108,7 @@ const paths = {
     child.stdout.on('data', (chunk) => { out += chunk; });
     child.stdin.end(SECRET);
     await new Promise((resolve) => child.on('close', resolve));
-    return JSON.parse(out) as { origin?: string; error?: string };
+    return JSON.parse(out) as Outcome;
   },
 };
 
