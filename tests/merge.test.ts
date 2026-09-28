@@ -180,6 +180,28 @@ describe('finalizeMerge (work must actually land)', () => {
     await world.destroy();
   });
 
+  it('reports the task repository’s landed commit, not the untouched wiki companion’s', async () => {
+    const wiki = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-'));
+    try {
+      await gitOrThrow(wiki, ['init', '-q', '-b', 'main']);
+      await ensureIdentity(wiki);
+      fs.writeFileSync(path.join(wiki, 'SPEC.md'), '# Spec\n');
+      await git(wiki, ['add', '-A']);
+      await git(wiki, ['commit', '-q', '-m', 'wiki']);
+      const world = await new WorktreeProvider(home).create({ taskId: 'with-wiki', repos: [repo, wiki], base: 'main', target: 'main' });
+      world.handle.repos![1]!.role = 'project-wiki';
+      const code = world.handle.repos![0]!;
+      await world.writeFile(`${code.name}/feature.js`, 'export const feature = true;\n');
+      await git(code.root, ['add', '-A']);
+      await git(code.root, ['commit', '-q', '-m', 'feature']);
+
+      const res = await finalizeMerge(world, 'main');
+      expect(res.merged).toBe(true);
+      expect(res.sha).toBe((await git(repo, ['rev-parse', 'main'])).stdout.trim());
+      await world.destroy();
+    } finally { fs.rmSync(wiki, { recursive: true, force: true }); }
+  });
+
   it.each(['corrected', 'legacy'])('lands work and reports files after a missing base (%s metadata)', async (metadata) => {
     const provider = new WorktreeProvider(home);
     // Setup now resolves the missing base and reports the correction immediately.

@@ -368,7 +368,12 @@ export class TokenAuthority {
       && await this.ownsTask(record, scope.taskId))) return { ok: false, record, reason: `missing capability ${capability}` };
     // Resolve the tenant from durable ownership, including callers that pass
     // only a project/task ID. A transfer must immediately fence old org tokens.
-    const projectId = scope?.projectId ?? (scope?.taskId ? (await this.store?.taskProjectIdAsync(scope.taskId)) : undefined);
+    // A task decides its own project: a scope that pairs it with another one
+    // would otherwise be checked against the project the caller named.
+    const taskProjectId = scope?.taskId ? (await this.store?.taskProjectIdAsync(scope.taskId)) : undefined;
+    if (taskProjectId && scope?.projectId && taskProjectId !== scope.projectId)
+      return { ok: false, record, reason: 'task belongs to another project' };
+    const projectId = scope?.projectId ?? taskProjectId;
     const projectOrganization = projectId ? await this.store?.projectOrganizationAsync(projectId) : undefined;
     if (projectOrganization && record.organizationId && projectOrganization !== record.organizationId)
       return { ok: false, record, reason: 'project belongs to another organization' };

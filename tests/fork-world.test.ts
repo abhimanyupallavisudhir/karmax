@@ -11,7 +11,7 @@ import { WorktreeProvider } from '../src/world/worktree.js';
 import { WorldCheckpointService } from '../src/world/checkpoint.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { gitOrThrow, ensureIdentity } from '../src/world/git.js';
-import { forkWorldSource } from '../src/world/fork.js';
+import { forkRecordedAuthority, forkWorldSource } from '../src/world/fork.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import type { WorldHandle } from '../src/world/types.js';
@@ -187,6 +187,88 @@ describe('fork world initialization', () => {
       (await store.close());
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('provisions the repositories and authority its checkpoint recorded, not newer project defaults (WD-11)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fork-recorded-'));
+    const store = (await Store.create(':memory:'));
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const [original, replacement] = ['original', 'replacement'].map((name) => path.join(dir, name));
+    for (const repo of [original!, replacement!]) {
+      fs.mkdirSync(repo);
+      await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
+      await ensureIdentity(repo);
+      fs.writeFileSync(path.join(repo, 'file.txt'), path.basename(repo));
+      await gitOrThrow(repo, ['add', '.']);
+      await gitOrThrow(repo, ['commit', '-qm', 'initial']);
+    }
+    const project = (await store.createProject('Fork', { repos: [original!], defaultBase: 'main' }));
+    const sourceTask = (await store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'source' } }));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const checkpoints = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
+    const source = await worlds.create('worktree', { taskId: sourceTask.id, repo: original, base: 'main', target: 'main' });
+    source.handle = (await store.registerWorld(source.handle, project.id)) as WorldHandle;
+    const created: WorldHandle[] = [];
+    try {
+      await source.writeFile('file.txt', 'unpublished source work');
+      await checkpoints.checkpoint(source.handle, { scrubSecrets: false });
+      const plan = forkWorldSource(sourceTask, source.handle)!;
+      // The project moved on to another repository after the source started;
+      // the workflow passes today's project repositories to createWorld.
+      (await store.updateProjectConfig(project.id, { ...project.config, repos: [replacement!] }));
+      const core = makeCoreActivities({ store, worlds, adapters: new Map(), checkpoints,
+        profiles: new ProfileResolver(store, 'mock') });
+      const task = (await store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'fork', base: plan.base, _forkWorld: plan } }));
+      const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repos: [replacement!],
+        base: plan.base, target: 'main', kind: 'worktree' });
+      created.push(handle);
+      const fork = await worlds.open(handle);
+      const recorded = fork.handle.repos!.find((repo) => repo.repo === original)!;
+      expect(recorded).toBeDefined();
+      expect(await fork.readFile(`${recorded.name}/file.txt`)).toBe('unpublished source work');
+      expect(fork.handle.repos!.some((repo) => repo.repo === replacement)).toBe(true);
+
+      // A checkout whose base history GitHub owned must be provisioned from
+      // origin again, even if the project has since switched to local policy.
+      const prTask = (await store.createTask({ projectId: project.id, title: 'PR source', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'source' } }));
+      const prSource = await worlds.create('worktree', { taskId: prTask.id, repo: original, base: 'main', target: 'main' });
+      prSource.handle.repos![0]!.sourceAuthority = 'origin';
+      prSource.handle = (await store.registerWorld(prSource.handle, project.id)) as WorldHandle;
+      created.push(prSource.handle);
+      const originCheckpoint = await checkpoints.checkpoint(prSource.handle, { scrubSecrets: false });
+      expect(originCheckpoint.repos[0]!.sourceAuthority).toBe('origin');
+      const prPlan = forkWorldSource(prTask, prSource.handle)!;
+      const again = (await store.createTask({ projectId: project.id, title: 'Fork again', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'fork', base: prPlan.base, _forkWorld: prPlan } }));
+      const spec = vi.spyOn(worlds, 'create').mockRejectedValueOnce(new Error('spec captured'));
+      await expect(core.createWorld({ taskId: again.id, projectId: project.id, repos: [replacement!],
+        base: prPlan.base, target: 'main', kind: 'worktree' })).rejects.toThrow('spec captured');
+      expect(spec.mock.calls[0]![1]).toMatchObject({ repositoryAuthorities: { [original!]: 'origin' } });
+      expect(spec.mock.calls[0]![1].repositoryAuthorities?.[replacement!]).toBeUndefined();
+    } finally {
+      for (const handle of created) await (await worlds.open(handle)).destroy();
+      await source.destroy();
+      (await store.close());
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves the authority of a checkpoint that predates recording it to the current policy (WD-11)', () => {
+    const entry = { repositoryId: 'r', source: 'git@github.com:acme/app.git', checkoutPath: '.', baseSha: 'a', branch: 'karmax/source' };
+    const checkpoint = (repo: Record<string, unknown>) => ({ repos: [{ ...entry, ...repo }] }) as any;
+    // Before authorities were recorded an 'origin' checkout looked exactly like
+    // a 'project' one, so neither may be forced to 'project'.
+    expect(forkRecordedAuthority(checkpoint({}), [entry.source])).toEqual([undefined]);
+    // Entries that record authorities omit only 'project'; they also carry the
+    // commit identity (and a local checkout's path).
+    const identity = { gitIdentity: { name: 'Agent', email: 'agent@example.com' } };
+    expect(forkRecordedAuthority(checkpoint(identity), [entry.source])).toEqual(['project']);
+    expect(forkRecordedAuthority(checkpoint({ localPath: '/srv/app' }), [entry.source])).toEqual(['project']);
+    expect(forkRecordedAuthority(checkpoint({ ...identity, sourceAuthority: 'origin' }), [entry.source])).toEqual(['origin']);
   });
 
   it('preserves separate repository branches and commits', async () => {

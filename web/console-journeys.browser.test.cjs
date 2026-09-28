@@ -1,60 +1,31 @@
 // Full console shell, trusted Chromium input, and deterministic local API/WS fakes.
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const { chromium } = require('playwright');
+const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cjs');
 
 (async () => {
-  const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--no-sandbox'] });
+  const browser = await launch();
   try {
     const context = await browser.newContext({ serviceWorkers: 'block' });
-    const requests = [], errors = [], sockets = [];
+    const errors = [];
     const project = { id: 'p', organizationId: 'o', name: 'Workspace', config: {} };
     const task = { id: 't', projectId: 'p', num: 1, title: 'Review <script>世界</script>', workflow: 'software-dev', params: {}, tags: ['tag'], lastView: { stage: 'do', status: 'active' } };
     const tags = [{ id: 'tag', projectId: 'p', name: 'Topic', kind: 'topic' }];
     const schema = [{ name: 'software-dev', params: [{ name: 'prompt', type: 'text', label: 'Prompt', scopes: ['task'], bind: 'prompt' }], stages: [{ key: 'do', label: 'Working' }] }];
     let failSearch = false, searchDelay = 0, failTagSave = true;
-    await context.routeWebSocket('**/ws*', ws => { sockets.push(ws); });
-    await context.route('http://console.test/**', async route => {
-      const req = route.request(), url = new URL(req.url()), p = url.pathname;
-      if (!p.startsWith('/api/')) {
-        const file = p === '/app.js' || p === '/styles.css' || p === '/markdown.js' || p === '/totp-qr.js' || p === '/register-service-worker.js' ? p.slice(1) : 'index.html';
-        return route.fulfill({ contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html', body: fs.readFileSync(path.join(__dirname, file), 'utf8') });
+    const { requests, sockets } = await fakeConsole(context, { project, tasks: [task], schema, async api(p, req) {
+      if (p === '/api/projects/p/tags') {
+        if (req.method() !== 'POST') return tags;
+        await new Promise(resolve => setTimeout(resolve, 150));
+        if (failTagSave) return reply(503, { error: 'Could not save tag' });
+        const tag = { ...req.postDataJSON(), id: 'created', projectId: 'p' };
+        tags.push(tag);
+        return tag;
       }
-      requests.push(`${req.method()} ${p}`);
-      let data = [];
-      if (p === '/api/meta') data = { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [] };
-      else if (p === '/api/launch') data = {};
-      else if (p === '/api/session') data = { authenticated: true, user: { id: 'u', name: 'Tester' } };
-      else if (p === '/api/settings/installation') data = { canManage: false };
-      else if (p === '/api/organizations') data = [{ id: 'o', name: 'Organization', slug: 'org' }];
-      else if (p === '/api/user/default-organization') data = { organizationId: 'o' };
-      else if (p === '/api/projects') data = [project];
-      else if (p === '/api/projects/p') data = project;
-      else if (p === '/api/schema') data = schema;
-      else if (p === '/api/contributions') data = { slots: [], commands: [], events: [] };
-      else if (p === '/api/models') data = { providers: [] };
-      else if (p.endsWith('/defaults')) data = { effective: {}, inherited: {} };
-      else if (p === '/api/projects/p/tasks') data = [task];
-      else if (p === '/api/projects/p/tags') {
-        if (req.method() === 'POST') {
-          await new Promise(resolve => setTimeout(resolve, 150));
-          if (failTagSave) return route.fulfill({ status: 503, json: { error: 'Could not save tag' } });
-          const tag = { ...req.postDataJSON(), id: 'created', projectId: 'p' };
-          tags.push(tag); data = tag;
-        } else data = tags;
-      }
-      else if (p === '/api/projects/p/search' || p === '/api/search') {
+      if (p === '/api/projects/p/search' || p === '/api/search') {
         if (searchDelay) await new Promise(resolve => setTimeout(resolve, searchDelay));
-        if (failSearch) return route.fulfill({ status: 503, json: { error: 'Search temporarily unavailable' } });
-        data = p === '/api/search' ? [{ projectId: 'p', tasks: [task], total: 1 }] : { tasks: [task], total: 1 };
+        if (failSearch) return reply(503, { error: 'Search temporarily unavailable' });
       }
-      else if (p === '/api/tasks/t') data = { taskId: 't', projectId: 'p', title: task.title, workflow: 'software-dev', stage: 'do', status: 'active', messages: [], actions: [], state: {} };
-      else if (p.endsWith('/sessions')) data = {};
-      else if (p.endsWith('/attempts')) data = { principalAttemptId: 't', attempts: [task] };
-      else if (p.endsWith('/events')) data = [];
-      return route.fulfill({ json: data });
-    });
+    } });
     context.setDefaultTimeout(8000);
     const page = await context.newPage();
     page.on('pageerror', error => { errors.push(error.message); console.error('page:', error.message); });
