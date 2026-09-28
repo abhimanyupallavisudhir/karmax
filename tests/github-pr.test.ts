@@ -67,6 +67,11 @@ function fakeGithub() {
     if (one) {
       const pr = prs.find((candidate) => candidate.number === Number(one[2]) && candidate.repo === one[1]);
       if (!pr) return json(404, { message: 'Not Found' });
+      // Real GitHub rule (task 387): a closed PR's base cannot change.
+      if (method === 'PATCH' && pr.state === 'closed' && body.state !== 'open' && 'base' in body)
+        return json(422, { message: 'Validation Failed', errors: [{ message: 'Cannot change the base branch of a closed pull request.' }] });
+      if (method === 'PATCH' && pr.state === 'closed' && body.state === 'open' && pr.unreopenable)
+        return json(422, { message: 'Validation Failed', errors: [{ message: 'state cannot be changed. The branch was force-pushed or recreated.' }] });
       if (method === 'PATCH') Object.assign(pr, body);
       return json(200, pr);
     }
@@ -484,6 +489,21 @@ describe('GitHub PR client', () => {
     const { pr } = await api.openOrUpdate(SLUG, { head: 'tavya/t2', base: 'main', title: 'T', body: 'b' });
     await api.update(SLUG, pr.number, { state: 'closed' });
     expect((await api.openOrUpdate(SLUG, { head: 'tavya/t2', base: 'main', title: 'T', body: 'b' })).pr.state).toBe('open');
+
+    // Retargeted while closed: reopen first, then change the base (task 387).
+    await api.update(SLUG, pr.number, { state: 'closed' });
+    const retargeted = await api.openOrUpdate(SLUG, { head: 'tavya/t2', base: 'release', title: 'T', body: 'b' });
+    expect(retargeted.pr).toMatchObject({ number: pr.number, state: 'open' });
+    expect(gh.prs[0].base.ref ?? gh.prs[0].base).toBe('release');
+
+    // A closed PR GitHub will not reopen is replaced by a fresh one.
+    await api.update(SLUG, pr.number, { state: 'closed' });
+    gh.prs[0].unreopenable = true;
+    const replaced = await api.openOrUpdate(SLUG, { head: 'tavya/t2', base: 'main', title: 'T', body: 'b' });
+    expect(replaced).toMatchObject({ created: true, pr: { state: 'open' } });
+    expect(replaced.pr.number).not.toBe(pr.number);
+    gh.prs.splice(1);
+    gh.prs[0].unreopenable = false;
 
     gh.prs[0].state = 'closed';
     gh.prs[0].merged_at = '2026-01-01T00:00:00Z';
@@ -1875,6 +1895,40 @@ describe('PR stage (remote policy "pr")', () => {
 
     await expect(core.openPr(handle, 'release', { title: 'Restored target' })).resolves.toHaveLength(1);
     expect(gh.prs[0].base.ref).toBe('release');
+    await core.destroyWorld(handle);
+  });
+
+  // Tasks 368–376 (2026-09-26): a sub-task's CI repair merged origin/<parent>,
+  // fast-forwarding an untouched checkout to the parent's newer tip. The stale
+  // local parent ref still counted those commits as "ahead", so krmax asked
+  // GitHub for a PR with no commits and escalated on its 422.
+  it('skips a checkout that only caught up with a newer remote target', async () => {
+    const gh = fakeGithub();
+    const core = await coreFor(gh);
+    const repo = await repoWithGithubOrigin('caught-up');
+    const handle = await core.createWorld({ taskId: 'task_pr_caught_up', repo, base: 'main', target: 'main', kind: 'worktree' });
+    const checkout = handle.repos![0]!;
+    // The target moves on origin after the world was created (another task landed).
+    const upstream = path.join(tmp, 'caught-up-upstream');
+    await gitOrThrow(tmp, ['clone', '-q', path.join(tmp, 'caught-up-origin.git'), upstream]);
+    await ensureIdentity(upstream);
+    fs.writeFileSync(path.join(upstream, 'landed.txt'), 'landed');
+    await gitOrThrow(upstream, ['add', '-A']);
+    await gitOrThrow(upstream, ['commit', '-q', '-m', 'landed elsewhere']);
+    await gitOrThrow(upstream, ['push', '-q', 'origin', 'main']);
+    // refresh_upstream + merge: the task branch now equals origin/main, while the
+    // local `main` ref is still the old tip.
+    await gitOrThrow(checkout.root, ['fetch', '-q', 'origin', 'main:refs/remotes/origin/main']);
+    await gitOrThrow(checkout.root, ['merge', '-q', '--ff-only', 'refs/remotes/origin/main']);
+    expect((await git(checkout.root, ['rev-list', '--count', `main..${checkout.branch}`])).stdout.trim()).toBe('1');
+
+    await expect(core.openPr(handle, 'main', { title: 'Nothing of its own' })).resolves.toEqual([]);
+    expect(gh.prs).toHaveLength(0);
+
+    fs.writeFileSync(path.join(checkout.root, 'own.txt'), 'own');
+    await git(checkout.root, ['add', '-A']);
+    await git(checkout.root, ['commit', '-q', '-m', 'own work']);
+    await expect(core.openPr(handle, 'main', { title: 'Own work' })).resolves.toHaveLength(1);
     await core.destroyWorld(handle);
   });
 

@@ -50,7 +50,11 @@ it('delivers sub-tasks and answers queued before a retried turn was interrupted,
     const result = await core.runAgentTurn(args);
     expect(result.subTasks).toEqual([spawn]);
     expect(result.subTaskResponses).toEqual([answer]);
-    // The next turn starts clean.
-    expect(await store.kvGet(`turnspawns:${task.id}#0`)).toBeUndefined();
+    // The next turn starts clean: its journal is its own.
+    attempt = 1;
+    runTurn.mockImplementationOnce(async () => ({ termination: { kind: 'success', status: 'end_turn' }, output: 'next' }));
+    const next = await core.runAgentTurn({ ...args, agentTurnId: `${task.id}#1` });
+    expect(next.subTasks ?? []).toEqual([]);
+    expect(next.subTaskResponses ?? []).toEqual([]);
   } finally { await world.destroy(); await store.close(); }
 });

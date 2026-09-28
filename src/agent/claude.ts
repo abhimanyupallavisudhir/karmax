@@ -16,6 +16,7 @@ import { createFollowUpInjector, toSdkUserMessage, followUpContent, withClaudeSt
 import { agentMcpToConfig } from '../contrib/manifests.js';
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
 import {
+  AgentChannelLost,
   ProviderFailure,
   apiThrottle,
   classifyLimitError,
@@ -131,6 +132,7 @@ export class ClaudeAdapter implements AgentAdapter {
             added++;
           }
           deliveredIndex++;
+          ctx.followUpsDelivered?.(deliveredIndex);
         }
       } catch { /* a failed poll must never break the turn */ }
       return added;
@@ -507,6 +509,7 @@ export class ClaudeAdapter implements AgentAdapter {
             injected++;
           }
           deliveredIndex++;
+          ctx.followUpsDelivered?.(deliveredIndex);
         }
         return injected;
       } catch {
@@ -794,6 +797,16 @@ export class ClaudeAdapter implements AgentAdapter {
         // the stream to its end lets any in-turn settlements clear before we report —
         // only genuinely still-running sub-agents remain (see subagents.ts).
         trackTaskMessage(subagents, message);
+        // The harness woke after we ended its input (a background task finished past
+        // the settle grace; task 388). Every control tool would now fail with "Stream
+        // closed", so stop it and let the retry resume the session with a live channel.
+        if (message.type === 'assistant' && injector.closed) {
+          onAbort();
+          throw new AgentChannelLost(
+            'Claude resumed work after its control channel closed; resuming the session with a working channel',
+            'a background task you were waiting on finished after your tool channel had closed, so your tools stopped working; they work again now',
+          );
+        }
         if (message.type === 'assistant') {
           harnessIdle = false; // working again: a pending settle re-check must not close under it
           const answered: unknown = (message as any).user_message_uuids ?? [(message as any).user_message_uuid];
@@ -1022,7 +1035,7 @@ export class ClaudeAdapter implements AgentAdapter {
           try { await boundedStartupProbe(() => diagnoseStartup('error'), 5000, undefined); }
           catch { /* retain the original startup failure */ }
         }
-        if (e instanceof ProviderFailure) throw e;
+        if (e instanceof ProviderFailure || e instanceof AgentChannelLost) throw e;
         if (remoteProcess?.lost) throw remoteProcess.lost;
         throw e; // preserve the original stack for unrelated SDK failures
       }

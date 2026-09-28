@@ -91,6 +91,7 @@ export class MockAdapter implements AgentAdapter {
             injected++;
           }
           deliveredIndex++;
+          ctx.followUpsDelivered?.(deliveredIndex);
         }
       }
       return injected;

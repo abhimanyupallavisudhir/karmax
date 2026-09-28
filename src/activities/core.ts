@@ -19,7 +19,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -36,7 +36,7 @@ import {
   modelProviderFromModel,
 } from '../agent/provider-registry.js';
 import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
-import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn, type QueuedDelegation } from '../agent/runtime.js';
+import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { SecretScrubber } from '../agent/activity.js';
 import { gateFollowUps } from './follow-up-gate.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
@@ -147,7 +147,8 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
   // Admission happens before a provider process exists. Temporal coordinator
   // backpressure/outages therefore cannot be an agent error and must retain
   // their retryable infrastructure classification through this outer boundary.
-  if (err instanceof AdmissionBackpressureError || err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError) {
+  if (err instanceof AdmissionBackpressureError || err instanceof AgentAdmissionInfrastructureError
+    || err instanceof AgentResourcesUnavailableError || err instanceof AgentChannelLost) {
     return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   }
   if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) {
@@ -1822,9 +1823,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let signal: AbortSignal | undefined;
       let legacyAgentTurnId: string | undefined;
       let turnSessionKey: string | undefined;
-      let delegationKey: string | undefined;
       let resumedActivityAttempt = false;
       let activityAttempt = 1;
+      // What earlier attempts of THIS turn recorded (open_pr, sub-tasks, decisions,
+      // mid-turn deliveries). Restored so a retry never drops them.
+      let restoredJournal: import('../agent/runtime.js').TurnJournal | undefined;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -1844,8 +1847,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
         turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
-        // Queued sub-task spawns/answers survive a retry of the same turn.
-        delegationKey = stableTurnId ? `turnspawns:${stableTurnId}` : undefined;
+        if (actx.info.attempt > 1 && turnSessionKey) {
+          try { restoredJournal = JSON.parse((await store.kvGet(`${turnSessionKey}:journal`)) ?? 'null') ?? undefined; }
+          catch { restoredJournal = undefined; }
+        }
         // Heartbeat details are Temporal's primary retry checkpoint. The per-turn
         // SQLite key closes the small hard-kill window before a heartbeat reaches the
         // service; unlike session:<task>:<role>, it cannot accidentally pick up a
@@ -2678,6 +2683,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal,
           heartbeat,
           pullFollowUps,
+          ...(turnSessionKey ? { journal: {
+            restored: restoredJournal,
+            save: async (journal: import('../agent/runtime.js').TurnJournal) => {
+              (await store.kvSet(`${turnSessionKey}:journal`, JSON.stringify(journal)));
+            },
+          } } : {}),
           pullSecretEnv: () => pullSecretEnv?.() ?? Promise.resolve({}),
           // Coalesce the live-output stream: adapters re-emit the growing *cumulative*
           // message text, so consecutive identical/prefix emits carry no new info.
@@ -2694,10 +2705,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const event = { type: 'agent.output', taskId: args.taskId, ts: Date.now(), payload };
             deps.bus?.emit({ ...event, seq: (await store.appendLiveOutput(event)) });
           },
-          ...(delegationKey ? {
-            queuedDelegation: await store.kvGet(delegationKey).then(raw => raw ? JSON.parse(raw) : undefined),
-            onDelegation: async (queued: QueuedDelegation) => { (await store.kvSet(delegationKey!, JSON.stringify(queued))); },
-          } : {}),
           subTaskParams: (params: unknown) => subTaskParams(store, { projectId: args.task.projectId, parentTaskId: args.taskId, params }),
           onReviewInfo: async (info, supplied) => {
             signal?.throwIfAborted();
@@ -2826,8 +2833,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (resultKey) {
           await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));
           resultCheckpointed = true;
-          // The checkpointed result now carries every queued spawn and answer.
-          if (delegationKey) (await store.kvDelete(delegationKey));
         }
         }
         // Defence in depth around the activity boundary. `runTurn` rejects an
@@ -2840,6 +2845,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         await finishUsage(true);
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
+        }
+        // A resumed attempt was handed only a continuation notice, so its adapter's
+        // count is not in the workflow's index space. The replaced attempt already
+        // delivered the scheduled batch plus whatever it injected mid-turn.
+        if (resumedActivityAttempt && args.role !== 'confirm') {
+          result.delivered = Math.max(restoredJournal?.delivered ?? 0, args.messages.length);
         }
         if (args.role === 'confirm' && result.confirmDecision?.action === 'confirm' && result.confirmDecision.otherAttempts) {
           (await store.kvSet(`attempt-choice:${args.taskId}`, result.confirmDecision.otherAttempts));
@@ -2865,6 +2876,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : err;
         }
+        // Tell the resumed attempt why it was interrupted, as for a sandbox freeze.
+        if (err instanceof AgentChannelLost && turnSessionKey)
+          (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify({ summary: err.summary })));
         const failure = classifyTurnError(err, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else
         // in a remote world may be the sandbox's fault, which its metrics can show.
@@ -3804,14 +3818,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }));
           recordedCurrents.add(observation);
         };
-        const externalWait = async (key: string, detail: string): Promise<GitHubMergeAuthorization> => {
+        const externalWait = async (key: string, detail: string, exhausted?: string): Promise<GitHubMergeAuthorization> => {
           const previous = events.filter((event) => event.type === 'github.ci.external-wait'
             && event.payload?.key === key).length;
           (await record(handle.id, 'github.ci.external-wait', { key, slug: ref.slug, number: ref.number,
             candidateHead: ref.headSha, poll: previous + 1 }));
           if (previous + 1 >= MAX_SUPERSEDED_CI_POLLS) return {
             status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
-            detail: `${detail}\n\nGitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry. The task owns no admission slot while parked.`,
+            detail: `${detail}\n\n${exhausted ?? `GitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry.`} The task owns no admission slot while parked.`,
             eligibleUserIds: [actorUserId],
           };
           return { status: 'waiting', prs: current, actorUserId, releaseAdmission: true, detail };

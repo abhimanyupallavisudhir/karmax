@@ -48,7 +48,7 @@ describe.each(storeBackends)('organization and collaboration domain ($name)', ({
         await store.addAuthorizationInbox(org.id, ['owner'],
           { kind: 'avatar-authorization', avatarId, projectId: project.id, requestId }, 1000);
       const inbox = await store.listInbox('owner', org.id);
-      expect(inbox.map((row) => row.subject?.requestId).sort()).toEqual(['Aa', 'BB']);
+      expect(inbox.map((row) => row.subject?.kind === 'avatar-authorization' ? row.subject.requestId : undefined).sort()).toEqual(['Aa', 'BB']);
     } finally { await store.close(); }
   });
 
@@ -427,6 +427,8 @@ describe.each(storeBackends)('organization and collaboration domain ($name)', ({
     (await store.setSettings(`quick:${project.id}`, 'software-dev', { secret: 'quick' }));
     (await store.kvSet(`session:${task.id}:do`, 'session-secret'));
     (await store.kvSet(`turnsession:${task.id}#1`, 'turn-secret'));
+    (await store.kvSet(`turnsession:${task.id}:run-1#0`, 'run-scoped-turn-secret'));
+    (await store.kvSet(`turnsession:${task.id}:run-1#0:journal`, '{"openPrRequested":true}'));
     (await store.kvSet(`wfpin:${project.id}:software-dev`, '1.0.0'));
     (await store.setPrincipalGrant('user:owner', `project:${project.id}`, { profileId: 'developer' }));
     (await store.createCard({ id: 'card-1', provider: 'test', scope: 'project', scopeId: project.id,
@@ -449,6 +451,8 @@ describe.each(storeBackends)('organization and collaboration domain ($name)', ({
       expect((await store.db.prepare(`SELECT COUNT(*) n FROM ${table}`).get())).toMatchObject({ n: 0 });
     expect((await store.kvGet(`session:${task.id}:do`))).toBeUndefined();
     expect((await store.kvGet(`turnsession:${task.id}#1`))).toBeUndefined();
+    expect((await store.kvGet(`turnsession:${task.id}:run-1#0`))).toBeUndefined();
+    expect((await store.kvGet(`turnsession:${task.id}:run-1#0:journal`))).toBeUndefined();
     expect((await store.kvGet(`wfpin:${project.id}:software-dev`))).toBeUndefined();
     expect((await store.db.prepare('SELECT projectId, taskId, worldId, metadata FROM usage_events').get()))
       .toMatchObject({ projectId: null, taskId: null, worldId: null, metadata: null });

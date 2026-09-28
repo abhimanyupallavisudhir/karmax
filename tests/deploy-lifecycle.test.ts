@@ -336,6 +336,43 @@ it('updates an exact master revision', () => {
   expect(result.stdout).toContain(`Update complete at ${h.target}`);
 });
 
+// A running workflow replays its recorded history under whatever code is
+// loaded, so a release that cannot replay one wedges it at its next event
+// (WF-34 would have wedged every task on tavya.io). The candidate replays them
+// all before anything is backed up or restarted.
+it('replays the running workflows under the candidate before backing up or restarting', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target]);
+  expect(result.status, result.stderr).toBe(0);
+  const calls = h.calls().map(args => args.join(' '));
+  const check = calls.findIndex(call => call.includes('run --rm --no-deps -T app npm run --silent replay-check'));
+  expect(check).toBeGreaterThan(calls.findIndex(call => call.includes('build --pull app')));
+  expect(check).toBeLessThan(calls.findIndex(call => call.includes('pg_dump')));
+  expect(check).toBeLessThan(calls.findIndex(call => call.includes('up -d')));
+});
+
+it('refuses a release that cannot replay a running workflow, leaving production as it was', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target], 'replay-check');
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('cannot replay');
+  expect(result.stderr).toContain(`production remains at ${h.previous}`);
+  expect(h.git('rev-parse', 'HEAD')).toBe(h.previous);
+  const calls = h.calls().map(args => args.join(' '));
+  const check = calls.findIndex(call => call.includes('replay-check'));
+  expect(calls.some(call => call.includes('pg_dump') || call.includes('up -d'))).toBe(false);
+  // The Compose tag points at the running code again for the next restart.
+  expect(calls.slice(check + 1).some(call => call.endsWith(' build app'))).toBe(true);
+});
+
+it('lets an operator skip the replay check explicitly, and says so', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target], 'replay-check', '', { KARMAX_SKIP_REPLAY_CHECK: '1' });
+  expect(result.status, result.stderr).toBe(0);
+  expect(h.calls().some(args => args.join(' ').includes('replay-check'))).toBe(false);
+  expect(result.stderr).toContain('replay check skipped');
+});
+
 // HEAD is the running revision: a failure before the new release starts must
 // leave the checkout at the one still serving.
 it('returns the checkout to the running revision when the target secrets cannot be written', () => {

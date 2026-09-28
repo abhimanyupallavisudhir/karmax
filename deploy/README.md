@@ -270,6 +270,16 @@ restores only that copy (the backup's size again in free disk space). Every
 restore, signed or not, is written to the audit log at the next boot
 (`backup.restored`, `backup.restored.unsigned`).
 
+### Replay check
+
+A running workflow replays its recorded history under whatever code the next
+worker loads, and one that cannot replay is stuck from its next event. Before
+`update` backs anything up or restarts, the new image replays every running
+workflow (`npm run replay-check`, coordinators included). If any fails, the
+update stops, lists them, and leaves the previous release running. Fix the
+release. `KARMAX_SKIP_REPLAY_CHECK=1 ./deploy/karmax update …` skips the check,
+for when the listed workflows are already broken or may break.
+
 ### Rollback compatibility
 
 `deploy/data-epoch` marks compatibility for automatic code-only rollback. Builds
