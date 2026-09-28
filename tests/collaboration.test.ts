@@ -400,7 +400,7 @@ describe('organization and collaboration domain', () => {
     const task = (await store.createTask({ projectId: project.id, title: 'Delete all of me', workflow: 'just-do',
       workflowVersion: '1', params: { prompt: 'customer data' } }));
     (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', branch: 'karmax/task', base: 'main', sealedProviderRef: 'opaque', meta: {} }, project.id));
+      root: '/workspace', branch: 'tavya/task', base: 'main', sealedProviderRef: 'opaque', meta: {} }, project.id));
     (await store.saveWorldCheckpoint({ id: 'checkpoint-1', worldId: task.id, generation: 1, projectId: project.id,
       runnerPoolId: 'pool-1', environmentDigest: 'image', repos: [],
       filesystemDelta: { objectKey: 'checkpoints/one', sha256: 'abc', bytes: 3 }, createdAt: 1 }));

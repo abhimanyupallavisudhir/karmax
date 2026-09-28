@@ -100,6 +100,16 @@ describe('organization storage locations', () => {
     await expect((async () => (await f.locations.reserveUpload('artifact-2', f.project.organizationId!, managed.id, 300, Date.now() + 60_000)))()).rejects.toThrow(/upload quota exceeded/i);
   });
 
+  it('prefixes new S3 locations with the brand and keeps an existing prefix on reconnect', async () => {
+    const f = (await fixture(1024));
+    const organizationId = f.project.organizationId!;
+    const connect = (input: { id?: string; name: string; prefix?: string }) => f.locations.connectS3(organizationId, {
+      endpoint: 'https://objects.example', bucket: 'tenant-data', accessKeyId: 'AKIA_TEST', secretAccessKey: 'secret', ...input });
+    expect((await connect({ name: 'New' })).config.prefix).toBe(`tavya/${organizationId}`);
+    const legacy = await connect({ name: 'Legacy', prefix: 'karmax/acme' });
+    expect((await connect({ id: legacy.id, name: 'Legacy' })).config.prefix).toBe('karmax/acme');
+  });
+
   it('keeps customer S3 secrets vaulted and pins revisions to the tested location', async () => {
     const f = (await fixture(1024));
     const objects = new Map<string, Buffer>();

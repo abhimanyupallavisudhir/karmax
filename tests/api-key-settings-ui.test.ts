@@ -19,7 +19,7 @@ describe('API key settings UI', () => {
     expect(editor).toContain("c.kind === 'key' ? (sd.modes?.[key] || (isOn ? 'on' : 'off'))");
     expect(editor).toContain("c.kind === 'key' && scope !== 'task'");
     expect(editor).toContain('<button class="cred-toggle ${mode}"');
-    expect(editor).toContain('<div class="cred-row ${esc(mode)}"');
+    expect(editor).toContain(`<div class="cred-row \${esc(c.signedOut ? 'signed-out' : mode)}"`);
     expect(editor).toContain('explainerOnly.delete(key)');
   });
 

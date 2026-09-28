@@ -83,7 +83,7 @@ describe('failed software-dev recovery', () => {
       taskId: task.id, title: task.title, workflow: 'goal', stage: 'failed', status: 'failed',
       messages: [{ id: 'm0', role: 'user', text: 'keep going', ts: 0 }],
       transcripts: [], actions: [], state: {},
-      branch: `karmax/${task.id}`, base: 'main', targetBranch: 'main', worldPath: world,
+      branch: `tavya/${task.id}`, base: 'main', targetBranch: 'main', worldPath: world,
       error: 'provider transport died', updatedAt: 1,
     } as any));
 
@@ -139,7 +139,7 @@ describe('failed software-dev recovery', () => {
       transcripts: [{ role: 'do', label: 'Do agent', messages: [{ id: 'm0', role: 'user', text: 'finish it', ts: 0 }] }],
       actions: [],
       state: { turnsSeen: 2 },
-      branch: `karmax/${task.id}`,
+      branch: `tavya/${task.id}`,
       base: 'main',
       targetBranch: 'main',
       worldPath: world,
@@ -164,7 +164,7 @@ describe('failed software-dev recovery', () => {
     expect(options.workflowId).toBe(task.id);
     expect(options.workflowIdReusePolicy).toBe('ALLOW_DUPLICATE_FAILED_ONLY');
     expect(options.args[0].recovery).toMatchObject({
-      world: { root: world, branch: `karmax/${task.id}`, repo },
+      world: { root: world, branch: `tavya/${task.id}`, repo },
       session: 'session-123',
       sessionHome: '(profile)',
       seen: 2,

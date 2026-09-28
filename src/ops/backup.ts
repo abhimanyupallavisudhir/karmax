@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { paths } from '../config/paths.js';
 import { scanInstances } from '../util/instance.js';
+import { BRAND } from '../domain/brand.js';
 
 const sqlite = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
@@ -87,7 +88,7 @@ export async function createBackup(options: {
     // Name a remedy the operator can actually carry out. "pass allowRunning"
     // described an API option that the `npm run backup` CLI had no flag for, so
     // the only way out of this error did not exist from where they were standing.
-    throw new Error(`stop Krmax before taking a backup (live app pids: ${live.join(', ')}), `
+    throw new Error(`stop ${BRAND} before taking a backup (live app pids: ${live.join(', ')}), `
       + 'or re-run with `npm run backup -- --allow-running` to accept a snapshot '
       + 'that is not point-in-time consistent');
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -168,7 +169,7 @@ export function verifyBackup(source: string): BackupManifest {
   const directory = path.resolve(source);
   const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as BackupManifest;
   if (manifest.format !== 'karmax-backup' || manifest.version !== 1 || !Array.isArray(manifest.files))
-    throw new Error('unsupported or invalid Krmax backup manifest');
+    throw new Error(`unsupported or invalid ${BRAND} backup manifest`);
   const payload = path.join(directory, 'payload');
   for (const entry of manifest.files) {
     const file = safeJoin(payload, entry.path);
@@ -205,7 +206,7 @@ export async function restoreBackup(source: string, options: { home?: string; al
     // components under a live process, which corrupts rather than merely tears.
     // "Krmax" not "karmax": this is operator-facing output, which carries the
     // brand (see the naming note in the SPEC, and tests/brand.test.ts).
-    throw new Error(`stop Krmax before restore (live app pids: ${running.join(', ')})`);
+    throw new Error(`stop ${BRAND} before restore (live app pids: ${running.join(', ')})`);
   if (manifest.temporal === 'embedded') await stopEmbeddedTemporal(p.temporal);
 
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });

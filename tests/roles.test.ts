@@ -7,7 +7,7 @@ import { GLOBAL_INSTRUCTIONS } from '../src/agent/instructions.js';
 import { autoResolve } from '../src/resolve/cases.js';
 import { allows } from '../src/platform/capabilities.js';
 
-const world = { id: 'w', root: '/tmp/w', branch: 'karmax/t', base: 'main', target: 'main' } as any;
+const world = { id: 'w', root: '/tmp/w', branch: 'tavya/t', base: 'main', target: 'main' } as any;
 const task = { taskId: 't', projectId: 'p', title: 'Add factorial', prompt: 'implement it' } as any;
 const profile = (over: any = {}) => ({ id: 'do', name: 'Do', provider: 'claude', role: 'do', ...over } as any);
 
@@ -261,7 +261,7 @@ describe('workflow-declared resolve rules (SPEC §5.2)', () => {
 describe('prompt preamble (SPEC §5.4)', () => {
   it('uses the platform preamble when the workflow declares no override', () => {
     const out = assemblePrompt({ profile: profile(), role: 'do', task: { ...task, workflow: 'software-dev' } as any, world });
-    expect(out).toContain('running inside karmax'); // platform TOOLS_PREAMBLE
+    expect(out).toContain('running inside tavya'); // platform TOOLS_PREAMBLE
     expect(out).toMatch(/create_review_info.*optional/i);
     expect(out).toContain('limited to 280 characters');
     expect(out).toContain('Source code is not a human-readable output');

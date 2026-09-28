@@ -46,6 +46,7 @@ import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, sanitizeAttachmentName } from '../store/attachments.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES, BUILTIN_WIKI_PREFIX } from '../wiki/wiki.js';
+import { copyRemoteWiki, RemoteWikiSnapshots } from '../wiki/remote-snapshot.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
 import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
@@ -74,6 +75,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
 import type { GithubActionsStatus, GithubActionsInspectOptions } from '../integrations/github-actions.js';
+import { BRAND } from '../domain/brand.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -359,7 +361,9 @@ export interface KarmaxApiDeps {
   bus?: KarmaxBus;
   /** Re-arm eligible automatic credential quarantines before replaying a credential
    * escalation. Production supplies this; lightweight API tests may omit it. */
-  refreshCredentialHealth?: (task: TaskRecord, provider?: string) => Promise<void>;
+  /** Re-arm the task's automatically quarantined credentials (and, on request,
+   * exhausted ones) so a parked turn can try them again. */
+  refreshCredentialHealth?: (task: TaskRecord, provider?: string, options?: { includeExhausted?: boolean }) => Promise<void>;
 }
 
 /**
@@ -369,6 +373,11 @@ export interface KarmaxApiDeps {
  * so authz lives in exactly one place.
  */
 export class KarmaxApi {
+  private remoteWikiReadCache?: RemoteWikiSnapshots;
+  private get remoteWikiReads(): RemoteWikiSnapshots {
+    return this.remoteWikiReadCache ??= new RemoteWikiSnapshots(
+      path.join(this.deps.contentDir ?? paths().content, '.wiki-snapshots'));
+  }
   /** A workflow id can have several unrelated runs after a lifecycle recovery.
    * Temporal's id-only handle may resolve an earlier closed run; replacements
    * persist their exact run id so every later query/signal targets the live run. */
@@ -540,7 +549,7 @@ export class KarmaxApi {
       `[Collaboration request ${request.id}]`,
       input.message?.trim() || `Task ${requester.num ? `#${requester.num}` : requester.id} needs your current branch.`,
       'Continue your work as needed, then commit all intended changes and call publish_task_branch.',
-      'Krmax will notify the requester automatically when publication succeeds or this task terminates; do not message it back just to report status.',
+      `${BRAND} will notify the requester automatically when publication succeeds or this task terminates; do not message it back just to report status.`,
     ].join('\n\n');
     try {
       await this.deliverWorkflowMessage(target.id, instruction, input.role ?? 'do');
@@ -915,7 +924,7 @@ export class KarmaxApi {
         throw new ValidationError('use a public HTTPS ChatGPT/Claude share link or upload a conversation file');
       if (typeof sessionId === 'string' && !publicConversationShare(sessionId)
         && !(this.deps.hostLocal ?? deploymentHostLocal()))
-        throw new ValidationError('provider conversation IDs are available only on a host-local Karmax; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link');
+        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link`);
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = (await this.deps.store.getTask(sourceId));
@@ -2639,6 +2648,11 @@ export class KarmaxApi {
       && / — retrying .+ in \d+s \(\d+\/\d+\)$/.test(view.error);
     if (infrastructureBackoff && !actions.some((action) => action.name === 'retry'))
       actions.unshift(RETRY_ACTION());
+    // A wait for a credential or its quota resumes by itself, but only a person
+    // knows they just topped up credits or that a limit lifted early.
+    if (view.status === 'waiting' && view.waitingFor?.kind === 'account' && view.waitingFor.provider
+      && !actions.some((action) => action.name === 'retry'))
+      actions.unshift(RETRY_ACTION());
 
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
     if (view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !origin)
@@ -3834,8 +3848,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
     const resolved = (await service.resolve(request.id, { action, by: principal, alreadyAuthorized, claim }));
     const message = action === 'approve'
-      ? `[Krmax permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Retry the blocked operation now; a newly scoped token will carry the grant.`
-      : `[Krmax permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
+      ? `[${BRAND} permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Retry the blocked operation now; a newly scoped token will carry the grant.`
+      : `[${BRAND} permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}${resolved.projectIds?.length ? `; additional task projects: ${resolved.projectIds.join(', ')}` : ''}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
     const resume = await this.resumeAfterCredentialDecision(request.taskId, message, request.role);
     const event = {
       taskId: request.taskId,
@@ -4315,7 +4329,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     messages.push({
       id: `recovery-${Date.now()}`,
       role: 'user',
-      text: `Krmax recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
+      text: `${BRAND} recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
       ts: messages.length,
     });
     const session = (await this.deps.store.kvGet(`session:${taskId}:do`)) || undefined;
@@ -4414,6 +4428,13 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
     }
     const heldView = scopedTask?.lastView;
+    if (signal === SIG.retry && scopedTask && heldView?.status === 'waiting'
+      && heldView.waitingFor?.kind === 'account' && heldView.waitingFor.provider) {
+      // The coordinator grants the parked turn as soon as a credential is usable
+      // again; the workflow itself has nothing to retry.
+      await this.deps.refreshCredentialHealth?.(scopedTask, heldView.waitingFor.provider, { includeExhausted: true });
+      return undefined;
+    }
     if (signal === SIG.retry && scopedTask && heldView?.stage === 'escalated'
       && heldView.status === 'blocked') {
       const credentialFailure = heldView.error?.match(/No usable\s+([^\s]+)\s+credential\b.*needs attention/i);
@@ -4558,7 +4579,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       const message: Message = {
         id: `landing-upgrade-${now}`,
         role: 'user',
-        text: `Karmax upgraded this attempt to the current fair Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the task context, inspect the current proposal, make only necessary fixes, verify it, and call open_pr again. The repaired proposal owns no landing slot and will request landing again at the back; live repository policy decides whether fresh approval is required. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
+        text: `${BRAND} upgraded this attempt to the current fair Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the task context, inspect the current proposal, make only necessary fixes, verify it, and call open_pr again. The repaired proposal owns no landing slot and will request landing again at the back; live repository policy decides whether fresh approval is required. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
         ts: now,
       };
       const nextView = this.withConversationMessage(heldView, 'do', message);
@@ -5397,12 +5418,20 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async wikiViews(token: string, projectId: string) {
     const view = (await this.wikiScope(token, 'project', projectId, false));
     const branches = projectWikiBranches(view.root);
+    // Only views that can actually open: a task whose world has been released
+    // (every finished task) has no checkout left to read, and listing hundreds
+    // of those buried the few live ones.
     const tasks = (await __asyncCollections.flatMap((await this.deps.store.listTasks(projectId)), async (task) => {
       const handle = ((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined;
-      if (!handle || !worldRepos(handle).some((repo) => repo.role === 'project-wiki') && !branches.includes(handle.branch)) return [];
+      if (!handle) return [];
+      const repo = worldRepos(handle).find((candidate) => candidate.role === 'project-wiki');
+      const state = repo && !fs.existsSync(repo.root) ? await this.deps.store.worldState(handle.id) : undefined;
+      const live = repo && (fs.existsSync(repo.root) || (state !== undefined && state !== 'released'));
+      if (!live && !branches.includes(handle.branch)) return [];
       return [{ id: task.id, num: task.num, title: task.title, branch: handle.branch,
         status: task.lastView?.status ?? (task.params.draft ? 'draft' : 'queued') }];
     }));
+    tasks.sort((a, b) => (b.num ?? 0) - (a.num ?? 0));
     return { defaultBranch: PROJECT_WIKI_BRANCH, branches, tasks };
   }
 
@@ -5534,27 +5563,38 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const handle = ((await this.deps.store.currentWorld(taskId)) ?? task.lastView?.world) as WorldHandle | undefined;
     const repo = handle ? worldRepos(handle).find((candidate) => candidate.role === 'project-wiki') : undefined;
     if (!handle || !repo || fs.existsSync(repo.root)) return undefined;
-    const access = await this.openCollaborationWorld(taskId, handle);
     const prefix = path.posix.relative(handle.root.replace(/\\/g, '/'), repo.root.replace(/\\/g, '/'));
-    if (prefix.startsWith('..')) {
-      await access.release();
-      throw new Error('project wiki is outside the task world');
+    if (prefix.startsWith('..')) throw new Error('project wiki is outside the task world');
+    const copy = async (root: string) => {
+      const access = await this.openCollaborationWorld(taskId, handle);
+      try { await copyRemoteWiki(access.world, prefix, root); }
+      finally { await access.release(); }
+    };
+    const readOnly = { flush: async () => { throw new Error('read-only wiki snapshot'); } };
+    // The task's own agent edits this checkout with its shell and must read
+    // back exactly what it wrote, so its reads stay live; everyone else
+    // browsing the branch shares the cached copy.
+    if (!write && caller.taskId !== taskId) {
+      const root = await this.remoteWikiReads.read(taskId, `${handle.id}:${handle.generation ?? 1}`, copy);
+      return { root, repo, taskId, ...readOnly, release: async () => {} };
     }
+    if (!write) {
+      const contentDir = this.deps.contentDir ?? paths().content;
+      fs.mkdirSync(contentDir, { recursive: true });
+      const root = fs.mkdtempSync(path.join(contentDir, '.wiki-snapshot-'));
+      try { await copy(root); }
+      catch (error) { fs.rmSync(root, { recursive: true, force: true }); throw error; }
+      return { root, repo, taskId, ...readOnly, release: async () => { fs.rmSync(root, { recursive: true, force: true }); } };
+    }
+    // A write edits the live checkout, so it works on a fresh copy of its own
+    // and holds the world open until the edit is committed there.
+    this.remoteWikiReads.invalidate(taskId);
+    const access = await this.openCollaborationWorld(taskId, handle);
     const contentDir = this.deps.contentDir ?? paths().content;
     fs.mkdirSync(contentDir, { recursive: true });
     const root = fs.mkdtempSync(path.join(contentDir, '.wiki-snapshot-'));
     try {
-      const all = await access.world.listFiles();
-      const inside = all.filter((file) => !prefix || file === prefix || file.startsWith(`${prefix}/`));
-      const relative = (file: string) => prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
-      for (const file of inside) {
-        const rel = relative(file);
-        if (!rel || rel.startsWith('.git/')) continue;
-        const target = path.join(root, rel);
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        fs.writeFileSync(target, await access.world.readFileBuffer(file));
-      }
-      const before = new Set(inside.map(relative).filter(Boolean));
+      const before = new Set(await copyRemoteWiki(access.world, prefix, root));
       return {
         root, repo, taskId,
         flush: async (message: string) => {
@@ -5574,6 +5614,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
             throw new Error(committed.stderr || committed.stdout);
         },
         release: async () => {
+          this.remoteWikiReads.invalidate(taskId);
           fs.rmSync(root, { recursive: true, force: true });
           await access.release();
         },

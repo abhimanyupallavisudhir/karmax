@@ -45,7 +45,7 @@ const snapshot = { id: 'old-session', exportId: '11111111-1111-4111-8111-1111111
 const context = { snapshot, cwd: "/tmp/user's checkout $(false)" };
 vm.runInNewContext(slice('function nativeConversationFilename(session)', 'async function downloadNativeConversation')
   + '\nresult = portableForkCommandFor(snapshot, cwd);', context);
-ok(context.result.includes(`sessions/karmax/${snapshot.filename}`), 'copy preserves the canonical filename');
+ok(context.result.includes(`sessions/tavya/${snapshot.filename}`), 'copy preserves the canonical filename');
 ok(context.result.includes('@openai/codex@0.154.0-alpha.11 fork'), 'fork uses the decoder-fixed pinned CLI');
 ok(context.result.includes(snapshot.exportId) && !context.result.includes('old-session'), 'fork identity matches the downloaded snapshot');
 ok(require('child_process').spawnSync('bash', ['-n', '-c', context.result]).status === 0, 'commands safely quote paths containing shell metacharacters');

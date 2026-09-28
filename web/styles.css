@@ -2078,6 +2078,13 @@ html[data-theme="dark"] .github-signin-btn:active,
   background: var(--surface-2); font-size: 12px; line-height: 1.6;
 }
 .cred-row.off { opacity: 0.5; }
+.cred-row.signed-out .cred-label { color: var(--ink-3); }
+.cred-signin {
+  font-size: 10px; font-weight: 700; padding: 0 7px; border-radius: 999px; flex: none;
+  border: 1px solid var(--warn, #e0b15a); background: transparent; color: var(--warn, #e0b15a); text-transform: uppercase;
+}
+button.cred-signin { cursor: pointer; }
+button.cred-signin:hover { background: var(--warn, #e0b15a); color: #fff; }
 .cred-row.dragging { opacity: 0.4; }
 .cred-drag { cursor: grab; color: var(--ink-3); user-select: none; font-size: 11px; line-height: 1; }
 .cred-drag:active { cursor: grabbing; }
@@ -2605,11 +2612,11 @@ html[data-theme="dark"] .github-signin-btn:active,
 .wiki-nav a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wiki-page .settings-section-title .chip { vertical-align: 3px; margin-left: 6px; }
 .wiki-view-picker { display: flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: 11.5px; }
-.wiki-view-picker input {
-  width: min(330px, 36vw); padding: 7px 30px 7px 10px; border: 1px solid var(--line);
+.wiki-view-picker select {
+  width: min(330px, 36vw); padding: 7px 10px; border: 1px solid var(--line); text-overflow: ellipsis;
   border-radius: 8px; background: var(--surface); color: var(--ink); font: inherit;
 }
-.wiki-view-picker input:focus { outline: 2px solid var(--accent-weak); border-color: var(--accent); }
+.wiki-view-picker select:focus { outline: 2px solid var(--accent-weak); border-color: var(--accent); }
 .wiki-md { font-size: 13px; line-height: 1.55; }
 .wiki-uncond .wiki-uncond-head { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; padding-bottom: 9px; border-bottom: 1px solid var(--line); }
 .wiki-uncond .wiki-uncond-head b { font-size: 14px; letter-spacing: -.01em; }

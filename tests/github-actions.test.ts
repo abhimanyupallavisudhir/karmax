@@ -41,7 +41,7 @@ describe('GitHub Actions API', () => {
   const inspection = (log: string, overrides: Partial<GithubActionsFailureInspection['run']> = {}): GithubActionsFailureInspection => ({
     run: {
       id: 42, name: 'CI', workflowId: 7, runNumber: 11, attempt: 1, event: 'pull_request',
-      status: 'completed', conclusion: 'failure', branch: 'karmax/task', headSha: 'abc123',
+      status: 'completed', conclusion: 'failure', branch: 'tavya/task', headSha: 'abc123',
       url: 'https://github.test/acme/app/actions/runs/42', createdAt: '', updatedAt: '', ...overrides,
     },
     jobs: [],

@@ -4,6 +4,7 @@ import { RESPOND_PROMPT_DEFAULT } from '../domain/respond-prompt.js';
 import { ResolveRuleDecl } from '../resolve/cases.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { DEVELOPER_WORKSPACE_CAPABILITIES } from '../platform/capabilities.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Workflow manifests (SPEC §4.3). Data-only declarations the host reads to wire
@@ -91,8 +92,10 @@ const landingAuthorityField = (): FieldSpec => ({
   name: 'landingAuthority',
   type: 'select',
   label: 'Pull-request landing authority',
-  help: 'auto — prefer the provider queue/auto-merge and use Karmax admission only when strict freshness needs it; external — a repository-triggered third-party system owns landing and Karmax only observes; karmax — always use Karmax fair fallback admission.',
+  help: `auto — prefer the provider queue/auto-merge and use ${BRAND} admission only when strict freshness needs it; external — a repository-triggered third-party system owns landing and ${BRAND} only observes; ${BRAND} — always use ${BRAND} fair fallback admission.`,
   options: ['auto', 'external', 'karmax'],
+  // The stored value predates the product name.
+  optionLabels: { karmax: BRAND },
   default: 'auto',
   scopes: ['project', 'global'],
   bind: 'project',
@@ -272,7 +275,7 @@ Candidate resolution skills (read any that look relevant before acting):
 (b) Our strong preference is that errors are caught by the auto-resolve SCRIPT, never by an agent. This one reached you because no auto-resolve case matched it. So, in order:
   1. Diagnose the cause. If you can fix it in the worktree (a bad file, a missing dependency, a stale artifact), do so, then call resolve_decision({action:"resume"}) to continue the interrupted agent, or {action:"retryStage"} to re-run the step fresh.
   2. If this class of error is MECHANICALLY recognizable (a stable error signature → a scripted fix), capture that so it auto-resolves next time WITHOUT an agent: save_skill a skill named "resolve/<slug>" whose content states (i) a regex/signature that matches this error, (ii) the exact fix or retry that resolves it, and (iii) whether it's safe to auto-retry. These skills are the source material for new auto-resolve cases (added later through the reviewed PR gate — the merge-only workflow — so they are tested before they ever run automatically).
-  3. If the failure is rooted NOT in this project's code but in a DEPENDENCY — karmax itself, or another library/tool/service — file a bug against that dependency's own repository using the \`gh\` CLI (or the appropriate tracker). karmax's repo is https://github.com/abhimanyupallavisudhir/karmax/ (e.g. \`gh issue create --repo abhimanyupallavisudhir/karmax --title "..." --body "..."\`). Include the error, a minimal repro, and enough context to reproduce. Then still record a resolve_decision for THIS task (resume/retryStage if you found a workaround, otherwise escalate).
+  3. If the failure is rooted NOT in this project's code but in a DEPENDENCY — ${BRAND} itself, or another library/tool/service — file a bug against that dependency's own repository using the \`gh\` CLI (or the appropriate tracker). ${BRAND}'s repo is https://github.com/abhimanyupallavisudhir/karmax/ (e.g. \`gh issue create --repo abhimanyupallavisudhir/karmax --title "..." --body "..."\`). Include the error, a minimal repro, and enough context to reproduce. Then still record a resolve_decision for THIS task (resume/retryStage if you found a workaround, otherwise escalate).
   4. If you cannot fix it, call resolve_decision({action:"escalate", reason:"<what a human needs to do>"}). Do not loop or keep trying.
 
 (c) The candidate skills above are your index of prior resolutions — prefer reusing a known fix over rediscovering one.
@@ -409,7 +412,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
     version: '1.26.0',
-    description: 'World → do/wait → review → optional per-PR provider/external landing or canonical Karmax fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.',
+    description: `World → do/wait → review → optional per-PR provider/external landing or canonical ${BRAND} fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.`,
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -465,9 +468,9 @@ export const MANIFESTS: WorkflowManifest[] = [
         workflow: 'software-dev',
         title: 'tavya init',
         prompt:
-          "## Initial set-up task for krmax-readiness\n1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to krmax's project wiki.\n2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.\n3) For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them.\nIt is important to use the \"default\" tag on wiki articles that must appear in the context of every new agent.\nReport what you changed.\n[To humans: This is not for you. Just press \"Queue\" and the agent will do the above.]",
+          `## Initial set-up task for ${BRAND}-readiness\n1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to ${BRAND}'s project wiki.\n2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.\n3) For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them.\nIt is important to use the "default" tag on wiki articles that must appear in the context of every new agent.\nReport what you changed.\n[To humans: This is not for you. Just press "Queue" and the agent will do the above.]`,
         hostedPrompt:
-          "## Initial set-up task for krmax-readiness\n1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to krmax's project wiki.\n2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.\nIt is important to use the \"default\" tag on wiki articles that must appear in the context of every new agent.\nReport what you changed.\n[To humans: This is not for you. Just press \"Queue\" and the agent will do the above.]",
+          `## Initial set-up task for ${BRAND}-readiness\n1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to ${BRAND}'s project wiki.\n2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.\nIt is important to use the "default" tag on wiki articles that must appear in the context of every new agent.\nReport what you changed.\n[To humans: This is not for you. Just press "Queue" and the agent will do the above.]`,
       },
     },
   },
@@ -641,7 +644,7 @@ const GITHUB_PR_ACTION_FIELDS = {
  */
 export const PLATFORM_EVENTS: EventSchemaDecl[] = [
   { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled', waitingFor: 'account | agentSlot | mergeSlot | human | other | null', waitingDetail: 'string | null', waitingSummary: 'string | null', waitingProvider: 'string | null', waitingResetAt: 'number | null', agentTurn: 'waiting-slot | running | null' } },
-  { type: 'pr.opened', description: 'karmax opened a pull request for a task (remote policy "pr").', fields: { repo: 'world repo name', slug: 'owner/name on GitHub', number: 'number', url: 'string', base: 'the branch the PR merges into', state: 'open | closed' } },
+  { type: 'pr.opened', description: `${BRAND} opened a pull request for a task (remote policy "pr").`, fields: { repo: 'world repo name', slug: 'owner/name on GitHub', number: 'number', url: 'string', base: 'the branch the PR merges into', state: 'open | closed' } },
   // The GitHub side of the same pull request, fed back by the App's webhook —
   // what happened *on GitHub*, as opposed to what karmax did (SPEC §5.4).
   { type: 'github.pr.opened', description: "A task's pull request was opened on GitHub.", fields: GITHUB_PR_ACTION_FIELDS },

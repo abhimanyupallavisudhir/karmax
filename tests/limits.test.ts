@@ -234,6 +234,21 @@ describe('resetAtFromHint', () => {
     expect(resetAtFromHint('in 3 hours', '5h', now)).toBe(now + 3 * 3_600_000);
   });
 
+  // Task 381 (2026-09-26): Codex said "try again at 5:55 PM" at 05:09, but the
+  // hint was dropped and the default 5h window retried twice into the same
+  // limit, spending the task's retry budget before the real reset.
+  it('reads Codex "try again at <time>" as the reset instant', () => {
+    const message = 'You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 5:55 PM.';
+    const c = classifyLimitError(message, { providerOrigin: true });
+    expect(c).toMatchObject({ limited: true, kind: 'quota', resetHint: '5:55 PM' });
+    const at = resetAtFromHint(c.resetHint, c.window ?? '5h', now);
+    const d = new Date(at);
+    expect(at).toBeGreaterThan(now);
+    expect([d.getHours(), d.getMinutes()]).toEqual([17, 55]);
+    expect(classifyLimitError('Rate limited. Try again in 20 minutes.', { providerOrigin: true }).resetHint)
+      .toBe('in 20 minutes');
+  });
+
   it('parses a weekday hint to that upcoming day', () => {
     const at = resetAtFromHint('Mon 12:00am', 'weekly', now);
     expect(at).toBeGreaterThan(now);

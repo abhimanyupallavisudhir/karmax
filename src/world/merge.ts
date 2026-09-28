@@ -7,6 +7,7 @@ import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
 import { paths } from '../config/paths.js';
 import { withWorktreeLock } from './worktree-lock.js';
 import { serializeProjectWikiOperation } from '../wiki/repository.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Where throwaway merge/landing worktrees are created: under karmax storage,
@@ -141,7 +142,7 @@ async function finalizeMergeRepoUnlocked(worldRepo: WorldRepo, target: string, w
       };
     }
     await git(root, ['add', '-A']);
-    const c = await git(root, [...asIdentity, 'commit', '-q', '-m', `karmax: work for ${worldId}`]);
+    const c = await git(root, [...asIdentity, 'commit', '-q', '-m', `${BRAND}: work for ${worldId}`]);
     if (c.code !== 0 && !/nothing to commit/.test(c.stdout + c.stderr)) {
       return { merged: false, landedFiles: [], note: `commit failed: ${c.stderr || c.stdout}` };
     }
@@ -199,7 +200,7 @@ async function finalizeMergeRepoUnlocked(worldRepo: WorldRepo, target: string, w
     '--no-ff',
     '--no-edit',
     '-m',
-    `karmax: merge ${target} into ${branch}`,
+    `${BRAND}: merge ${target} into ${branch}`,
     target,
   ]);
   if (into.code !== 0) {
@@ -252,7 +253,7 @@ async function finalizeMergeRepoUnlocked(worldRepo: WorldRepo, target: string, w
       '--no-ff',
       '--no-edit',
       '-m',
-      `karmax: merge ${branch} into ${target}`,
+      `${BRAND}: merge ${branch} into ${target}`,
       branch,
     ]);
     if (land.code !== 0) {

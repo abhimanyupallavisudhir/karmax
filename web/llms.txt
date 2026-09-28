@@ -1,17 +1,17 @@
-# krmax
+# tavya
 
-> krmax is a to-do list for managing AI agents instead of manually doing the work.
+> tavya is a to-do list for managing AI agents instead of manually doing the work.
 
-krmax gives agents isolated cloud worlds, lets people or agents own review and input stages, and uses explicit authorization for project management, credentials, and payments.
+tavya gives agents isolated cloud worlds, lets people or agents own review and input stages, and uses explicit authorization for project management, credentials, and payments.
 
 ## Links
 
 - [Issue tracker](https://github.com/abhimanyupallavisudhir/krmax-issues/issues)
-- [Pricing](https://krmax.io/pricing)
-- [Policies and trust](https://krmax.io/legal)
-- [Security](https://krmax.io/legal/security)
-- [Subprocessors](https://krmax.io/legal/subprocessors)
-- [Business DPA requests](https://krmax.io/legal/dpa)
+- [Pricing](https://tavya.io/pricing)
+- [Policies and trust](https://tavya.io/legal)
+- [Security](https://tavya.io/legal/security)
+- [Subprocessors](https://tavya.io/legal/subprocessors)
+- [Business DPA requests](https://tavya.io/legal/dpa)
 
 ## Agent entry points
 

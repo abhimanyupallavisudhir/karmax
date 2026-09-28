@@ -92,7 +92,7 @@ describe('durable background collaboration requests', () => {
       taskId: f.target.id,
       type: 'push.branch',
       ts: Date.now(),
-      payload: { branch: `karmax/${f.target.id}`, repos: ['app'] },
+      payload: { branch: `tavya/${f.target.id}`, repos: ['app'] },
     };
     const seq = (await f.store.appendEvent(event));
     f.bus.emit({ ...event, seq });
@@ -183,7 +183,7 @@ describe('durable background collaboration requests', () => {
       taskId: f.target.id,
       type: 'push.branch',
       ts: Date.now(),
-      payload: { branch: `karmax/${f.target.id}`, repos: ['app'] },
+      payload: { branch: `tavya/${f.target.id}`, repos: ['app'] },
     };
     const pushSeq = (await f.store.appendEvent(pushEvent));
     f.bus.emit({ ...pushEvent, seq: pushSeq });

@@ -2,6 +2,7 @@ import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
 import { untrustedBlock } from '../domain/untrusted.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Prompt assembly (SPEC §5.4). Fills the role template (owned by the profile)
@@ -34,7 +35,7 @@ import { untrustedBlock } from '../domain/untrusted.js';
  * if you add a rail, add it to that table-driven test rather than trimming text
  * here.
  */
-const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration platform. Your work happens in a git world (working directory). You have these platform tools available:
+const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration platform. Your work happens in a git world (working directory). You have these platform tools available:
 - create_sub_task(title, prompt): spawn a child task the parent awaits.
 - create_review_info(caption?, actions?): optional click-to-verify affordances for the Review stage. Use only when relevant: "run" actions for verification commands or starting an app/server (set server:true + openUrls to open it), and "open" actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output. The optional caption says WHAT to verify and is limited to 280 characters. Put summaries of changes/answers in your normal response, or in a file only when requested. The changed-files list is added automatically.
 - save_skill(name, content): persist a reusable skill for future tasks.
@@ -42,13 +43,13 @@ const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration pl
 - find_task(projectId, number), list_agents(taskId), get_conversation(taskId, role), fork_agent(...), and message_agent(...): discover work by its human #number and robustly inspect or continue another task agent without mutating its original session.
 - Prefer native MCP: use servers selected in the agent’s Tools, or request a remote MCP server by its MCP Registry name or official HTTPS URL. Use a Composio toolkit only as the fallback when no suitable remote MCP server exists.
 - list_connections(), request_connection({mcp | toolkit}, why), search_connection_tools(connectionId, search), execute_connection_tool(connectionId, tool, arguments): use connected apps through the gateway. Prefer managed sign-in to asking for passwords or API keys. The user allows an account they already connected or signs in from a Connect button in the task, which then resumes automatically.
-- request_agent_action(taskId, "publish_branch", message?): ask a collaborator to publish in the background. It returns a durable request id immediately; continue other useful work and never poll. Karmax injects completion or failure into this conversation and keeps the task in Do while a request remains outstanding.
+- request_agent_action(taskId, "publish_branch", message?): ask a collaborator to publish in the background. It returns a durable request id immediately; continue other useful work and never poll. ${BRAND} injects completion or failure into this conversation and keeps the task in Do while a request remains outstanding.
 - cancel_agent_action(requestId): withdraw one of your pending collaboration requests when its target is blocked or its result is no longer needed. This releases your Do-stage wait without cancelling the target task.
 - publish_task_branch(): publish your clean committed branch for collaborators.
 - import_task_branch(sourceTaskId): fetch a collaborator's published branch into a namespaced local ref, then inspect/test/cherry-pick or merge it normally.
 - refresh_upstream(branch?): fetch the latest upstream branch into refs/remotes/origin before merging or rebasing.
-- list_events(taskId?, since?) and describe_platform(): inspect karmax event/diagnostic context and discover the automation surface.
-- platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by karmax for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, safe mode, settings, review actions, and future UI operations.
+- list_events(taskId?, since?) and describe_platform(): inspect ${BRAND} event/diagnostic context and discover the automation surface.
+- platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by ${BRAND} for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, safe mode, settings, review actions, and future UI operations.
 - open_pr(): Do agents only. Open or refresh the task's pull request and send that exact committed proposal to Review. Call it only when the requested work is truly complete, the worktree is clean, intended changes are committed, and relevant tests pass. This is the final action of a completed Do turn.
 - confirm_decision(action, text?): use only when the workflow explicitly asks this turn to review or verify an already-open exact candidate. A final Do-agent integration verification uses this tool instead of open_pr and must not edit the proposal in that verification turn.
 - escalate_to_human(audience, message, urgency?): pause for input without opening a PR. Choose a specific user/team/Avatar when appropriate; discover valid routes with platform_request(GET, "/api/agent/escalation-targets"). A normal turn ending also waits for input from the default audience.
@@ -94,13 +95,13 @@ export function assemblePrompt(args: AssembleArgs): string {
   if (args.role === 'do' && args.task.responder?.kind === 'agent') {
     preamble += `
 
-Input routing for this task: its ordinary Waiting-for-input Responder is an agent. When you need a decision or information that this Responder can supply, do not call escalate_to_human. End the turn without open_pr and make your final response the concrete question; karmax will send it to the Responder and return the answer to this same Do conversation. Use escalate_to_human only when the requested input is inherently human-only (for example an approval, secret, or irreversible personal decision).`;
+Input routing for this task: its ordinary Waiting-for-input Responder is an agent. When you need a decision or information that this Responder can supply, do not call escalate_to_human. End the turn without open_pr and make your final response the concrete question; ${BRAND} will send it to the Responder and return the answer to this same Do conversation. Use escalate_to_human only when the requested input is inherently human-only (for example an approval, secret, or irreversible personal decision).`;
   }
   const target = args.task.target ?? args.world.target ?? args.world.base;
   if (args.role === 'do' && (target !== args.world.base || args.task.agents?.do?.resumeFrom)) {
     preamble += `
 
-Git ancestry for recovered, forked, or retargeted work: "recorded base" is the immutable commit this task world was provisioned from; "target" is only the branch the proposal will merge into; current HEAD is the tip you are editing. Retargeting does not rewrite the recorded base. Keep the initially provisioned task HEAD as an ancestor: do not reset, recreate, or replace the task branch with a source/target branch. Integrate the selected target into the existing task branch and apply recovered changes as descendant commits. Karmax checks this before publication and refuses unrelated or reparented history.`;
+Git ancestry for recovered, forked, or retargeted work: "recorded base" is the immutable commit this task world was provisioned from; "target" is only the branch the proposal will merge into; current HEAD is the tip you are editing. Retargeting does not rewrite the recorded base. Keep the initially provisioned task HEAD as an ancestor: do not reset, recreate, or replace the task branch with a source/target branch. Integrate the selected target into the existing task branch and apply recovered changes as descendant commits. ${BRAND} checks this before publication and refuses unrelated or reparented history.`;
   }
   const values: Record<string, string> = {
     toolsPreamble: preamble,

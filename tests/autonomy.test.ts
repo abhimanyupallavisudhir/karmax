@@ -995,7 +995,7 @@ describe('PTY terminal check-in (SPEC §5.5)', () => {
       ws.on('message', (m) => {
         try { const msg = JSON.parse(m.toString()); if (msg.type === 'data') buf += msg.data; } catch {}
         // send the command once the shell prompt has appeared
-        if (!sent && buf.includes('karmax:')) { sent = true; ws.send(JSON.stringify({ type: 'input', data: 'echo TERM_OK_123\n' })); }
+        if (!sent && buf.includes('tavya:')) { sent = true; ws.send(JSON.stringify({ type: 'input', data: 'echo TERM_OK_123\n' })); }
         if (buf.includes('TERM_OK_123\r') || /TERM_OK_123\b[\s\S]*\$/.test(buf)) { clearTimeout(timer); ws.close(); resolve(buf); }
       });
       ws.on('error', () => { clearTimeout(timer); resolve(buf); });
