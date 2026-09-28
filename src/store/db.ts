@@ -5242,6 +5242,12 @@ export class Store {
     const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
     for (const taskId of taskIds) (await exact.run(`permission:grant:${taskId}`));
     if (!organizationId) return;
+    for (const taskId of taskIds) {
+      const prefix = `permission:request:${organizationId}:${taskId}:`;
+      for (const { key } of (await this.kvEntries(prefix))) (await exact.run(`permission:deciding:${key.slice(prefix.length)}`));
+      (await this.kvDeletePrefix(prefix));
+    }
+    // An organization whose requests predate per-request rows (PL-8).
     const key = `permission:requests:${organizationId}`;
     const raw = (await this.kvGet(key));
     if (!raw) return;
@@ -7598,7 +7604,7 @@ export class Store {
    */
   async retentionSweep(now = Date.now()): Promise<{ scopedTokens: number; humanDelegations: number; githubDeliveries: number;
     githubPrObservations: number; subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number;
-    events: number; auditEntries: number }> {
+    permissionRequests: number; events: number; auditEntries: number }> {
     return this.db.transaction(async () => {
 
     // Keep immutable snapshots through a retry window. A late activity retry can
@@ -7639,6 +7645,18 @@ export class Store {
         .run(`retention:view:${task.id}`, '2'));
     }
 
+    // Decided permission requests outlive their decision events by nothing: both
+    // go after the event window. Pending ones stay until decided or withdrawn.
+    let permissionRequests = 0;
+    for (const { key, value } of (await this.kvEntries('permission:request:'))) {
+      let request: { status?: string; createdAt?: number; resolution?: { at?: number }; withdrawn?: { at?: number } };
+      try { request = JSON.parse(value); } catch { continue; }
+      const decidedAt = request.resolution?.at ?? request.withdrawn?.at ?? request.createdAt;
+      if (request.status === 'pending' || !(Number(decidedAt) < now - 90 * 86400_000)) continue;
+      (await this.db.prepare('DELETE FROM kv WHERE k=?').run(key));
+      permissionRequests++;
+    }
+
     return {
       scopedTokens: (await this.purgeScopedTokens(now)),
       humanDelegations: (await this.purgeHumanDelegations(now)),
@@ -7648,7 +7666,7 @@ export class Store {
         .run(now - 30 * 86400_000)).changes),
       subscriptionRequests: Number((await this.db.prepare(`DELETE FROM subscription_billing_requests
         WHERE createdAt<? AND responseJson IS NOT NULL`).run(now - 30 * 24 * 60 * 60 * 1000)).changes),
-      viewSnapshots, publicationFences, turnSessions,
+      viewSnapshots, publicationFences, turnSessions, permissionRequests,
       events: Number((await this.db.prepare(`DELETE FROM events WHERE seq IN
         (SELECT e.seq FROM events e WHERE e.ts<?
           AND (e.type NOT IN ('credential.approval-requested', 'permission.approval-requested',

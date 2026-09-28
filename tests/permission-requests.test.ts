@@ -105,6 +105,63 @@ describe('agent permission approval requests', () => {
     await expect((async () => (await requests.request({ ...base, capabilities: ['totally:invented'] })))()).rejects.toThrow(/unknown capability/i);
   });
 
+  // PL-8: requests lived in one kv blob per organization, rewritten whole by
+  // every ask and every decision and never pruned.
+  describe('storage', () => {
+    const ask = (taskId: string, capability = 'settings:read') => ({ taskId, projectId: 'home', role: 'do',
+      capabilities: [capability], audience: ['@owners'], recipients: ['owner'], reason: 'Inspect settings.',
+      requestedBy: `task-agent:${taskId}:do` });
+
+    it('writes only the request an ask or a decision is about', async () => {
+      const store = (await Store.create(':memory:'));
+      const service = new PermissionRequests(store, 'org_personal');
+      const first = (await service.request(ask('task_a')));
+      (await service.request(ask('task_b')));
+      const written: string[] = [];
+      const kvSet = store.kvSet.bind(store);
+      vi.spyOn(store, 'kvSet').mockImplementation(async (key, value) => { written.push(key); return kvSet(key, value); });
+      const third = (await service.request(ask('task_a', 'settings:write')));
+      (await service.resolve(first.id, { action: 'deny', by: 'user:owner' }));
+      expect(written).toEqual([`permission:request:org_personal:task_a:${third.id}`,
+        `permission:request:org_personal:task_a:${first.id}`]);
+      expect((await service.requests()).map((request) => request.id)).toHaveLength(3);
+      expect((await service.requests({ taskId: 'task_a' })).map((request) => [request.id, request.status]))
+        .toEqual([[first.id, 'denied'], [third.id, 'pending']]);
+      expect((await new PermissionRequests(store, 'org_other').requests())).toEqual([]);
+    });
+
+    it('moves the legacy organization blob into rows on first use', async () => {
+      const store = (await Store.create(':memory:'));
+      const legacy = [
+        { id: 'preq_old', type: 'permission', taskId: 'task_a', projectId: 'home', role: 'do', capabilities: ['settings:read'],
+          audience: ['@owners'], recipients: ['owner'], reason: 'Old.', requestedBy: 'task-agent:task_a:do',
+          status: 'granted', resolution: { action: 'approve', by: 'user:owner', at: 2 }, createdAt: 1 },
+        { id: 'preq_live', type: 'permission', taskId: 'task_b', projectId: 'home', role: 'do', capabilities: ['settings:write'],
+          audience: ['@owners'], recipients: ['owner'], reason: 'Live.', requestedBy: 'task-agent:task_b:do',
+          status: 'pending', createdAt: 3 },
+      ];
+      (await store.kvSet('permission:requests:org_personal', JSON.stringify(legacy)));
+      const service = new PermissionRequests(store, 'org_personal');
+      expect((await service.requests())).toEqual(legacy);
+      expect((await store.kvGet('permission:requests:org_personal'))).toBeUndefined();
+      expect((await store.kvEntries('permission:request:org_personal:')).map(({ key }) => key))
+        .toEqual(['permission:request:org_personal:task_a:preq_old', 'permission:request:org_personal:task_b:preq_live']);
+      expect((await service.resolve('preq_live', { action: 'approve', by: 'user:owner' }))).toMatchObject({ status: 'granted' });
+    });
+
+    it('prunes decided requests after the event window and keeps pending ones', async () => {
+      const store = (await Store.create(':memory:'));
+      const service = new PermissionRequests(store, 'org_personal');
+      const decided = (await service.request(ask('task_a')));
+      (await service.resolve(decided.id, { action: 'deny', by: 'user:owner' }));
+      const pending = (await service.request(ask('task_b')));
+      const day = 86400_000;
+      expect((await store.retentionSweep(Date.now() + 89 * day)).permissionRequests).toBe(0);
+      expect((await store.retentionSweep(Date.now() + 91 * day)).permissionRequests).toBe(1);
+      expect((await service.requests()).map((request) => request.id)).toEqual([pending.id]);
+    });
+  });
+
   it('removes pending requests and approved extensions with their task', async () => {
     const store = (await Store.create(':memory:'));
     (await store.claimPersonalOrganization('owner'));

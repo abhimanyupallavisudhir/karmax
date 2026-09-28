@@ -30,7 +30,14 @@ export interface PermissionRequest {
   task?: { id: string; num?: number; title: string; projectId: string };
 }
 
-const requestsKey = (organizationId: string) => `permission:requests:${organizationId}`;
+/** Before PL-8 every request of an organization lived in this one blob. */
+const legacyRequestsKey = (organizationId: string) => `permission:requests:${organizationId}`;
+/** One row per request, grouped by task: an ask or a decision rewrites only
+ * its own row, and a task's requests are one key range. */
+const permissionRequestPrefix = (organizationId: string, taskId?: string) =>
+  `permission:request:${organizationId}:${taskId === undefined ? '' : `${taskId}:`}`;
+const requestKey = (organizationId: string, request: Pick<PermissionRequest, 'taskId' | 'id'>) =>
+  `${permissionRequestPrefix(organizationId, request.taskId)}${request.id}`;
 const extensionsKey = (taskId: string) => `permission:grant:${taskId}`;
 const claimKey = (requestId: string) => `permission:deciding:${requestId}`;
 /** How long a decision may hold its claim. Long enough for a scope expansion's
@@ -55,7 +62,7 @@ export function exactCapability(raw: string): Capability {
  * axes of the next turn's scoped token. Nothing mutates a human/profile grant.
  */
 export class PermissionRequests {
-  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'kvDelete' | 'appendAudit'>, private organizationId: string) {}
+  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'kvDelete' | 'kvEntries' | 'appendAudit'>, private organizationId: string) {}
 
   /**
    * Claim the right to decide a request. Approving can widen the task's scope
@@ -97,15 +104,31 @@ export class PermissionRequests {
   }
 
   async requests(filter: { taskId?: string; status?: PermissionRequest['status'] } = {}): Promise<PermissionRequest[]> {
-    let all: PermissionRequest[] = [];
-    try {
-      const raw = (await this.store.kvGet(requestsKey(this.organizationId)));
-      all = raw ? JSON.parse(raw) : [];
-    } catch {
-      all = [];
+    (await this.migrate());
+    const all: PermissionRequest[] = [];
+    for (const { value } of (await this.store.kvEntries(permissionRequestPrefix(this.organizationId, filter.taskId)))) {
+      try { all.push(JSON.parse(value)); } catch { /* one malformed row must not hide the rest */ }
     }
-    return all.filter((request) => (!filter.taskId || request.taskId === filter.taskId)
-      && (!filter.status || request.status === filter.status));
+    return all.filter((request) => !filter.status || request.status === filter.status)
+      .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  }
+
+  /** Split the pre-PL-8 organization blob into rows, once. */
+  private async migrate(): Promise<void> {
+    if ((await this.store.kvGet(legacyRequestsKey(this.organizationId))) === undefined) return;
+    return this.store.transaction(async () => {
+      const raw = (await this.store.kvGet(legacyRequestsKey(this.organizationId)));
+      if (raw === undefined) return;
+      let legacy: unknown;
+      try { legacy = JSON.parse(raw); } catch { return; } // left for diagnosis, as before
+      for (const request of Array.isArray(legacy) ? legacy as PermissionRequest[] : [])
+        if (request?.id && request.taskId) (await this.save(request));
+      (await this.store.kvDelete(legacyRequestsKey(this.organizationId)));
+    });
+  }
+
+  private async find(requestId: string): Promise<PermissionRequest | undefined> {
+    return (await this.requests()).find((candidate) => candidate.id === requestId);
   }
 
   async extensionCaps(taskId: string, role?: string): Promise<Capability[]> {
@@ -148,10 +171,8 @@ export class PermissionRequests {
     if (!reason) throw new Error('reason is required');
     if ([...reason].length > 4_000) throw new Error('reason must be at most 4000 characters');
 
-    const all = (await this.requests());
     const fingerprint = (values: string[]) => [...values].sort().join('\0');
-    const existing = all.find((request) => request.status === 'pending'
-      && request.taskId === input.taskId
+    const existing = (await this.requests({ taskId: input.taskId })).find((request) => request.status === 'pending'
       && request.role === input.role
       && fingerprint(request.capabilities) === fingerprint(capabilities)
       && fingerprint(request.projectIds ?? []) === fingerprint(projectIds)
@@ -175,7 +196,7 @@ export class PermissionRequests {
       status: 'pending',
       createdAt: Date.now(),
     };
-    (await this.save([...all, request]));
+    (await this.save(request));
     (await this.store.appendAudit({
       principalId: input.requestedBy,
       action: 'permission.requested',
@@ -189,8 +210,7 @@ export class PermissionRequests {
 
   async resolve(requestId: string, input: { action: 'approve' | 'deny'; by: string; alreadyAuthorized?: boolean; claim?: string }): Promise<PermissionRequest> {
     return this.store.transaction(async () => {
-    const all = (await this.requests());
-    const request = all.find((candidate) => candidate.id === requestId);
+    const request = (await this.find(requestId));
     if (!request) throw new Error(`no permission request ${requestId}`);
     if (request.status !== 'pending') throw new Error(`request ${requestId} is already ${request.status}`);
     (await this.assertUnclaimed(requestId, input.claim));
@@ -206,7 +226,7 @@ export class PermissionRequests {
     }
     request.status = input.action === 'approve' ? 'granted' : 'denied';
     request.resolution = { action: input.action, by: input.by, at: Date.now() };
-    (await this.save(all));
+    (await this.save(request));
     (await this.store.kvDelete(claimKey(requestId)));
     (await this.store.appendAudit({
       principalId: input.by,
@@ -221,13 +241,12 @@ export class PermissionRequests {
 
   async dismiss(id: string, by: string, claim?: string): Promise<PermissionRequest> {
     return this.store.transaction(async () => {
-    const all = (await this.requests());
-    const request = all.find((candidate) => candidate.id === id);
+    const request = (await this.find(id));
     if (!request) throw new Error(`no permission request ${id}`);
     if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
     (await this.assertUnclaimed(id, claim));
     request.dismissed ??= { by, at: Date.now() };
-    (await this.save(all));
+    (await this.save(request));
     (await this.store.appendAudit({ principalId: by, action: 'permission.request.dismissed',
       scopeKey: `project:${request.projectId}`, detail: { requestId: id } }));
     return request;
@@ -235,7 +254,15 @@ export class PermissionRequests {
     });
   }
 
-  private async save(requests: PermissionRequest[]): Promise<void> {
-    (await this.store.kvSet(requestsKey(this.organizationId), JSON.stringify(requests)));
+  /** Drop a request outright, with any decision claim on it. */
+  async remove(request: Pick<PermissionRequest, 'taskId' | 'id'>): Promise<void> {
+    return this.store.transaction(async () => {
+      (await this.store.kvDelete(requestKey(this.organizationId, request)));
+      (await this.store.kvDelete(claimKey(request.id)));
+    });
+  }
+
+  private async save(request: PermissionRequest): Promise<void> {
+    (await this.store.kvSet(requestKey(this.organizationId, request), JSON.stringify(request)));
   }
 }
