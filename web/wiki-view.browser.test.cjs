@@ -26,7 +26,7 @@ function decl(name) {
 
 const FUNCTIONS = ['wikiScopeInfo', 'wikiView', 'wikiViewOptionsHtml', 'loadWikiRefs', 'wikiUrl', 'wikiRead',
   'forgetWikiReads', 'paintWikiRead', 'openWikiEntry', 'wikiEnclosingEntry', 'wikiTreeHtml', 'wireWikiView',
-  'wikiBody', 'renderWikiHome', 'renderWikiPage', 'wireWikiLocalLinks', 'wikiRoute', 'wikiViewFromQuery', 'isNewTabClick'];
+  'wikiBody', 'renderWikiHome', 'renderWikiPage', 'wireWikiLocalLinks', 'wikiRoute', 'wikiViewFromQuery', 'isNewTabClick', 'decodeRoutePart'];
 const DECLS = ['wikiReadCache', 'wikiReadsInFlight', 'wikiIsDefault', 'wikiGlyph', 'wikiTaskIds', 'wikiGeneration'];
 
 const index = (label) => ({
