@@ -10,10 +10,11 @@ import os from 'node:os';
 import path from 'node:path';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
 import { sharesHostRefDatabase, worldRepos, worldRepoSource, worldRepoTarget } from './types.js';
-import { ensureIdentity, git, gitOrThrow, isGitRepo } from './git.js';
+import { ensureIdentity, git, isGitRepo } from './git.js';
 import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merge.js';
 import { materializeGitCredential, type GitCredential } from './git-credential.js';
 import { canonicalRepositoryIdentity } from './repository-identity.js';
+import { mirroredClone, type MirroredClone } from './git-mirror.js';
 
 /** Clone options for the broker's throwaway repositories. `git fetch` and
  * `git commit` start `git maintenance run --auto`, which current Git detaches;
@@ -594,11 +595,14 @@ async function authorityBundle(temp: string, repo: WorldRepo, branch: string, au
   if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
   const credential = await resolveCredential(auth, repo);
   const { env } = materializeGitCredential(temp, credential);
-  const clone = path.join(temp, 'repo');
-  const cloned = await git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', '--branch', branch, '--single-branch', source, clone],
-    { env, timeoutMs: 10 * 60_000 });
-  if (cloned.code !== 0) throw new Error(`could not fetch branch "${branch}": ${cloned.stderr || cloned.stdout}`);
-  return createGitBundle(args => git(clone, args, { timeoutMs: 10 * 60_000 }), `refs/heads/${branch}`, bundlePath, known);
+  let scratch;
+  try { scratch = await mirroredClone(source, path.join(temp, 'repo'), env, { branch, scratch: temp }); }
+  catch (error) { throw new Error(`could not fetch branch "${branch}": ${error instanceof Error ? error.message : String(error)}`); }
+  try {
+    return await createGitBundle(args => git(scratch.clone, args, { timeoutMs: 10 * 60_000 }), `refs/heads/${branch}`, bundlePath, known);
+  } finally {
+    try { removeTemporaryDirectory(scratch.clone); } finally { await scratch.release(); }
+  }
 }
 
 export async function brokerFinalizeMerge(
@@ -784,23 +788,17 @@ async function withTransferredRepo<T>(
   if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
   let operationFailed = false;
+  let scratch: MirroredClone | undefined;
   try {
     const credential = await resolveCredential(auth, repo);
     const { env } = materializeGitCredential(temp, credential);
-    const clone = path.join(temp, 'repo');
-    const cloned = await timed('git-broker.clone', () => git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', '--single-branch', ...(branch ? ['--branch', branch] : []), source, clone], { env, timeoutMs: 10 * 60_000 }));
-    if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
-    // Keep the task branch as a negotiation base without fetching unrelated
-    // branches. Otherwise an already-published checkpoint is transferred again.
-    if (branch !== repo.branch) {
-      const ref = `refs/heads/${repo.branch}`;
-      const advertised = await git(clone, ['ls-remote', '--exit-code', '--refs', 'origin', ref], { env });
-      if (advertised.code === 0) {
-        await gitOrThrow(clone, ['fetch', '--no-tags', 'origin', `+${ref}:refs/remotes/origin/${repo.branch}`], { env });
-      } else if (advertised.code !== 2) {
-        throw new Error(`task branch discovery failed: ${advertised.stderr || advertised.stdout}`);
-      }
-    }
+    // The mirror supplies history; origin is asked only for its current tips
+    // and the objects the mirror lacks (WD-17, LT-10). The task branch stays a
+    // negotiation base, so an already-published checkpoint is not sent again.
+    scratch = await timed('git-broker.clone', () => mirroredClone(source, path.join(temp, 'repo'), env,
+      { branch, also: [repo.branch], scratch: temp }))
+      .catch((error) => { throw new Error(`authenticated clone failed: ${error instanceof Error ? error.message : String(error)}`); });
+    const clone = scratch.clone;
     await timed('git-broker.import-world', () => importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp));
     if (repo.baseSha) {
       const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
@@ -812,7 +810,7 @@ async function withTransferredRepo<T>(
     throw error;
   } finally {
     try {
-      removeTemporaryDirectory(temp);
+      try { removeTemporaryDirectory(temp); } finally { await scratch?.release(); }
     } catch (cleanupError) {
       // Cleanup must not replace the useful Git rejection (for example a stale
       // force-with-lease) with an incidental filesystem error.
