@@ -168,14 +168,18 @@ integration('PostgreSQL cutover', () => {
     const store = await Store.create(url!);
     try {
       const project = await store.createProject('Retention');
-      const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture', _workflowRunId: 'run' } });
       await store.kvSet(`view-conversation:${task.id}:run:0`, '{"messages":[]}');
       await store.kvSet(`view-conversation:${task.id}:run:1`, '{"messages":[]}');
       await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
         stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 }, 'run:1');
-      expect((await store.retentionSweep(Date.now() + 30 * 24 * 60 * 60 * 1000)).viewSnapshots).toBe(1);
+      // RT-30a: pre-fix run-scoped and legacy turn checkpoints go too.
+      for (const key of [`turnsession:${task.id}:run#1`, 'turnsession:legacy:run:activity']) await store.kvSet(key, 'x');
+      expect((await store.retentionSweep(Date.now() + 30 * 24 * 60 * 60 * 1000))).toMatchObject({ viewSnapshots: 1, turnSessions: 2 });
       expect(await store.kvGet(`view-conversation:${task.id}:run:0`)).toBeUndefined();
       expect(await store.kvGet(`view-conversation:${task.id}:run:1`)).toBeDefined();
+      expect((await store.retentionSweep(Date.now() + 31 * 24 * 60 * 60 * 1000)).turnSessions).toBe(0);
     } finally { await store.close(); }
   });
 

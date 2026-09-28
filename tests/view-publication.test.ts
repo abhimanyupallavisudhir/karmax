@@ -6,6 +6,7 @@ import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { conversationPublisher, type PublishedView } from '../src/domain/view-publication.js';
 import type { TaskView } from '../src/domain/types.js';
+import { reconcilePullRequestView } from '../src/integrations/github-pr.js';
 
 describe('durable conversation publication', () => {
   it.each(['done', 'cancelled', 'failed'] as const)('prunes completed turn retry records on %s while retaining resumable sessions', async status => {
@@ -82,6 +83,37 @@ describe('durable conversation publication', () => {
     } finally { await store.close(); }
   });
 
+  // RT-30a: tasks that settled before terminal publications pruned turn
+  // checkpoints kept their run-scoped and legacy rows forever, including tasks
+  // an earlier sweep had already marked as swept.
+  it.each(['unswept', 'swept by the earlier sweep'])('prunes a settled task\'s pre-fix turn checkpoints (%s)', async (history) => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Retention');
+    const task = await store.createTask({ projectId: project.id, title: 'Old', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'fixture', _workflowRunId: 'last-run' } });
+    const other = await store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'fixture', _workflowRunId: 'live-run' } });
+    const day = 24 * 60 * 60 * 1000;
+    const stale = [`turnsession:${task.id}:run#1`, `turnresult:${task.id}:do:${task.id}:run#1`, `turnspawns:${task.id}#0`,
+      `task-create:${task.id}:run:child`, 'turnsession:legacy:last-run:activity', 'turnspawns:legacy:last-run:activity',
+      ...(history === 'unswept' ? ['turnsession:legacy:earlier-run:activity'] : [])];
+    const kept = [`session:${task.id}:do`, `turnsession:${other.id}:run#1`, `turnresult:${other.id}:do:${other.id}:run#1`,
+      'turnsession:legacy:live-run:activity'];
+    try {
+      if (history === 'unswept') await store.kvSet(`view-publication-fence:${task.id}:earlier-run:publish`, '1');
+      await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
+      const settledAt = Date.now();
+      if (history !== 'unswept') await store.kvSet(`retention:view:${task.id}`, '1');
+      for (const key of [...stale, ...kept]) await store.kvSet(key, 'saved');
+      const swept = await store.retentionSweep(settledAt + 9 * day);
+      expect(swept.turnSessions).toBe(stale.length);
+      for (const key of stale) expect(await store.kvGet(key)).toBeUndefined();
+      for (const key of kept) expect(await store.kvGet(key)).toBe('saved');
+      expect((await store.retentionSweep(settledAt + 10 * day)).turnSessions).toBe(0);
+    } finally { await store.close(); }
+  });
+
   it('restarts the retention window when a settled task is resumed', async () => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Retention');
@@ -148,12 +180,11 @@ describe('durable conversation publication', () => {
       expect(writes[2]!.reference).not.toBe(writes[0]!.reference);
       expect((await store.getTask(task.id))?.lastView?.messages[0]?.text).toBe('edited in place');
 
-      // A retried old activity must read its own snapshot, not the current view.
-      await core.publishView(task.id, writes[1]!.view, writes[1]!.reference);
-      expect((await store.getTask(task.id))?.lastView?.messages[0]?.text).toContain('CI log');
-      expect((await store.getTask(task.id))?.lastView?.transcripts).toHaveLength(1);
+      // The superseded snapshot is gone (DB-2); a late retry that still refers
+      // to it is ignored by publication order (see "publication order").
+      expect((await store.kvGet(`view-conversation:${task.id}:${writes[0]!.reference}`))).toBeUndefined();
       await expect(core.publishView(task.id, writes[1]!.view, 'missing')).rejects.toThrow('snapshot is missing');
-      await expect(core.publishView(task.id, view, writes[0]!.reference)).rejects.toThrow('reference was reused');
+      await expect(core.publishView(task.id, writes[0]!.view as TaskView, writes[2]!.reference)).rejects.toThrow('reference was reused');
 
       // A replacement run writes its initial snapshot even if the old one exists.
       const restart = conversationPublisher('run-two', (v, ref) => core.publishView(task.id, v, ref));
@@ -197,6 +228,142 @@ describe('durable conversation publication', () => {
       expect((await inbox())).toEqual([]);
       expect((await store.getTask(task.id))?.lastView?.status).toBe('active');
     } finally { (await store.close()); }
+  });
+
+  // WF-27: publications of one task can land out of order — an activity attempt
+  // that timed out still completes, or a stopped run's last publication lands
+  // after its successor's. The store keeps the newest, not the last to arrive.
+  describe('publication order', () => {
+    async function publisher() {
+      const store = await Store.create(':memory:');
+      const project = await store.createProject('Order');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: 'x' } });
+      const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+        profiles: new ProfileResolver(store, 'mock') });
+      let runId = 'run-one';
+      const ctx = vi.spyOn(Context, 'current').mockImplementation(() =>
+        ({ info: { workflowExecution: { runId }, activityId: `publish-${Math.random()}`, attempt: 1 } }) as any);
+      const view = (stage: TaskView['stage'], updatedAt: number, text: string = stage): TaskView => ({ taskId: task.id, title: 'T',
+        workflow: 'software-dev', stage, status: 'active', messages: [{ id: 'm', role: 'agent', text, ts: 0 }],
+        actions: [], state: {}, updatedAt });
+      const stored = async () => (await store.getTask(task.id))?.lastView;
+      const updates = async () => (await store.eventsSince(task.id, 0)).filter((event) => event.type === 'view.updated').length;
+      return { store, task, core, view, stored, updates, useRun: (id: string) => { runId = id; },
+        close: async () => { ctx.mockRestore(); await store.close(); } };
+    }
+
+    // WF-32: a webhook records a merge on the stored view, and the workflow,
+    // which never saw it, must not publish the pull request back open.
+    it('keeps a pull request merge the workflow has not seen', async () => {
+      const f = await publisher();
+      try {
+        const pr = { repo: 'app', slug: 'o/app', number: 7, url: 'https://github.com/o/app/pull/7', state: 'open' as const };
+        const other = { ...pr, number: 8, url: 'https://github.com/o/app/pull/8' };
+        await f.core.publishView(f.task.id, { ...f.view('review', 40), pr, prs: [pr, other] });
+        await f.store.saveView(f.task.id, reconcilePullRequestView((await f.stored())!,
+          { repo: 'o/app', number: 7, state: 'closed', merged: true }));
+        await f.core.publishView(f.task.id, { ...f.view('review', 50), pr, prs: [pr, other] });
+        expect(await f.stored()).toMatchObject({ pr: { number: 7, state: 'closed', merged: true },
+          prs: [{ number: 7, state: 'closed', merged: true }, { number: 8, state: 'open' }] });
+      } finally { await f.close(); }
+    });
+
+    it('ignores a late publication that the same run has already superseded', async () => {
+      const f = await publisher();
+      try {
+        await f.core.publishView(f.task.id, f.view('review', 40));
+        expect(await f.core.publishView(f.task.id, f.view('do', 30))).toBeUndefined();
+        expect(await f.stored()).toMatchObject({ stage: 'review', messages: [{ text: 'review' }] });
+        expect(await f.updates()).toBe(1);
+        // The same publication retried, or a sibling from the same workflow task, still lands.
+        await f.core.publishView(f.task.id, { ...f.view('review', 40), status: 'waiting' });
+        expect(await f.stored()).toMatchObject({ status: 'waiting' });
+      } finally { await f.close(); }
+    });
+
+    // Two full publications with the same conversation race (an update
+    // handler's and the main loop's): the later revision lands first, and the
+    // publisher then refers to the earlier one's snapshot in newer frames.
+    it('keeps the snapshot of a full publication it drops as stale', async () => {
+      const f = await publisher();
+      try {
+        await f.core.publishView(f.task.id, f.view('do', 106, 'switched'), 'run-one:3');
+        expect(await f.core.publishView(f.task.id, f.view('review', 100, 'switched'), 'run-one:2')).toBeUndefined();
+        const { messages: _, ...status } = { ...f.view('resolve', 144), status: 'waiting' as const };
+        await f.core.publishView(f.task.id, status, 'run-one:2');
+        expect(await f.stored()).toMatchObject({ stage: 'resolve', status: 'waiting', messages: [{ text: 'switched' }] });
+      } finally { await f.close(); }
+    });
+
+    // Two publications of one workflow activation run concurrently (an update
+    // handler's and the main loop's). The newer one replaces the conversation
+    // and drops the older snapshot (DB-2) between the older one's order check
+    // and its snapshot check; the older one is stale, not a failed workflow.
+    it('drops a publication whose snapshot a newer one replaced in flight', async () => {
+      const f = await publisher();
+      try {
+        await f.core.publishView(f.task.id, f.view('review', 40, 'first'), 'run-one:0');
+        const kvHas = f.store.kvHas.bind(f.store);
+        let raced = false;
+        vi.spyOn(f.store, 'kvHas').mockImplementation(async (key) => {
+          if (!raced && key.endsWith(':run-one:0')) {
+            raced = true;
+            await f.core.publishView(f.task.id, f.view('do', 40, 'switched'), 'run-one:1');
+          }
+          return kvHas(key);
+        });
+        const { messages: _, ...status } = { ...f.view('review', 40, 'first'), status: 'waiting' as const };
+        expect(await f.core.publishView(f.task.id, status, 'run-one:0')).toBeUndefined();
+        expect(raced).toBe(true);
+        expect(await f.stored()).toMatchObject({ stage: 'do', status: 'active', messages: [{ text: 'switched' }] });
+      } finally { await f.close(); }
+    });
+
+    it('ignores a replaced run once its successor has published', async () => {
+      const f = await publisher();
+      try {
+        await f.core.publishView(f.task.id, f.view('review', 400));
+        f.useRun('run-two');
+        await f.core.publishView(f.task.id, f.view('do', 3));
+        expect(await f.stored()).toMatchObject({ stage: 'do' });
+        f.useRun('run-one');
+        await f.core.publishView(f.task.id, f.view('done', 500));
+        expect(await f.stored()).toMatchObject({ stage: 'do' });
+        f.useRun('run-two');
+        await f.core.publishView(f.task.id, f.view('review', 9));
+        expect(await f.stored()).toMatchObject({ stage: 'review' });
+      } finally { await f.close(); }
+    });
+
+    // DB-2: a live task's superseded conversation snapshots used to wait for the
+    // task to settle; each full copy of a long conversation stayed in kv.
+    it('drops the superseded conversation snapshot as soon as a newer one is saved', async () => {
+      const f = await publisher();
+      const writes: { view: PublishedView; reference: string }[] = [];
+      const publish = conversationPublisher('run-one', async (view, reference) => {
+        writes.push({ view, reference });
+        await f.core.publishView(f.task.id, view, reference);
+      });
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await publish(f.view('do', 2, 'first'));
+        await publish(f.view('do', 3, 'second'));
+        await publish(f.view('do', 4, 'third'));
+        expect((await f.store.kvEntries(`view-conversation:${f.task.id}:`)).map(({ key }) => key))
+          .toEqual([`view-conversation:${f.task.id}:run-one:2`]);
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'third' }] });
+        // A late retry of a superseded status publication finds no snapshot, and
+        // must be ignored rather than fail the workflow. A full one re-records
+        // its snapshot, which the run's next frames may refer to (see "keeps the
+        // snapshot"); retention removes it once the task settles.
+        await expect(f.core.publishView(f.task.id, writes[1]!.view, writes[1]!.reference)).resolves.toBeUndefined();
+        await expect(f.core.publishView(f.task.id, writes[2]!.view, writes[2]!.reference)).resolves.toBeUndefined();
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'third' }] });
+        expect((await f.store.kvEntries(`view-conversation:${f.task.id}:`)).map(({ key }) => key))
+          .toEqual([`view-conversation:${f.task.id}:run-one:1`, `view-conversation:${f.task.id}:run-one:2`]);
+      } finally { await f.close(); }
+    });
   });
 
   it('does not reference an unacknowledged write', async () => {
