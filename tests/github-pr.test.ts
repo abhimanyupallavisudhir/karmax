@@ -470,14 +470,14 @@ describe('GitHub PR client', () => {
 
     // Retargeted while closed: reopen first, then change the base (task 387).
     await api.update(SLUG, pr.number, { state: 'closed' });
-    const retargeted = await api.openOrUpdate(SLUG, { head: 'karmax/t2', base: 'release', title: 'T', body: 'b' });
+    const retargeted = await api.openOrUpdate(SLUG, { head: 'tavya/t2', base: 'release', title: 'T', body: 'b' });
     expect(retargeted.pr).toMatchObject({ number: pr.number, state: 'open' });
     expect(gh.prs[0].base.ref ?? gh.prs[0].base).toBe('release');
 
     // A closed PR GitHub will not reopen is replaced by a fresh one.
     await api.update(SLUG, pr.number, { state: 'closed' });
     gh.prs[0].unreopenable = true;
-    const replaced = await api.openOrUpdate(SLUG, { head: 'karmax/t2', base: 'main', title: 'T', body: 'b' });
+    const replaced = await api.openOrUpdate(SLUG, { head: 'tavya/t2', base: 'main', title: 'T', body: 'b' });
     expect(replaced).toMatchObject({ created: true, pr: { state: 'open' } });
     expect(replaced.pr.number).not.toBe(pr.number);
     gh.prs.splice(1);

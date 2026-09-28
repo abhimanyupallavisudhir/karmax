@@ -16605,7 +16605,7 @@ function showVisualNotification(item) {
   const alert = document.createElement('div');
   alert.className = 'notification-alert';
   alert.dataset.id = item.id;
-  alert.innerHTML = `<button class="notification-open"><strong>${esc(inboxTitle(item, siteName()))}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
+  alert.innerHTML = `<button class="notification-open"><strong>${esc(inboxTitle(item, '') || siteName())}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
   alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(liveInboxItem(item)); };
   alert.lastElementChild.onclick = () => alert.remove();
   region.prepend(alert);
@@ -16622,7 +16622,7 @@ function showSystemNotification(item) {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
   try {
     const number = item.task?.num != null ? `#${item.task.num} · ` : '';
-    const notification = new Notification(inboxTitle(item, siteName()), {
+    const notification = new Notification(inboxTitle(item, '') || siteName(), {
       body: `${URGENCY_LEVELS[urgencyRank(item.urgency)].toUpperCase()} · ${number}${inboxRowLabel(item)}`,
       silent: true, // Sound is controlled separately by this browser’s per-level preference.
       tag: item.id,                                    // a restated ask replaces its own popup
