@@ -2986,24 +2986,29 @@ async function loadOrganizations() {
 
 // The organization's people, teams and roles. A route that switches organization
 // and the settings page it paints share one read (any write drops it); the inbox
-// spans organizations and is loaded by its own callers.
+// spans organizations and is loaded by its own callers. A failed read keeps what
+// was known about this organization and rejects, so no page reads it as empty.
 async function loadCollaboration() {
   const organizationId = S.organizationId;
   if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
   const read = path => api(path, { maxAge: 10_000 });
-  const [members, teams, users, catalog] = await Promise.all([
-    read(`/api/organizations/${organizationId}/members`).catch(() => []),
-    read(`/api/organizations/${organizationId}/teams`).catch(() => []),
-    read('/api/users').catch(() => []),
-    read(`/api/organizations/${organizationId}/roles`).catch(() => null),
+  const [members, teams, users, catalog] = await Promise.allSettled([
+    read(`/api/organizations/${organizationId}/members`),
+    read(`/api/organizations/${organizationId}/teams`),
+    read('/api/users'),
+    read(`/api/organizations/${organizationId}/roles`),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
-  S.authorizationCatalog = catalog;
+  const known = S.authorizationCatalogOrganization === organizationId;
+  const value = (result, previous, empty) => result.status === 'fulfilled' ? result.value ?? empty : known ? previous : empty;
+  S.authorizationCatalog = value(catalog, S.authorizationCatalog, null);
+  S.organizationMembers = value(members, S.organizationMembers, []);
+  S.teams = value(teams, S.teams, []);
+  S.users = users.status === 'fulfilled' ? users.value || [] : S.users || [];
   S.authorizationCatalogOrganization = organizationId;
-  S.organizationMembers = members || [];
-  S.teams = teams || [];
-  S.users = users || [];
+  const failed = [members, teams, users, catalog].find((result) => result.status === 'rejected');
+  if (failed) throw failed.reason;
 }
 
 async function loadInbox() {
@@ -13245,15 +13250,18 @@ async function hydrateConversationSharing(scope, id) {
       <label class="form-row"><span>${scope === 'organization' ? 'Organization policy' : `Project policy · organization ${policy.organization ? 'allows' : 'disallows'} sharing`}</span><select ${policy.canManage ? '' : 'disabled'}>
         ${scope === 'organization' ? `<option value="disabled" ${!policy.enabled ? 'selected' : ''}>Disabled</option><option value="enabled" ${policy.enabled ? 'selected' : ''}>Allow developers to share</option>` : `<option value="inherit" ${policy.value === 'inherit' ? 'selected' : ''}>Use organization policy</option><option value="disabled" ${policy.value === 'disabled' ? 'selected' : ''}>Disable for this project</option>`}
       </select></label><button class="btn sm" data-save ${policy.canManage ? '' : 'disabled'}>Save</button>`;
+    const select = box.querySelector('select');
+    let saved = select.value;
     box.querySelector('[data-save]').onclick = async (event) => {
       const button = event.currentTarget;
-      button.disabled = true;
+      button.disabled = select.disabled = true;
       try {
-        const value = box.querySelector('select').value;
+        const value = select.value;
         await api(url, { method: 'PUT', body: JSON.stringify(scope === 'organization' ? { enabled: value === 'enabled' } : { value }) });
+        saved = value;
         toast('Public sharing policy saved');
-      } catch (error) { toast(error.message, true); }
-      finally { button.disabled = false; }
+      } catch (error) { select.value = saved; toast(error.message, true); }
+      finally { button.disabled = select.disabled = false; }
     };
   } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
 }
@@ -13667,11 +13675,14 @@ async function hydrateProjectAccess(proj) {
   const repositoriesAreCurrent = beginAsyncElementRender(repositoryBox);
   const renderIsCurrent = () => accessIsCurrent() && repositoriesAreCurrent();
   try {
+    // Unreadable GitHub state offers Retry; read as "not connected" it would send
+    // an organization that is connected into setup.
+    let githubLoadError = null;
     const [repositories, members, gitConnections, githubApp] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
       api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch(() => []),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch(() => ({ configured: false })),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch((error) => { githubLoadError = error; return []; }),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch((error) => { githubLoadError = error; return { configured: false }; }),
     ]);
     if (!renderIsCurrent()) return;
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
@@ -13686,7 +13697,7 @@ async function hydrateProjectAccess(proj) {
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
       <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button>${githubApp.configured && gitConnections.length && githubApp.userAuthorized ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository...</button>' : ''}</div>
-      ${!githubApp.configured ? `<div class="inline-form">${S.installationAccess
+      ${githubLoadError ? '<div id="project-github-error"></div>' : !githubApp.configured ? `<div class="inline-form">${S.installationAccess
         ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
         : '<span class="task-sub">The installation operator must set up the shared GitHub App before repositories can be connected.</span>'}</div>`
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
@@ -13696,6 +13707,7 @@ async function hydrateProjectAccess(proj) {
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
       catch (error) { toast(error.message, true); }
     }));
+    if (githubLoadError) paneError($('#project-github-error'), githubLoadError, () => hydrateProjectAccess(projectById(proj.id) || proj));
     const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
     wireRepositoryRemoves();
     $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
@@ -17864,8 +17876,13 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
   const paint = {
     async people() {
       const invitations = read('invitations').catch(() => []);
-      await loadCollaboration().catch(() => {});
+      const collaborationError = await loadCollaboration().then(() => null, (error) => error);
       if (!live('people')) return;
+      if (collaborationError) {
+        paneError($('#org-members'), collaborationError, () => refresh('people'));
+        paneError($('#org-teams'), collaborationError, () => refresh('people'));
+        return;
+      }
       const visibility = $('#organization-name-visibility');
       if (visibility) {
         visibility.disabled = !S.authorizationCatalog?.canCreate;
