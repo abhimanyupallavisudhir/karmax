@@ -59,14 +59,7 @@ jobs:
           fi
           grep -F 'unexpected key "queue"' "$RUNNER_TEMP/actionlint-negative.log"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '22'
-          cache: npm
-
-      - run: npm ci --ignore-scripts
-      # Only these known packages need install-time work (native bindings/codegen).
-      - run: npm rebuild @swc/core esbuild node-pty protobufjs
+      - uses: ./.github/actions/install
       - run: npm audit --audit-level=high
       - run: npm run typecheck
       # No lint errors; warning and `as any` budgets only shrink (scripts/lint.ts).
@@ -114,16 +107,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: ./.github/actions/install
+
+      - id: playwright
+        run: echo "version=$(node -p "require('playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
+      - id: browsers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          node-version: '22'
-          cache: npm
-
-      - run: npm ci --ignore-scripts
-      - run: npm rebuild @swc/core esbuild node-pty protobufjs
-
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright.outputs.version }}
       - name: Install Chromium for browser regressions
+        if: steps.browsers.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
+      # The cached browser still needs the system libraries it links against.
+      - name: Install Chromium's system libraries
+        if: steps.browsers.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
 
       - name: Install password-store interoperability tools
         run: |

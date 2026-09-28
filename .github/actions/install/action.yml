@@ -1,0 +1,31 @@
+name: Install dependencies
+description: >-
+  Node 22 and this lockfile's node_modules, restored from the cache when an
+  earlier run on the same platform and Node release built them.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: '22'
+
+    # Native modules are built for one Node ABI, so the exact release is part
+    # of the key along with the lockfile; no partial match is ever restored.
+    - id: node
+      shell: bash
+      run: echo "version=$(node --version)" >> "$GITHUB_OUTPUT"
+
+    - id: modules
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: node_modules
+        key: node-modules-${{ runner.os }}-${{ runner.arch }}-${{ steps.node.outputs.version }}-${{ hashFiles('package-lock.json') }}
+
+    - if: steps.modules.outputs.cache-hit != 'true'
+      shell: bash
+      run: npm ci --ignore-scripts
+    # Only these known packages need install-time work (native bindings/codegen).
+    - if: steps.modules.outputs.cache-hit != 'true'
+      shell: bash
+      run: npm rebuild @swc/core esbuild node-pty protobufjs

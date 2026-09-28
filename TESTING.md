@@ -83,6 +83,11 @@ No shard can finish faster than the slowest single file (`pipeline.test.ts`,
 about 6.5 minutes in CI). Adding a number to the `test` job's `shard` list helps
 only while the shards are well above that; past it, split the slowest file.
 
+Jobs install through `.github/actions/install`, which restores `node_modules`
+from the Actions cache when the lockfile, platform and Node release match an
+earlier run, and runs `npm ci` only on a miss; the shards also cache the
+locked Playwright release's Chromium.
+
 `deploy artifacts` installs the turnkey stack exactly as an operator does
 (`./deploy/karmax up karmax.localhost`), then checks the booted hosted cell:
 the edge routes to it, and the app reaches PostgreSQL only as its own role.

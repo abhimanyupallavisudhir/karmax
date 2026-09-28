@@ -10,6 +10,7 @@ const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
 const ciSource = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
 const workflow = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'deploy.yml'), 'utf8'));
+const installAction = parse(fs.readFileSync(path.join(repoRoot, '.github', 'actions', 'install', 'action.yml'), 'utf8'));
 const backupWorkflowPath = path.join(repoRoot, '.github', 'workflows', 'backup.yml');
 const deploy = workflow.jobs.deploy;
 const script: string = JSON.stringify(deploy.steps);
@@ -26,11 +27,33 @@ describe('post-push deployment to the public instance', () => {
   });
 
   it('does not execute arbitrary dependency install scripts in CI', () => {
-    for (const name of ['checks', 'test']) {
-      const steps = JSON.stringify(ci.jobs[name].steps);
-      expect(steps).toContain('npm ci --ignore-scripts');
-      expect(steps).toContain('npm rebuild @swc/core esbuild node-pty protobufjs');
-    }
+    const install = JSON.stringify(installAction.runs.steps);
+    expect(install).toContain('npm ci --ignore-scripts');
+    expect(install).toContain('npm rebuild @swc/core esbuild node-pty protobufjs');
+    expect(install).not.toMatch(/npm (?:ci|install)(?! --ignore-scripts)/);
+    for (const name of ['checks', 'test'])
+      expect(ci.jobs[name].steps.map((step: { uses?: string }) => step.uses)).toContain('./.github/actions/install');
+  });
+
+  // CI-29: every job used to reinstall 1.5 GB of node_modules. The cache is
+  // only as safe as its key: another lockfile or Node ABI must never hit it.
+  it('restores node_modules only for the same lockfile, platform and exact Node version', () => {
+    const steps = installAction.runs.steps as Array<{ id?: string; uses?: string; if?: string; run?: string; with?: Record<string, string> }>;
+    const cache = steps.find((step) => step.uses?.startsWith('actions/cache@'))!;
+    expect(cache.with?.path).toBe('node_modules');
+    for (const part of ['runner.os', 'runner.arch', 'steps.node.outputs.version', "hashFiles('package-lock.json')"])
+      expect(cache.with?.key).toContain(part);
+    expect(cache.with?.['restore-keys']).toBeUndefined();
+    for (const step of steps.filter((candidate) => /npm (ci|rebuild)/.test(candidate.run ?? '')))
+      expect(step.if).toBe(`steps.${cache.id}.outputs.cache-hit != 'true'`);
+  });
+
+  it('downloads Chromium only when the cached browser is not the locked Playwright release', () => {
+    const steps = JSON.stringify(ci.jobs.test.steps);
+    expect(steps).toContain('~/.cache/ms-playwright');
+    expect(steps).toContain('playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright.outputs.version }}');
+    expect(steps).toContain('npx playwright install --with-deps chromium');
+    expect(steps).toContain('npx playwright install-deps chromium');
   });
   it('schema-validates every workflow with a version-and-checksum-pinned actionlint', () => {
     expect(ciSource).toContain("ACTIONLINT_VERSION: '1.7.12'");
@@ -40,10 +63,9 @@ describe('post-push deployment to the public instance', () => {
   });
 
   it('pins downloaded workflow tools to immutable hashes', () => {
-    for (const job of Object.values(ci.jobs) as Array<{ steps?: Array<{ uses?: string }> }>) {
-      for (const step of job.steps ?? []) {
-        if (step.uses?.startsWith('actions/')) expect(step.uses).toMatch(/^actions\/[^@]+@[0-9a-f]{40}$/);
-      }
+    const steps = [installAction.runs.steps, ...Object.values(ci.jobs).map((job: any) => job.steps ?? [])].flat() as Array<{ uses?: string }>;
+    for (const step of steps) {
+      if (step.uses && !step.uses.startsWith('./')) expect(step.uses).toMatch(/^[\w.-]+\/[^@]+@[0-9a-f]{40}$/);
     }
     expect(ciSource).toContain('TEMPORAL_CLI_LINUX_AMD64_SHA256');
     expect(ciSource).toContain('sha256sum -c -');
