@@ -141,6 +141,15 @@ async function remoteCoreFor(github: { options: { apiBase?: string; fetch?: type
         repo.localPath = sources[index]!;
       }
       world.handle.repo = remotes[0]!;
+      // The backing worktrees are released from their host checkouts. Their
+      // SSH-shaped remote names would otherwise be locked as paths relative to
+      // the test's working directory, leaving `git@github.com:…/` behind.
+      const destroy = world.destroy.bind(world);
+      world.destroy = async () => {
+        for (const [index, repo] of world.handle.repos!.entries()) repo.repo = sources[index]!;
+        world.handle.repo = sources[0]!;
+        await destroy();
+      };
       active.set(spec.taskId, world);
       return world;
     },
