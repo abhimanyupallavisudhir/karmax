@@ -522,9 +522,9 @@ describe('durable conversation publication', () => {
       try {
         await publish(f.view('do', 1, 'first'));
         await Promise.all([publish(f.view('do', 2, 'second')), publish(f.view('do', 3, 'third'))]);
-        // Later frames refer to run-one:1, the last write acknowledged.
-        await publish({ ...f.view('do', 4, 'second'), status: 'waiting' });
-        expect(await f.stored()).toMatchObject({ status: 'waiting', messages: [{ text: 'second' }] });
+        // The publisher acknowledged run-one:1 last, so its next delta builds on it.
+        await publish({ ...f.view('do', 4, 'fourth'), status: 'waiting' });
+        expect(await f.stored()).toMatchObject({ status: 'waiting', messages: [{ text: 'fourth' }] });
       } finally { await f.close(); }
     });
   });
