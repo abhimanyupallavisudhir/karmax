@@ -620,3 +620,21 @@ it('WF-3: a merge-queue wait watches the position in a child, not a parent poll'
   expect(watches).toEqual([expect.objectContaining({ taskId: 'task', previous: { position: 2, total: 3 } })]);
   expect(wf.activities.mergeQueuePosition).toHaveBeenCalledOnce();
 });
+
+it('WF-3/WF-4: a continued parent at the sub-task barrier notices a child whose settlement signal was lost', async () => {
+  const { next, full } = await continuedRun();
+  next.recovery.continued.subTasks = { ...next.recovery.continued.subTasks, awaitingResponse: [], raises: [] };
+  // The child fails after run 2 has started, and the platform's signal is lost.
+  wf.activities.settledChildTasks = vi.fn().mockResolvedValueOnce([]).mockResolvedValue([{ taskId: 'child-1', stage: 'failed' }]);
+  const turns: any[][] = [];
+  wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+    turns.push(full(args));
+    if (turns.length === 2) wf.handlers.get('cancel')!();
+    return { output: 'Waiting for the child', providerCompleted: true, waitForSubtasks: true };
+  });
+  const waits: unknown[] = [];
+  wf.wait = () => { waits.push(wf.timeout); };
+  expect(await softwareDevV1_26(next)).toEqual({ stage: 'cancelled' });
+  expect(waits).toEqual(['1 hour']);
+  expect(turns[1]!.at(-1).text).toContain('Sub-task child-1 finished: failed');
+});

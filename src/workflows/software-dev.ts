@@ -266,6 +266,8 @@ const CONTINUE_AFTER_BYTES = 8 * 1024 * 1024;
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
 const MAX_CONTINUATION_BYTES = 1024 * 1024;
 const CONTINUE_RETRY_EVENTS = 500;
+/** How often a parent waiting on children it holds no handle for rereads them. */
+const CHILD_SETTLEMENT_RECHECK = '1 hour';
 
 /**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
@@ -2974,6 +2976,15 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (awaitingResponse.size > 0 && !needsHuman) {
           if (boundedNags) subtaskNags++;
           await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
+        } else if (!needsHuman && [...outstanding].some((id) => !childHandles.has(id))
+          && patched('software-dev-child-settlement-recheck-v1')) {
+          // A child restored without its handle (after continue-as-new or a
+          // replacement) is reported only by a best-effort signal, so its
+          // durable view is read again while the task waits.
+          while (!(await condition(wake, CHILD_SETTLEMENT_RECHECK))) {
+            for (const child of await coreChild.settledChildTasks(taskId))
+              if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
+          }
         } else await condition(wake);
         if (cancelled) return await abort();
       }
