@@ -18,7 +18,6 @@ const REMAINING: Record<string, number> = {
   'tests/task-picker-ui.test.ts': 1,
   'tests/ui-agent-settings.test.ts': 5,
   'tests/ui-deverbosification.test.ts': 9,
-  'tests/user-git-settings-ui.test.ts': 22,
   'tests/web-confirmer.test.ts': 10,
 };
 
