@@ -1,26 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { closeConsoleBrowser, consolePage, signedIn, type ApiCall, type ApiHandler } from './helpers/console-page.js';
+import { closeConsoleBrowser, consolePage, emptySettings, signedIn, type ApiCall, type ApiHandler } from './helpers/console-page.js';
 
 afterAll(closeConsoleBrowser);
-
-const all = { project: true, projectDelete: true, projectTransfer: true, organization: true };
-
-/** Every settings section loads with nothing configured yet. */
-const emptySettings: ApiHandler = ({ method, path: route }) => {
-  if (method !== 'GET') return undefined;
-  const pathname = route.split('?')[0]!;
-  if (pathname === '/api/settings/access') return all;
-  if (/\/(repositories|members|git-connections|resources|storage|runner-pools|world-providers|teams|invitations)$/.test(pathname)) return [];
-  if (pathname.endsWith('/roles')) return { profiles: [], capabilityGroups: [], creatableCapabilities: [], canCreate: false };
-  if (pathname.endsWith('/github/app')) return { configured: false };
-  if (pathname.endsWith('/secrets')) return { secrets: [], suggestions: [] };
-  if (pathname.endsWith('/services')) return { services: [] };
-  if (pathname.endsWith('/environment')) return { spec: {}, builds: [] };
-  if (pathname === '/api/users') return [];
-  return undefined;
-};
 
 async function settings(options: { path?: string; api?: ApiHandler; projects?: Array<Record<string, unknown>>;
   organizations?: Array<Record<string, unknown>> } = {}) {

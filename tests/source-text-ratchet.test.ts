@@ -12,7 +12,6 @@ import { sourceTextAssertions, testFiles } from './helpers/source-text-assertion
 const REMAINING: Record<string, number> = {
   'tests/account-diagnostics-ui.test.ts': 5,
   'tests/gateway-safe-mode.test.ts': 1,
-  'tests/github-reauthorize-ui.test.ts': 29,
   'tests/google-signin.test.ts': 2,
   'tests/memory-guard.test.ts': 1,
   'tests/provider-connections-ui.test.ts': 9,

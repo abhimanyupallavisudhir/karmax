@@ -123,3 +123,21 @@ export function signedIn(overrides: ApiHandler = () => undefined, fixture: {
     return undefined;
   };
 }
+
+/**
+ * Every settings section loading with nothing configured yet, and the caller
+ * holding every settings authority. Chain it after a test's own replies.
+ */
+export const emptySettings: ApiHandler = ({ method, path: route }) => {
+  if (method !== 'GET') return undefined;
+  const pathname = route.split('?')[0]!;
+  if (pathname === '/api/settings/access') return { project: true, projectDelete: true, projectTransfer: true, organization: true };
+  if (/\/(repositories|members|git-connections|resources|storage|runner-pools|world-providers|teams|invitations)$/.test(pathname)) return [];
+  if (pathname.endsWith('/roles')) return { profiles: [], capabilityGroups: [], creatableCapabilities: [], canCreate: false };
+  if (pathname.endsWith('/github/app')) return { configured: false };
+  if (pathname.endsWith('/secrets')) return { secrets: [], suggestions: [] };
+  if (pathname.endsWith('/services')) return { services: [] };
+  if (pathname.endsWith('/environment')) return { spec: {}, builds: [] };
+  if (pathname === '/api/users') return [];
+  return undefined;
+};
