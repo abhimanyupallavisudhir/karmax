@@ -112,6 +112,18 @@ export interface ViewPublicationOrder {
   revision?: number;
 }
 
+/** Conversation references are `${runId}:${revision}` (conversationPublisher):
+ * does `stored` hold the same run's conversation at `reference`'s revision or later? */
+function conversationSupersedes(stored: string, reference: string): boolean {
+  const revision = (value: string) => {
+    const at = value.lastIndexOf(':');
+    const n = Number(value.slice(at + 1));
+    return at > 0 && /^\d+$/.test(value.slice(at + 1)) && Number.isSafeInteger(n) ? { run: value.slice(0, at), n } : undefined;
+  };
+  const a = revision(stored), b = revision(reference);
+  return Boolean(a && b && a.run === b.run && a.n >= b.n);
+}
+
 /** A task's accepted publication position plus the runs it has moved past. */
 interface ViewOrderState { runId: string; seq: number; revision: number; retired: string[] }
 /** Runs a task replaces are few; remember enough to outlast a straggler. */
@@ -3832,6 +3844,13 @@ export class Store {
         payload: { requestId: request.id, action: 'withdraw', reason } }));
   }
 
+  /** Does the task's stored conversation make `reference`'s snapshot unnecessary
+   * (the same run, at the same or a later revision)? */
+  async conversationSupersedesReference(taskId: string, reference: string): Promise<boolean> {
+    const current = (await this.db.prepare('SELECT conversationRef FROM tasks WHERE id=?').get(taskId)) as { conversationRef?: string | null } | undefined;
+    return Boolean(current?.conversationRef && conversationSupersedes(current.conversationRef, reference));
+  }
+
   /** Returns false, and changes nothing, for a publication `order` shows is stale. */
   async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder): Promise<boolean> {
     return this.db.transaction(async () => {
@@ -3857,9 +3876,17 @@ export class Store {
     const { messages, transcripts, ...status } = view;
     if (conversationReference) {
       const key = `view-conversation:${taskId}:${conversationReference}`;
-      if (!(await this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(key))) throw new Error('Conversation publication snapshot is missing');
       const current = (await this.db.prepare('SELECT conversationRef FROM tasks WHERE id=?').get(taskId)) as any;
-      if (current?.conversationRef === conversationReference) {
+      // Within one run the conversation follows revisions while the status
+      // follows the workflow's order: two publishers of a run (an update handler
+      // and the main loop) can keep referring to an older revision after a newer
+      // one replaced it. Such a frame updates the status and keeps the newer
+      // conversation, and never needs the snapshot it names (DB-2 dropped it).
+      if (current?.conversationRef && conversationSupersedes(current.conversationRef, conversationReference)) {
+        (await this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId));
+      } else if (!(await this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(key))) {
+        throw new Error('Conversation publication snapshot is missing');
+      } else if (current?.conversationRef === conversationReference) {
         (await this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId));
       } else {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
