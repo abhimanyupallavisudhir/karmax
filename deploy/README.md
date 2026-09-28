@@ -253,7 +253,10 @@ written to the audit log at the next boot (`backup.restored`,
 
 `deploy/data-epoch` marks compatibility for automatic code-only rollback. Builds
 without a marker are epoch 1. Epoch 2 separates task conversation storage and
-introduces new durable workflow activity histories. If an update crosses epochs
+introduces new durable workflow activity histories. Epoch 3 binds every vault
+entry to its handle (`v2.` ciphertext, AU-27) and moves each stored card's CVC
+into its own entry (AU-31); the previous release cannot read either, so this
+migration is one-way. If an update crosses epochs
 and then fails readiness, the updater stops the app and preserves the candidate
 code and current data; it does **not** start the incompatible previous image.
 This deliberately trades availability for avoiding a misleading or destructive
@@ -265,6 +268,22 @@ backup with its matching application revision **and Temporal history**. Restorin
 a snapshot can discard work performed after it was taken. Do not run an older
 release against the migrated database or restore only one database. Validate this
 procedure on an isolated deployment before the production epoch transition.
+
+The epoch 3 vault migration first copies the unbound entries to
+`vault/entries.pre-v2/` (removed at boot 14 days later). To run the previous
+release against the vault alone, stop the app, move `vault/entries` aside,
+rename `vault/entries.pre-v2` to `vault/entries`, and delete `vault/vault.canary`.
+Secrets written since the upgrade are lost that way, so prefer the pre-update
+backup. Entries that would not open under the vault key are moved to
+`vault/entries/quarantine/` and recorded in the audit log
+(`vault.entry.quarantined`) rather than stopping boot.
+
+A boot that fails with "the vault key does not open this vault" found a
+well-formed `vault/vault.canary` the key cannot authenticate: `KARMAX_VAULT_KEY`
+(or `vault/vault.key`) is not the key the vault was created with. Restore the
+original key; do not delete the canary to get past it. A missing or damaged
+canary is not an error: the next boot re-checks the key against the entries
+(it must open most of them) and writes a new one.
 
 ## Cost and idle-world behavior
 

@@ -115,3 +115,129 @@ describe('vault key canary', () => {
     expect(fs.existsSync(path.join(dir, 'vault.canary'))).toBe(true);
   });
 });
+
+/** An entry the vault wrote under another key (a split vault) or not at all. */
+function foreignEntry(dir: string, handle: string) {
+  fs.writeFileSync(entryFile(dir, handle), JSON.stringify({ handle, blob: legacyBlob(crypto.randomBytes(32), 'foreign') }));
+}
+
+describe('a one-way migration that keeps its way back', () => {
+  it('copies the unbound entries aside before binding them', async () => {
+    const { dir } = legacyVault();
+    const original = fs.readFileSync(entryFile(dir, 'rotated'), 'utf8');
+    await new Vault(dir).migrate();
+    const aside = path.join(dir, 'entries.pre-v2', path.basename(entryFile(dir, 'rotated')));
+    expect(fs.readFileSync(aside, 'utf8')).toBe(original);
+    expect(fs.readFileSync(entryFile(dir, 'rotated'), 'utf8')).not.toBe(original);
+  });
+
+  it('quarantines the entries that will not open and binds the rest', async () => {
+    const { dir, key } = legacyVault();
+    fs.writeFileSync(entryFile(dir, 'second'), JSON.stringify({ handle: 'second', blob: legacyBlob(key, 'two') }));
+    fs.writeFileSync(entryFile(dir, 'power-loss'), '');
+    fs.writeFileSync(entryFile(dir, 'garbled'), '{"handle":');
+    foreignEntry(dir, 'foreign');
+    const vault = new Vault(dir);
+    expect(vault.list()).toEqual(expect.arrayContaining(['rotated', 'second', 'foreign']));
+    const { quarantined } = await vault.migrate();
+    expect(quarantined.map(q => q.handle ?? null).sort()).toEqual(['foreign', null, null].sort());
+    expect(fs.readdirSync(path.join(dir, 'entries', 'quarantine'))).toHaveLength(3);
+    expect(vault.list().sort()).toEqual(['rotated', 'second']);
+    expect(vault.reveal('second')).toBe('two');
+    // Later writes are not held hostage by the damaged entries.
+    await vault.put('after', 'value');
+    await vault.delete('rotated');
+    expect(vault.reveal('after')).toBe('value');
+  });
+
+  it('lists around an unreadable entry instead of refusing', async () => {
+    const dir = directory();
+    const vault = new Vault(dir);
+    await vault.put('kept', 'secret');
+    fs.writeFileSync(path.join(dir, 'entries', `${'0'.repeat(64)}.json`), '');
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(vault.list()).toEqual(['kept']);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('unreadable'));
+  });
+
+  it('keeps a readable secret whose older revision is damaged', async () => {
+    const { dir } = legacyVault();
+    const entry = JSON.parse(fs.readFileSync(entryFile(dir, 'rotated'), 'utf8'));
+    entry.previous.push(legacyBlob(crypto.randomBytes(32), 'foreign'));
+    fs.writeFileSync(entryFile(dir, 'rotated'), JSON.stringify(entry));
+    const vault = new Vault(dir);
+    const { quarantined } = await vault.migrate();
+    expect(quarantined).toEqual([expect.objectContaining({ handle: 'rotated', reason: expect.stringMatching(/revision/) })]);
+    expect(vault.reveal('rotated')).toBe('current');
+    expect(vault.reveal('rotated', 1)).toBe('older');
+    expect(vault.reveal('rotated', 2)).toBeUndefined();
+  });
+
+  it('syncs each entry and the directory before the rename publishes it', async () => {
+    const vault = new Vault(directory());
+    const fsync = vi.spyOn(fs, 'fsyncSync');
+    const rename = vi.spyOn(fs, 'renameSync');
+    await vault.put('durable', 'value');
+    const renamed = rename.mock.invocationCallOrder[0]!;
+    expect(fsync.mock.invocationCallOrder.some(call => call < renamed)).toBe(true);
+    expect(fsync.mock.invocationCallOrder.some(call => call > renamed)).toBe(true);
+  });
+});
+
+describe('the canary decides only when it can', () => {
+  it('re-checks an empty or truncated canary against the entries and rewrites it', async () => {
+    const dir = directory();
+    await new Vault(dir).put('kept', 'secret');
+    const canary = path.join(dir, 'vault.canary');
+    const good = fs.readFileSync(canary, 'utf8');
+    for (const damaged of ['', good.slice(0, good.length - 10)]) {
+      fs.writeFileSync(canary, damaged);
+      expect(new Vault(dir).reveal('kept')).toBe('secret');
+      expect(fs.readFileSync(canary, 'utf8')).not.toBe(damaged);
+    }
+    fs.writeFileSync(canary, '');
+    vi.stubEnv('KARMAX_VAULT_KEY', 'a-different-deployment-key-material-111');
+    expect(() => new Vault(dir)).toThrow(/vault key does not open this vault/);
+  });
+
+  it('does not record a key that opens only a minority of the entries', () => {
+    const { dir } = legacyVault();
+    const minority = crypto.randomBytes(32);
+    fs.writeFileSync(path.join(dir, 'vault.key'), minority);
+    for (const handle of ['a', 'b']) foreignEntry(dir, handle);
+    fs.writeFileSync(entryFile(dir, 'mine'), JSON.stringify({ handle: 'mine', blob: legacyBlob(minority, 'x') }));
+    // 'mine' opens under this key; 'rotated', 'a' and 'b' do not.
+    expect(() => new Vault(dir)).toThrow(/opens 1 of 4 entries/);
+    expect(fs.existsSync(path.join(dir, 'vault.canary'))).toBe(false);
+  });
+
+  it('keeps refusing unbound ciphertext when the canary is deleted', async () => {
+    const { dir, key } = legacyVault();
+    await new Vault(dir).migrate();
+    fs.rmSync(path.join(dir, 'vault.canary'));
+    fs.rmSync(path.join(dir, 'entries', '.bound'), { force: true });
+    fs.writeFileSync(entryFile(dir, 'planted'), JSON.stringify({ handle: 'planted', blob: legacyBlob(key, 'planted') }));
+    const vault = new Vault(dir);
+    await vault.migrate();
+    expect(() => vault.reveal('planted')).toThrow(/not bound to its handle/);
+  });
+
+  it('opens a vault it cannot write, as the read-only restore drill does', async () => {
+    const dir = directory();
+    await new Vault(dir).put('kept', 'secret');
+    fs.rmSync(path.join(dir, 'vault.canary'));
+    fs.chmodSync(dir, 0o500);
+    try { expect(new Vault(dir).reveal('kept')).toBe('secret'); }
+    finally { fs.chmodSync(dir, 0o700); }
+  });
+});
+
+describe('replacing a secret without its history', () => {
+  it('drops the earlier revisions', async () => {
+    const vault = new Vault(directory());
+    await vault.put('card', 'with-cvc');
+    await vault.put('card', 'without-cvc', { history: false });
+    expect(vault.reveal('card')).toBe('without-cvc');
+    expect(vault.reveal('card', 1)).toBeUndefined();
+  });
+});

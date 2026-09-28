@@ -17,12 +17,38 @@ const CANARY = 'karmax-vault-canary';
 /** Not a storable handle, so the canary's ciphertext cannot stand in for an entry. */
 const CANARY_HANDLE = '\0canary';
 const boundTo = (handle: string) => Buffer.from(`karmax-vault:v2\0${handle}`, 'utf8');
+const ENTRY_FILE = /^[a-f0-9]{64}\.json$/;
+/** The unbound entries as they were before binding, kept for a manual rollback. */
+const PRE_V2 = 'entries.pre-v2';
+const PRE_V2_RETENTION_MS = 14 * 86_400_000;
+
+/** An entry `migrate` moved to `entries/quarantine/` because it would not open. */
+export interface QuarantinedEntry { file: string; handle?: string; reason: string }
+
+/** Publish `data` at `file` only once it and the rename are on disk. */
+function writeDurably(file: string, data: string | Buffer): void {
+  const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const fd = fs.openSync(temporary, 'wx', 0o600);
+  try { fs.writeFileSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  try { fs.renameSync(temporary, file); } catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
+  syncDirectory(path.dirname(file));
+}
+function syncDirectory(dir: string): void {
+  const fd = fs.openSync(dir, 'r');
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+const cannotWrite = (error: unknown) => ['EACCES', 'EPERM', 'EROFS'].includes((error as NodeJS.ErrnoException)?.code ?? '');
 
 export class Vault {
   private keyPath: string;
   private dbPath: string;
   private key: Buffer;
   private entriesPath: string;
+  private canaryPath: string;
+  /** Recorded in the authenticated canary: unbound ciphertext is refused. */
+  private bound = false;
+  private quarantined: QuarantinedEntry[] = [];
+  private reported = new Set<string>();
 
   constructor(dir: string) {
     // The vault holds encrypted secrets and its key; keep the directory private
@@ -33,34 +59,61 @@ export class Vault {
     this.key = this.loadOrCreateKey();
     this.entriesPath = path.join(dir, 'entries');
     fs.mkdirSync(this.entriesPath, { recursive: true, mode: 0o700 });
-    this.checkCanary(path.join(dir, 'vault.canary'));
+    this.canaryPath = path.join(dir, 'vault.canary');
+    this.checkCanary();
+  }
+
+  private mismatch(detail = ''): Error {
+    return new Error(`the vault key does not open this vault${detail}: KARMAX_VAULT_KEY (or vault.key) `
+      + 'differs from the key it was created with; restore the original key');
   }
 
   /**
    * A known ciphertext under the vault key (AU-27). A wrong `KARMAX_VAULT_KEY`
    * otherwise surfaces only as per-entry authentication failures, while every
    * new secret is quietly written under the wrong key, splitting the vault in
-   * two. A vault from before the canary is checked against one of its own
-   * entries before one is recorded.
+   * two. The canary also records, authenticated, whether the vault is bound,
+   * so deleting a file cannot make it accept unbound ciphertext again.
+   *
+   * Only a well-formed canary that fails authentication refuses the key. A
+   * missing one (a vault from before the canary) or a damaged one (a crash, a
+   * bad disk) is re-derived from the entries: the key must open most of them,
+   * so a key that wrote only a few entries of a split vault is not recorded.
    */
-  private checkCanary(file: string): void {
-    const mismatch = () => new Error('the vault key does not open this vault: KARMAX_VAULT_KEY (or vault.key) '
-      + 'differs from the key it was created with; restore the original key');
-    if (fs.existsSync(file)) {
-      try { if (this.decrypt(fs.readFileSync(file, 'utf8'), CANARY_HANDLE) === CANARY) return; } catch {}
-      throw mismatch();
+  private checkCanary(): void {
+    const recorded = this.readCanary();
+    if (recorded !== undefined) { this.bound = recorded; return; }
+    let opened = 0, refused = 0, bound = false;
+    for (const handle of this.list()) {
+      let blob: string | undefined;
+      try { blob = this.readEntry(handle); } catch { continue; }
+      if (blob === undefined) continue;
+      try { this.decrypt(blob, handle); opened++; bound ||= blob.startsWith('v2.'); } catch { refused++; }
     }
-    // One entry that opens proves the key; one damaged entry must not refuse the rest.
-    const handles = this.list();
-    if (handles.length && !handles.some(handle => {
-      try { this.decrypt(this.readEntry(handle)!, handle); return true; } catch { return false; }
-    })) throw mismatch();
-    const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(temporary, this.encrypt(CANARY, CANARY_HANDLE), { mode: 0o600, flag: 'wx' });
-    try {
-      try { fs.linkSync(temporary, file); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-    } finally { fs.unlinkSync(temporary); }
+    if (refused && opened <= refused) throw this.mismatch(` (it opens ${opened} of ${opened + refused} entries)`);
+    // Bound entries mean this vault was bound; its canary was lost, not absent.
+    this.bound = bound;
+    this.writeCanary();
+  }
+
+  /** The recorded bound state, or undefined when there is no usable canary. */
+  private readCanary(): boolean | undefined {
+    let blob: unknown;
+    try { blob = JSON.parse(fs.readFileSync(this.canaryPath, 'utf8')).blob; } catch { return undefined; }
+    const parts = typeof blob === 'string' ? blob.split('.') : [];
+    if (parts.length !== 4 || parts[0] !== 'v2' || Buffer.from(parts[1]!, 'base64').length !== 12
+      || Buffer.from(parts[2]!, 'base64').length !== 16) return undefined;
+    let state: { canary?: string; bound?: unknown };
+    try { state = JSON.parse(this.decrypt(blob as string, CANARY_HANDLE)); } catch { throw this.mismatch(); }
+    if (state?.canary !== CANARY) throw this.mismatch();
+    return state.bound === true;
+  }
+
+  /** Best effort: a vault opened read-only (a restore drill) is checked, not recorded. */
+  private writeCanary(): void {
+    const blob = this.encrypt(JSON.stringify({ canary: CANARY, bound: this.bound }), CANARY_HANDLE);
+    try { writeDurably(this.canaryPath, `${JSON.stringify({ format: CANARY, blob })}\n`); }
+    catch (error) { if (!cannotWrite(error)) throw error; }
   }
 
   /**
@@ -111,14 +164,10 @@ export class Vault {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`vault ${this.dbPath} is not a secret map; restore it from a backup`);
     return parsed as Record<string, string>;
   }
-  /** Write-to-temp + rename so a crash mid-write can never leave a truncated
-   *  vault behind; the mode is applied explicitly because `writeFileSync`'s
-   *  `mode` only affects a file it creates. */
+  /** Write-to-temp + fsync + rename so a crash mid-write can never leave a
+   *  truncated vault behind. */
   private writeDb(db: Record<string, string>) {
-    const tmp = `${this.dbPath}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(db), { mode: 0o600 });
-    fs.chmodSync(tmp, 0o600);
-    fs.renameSync(tmp, this.dbPath);
+    writeDurably(this.dbPath, JSON.stringify(db));
   }
 
   /** `v2.` ciphertext authenticates its handle as additional data (AU-27), so
@@ -137,7 +186,7 @@ export class Vault {
     const parts = typeof blob === 'string' ? blob.split('.') : [];
     const bound = parts[0] === 'v2';
     if (bound) parts.shift();
-    else if (fs.existsSync(path.join(this.entriesPath, '.bound')))
+    else if (this.bound)
       throw new Error(`vault entry for ${handle} is not bound to its handle; restore it from a backup`);
     const iv = parts.length === 3 ? Buffer.from(parts[0]!, 'base64') : Buffer.alloc(0);
     const tag = parts.length === 3 ? Buffer.from(parts[1]!, 'base64') : Buffer.alloc(0);
@@ -159,9 +208,11 @@ export class Vault {
   private readEntry(handle: string): string | undefined {
     const file = this.entryPath(handle);
     if (fs.existsSync(file)) {
-      const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (entry.handle !== handle || typeof entry.blob !== 'string') throw new Error('vault entry is corrupt');
-      return entry.blob;
+      let entry: { handle?: unknown; blob?: unknown };
+      try { entry = JSON.parse(fs.readFileSync(file, 'utf8')); }
+      catch { throw new Error(`vault entry for ${handle} is unreadable; restore it from a backup`); }
+      if (entry?.handle !== handle || typeof entry.blob !== 'string') throw new Error('vault entry is corrupt');
+      return entry.blob as string;
     }
     if (fs.existsSync(path.join(this.entriesPath, '.migrated'))) return undefined;
     return this.readDb()[handle];
@@ -177,10 +228,7 @@ export class Vault {
   }
 
   private writeEntry(handle: string, blob: string, previous: string[] = []): void {
-    const file = this.entryPath(handle);
-    const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ handle, blob, ...(previous.length ? { previous } : {}) }), { mode: 0o600, flag: 'wx' });
-    fs.renameSync(tmp, file);
+    writeDurably(this.entryPath(handle), JSON.stringify({ handle, blob, ...(previous.length ? { previous } : {}) }));
   }
 
   private validateSecret(secret: string): void {
@@ -196,35 +244,109 @@ export class Vault {
         // Publish all entries before retiring the legacy map. A crash retries
         // this migration while readers can still use the original ciphertext.
         for (const [handle, blob] of Object.entries(this.readDb())) {
-          this.decrypt(blob, handle);
+          try { this.decrypt(blob, handle); }
+          catch (error) {
+            // Keep it for recovery, but one damaged secret must not stop the rest.
+            const file = `${crypto.createHash('sha256').update(handle).digest('hex')}.json`;
+            writeDurably(path.join(this.entriesPath, file), JSON.stringify({ handle, blob }));
+            this.quarantine(file, handle, (error as Error).message);
+            continue;
+          }
           this.writeEntry(handle, blob);
         }
         this.writeDb({});
-        fs.writeFileSync(marker, '', { mode: 0o600 });
+        writeDurably(marker, '');
       }
-      const bound = path.join(this.entriesPath, '.bound');
-      if (!fs.existsSync(bound)) {
-        // Re-encrypt every entry and its history under its handle, then stop
-        // accepting unbound ciphertext. Rewriting a bound blob is harmless, so
-        // a crash midway simply redoes the rest.
-        for (const handle of this.list()) {
-          const rebind = (blob: string) => blob.startsWith('v2.') ? blob : this.encrypt(this.decrypt(blob, handle), handle);
-          this.writeEntry(handle, rebind(this.readEntry(handle)!), this.history(handle).map(rebind));
-        }
-        fs.writeFileSync(bound, '', { mode: 0o600 });
-      }
+      if (!this.bound) this.bind();
       return operation();
     } finally { release?.(); }
   }
 
-  /** Bind an existing vault (AU-27) without waiting for its next write. */
-  async migrate(): Promise<void> {
-    await this.mutate(() => {});
+  /**
+   * Re-encrypt every entry and its history under its handle (AU-27), then
+   * record in the canary that unbound ciphertext is no longer accepted. This
+   * is one-way: the previous release cannot read `v2.` entries, so the
+   * unbound ones are first copied to `entries.pre-v2/` (deploy/README.md,
+   * "Rollback compatibility"). An entry that will not open under the proven
+   * key is damaged or foreign; it moves to `entries/quarantine/` instead of
+   * refusing every other secret. Rewriting a bound blob is harmless, so a
+   * crash midway simply redoes the rest.
+   */
+  private bind(): void {
+    // Another process may have bound the vault while this one waited.
+    if (this.readCanary()) { this.bound = true; return; }
+    const aside = path.join(path.dirname(this.entriesPath), PRE_V2);
+    if (!fs.existsSync(aside)) {
+      const staging = `${aside}.${process.pid}.${crypto.randomUUID()}.tmp`;
+      fs.mkdirSync(staging, { mode: 0o700 });
+      for (const file of fs.readdirSync(this.entriesPath).filter(file => ENTRY_FILE.test(file))) {
+        fs.copyFileSync(path.join(this.entriesPath, file), path.join(staging, file));
+        const fd = fs.openSync(path.join(staging, file), 'r');
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      }
+      syncDirectory(staging);
+      fs.renameSync(staging, aside);
+      syncDirectory(path.dirname(aside));
+    }
+    for (const file of fs.readdirSync(this.entriesPath).filter(file => ENTRY_FILE.test(file))) {
+      let entry: { handle: string; blob: string; previous?: unknown };
+      try {
+        entry = JSON.parse(fs.readFileSync(path.join(this.entriesPath, file), 'utf8'));
+        if (typeof entry?.handle !== 'string' || typeof entry.blob !== 'string'
+          || this.entryPath(entry.handle) !== path.join(this.entriesPath, file)) throw new Error('not a vault entry');
+      } catch { this.quarantine(file, undefined, 'unreadable entry file'); continue; }
+      const { handle } = entry;
+      const rebind = (blob: unknown) => {
+        if (typeof blob !== 'string') throw new Error('not a ciphertext');
+        const plain = this.decrypt(blob, handle);
+        return blob.startsWith('v2.') ? blob : this.encrypt(plain, handle);
+      };
+      let current: string;
+      try { current = rebind(entry.blob); }
+      catch (error) { this.quarantine(file, handle, (error as Error).message); continue; }
+      const history = Array.isArray(entry.previous) ? entry.previous : [];
+      const kept = history.flatMap(blob => { try { return [rebind(blob)]; } catch { return []; } });
+      if (kept.length < history.length)
+        this.quarantine(file, handle, `${history.length - kept.length} earlier revision(s) would not open`, true);
+      this.writeEntry(handle, current, kept);
+    }
+    this.bound = true;
+    this.writeCanary();
   }
 
-  async put(handle: string, secret: string): Promise<void> {
+  /** Move an entry aside, or copy it when its current secret survives. */
+  private quarantine(file: string, handle: string | undefined, reason: string, copy = false): void {
+    const dir = path.join(this.entriesPath, 'quarantine');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const target = path.join(dir, `${file}.${Date.now()}.${crypto.randomUUID()}`);
+    if (copy) fs.copyFileSync(path.join(this.entriesPath, file), target);
+    else fs.renameSync(path.join(this.entriesPath, file), target);
+    syncDirectory(dir);
+    syncDirectory(this.entriesPath);
+    this.quarantined.push({ file: path.relative(path.dirname(this.entriesPath), target), ...(handle === undefined ? {} : { handle }), reason });
+    console.error(`[vault] QUARANTINED ${handle === undefined ? file : `the entry for ${handle}`}: ${reason}. `
+      + `It is kept at ${target}; restore it from a backup if it is needed.`);
+  }
+
+  /** Bind an existing vault (AU-27) without waiting for its next write.
+   * Returns what it quarantined, for the audit log. */
+  async migrate(): Promise<{ quarantined: QuarantinedEntry[] }> {
+    await this.mutate(() => {
+      // The pre-binding copy exists for a rollback. Past the backup retention
+      // window it only keeps deleted secrets alive.
+      const aside = path.join(path.dirname(this.entriesPath), PRE_V2);
+      try { if (Date.now() - fs.statSync(aside).mtimeMs > PRE_V2_RETENTION_MS) fs.rmSync(aside, { recursive: true, force: true }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    });
+    return { quarantined: this.quarantined.splice(0) };
+  }
+
+  /** `history: false` replaces the secret and forgets its earlier revisions,
+   * for a value that must not survive in them (a card's CVC, AU-31). */
+  async put(handle: string, secret: string, options: { history?: boolean } = {}): Promise<void> {
     this.validateSecret(secret);
     await this.mutate(() => {
+      if (options.history === false) return this.writeEntry(handle, this.encrypt(secret, handle));
       const prior = this.readEntry(handle);
       if (prior !== undefined && this.decrypt(prior, handle) === secret) return;
       const previous = prior === undefined ? [] : [prior, ...this.history(handle)].slice(0, 5);
@@ -261,8 +383,18 @@ export class Vault {
     return blob === undefined ? undefined : this.decrypt(blob, handle);
   }
   list(): string[] {
-    const handles = fs.readdirSync(this.entriesPath).filter(file => /^[a-f0-9]{64}\.json$/.test(file))
-      .map(file => JSON.parse(fs.readFileSync(path.join(this.entriesPath, file), 'utf8')).handle as string);
+    const handles: string[] = [];
+    for (const file of fs.readdirSync(this.entriesPath).filter(file => ENTRY_FILE.test(file))) {
+      try {
+        const handle = JSON.parse(fs.readFileSync(path.join(this.entriesPath, file), 'utf8')).handle;
+        if (typeof handle !== 'string') throw new Error('no handle');
+        handles.push(handle);
+      } catch {
+        // One damaged file (a power loss mid-write) must not hide every other secret.
+        if (!this.reported.has(file)) console.error(`[vault] skipping unreadable entry ${path.join(this.entriesPath, file)}`);
+        this.reported.add(file);
+      }
+    }
     if (!fs.existsSync(path.join(this.entriesPath, '.migrated'))) handles.push(...Object.keys(this.readDb()));
     return [...new Set(handles)];
   }

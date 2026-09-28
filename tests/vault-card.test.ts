@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -76,9 +76,16 @@ describe('VaultCardProvider — the universal rail', () => {
     const card = await provision();
     (await broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details)));
     (await broker.deleteHandle(cardCvcHandle(card.id)));
-    expect(await separateStoredCardCvcs(broker)).toBe(1);
-    expect(await separateStoredCardCvcs(broker)).toBe(0);
+    const marker = path.join(dir, 'state', 'card-cvc-split.done');
+    expect(await separateStoredCardCvcs(broker, marker)).toBe(1);
+    expect(fs.existsSync(marker)).toBe(true);
+    // Done once: later boots neither list nor parse the vault again.
+    const listed = vi.spyOn(broker, 'listHandles');
+    expect(await separateStoredCardCvcs(broker, marker)).toBe(0);
+    expect(listed).not.toHaveBeenCalled();
     expect(JSON.parse(broker.resolve(cardSecretHandle(card.id), { caps: ['use-credential:*'] }))).not.toHaveProperty('cvc');
+    // …nor in the card secret's history, where `put` keeps earlier revisions.
+    expect(new Vault(dir).reveal(cardSecretHandle(card.id), 1)).toBeUndefined();
     expect(await provider.retrieveCardDetails(card.id)).toMatchObject({ number: '4242424242424242', cvc: '123' });
   });
 

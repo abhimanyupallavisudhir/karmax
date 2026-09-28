@@ -112,3 +112,14 @@ it.each(['build', 'backup'])('keeps the previous deployment when candidate %s fa
   expect(result.operations).not.toContain('up -d');
   expect(result.operations).not.toContain('stop app');
 });
+
+// The vault binding (AU-27), the CVC split (AU-31) and the per-item usage
+// records rewrite data the previous release cannot read. A readiness failure
+// after that first boot must stop, not restart the previous image against it.
+it('puts the one-way vault migration behind its own data epoch', () => {
+  const epoch = Number(fs.readFileSync(new URL('../deploy/data-epoch', import.meta.url), 'utf8').trim());
+  expect(epoch).toBeGreaterThanOrEqual(3);
+  const readme = fs.readFileSync(new URL('../deploy/README.md', import.meta.url), 'utf8');
+  expect(readme).toMatch(/Epoch 3[^]*vault[^]*one-way/);
+  expect(readme).toContain('entries.pre-v2');
+});

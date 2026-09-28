@@ -174,9 +174,11 @@ async function main() {
       : {}),
   }));
   const vault = new Vault(p.vault);
-  await vault.migrate(); // binds ciphertext written before AU-27 to its handle
+  // Binds ciphertext written before AU-27 to its handle; what will not open is quarantined, loudly.
+  for (const entry of (await vault.migrate()).quarantined)
+    (await store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
   const broker = new CredentialBroker(vault);
-  await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker); // AU-31
+  await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker, path.join(p.state, 'migrations', 'card-cvc-split')); // AU-31
   (await import('./autonomy/vault-items.js')).removeLegacyKeyCopies(p.state); // AU-33
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');
   const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
