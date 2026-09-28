@@ -114,7 +114,7 @@ remote target fails setup with an actionable error.
 - `src/coordinators/` — singleton lease coordinators (merge-queue, account, agent-queue, resource-publish).
 - `src/activities/` — the side-effecting work (worlds, agent turns, merges, …).
 - `src/agent/` — provider adapters + the per-turn runtime + prompt assembly.
-- `src/world/` — the world provider interface + worktree/container/memory backends.
+- `src/world/` — the world provider interface + worktree/container/E2B/Daytona/memory backends.
 - `src/platform/` — capabilities, scoped tokens, the `KarmaxApi` service layer, the MCP server.
 - `src/autonomy/` — credential broker + vault, config homes.
 - `src/gateway/` — HTTP/WebSocket gateway (the only thing the UI talks to).
