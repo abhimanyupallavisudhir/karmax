@@ -1334,7 +1334,7 @@ export class GitPassConnector implements CredentialConnector {
           items.push({ ...item, externalId: prefix + item.externalId, label: prefix + item.label,
             folder: prefix ? prefix + (item.folder ?? '') : item.folder });
         }
-      } catch { failures.push({ store: prefix || 'root', error: 'Cannot read repository; check credentials and retry' }); }
+      } catch (error) { failures.push({ store: prefix || 'root', error: gitPassVerificationError(error) }); }
     }
     return { items, failures };
   }
@@ -1355,7 +1355,13 @@ export class GitPassConnector implements CredentialConnector {
       if (!ids.length) continue;
       let pulled: PullResult;
       try { pulled = await connector.pull(ids.map(id => id.slice(prefix.length))); }
-      catch { result.failures.push(...ids.map(externalId => ({ externalId, error: `Store ${prefix || 'root'} is unavailable; check its connection and retry` }))); continue; }
+      catch (error) {
+        // Name the store's own problem (moved, emptied, unreadable key) so its owner
+        // can act; raw Git output stays behind the helper's fixed wording (AU-41).
+        const reason = gitPassVerificationError(error);
+        result.failures.push(...ids.map(externalId => ({ externalId, error: `Store ${prefix || 'root'}: ${reason}` })));
+        continue;
+      }
       result.items.push(...pulled.items.map(item => ({ ...item, externalId: prefix + item.externalId,
         label: prefix + item.label, folder: prefix ? prefix + (item.folder ?? '') : item.folder })));
       result.failures.push(...pulled.failures.map(failure => ({ ...failure, externalId: prefix + failure.externalId })));
