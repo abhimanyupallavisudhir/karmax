@@ -41,11 +41,11 @@ describe('Project settings', () => {
     expect(await ui.page.locator('#project-folder').count()).toBe(0);
     expect(await visible(ui, '#move-project')).toBe(true);
     expect(await visible(ui, '#delete-project')).toBe(false); // no projectDelete authority
-    expect(await ui.page.evaluate(() => {
-      const move = document.getElementById('move-project')!;
-      return [document.getElementById('project-advanced')!.compareDocumentPosition(move) & Node.DOCUMENT_POSITION_FOLLOWING,
-        move.compareDocumentPosition(document.getElementById('project-experimental')!) & Node.DOCUMENT_POSITION_FOLLOWING];
-    })).toEqual([Node_FOLLOWING, Node_FOLLOWING]);
+    expect(await ui.run(`{
+      const move = document.getElementById('move-project');
+      [document.getElementById('project-advanced').compareDocumentPosition(move) & Node.DOCUMENT_POSITION_FOLLOWING,
+        move.compareDocumentPosition(document.getElementById('project-experimental')) & Node.DOCUMENT_POSITION_FOLLOWING];
+    }`)).toEqual([Node_FOLLOWING, Node_FOLLOWING]);
     await ui.page.locator('#project-name').fill('Renamed');
     await ui.page.locator('#rename-project').click();
     await expect.poll(() => ui.calls.filter((call) => call.method === 'PATCH'))
@@ -54,7 +54,7 @@ describe('Project settings', () => {
 
     const organization = await settings({ path: '/org/settings', api: ({ method }) => method === 'PATCH' ? {} : undefined });
     await organization.page.locator('#rename-organization').evaluate((element) =>
-      (element.closest('section.settings-pane') as HTMLElement | null)?.dataset.pane).then((id) => pane(organization, id!));
+      element.closest('section.settings-pane')?.dataset.pane).then((id) => pane(organization, id!));
     await expect.poll(() => visible(organization, '#rename-organization')).toBe(true);
     await organization.page.locator('#organization-name').fill('Renamed organization');
     await organization.page.locator('#rename-organization').click();
@@ -86,7 +86,7 @@ describe('Project settings', () => {
         : route === '/api/projects/w/folder' ? [{ ...projects[1], folder: body.name }] : undefined });
     const edit = ui.page.locator('#rail [data-project-edit="p"]');
     // The edit affordance appears only when the row is hovered or focused.
-    const opacity = () => edit.evaluate((element) => Number(getComputedStyle(element).opacity));
+    const opacity = () => edit.evaluate((element) => Number((globalThis as any).getComputedStyle(element).opacity));
     expect(await opacity()).toBe(0);
     await ui.page.locator('#rail .proj', { has: ui.page.locator('[data-project-edit="p"]') }).hover();
     await expect.poll(opacity).toBeGreaterThan(0);
@@ -128,8 +128,8 @@ describe('Project settings', () => {
       await pane(ui, 'project-advanced');
       await expect.poll(() => visible(ui, '#delete-project')).toBe(true);
       await ui.page.locator('#delete-project').click();
-      await expect.poll(() => ui.page.evaluate(() => location.pathname)).not.toBe('/org/workspace/settings');
-      const landed = await ui.page.evaluate(() => location.pathname);
+      await expect.poll(() => ui.run<string>('location.pathname')).not.toBe('/org/workspace/settings');
+      const landed = await ui.run<string>('location.pathname');
       await ui.close();
       return landed;
     };
@@ -199,9 +199,9 @@ describe('Project settings', () => {
     expect(text).toContain('Base image (optional)');
     expect(await ui.page.locator('#environment-image').getAttribute('list')).toBe('environment-image-options');
     expect(await ui.page.locator('#environment-image-options option').evaluateAll((options) =>
-      options.map((option) => (option as HTMLOptionElement).value))).toContain('python:3.13-slim');
+      options.map((option) => (option as any).value))).toContain('python:3.13-slim');
     const suggestions = (await ui.page.locator('#environment-setup, #environment-boot').evaluateAll((fields) =>
-      fields.map((field) => (field as HTMLTextAreaElement).placeholder))).join('\n');
+      fields.map((field) => (field as any).placeholder))).join('\n');
     expect(suggestions).toContain('uv sync');
     expect(suggestions).toContain('uv run python manage.py migrate');
     await ui.close();
@@ -215,7 +215,7 @@ describe('Project settings', () => {
     const create = ui.page.getByRole('button', { name: 'New repository...' });
     await create.waitFor();
     expect(await save.evaluate((element, other) => element.parentElement === other!.parentElement
-      && !!(element.compareDocumentPosition(other!) & Node.DOCUMENT_POSITION_FOLLOWING), await create.elementHandle())).toBe(true);
+      && !!(element.compareDocumentPosition(other!) & (globalThis as any).Node.DOCUMENT_POSITION_FOLLOWING), await create.elementHandle())).toBe(true);
     await create.click();
     const dialog = ui.page.getByRole('dialog');
     expect(await dialog.getAttribute('aria-modal')).toBe('true');
@@ -223,7 +223,7 @@ describe('Project settings', () => {
     for (const label of ['GitHub account', 'Repository name', 'Description', 'Private repository']) expect(text).toContain(label);
     await ui.page.keyboard.press('Escape');
     await dialog.waitFor({ state: 'detached' });
-    expect(await create.evaluate((element) => element === document.activeElement)).toBe(true);
+    expect(await create.evaluate((element) => element === (globalThis as any).document.activeElement)).toBe(true);
     await ui.close();
   });
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import crypto from 'node:crypto';
-import { BillingRequestRejected, PaddleSubscriptionProvider } from '../src/billing/paddle.js';
+import { BillingRequestRejected, PaddleSubscriptionProvider, type PaddleRuntimeConfig } from '../src/billing/paddle.js';
 import { FakeSubscriptionProvider, SubscriptionBillingService } from '../src/billing/subscriptions.js';
 import { HOSTED_PLANS } from '../src/domain/entitlements.js';
 import { Store } from '../src/store/db.js';
@@ -321,7 +321,7 @@ function paddleApi(routes: Record<string, unknown | ((body: any) => unknown)>) {
     const reply = typeof route === 'function' ? (route as (body: any) => unknown)(init.body && JSON.parse(init.body)) : route;
     return reply instanceof Response ? reply : Response.json({ data: reply });
   });
-  return { fetcher, requests, provider: (overrides: Partial<typeof config> = {}) =>
+  return { fetcher, requests, provider: (overrides: Partial<PaddleRuntimeConfig> = {}) =>
     new PaddleSubscriptionProvider(() => ({ ...config, ...overrides }), fetcher as any) };
 }
 

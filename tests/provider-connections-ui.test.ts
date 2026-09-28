@@ -13,7 +13,7 @@ async function organization(selector: string, api: ApiHandler, hostLocal = true)
     { meta: { hostLocal } }) });
   await ui.run('boot()');
   await ui.page.locator(selector).first().waitFor({ state: 'attached' });
-  const id = await ui.page.locator(selector).first().evaluate((element) => (element.closest('section.settings-pane') as HTMLElement).dataset.pane);
+  const id = await ui.page.locator(selector).first().evaluate((element) => element.closest('section.settings-pane')!.dataset.pane);
   await ui.page.locator(`.settings-nav a[href="#${id}"]`).click();
   return ui;
 }

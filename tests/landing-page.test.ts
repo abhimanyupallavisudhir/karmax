@@ -32,9 +32,9 @@ describe('public landing page', () => {
       const ui = await consolePage({ path, api: signedOut });
       await ui.run('boot()');
       await ui.page.locator('#app > *').first().waitFor();
-      const shown = await ui.page.evaluate(() => document.querySelector('#landing-main') ? 'landing'
+      const shown = await ui.run<string>(`document.querySelector('#landing-main') ? 'landing'
         : document.querySelector('#signup-btn') ? 'signup'
-          : document.querySelector('#login-btn') ? 'login' : document.getElementById('app')!.innerText.slice(0, 80));
+          : document.querySelector('#login-btn') ? 'login' : document.getElementById('app').innerText.slice(0, 80)`);
       await ui.close();
       return shown;
     };
@@ -98,7 +98,7 @@ describe('public landing page', () => {
   it('follows the system theme until the visitor pins one, sharing the console preference', async () => {
     const ui = await landing();
     const { page } = ui;
-    const background = () => page.locator('.landing-page').evaluate((element) => getComputedStyle(element).backgroundColor);
+    const background = () => page.locator('.landing-page').evaluate((element) => (globalThis as any).getComputedStyle(element).backgroundColor);
     const toggle = page.locator('#landing-theme');
     await page.emulateMedia({ colorScheme: 'light' });
     const light = await background();
@@ -108,7 +108,7 @@ describe('public landing page', () => {
     await ui.run('labelLandingTheme(document.getElementById("landing-theme"))');
     expect(await toggle.getAttribute('aria-label')).toBe('Switch to light theme');
     await toggle.click();
-    expect(await page.evaluate(() => [document.documentElement.dataset.theme, localStorage.getItem('karmax-theme')]))
+    expect(await page.evaluate("[document.documentElement.dataset.theme, localStorage.getItem('karmax-theme')]"))
       .toEqual(['light', 'light']);
     expect(await toggle.getAttribute('aria-label')).toBe('Switch to dark theme');
     expect(await background()).toBe(light); // pinned light overrides the dark system theme
@@ -126,10 +126,10 @@ describe('public landing page', () => {
     const top = () => skip.evaluate((element) => element.getBoundingClientRect().bottom);
     expect(await top()).toBeLessThanOrEqual(0); // hidden above the page until focused
     await page.keyboard.press('Tab');
-    expect(await skip.evaluate((element) => element === document.activeElement)).toBe(true);
+    expect(await skip.evaluate((element) => element === (globalThis as any).document.activeElement)).toBe(true);
     await expect.poll(top).toBeGreaterThan(0);
     await page.keyboard.press('Tab');
-    expect(await page.evaluate(() => getComputedStyle(document.activeElement!).outlineStyle)).toBe('solid');
+    expect(await page.evaluate('getComputedStyle(document.activeElement).outlineStyle')).toBe('solid');
 
     const navHeight = () => page.locator('.landing-nav-inner').evaluate((element) => element.getBoundingClientRect().height);
     const wide = await navHeight();
@@ -137,7 +137,7 @@ describe('public landing page', () => {
     expect(await navHeight()).toBe(58);
     expect(wide).not.toBe(58);
 
-    const animation = () => page.locator('.product-task').first().evaluate((element) => getComputedStyle(element).animationName);
+    const animation = () => page.locator('.product-task').first().evaluate((element) => (globalThis as any).getComputedStyle(element).animationName);
     expect(await animation()).not.toBe('none');
     await page.emulateMedia({ reducedMotion: 'reduce' });
     expect(await animation()).toBe('none');

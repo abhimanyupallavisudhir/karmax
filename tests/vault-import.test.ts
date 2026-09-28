@@ -103,7 +103,7 @@ describe('connector import (web)', () => {
     await go.click();
     await expect.poll(() => go.textContent()).toBe('Importing 0/3…');
     // Disabled itself, not only marked busy by the console's generic click feedback.
-    expect(await go.evaluate((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+    expect(await go.evaluate((button) => (button as any).disabled)).toBe(true);
     release();
     // Success closes the panel; the summary reaches the user.
     await expect.poll(() => ui.toasts()).toContain('Imported 3 item(s)');
@@ -118,7 +118,7 @@ describe('connector import (web)', () => {
     const go = ui.page.locator('[data-imp-go]');
     await go.click();
     await expect.poll(() => ui.toasts()).toContain('your GPG key is locked');
-    expect(await go.evaluate((button) => (button as HTMLButtonElement).disabled)).toBe(false);
+    expect(await go.evaluate((button) => (button as any).disabled)).toBe(false);
     expect(await go.textContent()).toBe('Import');
     await ui.close();
   });
@@ -187,7 +187,7 @@ describe('connector import (web)', () => {
     await picks.first().waitFor();
     await importNew.check();
     // Discovering new entries implies keeping every entry, so the choice is taken away.
-    expect(await picks.evaluateAll((boxes) => boxes.map((box) => [(box as HTMLInputElement).checked, (box as HTMLInputElement).disabled])))
+    expect(await picks.evaluateAll((boxes) => boxes.map((box) => [(box as any).checked, (box as any).disabled])))
       .toEqual([[true, true], [true, true], [true, true]]);
     expect([await keep.isChecked(), await keep.isDisabled()]).toEqual([true, true]);
     await importNew.uncheck();

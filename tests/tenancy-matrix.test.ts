@@ -151,7 +151,7 @@ describe.each(storeBackends)('every catalog route refuses another organization\'
             return encodeURIComponent(id ?? `unknown-${param}`);
           });
           const url = new URL(`${base}${concrete}`);
-          for (const key of (rawQuery ?? '').split(/[&|]/).map((value) => value.split('=')[0]).filter(Boolean)) {
+          for (const key of (rawQuery ?? '').split(/[&|]/).map((value: string) => value.split('=')[0]).filter(Boolean)) {
             const id = foreignId(route, key!);
             if (id) targetsForeign = true;
             url.searchParams.set(key!, id ?? 'x');

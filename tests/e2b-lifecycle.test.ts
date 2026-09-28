@@ -24,14 +24,14 @@ function sandbox(id = `sbx-${Math.random().toString(36).slice(2)}`, script: Scri
         return script.run ? script.run(command, options) : { stdout: '', stderr: '', exitCode: 0 };
       }),
     },
-    files: { read: vi.fn(async () => ''), write: vi.fn(async () => undefined) },
+    files: { read: vi.fn(async (_file: string, _options?: any): Promise<any> => ''), write: vi.fn(async () => undefined) },
     pty: { create: vi.fn(async () => ({ pid: 7 })), sendInput: vi.fn(async () => undefined),
       resize: vi.fn(async () => undefined), kill: vi.fn(async () => undefined) } as E2BSandboxLike['pty'],
     pause: vi.fn(async () => undefined),
     kill: vi.fn(async () => undefined),
     updateNetwork: vi.fn(async () => undefined),
   } satisfies E2BSandboxLike;
-  return Object.assign(box, { commands: Object.assign(box.commands, { log: commands }) }) as typeof box & E2BSandboxLike;
+  return Object.assign(box, { commands: Object.assign(box.commands, { log: commands }) });
 }
 
 function factory(created: E2BSandboxLike, overrides: Partial<E2BFactory> = {}) {
@@ -81,7 +81,7 @@ describe('E2B provider lifecycle', () => {
       environment: { flavor: 'desktop' } as any });
     await new E2BWorldProvider(sdk, 1000, 'installation', undefined, 'installation-desktop').create({ taskId: 'd',
       base: 'main', environment: { flavor: 'desktop' } as any });
-    const calls = sdk.create.mock.calls.map(([options]: any[]) => [options.template, options.desktop ?? false]);
+    const calls = vi.mocked(sdk.create).mock.calls.map(([options]: any[]) => [options.template, options.desktop ?? false]);
     expect(calls).toEqual([['task-template', false], ['installation', false], ['org-desktop', true],
       ['installation-desktop', true]]);
   });

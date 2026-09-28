@@ -12,7 +12,7 @@ async function open(path: string, api: ApiHandler = () => undefined, ready = '#r
   await ui.page.locator(ready).first().waitFor({ state: 'attached' });
   return ui;
 }
-const where = (ui: Console) => ui.page.evaluate(() => location.pathname);
+const where = (ui: Console) => ui.run<string>('location.pathname');
 const githubAccounts = { githubApp: { configured: true, oauthConfigured: true, userAuthorized: true },
   accounts: [{ id: 'a1', login: 'octo', active: true, profile: { customIdentity: { userName: 'Octo Cat' } } }] };
 
@@ -68,7 +68,7 @@ describe('personal Git development settings', () => {
       if (method === 'DELETE') { connections = []; return {}; }
       return undefined;
     }, '#org-github .github-account-row');
-    const id = await ui.page.locator('#org-github').evaluate((element) => (element.closest('section.settings-pane') as HTMLElement).dataset.pane);
+    const id = await ui.page.locator('#org-github').evaluate((element) => element.closest('section.settings-pane')!.dataset.pane);
     await ui.page.locator(`.settings-nav a[href="#${id}"]`).click();
     const row = ui.page.locator('#org-github .github-account-row');
     expect(await row.getByRole('link', { name: 'Manage' }).getAttribute('href'))

@@ -357,7 +357,7 @@ describe('Google sign-in when configured', () => {
       await back.run('boot()');
       await expect.poll(() => back.page.locator('#login-err').textContent())
         .toBe('An account already exists for that email address with a password. Sign in with that password instead — social sign-in requires confirming the address first.');
-      expect(await back.page.evaluate(() => `${location.pathname}${location.search}`)).toBe('/login?next=%2Ftasks');
+      expect(await back.run<string>('location.pathname + location.search')).toBe('/login?next=%2Ftasks');
     } finally { await back.close(); }
   });
 });

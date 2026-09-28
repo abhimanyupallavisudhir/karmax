@@ -109,8 +109,8 @@ const card: CardFillDetails = { number: '4242424242424242', cvc: '123', expMonth
 async function fillIn(pages: FakePage[], selectors: CardFillSelectors, details = card, domain = 'shop.example') {
   const browser = await fakeBrowser(pages);
   try {
-    const result = await fillCardInWorld(hostWorld as any, { cdpUrl: browser.url, domain, selectors, details })
-      .then((value) => ({ value }), (error: Error) => ({ error }));
+    const result: { value?: Awaited<ReturnType<typeof fillCardInWorld>>; error?: Error } = await fillCardInWorld(hostWorld as any,
+      { cdpUrl: browser.url, domain, selectors, details }).then((value) => ({ value }), (error: Error) => ({ error }));
     return { ...result, values: pages.map((_page, index) => browser.values(index)), calls: browser.calls };
   } finally {
     await browser.close();

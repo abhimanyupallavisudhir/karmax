@@ -59,7 +59,7 @@ describe('concise settings UI', () => {
     // Even the Advanced section's link waits for the answer.
     const gated = ui.page.locator('[data-settings-access]');
     expect(await gated.count()).toBeGreaterThan(1);
-    expect(await gated.evaluateAll((controls) => controls.every((control) => (control as HTMLElement).hidden))).toBe(true);
+    expect(await gated.evaluateAll((controls) => controls.every((control) => control.hidden))).toBe(true);
     grant();
     await ui.page.locator('.settings-nav a[href="#project-advanced"]').click();
     await expect.poll(() => ui.page.locator('#delete-project').isVisible()).toBe(true);

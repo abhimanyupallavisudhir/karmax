@@ -19,7 +19,7 @@ async function open(path: string, api: ApiHandler = () => undefined, ready = '#r
 /** Open the settings pane holding `selector` the way a person does, from the section navigation. */
 async function pane(ui: Console, selector: string) {
   const id = await ui.page.locator(selector).first().evaluate((element) =>
-    (element.closest('section.settings-pane') as HTMLElement | null)?.dataset.pane);
+    element.closest('section.settings-pane')?.dataset.pane);
   await ui.page.locator(`.settings-nav a[href="#${id}"]`).click();
   await ui.page.locator(selector).first().waitFor();
 }
@@ -145,7 +145,7 @@ describe('GitHub merge authorization UX', () => {
       await ui.run(`document.getElementById('main').innerHTML = overviewTab(${JSON.stringify(view)}) + taskActions(${JSON.stringify(view)})`);
       return {
         heading: await ui.page.locator('#main .section-h').filter({ hasText: /^(Review|Work summary)$/ }).textContent(),
-        buttons: await ui.page.locator('#main .actions button').evaluateAll((buttons) => buttons.map((b) => (b as HTMLElement).dataset.label)),
+        buttons: await ui.page.locator('#main .actions button').evaluateAll((buttons) => buttons.map((b) => b.dataset.label)),
       };
     };
     const confirm = { name: 'confirm', kind: 'signal', label: 'Confirm PR', enabled: true };

@@ -52,7 +52,7 @@ describe('hosted onboarding UI', () => {
       '/org/settings#settings-compute', '/org/settings#settings-payments', '/org/settings#settings-plan']);
     expect(actions[2]![0]).toBe('Manage E2B/Daytona'); // a completed step offers management, not setup
     await guide(ui).locator('.onboarding-step a[href$="#settings-agents"]').click();
-    await expect.poll(() => ui.page.evaluate(() => `${location.pathname}${location.hash}`)).toBe('/org/settings#settings-agents');
+    await expect.poll(() => ui.run<string>('location.pathname + location.hash')).toBe('/org/settings#settings-agents');
     await guide(ui).locator('#onboarding-new-project').click();
     await ui.page.locator('#modal-root .new-project-dialog').waitFor();
     await ui.close();
@@ -124,7 +124,7 @@ describe('hosted onboarding UI', () => {
       const ui = await hosted({ viewport: { width, height: 800 } });
       const box = await guide(ui).evaluate((element) => {
         const rect = element.getBoundingClientRect();
-        return { right: innerWidth - rect.right, width: rect.width };
+        return { right: (globalThis as any).innerWidth - rect.right, width: rect.width };
       });
       await ui.close();
       return box;
