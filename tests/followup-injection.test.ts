@@ -17,12 +17,12 @@ describe('createFollowUpInjector (SDK streaming input)', () => {
     const consumer = (async () => {
       for await (const m of inj.stream) seen.push(m.message.content as string);
     })();
-    // let the initial message flush, then inject two more mid-stream
-    await new Promise((r) => setTimeout(r, 10));
+    // inject two more mid-stream: each after the consumer has read the last
+    await vi.waitFor(() => expect(seen).toEqual(['one']));
     inj.push(toSdkUserMessage('two'));
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.waitFor(() => expect(seen).toEqual(['one', 'two']));
     inj.push(toSdkUserMessage('three'));
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.waitFor(() => expect(seen).toEqual(['one', 'two', 'three']));
     expect(inj.closed).toBe(false);
     (await inj.close());
     await consumer;

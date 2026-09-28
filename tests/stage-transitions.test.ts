@@ -142,7 +142,8 @@ describe('task stage transitions', () => {
     const restore = f.api.moveTaskStage(f.token, f.task.id, 'review');
     // Attach the assertion immediately so the pre-fix rejection is observed.
     const restored = restore.then(value => ({ value }), error => ({ error }));
-    await new Promise(resolve => setTimeout(resolve, 50));
+    // A second look at the still-running run means the restore chose to wait.
+    await vi.waitFor(() => expect(descriptions.length).toBeGreaterThanOrEqual(2));
     expect(start).not.toHaveBeenCalled();
     expect((await f.store.getTask(f.task.id))?.lastView?.status).toBe('cancelled');
     closed = true;

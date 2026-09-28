@@ -360,13 +360,13 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
       args: [],
       env: { ...process.env } as Record<string, string>,
     }));
-    const started = Date.now();
-    const result = await login.connect('claude', 'work', { urlTimeoutMs: 10_000 });
+    // A day-long URL wait cannot elapse inside the test, so the answer can only
+    // come from the spawn failure itself; waiting for the URL would time out.
+    const result = await login.connect('claude', 'work', { urlTimeoutMs: 24 * 60 * 60_000 });
     expect(result).toEqual(expect.objectContaining({
       status: 'failed',
       detail: expect.stringMatching(/^could not launch karmax-missing-login-.*ENOENT/),
     }));
-    expect(Date.now() - started).toBeLessThan(2_000);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 

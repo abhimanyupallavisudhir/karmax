@@ -86,14 +86,26 @@ const card = await new Promise((resolve, reject) => {
 });
 if (!card.number || !card.cvc) throw new Error('card details were not delivered on stdin');
 const cdp = new URL(process.env.KARMAX_CARD_CDP);
-if (cdp.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1'].includes(cdp.hostname))
+const loopback = ['127.0.0.1', 'localhost', '[::1]'];
+if (cdp.protocol !== 'http:' || !loopback.includes(cdp.hostname))
   throw new Error('CDP endpoint must be loopback inside the task world');
 const pages = await fetch(new URL('/json/list', cdp)).then(r => {
   if (!r.ok) throw new Error('browser target discovery failed');
   return r.json();
 });
-const page = pages.find(p => p.type === 'page' && p.webSocketDebuggerUrl);
-if (!page) throw new Error('no browser page target');
+const expected = process.env.KARMAX_CARD_DOMAIN.toLowerCase();
+const merchant = host => host === expected || host.endsWith('.' + expected);
+// The checkout need not be the first tab; pick it the way host-side cdp.ts
+// pickPage does. Its live origin is still verified below.
+const page = pages.find(p => {
+  if (p.type !== 'page' || !p.webSocketDebuggerUrl) return false;
+  try { return merchant(new URL(p.url).hostname.toLowerCase()); } catch { return false; }
+});
+if (!page) throw new Error('no browser page for the reserved merchant');
+// Discovery can name any socket; the card may only go to this world's browser.
+const socket = new URL(page.webSocketDebuggerUrl);
+if (socket.protocol !== 'ws:' || !loopback.includes(socket.hostname))
+  throw new Error('browser page target must be a loopback websocket');
 const ws = new WebSocket(page.webSocketDebuggerUrl);
 await new Promise((resolve, reject) => {
   ws.addEventListener('open', resolve, { once: true });
@@ -117,9 +129,7 @@ const call = (method, params = {}) => new Promise((resolve, reject) => {
 });
 const originResult = await call('Runtime.evaluate', { expression: 'location.origin', returnByValue: true });
 const origin = originResult?.result?.value;
-const host = new URL(origin).hostname.toLowerCase();
-const expected = process.env.KARMAX_CARD_DOMAIN.toLowerCase();
-if (host !== expected && !host.endsWith('.' + expected)) throw new Error('checkout origin does not match reserved merchant');
+if (!merchant(new URL(origin).hostname.toLowerCase())) throw new Error('checkout origin does not match reserved merchant');
 const selectors = JSON.parse(process.env.KARMAX_CARD_SELECTORS);
 const focus = async selector => {
   if (selector === '@tab') {
