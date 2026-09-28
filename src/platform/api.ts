@@ -2905,13 +2905,17 @@ export class KarmaxApi {
     reason: string,
     disposition: 'replace' | 'cancel' | 'discard' = 'replace',
     gracefulTimeoutMs = 30_000,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const handle = (await this.workflowHandle(task.id));
+    // The run this stop acts on is the one its handle names now: `task` may
+    // predate a continue-as-new that moved the pin. Unpinned, the handle
+    // addresses the workflow id's current run.
+    const runId: string | undefined = handle.runId ?? (await withTimeout((async () =>
+      (await handle.describe())?.runId as string | undefined)(), QUERY_TIMEOUT_MS).catch(() => undefined));
     const minor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
     let stoppedGracefully = false;
     if (minor >= 22 && disposition !== 'discard' && typeof (handle as any).result === 'function') {
       if (disposition === 'replace') {
-        const runId = task.params?._workflowRunId;
         (await this.deps.store.kvSet(lifecycleReplacementKey(task.id), JSON.stringify({
           ...(typeof runId === 'string' && runId ? { runId } : {}),
           requestedAt: Date.now(),
@@ -2973,6 +2977,7 @@ export class KarmaxApi {
       }));
     }
     await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
+    return runId;
   }
 
   /** Setup can be terminated before a WorldHandle containing `worldLeaseId` is
@@ -3112,11 +3117,10 @@ export class KarmaxApi {
         // Stop the run as a replacement, not a cancellation: cancellation
         // cleanup closes open pull requests, silently dropping work the person
         // just declared done (task #395). No successor run follows.
-        await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
+        const runId = await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
         (await this.deps.store.kvDelete(lifecycleReplacementKey(task.id)));
         // No successor run will supersede the stopped one's late publications.
-        const runId = task.params._workflowRunId;
-        if (typeof runId === 'string' && runId) (await this.deps.store.retireViewRun(task.id, runId));
+        if (runId) (await this.deps.store.retireViewRun(task.id, runId));
       }
       if (task.params.draft) (await this.deps.store.clearDraft(taskId));
       // WF-32: `view` predates the stop. The stored view is newer for its PRs:

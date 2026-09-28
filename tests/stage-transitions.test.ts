@@ -617,6 +617,32 @@ describe('task stage transitions', () => {
     expect((await f.store.getTask(f.task.id))?.lastView).toMatchObject(expected);
   });
 
+  // WF-3/WF-4: continue-as-new moves the run pin, so a stop must name the run
+  // it actually signals, not the one an earlier read of the task named.
+  it('marks and retires the run a Done stops, read when it stops', async () => {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, '1.26.0'));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'run-1' }));
+    f.setGracefulResult(async () => ({}));
+    const api = f.api as any;
+    const checkpoint = api.transitionCheckpoint.bind(api);
+    vi.spyOn(api, 'transitionCheckpoint').mockImplementation(async (...args: unknown[]) => {
+      // The run continues as new while the Done is being prepared.
+      (await f.store.swapTaskRun(f.task.id, 'run-1', 'run-2'));
+      return checkpoint(...args);
+    });
+    const markers: string[] = [];
+    const kvSet = f.store.kvSet.bind(f.store);
+    vi.spyOn(f.store, 'kvSet').mockImplementation(async (key, value) => {
+      if (key.startsWith('task-lifecycle-replacement:')) markers.push(value);
+      return kvSet(key, value);
+    });
+    await f.api.moveTaskStage(f.token, f.task.id, 'done');
+    expect(f.signalled).toContainEqual(expect.objectContaining({ signal: 'prepareLifecycleReplacement', runId: 'run-2' }));
+    expect(markers.map((marker) => JSON.parse(marker).runId)).toEqual(['run-2']);
+    expect(JSON.parse((await f.store.kvGet(`view-order:${f.task.id}`))!).retired).toEqual(['run-2']);
+  });
+
   it('tells the parent when a person marks its sub-task done', async () => {
     const f = (await fixture());
     const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
