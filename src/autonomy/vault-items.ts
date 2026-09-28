@@ -131,6 +131,9 @@ export interface VaultItemStore {
   vaultUsageHistory?(itemIds: string[], now: number): (Record<string, VaultUsage>) | Promise<Record<string, VaultUsage>>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
+  kvDelete?(k: string): (void) | Promise<void>;
+  /** One range read of every key under a prefix; stores without it are read per key. */
+  kvEntries?(prefix: string): Promise<Array<{ key: string; value: string }>>;
   appendAudit(entry: { principalId: string; action: string; scopeKey?: string; detail?: Record<string, unknown> }): (number) | Promise<number>;
 }
 
@@ -140,6 +143,10 @@ export interface VaultItemStore {
 // no org qualifier.
 const kvItems = (org: string) => `vault:items:${org}`;
 const kvRequests = (org: string) => `vault:requests:${org}`;
+/** Access statistics live beside the index, one key per item: bumping them on
+ *  every access used to rewrite the whole organization index (AU-25). */
+export const kvUsagePrefix = (org: string) => `vault:usage:${org}:`;
+type ItemUsage = Pick<VaultItem, 'useCount' | 'frecencyScore' | 'frecencyUpdatedAt' | 'lastUsedAt'>;
 
 /** A damaged index must never read as empty: the next write would replace
  *  every entry with just the new one (AU-28). Fail closed; the stored bytes
@@ -253,6 +260,15 @@ export class VaultItems {
         });
       }
       (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items)));
+    }
+    const prefix = kvUsagePrefix(this.organizationId);
+    const usage = this.store.kvEntries ? await this.store.kvEntries(prefix)
+      : (await Promise.all(items.map(async (item) => ({ key: prefix + item.id, value: await this.store.kvGet(prefix + item.id) }))))
+        .filter((row): row is { key: string; value: string } => row.value !== undefined);
+    const byId = new Map(items.map((item) => [item.id, item]));
+    for (const { key, value } of usage) {
+      const item = byId.get(key.slice(prefix.length));
+      if (item) Object.assign(item, JSON.parse(value) as ItemUsage);
     }
     return items;
 
@@ -429,6 +445,7 @@ export class VaultItems {
     for (const field of item?.fields ?? []) (await this.broker?.deleteHandle(itemHandle(id, field)));
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
     (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.list()).filter((i) => i.id !== id))));
+    (await this.store.kvDelete?.(kvUsagePrefix(this.organizationId) + id));
 
     });
   }
@@ -578,23 +595,27 @@ export class VaultItems {
     if (!item.fields.includes(field)) throw new Error(`item "${item.label}" has no ${field}`);
     const handle = itemHandle(item.id, field);
     const secret = this.requireBroker().resolve(handle, { taskId: ctx.taskId, caps: [`use-credential:${handle}`] });
-    // Migrate history before appending this access so it is counted only once.
-    const items = (await this.list());
+    // Read fresh usage: callers may reuse an item across several fields. An item
+    // without its own usage key yet reads the index, which also migrates legacy
+    // history before this access is audited, so it is counted only once.
+    const usageKey = kvUsagePrefix(this.organizationId) + item.id;
+    const stored = (await this.store.kvGet(usageKey));
+    const current: ItemUsage | undefined = stored ? JSON.parse(stored) : (await this.list()).find((candidate) => candidate.id === item.id);
     (await this.store.appendAudit({
       principalId: ctx.principal ?? (ctx.taskId ? `task:${ctx.taskId}` : 'system'),
       action: ctx.mode === 'reveal' ? 'vault.revealed' : 'vault.used',
       detail: { itemId: item.id, label: item.label, field, ...(ctx.taskId ? { taskId: ctx.taskId } : {}) },
     }));
-    // Read fresh metadata: callers may reuse an item across several fields.
     // Usage must not move updatedAt, which connector sync uses for edits.
-    const current = items.find((candidate) => candidate.id === item.id);
     if (current) {
       const now = Date.now();
-      current.useCount = (current.useCount ?? 0) + 1;
-      current.frecencyScore = decayVaultUsage(current.frecencyScore ?? 0, current.frecencyUpdatedAt ?? now, now) + 1;
-      current.frecencyUpdatedAt = now;
-      current.lastUsedAt = now;
-      (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items)));
+      const usage: ItemUsage = {
+        useCount: (current.useCount ?? 0) + 1,
+        frecencyScore: decayVaultUsage(current.frecencyScore ?? 0, current.frecencyUpdatedAt ?? now, now) + 1,
+        frecencyUpdatedAt: now,
+        lastUsedAt: now,
+      };
+      (await this.store.kvSet(usageKey, JSON.stringify(usage)));
     }
     return secret;
 

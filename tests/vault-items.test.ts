@@ -136,6 +136,30 @@ describe('vault usage frequency', () => {
   });
 });
 
+describe('vault usage writes (AU-25)', () => {
+  it('records an access without rewriting the organization item index', async () => {
+    const store = (await Store.create(':memory:'));
+    try {
+      const { broker, dir } = makeService();
+      const items = new VaultItems(store, broker, dir, 'org_usage');
+      for (let i = 0; i < 200; i++) (await items.save({ type: 'login', label: `Login ${i}`, username: `user${i}@example.com`,
+        domains: [`site-${i}.example.com`], tags: ['team'], secrets: { password: `secret-${i}` } }));
+      const target = (await items.list())[123]!;
+      const writes: Array<{ key: string; bytes: number }> = [];
+      const kvSet = store.kvSet.bind(store);
+      vi.spyOn(store, 'kvSet').mockImplementation(async (key, value) => { writes.push({ key, bytes: value.length }); return kvSet(key, value); });
+      (await items.resolveField(target, 'password', { mode: 'use' }));
+      (await items.resolveField(target, 'password', { mode: 'use' }));
+      expect(writes.map((write) => write.key)).toEqual([`vault:usage:org_usage:${target.id}`, `vault:usage:org_usage:${target.id}`]);
+      expect(Math.max(...writes.map((write) => write.bytes))).toBeLessThan(200);
+      expect((await items.get(target.id))).toMatchObject({ useCount: 2, updatedAt: target.updatedAt });
+      expect((await new VaultItems(store, broker, dir, 'org_usage').get(target.id))?.useCount).toBe(2);
+      (await items.delete(target.id));
+      expect((await store.kvGet(`vault:usage:org_usage:${target.id}`))).toBeUndefined();
+    } finally { (await store.close()); }
+  });
+});
+
 describe('vault frecency', () => {
   it('decays previous accesses, adds new ones, and preserves usage through edits', async () => {
     const clock = vi.spyOn(Date, 'now');
