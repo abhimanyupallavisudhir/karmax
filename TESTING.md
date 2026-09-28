@@ -106,6 +106,27 @@ provider credit or write to a GitHub fixture, so ordinary `npm test` never runs 
 KARMAX_RUN_LIVE=1 OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
 ```
 
+### Live tests in GitHub Actions
+
+`.github/workflows/live.yml` runs every suite behind the live gate on demand
+(Actions → Live → Run workflow, optionally one suite), and every Monday once
+the repository variable `KARMAX_LIVE_SCHEDULE` is `true`; until then the
+schedule does nothing. Its jobs use the `live` environment, so its secrets can
+be restricted to master and gated on an approval. A suite whose secret is
+missing is skipped, and the `choose suites` log says why:
+
+| Suite | Secret | Runs |
+| --- | --- | --- |
+| `models` | `LIVE_ANTHROPIC_API_KEY`, `LIVE_OPENAI_API_KEY` (either) | `live-providers` |
+| `agent` | `LIVE_OPENAI_API_KEY` | `live-agent` |
+| `claude` | `LIVE_CLAUDE_CODE_OAUTH_TOKEN` | `claude-permission` |
+| `e2b` | `LIVE_E2B_API_KEY` | `cloud-live` |
+| `daytona` | `LIVE_DAYTONA_API_KEY` | `daytona-live`, `daytona-environment-live` |
+| `github` | `LIVE_GITHUB_TOKEN` (a fixture account; creates `karmax-e2e-tests`) | `github-live` |
+
+`daytona-workflow-live` and the Daytona snapshot build keep their own
+switches and do not run there.
+
 ## Docker test
 
 `tests/container.test.ts` and `tests/services-docker.test.ts` use Docker. An

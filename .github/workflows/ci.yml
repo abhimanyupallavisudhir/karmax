@@ -99,8 +99,6 @@ jobs:
       # Paid live suites remain opt-in. These shards run the Docker suites too.
       KARMAX_TEST_PASS_INTEROP: '1'
       KARMAX_TEST_PASS_BROWSER: '1'
-      TEMPORAL_CLI_VERSION: '1.7.2'
-      TEMPORAL_CLI_LINUX_AMD64_SHA256: 'e2f548af84e820b7d71f25fc6461a4e6a1ab7cdb6a80fde3c375641b0772375b'
       KARMAX_TEST_POSTGRES_URL: postgres://karmax_test:karmax_test@127.0.0.1:5432/karmax_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -134,16 +132,7 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" gopass
           sudo install "$RUNNER_TEMP/gopass" /usr/local/bin/gopass
 
-      # Integration tests boot a real Temporal dev server. src/temporal/dev-server.ts
-      # looks here by default; pinned so a CLI release cannot break the build.
-      - name: Install Temporal CLI
-        run: |
-          mkdir -p ~/.temporalio/bin
-          archive="$RUNNER_TEMP/temporal-cli.tar.gz"
-          curl -fsSL "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/temporal_cli_${TEMPORAL_CLI_VERSION}_linux_amd64.tar.gz" -o "$archive"
-          echo "${TEMPORAL_CLI_LINUX_AMD64_SHA256}  $archive" | sha256sum -c -
-          tar -xzf "$archive" -C ~/.temporalio/bin temporal
-          ~/.temporalio/bin/temporal --version
+      - uses: ./.github/actions/temporal-cli
 
       # The suite covers the current gopass release; the older one needs a
       # single extra run of the interop file, not one per shard.

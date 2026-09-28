@@ -67,8 +67,10 @@ describe('post-push deployment to the public instance', () => {
     for (const step of steps) {
       if (step.uses && !step.uses.startsWith('./')) expect(step.uses).toMatch(/^[\w.-]+\/[^@]+@[0-9a-f]{40}$/);
     }
-    expect(ciSource).toContain('TEMPORAL_CLI_LINUX_AMD64_SHA256');
-    expect(ciSource).toContain('sha256sum -c -');
+    const temporal = fs.readFileSync(path.join(repoRoot, '.github', 'actions', 'temporal-cli', 'action.yml'), 'utf8');
+    expect(temporal).toContain('TEMPORAL_CLI_LINUX_AMD64_SHA256');
+    expect(temporal).toContain('sha256sum -c -');
+    expect(ci.jobs.test.steps.map((step: { uses?: string }) => step.uses)).toContain('./.github/actions/temporal-cli');
   });
 
   it('exists, so a landed commit reaches the VPS without anyone SSHing in by hand', () => {
