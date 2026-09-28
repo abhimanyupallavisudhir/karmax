@@ -6,10 +6,11 @@
 # FROM (default origin/master, the deployed revision) is installed from a
 # scratch clone with its own `deploy/karmax up`, seeded with production-shaped
 # data through its HTTP API (scripts/rehearsal/client.ts) and backed up with its
-# `deploy/karmax backup`. It is then upgraded to TO (default HEAD) with FROM's
-# `deploy/karmax update <sha>`, as production is, and everything is verified
-# through TO's API. Finally the pre-update backup is restored onto a fresh TO
-# stack and verified again. Timings are printed; any failure exits non-zero.
+# `deploy/karmax backup`. It is then upgraded to TO (default HEAD) the way the
+# Deploy workflow upgrades production, with TO's own `deploy/karmax update
+# <sha>`, and everything is verified through TO's API. Finally the pre-update
+# backup is restored onto a fresh TO stack and verified again. Timings are
+# printed; any failure exits non-zero.
 #
 # Nothing reaches production or spends credit: the stack is its own Compose
 # project, agents are the mock, worlds come from a local E2B stand-in
@@ -259,10 +260,36 @@ BACKUP=$WORK/backup
 step 'c. Backup (FROM deploy/karmax backup)' backup.log ./deploy/karmax backup "$BACKUP" || abort
 
 # ---------------------------------------------------------------- d. update
+# As .github/workflows/deploy.yml does on the VPS: the updater that runs is the
+# deployed revision's own deploy/karmax, fetched with `git show`, so a release
+# can repair the updater that deploys it. A revision with deploy/update-runner.sh
+# runs it detached through the runner and is polled until it settles.
+deploy_like_production() {
+  local key status
+  git fetch -q --prune origin '+refs/heads/master:refs/remotes/origin/master'
+  git merge-base --is-ancestor "$DEPLOY_SHA" refs/remotes/origin/master || { echo 'deployment SHA is not on master'; return 1; }
+  git show "$DEPLOY_SHA:deploy/karmax" > ./deploy/.karmax-update && chmod 700 ./deploy/.karmax-update
+  if ! git cat-file -e "$DEPLOY_SHA:deploy/update-runner.sh" 2>/dev/null; then
+    ./deploy/.karmax-update update "$DEPLOY_SHA"; status=$?
+    rm -f ./deploy/.karmax-update; return "$status"
+  fi
+  git show "$DEPLOY_SHA:deploy/update-runner.sh" > ./deploy/.karmax-runner && chmod 700 ./deploy/.karmax-runner
+  key="$(date +%s)-1"
+  ./deploy/.karmax-runner start "$DEPLOY_SHA" "$key" ./deploy/.karmax-update || { rm -f ./deploy/.karmax-*; return 1; }
+  rm -f ./deploy/.karmax-update ./deploy/.karmax-runner
+  until [ -f "deploy/.updates/$key/log" ]; do sleep 1; done
+  tail -n +1 -f "deploy/.updates/$key/log" & local tailer=$! waited=0
+  # The Deploy workflow gives up after 30 minutes of polling; so does this.
+  while [ "$(cat "deploy/.updates/$key/status")" = running ] && [ "$waited" -lt 1800 ]; do sleep 2; waited=$((waited + 2)); done
+  sleep 1; kill "$tailer" 2>/dev/null || true
+  status=$(cat "deploy/.updates/$key/status")
+  echo "update runner status: $status"
+  [ "$status" = success ]
+}
 git -C "$WORK/origin.git" update-ref refs/heads/master "$DEPLOY_SHA"
 watch_app & WATCHER=$!
 update_started=$(date +%s)
-if step "d. Update to TO (deploy/karmax update ${DEPLOY_SHA:0:12})" update.log ./deploy/karmax update "$DEPLOY_SHA"; then
+if step "d. Update to TO (TO's deploy/karmax update ${DEPLOY_SHA:0:12})" update.log deploy_like_production; then
   deployed=$(git -C "$WORK/install" rev-parse HEAD)
   [ "$deployed" = "$DEPLOY_SHA" ] || record FAIL "the install is at $deployed after the update, not $DEPLOY_SHA"
 fi
