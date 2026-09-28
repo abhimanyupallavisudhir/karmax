@@ -11,12 +11,11 @@ export function makeChildActivities(store: Store) {
           waiting: child.lastView?.waitingFor?.kind === 'parent',
           detail: child.lastView?.waitingFor?.detail }));
     },
-    /** Children whose durable view has settled, with the stage they ended in. */
-    async settledChildTasks(parentTaskId: string) {
-      const children = await store.childTasks(parentTaskId);
-      return children.filter((child) => !child.lastView?.state?.lifecycleReplacement
-        && ['done', 'cancelled', 'failed'].includes(child.lastView?.status ?? ''))
-        .map((child) => ({ taskId: child.id, stage: child.lastView!.stage }));
+    /** Which of these children's durable views have settled, and at what stage. */
+    async settledChildTasks(parentTaskId: string, childTaskIds: string[]) {
+      return (await store.childTaskStates(parentTaskId, childTaskIds))
+        .filter((child) => !child.lifecycleReplacement && ['done', 'cancelled', 'failed'].includes(child.status ?? ''))
+        .map((child) => ({ taskId: child.id, stage: child.stage ?? child.status! }));
     },
   };
 }

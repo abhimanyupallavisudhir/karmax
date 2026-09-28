@@ -257,20 +257,28 @@ const MAX_AUTOMATED_LANDING_REPAIRS = 5;
 /** A run continues as new at the top of Do once it has grown by this much since
  * it started (or loaded a predecessor's conversation), so however many turns a
  * task takes its history stays far inside Temporal's 51,200-event / 50 MB
- * limits. That bounds Do, not every wait: on current pins long waits outside
- * Do wake on signals, or on child watchers that poll GitHub and the merge
+ * limits. That bounds turns, not waits: a run continues only when it reaches
+ * the top of Do, so a run parked anywhere, the sub-task barrier inside Do
+ * included, grows until it is woken. Many waits record nothing meanwhile:
+ * they wake on signals, or on child watchers that poll GitHub and the merge
  * queue (githubLandingWatch, mergeQueueWatch) and return only on a change.
- * Older pins still grow without bound while they wait: before v1.21 a GitHub
- * wait polls in the task at up to ten minutes (about 5,000 events a day, the
- * limit in about ten days), and before v1.9 a merge-queue wait polls every
- * 5 s. */
+ * These still poll in the task:
+ * - the sub-task barrier, while it waits on children it holds no handle for,
+ *   rereads them at intervals doubling from an hour to a day;
+ * - a GitHub wait in a state the watcher cannot serve, and every GitHub wait
+ *   before v1.21, backing off to ten minutes: a v1.20 landing pass records
+ *   about 51 events, about 7,300 a day, so the limit in about seven days;
+ * - a merge-queue wait before v1.9, every 5 s. */
 const CONTINUE_AFTER_EVENTS = 4_000;
 const CONTINUE_AFTER_BYTES = 8 * 1024 * 1024;
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
 const MAX_CONTINUATION_BYTES = 1024 * 1024;
 const CONTINUE_RETRY_EVENTS = 500;
-/** How often a parent waiting on children it holds no handle for rereads them. */
-const CHILD_SETTLEMENT_RECHECK = '1 hour';
+/** A parent waiting on children it holds no handle for rereads them after an
+ * hour, then at doubling intervals up to a day: about 11 history events per
+ * reread, so once daily the event limit is over a decade away. */
+const CHILD_SETTLEMENT_RECHECK_MS = 60 * 60 * 1000;
+const CHILD_SETTLEMENT_RECHECK_MAX_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
@@ -2496,7 +2504,12 @@ Inspect the complete current diff and specifically compare its delta from the re
   function trackChild(childTaskId: string, child: ChildWorkflowHandle<typeof softwareDev>) {
     child.result().then(
       (res) => {
-        if (durableChildSettlement && (res as { lifecycleReplacement?: boolean }).lifecycleReplacement) return;
+        if (durableChildSettlement && (res as { lifecycleReplacement?: boolean }).lifecycleReplacement) {
+          // The child goes on in a successor run this handle cannot follow, so
+          // it is reread at the barrier like a restored child.
+          if (patched('software-dev-forget-replaced-child-handle-v1')) childHandles.delete(childTaskId);
+          return;
+        }
         settled.push({ childTaskId, stage: (res as { stage: Stage }).stage });
       },
       (err) => settled.push({ childTaskId, stage: 'failed', detail: describeError(err) }),
@@ -2717,7 +2730,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     for (const append of afterLoad.splice(0)) append();
     // The predecessor learned of a child that failed or was terminated from
     // its handle, which this run lacks; the child's durable view still says.
-    if (outstanding.size) for (const child of await coreChild.settledChildTasks(taskId))
+    if (outstanding.size) for (const child of await coreChild.settledChildTasks(taskId, [...outstanding]))
       if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
     runStart = { events: workflowInfo().historyLength, bytes: workflowInfo().historySize };
   }
@@ -3013,9 +3026,15 @@ Inspect the complete current diff and specifically compare its delta from the re
           && patched('software-dev-child-settlement-recheck-v1')) {
           // A child restored without its handle (after continue-as-new or a
           // replacement) is reported only by a best-effort signal, so its
-          // durable view is read again while the task waits.
-          while (!(await condition(wake, CHILD_SETTLEMENT_RECHECK))) {
-            for (const child of await coreChild.settledChildTasks(taskId))
+          // durable view is read again while the task waits. A wake does not
+          // wait for a read in flight.
+          for (let delay = CHILD_SETTLEMENT_RECHECK_MS; !(await condition(wake, delay));
+            delay = Math.min(delay * 2, CHILD_SETTLEMENT_RECHECK_MAX_MS)) {
+            const scope = new CancellationScope({ cancellable: true });
+            const read = scope.run(() => coreChild.settledChildTasks(taskId, [...outstanding])).catch(() => []);
+            const children = await Promise.race([read, condition(wake).then(() => undefined, () => undefined)]);
+            if (!children) { scope.cancel(); break; }
+            for (const child of children)
               if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
           }
         } else await condition(wake);
@@ -3541,9 +3560,10 @@ Inspect the complete current diff and specifically compare its delta from the re
   let observedPreflight: GitHubMergeAuthorization | undefined;
   let priorPreflight: GitHubMergeAuthorization | undefined;
   // A parent-side poll repeats the whole landing pass. While what it observes
-  // is unchanged, each wait doubles up to ten minutes, so executions the
-  // watcher cannot serve (before v1.21, or an unwatchable state) stop growing
-  // history at a fixed rate (LT-12). A v1.20 webhook still wakes it at once.
+  // is unchanged, each wait doubles up to ten minutes, so polls the watcher
+  // cannot serve grow history more slowly, though still without bound (LT-12):
+  // current pins in states the watcher does not cover, and every pin before
+  // v1.21. A v1.20 webhook still wakes it at once.
   let githubPollStreak = 0;
   let githubPollObservation: string | undefined;
   function githubPollDelay(pollMs: number | string, observation: GitHubMergeAuthorization): number | string {

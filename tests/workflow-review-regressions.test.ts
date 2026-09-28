@@ -625,7 +625,8 @@ it('WF-3/WF-4: a continued parent at the sub-task barrier notices a child whose 
   const { next, full } = await continuedRun();
   next.recovery.continued.subTasks = { ...next.recovery.continued.subTasks, awaitingResponse: [], raises: [] };
   // The child fails after run 2 has started, and the platform's signal is lost.
-  wf.activities.settledChildTasks = vi.fn().mockResolvedValueOnce([]).mockResolvedValue([{ taskId: 'child-1', stage: 'failed' }]);
+  wf.activities.settledChildTasks = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([])
+    .mockResolvedValue([{ taskId: 'child-1', stage: 'failed' }]);
   const turns: any[][] = [];
   wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
     turns.push(full(args));
@@ -633,8 +634,45 @@ it('WF-3/WF-4: a continued parent at the sub-task barrier notices a child whose 
     return { output: 'Waiting for the child', providerCompleted: true, waitForSubtasks: true };
   });
   const waits: unknown[] = [];
-  wf.wait = () => { waits.push(wf.timeout); };
+  // The read races an untimed wake condition, which the harness also reports.
+  wf.wait = () => { if (wf.timeout !== undefined) waits.push(wf.timeout); };
   expect(await softwareDevV1_26(next)).toEqual({ stage: 'cancelled' });
-  expect(waits).toEqual(['1 hour']);
+  // Rereads back off from an hour, doubling up to a day.
+  expect(waits).toEqual([3_600_000, 7_200_000, 14_400_000]);
+  expect(wf.activities.settledChildTasks).toHaveBeenLastCalledWith('task', ['child-1']);
   expect(turns[1]!.at(-1).text).toContain('Sub-task child-1 finished: failed');
+});
+
+it('WF-3/WF-4: a follow-up wakes the sub-task barrier while it rereads its children', async () => {
+  const { next, full } = await continuedRun();
+  next.recovery.continued.subTasks = { ...next.recovery.continued.subTasks, awaitingResponse: [], raises: [] };
+  wf.activities.settledChildTasks = vi.fn().mockResolvedValueOnce([]).mockImplementation(() => {
+    wf.handlers.get('followUp')!({ id: 'u-during-read', role: 'user', text: 'Stop waiting', ts: 0 });
+    return new Promise(() => {});
+  });
+  const turns: any[][] = [];
+  wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+    turns.push(full(args));
+    if (turns.length === 2) wf.handlers.get('cancel')!();
+    return { output: 'Waiting for the child', providerCompleted: true, waitForSubtasks: true };
+  });
+  wf.wait = () => undefined;
+  expect(await softwareDevV1_26(next)).toEqual({ stage: 'cancelled' });
+  expect(turns[1]!.at(-1).text).toBe('Stop waiting');
+});
+
+it('WF-3/WF-4: a child replaced under its parent is reread like a restored one', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child-1' }));
+  // The child's run is replaced: its handle's result is not its settlement.
+  wf.startChild = () => ({ signal: vi.fn(), result: async () => ({ stage: 'cancelled', lifecycleReplacement: true }) });
+  let turns = 0;
+  wf.activities.runAgentTurn.mockImplementation(async () => {
+    if (++turns === 1) return { output: 'Delegating', providerCompleted: true, subTasks: [{ title: 'Child', prompt: 'Part' }] };
+    return { output: 'Waiting', providerCompleted: true, waitForSubtasks: true };
+  });
+  const waits: unknown[] = [];
+  wf.wait = () => { waits.push(wf.timeout); wf.handlers.get('cancel')!(); };
+  expect(await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] } })).toEqual({ stage: 'cancelled' });
+  expect(waits[0]).toBe(3_600_000);
 });

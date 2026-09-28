@@ -3742,6 +3742,18 @@ export class Store {
       .map(rowToTask);
   }
 
+  /** The status of some of a parent's children, without their conversations. */
+  async childTaskStates(parentTaskId: string, childTaskIds: string[]): Promise<
+    { id: string; status?: string; stage?: string; lifecycleReplacement: boolean }[]> {
+    if (!childTaskIds.length) return [];
+    const rows = (await this.db.prepare(`SELECT id, json_extract(lastView, '$.status') status,
+        json_extract(lastView, '$.stage') stage, json_extract(lastView, '$.state.lifecycleReplacement') replaced
+      FROM tasks WHERE parentTaskId = ? AND id IN (${childTaskIds.map(() => '?').join(', ')})`)
+      .all(parentTaskId, ...childTaskIds)) as { id: string; status?: string | null; stage?: string | null; replaced?: unknown }[];
+    return rows.map((row) => ({ id: row.id, status: row.status ?? undefined, stage: row.stage ?? undefined,
+      lifecycleReplacement: row.replaced === true || row.replaced === 1 || row.replaced === 'true' }));
+  }
+
   async childTasks(parentTaskId: string): Promise<TaskRecord[]> {
     const tasks = (
       (await this.db.prepare('SELECT * FROM tasks WHERE parentTaskId = ? ORDER BY createdAt').all(parentTaskId)) as any[]
