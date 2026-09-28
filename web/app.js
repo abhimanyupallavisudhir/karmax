@@ -3618,7 +3618,6 @@ function brandMark() {
 async function refreshOnboarding() {
   const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   const userId = S.user?.id;
-  const pageEpoch = S.routeEpoch;
   const organizationId = S.organizationId;
   if (!S.meta?.hosted || !organizationId || !S.user) {
     S.onboarding = null;
@@ -3629,7 +3628,7 @@ async function refreshOnboarding() {
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`);
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
-    acceptOnboardingStatus(status, pageEpoch);
+    acceptOnboardingStatus(status);
   } catch {
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
     // Keep the last known guide and retry even when the first request failed.
@@ -3640,12 +3639,14 @@ async function refreshOnboarding() {
   renderOnboarding();
 }
 
-// Completion feedback belongs only to the page that observed the transition.
-// It is deliberately absent from both the saved preference and browser storage.
-function acceptOnboardingStatus(status, pageEpoch) {
+// Completion feedback lasts until the next navigation (applyRoute) and is
+// deliberately absent from both the saved preference and browser storage. The
+// step that finishes setup may itself navigate (a new project opens), so a
+// response that lands on the next page still confirms it.
+function acceptOnboardingStatus(status) {
   const previous = S.onboarding;
   if (status.complete && previous?.visible && !previous.complete
-    && previous.organizationId === status.organizationId && pageEpoch === S.routeEpoch) {
+    && previous.organizationId === status.organizationId) {
     S.onboardingCompletion = { organizationId: status.organizationId, userId: S.user?.id };
   } else if (!status.complete) {
     S.onboardingCompletion = null;
@@ -3662,14 +3663,13 @@ async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
   const organizationId = S.organizationId;
   const userId = S.user?.id;
-  const pageEpoch = S.routeEpoch;
   const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`, {
       method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
-    acceptOnboardingStatus(status, pageEpoch);
+    acceptOnboardingStatus(status);
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
 }
@@ -3755,6 +3755,9 @@ function renderOnboarding() {
     <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
+  // A step's link opens the settings that step needs, which the expanded card
+  // would then cover; tuck it into its progress pill while the person works.
+  host.querySelectorAll('.onboarding-step a[data-spa]').forEach((link) => link.addEventListener('click', () => setOnboardingDisplay('minimized')));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-close')?.addEventListener('click', () => setOnboardingDisplay('closed'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
@@ -19172,7 +19175,9 @@ function renderLogin() {
       location.href = result.url;
     } catch (error) { $('#login-err').textContent = error.message; }
   });
-  $('#signup-open').addEventListener('click', () => openPublicAuth('/signup', renderSignup));
+  // An invitee stays on the invitation link: boot() accepts it once the account
+  // exists, and /signup would drop its token.
+  $('#signup-open').addEventListener('click', () => S.pendingInvite ? renderSignup() : openPublicAuth('/signup', renderSignup));
   $('#forgot-open')?.addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
@@ -19305,7 +19310,7 @@ function renderSignup() {
   $('#signup-btn').addEventListener('click', go);
   wireSocialBtn('signup-google-btn', 'google', '#signup-err', true);
   wireSocialBtn('signup-github-btn', 'github', '#signup-err', true);
-  $('#signup-back').addEventListener('click', () => openPublicAuth('/login', renderLogin));
+  $('#signup-back').addEventListener('click', () => S.pendingInvite ? renderLogin() : openPublicAuth('/login', renderLogin));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 

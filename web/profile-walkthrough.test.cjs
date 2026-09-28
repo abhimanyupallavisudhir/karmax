@@ -59,7 +59,7 @@ test('ordinary users can restart their own walkthrough and immediately refresh i
 });
 
 function onboardingContext() {
-  const host = { hidden: false, innerHTML: '' };
+  const host = { hidden: false, innerHTML: '', querySelectorAll: () => [] };
   let timer;
   const ctx = vm.createContext({
     S: { meta: { hosted: true }, organizationId: 'org1', user: { id: 'user1' } },
@@ -172,7 +172,9 @@ test('navigation removes completion feedback and returning does not restore it',
   assert.equal(host.hidden, true);
 });
 
-test('a completion response from the previous page cannot display a notice after navigation', async () => {
+// Creating the first project finishes setup and then opens that project: the
+// write's own refresh is still in flight when the console navigates.
+test('setup finished by an action that then navigates still says so on the new page', async () => {
   const { ctx, host } = onboardingContext();
   unfinishedOnboarding(ctx);
   let resolve;
@@ -181,6 +183,10 @@ test('a completion response from the previous page cannot display a notice after
   beginNavigation(ctx);
   resolve(finishedOnboarding);
   await pending;
+  assert.equal(host.hidden, false);
+  assert.match(host.innerHTML, /Setup complete/);
+  // The next navigation still removes it for good.
+  beginNavigation(ctx);
   assert.equal(host.hidden, true);
 });
 
@@ -215,4 +221,28 @@ test('the header minus minimizes and the header close hides the guide', async ()
     assert.equal(host.hidden, display === 'closed');
     if (display === 'minimized') assert.match(host.innerHTML, /Finish setup/);
   }
+});
+
+test('a step link tucks the guide away so the settings it opens stay usable', async () => {
+  const { ctx, host } = onboardingContext();
+  unfinishedOnboarding(ctx);
+  ctx.S.onboarding.steps = { github: {}, agentLogin: {}, e2b: {}, optional: {}, project: {} };
+  const links = [];
+  host.querySelectorAll = (selector) => {
+    assert.equal(selector, '.onboarding-step a[data-spa]');
+    return (host.innerHTML.match(/<a class="btn sm" data-spa/g) || []).map(() => {
+      const link = { addEventListener: (_event, fn) => { link.click = fn; } };
+      links.push(link);
+      return link;
+    });
+  };
+  ctx.$ = selector => selector === '#hosted-onboarding' ? host : null;
+  Object.assign(ctx, { siteNameMarkup: () => 'Tavya', globalRoute: () => '/settings', esc: String, newProject: () => {} });
+  vm.runInContext('renderOnboarding()', ctx);
+  assert.equal(links.length, 5);
+  const calls = [];
+  ctx.api = async (...args) => { calls.push(args); return { ...ctx.S.onboarding, display: 'minimized' }; };
+  await links[1].click();
+  assert.deepEqual(JSON.parse(calls[0][1].body), { display: 'minimized', finishReplay: false });
+  assert.match(host.innerHTML, /Finish setup/);
 });
