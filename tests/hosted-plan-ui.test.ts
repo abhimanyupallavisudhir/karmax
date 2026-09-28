@@ -75,7 +75,7 @@ describe('hosted plan organization UI', () => {
     const hydration = extractFunction('hydrateOrganizationView');
     expect(organization).toContain('href="#settings-plan"');
     expect(organization).toContain('id="org-plan"');
-    expect(hydration).toContain('/entitlements');
+    expect(hydration).toContain("read('entitlements')");
     expect(hydration).toContain('organizationPlanMarkup(entitlements)');
   });
 

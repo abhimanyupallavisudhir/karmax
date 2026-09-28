@@ -9,9 +9,9 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
  * connected browsers still observe it. The local bus only wakes the poller to
  * reduce latency; correctness comes from monotonically increasing event.seq.
  */
-type RoutedEvent = { event: KarmaxEvent & { seq?: number }; projectId?: string; bytes: number };
+type RoutedEvent = { event: KarmaxEvent & { seq?: number }; projectId?: string; siblingAttempt?: boolean; bytes: number };
 interface Subscriber {
-  listener: (event: KarmaxEvent & { seq?: number }, projectId?: string) => unknown;
+  listener: (event: KarmaxEvent & { seq?: number }, projectId?: string, siblingAttempt?: boolean) => unknown;
   overflow?: () => void;
   queue: RoutedEvent[];
   bytes: number;
@@ -80,7 +80,7 @@ export class DurableEventFanout {
       const routed = subscriber.queue.shift()!;
       subscriber.bytes -= routed.bytes;
       try {
-        const result = subscriber.listener(routed.event, routed.projectId);
+        const result = subscriber.listener(routed.event, routed.projectId, routed.siblingAttempt);
         if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
           subscriber.running = true;
           void Promise.resolve(result).catch(error => console.error('[fanout] subscriber failed:', error))
@@ -117,11 +117,12 @@ export class DurableEventFanout {
         // it here would skip the middle of bursts larger than one page.
         const rows = await this.store.nextEventsSince(this.cursor, 500);
         if (!rows.length) break;
-        const projects = await this.store.taskProjectIds(rows.map(row => row.taskId));
+        const routes = await this.store.taskEventRoutes(rows.map(row => row.taskId));
         for (const event of rows) {
           if (this.closed) break;
           this.cursor = Math.max(this.cursor, event.seq ?? 0);
-          const routed = { event, projectId: projects.get(event.taskId), bytes: Buffer.byteLength(JSON.stringify(event)) };
+          const route = routes.get(event.taskId);
+          const routed = { event, projectId: route?.projectId, siblingAttempt: route?.siblingAttempt, bytes: Buffer.byteLength(JSON.stringify(event)) };
           for (const subscriber of this.listeners) this.deliver(subscriber, routed);
         }
         if (rows.length < 500) break;
