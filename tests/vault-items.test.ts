@@ -18,6 +18,8 @@ import {
   itemHandle,
   removeTurnKeys,
   removeLegacyKeyCopies,
+  turnKeyDirectory,
+  sweepTurnKeys,
 } from '../src/autonomy/vault-items.js';
 import { fillViaCdp } from '../src/autonomy/fill.js';
 
@@ -394,7 +396,7 @@ describe('spawn-time materialization (§5A)', () => {
     (await items.save({ type: 'api-key', label: 'guarded', envVar: 'GUARDED', policy: { use: 'ask' }, secrets: { secret: 'nope' } }));
 
     // Key files live for one turn, in a directory the turn owns (AU-33).
-    const turn = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-turn-keys-'));
+    const turn = turnKeyDirectory();
     const env = (await items.envFor('t1', caps, turn));
     expect(env.FOO).toBe('bar');
     expect(env.QUOTED).toBe('a b');
@@ -602,4 +604,27 @@ it('rejects blank standalone notes without overwriting a stored note (AU-22)', a
   const item = await items.save({ type: 'note', label: 'Note', secrets: { note: 'retained' } });
   await expect(items.save({ id: item.id, type: 'note', secrets: { note: '  ' } })).rejects.toThrow(/empty/);
   expect(await items.resolveField(item, 'note', { mode: 'reveal' })).toBe('retained');
+});
+
+describe('turn key files after a crash', () => {
+  it('sweeps the directories of dead processes and keeps live turns', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-sweep-'));
+    try {
+      const live = turnKeyDirectory(tmp);
+      fs.writeFileSync(path.join(live, 'key'), 'LIVE');
+      // A pid no process can have: the turn that wrote it crashed.
+      const dead = path.join(tmp, 'karmax-turn-keys-2147483646-abc123');
+      fs.mkdirSync(dead);
+      fs.writeFileSync(path.join(dead, 'key'), 'PLAINTEXT');
+      const unowned = path.join(tmp, 'karmax-turn-keys-abc123');
+      fs.mkdirSync(unowned);
+      const unrelated = path.join(tmp, 'something-else');
+      fs.mkdirSync(unrelated);
+      expect(sweepTurnKeys(tmp)).toBe(2);
+      expect(fs.existsSync(dead)).toBe(false);
+      expect(fs.existsSync(unowned)).toBe(false);
+      expect(fs.readFileSync(path.join(live, 'key'), 'utf8')).toBe('LIVE');
+      expect(fs.existsSync(unrelated)).toBe(true);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
 });

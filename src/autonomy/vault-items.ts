@@ -1,6 +1,7 @@
 import type { World } from '../world/types.js';
 import { decayVaultUsage, type VaultUsage, type VaultSelectionUsage } from '../util/vault-usage.js';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CredentialBroker } from './broker.js';
@@ -233,6 +234,31 @@ export function totpCode(seed: string, nowMs = Date.now(), stepSeconds = 30, dig
 // ── the service ────────────────────────────────────────────────────���─────────
 
 const TURN_KEYS = '.karmax-injection/vault';
+
+const TURN_KEY_PREFIX = 'karmax-turn-keys-';
+
+/** A private host directory for one turn's key files, named by its owner's pid
+ * so a later sweep can tell a crashed turn's plaintext keys from a live one's. */
+export function turnKeyDirectory(tmp = os.tmpdir()): string {
+  return fs.mkdtempSync(path.join(tmp, `${TURN_KEY_PREFIX}${process.pid}-`));
+}
+
+/** Remove the turn key directories whose process is gone (a crash skipped
+ * `removeTurnKeys`). Run at primary and worker start; returns how many. */
+export function sweepTurnKeys(tmp = os.tmpdir()): number {
+  let swept = 0;
+  for (const name of fs.readdirSync(tmp)) {
+    if (!name.startsWith(TURN_KEY_PREFIX)) continue;
+    const pid = Number(/^karmax-turn-keys-(\d+)-/.exec(name)?.[1]);
+    if (pid > 0) {
+      try { process.kill(pid, 0); continue; } // alive (or not ours to signal): a live turn may own it
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'EPERM') continue; }
+    }
+    fs.rmSync(path.join(tmp, name), { recursive: true, force: true });
+    swept++;
+  }
+  return swept;
+}
 
 /** Delete the key files `envFor` wrote for a turn that has ended. */
 export async function removeTurnKeys(keys: World | string): Promise<void> {

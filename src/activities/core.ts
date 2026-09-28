@@ -47,7 +47,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import type { AuthorizationService } from '../platform/authorization.js';
 import { CredentialBroker } from '../autonomy/broker.js';
-import { VaultItems, removeTurnKeys } from '../autonomy/vault-items.js';
+import { VaultItems, removeTurnKeys, turnKeyDirectory } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
@@ -2594,7 +2594,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // turn ends (AU-33).
             // Item resolution is per-organization (the tenant boundary), so bind
             // to the task's org — not the module-level personal-org instance.
-            turnKeys = isRemote(args.worldHandle.kind) ? world : fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-turn-keys-'));
+            turnKeys = isRemote(args.worldHandle.kind) ? world : turnKeyDirectory();
             const vaultEnv = await orgVaultItems.envFor(args.taskId, effective, turnKeys);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
