@@ -91,7 +91,6 @@ async function agentQueueTarget(deps: CoordinatorActivityDeps,
     workflowId: string;
     capacity: number;
     detail?: string;
-    blocked?: boolean;
   }> {
   if (deps.store?.hosted) {
     const durableOrganizationId = item.queueId?.startsWith('agent-queue:')
@@ -110,7 +109,6 @@ async function agentQueueTarget(deps: CoordinatorActivityDeps,
       return {
         workflowId: agentQueueId(organizationId),
         capacity: 0,
-        blocked: true,
         detail: `${entitlements.planName} allows ${limit} organization user${limit === 1 ? '' : 's'}, but this organization has ${entitlements.currentMemberCount}. Remove ${extra} member${extra === 1 ? '' : 's'} or restore Team to start another agent run.`,
       };
     }
@@ -239,7 +237,9 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       provider?: string;
       title?: string;
       projectId?: string;
-    }): Promise<{ granted: boolean; position: number; capacity: number; detail?: string; blocked?: boolean; queueId: string }> {
+    }): Promise<{ granted: boolean; position: number; capacity: number; detail?: string;
+      /** Recorded by historical results only; workflows still read it on replay. */
+      blocked?: boolean; queueId: string }> {
       (await timing(item.taskId, item.turnId, 'queue.slot.requested'));
       const target = (await agentQueueTarget(deps, item));
       await client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
@@ -252,14 +252,12 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signal: SIG_SET_AGENT_CAPACITY,
         signalArgs: [{ capacity: target.capacity }],
       });
-      if (target.blocked) return {
-        granted: false,
-        position: -1,
-        capacity: 0,
-        blocked: true,
-        queueId: target.workflowId,
-        detail: target.detail,
-      };
+      // A blocked plan queues the turn at zero capacity. The entitlement
+      // reconciler restores capacity when membership or billing recovers, and
+      // the queue then grants by signal: waiting records no history, where
+      // returning `blocked` made every task re-request on a 30 s timer (WF-3).
+      // Tasks sleeping in that historical loop join the queue on their next
+      // request without a workflow change.
       const admission = await client.workflow.getHandle(target.workflowId).executeUpdate(UPD_REQUEST_AGENT, {
         args: [item],
       }) as { granted: boolean; position: number; capacity: number };

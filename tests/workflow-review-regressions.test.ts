@@ -315,3 +315,34 @@ it('WF-4: a turn records its new messages, not the whole conversation', async ()
   for (const view of writes.filter((view: any) => view.conversationPatch))
     expect(JSON.stringify(view.conversationPatch).length).toBeLessThan(3_000);
 });
+
+it('WF-3: plan-blocked admission waits for the queue grant, not a timer', async () => {
+  const { Store } = await import('../src/store/db.js');
+  const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
+  const store = (await Store.create(':memory:', { hosted: true }));
+  const organization = (await store.createOrganization({ name: 'Over limit', ownerUserId: 'owner' }));
+  (await store.setOrganizationPlan(organization.id, 'team'));
+  (await store.setOrganizationMembership(organization.id, 'second', 'member'));
+  (await store.setOrganizationPlan(organization.id, 'free'));
+  const project = (await store.createProject('Product', {}, organization.id));
+  const executeUpdate = vi.fn(async () => ({ granted: false, position: 1, capacity: 0 }));
+  const coordinator = makeCoordinatorActivities({ store, taskQueue: 'test', client: { workflow: {
+    signalWithStart: vi.fn(async () => undefined), getHandle: vi.fn(() => ({ executeUpdate, signal: vi.fn() })),
+  } } as any });
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.agentUsesHostCapacity = vi.fn(async () => true);
+  wf.activities.requestAgentSlot = coordinator.requestAgentSlot;
+  const waits: unknown[] = [];
+  wf.wait = () => {
+    waits.push(wf.timeout);
+    const view = wf.handlers.get('view')!();
+    if (wf.activities.runAgentTurn.mock.calls.length) return wf.handlers.get('cancel')!();
+    expect(view.waitingFor).toMatchObject({ kind: 'agentSlot', detail: expect.stringContaining('Free allows 1 organization user') });
+    const { turnId } = (executeUpdate.mock.calls[0] as any)[1].args[0];
+    wf.handlers.get('agentSlotGranted')!({ turnId });
+  };
+  await softwareDevV1_26({ ...input, projectId: project.id, project: { repos: ['/tmp/repo'] } });
+  expect(waits[0]).toBeUndefined();
+  expect(wf.activities.runAgentTurn).toHaveBeenCalledOnce();
+  (await store.close());
+});
