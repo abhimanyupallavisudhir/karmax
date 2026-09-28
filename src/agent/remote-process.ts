@@ -20,6 +20,7 @@ import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 import { exposeRemoteNodeCommand, installRemoteNodeCommand, PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from './remote-node.js';
 import { collectStartupProbe, StartupProtocolTrace } from './startup-diagnostics.js';
+import { isTransportError } from './limits.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
@@ -92,10 +93,12 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   // The bootstrap also stops a previous writer and protects the home, so
   // nothing below lands before either. One prewarmed for this very home,
   // session and history is used once; a failed one is rerun at once, and one
-  // prewarmed for something else is not waited for (the runtime installation
-  // it may still be running is locked in the sandbox).
+  // prewarmed for something else does not delay this one (the runtime
+  // installation it may still be running is locked in the sandbox). It too
+  // stops the home's writer, though, so it must settle before the agent starts.
   const early = bootstraps.get(world);
   const reused = early?.key === request.key ? early!.bootstrap.catch(() => undefined) : undefined;
+  const superseded = early?.key !== undefined && early.key !== request.key ? early.bootstrap.catch(() => undefined) : undefined;
   const own = (async () => (await reused) ?? runBootstrap(world, request))();
   bootstraps.set(world, { bootstrap: own, ...(early?.browser ? { browser: early.browser } : {}) });
   const bootstrap = await timed('bootstrap.prepare', () => own);
@@ -109,6 +112,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
     timed('bootstrap.seed-files', () => mapBatches(files, seed)),
     // A safety net, not a requirement: never fail a turn over it.
     installMemoryGuard(world).catch(() => undefined),
+    superseded && timed('bootstrap.superseded', () => superseded),
     provider !== 'codex'
       // A transcript the sandbox holds already, or has extended, stays as it is.
       ? timed('bootstrap.history', () => mapBatches(history.filter(file => {
@@ -160,7 +164,10 @@ export function prewarmRemoteAgentHome(world: World, provider: Provider, localHo
     bootstrap.catch(() => undefined);
     const entry: WorldBootstrap = { ...(localHome ? { key: request.key } : {}), bootstrap };
     if (browser) {
-      entry.browser = bootstrap.then((prepared) => readyBrowser(runtimeWorld, prepared.runtimeBin, prepared.browser));
+      entry.browser = bootstrap.then((prepared) => readyBrowser(runtimeWorld, prepared.runtimeBin, prepared.browser).catch((error) => {
+        if (error && typeof error === 'object') browserFailures.add(error);
+        throw error;
+      }));
       entry.browser.catch(() => undefined);
     }
     bootstraps.set(runtimeWorld, entry);
@@ -176,6 +183,8 @@ interface WorldBootstrap {
   browser?: Promise<BrowserTools>;
 }
 const bootstraps = new WeakMap<World, WorldBootstrap>();
+/** Browser readiness a prewarm tried and failed: reported, not repeated. */
+const browserFailures = new WeakSet<object>();
 
 const workDirectory = (world: World) => path.posix.join(world.handle.root, '.karmax-injection/work-env');
 
@@ -261,7 +270,25 @@ function syncedCodexHistory(relative: string, history: Array<{ relative: string;
 }
 
 // Exit statuses by which the bootstrap command names the step that failed.
-const BOOTSTRAP_NODE = 64, BOOTSTRAP_EXPOSE = 65, BOOTSTRAP_QUIESCE = 66, BOOTSTRAP_PROTECT = 67;
+const BOOTSTRAP_NODE = 64, BOOTSTRAP_EXPOSE = 65, BOOTSTRAP_QUIESCE = 66, BOOTSTRAP_PROTECT = 67, BOOTSTRAP_LOCKED = 68;
+/** sandboxLock's status when another holder kept the lock past its wait. */
+const LOCK_BUSY = 75;
+
+/** Shell that holds an exclusive sandbox lock on descriptor 9 until the
+ * enclosing (sub)shell ends: one installer at a time, including an abandoned
+ * turn's still-running one. The kernel releases it with its holder, however
+ * that ends. BusyBox flock has no -w, so `timeout` bounds the wait; without
+ * flock the step runs unlocked, as before. */
+function sandboxLock(file: string, seconds: number): string {
+  const wait = Number(process.env.KARMAX_REMOTE_INSTALL_LOCK_SECONDS) || seconds;
+  return [
+    `exec 9>>${quote(file)} || exit 1`,
+    'if command -v flock >/dev/null 2>&1; then',
+    `  if command -v timeout >/dev/null 2>&1; then timeout ${wait} flock 9; else flock 9; fi`,
+    `  case $? in 0) ;; 124|143) exit ${LOCK_BUSY};; *) exit 1;; esac`,
+    'fi',
+  ].join('\n');
+}
 const HISTORY_MARKER = 'KARMAX_HISTORY_INVENTORY ';
 const BROWSER_MARKER = 'KARMAX_BROWSER_PROBE ';
 const SYSTEM_CODEX_CONFIG = 'KARMAX_SYSTEM_CODEX_CONFIG';
@@ -271,7 +298,7 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
   const runtime = remoteNodeRuntime(world);
   const node = path.posix.join(runtime.bin, 'node');
   const command = [
-    `( ${runtime.install} ) || exit ${BOOTSTRAP_NODE}`,
+    `( ${runtime.install} ) || { [ $? = ${LOCK_BUSY} ] && exit ${BOOTSTRAP_LOCKED}; exit ${BOOTSTRAP_NODE}; }`,
     // Login shells reset PATH in /etc/profile. Publish the whole paired toolchain
     // at the standard sandbox location, including on resumed worlds.
     `( ${runtime.expose} ) || exit ${BOOTSTRAP_EXPOSE}`,
@@ -293,6 +320,8 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
   const result = await world.exec('bash', ['-lc', command], { timeoutMs: 5 * 60_000 });
   const detail = result.stderr || result.stdout;
   if (result.code === BOOTSTRAP_NODE) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${detail}`);
+  if (result.code === BOOTSTRAP_LOCKED)
+    throw new Error('the managed runtime is still being installed by another turn in this sandbox; its lock stayed busy');
   if (result.code === BOOTSTRAP_EXPOSE)
     throw new Error(`could not make managed Node/npm the sandbox default (requires writable /usr/local/bin or passwordless sudo): ${detail}`);
   if (result.code === BOOTSTRAP_QUIESCE) throw new CodexHistoryError(`could not stop previous writer: ${detail}`);
@@ -1333,7 +1362,12 @@ function parseBrowserProbe(stdout: string): BrowserProbe | undefined {
 export async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBin?: string): Promise<NonNullable<RemoteAgentHome['browserMcp']>> {
   const entry = bootstraps.get(world.withoutProjectEnvironment?.() ?? world);
   const bin = runtimeBin ?? (await entry?.bootstrap.catch(() => undefined))?.runtimeBin;
-  let tools = await entry?.browser?.catch(() => undefined);
+  // A prewarmed repair that failed is this turn's failure; only a lost
+  // transport, or a bootstrap that never reached the browser, is tried again.
+  let tools = await entry?.browser?.catch((error) => {
+    if (browserFailures.has(error) && !isTransportError(error)) throw error;
+    return undefined;
+  });
   if (!tools) {
     const ready = timed('bootstrap.browser.ready', async () => readyBrowser(world, bin,
       parseBrowserProbe((await world.exec('bash', ['-c', browserProbeCommand(world, bin ? path.posix.join(bin, 'node') : 'node')])).stdout)));
@@ -1369,6 +1403,9 @@ async function repairBrowser(world: World, runtimeBin: string | undefined, probe
   const pathEnv = runtimeBin ? `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
   const bakedRoot = '/opt/karmax/browser';
   const bakedCache = '/opt/karmax/browsers';
+  // One repair at a time per sandbox, including an abandoned turn's still-running one.
+  const locked = sandboxLock(path.posix.join(absolute, '.install.lock'), 540);
+  const busy = () => new Error('remote browser tools are still being installed by another turn in this sandbox; its lock stayed busy');
   const baked = probe ? { code: probe.baked ? 0 : 1 }
     : await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
   if (baked.code === 0) {
@@ -1391,11 +1428,14 @@ async function repairBrowser(world: World, runtimeBin: string | undefined, probe
       `chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}`,
     ];
     const install = await timed('bootstrap.browser.install', () => world.exec('bash', ['-lc', [
-      ...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
-      `mkdir -p ${quote(absolute)} ${quote(browserCache)}`,
-      `npm install --prefix ${quote(absolute)} --no-audit --no-fund --omit=dev ${packages.map(quote).join(' ')}`,
-      `PLAYWRIGHT_BROWSERS_PATH=${quote(browserCache)} ${quote(path.posix.join(bin, 'playwright'))} install chromium`,
-    ].join(' && ')], { timeoutMs: 10 * 60_000 }));
+      `mkdir -p ${quote(absolute)} ${quote(browserCache)} || exit 1`,
+      locked,
+      [...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
+        `npm install --prefix ${quote(absolute)} --no-audit --no-fund --omit=dev ${packages.map(quote).join(' ')}`,
+        `PLAYWRIGHT_BROWSERS_PATH=${quote(browserCache)} ${quote(path.posix.join(bin, 'playwright'))} install chromium`,
+      ].join(' && '),
+    ].join('\n')], { timeoutMs: 10 * 60_000 }));
+    if (install.code === LOCK_BUSY) throw busy();
     if (install.code !== 0) throw new Error(`remote browser installation failed: ${install.stderr || install.stdout}`);
     const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
       cwd: absolute, env: { NODE_PATH: path.posix.join(absolute, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: browserCache,
@@ -1412,15 +1452,18 @@ async function repairBrowser(world: World, runtimeBin: string | undefined, probe
       // passwordless sudo even when browser libraries are absent. Repair that
       // case once; custom locked-down images still fail with an actionable
       // template/image error instead of handing the agent a broken MCP.
+      // Under the same lock: two install-deps would contend for dpkg's.
       const dependencyInstall = await world.exec('bash', ['-lc', [
+        locked,
         ...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
         `installer=${quote(path.posix.join(bin, 'playwright'))}`,
         'if [ "$(id -u)" = 0 ]; then "$installer" install-deps chromium',
         'elif command -v sudo >/dev/null 2>&1; then sudo -n "$installer" install-deps chromium',
         'else exit 126',
         'fi',
-      ].join('; ')], { env: { PLAYWRIGHT_BROWSERS_PATH: browserCache,
+      ].join('\n')], { env: { PLAYWRIGHT_BROWSERS_PATH: browserCache,
         ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 10 * 60_000 });
+      if (dependencyInstall.code === LOCK_BUSY) throw busy();
       const repaired = dependencyInstall.code === 0
         ? await world.exec(nodeCommand, ['-e', "require('playwright').chromium.launch({headless:true,args:['--no-sandbox']}).then(async b=>{await b.close()}).catch(e=>{console.error(e);process.exit(1)})"], {
             cwd: absolute, env: { NODE_PATH: path.posix.join(absolute, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: browserCache,
@@ -1490,18 +1533,16 @@ function remoteNodeRuntime(world: World): { bin: string; install: string; expose
   const bin = path.posix.join(root, 'bin');
   const node = path.posix.join(bin, 'node');
   return { bin, expose: exposeRemoteNodeCommand(bin), install: [
-    `mkdir -p ${quote(bin)}`,
-    // One installer at a time, including an abandoned turn's still-running
-    // bootstrap: two npm installs into one prefix corrupt it. The kernel
-    // releases the lock with its holder, however that ends.
-    `exec 9>>${quote(path.posix.join(root, '.install.lock'))}`,
-    '{ ! command -v flock >/dev/null 2>&1 || flock -w 240 9; }',
-    installRemoteNodeCommand(root, REMOTE_NODE_VERSION, REMOTE_NPM_VERSION),
+    `mkdir -p ${quote(bin)} || exit 1`,
+    // Two npm installs into one prefix corrupt it. The bootstrap's own
+    // timeout is five minutes; leave the installation one of them.
+    sandboxLock(path.posix.join(root, '.install.lock'), 240),
+    [installRemoteNodeCommand(root, REMOTE_NODE_VERSION, REMOTE_NPM_VERSION),
     `ln -sfn ../node_modules/node/bin/node ${quote(node)}`,
     `ln -sfn ../node_modules/npm/bin/npm-cli.js ${quote(path.posix.join(bin, 'npm'))}`,
     `ln -sfn ../node_modules/npm/bin/npx-cli.js ${quote(path.posix.join(bin, 'npx'))}`,
-    `${quote(node)} -e ${quote(acceptable)}`,
-  ].join(' && ') };
+    `${quote(node)} -e ${quote(acceptable)}`].join(' && '),
+  ].join('\n') };
 }
 
 function removeTomlTable(source: string, owned: string): string {

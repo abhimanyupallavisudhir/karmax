@@ -69,7 +69,7 @@ const PRELOADED_PATHS = ['/etc/codex', '/opt/karmax/bin', '/opt/karmax/browser',
  * like a template's /etc/profile; `intercept` may answer a command instead. */
 export function directorySandbox(root: string, meter: SandboxMeter, options: {
   latency?: SandboxLatency; growth?: number; profile?: string;
-  intercept?: (command: string, args: string[]) => ExecResult | Promise<ExecResult> | undefined;
+  intercept?: (command: string, args: string[]) => ExecResult | undefined | Promise<ExecResult | undefined>;
 } = {}): World {
   const latency = options.latency ?? NO_LATENCY;
   fs.mkdirSync(path.join(root, '.usr-local-bin'), { recursive: true });
@@ -108,8 +108,9 @@ for (const name of ['accessSync', 'existsSync', 'statSync', 'readFileSync', 'ope
     async exec(command, args, execOptions = {}) {
       meter.execs.push([command, ...args].join(' '));
       await trip();
-      const intercepted = options.intercept?.(command, args);
-      if (intercepted) return await intercepted;
+      // An intercept may answer, or delay the real command and let it run.
+      const intercepted = await options.intercept?.(command, args);
+      if (intercepted) return intercepted;
       // A shell's script follows its -c flag; every other argument is a plain path or value.
       const result = await runLocalCommand(redirect(command), args.map((arg) => redirect(arg)), {
         cwd: execOptions.cwd ?? root, env: { ...process.env, ...sandboxEnv(execOptions.env) } as NodeJS.ProcessEnv,

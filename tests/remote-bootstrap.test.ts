@@ -4,11 +4,11 @@ import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../src/agent/codex.js';
 import crypto from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { ensureRemoteBrowser, ensureRemoteNode, prewarmRemoteAgentHome, remoteAgentHomeRelative, seedRemoteAgentHome,
   syncRemoteAgentHome } from '../src/agent/remote-process.js';
 import { CodexHistoryError } from '../src/agent/codex-history.js';
-import { KARMAX_TOKEN_FILE } from '../src/autonomy/config-homes.js';
+import { KARMAX_TOKEN_FILE, PLAYWRIGHT_VERSION } from '../src/autonomy/config-homes.js';
 import type { ExecResult } from '../src/world/types.js';
 import { prepareConnections } from '../src/mcp/connections/runtime.js';
 import { directorySandbox, freshCodexHome, newMeter, NO_LATENCY, sandboxRollout, stageBakedBrowser, stageBakedRuntime, stageRemoteRuntime,
@@ -393,7 +393,7 @@ it('starts a Codex turn when the work-environment directory cannot be made', asy
   await fixture.turn();
 });
 
-it('reruns a prewarmed bootstrap that failed, and does not wait for one it cannot use', async () => {
+it('reruns a prewarmed bootstrap that failed, and starts its own beside one it cannot use', async () => {
   const root = temp('karmax-sandbox-'), localHome = temp('karmax-codex-home-');
   stageRemoteRuntime(root);
   let bootstraps = 0;
@@ -402,13 +402,20 @@ it('reruns a prewarmed bootstrap that failed, and does not wait for one it canno
   prewarmRemoteAgentHome(failing, 'codex', localHome);
   await seedRemoteAgentHome(failing, 'codex', localHome);
   expect(bootstraps).toBe(2);
-  // A prewarm for another session is still running; the seed runs its own now.
-  const slow = directorySandbox(root, newMeter(), { intercept: (_command, args) => args.some((arg) => arg.includes('KARMAX_SYSTEM_CODEX_CONFIG'))
-    && args.some((arg) => arg.includes(THREAD)) ? new Promise<ExecResult>((resolve) => setTimeout(() => resolve({ code: 1, stdout: '', stderr: '' }), 3000)) : undefined });
-  prewarmRemoteAgentHome(slow, 'codex', localHome, THREAD);
+  // A prewarm for another session is still running: the seed runs its own
+  // bootstrap now, and returns (so the agent starts) once that one settled.
+  let own = Infinity;
   const started = performance.now();
+  const slow = directorySandbox(root, newMeter(), { intercept: (_command, args) => {
+    if (!args.some((arg) => arg.includes('KARMAX_SYSTEM_CODEX_CONFIG'))) return undefined;
+    if (args.some((arg) => arg.includes(THREAD))) return new Promise<ExecResult>((resolve) => setTimeout(() => resolve({ code: 1, stdout: '', stderr: '' }), 1500));
+    own = performance.now() - started;
+    return undefined;
+  } });
+  prewarmRemoteAgentHome(slow, 'codex', localHome, THREAD);
   await seedRemoteAgentHome(slow, 'codex', localHome);
-  expect(performance.now() - started).toBeLessThan(2000);
+  expect(own).toBeLessThan(1000);
+  expect(performance.now() - started).toBeGreaterThanOrEqual(1500);
 });
 
 it('shares a prewarmed bootstrap with MCP connection preparation', async () => {
@@ -509,4 +516,81 @@ it('LT-22 reuses a verified baked browser without a prewarmed bootstrap, and rep
   expect(verified.execs).toHaveLength(1);
   fs.rmSync(path.join(root, '.opt-karmax/browsers/chromium/chrome'));
   expect(smokes(await turn())).toHaveLength(1);
+});
+
+// Second review round: locks, a superseded prewarm and prewarm failures.
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+it('never lets a superseded prewarm stop the agent the seed prepared for', async () => {
+  const root = temp('karmax-sandbox-'), localHome = temp('karmax-codex-home-');
+  stageRemoteRuntime(root);
+  let release!: () => void;
+  const held = new Promise<undefined>((resolve) => { release = () => resolve(undefined); });
+  // A prewarm for another session is queued by the provider; the seed's own bootstrap is not.
+  const world = directorySandbox(root, newMeter(), { intercept: (_command, args) =>
+    args.some((arg) => arg.includes('KARMAX_SYSTEM_CODEX_CONFIG')) && args.some((arg) => arg.includes(THREAD)) ? held : undefined });
+  prewarmRemoteAgentHome(world, 'codex', localHome, THREAD);
+  setTimeout(release, 400);
+  const home = await seedRemoteAgentHome(world, 'codex', localHome);
+  // The launcher starts the agent and records it, as spawnRemoteAgentProcess does.
+  const agent = spawn('bash', ['-c', 'exec -a codex-app-server sleep 30'], { detached: true, stdio: 'ignore' });
+  try {
+    fs.writeFileSync(path.join(root, home.relative, 'karmax-agent.pid'), `${agent.pid}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(alive(agent.pid!)).toBe(true);
+  } finally { agent.kill('SIGKILL'); }
+});
+
+it('bounds the runtime lock wait with a timeout BusyBox flock accepts, and says when it is busy', async () => {
+  const root = temp('karmax-sandbox-'), localHome = temp('karmax-codex-home-');
+  stageRemoteRuntime(root);
+  // BusyBox flock has no -w.
+  const stubs = temp('karmax-stubs-');
+  fs.writeFileSync(path.join(stubs, 'flock'), `#!/bin/sh\ncase "$1" in -w*) echo 'flock: unrecognized option: w' >&2; exit 1;; esac\nexec ${spawnSync('sh', ['-c', 'command -v flock'], { encoding: 'utf8' }).stdout.trim()} "$@"\n`, { mode: 0o755 });
+  const profile = `export PATH='${stubs}':"$PATH"\n`;
+  await seedRemoteAgentHome(directorySandbox(root, newMeter(), { profile }), 'codex', localHome);
+  // Another turn's bootstrap holds the lock.
+  const lock = path.join(root, '.karmax-injection/agent/tools/node-22.16.0/.install.lock');
+  const holder = spawn('flock', [lock, 'sleep', '30'], { stdio: 'ignore' });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    process.env.KARMAX_REMOTE_INSTALL_LOCK_SECONDS = '1';
+    await expect(seedRemoteAgentHome(directorySandbox(root, newMeter(), { profile }), 'codex', localHome))
+      .rejects.toThrow(/managed runtime is still being installed by another turn/);
+  } finally { holder.kill('SIGKILL'); delete process.env.KARMAX_REMOTE_INSTALL_LOCK_SECONDS; }
+});
+
+it('installs browser tools under a lock, so two turns never repair one sandbox at once', async () => {
+  const root = temp('karmax-sandbox-');
+  stageRemoteRuntime(root);
+  const bin = path.join(root, '.karmax-injection/agent/tools/node-22.16.0/bin');
+  const lock = path.join(root, `.karmax-injection/agent/tools/browser-${PLAYWRIGHT_VERSION}/.install.lock`);
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  const holder = spawn('flock', [lock, 'sleep', '30'], { stdio: 'ignore' });
+  const meter = newMeter();
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    process.env.KARMAX_REMOTE_INSTALL_LOCK_SECONDS = '1';
+    await expect(ensureRemoteBrowser(directorySandbox(root, meter, { intercept: (_command, args) =>
+      args.some((arg) => arg.includes('playwright@')) && !args.some((arg) => arg.includes('flock'))
+        ? { code: 1, stdout: '', stderr: 'unlocked install' } : undefined }), 'playwright', bin))
+      .rejects.toThrow(/browser tools are still being installed by another turn/);
+  } finally { holder.kill('SIGKILL'); delete process.env.KARMAX_REMOTE_INSTALL_LOCK_SECONDS; }
+});
+
+it.each([
+  ['reports a prewarmed browser repair failure instead of repeating it', { code: 1, stdout: '', stderr: 'npm ERR! 404 Not Found' }, 1],
+  ['repeats a prewarmed browser repair that lost its transport', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), 2],
+])('%s', async (_, failure, attempts) => {
+  const root = temp('karmax-sandbox-'), localHome = temp('karmax-codex-home-');
+  stageRemoteRuntime(root);
+  let installs = 0;
+  const world = directorySandbox(root, newMeter(), { intercept: (_command, args) => {
+    if (!args.some((arg) => arg.includes('npm install --prefix') && arg.includes('playwright@'))) return undefined;
+    installs++;
+    return failure instanceof Error && installs === 1 ? Promise.reject(failure) : { code: 1, stdout: '', stderr: 'npm ERR! 404 Not Found' };
+  } });
+  prewarmRemoteAgentHome(world, 'codex', localHome, undefined, BROWSER);
+  await expect(ensureRemoteBrowser(world, 'chrome-devtools')).rejects.toThrow(/remote browser installation failed: npm ERR! 404/);
+  expect(installs).toBe(attempts);
 });
