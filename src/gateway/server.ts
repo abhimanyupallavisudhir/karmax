@@ -1163,6 +1163,10 @@ export class Gateway {
     }
     if (!['/ws', '/ws/terminal', '/ws/review-action'].includes(url.pathname) || !this.sameOriginRequest(req)) return;
     const ticket = url.pathname === '/ws/terminal' ? this.terminalTickets.get(url.searchParams.get('ticket') ?? '') : undefined;
+    // A live ticket admits its person while the session that asked for it is
+    // signed in: signing out any other session revokes its cached token early.
+    if (ticket && ticket.taskId === url.searchParams.get('taskId') && ticket.expiresAt > Date.now() && ticket.session.userId)
+      return await this.sessionLive(ticket.session) ? `user:${ticket.session.userId}` : undefined;
     const auth = ticket && ticket.taskId === url.searchParams.get('taskId') && ticket.expiresAt > Date.now()
       ? ticket.session : await this.socketAuth(req, url);
     if (!auth) return;
@@ -8539,7 +8543,10 @@ export class Gateway {
    * session can sign out, a local password session log out or expire. */
   private async sessionLive(session: Session): Promise<boolean> {
     if (session.identitySessionId && session.userId) return this.deps.tokens.identitySessionLive(session.identitySessionId, session.userId);
-    if ([...this.sessions.values()].includes(session)) return (session.expiresAt ?? Infinity) > Date.now();
+    // Passwordless local mode shares one session with no sign-in to protect:
+    // its 12-hour expiry would only cut a shell off minutes after attaching.
+    if ([...this.sessions.values()].includes(session))
+      return (!this.deps.password && !this.deps.identity) || (session.expiresAt ?? Infinity) > Date.now();
     return !!(await this.deps.tokens.verify(session.apiToken)); // an API token: until it is revoked or expires
   }
 

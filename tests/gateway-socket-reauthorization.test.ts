@@ -272,10 +272,49 @@ describe('a ticket terminal ends with the session that asked for it', () => {
     } finally { await h.close(); }
   });
 
+  // Round 4, item 11: a check that fails to run is not a refusal.
+  it('keeps the shell when the identity lookup fails', async () => {
+    const { h, ws } = await attached({ user: 'dev', userId: 'dev', apiToken: 'unused', identitySessionId: 'browser-session' },
+      (_gateway, harness) => harness.tokens.connectIdentitySessions(async () => { throw new Error('identity store unavailable'); }));
+    try {
+      authorizationChanged();
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      expect(ws.close).not.toHaveBeenCalled();
+    } finally { await h.close(); }
+  });
+
+  // Item 12: passwordless local mode has one shared session and no sign-in to protect.
+  it('does not end a passwordless session’s shell at its expiry', async () => {
+    const session = { user: 'dev', userId: 'dev', apiToken: 'unused', expiresAt: Date.now() + 60_000 };
+    const { h, ws } = await attached(session, (gateway) => { gateway.sessions.set('sid', session); });
+    try {
+      session.expiresAt = Date.now() - 1;
+      authorizationChanged();
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      expect(ws.close).not.toHaveBeenCalled();
+    } finally { await h.close(); }
+  });
+
+  // Item 10: signing out another session revokes the ticket session's cached
+  // token; the ticket itself is still good while its own session is live.
+  it('admits a live ticket whose cached token was revoked', async () => {
+    const h = await stubGateway();
+    try {
+      const gateway = h.gateway as any;
+      h.tokens.connectIdentitySessions(async () => true);
+      const minted = await h.tokens.mintPrincipal('user:dev', ['task:edit']);
+      await h.tokens.revoke(minted.token);
+      gateway.terminalTickets.set('ticket', { taskId: 't', expiresAt: Date.now() + 60_000,
+        session: { user: 'dev', userId: 'dev', apiToken: minted.token, identitySessionId: 'browser' } });
+      const url = new URL('http://localhost/ws/terminal?taskId=t&ticket=ticket');
+      expect(await gateway.upgradePrincipal({ headers: {}, url: url.pathname + url.search }, url)).toBe('user:dev');
+    } finally { await h.close(); }
+  });
+
   it('closes when a local password session logs out', async () => {
     const session = { user: 'dev', userId: 'dev', apiToken: 'unused', expiresAt: Date.now() + 60_000 };
     let sessions: Map<string, unknown>;
-    const { h, ws } = await attached(session, (gateway) => { sessions = gateway.sessions; sessions.set('sid', session); });
+    const { h, ws } = await attached(session, (gateway) => { gateway.deps.password = 'required'; sessions = gateway.sessions; sessions.set('sid', session); });
     try {
       sessions!.delete('sid');
       authorizationChanged();
