@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Rehearses a release upgrade on a production-shaped turnkey stack:
 #
-#   scripts/rehearse-upgrade.sh [--from REV] [--to REV] [--work DIR] [--keep]
+#   scripts/rehearse-upgrade.sh [--from REV] [--to REV] [--work DIR] [--keep] [--no-runner]
 #
 # FROM (default origin/master, the deployed revision) is installed from a
 # scratch clone with its own `deploy/karmax up`, seeded with production-shaped
 # data through its HTTP API (scripts/rehearsal/client.ts) and backed up with its
 # `deploy/karmax backup`. It is then upgraded to TO (default HEAD) the way the
-# Deploy workflow upgrades production, with TO's own `deploy/karmax update
-# <sha>`, and everything is verified through TO's API. Finally the pre-update
+# Deploy workflow upgrades production: TO's own `deploy/karmax update <sha>`,
+# through TO's update-runner.sh when it has one (--no-runner skips the runner,
+# as deploy.yml did before it, to tell the runner's failures from the
+# release's). Everything is verified through TO's API; then the pre-update
 # backup is restored onto a fresh TO stack and verified again. Timings are
 # printed; any failure exits non-zero.
 #
@@ -26,6 +28,7 @@ FROM=origin/master
 TO=HEAD
 WORK=''
 KEEP=0
+RUNNER=1
 DOMAIN=rehearse.localhost
 # A project of its own, so the rehearsal never touches an installation's
 # `karmax` containers or volumes on the same host. deploy/karmax runs every
@@ -41,13 +44,14 @@ NODE_IMAGE=node:22-bookworm-slim
 E2B_API_PORT=${REHEARSAL_E2B_PORT:-13000}
 E2B_ENVD_PORT=$((E2B_API_PORT + 1))
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --from) FROM=$2; shift 2 ;;
     --to) TO=$2; shift 2 ;;
     --work) WORK=$2; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --no-runner) RUNNER=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; echo "rehearse: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -278,7 +282,7 @@ deploy_like_production() {
   git fetch -q --prune origin '+refs/heads/master:refs/remotes/origin/master'
   git merge-base --is-ancestor "$DEPLOY_SHA" refs/remotes/origin/master || { echo 'deployment SHA is not on master'; return 1; }
   git show "$DEPLOY_SHA:deploy/karmax" > ./deploy/.karmax-update && chmod 700 ./deploy/.karmax-update
-  if ! git cat-file -e "$DEPLOY_SHA:deploy/update-runner.sh" 2>/dev/null; then
+  if [ "$RUNNER" -eq 0 ] || ! git cat-file -e "$DEPLOY_SHA:deploy/update-runner.sh" 2>/dev/null; then
     ./deploy/.karmax-update update "$DEPLOY_SHA"; status=$?
     rm -f ./deploy/.karmax-update; return "$status"
   fi
@@ -296,6 +300,7 @@ deploy_like_production() {
   [ "$status" = success ]
 }
 git -C "$WORK/origin.git" update-ref refs/heads/master "$DEPLOY_SHA"
+previous_app=$(app_container)
 watch_app & WATCHER=$!
 update_started=$(date +%s)
 updated=0
@@ -304,9 +309,14 @@ if step "d. Update to TO (TO's deploy/karmax update ${DEPLOY_SHA:0:12})" update.
   if [ "$deployed" = "$DEPLOY_SHA" ]; then updated=1
   else record FAIL "the install is at $deployed after the update, not $DEPLOY_SHA"; fi
 fi
+# The first boot: from the new app container's start to its first ready
+# answer. The container FROM ran before the update does not count.
 sleep 2
-boot=$(awk -v id="$(app_container)" -v since="$update_started" '$1 == id && $2 >= since { print $3 - $2 }' "$LOGS/boots.txt" 2>/dev/null | tail -n 1)
-[ -z "$boot" ] || timing '   First boot of TO (app start to ready)' "$boot"
+current_app=$(app_container)
+if [ "$updated" -eq 1 ] && [ -n "$current_app" ] && [ "$current_app" != "$previous_app" ]; then
+  boot=$(awk -v id="$current_app" '$1 == id { print $3 - $2 }' "$LOGS/boots.txt" 2>/dev/null | tail -n 1)
+  [ -z "$boot" ] || timing '   First boot of TO (app start to ready)' "$boot"
+fi
 
 # ---------------------------------------------------------------- e. verify TO
 doctor_role() {
