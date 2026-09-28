@@ -138,6 +138,8 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await step('setup completes', () => expect.poll(() => page.evaluate((id) => fetch(`/api/user/onboarding?organizationId=${id}`)
         .then((response) => response.json()), organization.id)).toMatchObject({ complete: true, completedRequired: 4 }));
       await step('the guide steps aside', () => page.locator('#hosted-onboarding .onboarding-card').waitFor({ state: 'detached' }));
+      // The step that finished setup navigated; the person is still told so.
+      await step('setup completion is confirmed', () => page.locator('#hosted-onboarding .onboarding-complete').getByText('Setup complete').waitFor());
       expect(errors).toEqual([]);
     } finally { await context.close(); }
   }, 90_000);

@@ -502,7 +502,6 @@ function renderRouteLoadingPage(title, label = 'Loading…') {
 }
 
 async function applyRoute() {
-  if (S.onboardingCompletion) dismissOnboardingCompletion();
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
@@ -3639,10 +3638,10 @@ async function refreshOnboarding() {
   renderOnboarding();
 }
 
-// Completion feedback lasts until the next navigation (applyRoute) and is
-// deliberately absent from both the saved preference and browser storage. The
-// step that finishes setup may itself navigate (a new project opens), so a
-// response that lands on the next page still confirms it.
+// Completion feedback is a short-lived notice, deliberately absent from both
+// the saved preference and browser storage. The step that finishes setup may
+// itself navigate (a new project opens), before or after this response lands,
+// so the notice outlives navigation and leaves on its own (renderOnboarding).
 function acceptOnboardingStatus(status) {
   const previous = S.onboarding;
   if (status.complete && previous?.visible && !previous.complete
@@ -3655,6 +3654,8 @@ function acceptOnboardingStatus(status) {
 }
 
 function dismissOnboardingCompletion() {
+  clearTimeout(S.onboardingCompletionTimer);
+  S.onboardingCompletionTimer = null;
   S.onboardingCompletion = null;
   renderOnboarding();
 }
@@ -3704,6 +3705,7 @@ function renderOnboarding() {
     && completion.userId === S.user?.id && S.meta?.hosted) {
     clearTimeout(S.onboardingTimer);
     S.onboardingTimer = null;
+    S.onboardingCompletionTimer ??= setTimeout(dismissOnboardingCompletion, 8_000);
     host.hidden = false;
     host.innerHTML = `<div class="onboarding-minimized onboarding-complete" role="status">
       <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
@@ -3713,6 +3715,9 @@ function renderOnboarding() {
     $('#onboarding-complete-close')?.addEventListener('click', dismissOnboardingCompletion);
     return;
   }
+  // The notice is gone some other way (sign-out, another organization, setup
+  // reopened): its timer must not cut a later notice short.
+  if (S.onboardingCompletionTimer) { clearTimeout(S.onboardingCompletionTimer); S.onboardingCompletionTimer = null; }
   if (!state?.visible || state.organizationId !== S.organizationId) {
     clearTimeout(S.onboardingTimer);
     S.onboardingTimer = null;
