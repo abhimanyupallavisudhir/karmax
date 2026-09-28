@@ -28,7 +28,8 @@ import { canonicalRepositoryIdentity } from './repository-identity.js';
  * they can never drop an object a clone still reads. Least recently used idle
  * mirrors are removed once the cache exceeds KARMAX_GIT_MIRROR_MAX_BYTES
  * (default 2 GiB) or 32 repositories. `0` keeps no cache: each operation's
- * mirror then lives only in its own temporary directory.
+ * mirror then lives only in its own temporary directory, as it always does off
+ * Linux, where those locks are unavailable.
  */
 
 const MAX_MIRRORS = 32;
@@ -65,7 +66,7 @@ export async function mirroredClone(source: string, clone: string, env: Record<s
   const wanted = [...new Set([branch, ...(options.also ?? [])])]
     .filter((name): name is string => Boolean(name && advertised.tips[name]));
 
-  const persistent = maxBytes() > 0;
+  const persistent = maxBytes() > 0 && process.platform === 'linux';
   const mirror = persistent
     ? path.join(mirrorRoot(), `${crypto.createHash('sha256').update(canonicalRepositoryIdentity(source)).digest('hex').slice(0, 32)}.git`)
     : path.join(options.scratch, 'mirror.git');

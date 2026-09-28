@@ -769,5 +769,20 @@ describe('cloud Git broker', () => {
       expect(result.errors?.source).toMatch(/could not fetch branch "no-such-branch"[\s\S]*not found/);
       await f.destroy(world);
     });
+
+    it('keeps no persistent mirror off Linux, where host file locks are unavailable', async () => {
+      const f = await cloudFixture('portable');
+      const world = await f.world('portable-task');
+      await f.commit(world, 'portable.txt');
+      const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+      Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+      try {
+        expect(await brokerPushBranches(world, f.env)).toEqual({ pushed: ['source'], skipped: [] });
+        expect((await brokerFinalizeMerge(world, 'main', { name: 'Karmax Test', email: 'karmax@example.com' }, f.env)).merged).toBe(true);
+      } finally { Object.defineProperty(process, 'platform', platform); }
+      expect((await git(f.remote, ['show', 'main:portable.txt'])).stdout).toBe('portable.txt\n');
+      expect(mirrors()).toEqual([]);
+      await f.destroy(world);
+    });
   });
 });
