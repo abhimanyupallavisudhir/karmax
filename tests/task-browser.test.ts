@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { CUSTODY_ENV, registerAgent } from '../src/agent/custody.js';
 import { localTaskBrowserUrl } from '../src/autonomy/task-browser.js';
+import { apiMcpTools } from '../src/mcp/connections/client.js';
+import net from 'node:net';
 
 // AU-14/AU-32: a local fill types into the browser that this task's own agent
 // launched, found by the custody marker its descendants inherit, never into a
@@ -54,5 +56,34 @@ describe('a local task’s own browser', () => {
       expect(() => localTaskBrowserUrl('task_c')).toThrow(/no agent of this task is running/);
       expect(() => localTaskBrowserUrl(undefined)).toThrow(/call this from a task/);
     } finally { Object.defineProperty(process, 'platform', { value: real }); }
+  });
+
+  // #367 review item 11: the Messages and Responses rails start the browser MCP
+  // server themselves, with no agent process whose marker Chrome could inherit.
+  it('finds the browser an API-key turn\'s own MCP server launched', async () => {
+    if (process.platform !== 'linux') return;
+    const port = await new Promise<number>((resolve) => {
+      const probe = net.createServer().listen(0, '127.0.0.1', () => {
+        const { port } = probe.address() as net.AddressInfo;
+        probe.close(() => resolve(port));
+      });
+    });
+    const world: any = { handle: { id: 'task_api', kind: 'worktree', root: home } };
+    const mcp = await apiMcpTools(world, [{ name: 'chrome-devtools', command: process.execPath,
+      args: [path.resolve('tests/fixtures/fake-browser-mcp.mjs'), String(port)] } as any]);
+    try {
+      let url: string | undefined;
+      for (let attempt = 0; attempt < 50 && !url; attempt++) {
+        try { url = localTaskBrowserUrl('task_api'); } catch { await settle(); }
+      }
+      expect(url).toBe(`http://127.0.0.1:${port}`);
+      expect(() => localTaskBrowserUrl('task_other')).toThrow(/no agent of this task is running/);
+    } finally { await mcp.close(); }
+    // The turn's end releases the custody record and the browser with it.
+    for (let attempt = 0; attempt < 50; attempt++) {
+      try { localTaskBrowserUrl('task_api'); } catch (error) { if (/no agent of this task/.test(String(error))) break; }
+      await settle();
+    }
+    expect(() => localTaskBrowserUrl('task_api')).toThrow(/no agent of this task is running/);
   });
 });
