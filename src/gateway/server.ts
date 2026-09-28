@@ -3317,7 +3317,7 @@ export class Gateway {
               ? this.json(res, 200, (await view(avatar)))
               : this.json(res, 404, { error: 'avatar not found' });
           }
-          return this.json(res, 200, { availability, avatars: (await store.listAvatars(projectId)).map(view) });
+          return this.json(res, 200, { availability, avatars: (await Promise.all((await store.listAvatars(projectId)).map(view))) });
         }
 
         const subject = requireHumanSubject(callerIdentity);

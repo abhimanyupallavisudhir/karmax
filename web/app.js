@@ -12113,11 +12113,15 @@ async function openAvatarEditor(proj, avatar) {
   const overlay = document.createElement('div'); overlay.className = 'overlay avatar-editor-overlay';
   overlay.innerHTML = '<div class="modal-card avatar-editor"><div class="loading">Loading…</div></div>'; document.body.appendChild(overlay);
   const close = () => overlay.remove(); overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  try { await fillAvatarEditor(overlay, close, proj, avatar); } catch (error) { close(); toast(error.message, true); }
+}
+
+async function fillAvatarEditor(overlay, close, proj, avatar) {
   const [vaultItems, githubData] = await Promise.all([api(`/api/vault/items?organizationId=${encodeURIComponent(proj.organizationId)}`).catch(() => []), api('/api/user/github-accounts').catch(() => ({ accounts: [] }))]);
   const githubAccounts = githubData.accounts || [], activeGithub = githubAccounts.find((account) => account.active);
   const selectedCredentialIds = new Set((avatar?.authorization?.capabilities || []).filter((cap) => cap.startsWith('use-credential:item:')).map((cap) => cap.slice('use-credential:item:'.length)));
   let credentialPolicies = JSON.parse(JSON.stringify(avatar?.credentialPolicies || {}));
-  const callMode = avatar?.callableBy?.includes('@project') ? 'project' : avatar?.callableBy?.length === 1 && avatar.callableBy[0] === `user:${avatar.ownerUserId}` ? 'me' : 'specific';
+  const callMode = !avatar ? 'me' : avatar.callableBy?.includes('@project') ? 'project' : avatar.callableBy?.length === 1 && avatar.callableBy[0] === `user:${avatar.ownerUserId}` ? 'me' : 'specific';
   const roles = new Set(avatar?.roles || []), selectedAuth = avatar?.authorityMode === 'restricted' ? avatar.authorization : { level: 'developer', scope: 'projects', projectIds: [proj.id] };
   const runtime = avatar?.runtime || { provider: agentProviderChoice(), model: '', effort: '' };
   overlay.querySelector('.avatar-editor').innerHTML = `<div class="avatar-editor-head"><div><h2>${avatar ? 'Edit Avatar' : 'New Avatar'}</h2><p>Create a named autonomous principal. Only you can edit its instructions.</p></div><button class="icon-btn avatar-editor-close" type="button" aria-label="Close">✕</button></div><div class="avatar-editor-scroll">
@@ -12139,7 +12143,7 @@ async function openAvatarEditor(proj, avatar) {
   const anyRole = overlay.querySelector('#avatar-any-role'), roleGrid = overlay.querySelector('.avatar-role-grid'); anyRole.addEventListener('change', () => { roleGrid.hidden = anyRole.checked; });
   overlay.querySelector('.avatar-editor-save').addEventListener('click', async () => {
     const button = overlay.querySelector('.avatar-editor-save'); button.disabled = true; const authorityMode = authorityInputs.find((input) => input.checked)?.value || 'full';
-    const callableBy = callModeEl.value === 'me' ? [`user:${S.user.id}`] : callModeEl.value === 'project' ? ['@project'] : overlay.querySelector('#avatar-callers').value.split(',').map((value) => value.trim()).filter(Boolean);
+    const callableBy = callModeEl.value === 'me' ? [`user:${typeof S.user === 'string' ? S.user : S.user?.id}`] : callModeEl.value === 'project' ? ['@project'] : overlay.querySelector('#avatar-callers').value.split(',').map((value) => value.trim()).filter(Boolean);
     const requestedAuthorization = authorityMode === 'restricted'
       ? readAuthorizationEditor(overlay.querySelector('#avatar-authorization')) : null;
     const payload = { name: overlay.querySelector('#avatar-name').value, purpose: overlay.querySelector('#avatar-purpose').value,
