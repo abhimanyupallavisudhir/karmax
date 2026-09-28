@@ -40,13 +40,20 @@ export function keepAuthorized(socket: WebSocket, lifetime: ReturnType<typeof so
   allowed: () => Promise<boolean>, intervalMs = 5_000): void {
   let running: Promise<void> | undefined;
   let again = false;
+  // A close frame only starts a handshake the client may ignore: stop what the
+  // socket drives at once, and cut it off if it does not answer.
+  const withdraw = () => {
+    lifetime.close();
+    socket.close(4403, 'access withdrawn');
+    setTimeout(() => { if (socket.readyState !== socket.CLOSED) socket.terminate(); }, 1_000).unref?.();
+  };
   const check = (): void => {
     if (running) { again = true; return; }
     running = (async () => {
       do {
         again = false;
         if (lifetime.closed) return;
-        if (!(await allowed().catch(() => true)) && !lifetime.closed) { socket.close(4403, 'access withdrawn'); return; }
+        if (!(await allowed().catch(() => true)) && !lifetime.closed) { withdraw(); return; }
       } while (again);
     })().finally(() => { running = undefined; });
   };

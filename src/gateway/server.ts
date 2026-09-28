@@ -60,7 +60,7 @@ import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexMo
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
-import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
+import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, allows, type Capability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
@@ -574,6 +574,7 @@ export class Gateway {
   private terminalStops = new Set<() => Promise<void>>();
   private requestGuards = new WeakMap<http.IncomingMessage, () => Promise<void>>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
+  private personDecisions = new Map<string, { allowed: Promise<boolean>; until: number }>();
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
    *  directly, so without this a password could be guessed online. */
@@ -1382,6 +1383,8 @@ export class Gateway {
       void finish(code, clientClosed).catch(failed).finally(() => { try { ws.close(); } catch {} });
     });
     ws.on('message', raw => {
+      // A socket that is closing (access withdrawn, say) no longer drives the shell.
+      if (ws.readyState !== WebSocketClient.OPEN) return;
       let msg: any;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       try {
@@ -1392,10 +1395,14 @@ export class Gateway {
     // Close the provider stream first, then drain accepted output. Natural exit
     // and socket close share one finalization promise and one lease release.
     ws.on('close', () => { void stopTerminal().catch(failed); });
-    // The shell lasts only as long as its principal may edit the task.
-    keepAuthorized(ws, socketLifetime(ws), async () => {
+    // The shell lasts only as long as its principal may edit the task. A
+    // `karmax attach` connects with a ticket and no cookie; its person is
+    // decided from their current grants, not the ticket's 10-minute token.
+    const lifetime = socketLifetime(ws);
+    lifetime.add(() => stopTerminal());
+    keepAuthorized(ws, lifetime, async () => {
       const current = await this.socketAuth(req, url, task.projectId) ?? ticketRecord?.session;
-      return !!current && (await this.deps.tokens.check(current.apiToken, 'task:edit', { projectId: task.projectId, taskId })).ok;
+      return !!current && await this.sessionMay(current, 'task:edit', task.projectId, taskId);
     });
     if (this.closing || ws.readyState !== 1) await stopTerminal();
   }
@@ -1433,7 +1440,7 @@ export class Gateway {
     lifetime.add(off);
     keepAuthorized(ws, lifetime, async () => {
       const current = await this.socketAuth(req, url, task?.projectId);
-      return !!current && (await this.deps.tokens.check(current.apiToken, 'task:review:execute', { projectId: task?.projectId, taskId: rec.taskId })).ok;
+      return !!current && await this.sessionMay(current, 'task:review:execute', task?.projectId, rec.taskId);
     });
   }
 
@@ -8310,7 +8317,7 @@ export class Gateway {
       const auth = await this.socketAuth(req, url, task?.projectId);
       stillAllowed = async () => {
         const current = task && await this.socketAuth(req, url, task.projectId);
-        return !!current && (await this.deps.tokens.check(current.apiToken, 'task:review:execute', { projectId: task!.projectId, taskId })).ok;
+        return !!current && await this.sessionMay(current, 'task:review:execute', task!.projectId, taskId);
       };
       if (!task || !auth || !(await this.deps.tokens.check(auth.apiToken, 'task:review:execute', { projectId: task.projectId, taskId })).ok) {
         browser.close(4403, 'forbidden'); return;
@@ -8326,7 +8333,7 @@ export class Gateway {
         if (((await this.deps.store.currentWorld(current.worldId))?.generation ?? 1) !== current.generation) return false;
         if (current.tokenHash) return true;
         const session = await this.auth(req, current.projectId, current.organizationId);
-        return !!session && (await this.deps.tokens.check(session.apiToken, 'task:read', { projectId: current.projectId, taskId: current.taskId })).ok;
+        return !!session && await this.sessionMay(session, 'task:read', current.projectId, current.taskId);
       };
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
       if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
@@ -8367,6 +8374,7 @@ export class Gateway {
     const upstream = new WebSocketClient(target.url, protocols, { headers: target.headers });
     const pending: Array<{ data: import('ws').RawData; binary: boolean }> = [];
     browser.on('message', (data, binary) => {
+      if (browser.readyState !== WebSocketClient.OPEN) return;
       if (upstream.readyState === WebSocketClient.OPEN) upstream.send(data, { binary });
       else if (upstream.readyState === WebSocketClient.CONNECTING && pending.length < 100) pending.push({ data, binary });
     });
@@ -8383,7 +8391,48 @@ export class Gateway {
     upstream.on('message', (data, binary) => { if (browser.readyState === browser.OPEN) browser.send(data, { binary }); });
     upstream.on('close', (code, reason) => { release(); if (browser.readyState === browser.OPEN) browser.close(code || 1000, reason.toString()); });
     upstream.on('error', () => { release(); if (browser.readyState === browser.OPEN) browser.close(1011, 'preview upstream failed'); });
+    lifetime.add(() => { if (upstream.readyState !== WebSocketClient.CLOSED) upstream.terminate(); });
     keepAuthorized(browser, lifetime, stillAllowed);
+  }
+
+  /**
+   * May a socket's session still do `capability`? A person is decided from
+   * their current grants (with the account-closed and SSO checks), as their
+   * event stream is: their socket token is minted for ten minutes, so it
+   * would see a narrowed grant late and close a still-authorized session
+   * once it expired. Decisions are shared for a second, so a pass over many
+   * sockets of one person costs one lookup. Anything else is its token.
+   */
+  private async sessionMay(session: Session, capability: Capability, projectId: string | undefined, taskId: string): Promise<boolean> {
+    if (!session.userId || !this.deps.authorization || !projectId)
+      return (await this.deps.tokens.check(session.apiToken, capability, { projectId, taskId })).ok;
+    const key = `${authorizationEpoch()}\0${session.userId}\0${projectId}\0${capability}`;
+    const now = Date.now();
+    const cached = this.personDecisions.get(key);
+    if (cached && cached.until > now) return cached.allowed;
+    if (this.personDecisions.size > 1024) this.personDecisions.clear();
+    const userId = session.userId;
+    const allowed = (async () => {
+      if (await this.deps.store.kvGet(`account-closed:${userId}`)) return false;
+      const organizationId = await this.deps.store.projectOrganizationAsync(projectId);
+      if (organizationId && !(await this.ssoAdmits(userId, session.email, organizationId))) return false;
+      if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`) && ['task:edit', 'task:review:execute'].includes(capability))
+        return false; // as tokens.check: history from before a project move
+      const caps = await this.deps.authorization!.capabilitiesAsync(`user:${userId}`, projectId, organizationId);
+      if (allows(caps, capability)) return true;
+      // `task:manage-own` covers the tasks this person created, and their sub-tasks.
+      if (!OWN_TASK_CAPABILITIES.has(capability) || !allows(caps, 'task:manage-own')) return false;
+      for (let id: string | undefined = taskId, seen = new Set<string>(); id && !seen.has(id);) {
+        seen.add(id);
+        const record = await this.deps.store.taskMetadataAsync(id);
+        if (record?.createdBy?.kind === 'user' && record.createdBy.userId === userId) return true;
+        id = record?.parentTaskId;
+      }
+      return false;
+    })();
+    allowed.catch(() => this.personDecisions.delete(key));
+    this.personDecisions.set(key, { allowed, until: now + 1_000 });
+    return allowed;
   }
 
   /** SCIM 2.0 provisioning boundary. A tenant-scoped bearer token is stored only
