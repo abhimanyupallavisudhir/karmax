@@ -105,7 +105,7 @@ import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
-import type { ForkWorldSource } from '../world/fork.js';
+import { forkDevelopmentSources, forkRecordedAuthority, type ForkWorldSource } from '../world/fork.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
 import { syncLocalTarget, type LocalTargetSyncResult } from '../world/target-sync.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
@@ -1292,8 +1292,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (e) {
         (await record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" clone credentials: ${e instanceof Error ? e.message : e}` }));
       }
-      const developmentSources = (args.repos?.length ? args.repos : args.repo ? [args.repo] : [])
-        .map((source) => source.trim()).filter(Boolean);
       // The project wiki is a platform-owned companion repository for source
       // work. A zero-repo task reads and mutates project state through the
       // platform API, so attaching the wiki there would secretly reintroduce a
@@ -1303,6 +1301,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : undefined;
       if (project && !(await store.projectWiki(project.id))) (await store.setProjectWikiRepository(project.id));
       const wikiRepository = project ? (await store.projectWiki(project.id))?.repository : undefined;
+      const developmentSources = forkDevelopmentSources((args.repos?.length ? args.repos : args.repo ? [args.repo] : [])
+        .map((source) => source.trim()).filter(Boolean), forkCheckpoint, [wikiRoot, wikiRepository?.sshUrl]);
       if (remote && developmentSources.length > 0 && project && (!wikiRepository || !wikiRepository.private))
         throw new Error('the project wiki needs a private GitHub remote before a cloud world can be created');
       const requestedSources = [
@@ -1363,8 +1363,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ?? (candidate.baseBranch ? base : commonBranchesResolved ? args.target ?? base : candidate.repository.defaultBranch);
         return [[source, { base, target }]];
       }));
-      const repositoryAuthorities: Record<string, 'origin'> = Object.fromEntries(worldSources.flatMap((source, index) =>
+      const repositoryAuthorities: Record<string, 'project' | 'origin'> = Object.fromEntries(worldSources.flatMap((source, index) =>
         githubIsAuthority && githubSlug(transportSources[index]!) ? [[source, 'origin' as const]] : []));
+      forkRecordedAuthority(forkCheckpoint, requestedSources).forEach((authority, index) => {
+        if (authority) repositoryAuthorities[worldSources[index]!] = authority;
+      });
       const repositoryOrigins = Object.fromEntries(worldSources.flatMap((source, index) =>
         !remote && sourceResolutions[index]?.localPath && transportSources[index] !== source
           ? [[source, transportSources[index]!]]
