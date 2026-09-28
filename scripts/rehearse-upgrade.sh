@@ -43,7 +43,7 @@ FAKE_E2B=karmax-rehearsal-e2b
 # The client and the E2B stand-in are TypeScript run by Node's type stripping,
 # in containers: nothing on the host but Docker, and outside the process tree a
 # sandbox's memory guard may kill.
-NODE_IMAGE=node:22-bookworm-slim
+NODE_IMAGE=node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
 E2B_API_PORT=${REHEARSAL_E2B_PORT:-13000}
 E2B_ENVD_PORT=$((E2B_API_PORT + 1))
 
