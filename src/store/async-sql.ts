@@ -23,7 +23,7 @@ export class AsyncPostgres {
     if (!Number.isSafeInteger(this.maxPending) || this.maxPending < 1
       || !Number.isSafeInteger(options.max ?? 4) || (options.max ?? 4) < 1)
       throw new Error('database pool and admission limits must be positive integers');
-    this.pool = new Pool({ connectionString: url, max: options.max ?? 4,
+    this.pool = new Pool({ connectionString: url, max: options.max ?? 4, application_name: 'karmax',
       connectionTimeoutMillis: 5000, idleTimeoutMillis: 30_000,
       statement_timeout: options.statementTimeoutMs ?? 15_000,
       types: { getTypeParser: (oid, format) => oid === 20 || oid === 1700 ? Number : types.getTypeParser(oid, format) } });

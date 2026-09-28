@@ -34,7 +34,11 @@ git() {
   case "$*" in *"fetch --prune origin master") return 0 ;; esac
   command git "$@"
 }
-dc() { printf '%s\\n' "$*" >> "$ROOT_DIR/operations"; [ "${failure}" != build ] || [ "$*" != "build --pull app" ]; }
+dc() {
+  printf '%s\\n' "$*" >> "$ROOT_DIR/operations"
+  case "$*" in *psql*) [ "${failure}" != role ]; return ;; esac
+  [ "${failure}" != build ] || [ "$*" != "build --pull app" ]
+}
 cmd_backup_candidate() { destination="$DEPLOY_DIR/backups/fixture"; mkdir -p "$destination"; [ "${failure}" != backup ]; }
 ready_calls=0
 wait_ready() { ready_calls=$((ready_calls + 1)); [ "${ready ? '1' : '0'}" = 1 ] || [ "$ready_calls" -gt 1 ]; }
@@ -66,6 +70,17 @@ it('completes a healthy epoch transition', () => {
   expect(result.status).toBe(0);
   expect(result.head).toBe(result.target);
   expect(result.operations).not.toContain('stop app');
+});
+// A KARMAX_DATABASE_URL left in karmax.env keeps the app on the superuser
+// silently; the deploy log is where an operator would notice.
+it('reports which role the app connects as after a healthy update, never failing on it', () => {
+  const healthy = update(undefined, '2\n', true);
+  expect(healthy.status).toBe(0);
+  expect(healthy.operations).toMatch(/up -d --remove-orphans\n(?:.*\n)*exec -T postgresql psql/);
+  const unreadable = update(undefined, '2\n', true, 'role');
+  expect(unreadable.status).toBe(0);
+  expect(unreadable.stderr).toContain('could not ask PostgreSQL');
+  expect(unreadable.stdout).toContain('Update complete');
 });
 it('rejects a malformed epoch before changing the deployment', () => {
   const result = update('2\n', 'not-an-epoch\n');

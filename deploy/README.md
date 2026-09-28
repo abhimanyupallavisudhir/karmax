@@ -233,7 +233,10 @@ backup. The release workflow also retains its existing 14-day age limit.
 
 `restore` verifies the control-plane payload, PostgreSQL dumps, and deployment
 secrets, then restores every dump into a staging database (`karmax_restore`,
-…) beside the live ones. Only when all of them restored does it stop the
+…) beside the live ones; it refuses when PostgreSQL's disk cannot hold even
+the dumps, and warns before the prompt when it may not hold the restored
+databases, since filling it would stop the live instance. Only when all of
+them restored does it stop the
 instance, drop the live databases and rename the staged ones into place; a
 failure before that leaves the instance as it was. Dumps are restored without
 owners or grants, so a new host or an empty PostgreSQL volume works; the next
@@ -286,24 +289,17 @@ the app's `/var/lib/karmax/karmax.env` overrides the role's URL.
 
 Releases before the `karmax` role gave the app the `temporal` superuser
 password. After the first update to a release with the role, confirm it with
-`./deploy/karmax doctor`, then rotate that password, since the old app
-process held it:
+`./deploy/karmax doctor` (`update` also reports it), then rotate that
+password, since the old app process held it:
 
 ```bash
-password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
-./deploy/karmax backup
-docker compose --project-directory deploy --env-file deploy/.turnkey.env -f deploy/compose.turnkey.yml \
-  exec -T postgresql psql -U temporal -d postgres -v ON_ERROR_STOP=1 \
-  -c "ALTER ROLE temporal PASSWORD '$password'"
-sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$password/" deploy/.turnkey.env
-./deploy/karmax up
-./deploy/karmax doctor
+./deploy/karmax rotate-postgres-password
 ```
 
-The `postgresql` service reads `POSTGRES_PASSWORD` only when it initializes an
-empty volume, so the `ALTER ROLE` is what changes the password; `up` restarts
-Temporal and the jobs with the new value. Temporal is briefly unavailable
-between the two steps, and in-flight workflows resume once it reconnects.
+It changes the password through psql's standard input (never a command line
+`ps` would show), rewrites `.turnkey.env`, and recreates PostgreSQL, Temporal
+and the setup jobs without rebuilding images: expect a minute of downtime while
+they restart; in-flight workflows resume once Temporal is back.
 
 Larger installations can use `compose.hosted.yml` with managed PostgreSQL,
 managed Temporal, S3, and one active Karmax cell. Copy `.env.example`, provide
