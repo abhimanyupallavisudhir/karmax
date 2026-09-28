@@ -231,6 +231,25 @@ describe('Krmax panagent bridge', () => {
     }
   });
 
+  it('imports a saved Claude share that discusses challenges (PA-9)', async () => {
+    const home = temporary('karmax-panagent-share-');
+    try {
+      // Claude's ordinary pages load Cloudflare's challenge-platform script; that
+      // and quoted challenge text are content, not an anti-bot interstitial.
+      const html = '<!doctype html><html><head><title>Claude</title>'
+        + '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></head><body>'
+        + '<div data-testid="user-message"><p>Why does my scraper see "Verify you are human"?</p></div>'
+        + '<div data-testid="assistant-message"><p>That page is a Cloudflare challenge.</p></div></body></html>';
+      const result = await importWithPanagent({ source: { data: Buffer.from(html), name: 'share.html' }, provider: 'mock',
+        forkHome: home, worldPath: '/tmp/new-world', mode: 'context', native: false });
+      expect(result.kind).toBe('context');
+      if (result.kind !== 'context') return;
+      expect(result.message.text).toContain('That page is a Cloudflare challenge.');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('keeps imported delimiters inside the guarded context', async () => {
     const home = temporary('karmax-panagent-delimiters-');
     try {
