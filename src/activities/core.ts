@@ -508,7 +508,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
     const projectId = typeof handle.meta?.projectId === 'string'
       ? handle.meta.projectId
-      : taskId ? (await store.getTask(taskId))?.projectId : undefined;
+      : taskId ? (await store.taskProjectIdAsync(taskId)) : undefined;
     return (await developmentGitBinding(taskId ?? handle.id, projectId,
       typeof profileName === 'string' ? profileName : undefined));
   };
@@ -944,12 +944,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     if (!isRemote(handle.kind) || !deps.runners) return handle;
     const existing = typeof handle.meta?.worldLeaseId === 'string' ? (await store.worldLease(handle.meta.worldLeaseId)) : undefined;
     if (existing?.state === 'active') return handle;
-    const projectId = String(handle.meta?.projectId ?? (await store.getTask(taskId))?.projectId ?? '');
+    const projectId = String(handle.meta?.projectId ?? (await store.taskProjectIdAsync(taskId)) ?? '');
     const project = (await store.getProject(projectId));
     if (!project) throw new Error('cloud world has no owning project');
     const ctx = activityContext.current();
     const acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId, worldId: handle.id, provider: handle.kind,
-      priority: Number((await store.getTask(taskId))?.params.priority ?? 0), signal: ctx.cancellationSignal,
+      priority: (await store.taskPriority(taskId)), signal: ctx.cancellationSignal,
       heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) }));
     const next = (await store.updateWorldMeta(handle, { worldLeaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId }));
     (await store.setWorldState(next, 'ready'));
@@ -2289,9 +2289,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : forkOrigin.unpublished
             ? 'This independent world includes the source checkpoint’s unpublished work. Shared external services retain their configured sharing behavior.'
             : 'The source task landed. This world starts from its merge destination with the normal promoted project resources, rather than its old unpublished state.') : '';
-      const attemptGroup = (await store.attemptGroup(args.taskId));
-      const attemptContext = attemptGroup && attemptGroup.attempts.length > 1
-        ? `\n\nThis task has ${attemptGroup.attempts.length} attempts. Other attempts: ${attemptGroup.otherAttempts ?? (await store.otherAttemptsDefault(args.taskId))}. `
+      const attemptGroup = (await store.attemptSummary(args.taskId));
+      const attemptContext = attemptGroup && attemptGroup.attempts > 1
+        ? `\n\nThis task has ${attemptGroup.attempts} attempts. Other attempts: ${attemptGroup.otherAttempts ?? (await store.otherAttemptsDefault(args.taskId))}. `
           + (args.role === 'confirm' && !attemptGroup.committedAttemptId
             ? 'When accepting, set otherAttempts in confirm_decision to keep or cancel. Keep allows complementary proposals to continue and merge; cancel stops the alternatives. Follow an explicit project default; otherwise decide based on the value of the alternatives.'
             : 'If other attempts are kept, integrate against the latest target and assess combined behavior, redundant changes, and incompatible assumptions, as well as textual conflicts. Validate the combined result.')
