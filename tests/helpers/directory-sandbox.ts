@@ -18,27 +18,34 @@ export interface SandboxMeter {
   execs: string[];
   uploaded: number;
   downloaded: number;
-  /** Native CLI processes launched through the agent launcher. */
+  /** Native CLI processes launched through the agent launcher, and their scripts. */
   cliStarts: string[];
-  /** When the fake app-server received `turn/start` (performance.now()). */
+  launches: string[];
+  /** When the fake app-server received `turn/start` (performance.now()), and
+   * how many round trips and commands preceded it. */
   modelStartedAt?: number;
+  roundTripsAtModelStart?: number;
+  execsAtModelStart?: number;
   requests: any[];
+  /** App-server protocol order: `request <method>` / `answer <method>`. */
+  events: string[];
 }
 
-export const newMeter = (): SandboxMeter => ({ roundTrips: 0, execs: [], uploaded: 0, downloaded: 0, cliStarts: [], requests: [] });
+export const newMeter = (): SandboxMeter => ({ roundTrips: 0, execs: [], uploaded: 0, downloaded: 0, cliStarts: [], launches: [], requests: [], events: [] });
 
 const READY = '\u001eKARMAX_AGENT_READY\u001e';
 const delay = (ms: number) => ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
 
-/** `/usr/local/bin` (where karmax exposes its managed Node) is redirected into
- * the directory, so no test or benchmark can replace the machine's own Node. */
+/** `/usr/local/bin` (where karmax exposes its managed Node) and `/etc/codex`
+ * (Codex's system config layer) are redirected into the directory, so no test
+ * or benchmark can replace the machine's own Node or depend on its config. */
 export function directorySandbox(root: string, meter: SandboxMeter, options: {
   latency?: SandboxLatency; growth?: number;
 } = {}): World {
   const latency = options.latency ?? NO_LATENCY;
   const usrLocalBin = path.join(root, '.usr-local-bin');
   fs.mkdirSync(usrLocalBin, { recursive: true });
-  const redirect = (value: string) => value.replaceAll('/usr/local/bin', usrLocalBin);
+  const redirect = (value: string) => value.replaceAll('/usr/local/bin', usrLocalBin).replaceAll('/etc/codex', path.join(root, '.etc-codex'));
   const trip = async (bytes = 0) => { meter.roundTrips++; await delay(latency.roundTripMs + bytes / latency.bytesPerMs); };
   const file = (relative: string) => path.join(root, relative);
   const write = async (relative: string, content: Buffer) => {
@@ -126,7 +133,10 @@ function fakeCodex(script: string, home: string, meter: SandboxMeter, latency: S
   const send = (value: unknown) => { const line = JSON.stringify(value) + '\n'; for (const listener of outputs) listener(line); };
   const exit = (code: number) => { for (const listener of exits) listener(code); };
   const listing = /mcp\W+list/.test(script);
+  // Servers the launch flags enable are the ones that start (and list tools).
+  const enabled = [...script.matchAll(/mcp_servers\.([A-Za-z0-9_-]+)\.enabled=true/g)].map((match) => match[1]!);
   meter.cliStarts.push(listing ? 'mcp list' : 'app-server');
+  meter.launches.push(script);
   setTimeout(() => {
     for (const listener of outputs) listener(`${READY}\n`);
     if (listing) { for (const listener of outputs) listener('[]\n'); setTimeout(() => exit(0), 5); }
@@ -135,10 +145,14 @@ function fakeCodex(script: string, home: string, meter: SandboxMeter, latency: S
   let thread = '';
   const handle = async (request: any) => {
     meter.requests.push(request);
-    const reply = (result: unknown) => send({ id: request.id, result });
+    meter.events.push(`request ${request.method}`);
+    const reply = (result: unknown) => { meter.events.push(`answer ${request.method}`); send({ id: request.id, result }); };
     if (request.method === 'initialize') reply({});
     else if (request.method === 'account/rateLimits/read') { await delay(latency.accountReadMs); reply({ rateLimits: {} }); }
-    else if (request.method === 'mcpServerStatus/list') reply({ data: [], nextCursor: null });
+    else if (request.method === 'mcpServerStatus/list') {
+      await delay(latency.roundTripMs);
+      reply({ data: enabled.map((name) => ({ name, tools: { ping: {} } })), nextCursor: null });
+    }
     else if (request.method === 'thread/start') {
       thread = crypto.randomUUID();
       const file = path.join(home, 'sessions/2026/09/28', `rollout-2026-09-28T00-00-00-${thread}.jsonl`);
@@ -152,6 +166,8 @@ function fakeCodex(script: string, home: string, meter: SandboxMeter, latency: S
       reply({ thread: { id: thread } });
     } else if (request.method === 'turn/start') {
       meter.modelStartedAt = performance.now();
+      meter.roundTripsAtModelStart = meter.roundTrips;
+      meter.execsAtModelStart = meter.execs.length;
       const file = sandboxRollout(home, thread)!;
       const lines = fs.readFileSync(file, 'utf8').trimEnd().split('\n');
       let ordinal = JSON.parse(lines.at(-1)!).ordinal + 1;

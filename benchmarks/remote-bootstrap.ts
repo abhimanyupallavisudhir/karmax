@@ -9,26 +9,30 @@
  * else: seeding, history reconciliation, tool migration, MCP selection and the
  * post-turn export. No sandbox, model or credit is used.
  *
- *   npx tsx benchmarks/remote-bootstrap.ts [turns=8] [growthKiB=512]
+ *   npx tsx benchmarks/remote-bootstrap.ts [turns=8] [growthKiB=512] [promptMs=0]
  *
- * Reports, per turn, adapter start → `turn/start` (the model starts) and
+ * Reports, per turn, turn start → `turn/start` (the model starts) and
  * `turn/start` → adapter return (the post-turn export), plus provider round
- * trips, bytes moved each way and native CLI starts. */
+ * trips, sandbox commands before the model starts, bytes moved each way and
+ * native CLI starts. With promptMs > 0 the turn first spends that long
+ * preparing its prompt (the traces' wiki snapshot took 0.8–1.6 s), with the
+ * sandbox bootstrap started beside it as runAgentTurn does. */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { CodexAdapter } from '../src/agent/codex.js';
+import { prewarmRemoteAgentHome } from '../src/agent/remote-process.js';
 import { TimingTrace, withTiming, type TimingRow } from '../src/timing/index.js';
 import { directorySandbox, freshCodexHome, newMeter, stageRemoteRuntime, type SandboxLatency } from '../tests/helpers/directory-sandbox.js';
 
 export const E2B_LATENCY: SandboxLatency = { roundTripMs: 180, bytesPerMs: 10_000, cliStartMs: 900, accountReadMs: 700 };
 
 export interface TurnSample {
-  turn: number; modelStartMs: number; exportMs: number; roundTrips: number;
+  turn: number; modelStartMs: number; exportMs: number; roundTrips: number; execsBeforeModel: number;
   uploadedKiB: number; downloadedKiB: number; cliStarts: number; historyKiB: number; spans: Record<string, number>;
 }
 
-export async function benchmarkRemoteBootstrap(turns = 8, growthKiB = 512, latency = E2B_LATENCY): Promise<TurnSample[]> {
+export async function benchmarkRemoteBootstrap(turns = 8, growthKiB = 512, latency = E2B_LATENCY, promptMs = 0): Promise<TurnSample[]> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-bench-sandbox-'));
   const localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-bench-home-'));
   const samples: TurnSample[] = [];
@@ -44,6 +48,10 @@ export async function benchmarkRemoteBootstrap(turns = 8, growthKiB = 512, laten
       const world = directorySandbox(root, meter, { latency, growth: growthKiB * 1024 });
       const rows: TimingRow[] = [];
       const started = performance.now();
+      if (promptMs > 0) {
+        prewarmRemoteAgentHome(world, 'codex', localHome, session);
+        await new Promise((resolve) => setTimeout(resolve, promptMs));
+      }
       const result = await withTiming(new TimingTrace({ taskId: 'benchmark' }, (row) => { rows.push(row); }), () => new CodexAdapter().runTurn({
         profile: { id: 'benchmark', name: 'codex', provider: 'codex', role: 'do', capabilities: [], mcpConnections: [] },
         world, messages: [{ id: `m${turn}`, role: 'user', text: 'continue', ts: 0 }], systemPrompt: 'Do the task.',
@@ -57,7 +65,7 @@ export async function benchmarkRemoteBootstrap(turns = 8, growthKiB = 512, laten
       const spans: Record<string, number> = {};
       for (const row of rows) if (row.phase === 'end') spans[row.name] = Math.round((spans[row.name] ?? 0) + row.durationMs!);
       samples.push({ turn, modelStartMs: Math.round(meter.modelStartedAt - started), exportMs: Math.round(finished - meter.modelStartedAt),
-        roundTrips: meter.roundTrips, uploadedKiB: Math.round(meter.uploaded / 1024), downloadedKiB: Math.round(meter.downloaded / 1024),
+        roundTrips: meter.roundTrips, execsBeforeModel: meter.execsAtModelStart ?? 0, uploadedKiB: Math.round(meter.uploaded / 1024), downloadedKiB: Math.round(meter.downloaded / 1024),
         cliStarts: meter.cliStarts.length, historyKiB: Math.round(history / 1024), spans });
     }
     return samples;
@@ -68,11 +76,11 @@ export async function benchmarkRemoteBootstrap(turns = 8, growthKiB = 512, laten
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const [turns, growth] = process.argv.slice(2).map(Number);
-  const samples = await benchmarkRemoteBootstrap(turns || undefined, growth || undefined);
+  const [turns, growth, promptMs] = process.argv.slice(2).map(Number);
+  const samples = await benchmarkRemoteBootstrap(turns || undefined, growth || undefined, E2B_LATENCY, promptMs || 0);
   console.table(samples.map(({ spans: _, ...sample }) => sample));
   if (process.env.KARMAX_BENCHMARK_SPANS) for (const sample of samples) console.log(sample.turn, JSON.stringify(sample.spans));
   const resumed = samples.slice(1).map((sample) => sample.modelStartMs).sort((a, b) => a - b);
-  console.log(JSON.stringify({ latency: E2B_LATENCY, firstTurnModelStartMs: samples[0]?.modelStartMs,
+  console.log(JSON.stringify({ latency: E2B_LATENCY, promptMs: promptMs || 0, firstTurnModelStartMs: samples[0]?.modelStartMs,
     resumedModelStartMedianMs: resumed[resumed.length >> 1], lastTurn: samples.at(-1) }));
 }

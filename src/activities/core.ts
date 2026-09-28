@@ -84,7 +84,7 @@ import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
-import { isRemoteAgentWorld, materializeRemoteSession } from '../agent/remote-process.js';
+import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -2217,6 +2217,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
         }
       }
+
+      // A native agent's sandbox bootstrap runs while its prompt is prepared (LT-1).
+      if (remoteSubscriptionRail && resolvedAuth?.configHome && (profile.provider === 'codex' || profile.provider === 'claude'))
+        prewarmRemoteAgentHome(world, profile.provider, resolvedAuth.configHome, session);
 
       // Self-healing loop (SPEC §3.4): show the Resolve agent the INDEX of prior saved
       // resolutions (`{{skills}}`) so it reuses a known fix rather than rediscovering
