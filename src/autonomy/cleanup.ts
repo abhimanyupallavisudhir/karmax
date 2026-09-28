@@ -31,7 +31,7 @@ export async function deleteOrganizationAutonomy(store: Store, broker: Credentia
     || await store.kvGet(`agent-mail:provider:${organizationId}`)))
     throw new Error('credential broker is required for organization secret cleanup');
   for (const item of items) await vault.delete(item.id);
-  for (const card of cards) await broker!.deleteHandle(`payment:card:${card.id}`);
+  for (const card of cards) for (const handle of [`payment:card:${card.id}`, `payment:card:${card.id}:cvc`]) await broker!.deleteHandle(handle);
   for (const handle of broker?.listHandles() ?? []) {
     if (handle.startsWith(`connector:${organizationId}:`) || handle.startsWith(`connector-export:${organizationId}:`)) await broker!.deleteHandle(handle);
   }

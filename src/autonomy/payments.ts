@@ -67,6 +67,28 @@ export interface CardBillingAddress {
 
 /** Vault handle holding a registered card's secret half. */
 export const cardSecretHandle = (cardId: string) => `payment:card:${cardId}`;
+/** The CVC is its own secret (AU-31): the stored card secret alone (PAN, expiry,
+ * billing) is never a complete card-not-present credential, and the fill
+ * resolves the CVC only to type it. */
+export const cardCvcHandle = (cardId: string) => `payment:card:${cardId}:cvc`;
+
+/** Move the CVC of every card stored before AU-31 out of its card secret.
+ * Idempotent; returns how many cards it separated. */
+export async function separateStoredCardCvcs(broker: CredentialBroker): Promise<number> {
+  let separated = 0;
+  for (const handle of broker.listHandles()) {
+    if (!/^payment:card:[^:]+$/.test(handle)) continue;
+    let details: Partial<CardDetails>;
+    try { details = JSON.parse(broker.resolve(handle, { caps: [`use-credential:${handle}`] })); }
+    catch { continue; } // not card details; never block boot on one entry
+    if (details?.cvc === undefined) continue;
+    const { cvc, ...rest } = details;
+    (await broker.registerHandle(`${handle}:cvc`, String(cvc)));
+    (await broker.registerHandle(handle, JSON.stringify(rest)));
+    separated++;
+  }
+  return separated;
+}
 
 /**
  * What can still be spent on a card. `available` alone is not the answer: on an
@@ -278,9 +300,15 @@ export class VaultCardProvider implements PaymentProvider {
       currency: (spec.currency ?? 'usd').toLowerCase(), status: 'active',
       last4: details.number.slice(-4), createdAt: Date.now(),
     };
-    (await this.broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details)));
+    const { cvc, ...stored } = details;
+    (await this.broker.registerHandle(cardCvcHandle(card.id), cvc));
+    (await this.broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(stored)));
     try { (await this.store.createCard(card)); }
-    catch (error) { (await this.broker.deleteHandle(cardSecretHandle(card.id))); throw error; }
+    catch (error) {
+      (await this.broker.deleteHandle(cardSecretHandle(card.id)));
+      (await this.broker.deleteHandle(cardCvcHandle(card.id)));
+      throw error;
+    }
     return card;
   }
   async getCard(cardId: string): Promise<Card | undefined> {
@@ -312,7 +340,10 @@ export class VaultCardProvider implements PaymentProvider {
     const card = await this.getCard(cardId);
     if (!card || card.status === 'canceled') throw new Error('card is not active');
     const handle = cardSecretHandle(cardId);
-    return JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as CardDetails;
+    const details = JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as CardDetails;
+    // A card stored before AU-31 still carries its CVC until boot separates it.
+    const cvc = details.cvc ?? this.broker.resolve(cardCvcHandle(cardId), { caps: [`use-credential:${cardCvcHandle(cardId)}`] });
+    return { ...details, cvc };
   }
   describe(): ProviderInfo {
     return { name: this.name, label: 'Your own virtual card', kind: 'card', available: true, connected: true,
@@ -331,6 +362,7 @@ export class VaultCardProvider implements PaymentProvider {
   async revoke(cardId: string): Promise<void> {
     if (!await this.getCard(cardId)) throw new Error('no such card');
     (await this.broker.deleteHandle(cardSecretHandle(cardId)));
+    (await this.broker.deleteHandle(cardCvcHandle(cardId)));
     (await this.store.updateCard(cardId, { status: 'canceled', available: 0 }));
   }
 }

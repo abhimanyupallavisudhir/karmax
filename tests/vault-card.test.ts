@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { VaultCardProvider, PaymentRegistry, BudgetService, MockPaymentProvider,
-  StripeIssuingProvider, cardSecretHandle, type PaymentProvider } from '../src/autonomy/payments.js';
+  StripeIssuingProvider, cardSecretHandle, cardCvcHandle, separateStoredCardCvcs, type PaymentProvider } from '../src/autonomy/payments.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { Store } from '../src/store/db.js';
@@ -61,6 +61,26 @@ describe('VaultCardProvider — the universal rail', () => {
       .toMatchObject({ number: '4242424242424242', cvc: '123', expMonth: 12, expYear: 2031 });
   });
 
+  // AU-31: the CVC is kept out of the card secret, so the PAN secret alone is
+  // never a complete card-not-present credential.
+  it('keeps the CVC out of the stored card secret', async () => {
+    const card = await provision();
+    const stored = JSON.parse(broker.resolve(cardSecretHandle(card.id), { caps: ['use-credential:*'] }));
+    expect(stored).toMatchObject({ number: '4242424242424242', expMonth: 12, expYear: 2031 });
+    expect(stored).not.toHaveProperty('cvc');
+    expect(broker.resolve(cardCvcHandle(card.id), { caps: ['use-credential:*'] })).toBe('123');
+  });
+
+  it('separates the CVC of a card stored before AU-31, once', async () => {
+    const card = await provision();
+    (await broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details)));
+    (await broker.deleteHandle(cardCvcHandle(card.id)));
+    expect(await separateStoredCardCvcs(broker)).toBe(1);
+    expect(await separateStoredCardCvcs(broker)).toBe(0);
+    expect(JSON.parse(broker.resolve(cardSecretHandle(card.id), { caps: ['use-credential:*'] }))).not.toHaveProperty('cvc');
+    expect(await provider.retrieveCardDetails(card.id)).toMatchObject({ number: '4242424242424242', cvc: '123' });
+  });
+
   it('carries an optional billing address through to fill, dropping blanks', async () => {
     const card = await provision({ details: { ...details,
       billing: { line1: '1 High St', city: 'London', postalCode: 'SW1A 1AA', country: '' } } });
@@ -95,6 +115,7 @@ describe('VaultCardProvider — the universal rail', () => {
     const card = await provision();
     await provider.revoke(card.id);
     expect(broker.hasHandle(cardSecretHandle(card.id))).toBe(false);
+    expect(broker.hasHandle(cardCvcHandle(card.id))).toBe(false);
     expect((await store.getCard(card.id)).status).toBe('canceled');
     await expect(provider.retrieveCardDetails(card.id)).rejects.toThrow(/not active/i);
   });
