@@ -655,6 +655,61 @@ describe('task stage transitions', () => {
     expect(JSON.parse((await f.store.kvGet(`view-order:${f.task.id}`))!).retired).toEqual(['run-2']);
   });
 
+  // A run can continue as new between resolving it and signalling it. The
+  // closed run then answers not-found; the stop must act on the live run.
+  it.each([['pinned', 'run-1'], ['unpinned', undefined]] as const)(
+    'stops and retires the live run when a %s run continued as new just before', async (_kind, pin) => {
+      const f = (await fixture());
+      (await f.store.setTaskWorkflowVersion(f.task.id, '1.26.0'));
+      if (pin) (await f.store.patchTaskParams(f.task.id, { _workflowRunId: pin }));
+      let live = 'run-1';
+      const getHandle = f.client.workflow.getHandle.bind(f.client.workflow);
+      vi.spyOn(f.client.workflow, 'getHandle').mockImplementation((id: string, runId?: string) => {
+        const handle = getHandle(id, runId);
+        if (id !== f.task.id) return handle;
+        return { ...handle,
+          describe: async () => ({ runId: runId ?? live, status: { name: (runId ?? live) === live ? 'RUNNING' : 'CONTINUED_AS_NEW' } }),
+          async signal(signal: string, ...args: unknown[]) {
+            if (runId === 'run-1' && signal === 'prepareLifecycleReplacement') {
+              // run-1 hands its pin to run-2 as it continues as new.
+              live = 'run-2';
+              if (pin) { (await f.store.swapTaskRun(f.task.id, 'run-1', '')); (await f.store.swapTaskRun(f.task.id, '', 'run-2')); }
+              throw new WorkflowNotFoundError('workflow execution already completed', f.task.id, runId);
+            }
+            return handle.signal(signal, ...args);
+          },
+          result: async () => ({}),
+          async terminate(reason: string) {
+            if (runId === 'run-1') throw new WorkflowNotFoundError('workflow execution already completed', f.task.id, runId);
+            return handle.terminate(reason);
+          } };
+      });
+      const markers: string[] = [];
+      const kvSet = f.store.kvSet.bind(f.store);
+      vi.spyOn(f.store, 'kvSet').mockImplementation(async (key, value) => {
+        if (key.startsWith('task-lifecycle-replacement:')) markers.push(value);
+        return kvSet(key, value);
+      });
+      await f.api.moveTaskStage(f.token, f.task.id, 'done');
+      expect(f.signalled).toContainEqual(expect.objectContaining({ signal: 'prepareLifecycleReplacement', runId: 'run-2' }));
+      expect(markers.map((marker) => JSON.parse(marker).runId)).toEqual(['run-1', 'run-2']);
+      expect(JSON.parse((await f.store.kvGet(`view-order:${f.task.id}`))!).retired).toEqual(['run-2']);
+    });
+
+  it('unpins the run a move back to Draft stopped, read when it stops', async () => {
+    const f = (await fixture());
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'run-1' }));
+    const api = f.api as any;
+    const cleanup = api.waitForTerminalCleanup.bind(api);
+    vi.spyOn(api, 'waitForTerminalCleanup').mockImplementation(async (...args: unknown[]) => {
+      (await f.store.swapTaskRun(f.task.id, 'run-1', 'run-2'));
+      return cleanup(...args);
+    });
+    await f.api.moveTaskStage(f.token, f.task.id, 'draft');
+    expect(f.terminated).toEqual([expect.stringContaining('Task moved back to Draft')]);
+    expect((await f.store.taskMetadata(f.task.id))?.params._workflowRunId).toBe('');
+  });
+
   it('tells the parent when a person marks its sub-task done', async () => {
     const f = (await fixture());
     const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
