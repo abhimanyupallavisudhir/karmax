@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
+import { lockContended } from './helpers/lock-waiters.js';
 import { acquireFileLock } from '../src/util/file-lock.js';
 
 const linux = process.platform === 'linux' ? it : it.skip;
@@ -76,7 +77,7 @@ linux('waits asynchronously for another writer before reading the secret map', a
   let written = false;
   const writing = vault.put('later', 'fixture').then(() => { written = true; });
   try {
-    await new Promise(resolve => setTimeout(resolve, 30));
+    await lockContended(path.join(dir, 'secrets.json.lock'));
     expect(written).toBe(false);
   } finally { release(); await writing; }
   expect(vault.reveal('later')).toBe('fixture');

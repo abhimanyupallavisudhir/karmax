@@ -399,11 +399,12 @@ describe('searchWiki (host-side grep — the cloud-world-safe path)', () => {
   it('does not hang on a catastrophic-backtracking pattern', () => {
     const root = tmp();
     try {
-      writeWikiPage(root, 'bait', `---\ndescription: d\n---\n${'a'.repeat(60)}b\n`);
-      const started = Date.now();
-      const hits = searchWiki(root, '(a+)+$');
-      expect(Date.now() - started).toBeLessThan(2_000);
-      expect(Array.isArray(hits)).toBe(true);
+      // Run as a regex, the pattern backtracks for minutes on the bait line and
+      // cannot match the quoted one, which ends in `$`. Matched literally, it
+      // finds exactly the quoted line and never touches the bait.
+      writeWikiPage(root, 'bait', `---\ndescription: d\n---\n${'a'.repeat(60)}b\nquoted: (a+)+$\n`);
+      expect(isSafeSearchPattern('(a+)+$')).toBe(false);
+      expect(searchWiki(root, '(a+)+$').map((hit) => hit.text)).toEqual(['quoted: (a+)+$']);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -1193,10 +1194,10 @@ describe('search regex safety guard', () => {
     // back to a literal match, so this returns promptly instead of hanging.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-wiki-redos-'));
     try {
-      writeWikiPage(root, 'notes/long', `---\nname: Long\n---\n${'a'.repeat(4_000)}`, 'skill');
-      const started = Date.now();
-      expect(searchWiki(root, 'a*a*a*a*a*a*a*a*a*a*b')).toEqual([]);
-      expect(Date.now() - started).toBeLessThan(2_000);
+      // As a regex the pattern would match the bare `b` line (after backtracking
+      // through the run of `a`s); as a literal only the quoted line matches.
+      writeWikiPage(root, 'notes/long', `---\nname: Long\n---\n${'a'.repeat(4_000)}\nb\nquoted: a*a*a*a*a*a*a*a*a*a*b`, 'skill');
+      expect(searchWiki(root, 'a*a*a*a*a*a*a*a*a*a*b').map((hit) => hit.text)).toEqual(['quoted: a*a*a*a*a*a*a*a*a*a*b']);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

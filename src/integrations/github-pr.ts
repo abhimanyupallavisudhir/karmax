@@ -301,7 +301,7 @@ export class GithubPrApi {
     const marker = `<!-- karmax-comment:${createHash('sha256').update(key).digest('hex')} -->`;
     for (let page = 1; page <= 100; page++) {
       const comments = await this.request<Array<{ body?: string }>>(
-        `/repos/${slug}/issues/${number}/comments?per_page=100&page=${page}`);
+        `/repos/${repositorySlug(slug)}/issues/${number}/comments?per_page=100&page=${page}`);
       if (comments.some(comment => comment.body?.includes(marker))) return;
       if (comments.length < 100) {
         await this.comment(slug, number, `${body}\n\n${marker}`);
@@ -583,7 +583,8 @@ export class GithubPrApi {
           .map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean).join(' — ');
         return `${location ? `${location}: ` : ''}${message || annotation.annotation_level || 'check annotation'}`;
       }).join('\n');
-      check.detail = [check.detail, output, rendered].filter(Boolean).join('\n').slice(0, 24_000);
+      const detail = [check.detail, output, rendered].filter(Boolean).join('\n').slice(0, 24_000);
+      if (detail) check.detail = detail;
     }
     return candidates.map(({ databaseId: _databaseId, ...check }) => check);
   }

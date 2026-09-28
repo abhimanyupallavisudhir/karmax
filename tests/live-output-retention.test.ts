@@ -82,15 +82,21 @@ describe('streamed agent text on a socket', () => {
     const ws = Object.assign(new EventEmitter(), { readyState: 1, bufferedAmount: 0, close: vi.fn(),
       send: vi.fn((data: string) => { ws.bufferedAmount += Buffer.byteLength(data); }) });
     await (h.gateway as any).eventStream(ws, { headers: {}, url: '/ws' });
-    const sent = () => ws.send.mock.calls.map(([data]) => JSON.parse(String(data))).filter((ev) => ev.type === 'agent.output');
+    const frames = () => ws.send.mock.calls.map(([data]) => JSON.parse(String(data)));
+    const sent = () => frames().filter((ev) => ev.type === 'agent.output');
+    // The fan-out has read up to `seq` and handed every event to the socket.
+    const fanout = (h.gateway as any).fanout;
+    const delivered = (seq: number) => vi.waitFor(() => {
+      expect(fanout.cursor).toBeGreaterThanOrEqual(seq);
+      expect([...fanout.listeners].every((subscriber: any) => !subscriber.running && !subscriber.queue.length)).toBe(true);
+    });
     try {
       for (const text of windows()) {
         const event = live(task.id, text);
         const seq = await h.store.appendLiveOutput(event);
         await (h.gateway as any).deps.bus.emit({ ...event, seq });
-        await new Promise((resolve) => setTimeout(resolve, 5)); // the fan-out reads each window
+        await delivered(seq); // the fan-out reads each window
       }
-      await new Promise((resolve) => setTimeout(resolve, 150));
       expect(ws.close).not.toHaveBeenCalled();
       expect(ws.bufferedAmount).toBeLessThan(1024 * 1024);
       const before = sent().length;
@@ -99,7 +105,13 @@ describe('streamed agent text on a socket', () => {
       ws.bufferedAmount = 0;
       await vi.waitFor(() => { expect(sent().length).toBe(before + 1); });
       expect(String(sent().at(-1).payload.text)).toBe(REPLY);
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      // Releasing the held text emptied the hold, so a second copy could only
+      // come from the fan-out itself, which delivers in order: once an event
+      // appended afterwards arrives, any repeat would already be here.
+      const sentinel = { taskId: task.id, type: 'agent.activity', ts: Date.now(), payload: { kind: 'tool', title: 'sentinel' } };
+      const sentinelSeq = await h.store.appendEvent(sentinel as any);
+      await (h.gateway as any).deps.bus.emit({ ...sentinel, seq: sentinelSeq });
+      await vi.waitFor(() => expect(frames().some((ev) => ev.type === 'agent.activity')).toBe(true));
       expect(sent().length).toBe(before + 1);
     } finally { ws.readyState = 3; ws.emit('close'); await h.close(); }
   });

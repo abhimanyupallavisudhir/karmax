@@ -8,6 +8,7 @@ import { SharedWorldCoordination } from '../src/world/shared-coordination.js';
 import { WorldOperationLock } from '../src/world/operation-lock.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { acquireFileLock } from '../src/util/file-lock.js';
+import { lockContended } from './helpers/lock-waiters.js';
 
 const linux = process.platform === 'linux' ? it : it.skip;
 const directories: string[] = [];
@@ -64,7 +65,8 @@ linux('excludes another process until its transition owner dies, without blockin
   const coordination = new SharedWorldCoordination(dir);
   let entered = false;
   const waiting = coordination.operation('world', async () => { entered = true; });
-  await new Promise(resolve => setTimeout(resolve, 50));
+  // Blocked in the kernel behind the owner's lock, while this test keeps running.
+  await lockContended((coordination as any).filename('world', 'operation'));
   expect(entered).toBe(false);
   const closed = once(owner, 'close');
   owner.kill('SIGKILL');

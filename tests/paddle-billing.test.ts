@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import crypto from 'node:crypto';
-import { PaddleSubscriptionProvider } from '../src/billing/paddle.js';
+import { BillingRequestRejected, PaddleSubscriptionProvider, type PaddleRuntimeConfig } from '../src/billing/paddle.js';
 import { FakeSubscriptionProvider, SubscriptionBillingService } from '../src/billing/subscriptions.js';
+import { HOSTED_PLANS } from '../src/domain/entitlements.js';
 import { Store } from '../src/store/db.js';
 
 const config = { environment: 'sandbox' as const, apiKey: 'pdl_sdbx_apikey_test',
@@ -305,5 +306,265 @@ describe('Paddle subscription billing', () => {
       await billing.handleWebhook(event.raw, event.signature);
       expect(await billing.current(b.id)).toMatchObject({ status: 'active', access: 'active' });
     } finally { await store.close(); }
+  });
+});
+
+/** Paddle's API as a list of scripted replies, keyed by "METHOD path". */
+function paddleApi(routes: Record<string, unknown | ((body: any) => unknown)>) {
+  const requests: Array<{ method: string; url: string; body?: any; headers: Record<string, string> }> = [];
+  const fetcher = vi.fn(async (url: any, init: any) => {
+    const parsed = new URL(String(url));
+    const key = `${init.method} ${parsed.pathname}${parsed.search}`;
+    requests.push({ method: init.method, url: String(url), body: init.body && JSON.parse(init.body), headers: init.headers });
+    const route = routes[key] ?? routes[`${init.method} ${parsed.pathname}`];
+    if (route === undefined) return Response.json({ error: { code: 'not_found' } }, { status: 404 });
+    const reply = typeof route === 'function' ? (route as (body: any) => unknown)(init.body && JSON.parse(init.body)) : route;
+    return reply instanceof Response ? reply : Response.json({ data: reply });
+  });
+  return { fetcher, requests, provider: (overrides: Partial<PaddleRuntimeConfig> = {}) =>
+    new PaddleSubscriptionProvider(() => ({ ...config, ...overrides }), fetcher as any) };
+}
+
+const included = HOSTED_PLANS.team.includedActiveUsers;
+const teamItems = (seats: number) => [{ price: { id: 'pri_team' }, quantity: 1 },
+  ...(seats > included ? [{ price: { id: 'pri_seat' }, quantity: seats - included }] : [])];
+
+// Each provider operation on its own, against a fake Paddle API (CI-38k).
+describe('Paddle provider operations', () => {
+  it('is configured only with keys, a client token and all three prices', async () => {
+    expect(await new PaddleSubscriptionProvider(() => config).configured()).toBe(true);
+    for (const missing of ['apiKey', 'webhookSecret', 'clientToken', 'individualPriceId', 'teamBasePriceId', 'teamSeatPriceId'] as const)
+      expect(await new PaddleSubscriptionProvider(() => ({ ...config, [missing]: undefined })).configured()).toBe(false);
+    expect(await new PaddleSubscriptionProvider(() => ({ ...config, teamSeatPriceId: '' })).catalog()).toBeUndefined();
+    await expect(new PaddleSubscriptionProvider(() => config).createCustomer()).rejects.toThrow(/during checkout/);
+  });
+
+  it('prices checkouts on the server and refuses seat counts it cannot bill', async () => {
+    const api = paddleApi({ 'POST /transactions': { id: 'txn_individual' } });
+    const input = { organizationId: 'org', customerId: '', successUrl: 'https://karmax.example/?ok', cancelUrl: 'https://karmax.example/', idempotencyKey: 'k' };
+    await api.provider().createCheckout({ ...input, plan: 'individual', seats: 7 });
+    expect(api.requests[0]!.body).toMatchObject({ items: [{ price_id: 'pri_individual', quantity: 1 }], collection_mode: 'automatic',
+      custom_data: { karmax_request: 'k' }, checkout: { url: 'https://karmax.example/billing/checkout?success=https%3A%2F%2Fkarmax.example%2F%3Fok' } });
+    for (const seats of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])
+      await expect(api.provider().createCheckout({ ...input, plan: 'team', seats })).rejects.toThrow(new BillingRequestRejected('invalid seat count'));
+    await expect(api.provider({ teamBasePriceId: undefined }).createCheckout({ ...input, plan: 'team', seats: 3 }))
+      .rejects.toThrow(new BillingRequestRejected('Paddle prices are not configured'));
+    expect(api.requests).toHaveLength(1);
+  });
+
+  it('does not hand out a checkout for a transaction id it cannot trust', async () => {
+    const input = { organizationId: 'org', customerId: '', plan: 'individual' as const, seats: 1, successUrl: 'https://karmax.example/',
+      cancelUrl: 'https://karmax.example/', idempotencyKey: 'k' };
+    for (const reply of [{}, { id: 'txn_../../evil' }, { id: 'sub_123' }])
+      await expect(paddleApi({ 'POST /transactions': reply }).provider().createCheckout(input))
+        .rejects.toThrow('Paddle returned an invalid transaction; reconcile before retrying');
+  });
+
+  it('classifies failures by whether a write may have happened', async () => {
+    const failing = (response: () => Response | Promise<Response>) => new PaddleSubscriptionProvider(() => config, vi.fn(async () => response()) as any);
+    const input = { organizationId: 'org', customerId: '', plan: 'individual' as const, seats: 1, successUrl: 'https://karmax.example/',
+      cancelUrl: 'https://karmax.example/', idempotencyKey: 'k' };
+    // A definite 4xx rejection is safe to correct and retry.
+    const rejected = await failing(() => Response.json({ error: { code: 'price_not_found' } }, { status: 400 })).createCheckout(input).catch((e) => e);
+    expect(rejected).toBeInstanceOf(BillingRequestRejected);
+    expect(rejected.message).toBe('Paddle request failed (400, price_not_found)');
+    // A 5xx, a network failure or a reply without data may have landed.
+    for (const response of [() => new Response('oops', { status: 502 }), () => Promise.reject(new Error('socket hang up')), () => Response.json({})]) {
+      const error = await failing(response).createCheckout(input).catch((e) => e);
+      expect(error).not.toBeInstanceOf(BillingRequestRejected);
+    }
+    expect((await failing(() => new Response('oops', { status: 502 })).createCheckout(input).catch((e) => e)).message)
+      .toBe('Paddle request failed (502, unknown_error); reconcile before retrying');
+    // A failed read performed no write at all.
+    const read = await failing(() => Promise.reject(new Error('socket hang up'))).createPortal({ customerId: '', subscriptionId: 'sub_1', returnUrl: '', idempotencyKey: 'k' }).catch((e) => e);
+    expect(read).toBeInstanceOf(BillingRequestRejected);
+    // Without an API key nothing is sent.
+    const fetcher = vi.fn();
+    await expect(new PaddleSubscriptionProvider(() => ({ ...config, apiKey: undefined }), fetcher as any).cancelCheckout('txn_1'))
+      .rejects.toThrow(new BillingRequestRejected('Paddle API key is not configured'));
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('talks to the live API outside the sandbox', async () => {
+    const api = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', status: 'canceled' } });
+    await api.provider({ environment: 'live' }).cancelAtPeriodEnd({ subscriptionId: 'sub_1', idempotencyKey: 'k' });
+    expect(api.requests[0]).toMatchObject({ url: 'https://api.paddle.com/subscriptions/sub_1',
+      headers: { Authorization: `Bearer ${config.apiKey}`, 'Paddle-Version': '1' } });
+  });
+
+  it('returns only a genuine Paddle payment-method link as the billing portal', async () => {
+    const portal = (url: unknown) => paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', management_urls: { update_payment_method: url } } })
+      .provider().createPortal({ customerId: '', subscriptionId: 'sub_1', returnUrl: '', idempotencyKey: 'k' });
+    await expect(portal('https://sandbox-customer-portal.paddle.com/cpl_1')).resolves.toEqual({ url: 'https://sandbox-customer-portal.paddle.com/cpl_1' });
+    await expect(portal('https://customer-portal.paddle.com/cpl_1')).resolves.toBeTruthy();
+    for (const url of ['https://customer-portal.paddle.com.evil.example/', 'http://customer-portal.paddle.com/cpl', undefined])
+      await expect(portal(url)).rejects.toThrow(new BillingRequestRejected('Paddle has not provided a billing portal link'));
+    await expect(new PaddleSubscriptionProvider(() => config).createPortal({ customerId: '', returnUrl: '', idempotencyKey: 'k' }))
+      .rejects.toThrow(new BillingRequestRejected('no Paddle subscription exists'));
+  });
+
+  it('changes a plan only when the items differ, prorating at the next period', async () => {
+    const api = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', items: teamItems(4) }, 'PATCH /subscriptions/sub_1': { id: 'sub_1' } });
+    expect(await api.provider().changePlan({ subscriptionId: 'sub_1', plan: 'team', seats: 4, items: {}, idempotencyKey: 'k' })).toEqual({ id: 'sub_1' });
+    expect(api.requests.map((r) => r.method)).toEqual(['GET']);
+    await api.provider().changePlan({ subscriptionId: 'sub_1', plan: 'individual', seats: 1, items: {}, idempotencyKey: 'k' });
+    expect(api.requests.at(-1)).toMatchObject({ method: 'PATCH',
+      body: { items: [{ price_id: 'pri_individual', quantity: 1 }], proration_billing_mode: 'prorated_next_billing_period' } });
+  });
+
+  it('schedules cancellation once, at the end of the period', async () => {
+    for (const current of [{ status: 'canceled' }, { status: 'active', scheduled_change: { action: 'cancel' } }]) {
+      const api = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', ...current } });
+      expect(await api.provider().cancelAtPeriodEnd({ subscriptionId: 'sub_1', idempotencyKey: 'k' })).toEqual({ id: 'sub_1' });
+      expect(api.requests).toHaveLength(1);
+    }
+    const api = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', status: 'active', scheduled_change: { action: 'pause' } },
+      'POST /subscriptions/sub_1/cancel': { id: 'sub_1' } });
+    await api.provider().cancelAtPeriodEnd({ subscriptionId: 'sub_1', idempotencyKey: 'k' });
+    expect(api.requests.at(-1)).toMatchObject({ method: 'POST', body: { effective_from: 'next_billing_period' } });
+  });
+
+  it('changes seats only on a plain Team subscription', async () => {
+    const seats = (items: unknown, count = 5) => {
+      const api = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', items }, 'PATCH /subscriptions/sub_1': { id: 'sub_1' } });
+      return { api, result: api.provider().updateSeats({ subscriptionId: 'sub_1', seats: count, idempotencyKey: 'k' }) };
+    };
+    await expect(seats([{ price: { id: 'pri_individual' }, quantity: 1 }]).result)
+      .rejects.toThrow(new BillingRequestRejected('cannot update seats on a non-Team Paddle subscription'));
+    await expect(seats([...teamItems(3), { price: { id: 'pri_addon' }, quantity: 1 }]).result)
+      .rejects.toThrow(new BillingRequestRejected('Paddle subscription has unexpected items; reconcile before changing seats'));
+    const unchanged = seats(teamItems(5));
+    await unchanged.result;
+    expect(unchanged.api.requests.map((r) => r.method)).toEqual(['GET']);
+    const grown = seats(teamItems(5), 8);
+    await grown.result;
+    expect(grown.api.requests.at(-1)!.body.items).toEqual([{ price_id: 'pri_team', quantity: 1 }, { price_id: 'pri_seat', quantity: 8 - included }]);
+  });
+
+  it('cancels an unpaid checkout, never one Paddle is already charging', async () => {
+    const cancel = (status: string, patched = 'canceled') => {
+      const api = paddleApi({ 'GET /transactions/txn_1': { id: 'txn_1', status }, 'PATCH /transactions/txn_1': { id: 'txn_1', status: patched } });
+      return { api, result: api.provider().cancelCheckout('txn_1') };
+    };
+    const already = cancel('canceled');
+    await expect(already.result).resolves.toEqual({ id: 'txn_1' });
+    expect(already.api.requests).toHaveLength(1);
+    for (const status of ['paid', 'completed', 'billed'])
+      await expect(cancel(status).result).rejects.toThrow(new BillingRequestRejected('payment is already processing; wait for subscription confirmation before canceling'));
+    const open = cancel('ready');
+    await expect(open.result).resolves.toEqual({ id: 'txn_1' });
+    expect(open.api.requests.at(-1)).toMatchObject({ method: 'PATCH', body: { status: 'canceled' } });
+    await expect(cancel('draft', 'draft').result).rejects.toThrow('Paddle checkout cancellation needs reconciliation');
+  });
+
+  it('refuses to resume a checkout Paddle is already processing', async () => {
+    const api = paddleApi({ 'GET /transactions/txn_1': { id: 'txn_1', status: 'paid', items: [] } });
+    await expect(api.provider().resumeCheckout({ checkoutId: 'txn_1', plan: 'individual', seats: 1, successUrl: 'https://karmax.example/' } as any))
+      .rejects.toThrow(/processing the existing checkout/);
+    const canceled = paddleApi({ 'GET /transactions/txn_1': { id: 'txn_1', status: 'canceled' } });
+    expect(await canceled.provider().resumeCheckout({ checkoutId: 'txn_1', plan: 'individual', seats: 1, successUrl: 'https://karmax.example/' } as any)).toBeNull();
+  });
+});
+
+describe('Paddle webhook verification', () => {
+  const provider = new PaddleSubscriptionProvider(() => config);
+
+  it('rejects signatures it cannot pin to one fresh timestamp', async () => {
+    const event = signed(payload('evt_sig'));
+    const ts = /ts=(\d+)/.exec(event.signature)![1]!;
+    const h1 = /h1=([a-f0-9]+)/.exec(event.signature)![1]!;
+    for (const signature of [`ts=${ts};ts=${ts};h1=${h1}`, `h1=${h1}`, `ts=${ts}`, `ts=${ts};h1=${h1.slice(0, 63)}`, `ts=${ts};h1=zz${h1.slice(2)}`,
+      `ts=${Number(ts) + 301};h1=${h1}`, `ts=abc;h1=${h1}`])
+      await expect(provider.verifyWebhook(event.raw, signature)).rejects.toThrow(/signature/);
+    await expect(new PaddleSubscriptionProvider(() => ({ ...config, webhookSecret: undefined })).verifyWebhook(event.raw, event.signature))
+      .rejects.toThrow(/signature/);
+    // Whitespace around the parts is tolerated.
+    await expect(provider.verifyWebhook(event.raw, ` ts=${ts} ; h1=${h1} `)).resolves.toMatchObject({ id: 'evt_sig' });
+  });
+
+  it('ignores event types it does not act on, and refuses malformed ones', async () => {
+    const other = signed({ event_id: 'evt_txn', event_type: 'transaction.completed', occurred_at: '2026-09-24T12:00:00Z', data: { id: 'txn_1' } });
+    expect(await provider.verifyWebhook(other.raw, other.signature)).toEqual({ id: 'evt_txn', type: 'ignored',
+      created: Date.parse('2026-09-24T12:00:00Z') / 1000, data: { object: {} } });
+    for (const broken of [{ event_id: '' }, { occurred_at: 'yesterday' }, { event_type: 7 }, { data: null }]) {
+      const event = signed({ ...payload('evt_broken'), ...broken });
+      await expect(provider.verifyWebhook(event.raw, event.signature)).rejects.toThrow('invalid Paddle webhook event');
+    }
+    for (const snapshot of [{ id: 'txn_1' }, { customer_id: 7 }, { status: 'deleted' }, { items: null }]) {
+      const base = payload('evt_snapshot');
+      const event = signed({ ...base, data: { ...base.data, ...snapshot } });
+      await expect(provider.verifyWebhook(event.raw, event.signature)).rejects.toThrow('invalid Paddle subscription snapshot');
+    }
+  });
+
+  it('maps lifecycle events onto the shared subscription states', async () => {
+    const canceled = signed(payload('evt_canceled', 'canceled'));
+    expect(await provider.verifyWebhook(canceled.raw, canceled.signature)).toMatchObject({ type: 'customer.subscription.deleted', checkoutId: undefined });
+    const base = payload('evt_updated', 'past_due');
+    const updated = signed({ ...base, event_type: 'subscription.updated',
+      data: { ...base.data, scheduled_change: { action: 'cancel' }, current_billing_period: null } });
+    expect(await provider.verifyWebhook(updated.raw, updated.signature)).toMatchObject({ type: 'customer.subscription.updated',
+      checkoutId: undefined, data: { object: { status: 'past_due', cancel_at_period_end: true, current_period_end: undefined } } });
+  });
+});
+
+describe('Paddle request reconciliation', () => {
+  const checkout = { kind: 'checkout' as const, plan: 'individual' as const, seats: 1, successUrl: 'https://karmax.example/' };
+  const ours = { id: 'txn_ours', origin: 'api', status: 'draft', collection_mode: 'automatic', custom_data: { karmax_request: 'ref:checkout' },
+    items: [{ price: { id: 'pri_individual' }, quantity: 1 }] };
+  const page = (data: unknown[], next?: string) => Response.json({ data, meta: { pagination: { has_more: !!next, next } } });
+
+  it('recovers the transaction it created by its stored reference, across pages', async () => {
+    const api = paddleApi({
+      'GET /transactions': (() => { let n = 0; return () => (n++ === 0
+        ? page([{ ...ours, id: 'txn_other', custom_data: { karmax_request: 'other:checkout' } }], 'https://sandbox-api.paddle.com/transactions?after=txn_other')
+        : page([ours])); })(),
+    });
+    expect(await api.provider().reconcileRequest(checkout, 'ref', Date.parse('2026-09-24T12:00:00Z'))).toEqual({ id: 'txn_ours',
+      url: 'https://karmax.example/billing/checkout?success=https%3A%2F%2Fkarmax.example%2F&_ptxn=txn_ours' });
+    expect(api.requests[0]!.url).toBe('https://sandbox-api.paddle.com/transactions?per_page=200&origin=api&created_at[GTE]=2026-09-24T11%3A59%3A00.000Z');
+    expect(api.requests[1]!.url).toBe('https://sandbox-api.paddle.com/transactions?after=txn_other');
+  });
+
+  it('will not follow pagination off the Paddle API', async () => {
+    const api = paddleApi({ 'GET /transactions': page([], 'https://evil.example/transactions?after=x') });
+    await expect(api.provider().reconcileRequest(checkout, 'ref', Date.now())).rejects.toThrow('invalid Paddle reconciliation pagination URL');
+    expect(api.requests).toHaveLength(1);
+  });
+
+  it('gives up, proving nothing, after twenty pages', async () => {
+    const api = paddleApi({ 'GET /transactions': () => page([], '/transactions?after=more') });
+    expect(await api.provider().reconcileRequest(checkout, 'ref', Date.now())).toBeNull();
+    expect(api.requests).toHaveLength(20);
+  });
+
+  it('refuses to adopt a match that is not the checkout it asked for', async () => {
+    for (const change of [{ collection_mode: 'manual' }, { id: 'txn_UPPER' }, { items: [{ price: { id: 'pri_team' }, quantity: 1 }] }]) {
+      const api = paddleApi({ 'GET /transactions': page([{ ...ours, ...change }]) });
+      expect(await api.provider().reconcileRequest(checkout, 'ref', Date.now())).toBeNull();
+    }
+    const invalid = paddleApi({ 'GET /transactions': Response.json({ data: { not: 'a list' } }) });
+    await expect(invalid.provider().reconcileRequest(checkout, 'ref', Date.now())).rejects.toThrow(/invalid data/);
+  });
+
+  it('checks a known checkout id first and searches only if it was canceled', async () => {
+    const direct = paddleApi({ 'GET /transactions/txn_ours': ours });
+    expect(await direct.provider().reconcileRequest({ ...checkout, checkoutId: 'txn_ours' }, 'ref', Date.now())).toMatchObject({ id: 'txn_ours' });
+    expect(direct.requests).toHaveLength(1);
+    const replaced = paddleApi({ 'GET /transactions/txn_old': { ...ours, id: 'txn_old', status: 'canceled' }, 'GET /transactions': page([]) });
+    expect(await replaced.provider().reconcileRequest({ ...checkout, checkoutId: 'txn_old' }, 'ref', Date.now())).toEqual({ absent: true });
+  });
+
+  it('cannot reconcile an intent missing what it would compare', async () => {
+    const api = paddleApi({ 'GET /subscriptions/sub_1': { id: 'sub_1', items: teamItems(3) }, 'GET /transactions/txn_1': { id: 'txn_1', status: 'canceled' } });
+    const provider = api.provider();
+    expect(await provider.reconcileRequest({ kind: 'abandon' }, 'ref', Date.now())).toBeNull();
+    expect(await provider.reconcileRequest({ kind: 'change' }, 'ref', Date.now())).toBeNull();
+    expect(await provider.reconcileRequest({ kind: 'seats', subscriptionId: 'sub_1', plan: 'team' }, 'ref', Date.now())).toBeNull();
+    expect(await provider.reconcileRequest({ kind: 'checkout', plan: 'team', seats: 3 }, 'ref', Date.now())).toBeNull();
+    expect(api.requests).toHaveLength(1);
+    // What was asked for is already true at Paddle.
+    expect(await provider.reconcileRequest({ kind: 'seats', subscriptionId: 'sub_1', plan: 'team', seats: 3 }, 'ref', Date.now())).toEqual({ id: 'sub_1' });
+    expect(await provider.reconcileRequest({ kind: 'abandon', checkoutId: 'txn_1' }, 'ref', Date.now())).toEqual({ id: 'txn_1' });
   });
 });
