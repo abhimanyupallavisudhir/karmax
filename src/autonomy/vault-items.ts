@@ -230,7 +230,21 @@ export function totpCode(seed: string, nowMs = Date.now(), stepSeconds = 30, dig
   return code;
 }
 
-// ── the service ──────────────────────────────────────────────────────────────
+// ── the service ────────────────────────────────────────────────────���─────────
+
+const TURN_KEYS = '.karmax-injection/vault';
+
+/** Delete the key files `envFor` wrote for a turn that has ended. */
+export async function removeTurnKeys(keys: World | string): Promise<void> {
+  if (typeof keys === 'string') { fs.rmSync(keys, { recursive: true, force: true }); return; }
+  const removed = await keys.exec('rm', ['-rf', '--', path.posix.join(keys.handle.root, TURN_KEYS)]);
+  if (removed.code !== 0) throw new Error('could not remove the turn\'s key files');
+}
+
+/** Remove every host copy of a vault key left by versions before AU-33. */
+export function removeLegacyKeyCopies(home = paths().state): void {
+  fs.rmSync(path.join(home, 'vault-items'), { recursive: true, force: true });
+}
 
 export class VaultItems {
   constructor(
@@ -632,9 +646,11 @@ export class VaultItems {
    * Env for a task's agent subprocess from its granted `auto` items: `env`
    * items contribute their KEY=VALUE lines, `api-key` items their secret under
    * `envVar`, `ssh-key` items a 0600 key file path under `envVar`. `ask` items
-   * and unattached items never inject ambiently.
+   * and unattached items never inject ambiently. Key files are written to
+   * `keys` — the receiving world, or a host directory — for one turn, and
+   * `removeTurnKeys` deletes them when it ends (AU-33).
    */
-  async envFor(taskId: string, caps: Capability[], world?: World): Promise<Record<string, string>> {
+  async envFor(taskId: string, caps: Capability[], keys?: World | string): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
     for (const item of (await this.list())) {
       if (!['env', 'api-key', 'ssh-key'].includes(item.type)) continue;
@@ -651,7 +667,7 @@ export class VaultItems {
         } else if (item.type === 'api-key' && item.envVar && item.fields.includes('secret')) {
           env[item.envVar] = (await this.resolveField(item, 'secret', { taskId, mode: 'use' }));
         } else if (item.type === 'ssh-key' && item.envVar && item.fields.includes('privateKey')) {
-          env[item.envVar] = (await this.materializeKey(item, { taskId }, world));
+          env[item.envVar] = (await this.materializeKey(item, { taskId }, keys));
         }
       } catch (e) {
         // One corrupted/missing secret must not block every turn granted to it;
@@ -768,26 +784,28 @@ export class VaultItems {
     });
   }
 
-  /** Write a key to a 0600 file (idempotent per save) and return its path. */
-  private async materializeKey(item: VaultItem, ctx: { taskId?: string }, world?: World): Promise<string> {
-    if (world) {
-      const secret = await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' });
-      const relative = `.karmax-injection/vault/${crypto.createHash('sha256').update(item.id).digest('hex')}.key`;
-      await world.writeFile(relative, secret.endsWith('\n') ? secret : `${secret}\n`);
-      const file = path.posix.join(world.handle.root, relative);
-      const mode = await world.exec('chmod', ['600', file]);
-      if (mode.code !== 0) throw new Error('could not restrict remote key file permissions');
+  /** Write a key to a 0600 file for this turn and return its path. */
+  private async materializeKey(item: VaultItem, ctx: { taskId?: string }, keys?: World | string): Promise<string> {
+    if (!keys) throw new Error('no turn directory for key files');
+    const secret = await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' });
+    const content = secret.endsWith('\n') ? secret : `${secret}\n`;
+    const name = `${crypto.createHash('sha256').update(item.id).digest('hex')}.key`;
+    if (typeof keys === 'string') {
+      fs.mkdirSync(keys, { recursive: true, mode: 0o700 });
+      const file = path.join(keys, name);
+      fs.writeFileSync(file, content, { mode: 0o600 });
       return file;
     }
-    const file = path.join(this.keyDir(item.id), 'key');
-    if (!fs.existsSync(file)) {
-      const secret = (await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' }));
-      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(file, secret.endsWith('\n') ? secret : `${secret}\n`, { mode: 0o600 });
-    }
+    const relative = `${TURN_KEYS}/${name}`;
+    await keys.writeFile(relative, content);
+    const file = path.posix.join(keys.handle.root, relative);
+    const mode = await keys.exec('chmod', ['600', file]);
+    if (mode.code !== 0) throw new Error('could not restrict remote key file permissions');
     return file;
   }
 
+  /** Copies of keys that versions before AU-33 kept on the host until the item
+   *  was deleted; nothing reads them any more. */
   private keyDir(id: string): string {
     return path.join(this.home, 'vault-items', id);
   }

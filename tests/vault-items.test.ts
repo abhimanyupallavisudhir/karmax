@@ -16,6 +16,8 @@ import {
   itemCaps,
   domainMatches,
   itemHandle,
+  removeTurnKeys,
+  removeLegacyKeyCopies,
 } from '../src/autonomy/vault-items.js';
 import { fillViaCdp } from '../src/autonomy/fill.js';
 
@@ -383,7 +385,7 @@ describe('the pull model: requests + human resolutions (§7)', () => {
 
 describe('spawn-time materialization (§5A)', () => {
   it('injects env bags, api keys under envVar, and ssh keys as 0600 files', async () => {
-    const { items } = makeService();
+    const { items, dir } = makeService();
     const caps = ['use-credential:*'];
     (await items.save({ type: 'env', label: 'proj env', secrets: { env: '# comment\nFOO=bar\nexport QUOTED="a b"\nbad line\n' } }));
     (await items.save({ type: 'api-key', label: 'openai', envVar: 'OPENAI_API_KEY', secrets: { secret: 'sk-123' } }));
@@ -391,14 +393,26 @@ describe('spawn-time materialization (§5A)', () => {
     // an `ask` item never injects ambiently
     (await items.save({ type: 'api-key', label: 'guarded', envVar: 'GUARDED', policy: { use: 'ask' }, secrets: { secret: 'nope' } }));
 
-    const env = (await items.envFor('t1', caps));
+    // Key files live for one turn, in a directory the turn owns (AU-33).
+    const turn = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-turn-keys-'));
+    const env = (await items.envFor('t1', caps, turn));
     expect(env.FOO).toBe('bar');
     expect(env.QUOTED).toBe('a b');
     expect(env.OPENAI_API_KEY).toBe('sk-123');
     expect(env.GUARDED).toBeUndefined();
     expect(fs.readFileSync(env.DEPLOY_KEY_FILE!, 'utf8')).toBe('PRIVATE\n');
     expect(fs.statSync(env.DEPLOY_KEY_FILE!).mode & 0o777).toBe(0o600);
-    expect(env.DEPLOY_KEY_FILE).toContain(ssh.id);
+    expect(path.dirname(env.DEPLOY_KEY_FILE!)).toBe(turn);
+    expect(fs.existsSync(path.join(dir, 'state', 'vault-items', ssh.id))).toBe(false);
+    await removeTurnKeys(turn);
+    expect(fs.existsSync(env.DEPLOY_KEY_FILE!)).toBe(false);
+    // Without a turn directory a key is not written anywhere.
+    expect((await items.envFor('t1', caps)).DEPLOY_KEY_FILE).toBeUndefined();
+    // Host copies kept by earlier versions are removed at boot.
+    fs.mkdirSync(path.join(dir, 'state', 'vault-items', ssh.id), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'state', 'vault-items', ssh.id, 'key'), 'PRIVATE');
+    removeLegacyKeyCopies(path.join(dir, 'state'));
+    expect(fs.existsSync(path.join(dir, 'state', 'vault-items'))).toBe(false);
     // ungranted task gets nothing
     expect(Object.keys((await items.envFor('t2', [])))).toHaveLength(0);
   });
@@ -527,7 +541,7 @@ describe('zero-exposure CDP fill (§5B)', () => {
       cdpUrl: `http://127.0.0.1:${port}`,
       selector: '#password',
       text: 's3cret', expectDomains: ['example.com'],
-    })).rejects.toThrow(/Karmax-managed chrome-devtools browser.*cdpUrl/);
+    })).rejects.toThrow(/Is this task's chrome-devtools browser still open/);
   });
 });
 

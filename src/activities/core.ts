@@ -47,7 +47,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import type { AuthorizationService } from '../platform/authorization.js';
 import { CredentialBroker } from '../autonomy/broker.js';
-import { VaultItems } from '../autonomy/vault-items.js';
+import { VaultItems, removeTurnKeys } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
@@ -2414,6 +2414,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // call ONLY — the setup above is cheap — and released in `finally` below.
       let releaseSlot: () => void | Promise<void> = () => {};
       let mcpCleanup: (() => Promise<void>) | undefined;
+      let turnKeys: World | string | undefined;
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
@@ -2589,10 +2590,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               : (await gitEnvFor(args.worldHandle, args.taskId));
             // Granted `auto` vault items materialize into the work-command env
             // (wiki plans/PLAN-passwords §5A): .env bags, API keys under their envVar,
-            // SSH keys as 0600 files inside the receiving world.
+            // SSH keys as 0600 files inside the receiving world, removed when the
+            // turn ends (AU-33).
             // Item resolution is per-organization (the tenant boundary), so bind
             // to the task's org — not the module-level personal-org instance.
-            const vaultEnv = await orgVaultItems.envFor(args.taskId, effective, isRemote(args.worldHandle.kind) ? world : undefined);
+            turnKeys = isRemote(args.worldHandle.kind) ? world : fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-turn-keys-'));
+            const vaultEnv = await orgVaultItems.envFor(args.taskId, effective, turnKeys);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
@@ -2834,7 +2837,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           finally {
             releaseConfirm();
             try { await mcpCleanup?.(); }
-            finally { await publishLegacyAgentState(undefined); }
+            finally {
+              // A world that cannot be reached now drops its keys with the world.
+              try { if (turnKeys) await removeTurnKeys(turnKeys).catch((e) => console.warn(`[vault] turn key files not removed: ${e instanceof Error ? e.message : e}`)); }
+              finally { await publishLegacyAgentState(undefined); }
+            }
           }
         }
       }
