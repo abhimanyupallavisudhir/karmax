@@ -4,6 +4,10 @@ import { NativeConnection, Worker, bundleWorkflowCode } from '@temporalio/worker
 import { startDevServer } from '../src/temporal/dev-server.js';
 import { makeClient } from '../src/temporal/client.js';
 import { replayRunningWorkflows } from '../src/ops/replay-check.js';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // A running workflow replays its recorded history under whatever code the next
 // worker loads. `deploy/karmax update` replays every running workflow under the
@@ -17,6 +21,17 @@ it('replays every running workflow under a bundle and names each one it cannot r
   });
   const taskQueue = 'replay-check';
   try {
+    // The updater runs the check in the new image before anything has started
+    // with it: the app's database URL file does not exist yet on the first
+    // upgrade to a release with its own role, and the check needs only Temporal.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-replay-cli-'));
+    const cli = spawnSync(process.execPath, ['--import', 'tsx', 'src/scripts/replay-check.ts'], { encoding: 'utf8', timeout: 120_000,
+      env: { ...process.env, KARMAX_HOME: home, KARMAX_TEMPORAL_ADDRESS: server.address, KARMAX_TEMPORAL_NAMESPACE: server.namespace,
+        KARMAX_DATABASE_URL_FILE: path.join(home, 'missing', 'database_url') } });
+    fs.rmSync(home, { recursive: true, force: true });
+    expect(cli.status, cli.stderr).toBe(0);
+    expect(cli.stdout).toContain('Replayed all 0 running workflows under this release.');
+
     const recorded = await bundle('recorded');
     const worker = await Worker.create({
       connection: native, namespace: server.namespace, taskQueue, workflowBundle: recorded,

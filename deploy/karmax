@@ -627,7 +627,7 @@ cmd_update() {
       dc build app || true
       cleanup_migration
       migration_backup=''
-      die "deployment $target cannot replay the workflows running now; production remains at $previous. Fix the release, or rerun with KARMAX_SKIP_REPLAY_CHECK=1 only if the workflows listed above may break"
+      die "deployment $target stopped by the replay check, which lists above the running workflows it cannot replay or why it could not run; production remains at $previous. Fix the release, or rerun with KARMAX_SKIP_REPLAY_CHECK=1 only if those workflows may break"
     fi
   fi
   if ! cmd_backup_candidate; then

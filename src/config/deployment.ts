@@ -62,8 +62,8 @@ const SECRET_FILE_ENV = [
  * process.env. Explicit NAME values win, making local and managed-secret
  * deployments use the same downstream configuration. */
 export function hydrateSecretFiles(env: NodeJS.ProcessEnv = process.env,
-  read: (filename: string) => string): void {
-  for (const name of SECRET_FILE_ENV) {
+  read: (filename: string) => string, names: readonly (typeof SECRET_FILE_ENV)[number][] = SECRET_FILE_ENV): void {
+  for (const name of names) {
     if (env[name]) continue;
     const filename = env[`${name}_FILE`]?.trim();
     if (filename) env[name] = read(filename).trimEnd();

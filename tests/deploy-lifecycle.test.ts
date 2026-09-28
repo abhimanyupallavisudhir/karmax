@@ -378,7 +378,7 @@ it('refuses a release that cannot replay a running workflow, leaving production 
   const h = checkout();
   const result = h.run(['update', h.target], 'replay-check');
   expect(result.status).not.toBe(0);
-  expect(result.stderr).toContain('cannot replay');
+  expect(result.stderr).toContain('stopped by the replay check');
   expect(result.stderr).toContain(`production remains at ${h.previous}`);
   expect(h.git('rev-parse', 'HEAD')).toBe(h.previous);
   const calls = h.calls().map(args => args.join(' '));
