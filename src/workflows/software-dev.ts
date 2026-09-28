@@ -24,7 +24,7 @@ import { ActivityCancellationType } from '@temporalio/common';
 import type { childActivities } from '../activities/children.js';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
-import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED } from '../coordinators/names.js';
+import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED, RELIST_ACCOUNT_GRANT } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { renderRespondPrompt } from '../domain/respond-prompt.js';
@@ -762,14 +762,18 @@ async function softwareDevImpl(
   let responderRounds = 0;
   let subtaskNags = 0;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
-  const accountGrants = new Map<string, {
+  type AccountGrant = {
     accountId: string;
     configHome?: string;
     apiKeyHandle?: string;
     credentialKind?: CredentialKind;
     credentialProvider?: string;
-  }>();
+  };
+  const accountGrants = new Map<string, AccountGrant>();
   const agentSlotGrants = new Set<string>();
+  // The last failed turn's provider limit was reported against its leased
+  // credential, so its re-lease parks until that credential recovers.
+  let limitReportedToCoordinator = false;
   let turnSeq = 0;
   let accountPool = 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
   // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
@@ -1523,6 +1527,7 @@ async function softwareDevImpl(
       let attempt = 0;
       let infraRetries = 0;
       for (; attempt <= MAX_RESOLVE_ATTEMPTS; attempt++) {
+        limitReportedToCoordinator = false;
         try {
           return await fn();
         } catch (err) {
@@ -1592,6 +1597,11 @@ async function softwareDevImpl(
             if (auto.resolved) {
               log.info('auto-resolve matched', { stage: stageName, action: auto.action, note: auto.note });
               error = undefined;
+              // A limit reported against the leased credential re-leases through a
+              // coordinator park lasting until that credential recovers: a wait for
+              // quota or a sign-in, not a failed attempt (task 381 escalated after
+              // two early quota retries).
+              if (providerLimit && limitReportedToCoordinator && patched('software-dev-provider-limit-wait-v1')) attempt--;
               continue;
             }
             // Scripted recovery missed. With the process-wide Resolve-agent flag
@@ -1899,41 +1909,60 @@ async function softwareDevImpl(
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
       return await admittedTurn(agentTurnId(taskId, turnSeq++), undefined, status);
     }
-    // Credential-policy allow-list for real providers (precedence + enable/disable,
-    // resolved global→project→task); mock uses the coordinator's provider fallback.
-    const allowed = compactStart ? prepared?.allowed :
-      credentialProvider !== 'mock'
-        ? await core.resolveCredentialOrder({ taskId, projectId: input.projectId, provider: credentialProvider, role, task: liveInput }).catch(() => undefined)
-        : undefined;
     const displayProvider =
       credentialProvider === 'claude' || credentialProvider === 'codex' || credentialProvider === 'opencode'
       || credentialProvider === 'kimi' || credentialProvider === 'grok' || credentialProvider === 'mock'
         ? credentialProvider
         : undefined;
+    // Credential-policy allow-list for real providers (precedence + enable/disable,
+    // resolved global→project→task); mock uses the coordinator's provider fallback.
+    const resolveAllowed = async () => credentialProvider !== 'mock'
+      ? await core.resolveCredentialOrder({ taskId, projectId: input.projectId, provider: credentialProvider, role, task: liveInput }).catch(() => undefined)
+      : undefined;
+    // Histories recorded before credential re-listing resolved the first allow-list
+    // BEFORE this turn's id; later ones resolve it after. Only the run's first
+    // `agent-turn-run-identity-v1` marker is a command, so only it can tell them
+    // apart: replay reports the marker unknown here exactly when the history
+    // recorded it after that resolution. Live executions take the current order.
+    const resolvedFirst = !compactStart && !patched('agent-turn-run-identity-v1');
+    const firstAllowed = resolvedFirst ? await resolveAllowed() : undefined;
     const turnId = agentTurnId(taskId, turnSeq++);
-    const lease = await coordinator.leaseAccount(taskId, turnId, credentialProvider, allowed);
-    const priorStatus = status;
-    status = 'waiting';
-    // The existing publication command is retained for replay. New activity
-    // results say whether the request really parked; old recorded void results
-    // keep the historical account-wait state.
-    waitingFor = lease?.waiting === false
-      ? { kind: 'agentSlot', provider: displayProvider, detail: 'Starting agent' }
-      : { kind: 'account', provider: credentialProvider,
-          ...(lease?.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
-          ...(lease?.detail ? { detail: lease.detail } : {}) };
-    if (!compactStart || lease?.waiting !== false) await publish();
-    if (liveAgentStates) {
-      // The coordinator owns refresh timers and signals every grant. An arbitrary
-      // workflow-side timeout used to fall through with no grant and accidentally
-      // run on the profile credential, bypassing the exhausted account policy.
-      await condition(() => accountGrants.has(turnId) || cancelled);
-    } else {
-      // Immutable v1 command history: extant executions recorded this timer.
-      await condition(() => accountGrants.has(turnId) || cancelled, '6 hours');
+    let priorStatus = status;
+    let requests = 0;
+    let grant: AccountGrant | undefined;
+    // The coordinator hands a parked request back when credentials change under
+    // it (a new login, a policy edit); resolve the allow-list again and re-ask.
+    for (;;) {
+      // The first ask may use a list resolved above (by a compact start, with the
+      // provider); a re-ask must not reuse that stale list.
+      const allowed = requests === 0 && compactStart ? prepared?.allowed
+        : requests === 0 && resolvedFirst ? firstAllowed
+        : await resolveAllowed();
+      const lease = await coordinator.leaseAccount(taskId, turnId, credentialProvider, allowed);
+      if (requests++ === 0) priorStatus = status;
+      status = 'waiting';
+      // The existing publication command is retained for replay. New activity
+      // results say whether the request really parked; old recorded void results
+      // keep the historical account-wait state.
+      waitingFor = lease?.waiting === false
+        ? { kind: 'agentSlot', provider: displayProvider, detail: 'Starting agent' }
+        : { kind: 'account', provider: credentialProvider,
+            ...(lease?.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+            ...(lease?.detail ? { detail: lease.detail } : {}) };
+      if (!compactStart || lease?.waiting !== false) await publish();
+      if (liveAgentStates) {
+        // The coordinator owns refresh timers and signals every grant. An arbitrary
+        // workflow-side timeout used to fall through with no grant and accidentally
+        // run on the profile credential, bypassing the exhausted account policy.
+        await condition(() => accountGrants.has(turnId) || cancelled);
+      } else {
+        // Immutable v1 command history: extant executions recorded this timer.
+        await condition(() => accountGrants.has(turnId) || cancelled, '6 hours');
+      }
+      grant = accountGrants.get(turnId);
+      accountGrants.delete(turnId);
+      if (grant?.accountId !== RELIST_ACCOUNT_GRANT || cancelled) break;
     }
-    const grant = accountGrants.get(turnId);
-    accountGrants.delete(turnId);
     if (liveAgentStates && cancelled && !grant) await coordinator.cancelAccount(taskId, turnId).catch(() => undefined);
     if (!liveAgentStates) {
       // Preserve v1's in-memory transition. It intentionally did not publish here;
@@ -1948,12 +1977,13 @@ async function softwareDevImpl(
     }
     if (liveAgentStates && cancelled) {
       if (grant && grant.accountId !== '(passthrough)' && grant.accountId !== '(denied)'
-        && patched('software-dev-return-cancelled-grant-v1'))
+        && grant.accountId !== RELIST_ACCOUNT_GRANT && patched('software-dev-return-cancelled-grant-v1'))
         await coordinator.returnAccount(grant.accountId, { taskId, turnId }).catch(() => undefined);
       throw new Cancelled();
     }
-    // The coordinator denies a turn whose every allowed credential needs human action
-    // (#5): escalate rather than run/park.
+    // A coordinator replaying pre-credential-wait history denies a turn whose every
+    // allowed credential needs human action (#5): escalate rather than run/park.
+    // Current coordinators park that request until a credential recovers.
     if (grant?.accountId === '(denied)') {
       if (cancelled) throw new Cancelled();
       throw new CredentialDenied(`No usable ${credentialProvider} credential — every allowed login/key needs attention (funding, re-auth, or re-enable it in credential settings).`);
@@ -1974,13 +2004,13 @@ async function softwareDevImpl(
       if (grant && !passthrough && !cancelled && !isCancellation(err)) {
         const cls = limitFailureClassification(err);
         if (cls?.hard) {
-          await coordinator.setAccountAvailability({
+          limitReportedToCoordinator = await coordinator.setAccountAvailability({
             accountId: grant.accountId,
             status: 'needs-attention',
             ...(cls.diagnostic ? { failure: {
               kind: cls.kind, provider: cls.provider, diagnostic: cls.diagnostic,
             } } : {}),
-          }).catch(() => undefined);
+          }).then(() => true, () => false);
         } else if (cls?.limited) {
           // Must use the same version-selected proxy as `setAccountAvailability`
           // above: on the unbounded `coord` this retries forever, and the activity
@@ -1988,7 +2018,7 @@ async function softwareDevImpl(
           // coordinator that keeps rejecting freezes the task here with no route to
           // a human. `.catch()` cannot save it; an unlimited-retry activity never
           // rejects, it just never returns.
-          await coordinator
+          limitReportedToCoordinator = await coordinator
             .reportAccountExhausted({
               accountId: grant.accountId,
               window: cls.window ?? '5h',
@@ -1998,7 +2028,7 @@ async function softwareDevImpl(
                 kind: cls.kind, provider: cls.provider, diagnostic: cls.diagnostic,
               } } : {}),
             })
-            .catch(() => undefined);
+            .then(() => true, () => false);
         }
       }
       throw err;
@@ -2418,7 +2448,7 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
   async function spawnSubTasks(list: SubTaskRequest[]) {
-    await core.commitWork(world as any, `karmax: snapshot before sub-tasks for ${taskId}`);
+    await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
     for (const s of list) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
       // no per-parent child cap; execution is governed by shared admission control.
@@ -3402,10 +3432,10 @@ Inspect the complete current diff and specifically compare its delta from the re
           : providerQueueAccepted
           ? 'The configured provider owns landing order and is validating the integration candidate.'
           : frontHeldLanding
-            ? 'Waiting for the authoritative karmax landing slot for exact-candidate validation.'
+            ? 'Waiting for the authoritative tavya landing slot for exact-candidate validation.'
             : fairLanding
               ? 'Waiting for fair fallback admission unless the provider accepts landing ownership.'
-              : 'Waiting for a short krmax admission turn before handing landing to GitHub.',
+              : 'Waiting for a short tavya admission turn before handing landing to GitHub.',
       };
       if (providerQueueAccepted) mergeQueuePos = undefined;
     }
@@ -3839,7 +3869,7 @@ Inspect the complete current diff and specifically compare its delta from the re
                   ? 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and return to this same Do conversation for verification before landing.'
                   : 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and integration-agent review before landing.'
                 : fairLanding
-                  ? 'The existing task intent is preserved, but this failure released every Karmax admission slot. After repair, repository policy decides whether fresh review is required, and the proposal requests landing again at the back.'
+                  ? 'The existing task intent is preserved, but this failure released every tavya admission slot. After repair, repository policy decides whether fresh review is required, and the proposal requests landing again at the back.'
                   : 'The existing human intent authorization is preserved; an automated integration reviewer will validate the repair before it is requeued.'
               : 'This change invalidated the prior authorization, so the updated proposal must pass human Review.'}`
             : explicitPrCycle
@@ -4134,7 +4164,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     if (!lifecycleReplacement && githubPrLifecycle && world && prs.length
       && (githubAuthoritativeCancellation || prs.some((p) => p.state === 'open'))) {
       const reconciled = await core.closePrs(world as any, prs,
-        'The karmax task for this branch was cancelled; closing the pull request.').catch(() => undefined);
+        'The tavya task for this branch was cancelled; closing the pull request.').catch(() => undefined);
       prs = githubAuthoritativeCancellation && reconciled
         ? reconciled
         : prs.map((p) => ({ ...p, state: 'closed' as const }));

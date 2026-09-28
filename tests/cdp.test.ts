@@ -59,7 +59,7 @@ describe('listPages', () => {
   it('explains how to get a reachable browser when discovery fails', async () => {
     const browser = await fakeBrowser([], { listStatus: 500 });
     try {
-      await expect(listPages(browser.url)).rejects.toThrow(/cannot reach Chrome DevTools at http:\/\/127\.0\.0\.1:\d+.*Karmax-managed chrome-devtools browser.*HTTP 500/);
+      await expect(listPages(browser.url)).rejects.toThrow(/cannot reach Chrome DevTools at http:\/\/127\.0\.0\.1:\d+.*tavya-managed chrome-devtools browser.*HTTP 500/);
     } finally {
       await browser.close();
     }

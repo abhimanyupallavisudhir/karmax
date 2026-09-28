@@ -20,6 +20,7 @@ import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 import { exposeRemoteNodeCommand, installRemoteNodeCommand, PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from './remote-node.js';
 import { collectStartupProbe, StartupProtocolTrace } from './startup-diagnostics.js';
+import { BRAND } from '../domain/brand.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
@@ -1489,7 +1490,7 @@ async function repairBrowser(world: World, runtimeBin: string | undefined, probe
               ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 60_000,
           })
         : dependencyInstall;
-      if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a Krmax browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
+      if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a ${BRAND} browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
     }
   }
   return { chromium, bin: resolvedBin, cache: resolvedCache };

@@ -306,7 +306,7 @@ describe('hosted subscription billing', () => {
     await expect((async () => (await billing.handleWebhook(event(retryId, 'customer.subscription.updated', {
       id: 'sub_acme', customer: `cus_${organization.id}`, status: 'active',
       items: { data: [{ id: 'si_unknown', price: { id: 'price_unknown' }, quantity: 1 }] },
-    }, 101))))()).rejects.toThrow('no configured Karmax plan price');
+    }, 101))))()).rejects.toThrow('no configured tavya plan price');
     expect((await billing.handleWebhook(event(retryId, 'customer.subscription.updated', {
       id: 'sub_acme', customer: `cus_${organization.id}`, status: 'active',
       items: { data: [{ id: 'si_individual', price: { id: 'price_individual' }, quantity: 1 }] },

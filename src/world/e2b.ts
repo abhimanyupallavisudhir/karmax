@@ -32,6 +32,7 @@ import { boundedResponseBody } from './http.js';
 import { serviceHomeLabel } from './services.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
+import { taskBranch } from '../domain/brand.js';
 
 const HOME = '/home/user';
 const ROOT = '/home/user/karmax';
@@ -226,7 +227,7 @@ export class E2BWorldProvider implements WorldProvider {
         id: spec.taskId,
         root,
         workspaceRoot: root,
-        branch: spec.branch ?? `karmax/${spec.taskId}`,
+        branch: spec.branch ?? taskBranch(spec.taskId),
         base: repos[0]?.base ?? spec.base,
         target: repos[0]?.target ?? spec.target,
         repo: repos[0]?.repo,

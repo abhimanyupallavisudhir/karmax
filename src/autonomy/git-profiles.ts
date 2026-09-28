@@ -9,6 +9,7 @@ import { git, isolatedGitEnvironment } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
 import { shellQuote } from '../util/shell.js';
 import { paths } from '../config/paths.js';
+import { BRAND } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
 
@@ -289,8 +290,8 @@ export class GitProfiles {
     };
     const profile = (await this.save({
       name: GITHUB_AUTOMATION_PROFILE,
-      userName: customIdentity.userName || 'krmax',
-      userEmail: customIdentity.userEmail || `krmax+${this.organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost`,
+      userName: customIdentity.userName || BRAND,
+      userEmail: customIdentity.userEmail || `${BRAND}+${this.organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost`,
       ...(Object.keys(customIdentity).length ? { customIdentity } : {}),
       signingKey: args.signingKey,
       clearSigningKey: args.removeSigningKey,
@@ -415,7 +416,7 @@ export class GitProfiles {
       });
     } else {
       const name = await git(process.cwd(), ['config', '--global', 'user.name']);
-      checks.push({ label: 'host git identity', ok: name.code === 0 && !!name.stdout.trim(), detail: name.stdout.trim() || 'unset — karmax commits as karmax@localhost' });
+      checks.push({ label: 'host git identity', ok: name.code === 0 && !!name.stdout.trim(), detail: name.stdout.trim() || `unset — ${BRAND} commits as ${BRAND}@localhost` });
     }
     // A GitHub API token for remote policy 'pr'. PRs go through the REST API, so
     // this is a token question, not a `gh` installation question — the CLI is

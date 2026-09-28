@@ -64,7 +64,7 @@ describe('Phone Access status', () => {
   it('leaves an unrecognized route alone without guessing its port', async () => {
     const status = await controller(tailscale({ serve: JSON.stringify({ TCP: { 22: { TCPForward: '127.0.0.1:22' } } }) })).status();
     expect(status).toMatchObject({ state: 'conflict', canSetup: false, canEnable: false, canDisable: false,
-      detail: 'Tailscale already routes this phone address to another local service. Krmax left that configuration untouched.' });
+      detail: 'Tailscale already routes this phone address to another local service. tavya left that configuration untouched.' });
     expect(status.fallbackCommands).toBeUndefined();
   });
 

@@ -375,7 +375,11 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
       note = modelLimit[1];
     }
   }
-  const resetMatch = m.match(/resets?\s+([^\n."']+?)(?:\s*[.\n"']|$)/i);
+  // "resets Jul 5, 2:19am" (Claude) · "try again at 5:55 PM" / "in 20 minutes" (Codex).
+  // Message-only failures in older histories keep the routing they recorded.
+  const resetMatch = options.legacy
+    ? m.match(/resets?\s+([^\n."']+?)(?:\s*[.\n"']|$)/i)
+    : m.match(/(?:resets?|try again)\s+(?:at\s+)?([^\n."']+?)(?:\s*[.\n"']|$)/i);
   const resetHint = resetMatch ? resetMatch[1]!.trim() : undefined;
   return { limited: true, kind: 'quota', window, ...(resetHint ? { resetHint } : {}), ...(note ? { note } : {}) };
 }

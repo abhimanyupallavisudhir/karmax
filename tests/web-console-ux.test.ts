@@ -298,7 +298,7 @@ describe('copy', () => {
       const body = fs.readFileSync(path.join(webDir, name), 'utf8');
       expect(body, `${name} capitalizes the product name in prose`).not.toMatch(/Krmax/);
     }
-    expect(html).toContain('<title>krmax</title>');
+    expect(html).toContain('<title>tavya</title>');
   });
 
   it('does not leak internal codenames or internal concept names', () => {

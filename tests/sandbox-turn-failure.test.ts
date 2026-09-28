@@ -19,7 +19,7 @@ async function failTurn(failure: Error, diagnosis: WorldDiagnosis | undefined) {
   const worlds = new WorldRegistry();
   let asked: { since: number } | undefined;
   const world = {
-    handle: { kind: 'fake-remote', id: 'sandbox-task', root: '/workspace', branch: 'karmax/sandbox-task', base: 'main' },
+    handle: { kind: 'fake-remote', id: 'sandbox-task', root: '/workspace', branch: 'tavya/sandbox-task', base: 'main' },
     async exec() { return { code: 0, stdout: '', stderr: '' }; },
     async writeFile() {}, async readFile() { return ''; }, async listFiles() { return []; }, async destroy() {},
     async diagnose(window: { since: number }) { asked = window; return diagnosis; },
@@ -94,7 +94,7 @@ describe('sandbox-caused turn failures', () => {
     const store = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();
     const world = {
-      handle: { kind: 'fake-remote', id: 'retry-task', root: '/workspace', branch: 'karmax/retry-task', base: 'main' },
+      handle: { kind: 'fake-remote', id: 'retry-task', root: '/workspace', branch: 'tavya/retry-task', base: 'main' },
       async exec() { return { code: 0, stdout: '', stderr: '' }; },
       async writeFile() {}, async readFile() { return ''; }, async listFiles() { return []; }, async destroy() {},
       async diagnose() { return exhausted; },
