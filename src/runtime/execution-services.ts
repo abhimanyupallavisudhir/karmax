@@ -1,4 +1,4 @@
-import { WorldReferenceKeys } from '../world/reference-keys.js';
+import { WorldReferenceKeys, unreadableReferenceWarning } from '../world/reference-keys.js';
 import type { Client } from '@temporalio/client';
 import type { Store } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
@@ -48,15 +48,16 @@ export async function createExecutionServices(input: {
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
     async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), undefined, undefined, referenceKeys));
   if (bootstrap) {
-    let unreadable = 0;
+    const unreadable: (string | undefined)[] = [];
     for (const state of ['ready', 'parked', 'hibernated', 'degraded'] as const) {
       for (const { handle } of await store.listWorldInstances(state)) {
         if (!['e2b', 'daytona'].includes(handle.kind)) continue;
         try { await worlds.get(handle.kind).status?.(handle as import('../world/types.js').WorldHandle); }
-        catch { unreadable++; }
+        catch { unreadable.push(handle.sealedProviderRef); }
       }
     }
-    if (unreadable) console.warn(`${unreadable} world reference(s) cannot be opened. Restore the original KARMAX_WORLD_REF_KEY; their sandboxes will be preserved.`);
+    const warning = unreadableReferenceWarning(unreadable);
+    if (warning) console.warn(warning);
   }
   const objectStore = process.env.KARMAX_OBJECT_STORE === 's3'
     ? new S3ObjectStore({
