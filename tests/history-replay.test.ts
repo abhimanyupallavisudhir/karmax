@@ -16,13 +16,16 @@ import { historyFromJson } from './helpers/stub-task-worker.js';
 // on older pins (tests/helpers/record-task-history.ts): a v1.20 landing that
 // polls a repeated failure without backing off, and a v1.23 task past the
 // threshold. Recorded at a14b89e4: a merge-queue wait polling its position.
+// Recorded at dac51479: a replacement parent parked at the sub-task barrier
+// with a restored child, before the barrier reread such children.
 it('replays task histories recorded before history bounding', async () => {
   const workflowBundle = await bundleWorkflowCode({
     workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)),
   });
   for (const name of ['history-long-prechange', 'history-landing-duplicate-prechange',
     'history-admission-prechange', 'history-admission-justdo-prechange', 'history-long-past-threshold-prechange',
-    'history-landing-duplicate-v1_20-prechange', 'history-long-v1_23-prechange', 'history-merge-queue-prechange']) {
+    'history-landing-duplicate-v1_20-prechange', 'history-long-v1_23-prechange', 'history-merge-queue-prechange',
+    'history-subtask-barrier-prechange']) {
     const file = new URL(`./fixtures/${name}.json`, import.meta.url);
     const json = JSON.parse(fs.existsSync(file) ? fs.readFileSync(file, 'utf8')
       : zlib.gunzipSync(fs.readFileSync(new URL(`${file.href}.gz`))).toString('utf8'));

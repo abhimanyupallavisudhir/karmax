@@ -7,7 +7,8 @@
  *
  * To record what a change must keep replaying, run it from a checkout of the
  * commit before the change (copy this file and stub-task-worker.ts there if
- * they are newer). Scenarios: landing-duplicate, merge-queue-wait, long.
+ * they are newer). Scenarios: landing-duplicate, merge-queue-wait, long,
+ * subtask-barrier.
  */
 import fs from 'node:fs';
 import { startStubTaskWorker, historyChain, type StubActivities } from './stub-task-worker.js';
@@ -20,7 +21,9 @@ const prs = [{ slug: 'test/repo', number: 1, headSha: 'abc', url: 'https://githu
 const calls = new Map<string, number>();
 const count = (name: string) => calls.get(name) ?? 0;
 const common: StubActivities = {
-  restoreChildTasks: async () => [], publishView: async () => 'fence', parkWaitingWorld: async () => {},
+  // A replacement parent restores a child it holds no handle for.
+  restoreChildTasks: async () => scenario === 'subtask-barrier' ? [{ taskId: 'child-1', title: 'Child', waiting: false }] : [],
+  publishView: async () => 'fence', parkWaitingWorld: async () => {},
   recordEvent: async () => {}, createWorld: async () => world, prepareAgentTurn: async () => ({ accountPool: 0 }),
   agentUsesHostCapacity: async () => false, pendingServiceConnections: async () => 0,
   buildReview: async () => ({ summary: 'fixture', changedFiles: [] }), checkProposal: async () => ({ ready: true }),
@@ -39,7 +42,8 @@ let turns = 0;
 const replies = (i: number) => `Reply ${i}. ${'r'.repeat(200)}`;
 const counted = Object.fromEntries(Object.entries({
   ...common,
-  runAgentTurn: async () => ({ output: replies(turns++), providerCompleted: true }),
+  runAgentTurn: async () => ({ output: replies(turns++), providerCompleted: true,
+    ...(scenario === 'subtask-barrier' ? { waitForSubtasks: true } : {}) }),
 }).map(([name, fn]) => [name, async (...args: unknown[]) => {
   calls.set(name, count(name) + 1);
   return (fn as (...values: unknown[]) => unknown)(...args);
@@ -53,12 +57,15 @@ const inputs: Record<string, unknown> = {
         lastRepairFingerprint: 'test/repo#1:abc:ci', repairAttempts: 1 } } },
   'merge-queue-wait': { taskId: workflowId, projectId: 'fixture', title: 'Merge queue fixture', prompt: '',
     project: { repos: ['/fixture'] }, recovery: { resumeStage: 'merge', messages: [], world } },
+  'subtask-barrier': { taskId: workflowId, projectId: 'fixture', title: 'Barrier fixture', prompt: '',
+    project: { repos: ['/fixture'] }, recovery: { resumeStage: 'do', messages: [{ id: 'm0', role: 'user', text: 'Delegate', ts: 0 }], world } },
   long: { taskId: workflowId, projectId: 'fixture', title: 'Long task', prompt: `Start. ${'p'.repeat(500)}`,
     project: { repos: ['/fixture'], remote: 'pr' } },
 };
 const until: Record<string, () => boolean> = {
   'landing-duplicate': () => count('mergeGithubPrs') >= 5,
   'merge-queue-wait': () => count('mergeQueuePosition') >= 2,
+  'subtask-barrier': () => count('runAgentTurn') >= 1,
 };
 
 const env = await startStubTaskWorker(counted);
@@ -82,6 +89,13 @@ try {
       await handle.signal('followUp', { id: `u${i}`, role: 'user', text: `Follow-up ${i}. ${'u'.repeat(100)}`, ts: i });
     }
   } else await wait(until[scenario]!);
+  if (scenario === 'subtask-barrier') {
+    // A follow-up wakes the barrier, so the parked wait is followed by events
+    // a changed wait would contradict on replay.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await handle.signal('followUp', { id: 'u1', role: 'user', text: 'Carry on', ts: 1 });
+    await wait(() => count('runAgentTurn') >= 2);
+  }
   // Let the workflow task that reacts to the last activity complete.
   await new Promise((resolve) => setTimeout(resolve, 1_000));
   const [run] = await historyChain(env.client, workflowId);
