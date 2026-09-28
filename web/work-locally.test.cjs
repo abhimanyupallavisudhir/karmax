@@ -67,6 +67,20 @@ ok(require('child_process').spawnSync('bash', ['-n', '-c', context.result]).stat
   ok(button.textContent === '✓ Downloaded', 'the warned download still completes');
   ok(toasts.length === 1 && !toasts[0].error && toasts[0].message.includes('System messages were mapped to Codex developer messages.'),
     'conversion warnings are shown after the download');
+
+  // Several kinds of change stay one short line: the first, then a count.
+  const many = encodeURIComponent(JSON.stringify([
+    { code: 'a', message: 'System messages were mapped to Codex developer messages.' },
+    { code: 'b', message: 'Reasoning summaries were converted to labelled message text.', count: 12 },
+    { code: 'c', message: 'Image or attachment references were converted to labelled text.' },
+  ]));
+  toasts.length = 0;
+  download.feedbackFetch = async () => ({ ok: true, blob: async () => ({}),
+    headers: { get: (name) => name === 'x-karmax-conversation-warnings' ? many : null } });
+  vm.runInNewContext('result = downloadNativeConversation(button);', download);
+  await download.result;
+  ok(toasts.length === 1 && toasts[0].message === 'Converted with changes: System messages were mapped to Codex developer messages. (+2 more)',
+    'several conversion warnings collapse into one short toast');
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

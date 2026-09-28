@@ -35,10 +35,20 @@ export type PanagentImportResult =
 export type PanagentWarning = { code: string; severity: string; message: string; path?: string };
 
 /** The `x-karmax-conversation-warnings` value for a converted download: what
- * the conversion changed, URI-encoded JSON. Info notes are not warnings. */
+ * the conversion changed, URI-encoded JSON. Info notes are not warnings.
+ * Readers warn once per affected record, so repeats collapse into one counted
+ * note per code, and the list is capped: browsers reject a response whose
+ * headers pass ~256 KB, which would lose the download itself. */
 export function conversionWarningsHeader(warnings: readonly PanagentWarning[] = []): string | undefined {
-  const notes = warnings.filter((warning) => warning.severity !== 'info').map(({ code, message }) => ({ code, message }));
-  return notes.length ? encodeURIComponent(JSON.stringify(notes)) : undefined;
+  const notes = new Map<string, { code: string; message: string; count: number }>();
+  for (const { code, severity, message } of warnings) {
+    if (severity === 'info') continue;
+    const note = notes.get(code);
+    if (note) note.count++;
+    else if (notes.size < 8) notes.set(code, { code: code.slice(0, 80), message: message.slice(0, 300), count: 1 });
+  }
+  const listed = [...notes.values()].map(({ count, ...note }) => (count > 1 ? { ...note, count } : note));
+  return listed.length ? encodeURIComponent(JSON.stringify(listed)) : undefined;
 }
 
 /** Render Karmax's durable, provider-neutral transcript as a resumable native

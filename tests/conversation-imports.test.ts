@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { exportConversationWithPanagent, importWithPanagent, publicConversationShare } from '../src/agent/panagent.js';
+import { conversionWarningsHeader, exportConversationWithPanagent, importWithPanagent, publicConversationShare } from '../src/agent/panagent.js';
 import {
   ConversationImportError,
   conversationImportObjectKey,
@@ -94,6 +94,23 @@ describe('conversation import storage', () => {
 });
 
 describe('Krmax panagent bridge', () => {
+  // Readers warn once per affected record. The download header must stay far
+  // below the ~256 KB response-header limit browsers enforce.
+  it('collapses per-record conversion warnings into a bounded header', () => {
+    const warnings = [
+      ...Array.from({ length: 5_000 }, (_, index) => ({ code: 'codex_unpaired_tool_result', severity: 'warning',
+        message: 'A Codex tool result had no matching call.', path: `records[${index}]` })),
+      { code: 'codex_world_state_not_represented', severity: 'info', message: 'Codex world state cannot be recreated.' },
+      ...Array.from({ length: 30 }, (_, index) => ({ code: `code_${index}`, severity: 'warning', message: 'x'.repeat(10_000) })),
+    ];
+    const header = conversionWarningsHeader(warnings)!;
+    expect(header.length).toBeLessThan(8 * 1024);
+    const notes = JSON.parse(decodeURIComponent(header));
+    expect(notes[0]).toEqual({ code: 'codex_unpaired_tool_result', message: 'A Codex tool result had no matching call.', count: 5_000 });
+    expect(notes.some((note: { code: string }) => note.code === 'codex_world_state_not_represented')).toBe(false);
+    expect(conversionWarningsHeader([{ code: 'only_info', severity: 'info', message: 'Nothing changed.' }])).toBeUndefined();
+  });
+
   it('does not pass host credentials to the Python converter', async () => {
     const home = temporary('karmax-panagent-env-');
     const executable = path.join(home, 'python');

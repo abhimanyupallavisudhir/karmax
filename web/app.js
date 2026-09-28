@@ -9523,7 +9523,7 @@ async function downloadNativeConversation(button) {
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(href), 60_000);
     button.textContent = '✓ Downloaded';
-    if (notes.length) toast(`Converted with changes: ${notes.join(' ')}`);
+    if (notes.length) toast(`Converted with changes: ${notes[0]}${notes.length > 1 ? ` (+${notes.length - 1} more)` : ''}`);
     setTimeout(() => { if (button.isConnected) button.textContent = label; }, 1200);
   } catch (error) {
     button.textContent = label;
