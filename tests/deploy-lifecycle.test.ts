@@ -30,12 +30,17 @@ if (args.includes('cp')) {
   const destination = args.at(-1);
   fs.mkdirSync(destination, { recursive: true });
   fs.writeFileSync(path.join(destination, 'manifest.json'), '{}');
-  fs.writeFileSync(path.join(destination, 'manifest.hmac'), 'fixture');
+  fs.writeFileSync(path.join(destination, 'manifest.sig'), 'fixture');
 }
+if (args.includes('--sign-checksums')) { fs.readFileSync(0); process.stdout.write('signature-fixture'); }
 if (args.includes('pg_dump')) process.stdout.write('dump-' + args.at(-1));
 if (args.join(' ').includes('pg_stat_activity')) process.stdout.write(process.env.FAKE_SESSIONS ?? '');
-// Like Compose, a one-off without -T reads whatever stdin holds.
-if (args.includes('pg_restore') || (args.includes('run') && !args.includes('-T'))) fs.readFileSync(0);
+if (args.includes('pg_restore')) {
+  const input = fs.readFileSync(0);
+  if (!args.includes('/dev/null') && process.env.FAKE_RESTORED) fs.appendFileSync(process.env.FAKE_RESTORED, args.at(-1) + '=' + input + '\\n');
+} else if (args.includes('run') && !args.includes('-T')) fs.readFileSync(0); // like Compose, a one-off without -T reads stdin
+// Change the backup the operator pointed at once it has been verified.
+if (args.join(' ').includes('--verify-deployment') && process.env.FAKE_TAMPER) fs.writeFileSync(process.env.FAKE_TAMPER, 'tampered');
 `, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   const run = (args: string[], fail = '', input = '', env: Record<string, string> = {}) => spawnSync('sh', [path.join(deploy, 'karmax'), ...args], {
@@ -58,8 +63,13 @@ it('publishes a complete backup atomically and verifies its checksums (CI-37)', 
   const destination = path.join(h.root, 'snapshot');
   const result = h.run(['backup', destination]);
   expect(result.status, result.stderr).toBe(0);
-  expect(fs.readdirSync(destination).sort()).toEqual(['SHA256SUMS', 'control-plane', 'deployment-secrets', 'karmax.dump', 'temporal-visibility.dump', 'temporal.dump']);
+  expect(fs.readdirSync(destination).sort()).toEqual(['SHA256SUMS', 'SHA256SUMS.sig', 'control-plane', 'deployment-secrets', 'karmax.dump', 'temporal-visibility.dump', 'temporal.dump']);
+  // The dumps are outside the signed control-plane manifest, so their checksums are signed too (DB-10).
+  expect(fs.readFileSync(path.join(destination, 'SHA256SUMS.sig'), 'utf8')).toBe('signature-fixture');
+  expect(h.calls().some(args => args.join(' ').includes('exec -T app npm run --silent backup -- --sign-checksums'))).toBe(true);
   expect(spawnSync('sha256sum', ['-c', 'SHA256SUMS'], { cwd: destination }).status).toBe(0);
+  // …and the control-plane manifest, so the two signatures vouch for one backup.
+  expect(fs.readFileSync(path.join(destination, 'SHA256SUMS'), 'utf8')).toMatch(/ {2}control-plane\/manifest\.json$/m);
   expect(fs.readdirSync(h.root).some(name => name.includes('.partial.'))).toBe(false);
   expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
 });
@@ -143,7 +153,7 @@ it('verifies every restore input before stopping services, and waits for the res
   const stopped = calls.findIndex(args => args.includes('down'));
   expect(stopped).toBeGreaterThan(0);
   expect(calls.slice(0, stopped).filter(args => args.includes('pg_restore') && args.includes('/dev/null'))).toHaveLength(3);
-  expect(calls.slice(0, stopped).some(args => args.includes('--verify'))).toBe(true);
+  expect(calls.slice(0, stopped).some(args => args.includes('--verify-deployment'))).toBe(true);
   expect(calls.slice(stopped).filter(dropsLive)).toHaveLength(3);
   expect(calls.slice(stopped).some(args => args.join(' ').includes('npm run restore -- /restore'))).toBe(true);
   expect(result.stdout).toContain('Restore complete');
@@ -158,7 +168,8 @@ it('reads the backup as root and gives the restored data to the app user', () =>
   expect(h.run(['backup', destination]).status).toBe(0);
   h.clear();
   expect(h.run(['restore', destination], '', 'RESTORE\n').status).toBe(0);
-  const readers = h.calls().filter(args => args.includes('run') && args.some(arg => arg.endsWith(':/restore:ro')));
+  // The verification reads the whole backup (/backup), the restore its control plane (/restore).
+  const readers = h.calls().filter(args => args.includes('run') && args.some(arg => arg.endsWith(':/backup:ro') || arg.endsWith(':/restore:ro')));
   expect(readers).toHaveLength(2);
   for (const args of readers) expect(args.slice(args.indexOf('run'), args.indexOf('app'))).toEqual(expect.arrayContaining(['--user', 'root']));
   expect(readers[1]!.at(-1)).toBe('npm run restore -- /restore && chown -R karmax:karmax /var/lib/karmax');
@@ -225,6 +236,69 @@ it('rejects changed dump bytes and cancelled confirmation before stopping servic
   h.clear();
   fs.appendFileSync(path.join(destination, 'temporal.dump'), 'tampered');
   expect(h.run(['restore', destination], '', 'RESTORE\n').status).not.toBe(0);
+  expect(h.calls().some(args => args.includes('build') || args.includes('down'))).toBe(false);
+});
+
+// DB-10: a restore checks both signatures before anything stops; a backup from
+// another host is trusted by fingerprint, and one from before signing needs
+// the operator's explicit flag and a stronger confirmation.
+it('verifies backup signatures first, and restores an unsigned backup only when told to', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  h.clear();
+  const fingerprint = 'SHA256:AbCdEf+/0123456789abcdefghijklmnopqrstuvwxyz';
+  expect(h.run(['restore', '--trust-key', fingerprint, destination], '', 'RESTORE\n').status).toBe(0);
+  const calls = h.calls().map(args => args.join(' '));
+  const stopped = calls.findIndex(call => call.endsWith(' down'));
+  const checked = calls.findIndex(call => call.includes(`npm run restore -- --verify-deployment --trust-key ${fingerprint} /backup`));
+  expect(checked).toBeGreaterThan(-1);
+  expect(checked).toBeLessThan(stopped);
+  expect(calls.slice(stopped).some(call => call.includes(`npm run restore -- --trust-key ${fingerprint} /restore`))).toBe(true);
+
+  h.clear();
+  expect(h.run(['restore', '--trust-key', 'not-a-fingerprint', destination], '', 'RESTORE\n').status).not.toBe(0);
+  expect(h.calls().some(args => args.includes('build') || args.includes('run'))).toBe(false);
+  // A plain RESTORE does not accept an unsigned backup.
+  expect(h.run(['restore', '--accept-unsigned-v1', destination], '', 'RESTORE\n').status).not.toBe(0);
+  expect(h.calls().some(args => args.includes('down'))).toBe(false);
+  h.clear();
+  const unsigned = h.run(['restore', '--accept-unsigned-v1', destination], '', 'RESTORE UNSIGNED\n');
+  expect(unsigned.status, unsigned.stderr).toBe(0);
+  expect(unsigned.stdout).toContain('This backup is unsigned');
+  const accepted = h.calls().map(args => args.join(' '));
+  expect(accepted.some(call => call.includes('--verify-deployment --accept-unsigned-v1 /backup'))).toBe(true);
+  expect(accepted.some(call => call.includes('npm run restore -- --accept-unsigned-v1 /restore'))).toBe(true);
+});
+
+// DB-10 review: everything a restore uses comes from a private copy that was
+// verified, not from the backup directory, which can change after the check.
+it('restores from the private copy it verified', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  h.clear();
+  const restored = path.join(h.root, 'restored');
+  const result = h.run(['restore', destination], '', 'RESTORE\n',
+    { FAKE_RESTORED: restored, FAKE_TAMPER: path.join(destination, 'temporal.dump') });
+  expect(result.status, result.stderr).toBe(0);
+  expect(fs.readFileSync(restored, 'utf8')).toContain('temporal_restore=dump-temporal\n');
+  expect(fs.readFileSync(restored, 'utf8')).not.toContain('tampered');
+  const mounts = h.calls().map(args => args.join(' ')).filter(call => call.includes(':/backup:ro') || call.includes(':/restore:ro'));
+  expect(mounts.length).toBeGreaterThan(0);
+  for (const call of mounts) expect(call).not.toContain(`${destination}/`);
+  expect(fs.readdirSync(h.deploy).filter(name => name.startsWith('.restore-stage'))).toEqual([]);
+});
+
+it('refuses a backup containing a symbolic link before building anything', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  fs.symlinkSync('/etc/hostname', path.join(destination, 'deployment-secrets', 'extra'));
+  h.clear();
+  const result = h.run(['restore', destination], '', 'RESTORE\n');
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('symbolic link');
   expect(h.calls().some(args => args.includes('build') || args.includes('down'))).toBe(false);
 });
 
@@ -298,6 +372,30 @@ it('refuses a release that cannot replay a running workflow, leaving production 
   expect(calls.some(call => call.includes('pg_dump') || call.includes('up -d'))).toBe(false);
   // The Compose tag points at the running code again for the next restart.
   expect(calls.slice(check + 1).some(call => call.endsWith(' build app'))).toBe(true);
+});
+
+// The two gates in the real updater: replay check before the backup, vault
+// preflight after it and before anything restarts.
+it('runs build, replay check, backup, vault preflight and restart in that order', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target]);
+  expect(result.status, result.stderr).toBe(0);
+  const calls = h.calls().map(args => args.join(' '));
+  const at = (text: string) => calls.findIndex(call => call.includes(text));
+  const order = ['build --pull app', 'npm run --silent replay-check', 'pg_dump', 'npm run --silent vault-preflight', 'up -d'].map(at);
+  expect(order.every(index => index >= 0)).toBe(true);
+  expect([...order].sort((a, b) => a - b)).toEqual(order);
+});
+
+it('keeps production when the vault preflight finds something, after the backup', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target], 'vault-preflight');
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain(`production remains at ${h.previous}`);
+  expect(h.git('rev-parse', 'HEAD')).toBe(h.previous);
+  const calls = h.calls().map(args => args.join(' '));
+  expect(calls.some(call => call.includes('pg_dump'))).toBe(true);
+  expect(calls.some(call => call.includes('up -d'))).toBe(false);
 });
 
 it('lets an operator skip the replay check explicitly, and says so', () => {

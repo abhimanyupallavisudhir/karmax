@@ -1,9 +1,38 @@
-import { restoreBackup, verifyBackup } from '../ops/backup.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { restoreBackup, verifyBackup, verifyDeploymentBackup } from '../ops/backup.js';
 
-const verifyOnly = process.argv[2] === '--verify';
-const source = process.argv[verifyOnly ? 3 : 2];
-if (!source) throw new Error('usage: npm run restore -- /path/to/backup');
-const manifest = verifyOnly ? verifyBackup(source) : await restoreBackup(source);
+// npm run restore -- [--verify] [--trust-key SHA256:…]… [--accept-unsigned-v1] BACKUP_DIR
+// npm run restore -- --verify-deployment [--trust-key …] [--accept-unsigned-v1] DEPLOY_BACKUP_DIR
+//   (deploy/karmax: its signed SHA256SUMS, every file listed, and control-plane/)
+const args = process.argv.slice(2);
+const flag = (name: string) => {
+  const i = args.indexOf(name);
+  if (i < 0) return false;
+  args.splice(i, 1);
+  return true;
+};
+const trustKeys: string[] = [];
+for (let i; (i = args.indexOf('--trust-key')) >= 0;) {
+  const [, key] = args.splice(i, 2);
+  if (!key || key.startsWith('--')) throw new Error('--trust-key needs the fingerprint of the key that signed the backup');
+  trustKeys.push(key);
+}
+const acceptUnsignedV1 = flag('--accept-unsigned-v1');
+const verifyOnly = flag('--verify');
+const deployment = flag('--verify-deployment');
+if (args.some((a) => a.startsWith('--')) || args.length !== 1)
+  throw new Error('usage: npm run restore -- [--verify | --verify-deployment] [--trust-key SHA256:…] [--accept-unsigned-v1] /path/to/backup');
+const source = args[0]!;
+if (deployment) {
+  const { manifest, signedBy } = verifyDeploymentBackup(source, { trustKeys, acceptUnsignedV1 });
+  console.log(signedBy ? `backup signed by ${signedBy}: checksums, ${manifest.files.length} control-plane files verified`
+    : 'WARNING: this backup is unsigned; it was accepted with --accept-unsigned-v1 and cannot be authenticated');
+  process.exit(0);
+}
+const unsigned = !fs.existsSync(path.join(source, 'manifest.sig'));
+const manifest = verifyOnly ? verifyBackup(source, { trustKeys, acceptUnsignedV1 }) : await restoreBackup(source, { trustKeys, acceptUnsignedV1 });
+if (unsigned) console.log('WARNING: this backup is unsigned; it was accepted with --accept-unsigned-v1 and cannot be authenticated');
 if (verifyOnly) {
   console.log(`backup verified: ${manifest.files.length} files`);
   process.exit(0);

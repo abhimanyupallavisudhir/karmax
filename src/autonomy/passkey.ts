@@ -25,6 +25,10 @@ export interface PasskeyCredential {
   signCount?: number;
 }
 
+/** Opens an origin-verified session on the task browser's page for `expectDomains`:
+ *  a loopback CDP URL on this host, or `openWorldPage` in a remote world. */
+export type PageOpener = (expectDomains: string[]) => Promise<{ session: CdpSession; origin: string }>;
+
 const AUTH_OPTIONS = {
   protocol: 'ctap2',
   transport: 'internal',
@@ -38,17 +42,47 @@ export class PasskeyManager {
   private held = new Map<string, { session: CdpSession; origin: string; timer: NodeJS.Timeout;
     owner: string; authenticatorId: string; mode: 'enroll' | 'login';
     onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }>();
-  constructor(private ttlMs = 180_000) {}
+  /** Each held session keeps a browser session (in a remote world, also a
+   * terminal and the world itself) open until it is released or expires. */
+  constructor(private ttlMs = 180_000, private limits = { perOwner: 3, total: 64 }) {}
+  /** Sessions `begin` has admitted but not yet opened, by owner. */
+  private reserved = new Map<string, number>();
 
 
   /**
-   * Prepare a virtual authenticator on the page (origin-verified). For `login`,
+   * Prepare a virtual authenticator on the page (origin-verified), in the task's
+   * own browser. For `login`,
    * the stored credential is loaded so the agent can immediately sign in. The
    * session stays open (held under TTL) until `harvest`/`release`.
    */
-  async begin(cdpUrl: string, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }): Promise<{ authenticatorId: string; origin: string }> {
+  async begin(page: string | PageOpener, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void>; reserved?: boolean }): Promise<{ authenticatorId: string; origin: string }> {
     if (!opts.owner || !opts.expectDomains?.length) throw new Error('passkey sessions require an owner and target domains');
-    const { session, origin } = await openPage(cdpUrl, { expectDomains: opts.expectDomains });
+    // Take the slot before the first await, so parallel requests cannot all pass
+    // the check; a caller that reserved one already (to open the page, or spend a
+    // grant, only when a session can be held) passes `reserved`.
+    const release = opts.reserved ? () => {} : this.reserve(opts.owner);
+    try { return await this.open(page, opts); }
+    finally { release(); }
+  }
+
+  /** Hold one of `owner`'s session slots until the returned release is called. */
+  reserve(owner: string): () => void {
+    this.assertRoom(owner);
+    this.reserved.set(owner, (this.reserved.get(owner) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const left = (this.reserved.get(owner) ?? 1) - 1;
+      if (left) this.reserved.set(owner, left); else this.reserved.delete(owner);
+    };
+  }
+
+  private async open(page: string | PageOpener, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }): Promise<{ authenticatorId: string; origin: string }> {
+    if (!opts.expectDomains?.length) throw new Error('passkey sessions require target domains');
+    const { session, origin } = typeof page === 'string'
+      ? await openPage(page, { expectDomains: opts.expectDomains })
+      : await page(opts.expectDomains);
     try {
       await session.call('WebAuthn.enable', { enableUI: false });
       const added = await session.call('WebAuthn.addVirtualAuthenticator', { options: AUTH_OPTIONS });
@@ -70,6 +104,15 @@ export class PasskeyManager {
       (await session.close());
       throw e;
     }
+  }
+
+  /** Throw unless `owner` may hold one more session, counting ones still opening. */
+  assertRoom(owner: string): void {
+    const owned = [...this.held.values()].filter((held) => held.owner === owner).length + (this.reserved.get(owner) ?? 0);
+    if (owned >= this.limits.perOwner)
+      throw new Error(`this task already has ${owned} passkey sessions open; save or release one first`);
+    const opening = [...this.reserved.values()].reduce((sum, count) => sum + count, 0);
+    if (this.held.size + opening >= this.limits.total) throw new Error('too many passkey sessions are open; try again in a few minutes');
   }
 
   /** Read the credential(s) the site just wrote into the authenticator, then

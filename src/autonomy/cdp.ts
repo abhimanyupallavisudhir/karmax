@@ -1,5 +1,4 @@
 import { domainMatches } from './vault-items.js';
-import { BRAND } from '../domain/brand.js';
 
 /**
  * Shared Chrome DevTools Protocol plumbing for the host-side credential paths
@@ -44,8 +43,7 @@ export async function listPages(cdpUrl: string, timeoutMs = 15_000): Promise<Cdp
   } catch (e) {
     throw new Error(
       `browser credential fill is unavailable: cannot reach Chrome DevTools at ${base.origin}. ` +
-      `Use the ${BRAND}-managed chrome-devtools browser (which exposes a loopback CDP endpoint), ` +
-      `or pass that browser's cdpUrl. ${e instanceof Error ? e.message : String(e)}`,
+      `Is this task's chrome-devtools browser still open? ${e instanceof Error ? e.message : String(e)}`,
       { cause: e },
     );
   }
@@ -113,19 +111,23 @@ export async function openPage(cdpUrl: string, opts: { expectDomains?: string[];
       ? `no open page matches ${opts.expectDomains.join(', ')} — navigate to the login page first`
       : 'no open page at the CDP endpoint');
   }
-  const session = await connect(page.webSocketDebuggerUrl!, timeoutMs);
+  return verifiedPage((await connect(page.webSocketDebuggerUrl!, timeoutMs)), opts.expectDomains);
+}
+
+/** Check a page session's live origin against `expectDomains`; closes it if it does not match. */
+export async function verifiedPage(session: CdpSession, expectDomains?: string[]): Promise<{ session: CdpSession; origin: string }> {
   try {
     const originResult = await session.call('Runtime.evaluate', { expression: 'location.origin', returnByValue: true });
     const origin = String(originResult?.result?.value ?? '');
-    if (opts.expectDomains?.length) {
+    if (expectDomains?.length) {
       let host = '';
       try {
         host = new URL(origin).hostname;
       } catch {
         /* about:blank etc. */
       }
-      if (!host || !opts.expectDomains.some((d) => domainMatches(host, d))) {
-        throw new Error(`refusing: the page origin (${origin || 'unknown'}) does not match the expected domains (${opts.expectDomains.join(', ')})`);
+      if (!host || !expectDomains.some((d) => domainMatches(host, d))) {
+        throw new Error(`refusing: the page origin (${origin || 'unknown'}) does not match the expected domains (${expectDomains.join(', ')})`);
       }
     }
     return { session, origin };

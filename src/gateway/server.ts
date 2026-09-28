@@ -1,4 +1,5 @@
-import { socketLifetime } from './socket-lifetime.js';
+import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
+import type { PasskeyCredential } from '../autonomy/passkey.js';
 import { ExecutionOutput } from './execution-output.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -60,7 +61,7 @@ import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexMo
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
-import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
+import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, allows, type Capability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
@@ -70,7 +71,7 @@ import { worldHandleForView } from '../world/resolve.js';
 import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
 import { createCodexConversationExport, readCodexConversationExport } from '../store/conversation-exports.js';
 import type { AccessMode, AccessStatus, VaultFieldName } from '../autonomy/vault-items.js';
-import { defaultCdpUrl } from '../autonomy/cdp-endpoint.js';
+import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { newId } from '../util/id.js';
 import { DurableEventFanout } from './fanout.js';
 import { authorizationChanged, authorizationEpoch } from '../store/authorization-epoch.js';
@@ -572,6 +573,8 @@ interface Session {
   user: string;
   apiToken: string;
   userId?: string;
+  /** The browser (identity) session this one stands for, when it does. */
+  identitySessionId?: string;
   email?: string;
   expiresAt?: number;
 }
@@ -584,6 +587,7 @@ export class Gateway {
   private terminalStops = new Set<() => Promise<void>>();
   private requestGuards = new WeakMap<http.IncomingMessage, () => Promise<void>>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
+  private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number }>();
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
    *  directly, so without this a password could be guessed online. */
@@ -737,8 +741,8 @@ export class Gateway {
     // token cost several store reads per event per socket, and a streaming agent
     // publishes several events a second. A decision lasts until this process
     // commits anything that can withdraw access (revocation, member removal,
-    // project transfer), until the token expires, and at most
-    // SOCKET_DECISION_TTL_MS, which bounds changes made by another replica.
+    // project transfer), until a token-based socket's token expires, and at
+    // most SOCKET_DECISION_TTL_MS, which bounds changes made by another replica.
     const decisions = new Map<string, { allowed: Promise<boolean>; until: number; epoch: number }>();
     const mayRead = (projectId: string | undefined, taskId: string): Promise<boolean> => {
       const key = `${projectId ?? ''}\0${taskId}`;
@@ -748,13 +752,19 @@ export class Gateway {
       // Read before deciding: a change committed while the check runs moves it again.
       const epoch = authorizationEpoch();
       const allowed = (async () => {
-        if ((await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId } : undefined)).ok) return true;
-        const humanCaps = auth.userId && projectId ? (await this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId)) : [];
-        return allows(humanCaps ?? [], 'task:event:read');
+        // A person's socket decides from their grants as they stand now: its
+        // token keeps the capabilities it was minted with for ten minutes, so
+        // a narrowed grant would otherwise wait for it to rotate (GW-13).
+        if (auth.userId && this.deps.authorization)
+          return !!projectId && allows((await this.deps.authorization.capabilitiesAsync(`user:${auth.userId}`, projectId)), 'task:event:read');
+        return (await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId } : undefined)).ok;
       })();
       // A failed lookup is not a decision: the next event asks again.
       allowed.catch(() => { if (decisions.get(key)?.allowed === allowed) decisions.delete(key); });
-      decisions.set(key, { allowed, epoch, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS, scoped?.expiresAt ?? Infinity) });
+      // A person's decision does not depend on the socket token, so it does not
+      // expire with it; a token's does.
+      decisions.set(key, { allowed, epoch, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS,
+        auth.userId && this.deps.authorization ? Infinity : scoped?.expiresAt ?? Infinity) });
       return allowed;
     };
     // Streamed text supersedes itself, so a client that has fallen behind gets
@@ -1157,6 +1167,10 @@ export class Gateway {
     }
     if (!['/ws', '/ws/terminal', '/ws/review-action'].includes(url.pathname) || !this.sameOriginRequest(req)) return;
     const ticket = url.pathname === '/ws/terminal' ? this.terminalTickets.get(url.searchParams.get('ticket') ?? '') : undefined;
+    // A live ticket admits its person while the session that asked for it is
+    // signed in: signing out any other session revokes its cached token early.
+    if (ticket && ticket.taskId === url.searchParams.get('taskId') && ticket.expiresAt > Date.now() && ticket.session.userId)
+      return await this.sessionLive(ticket.session) ? `user:${ticket.session.userId}` : undefined;
     const auth = ticket && ticket.taskId === url.searchParams.get('taskId') && ticket.expiresAt > Date.now()
       ? ticket.session : await this.socketAuth(req, url);
     if (!auth) return;
@@ -1312,7 +1326,8 @@ export class Gateway {
       ? ticketRecord.session
       : await this.socketAuth(req, url, task?.projectId);
     if (!auth) { ws.close(4401, 'unauthorized'); return; }
-    if (!(await this.deps.tokens.check(auth.apiToken, 'task:edit', { projectId: task?.projectId, taskId })).ok) {
+    // The same decision the open shell is re-checked with (keepAuthorized below).
+    if (!(task && await this.sessionMay(auth, 'task:edit', task.projectId, taskId))) {
       ws.close(4403, 'forbidden'); return;
     }
     const projectRecord = task ? (await this.deps.store.getProject(task.projectId)) : undefined;
@@ -1411,6 +1426,8 @@ export class Gateway {
       void finish(code, clientClosed).catch(failed).finally(() => { try { ws.close(); } catch {} });
     });
     ws.on('message', raw => {
+      // A socket that is closing (access withdrawn, say) no longer drives the shell.
+      if (ws.readyState !== WebSocketClient.OPEN) return;
       let msg: any;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       try {
@@ -1421,6 +1438,19 @@ export class Gateway {
     // Close the provider stream first, then drain accepted output. Natural exit
     // and socket close share one finalization promise and one lease release.
     ws.on('close', () => { void stopTerminal().catch(failed); });
+    // The shell lasts only as long as its principal may edit the task. A
+    // `karmax attach` connects with a ticket and no cookie; its person is
+    // decided from their current grants, not the ticket's 10-minute token.
+    const lifetime = socketLifetime(ws);
+    lifetime.add(() => stopTerminal());
+    keepAuthorized(ws, lifetime, async () => {
+      // The ticket's session when it authorised the connection, and only while
+      // it is still signed in; otherwise the request's own.
+      const current = auth === ticketRecord?.session
+        ? (await this.sessionLive(auth) ? auth : undefined)
+        : await this.socketAuth(req, url, task.projectId);
+      return !!current && await this.sessionMay(current, 'task:edit', task.projectId, taskId);
+    });
     if (this.closing || ws.readyState !== 1) await stopTerminal();
   }
 
@@ -1455,6 +1485,10 @@ export class Gateway {
       if (done) { send({ type: 'exit', code }); try { ws.close(); } catch {} }
     }));
     lifetime.add(off);
+    keepAuthorized(ws, lifetime, async () => {
+      const current = await this.socketAuth(req, url, task?.projectId);
+      return !!current && await this.sessionMay(current, 'task:review:execute', task?.projectId, rec.taskId);
+    });
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
@@ -4855,11 +4889,11 @@ export class Gateway {
         }
         const policy = (await resolvePaymentPolicy(store, task.projectId, task.id));
         const cards = (await store.listCards(task.projectId)).filter(card => policy.cardIds.includes(card.id))
-          .map(({ id, label, last4, status }) => ({ id, label, last4, status }));
+          .map(({ id, label, last4, status, currency }) => ({ id, label, last4, status, currency }));
         return this.json(res, 200, { ...policy, cards,
           canEdit: !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')
             && (await this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId })).ok,
-          spent: (await store.paymentSpent(task.id)), released });
+          spent: (await store.paymentSpent(task.id, false, policy.currency)), released });
       }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
       if (editMatch && method === 'PATCH') {
@@ -6627,7 +6661,7 @@ export class Gateway {
           };
           try {
             const origin = await this.fillCredential(callerTaskId, {
-              selector: String(b.selector ?? ''), cdpUrl: b.cdpUrl, expectDomains: item.domains, resolveText,
+              selector: String(b.selector ?? ''), expectDomains: item.domains, resolveText,
             });
             return this.json(res, 200, { status: 'granted', itemId: item.id, filled: true, origin });
           } catch (e) {
@@ -6763,12 +6797,23 @@ export class Gateway {
 
         // ── agent-enrolled passkeys (§8) ──
         if (p.startsWith('/api/vault/passkey')) {
-          const passkeyTask = callerTaskId ? await store.getTask(callerTaskId) : undefined;
-          const passkeyWorld = passkeyTask ? worldHandleForView(passkeyTask.lastView, callerTaskId!,
-            await store.effectiveProjectConfig(passkeyTask.projectId)) : undefined;
-          if (this.deps.hosted || (passkeyWorld && (worldHandleIsRemote(passkeyWorld)
-            || this.deps.worlds.get(passkeyWorld.kind)?.capabilities?.remote)))
-            return this.json(res, 400, { error: 'passkeys require a local browser; remote passkey sessions are not available yet' });
+          // A passkey ceremony runs in the calling task's own browser (AU-12,
+          // AU-14): its world's, relayed over a world terminal, or on this host
+          // the one its agent launched. Found before a one-shot grant is spent.
+          let passkeyPage: (domains: string[]) => Promise<{ session: import('../autonomy/cdp.js').CdpSession; origin: string }> = async () => { throw new Error('no browser session'); };
+          if (p === '/api/vault/passkey/enroll' || p === '/api/vault/passkey/login') {
+            const passkeyWorld = await this.taskWorldHandle(callerTaskId);
+            if (!passkeyWorld) return this.json(res, 400, { error: 'passkeys run in a task\'s own browser; call this from a task that has a world' });
+            const inWorld = this.agentRunsInWorld(passkeyWorld);
+            if (this.deps.hosted && !inWorld) return this.json(res, 400, { error: 'hosted passkeys run in the task\'s remote world' });
+            if (inWorld) passkeyPage = (domains) => this.openTaskWorldPage(callerTaskId!, passkeyWorld, domains);
+            else {
+              let browser: string;
+              try { browser = localTaskBrowserUrl(callerTaskId); }
+              catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
+              passkeyPage = async (domains) => (await import('../autonomy/cdp.js')).openPage(browser, { expectDomains: domains });
+            }
+          }
           const passkeyOwner = JSON.stringify([organizationId, principal, callerTaskId]);
           if (!this.passkeys) {
             const { PasskeyManager } = await import('../autonomy/passkey.js');
@@ -6779,7 +6824,7 @@ export class Gateway {
           try {
             if (p === '/api/vault/passkey/enroll' && method === 'POST') {
               const domains = Array.isArray(b.domains) ? b.domains.map(String) : b.domain ? [String(b.domain)] : undefined;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'enroll', owner: passkeyOwner });
+              const started = await this.passkeys.begin(passkeyPage, { expectDomains: domains, mode: 'enroll', owner: passkeyOwner });
               return this.json(res, 200, { ...started, next: 'trigger the site\'s "create a passkey" button in the browser, then POST /api/vault/passkey/save with this authenticatorId' });
             }
             if (p === '/api/vault/passkey/save' && method === 'POST') {
@@ -6802,27 +6847,40 @@ export class Gateway {
             }
             if (p === '/api/vault/passkey/login' && method === 'POST') {
               if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no passkey item — enroll one first' });
-              const decision = (await vault.access(caps, callerTaskId, item, 'use', { consume: true }));
-              if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
-              const creds = JSON.parse((await vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' }))) as any[];
+              const checked = (await vault.access(caps, callerTaskId, item, 'use'));
+              if (checked.status !== 'granted') return this.json(res, 200, { ...checked, itemId: item.id });
+              // Open the page before a one-shot grant is spent on a ceremony that cannot run.
               const domains = item.domains;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner,
-                onCredentials: async updated => {
-                  await store.transaction(async () => {
-                    const current = await vault.get(item.id);
-                    if (!current || current.type !== 'passkey') return;
-                    const secret = await vault.readSecret(current, 'passkey');
-                    if (secret === undefined) return;
-                    const saved = JSON.parse(secret) as any[];
-                    for (const credential of saved) {
-                      const next = updated.find(c => c.credentialId === credential.credentialId && c.privateKey === credential.privateKey);
-                      if (next && Number.isSafeInteger(next.signCount) && next.signCount! > (credential.signCount ?? 0))
-                        credential.signCount = next.signCount;
-                    }
-                    await vault.save({ id: current.id, type: 'passkey', secrets: { passkey: JSON.stringify(saved) } });
-                  });
-                } });
-              return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
+              if (!domains?.length) return this.json(res, 400, { error: 'this passkey item has no domains' });
+              // A slot is held before the page opens or the grant is spent.
+              const releaseSlot = this.passkeys.reserve(passkeyOwner);
+              try {
+                const page = await passkeyPage(domains);
+                let handedOff = false;
+                try {
+                  const decision = (await vault.access(caps, callerTaskId, item, 'use', { consume: true }));
+                  if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+                  const creds = JSON.parse((await vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' }))) as PasskeyCredential[];
+                  const started = await this.passkeys.begin(async () => page, { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner, reserved: true,
+                    onCredentials: async updated => {
+                      await store.transaction(async () => {
+                        const current = await vault.get(item.id);
+                        if (!current || current.type !== 'passkey') return;
+                        const secret = await vault.readSecret(current, 'passkey');
+                        if (secret === undefined) return;
+                        const saved = JSON.parse(secret) as PasskeyCredential[];
+                        for (const credential of saved) {
+                          const next = updated.find(c => c.credentialId === credential.credentialId && c.privateKey === credential.privateKey);
+                          if (next && Number.isSafeInteger(next.signCount) && next.signCount! > (credential.signCount ?? 0))
+                            credential.signCount = next.signCount;
+                        }
+                        await vault.save({ id: current.id, type: 'passkey', secrets: { passkey: JSON.stringify(saved) } });
+                      });
+                    } });
+                  handedOff = true; // held now; closing it twice on a failed begin is harmless
+                  return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
+                } finally { if (!handedOff) await page.session.close(); }
+              } finally { releaseSlot(); }
             }
             if (p === '/api/vault/passkey/release' && method === 'POST') {
               (await this.passkeys.release(String(b.authenticatorId ?? ''), passkeyOwner));
@@ -8347,6 +8405,8 @@ export class Gateway {
     let taskId: string;
     let port: number;
     let requestPath: string;
+    /** The connect-time decision, made again while the socket stays open. */
+    let stillAllowed: () => Promise<boolean>;
     const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
     if (taskMatch) {
       if (configuredPreviewOrigin()) { browser.close(4403, 'use isolated preview origin'); return; }
@@ -8354,6 +8414,10 @@ export class Gateway {
       port = Number(taskMatch[2]);
       const task = (await this.deps.store.getTask(taskId));
       const auth = await this.socketAuth(req, url, task?.projectId);
+      stillAllowed = async () => {
+        const current = task && await this.socketAuth(req, url, task.projectId);
+        return !!current && await this.sessionMay(current, 'task:review:execute', task!.projectId, taskId);
+      };
       if (!task || !auth || !(await this.deps.tokens.check(auth.apiToken, 'task:review:execute', { projectId: task.projectId, taskId })).ok) {
         browser.close(4403, 'forbidden'); return;
       }
@@ -8362,6 +8426,14 @@ export class Gateway {
     } else {
       const leaseMatch = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
       const lease = leaseMatch ? (await this.deps.store.previewLease(leaseMatch[1]!)) : undefined;
+      stillAllowed = async () => {
+        const current = await this.deps.store.previewLease(lease!.id);
+        if (!current || current.revokedAt || current.expiresAt <= Date.now()) return false;
+        if (((await this.deps.store.currentWorld(current.worldId))?.generation ?? 1) !== current.generation) return false;
+        if (current.tokenHash) return true;
+        const session = await this.auth(req, current.projectId, current.organizationId);
+        return !!session && await this.sessionMay(session, 'task:read', current.projectId, current.taskId);
+      };
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
       if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
         browser.close(4404, 'preview expired'); return;
@@ -8401,6 +8473,7 @@ export class Gateway {
     const upstream = new WebSocketClient(target.url, protocols, { headers: target.headers });
     const pending: Array<{ data: import('ws').RawData; binary: boolean }> = [];
     browser.on('message', (data, binary) => {
+      if (browser.readyState !== WebSocketClient.OPEN) return;
       if (upstream.readyState === WebSocketClient.OPEN) upstream.send(data, { binary });
       else if (upstream.readyState === WebSocketClient.CONNECTING && pending.length < 100) pending.push({ data, binary });
     });
@@ -8417,6 +8490,68 @@ export class Gateway {
     upstream.on('message', (data, binary) => { if (browser.readyState === browser.OPEN) browser.send(data, { binary }); });
     upstream.on('close', (code, reason) => { release(); if (browser.readyState === browser.OPEN) browser.close(code || 1000, reason.toString()); });
     upstream.on('error', () => { release(); if (browser.readyState === browser.OPEN) browser.close(1011, 'preview upstream failed'); });
+    lifetime.add(() => { if (upstream.readyState !== WebSocketClient.CLOSED) upstream.terminate(); });
+    keepAuthorized(browser, lifetime, stillAllowed);
+  }
+
+  /**
+   * May a socket's session still do `capability`? A person is decided from
+   * their current grants (with the account-closed and SSO checks), as their
+   * event stream is: their socket token is minted for ten minutes, so it
+   * would see a narrowed grant late and close a still-authorized session
+   * once it expired. Decisions are shared for a second, so a pass over many
+   * sockets of one person costs one lookup. Anything else is its token.
+   */
+  private async sessionMay(session: Session, capability: Capability, projectId: string | undefined, taskId: string): Promise<boolean> {
+    if (!session.userId || !this.deps.authorization || !projectId)
+      return (await this.deps.tokens.check(session.apiToken, capability, { projectId, taskId })).ok;
+    const userId = session.userId;
+    // Shared: what the person may do in the project. Per call: the task.
+    const caps = await this.personCapabilities(userId, session.email, projectId);
+    if (!caps) return false;
+    if (['task:edit', 'task:review:execute'].includes(capability) && await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
+      return false; // as tokens.check: history from before a project move
+    if (allows(caps, capability)) return true;
+    // `task:manage-own` covers the tasks this person created, and their sub-tasks.
+    if (!OWN_TASK_CAPABILITIES.has(capability) || !allows(caps, 'task:manage-own')) return false;
+    for (let id: string | undefined = taskId, seen = new Set<string>(); id && !seen.has(id);) {
+      seen.add(id);
+      const record = await this.deps.store.taskMetadataAsync(id);
+      if (record?.createdBy?.kind === 'user' && record.createdBy.userId === userId) return true;
+      id = record?.parentTaskId;
+    }
+    return false;
+  }
+
+  /** A person's capabilities in a project, or undefined when their account is
+   * closed or SSO no longer admits them; shared across their sockets for a
+   * second within one authorization epoch. */
+  private personCapabilities(userId: string, email: string | undefined, projectId: string): Promise<Capability[] | undefined> {
+    const key = `${authorizationEpoch()}\0${userId}\0${projectId}`;
+    const now = Date.now();
+    const cached = this.personDecisions.get(key);
+    if (cached && cached.until > now) return cached.caps;
+    if (this.personDecisions.size > 1024) this.personDecisions.clear();
+    const caps = (async () => {
+      if (await this.deps.store.kvGet(`account-closed:${userId}`)) return undefined;
+      const organizationId = await this.deps.store.projectOrganizationAsync(projectId);
+      if (organizationId && !(await this.ssoAdmits(userId, email, organizationId))) return undefined;
+      return this.deps.authorization!.capabilitiesAsync(`user:${userId}`, projectId, organizationId);
+    })();
+    caps.catch(() => this.personDecisions.delete(key));
+    this.personDecisions.set(key, { caps, until: now + 1_000 });
+    return caps;
+  }
+
+  /** Is the session a ticket was issued for still signed in? A browser
+   * session can sign out, a local password session log out or expire. */
+  private async sessionLive(session: Session): Promise<boolean> {
+    if (session.identitySessionId && session.userId) return this.deps.tokens.identitySessionLive(session.identitySessionId, session.userId);
+    // Passwordless local mode shares one session with no sign-in to protect:
+    // its 12-hour expiry would only cut a shell off minutes after attaching.
+    if ([...this.sessions.values()].includes(session))
+      return (!this.deps.password && !this.deps.identity) || (session.expiresAt ?? Infinity) > Date.now();
+    return !!(await this.deps.tokens.verify(session.apiToken)); // an API token: until it is revoked or expires
   }
 
   /** SCIM 2.0 provisioning boundary. A tenant-scoped bearer token is stored only
@@ -8623,29 +8758,52 @@ export class Gateway {
    * so the fill runs INSIDE the world via `world.exec`, the secret handed over
    * stdin (never argv/env/a file). The agent still controls its browser. Either way
    * the live page origin is re-verified against the item's domains before typing.
+   * The browser is always the calling task's own, never one the agent names
+   * (AU-14): its world's, or on the host the one its agent launched.
    */
   private async fillCredential(callerTaskId: string | undefined, args: {
-    selector: string; cdpUrl?: unknown; expectDomains?: string[]; resolveText: () => string | Promise<string>;
+    selector: string; expectDomains?: string[]; resolveText: () => string | Promise<string>;
   }): Promise<string> {
-    const cdpUrl = String(args.cdpUrl ?? defaultCdpUrl());
-    const task = callerTaskId ? (await this.deps.store.getTask(callerTaskId)) : undefined;
-    const handle = task
-      ? worldHandleForView(task.lastView, callerTaskId!, (await this.deps.store.effectiveProjectConfig(task.projectId)))
-      : undefined;
-    const remote = !!handle && (worldHandleIsRemote(handle) || !!this.deps.worlds.get(handle.kind)?.capabilities?.remote);
-    if (handle && remote) {
+    const handle = await this.taskWorldHandle(callerTaskId);
+    if (handle && this.agentRunsInWorld(handle)) {
       let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
       try {
         access = this.deps.worldAccess ? await this.deps.worldAccess.open(callerTaskId!, handle) : undefined;
         const world = access?.world ?? await this.deps.worlds.open(handle);
         const { fillInWorld } = await import('../autonomy/world-fill.js');
-        return (await fillInWorld(world, { selector: args.selector, expectDomains: args.expectDomains, cdpUrl, resolveText: args.resolveText })).origin;
+        return (await fillInWorld(world, { selector: args.selector, expectDomains: args.expectDomains, cdpUrl: WORLD_CDP_URL, resolveText: args.resolveText })).origin;
       } finally {
         await access?.release();
       }
     }
     const { fillViaCdp } = await import('../autonomy/fill.js');
-    return (await fillViaCdp({ cdpUrl, selector: args.selector, resolveText: args.resolveText, expectDomains: args.expectDomains })).origin;
+    return (await fillViaCdp({ cdpUrl: localTaskBrowserUrl(callerTaskId), selector: args.selector, resolveText: args.resolveText, expectDomains: args.expectDomains })).origin;
+  }
+
+  /** A page session in the task world's browser, holding the world open until it closes. */
+  private async openTaskWorldPage(taskId: string, handle: WorldHandle, expectDomains: string[]) {
+    const access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+    let released = false;
+    const release = async () => { if (!released) { released = true; await access?.release(); } };
+    try {
+      const world = access?.world ?? await this.deps.worlds.open(handle);
+      const { openWorldPage } = await import('../autonomy/world-fill.js');
+      return await openWorldPage(world, { expectDomains, cdpUrl: WORLD_CDP_URL, onClose: release });
+    } catch (e) {
+      await release();
+      throw e;
+    }
+  }
+
+  private async taskWorldHandle(taskId: string | undefined) {
+    const task = taskId ? (await this.deps.store.getTask(taskId)) : undefined;
+    return task ? worldHandleForView(task.lastView, taskId!, (await this.deps.store.effectiveProjectConfig(task.projectId))) : undefined;
+  }
+
+  /** Does the task's agent — and so its browser — run inside its world (a cloud
+   *  sandbox or a container) rather than on this host? */
+  private agentRunsInWorld(handle: WorldHandle): boolean {
+    return handle.kind === 'container' || worldHandleIsRemote(handle) || !!this.deps.worlds.get(handle.kind)?.capabilities?.remote;
   }
 
   private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {
@@ -8812,7 +8970,8 @@ export class Gateway {
         resolvedOrganizationId, identity.session.id)).token, fingerprint, expiresAt: now + ttl, userId: identity.user.id };
       this.identityTokens.set(cacheKey, cached);
     }
-    return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken };
+    return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken,
+      identitySessionId: identity.session.id };
   }
   /** Browser sockets use HttpOnly cookies; API clients use Authorization. */
   private async socketAuth(req: http.IncomingMessage, _url: URL, projectId?: string): Promise<Session | undefined> {

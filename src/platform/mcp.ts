@@ -619,7 +619,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         `Type a vault credential into the page open in your browser WITHOUT the secret entering your context — ${BRAND} resolves and types it over CDP after verifying the page origin matches the credential's domains. Call once per field (username, password, then totp for a one-time code). The ${BRAND} browser MCP already runs a Chrome that exposes this DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
-      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string(), cdpUrl: z.string().optional() },
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/fill', a))),
   );
@@ -669,7 +669,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         'Enroll a NEW passkey belonging to tavya on the account open in your browser (the user\'s own passkeys are unusable — the OS biometric is theirs). tavya preps a virtual authenticator (origin-verified); you trigger the site\'s "create a passkey" button; then call save_passkey with the returned authenticatorId. Afterwards use_passkey logs in with no 2FA prompt.',
-      inputSchema: { domain: z.string(), cdpUrl: z.string().optional() },
+      inputSchema: { domain: z.string() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/enroll', a))),
   );
@@ -686,7 +686,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         `Log in with a ${BRAND}-enrolled passkey: ${BRAND} loads the stored credential into a virtual authenticator on the page; you trigger the site's "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticatorId (release it when done via platform_request POST /api/vault/passkey/release), or needs_approval/not_in_vault.`,
-      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), cdpUrl: z.string().optional() },
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/login', a))),
   );

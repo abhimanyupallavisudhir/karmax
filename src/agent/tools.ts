@@ -209,11 +209,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_spend',
     description:
-      'Reserve authorization to pay with a permitted project/organization card. Amount in cents. Returns granted, needs_approval, needs_funding, or denied. If not granted, stop and report — the human will raise the card limit or approve, then you can retry.',
+      'Reserve authorization to pay with a permitted project/organization card. Amount in the smallest unit of the card\'s currency (cents for USD, whole yen for JPY; the task\'s payment context gives each scale). Returns granted, needs_approval, needs_funding, or denied. If not granted, stop and report — the human will raise the card limit or approve, then you can retry.',
     parameters: {
       type: 'object',
       properties: {
-        amount: { type: 'number', description: 'Amount in cents.' },
+        amount: { type: 'number', description: 'Amount in the smallest unit of the card\'s currency, e.g. 1250 for 12.50 USD or 1250 for 1,250 JPY.' },
         card_id: { type: 'string', description: 'Optional card id, as an alternative to card_name.' },
         card_name: { type: 'string', description: 'Name of the card to use (unique within the organization). Follow the user’s instructions about which card to use.' },
         merchant: { type: 'string' },
@@ -225,12 +225,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'fill_payment_card',
     description:
-      'After request_spend returns granted, securely fill that reserved card into checkout inputs over loopback Chrome DevTools. Card number and CVC never enter your context. Use the returned request_id; merchant in request_spend must be the checkout domain.',
+      'After request_spend returns granted, securely fill that reserved card into checkout inputs in your own browser (the one your browser tools drive). Card number and CVC never enter your context. Use the returned request_id; merchant in request_spend must be the checkout domain.',
     parameters: {
       type: 'object',
       properties: {
         request_id: { type: 'string' },
-        cdp_url: { type: 'string', description: 'Loopback Chrome DevTools endpoint, e.g. http://127.0.0.1:9222.' },
         number_selector: { type: 'string', description: 'CSS selector, or @focused after you focus an iframe field with the browser tool.' },
         cvc_selector: { type: 'string', description: 'CSS selector; @tab advances once from the prior field before typing.' },
         expiry_selector: { type: 'string', description: 'Combined MM/YY field. Use this or both month/year selectors. @tab advances once from the prior field.' },
@@ -241,7 +240,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         postal_code_selector: { type: 'string', description: 'Optional billing postal/ZIP field.' },
         country_selector: { type: 'string', description: 'Optional billing country field.' },
       },
-      required: ['request_id', 'cdp_url', 'number_selector', 'cvc_selector'],
+      required: ['request_id', 'number_selector', 'cvc_selector'],
     },
   },
   {
@@ -297,7 +296,6 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
         field: { type: 'string', enum: ['username', 'password', 'totp'], description: 'Default password. totp types the current one-time code.' },
         selector: { type: 'string', description: 'CSS selector of the input element to fill.' },
-        cdp_url: { type: 'string', description: 'DevTools endpoint (default http://127.0.0.1:9222).' },
       },
       required: ['selector'],
     },
@@ -389,7 +387,6 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       type: 'object',
       properties: {
         domain: { type: 'string', description: 'The site you are enrolling on, e.g. "example.com".' },
-        cdp_url: { type: 'string', description: 'Browser DevTools endpoint (default http://127.0.0.1:9222).' },
       },
       required: ['domain'],
     },
@@ -417,7 +414,6 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       properties: {
         item_id: { type: 'string' },
         domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
-        cdp_url: { type: 'string' },
       },
     },
   },
@@ -1009,7 +1005,6 @@ export function platformToolHandlers(
       if (!ctx.fillPaymentCard) throw new Error('secure payment-card fill is unavailable');
       return JSON.stringify(await ctx.fillPaymentCard({
         requestId: String(args?.request_id ?? ''),
-        cdpUrl: String(args?.cdp_url ?? ''),
         selectors: {
           number: String(args?.number_selector ?? ''),
           cvc: String(args?.cvc_selector ?? ''),
@@ -1044,7 +1039,7 @@ export function platformToolHandlers(
     async fill_credential(args) {
       return JSON.stringify(await platformRequest('POST', '/api/vault/fill', {
         itemId: args?.item_id, domain: args?.domain, field: args?.field,
-        selector: String(args?.selector ?? ''), cdpUrl: args?.cdp_url,
+        selector: String(args?.selector ?? ''),
       }));
     },
     async get_credential(args) {
@@ -1091,7 +1086,7 @@ export function platformToolHandlers(
       return JSON.stringify(await platformRequest('GET', `/api/organizations/${org}/agent-mail${q.toString() ? `?${q}` : ''}`));
     },
     async enroll_passkey(args) {
-      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/enroll', { domain: args?.domain, cdpUrl: args?.cdp_url }));
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/enroll', { domain: args?.domain }));
     },
     async save_passkey(args) {
       return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/save', {
@@ -1099,7 +1094,7 @@ export function platformToolHandlers(
       }));
     },
     async use_passkey(args) {
-      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/login', { itemId: args?.item_id, domain: args?.domain, cdpUrl: args?.cdp_url }));
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/login', { itemId: args?.item_id, domain: args?.domain }));
     },
     // ─── task list operations (mirroring the platform MCP server) ─────────
     async create_task(args) {
