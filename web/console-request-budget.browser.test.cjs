@@ -139,6 +139,8 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       await page.evaluate(() => { history.pushState({ kx: 1 }, '', '/second/settings'); dispatchEvent(new PopStateEvent('popstate')); });
       await page.waitForFunction(() => document.querySelector('#org-members') && !document.querySelector('#org-members').textContent.startsWith('Loading'));
     }));
+    const panes = ['#org-plan .plan-summary, #org-plan *', '#org-github .github-org-actions', '#org-execution-pool', '#org-providers .provider-connection', '#org-runners #runner-create', '#org-storage #storage-connect', '#org-usage'];
+    assert.deepEqual(await page.evaluate(selectors => selectors.filter(selector => !document.querySelector(selector)), panes), [], 'every organization pane paints');
     record(await measure('organization switch (settings)', async () => {
       await page.evaluate(() => { history.pushState({ kx: 1 }, '', '/org/settings'); dispatchEvent(new PopStateEvent('popstate')); });
       await page.waitForFunction(() => document.querySelector('#org-members') && document.querySelector('#org-switcher input, #org-switcher')?.outerHTML.includes('Organization'));
@@ -161,6 +163,14 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       };
       budget('boot', 24, 5);
       budget('boot (other organization)', 24, 5);
+      budget('organization action (create team)', 6);
+      // The route that switches organization and the settings page it paints share one read.
+      for (const key of ['GET /api/organizations/o2/members', 'GET /api/organizations/o2/teams', 'GET /api/organizations/o2/roles'])
+        assert.equal(results['organization switch'].counts[key], 1, `an organization switch reads ${key} once`);
+      for (const key of ['GET /api/organizations/o/members', 'GET /api/organizations/o/teams', 'GET /api/organizations/o/roles'])
+        assert.ok((results['organization switch (settings)'].counts[key] || 0) <= 1, `an organization switch into settings reads ${key} at most once`);
+      for (const name of ['organization switch', 'organization switch (settings)', 'organization action (create team)'])
+        assert.equal(results[name].counts['GET /api/inbox'], undefined, `${name}: the inbox spans organizations and is not reloaded`);
       assert.ok(!Object.keys(results['boot (other organization)'].counts).some(key => key.includes('/organizations/o/')),
         'a deep link loads only its own organization');
       budget('busy event stream (list)', 0);
