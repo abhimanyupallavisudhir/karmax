@@ -34,12 +34,17 @@ if (args.includes('cp')) {
 }
 if (args.includes('--sign-checksums')) { fs.readFileSync(0); process.stdout.write('signature-fixture'); }
 if (args.includes('pg_dump')) process.stdout.write('dump-' + args.at(-1));
-if (args.includes('pg_restore')) fs.readFileSync(0);
+if (args.includes('pg_restore')) {
+  const input = fs.readFileSync(0);
+  if (!args.includes('/dev/null') && process.env.FAKE_RESTORED) fs.appendFileSync(process.env.FAKE_RESTORED, args.at(-1) + '=' + input + '\\n');
+}
+// Change the backup the operator pointed at once it has been verified.
+if (args.join(' ').includes('--verify-deployment') && process.env.FAKE_TAMPER) fs.writeFileSync(process.env.FAKE_TAMPER, 'tampered');
 `, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  const run = (args: string[], fail = '', input = '') => spawnSync('sh', [path.join(deploy, 'karmax'), ...args], {
+  const run = (args: string[], fail = '', input = '', env: Record<string, string> = {}) => spawnSync('sh', [path.join(deploy, 'karmax'), ...args], {
     encoding: 'utf8', input, timeout: 30_000,
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, FAKE_FAIL: fail },
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, FAKE_FAIL: fail, ...env },
   });
   const calls = () => fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]) : [];
   return { root, deploy, run, calls, clear: () => fs.writeFileSync(log, '') };
@@ -55,6 +60,8 @@ it('publishes a complete backup atomically and verifies its checksums (CI-37)', 
   expect(fs.readFileSync(path.join(destination, 'SHA256SUMS.sig'), 'utf8')).toBe('signature-fixture');
   expect(h.calls().some(args => args.join(' ').includes('exec -T app npm run --silent backup -- --sign-checksums'))).toBe(true);
   expect(spawnSync('sha256sum', ['-c', 'SHA256SUMS'], { cwd: destination }).status).toBe(0);
+  // …and the control-plane manifest, so the two signatures vouch for one backup.
+  expect(fs.readFileSync(path.join(destination, 'SHA256SUMS'), 'utf8')).toMatch(/ {2}control-plane\/manifest\.json$/m);
   expect(fs.readdirSync(h.root).some(name => name.includes('.partial.'))).toBe(false);
   expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
 });
@@ -105,7 +112,7 @@ it('verifies every restore input before stopping services, and waits for the res
   const stopped = calls.findIndex(args => args.includes('down'));
   expect(stopped).toBeGreaterThan(0);
   expect(calls.slice(0, stopped).filter(args => args.includes('pg_restore'))).toHaveLength(3);
-  expect(calls.slice(0, stopped).some(args => args.includes('--verify'))).toBe(true);
+  expect(calls.slice(0, stopped).some(args => args.includes('--verify-deployment'))).toBe(true);
   expect(calls.slice(stopped).filter(args => args.includes('dropdb'))).toHaveLength(3);
   expect(calls.slice(stopped).some(args => args.includes('restore') && !args.includes('--verify'))).toBe(true);
   expect(result.stdout).toContain('Restore complete');
@@ -146,10 +153,9 @@ it('verifies backup signatures first, and restores an unsigned backup only when 
   expect(h.run(['restore', '--trust-key', fingerprint, destination], '', 'RESTORE\n').status).toBe(0);
   const calls = h.calls().map(args => args.join(' '));
   const stopped = calls.findIndex(call => call.endsWith(' down'));
-  const checked = calls.findIndex(call => call.includes(`npm run restore -- --verify-checksums --trust-key ${fingerprint} /backup/SHA256SUMS`));
+  const checked = calls.findIndex(call => call.includes(`npm run restore -- --verify-deployment --trust-key ${fingerprint} /backup`));
   expect(checked).toBeGreaterThan(-1);
   expect(checked).toBeLessThan(stopped);
-  expect(calls.some(call => call.includes(`npm run restore -- --verify --trust-key ${fingerprint} /restore`))).toBe(true);
   expect(calls.slice(stopped).some(call => call.includes(`npm run restore -- --trust-key ${fingerprint} /restore`))).toBe(true);
 
   h.clear();
@@ -163,6 +169,37 @@ it('verifies backup signatures first, and restores an unsigned backup only when 
   expect(unsigned.status, unsigned.stderr).toBe(0);
   expect(unsigned.stdout).toContain('This backup is unsigned');
   const accepted = h.calls().map(args => args.join(' '));
-  expect(accepted.some(call => call.includes('--verify-checksums --accept-unsigned-v1 /backup/SHA256SUMS'))).toBe(true);
+  expect(accepted.some(call => call.includes('--verify-deployment --accept-unsigned-v1 /backup'))).toBe(true);
   expect(accepted.some(call => call.includes('npm run restore -- --accept-unsigned-v1 /restore'))).toBe(true);
+});
+
+// DB-10 review: everything a restore uses comes from a private copy that was
+// verified, not from the backup directory, which can change after the check.
+it('restores from the private copy it verified', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  h.clear();
+  const restored = path.join(h.root, 'restored');
+  const result = h.run(['restore', destination], '', 'RESTORE\n',
+    { FAKE_RESTORED: restored, FAKE_TAMPER: path.join(destination, 'temporal.dump') });
+  expect(result.status, result.stderr).toBe(0);
+  expect(fs.readFileSync(restored, 'utf8')).toContain('temporal=dump-temporal\n');
+  expect(fs.readFileSync(restored, 'utf8')).not.toContain('tampered');
+  const mounts = h.calls().map(args => args.join(' ')).filter(call => call.includes(':/backup:ro') || call.includes(':/restore:ro'));
+  expect(mounts.length).toBeGreaterThan(0);
+  for (const call of mounts) expect(call).not.toContain(`${destination}/`);
+  expect(fs.readdirSync(h.deploy).filter(name => name.startsWith('.restore-stage'))).toEqual([]);
+});
+
+it('refuses a backup containing a symbolic link before building anything', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  fs.symlinkSync('/etc/hostname', path.join(destination, 'deployment-secrets', 'extra'));
+  h.clear();
+  const result = h.run(['restore', destination], '', 'RESTORE\n');
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('symbolic link');
+  expect(h.calls().some(args => args.includes('build') || args.includes('down'))).toBe(false);
 });

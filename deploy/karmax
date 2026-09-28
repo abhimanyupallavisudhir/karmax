@@ -14,13 +14,14 @@ die() { echo "karmax: $*" >&2; exit 1; }
 note() { echo "• $*"; }
 dc() { docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
+# The checksums cover the dumps and secrets outside the signed control-plane
+# manifest, and the manifest itself, so the two signatures vouch for one backup.
 backup_checksums() (
   destination=$1
-  (cd "$destination" && sha256sum *.dump deployment-secrets/* > SHA256SUMS)
+  (cd "$destination" && sha256sum *.dump deployment-secrets/* control-plane/manifest.json > SHA256SUMS)
 )
 
-# The checksums cover the dumps and secrets outside the signed control-plane
-# manifest, so they are signed by the same installation key (DB-10). $1 is the
+# The checksums are signed by the same installation key (DB-10). $1 is the
 # app invocation: `exec -T app` for the live app, `run --rm --no-deps -T app`
 # for a validated candidate.
 sign_checksums() (
@@ -308,29 +309,35 @@ cmd_restore() {
   source=${1:-}
   [ -n "$source" ] || die 'usage: ./deploy/karmax restore [--trust-key SHA256:…] [--accept-unsigned-v1] /path/to/backup'
   case "$source" in /*) ;; *) source="$PWD/$source" ;; esac
+  [ -d "$source" ] || die "backup not found: $source"
+  [ -f "$ENV_FILE" ] || die 'configure the destination first with `./deploy/karmax up your-domain`'
+  # Verify and restore a private copy, never the backup directory itself,
+  # which could change between the check and the restore.
+  stage=$(mktemp -d "$DEPLOY_DIR/.restore-stage.XXXXXX") || die 'could not create a private restore stage'
+  trap 'rm -rf "$stage"' EXIT
+  chmod 700 "$stage"
+  cp -RP "$source/." "$stage/" || die "could not copy $source for verification"
+  [ -z "$(find "$stage" -type l)" ] || die 'backup contains a symbolic link; refusing to restore it'
+  echo "This replaces Karmax and Temporal data on this instance with: $source"
+  source=$stage
   [ -f "$source/control-plane/manifest.json" ] || die 'backup is missing control-plane/manifest.json'
   [ -f "$source/temporal.dump" ] || die 'backup is missing temporal.dump'
   [ -f "$source/temporal-visibility.dump" ] || die 'backup is missing temporal-visibility.dump'
   [ -d "$source/deployment-secrets" ] || die 'backup is missing deployment-secrets'
-  [ -f "$ENV_FILE" ] || die 'configure the destination first with `./deploy/karmax up your-domain`'
   [ -f "$source/SHA256SUMS" ] || die 'backup is missing checksums; cannot verify before restore'
   (cd "$source" && sha256sum -c SHA256SUMS) || die 'backup checksum verification failed'
-  # Check the signatures, the control-plane manifest and every payload file
-  # using the candidate app, while the live containers and all three databases
-  # are still untouched.
+  # Check both signatures, every checksum, the control-plane manifest and
+  # every payload file using the candidate app, while the live containers and
+  # all three databases are still untouched.
   dc build app
   # shellcheck disable=SC2086 # fingerprints and flags are validated words
-  dc run --rm --no-deps -v "$source:/backup:ro" app npm run restore -- --verify-checksums$trust$unsigned /backup/SHA256SUMS \
-    || die 'backup signature verification failed'
-  # shellcheck disable=SC2086
-  dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore -- --verify$trust$unsigned /restore \
-    || die 'control-plane backup verification failed'
+  dc run --rm --no-deps -v "$source:/backup:ro" app npm run restore -- --verify-deployment$trust$unsigned /backup \
+    || die 'backup verification failed'
   for dump in karmax temporal temporal-visibility; do
     [ -f "$source/$dump.dump" ] || { [ "$dump" = karmax ] && continue; die "backup is missing $dump.dump"; }
     dc run --rm --no-deps -T postgresql pg_restore -f /dev/null < "$source/$dump.dump" \
       || die "PostgreSQL dump verification failed: $dump.dump"
   done
-  echo "This replaces Karmax and Temporal data on this instance with: $source"
   confirm=RESTORE
   if [ -n "$unsigned" ]; then
     echo 'This backup is unsigned: nothing proves it has not been altered since it was taken.'
@@ -363,6 +370,8 @@ cmd_restore() {
   dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore --$trust$unsigned /restore
   dc up -d --remove-orphans
   wait_ready || die 'Karmax failed its readiness check after restore'
+  rm -rf "$stage"
+  trap - EXIT
   note 'Restore complete.'
   print_finish
 }

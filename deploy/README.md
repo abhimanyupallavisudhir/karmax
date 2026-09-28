@@ -237,17 +237,23 @@ Karmax and Temporal databases, reapplies the current Temporal schema, and retain
 destination's domain. It requires typing `RESTORE` and will not delete Docker
 volumes as part of ordinary `down` or `update` operations.
 
-Backups are signed: the control-plane manifest and `SHA256SUMS` (which covers
-the dumps and deployment secrets) by an Ed25519 key kept in the app's data
-volume (`state/backup-signing.key`) and never copied into a backup. `backup`
-prints the key's `SHA256:…` fingerprint; record it off-host, since it is what
-lets another host trust the backup. A restore on the same host needs nothing
-more. On a fresh host, run `./deploy/karmax restore --trust-key SHA256:… DIR`
-with the recorded fingerprint. A backup taken before signing is refused unless
-you pass `--accept-unsigned-v1` and type `RESTORE UNSIGNED`. Do that only for a
-backup you know has stayed in trusted storage. Every restore, signed or not, is
-written to the audit log at the next boot (`backup.restored`,
-`backup.restored.unsigned`).
+Backups are signed: the control-plane manifest (`manifest.sig`) and
+`SHA256SUMS` (`SHA256SUMS.sig`), which covers the dumps, the deployment secrets
+and the control-plane manifest, so the two signatures vouch for one backup. The
+key is an Ed25519 key at the root of the app's data volume
+(`/var/lib/karmax/backup-signing.key`), outside everything a backup copies, and
+a restore never replaces it. The manifest stays `version: 1`, so the previous
+release can still restore a signed backup. `backup` prints the key's
+`SHA256:…` fingerprint; record it off-host, since it is what lets another host
+trust the backup. A restore on the same host needs nothing more. On a fresh
+host, run `./deploy/karmax restore --trust-key SHA256:… DIR` with the recorded
+fingerprint. An unsigned backup (taken before signing) is refused unless you
+pass `--accept-unsigned-v1` and type `RESTORE UNSIGNED`. Do that only for a
+backup you know has stayed in trusted storage. `restore` first copies the
+backup into a private directory, refuses symbolic links, and verifies and
+restores only that copy (the backup's size again in free disk space). Every
+restore, signed or not, is written to the audit log at the next boot
+(`backup.restored`, `backup.restored.unsigned`).
 
 ### Rollback compatibility
 
