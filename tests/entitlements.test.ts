@@ -285,6 +285,30 @@ describe.each(storeBackends)('hosted agent-run admission integration ($name)', (
       .toEqual({ state: 'active' });
   });
 
+  // WF-3: a plan-blocked turn waits for this reconciler to restore capacity;
+  // one wedged task workflow must not hold up every organization after it.
+  it('moves on to the next organization when a task view query hangs', async () => {
+    const store = (await open({ hosted: true }));
+    const wedged = (await store.createOrganization({ name: 'Wedged', ownerUserId: 'owner' }));
+    const next = (await store.createOrganization({ name: 'Next', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Product', {}, wedged.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Wedged', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'Run' } }));
+    (await store.admitAgentUsage({ id: `${task.id}#0`, organizationId: wedged.id,
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' }));
+    const signalled: string[] = [];
+    const client = { workflow: { getHandle: vi.fn((id: string) => id.startsWith('agent-queue:')
+      ? { signal: vi.fn(async () => { signalled.push(id); }),
+          query: vi.fn(async () => ({ capacity: 1, current: [], queue: [] })) }
+      : { query: vi.fn(() => new Promise(() => {})) }) } } as any;
+    const reconciler = new EntitlementQueueReconciler({ store, client, intervalMs: 0, queryTimeoutMs: 50 });
+    (await reconciler.start());
+    await vi.waitFor(() => expect(signalled).toContain(`agent-queue:${next.id}`), { timeout: 2_000 });
+    expect((await store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(`${task.id}#0`)))
+      .toEqual({ state: 'active' });
+    await reconciler.stop();
+  });
+
   it('preserves pre-durable usage admissions whose workflow view has no turn identity', async () => {
     const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Historical workflow', ownerUserId: 'owner' }));
@@ -365,7 +389,7 @@ describe.each(storeBackends)('hosted agent-run admission integration ($name)', (
     expect(returnedBeforeRelease).toBe(false);
   });
 
-  it('blocks new run admission while over the member limit and reopens after recovery', async () => {
+  it('queues run admission at zero capacity while over the member limit and reopens after recovery', async () => {
     const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Over limit', ownerUserId: 'owner' }));
     (await store.setOrganizationPlan(organization.id, 'team'));
@@ -376,19 +400,23 @@ describe.each(storeBackends)('hosted agent-run admission integration ($name)', (
       projectId: project.id, title: 'Blocked', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Run' },
     }));
     (await store.setOrganizationPlan(organization.id, 'free'));
-    const executeUpdate = vi.fn(async () => ({ granted: true, position: 0, capacity: 5 }));
+    const executeUpdate = vi.fn(async () => ({ granted: false, position: 1, capacity: 0 }));
     const signalWithStart = vi.fn(async () => undefined);
     const activities = makeCoordinatorActivities({ store, taskQueue: 'test', client: {
       workflow: { signalWithStart, getHandle: vi.fn(() => ({ executeUpdate, signal: vi.fn(async () => undefined) })) },
     } as any });
 
-    await expect(activities.requestAgentSlot({
+    // The turn waits in the zero-capacity queue for the grant signal the
+    // entitlement reconciler releases on recovery, instead of polling (WF-3).
+    const admission = await activities.requestAgentSlot({
       taskId: task.id, turnId: `${task.id}#0`, role: 'do', projectId: project.id,
-    })).resolves.toMatchObject({
-      granted: false, blocked: true, capacity: 0, queueId: `agent-queue:${organization.id}`,
+    });
+    expect(admission).toMatchObject({
+      granted: false, capacity: 0, queueId: `agent-queue:${organization.id}`,
       detail: 'Free allows 1 organization user, but this organization has 3. Remove 2 members or restore Team to start another agent run.',
     });
-    expect(executeUpdate).not.toHaveBeenCalled();
+    expect(admission.blocked).toBeUndefined();
+    expect(executeUpdate).toHaveBeenCalledOnce();
     expect(signalWithStart).toHaveBeenLastCalledWith('agentQueue', expect.objectContaining({
       workflowId: `agent-queue:${organization.id}`,
       args: [{ capacity: 0 }],
@@ -397,12 +425,13 @@ describe.each(storeBackends)('hosted agent-run admission integration ($name)', (
 
     (await store.removeOrganizationMembership(organization.id, 'second'));
     (await store.removeOrganizationMembership(organization.id, 'third'));
+    executeUpdate.mockResolvedValueOnce({ granted: true, position: 0, capacity: 5 });
     await expect(activities.requestAgentSlot({
       taskId: task.id, turnId: `${task.id}#0`, role: 'do', projectId: project.id,
     })).resolves.toMatchObject({
       granted: true, capacity: 5, queueId: `agent-queue:${organization.id}`,
     });
-    expect(executeUpdate).toHaveBeenCalledOnce();
+    expect(executeUpdate).toHaveBeenCalledTimes(2);
   });
 
   it('uses a durable organization queue and refreshes its capacity from plan changes', async () => {

@@ -359,6 +359,15 @@ export class KarmaxApi {
     return this.remoteWikiReadCache ??= new RemoteWikiSnapshots(
       path.join(this.deps.contentDir ?? paths().content, '.wiki-snapshots'));
   }
+  /** The run a task's signals reach now: its pin, else (legacy tasks, or one
+   * mid continue-as-new) the workflow id's current run. */
+  private async currentRunId(taskId: string): Promise<string | undefined> {
+    const pinned = (await this.deps.store.taskMetadata(taskId))?.params?._workflowRunId;
+    if (typeof pinned === 'string' && pinned) return pinned;
+    return withTimeout((async () => (await this.deps.client.workflow.getHandle(taskId).describe())?.runId as string | undefined)(),
+      QUERY_TIMEOUT_MS).catch(() => undefined);
+  }
+
   /** A workflow id can have several unrelated runs after a lifecycle recovery.
    * Temporal's id-only handle may resolve an earlier closed run; replacements
    * persist their exact run id so every later query/signal targets the live run. */
@@ -366,6 +375,14 @@ export class KarmaxApi {
     const runId = (metadata === undefined ? (await this.deps.store.taskMetadata(taskId)) : metadata)?.params?._workflowRunId;
     return this.deps.client.workflow.getHandle(taskId,
       typeof runId === 'string' && runId ? runId : undefined);
+  }
+
+  /** Settle a task the workflow can no longer settle. A parent that continued
+   * as new learns of it only from this signal, not from its child's handle. */
+  private async saveSettledView(taskId: string, view: TaskView): Promise<void> {
+    (await this.deps.store.saveView(taskId, view));
+    await notifyChildSettlement(this.deps.store, this.deps.client, view)
+      .catch((error) => console.warn(`[karmax] could not tell the parent that ${taskId} settled:`, error));
   }
 
   private armer?: TriggerArmer;
@@ -2888,30 +2905,46 @@ export class KarmaxApi {
     reason: string,
     disposition: 'replace' | 'cancel' | 'discard' = 'replace',
     gracefulTimeoutMs = 30_000,
-  ): Promise<void> {
-    const handle = (await this.workflowHandle(task.id));
+  ): Promise<string[]> {
     const minor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
-    let stoppedGracefully = false;
-    if (minor >= 22 && disposition !== 'discard' && typeof (handle as any).result === 'function') {
-      if (disposition === 'replace') {
-        const runId = task.params?._workflowRunId;
-        (await this.deps.store.kvSet(lifecycleReplacementKey(task.id), JSON.stringify({
-          ...(typeof runId === 'string' && runId ? { runId } : {}),
-          requestedAt: Date.now(),
-        })));
+    const graceful = minor >= 22 && disposition !== 'discard';
+    // Act on a handle bound to the run resolved now: `task` may predate a
+    // continue-as-new that moved the pin, and a run that continues as new
+    // between resolving and signalling answers not-found. Then resolve the
+    // live run again and stop that one (WF-3/WF-4). Returns every run it
+    // acted on, the last being the one stopped.
+    const attempted: string[] = [];
+    for (let attempt = 1; ; attempt++) {
+      const runId = (await this.currentRunId(task.id));
+      if (runId) attempted.push(runId);
+      const handle = this.deps.client.workflow.getHandle(task.id, runId);
+      let closed = false;
+      let stoppedGracefully = false;
+      if (graceful && typeof (handle as any).result === 'function') {
+        if (disposition === 'replace') {
+          (await this.deps.store.kvSet(lifecycleReplacementKey(task.id), JSON.stringify({
+            ...(runId ? { runId } : {}),
+            requestedAt: Date.now(),
+          })));
+        }
+        try {
+          await handle.signal(disposition === 'cancel' ? 'cancel' : 'prepareLifecycleReplacement');
+          await withTimeout(Promise.resolve((handle as any).result()), gracefulTimeoutMs);
+          stoppedGracefully = true;
+        } catch (error) {
+          // A wedged/older execution still has the bounded termination fallback.
+          closed = error instanceof WorkflowNotFoundError;
+        }
       }
-      try {
-        await handle.signal(disposition === 'cancel' ? 'cancel' : 'prepareLifecycleReplacement');
-        await withTimeout(Promise.resolve((handle as any).result()), gracefulTimeoutMs);
-        stoppedGracefully = true;
-      } catch {
-        // A wedged/older execution still has the bounded termination fallback.
+      if (!stoppedGracefully && !closed) {
+        await handle.terminate(reason).catch((error: unknown) => {
+          if (!(error instanceof WorkflowNotFoundError)) throw error;
+          closed = true;
+        });
       }
-    }
-    if (!stoppedGracefully) {
-      await handle.terminate(reason).catch((error: unknown) => {
-        if (!(error instanceof WorkflowNotFoundError)) throw error;
-      });
+      if (!closed || !runId || (await this.currentRunId(task.id)) === runId) break;
+      if (attempt === 3)
+        throw new Error(`${task.title} kept continuing as new while it was being stopped; try again.`);
     }
 
     // Do not trust only the projected turn: pre-1.7 account waits did not expose
@@ -2956,6 +2989,7 @@ export class KarmaxApi {
       }));
     }
     await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
+    return attempted;
   }
 
   /** Setup can be terminated before a WorldHandle containing `worldLeaseId` is
@@ -3095,11 +3129,11 @@ export class KarmaxApi {
         // Stop the run as a replacement, not a cancellation: cancellation
         // cleanup closes open pull requests, silently dropping work the person
         // just declared done (task #395). No successor run follows.
-        await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
+        const runs = await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
         (await this.deps.store.kvDelete(lifecycleReplacementKey(task.id)));
-        // No successor run will supersede the stopped one's late publications.
-        const runId = task.params._workflowRunId;
-        if (typeof runId === 'string' && runId) (await this.deps.store.retireViewRun(task.id, runId));
+        // No successor run will supersede the late publications of the runs
+        // the stop reached, including one that continued as new under it.
+        for (const runId of runs) (await this.deps.store.retireViewRun(task.id, runId));
       }
       if (task.params.draft) (await this.deps.store.clearDraft(taskId));
       // WF-32: `view` predates the stop. The stored view is newer for its PRs:
@@ -3151,22 +3185,22 @@ export class KarmaxApi {
 
     if (target === 'draft') {
       await this.waitForTerminalCleanup(task, view);
-      if (!['done', 'cancelled', 'failed'].includes(view.status))
-        await this.stopTaskActivity(task, view, 'Task moved back to Draft', 'discard');
+      const stopped = ['done', 'cancelled', 'failed'].includes(view.status) ? undefined
+        : await this.stopTaskActivity(task, view, 'Task moved back to Draft', 'discard');
       const world = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
       if (world && this.deps.worlds) {
         const opened = await this.deps.worlds.open(world).catch(() => undefined);
         await opened?.destroy().catch(() => undefined);
       }
       (await this.deps.store.kvDelete(`attempt-choice:${taskId}`));
-      const draftParams = { ...task.params };
-      delete (draftParams as any)._workflowRunId;
       (await this.deps.store.updateTaskParams(taskId, {
-        ...draftParams,
+        ...task.params,
         draft: true,
         archived: false,
         _discardProgress: true,
       }));
+      const runId = stopped?.at(-1) ?? (await this.deps.store.taskMetadata(taskId))?.params?._workflowRunId;
+      if (typeof runId === 'string' && runId) (await this.deps.store.swapTaskRun(taskId, runId, ''));
       (await this.deps.store.electPrincipal(task.intentId ?? task.id));
       return (await this.getDraftView(token, taskId))!;
     }
@@ -4504,7 +4538,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       (await this.releaseTaskRunnerLeases(taskId));
       const latest = (await this.deps.store.getTask(taskId))?.lastView ?? heldView;
       if (!['done', 'cancelled', 'failed'].includes(latest.status)) {
-        (await this.deps.store.saveView(taskId, {
+        (await this.saveSettledView(taskId, {
           ...latest,
           stage: 'cancelled',
           status: 'cancelled',
@@ -4534,7 +4568,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         return msg;
       }
       if (signal === SIG.cancel) {
-        (await this.deps.store.saveView(taskId, {
+        (await this.saveSettledView(taskId, {
           ...terminal,
           stage: 'cancelled',
           status: 'cancelled',
@@ -4726,7 +4760,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         if (!task) throw e;
         const view = task.lastView;
         if (view && !['done', 'cancelled', 'failed'].includes(view.status)) {
-          (await this.deps.store.saveView(taskId, {
+          (await this.saveSettledView(taskId, {
             ...view,
             stage: 'cancelled',
             status: 'cancelled',

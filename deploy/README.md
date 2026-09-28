@@ -211,6 +211,7 @@ release their execution lease when finished.
 ./deploy/karmax status
 ./deploy/karmax logs                # or: logs temporal
 ./deploy/karmax backup              # deploy/backups/<UTC timestamp>
+./deploy/karmax prune-backups       # drop automatic snapshots past retention
 ./deploy/karmax update              # backup, validate commit ancestry, rebuild
 ./deploy/karmax down                # preserves all volumes and certificates
 ./deploy/karmax restore BACKUP_DIR  # verified and signature-checked, explicit destructive prompt
@@ -224,12 +225,18 @@ their durable form. Copy backups to encrypted off-host storage. Anyone holding a
 backup can recover the vault, so protect it like production credentials.
 
 On Linux hosts with the util-linux `hardlink` command, completed backups share
-identical large object-store files automatically. This preserves every restore
-point and its verified bytes while avoiding a full physical copy of unchanged
-checkpoints on every deployment. To compact existing backups, run
-`sh deploy/compact-backups.sh`. Treat completed backup directories as immutable;
-copy files out before editing them. The live data volume is never linked to a
-backup. The release workflow also retains its existing 14-day age limit.
+identical large files (object-store checkpoints, agent transcripts)
+automatically. This preserves every restore point and its verified bytes while
+avoiding a full physical copy of unchanged data on every deployment. To compact
+existing backups, run `sh deploy/compact-backups.sh`. Treat completed backup
+directories as immutable; copy files out before editing them. The live data
+volume is never linked to a backup.
+
+Automatic snapshots are pruned: `update` keeps the newest 10 `predeploy-*`
+snapshots, and the daily `scheduled-*` snapshots are kept for 14 days. A
+successful update also prunes dangling images and caps the Docker build cache
+at 8 GB. Snapshots with any other name (`backup` without a directory, or one
+you name) are never deleted automatically.
 
 `restore` verifies the control-plane payload, PostgreSQL dumps, and deployment
 secrets, then restores every dump into a staging database (`karmax_restore`,

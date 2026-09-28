@@ -67,6 +67,33 @@ it('publishes a complete backup atomically and verifies its checksums (CI-37)', 
   expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
 });
 
+// Every deploy snapshots fresh database dumps and agent transcripts. Kept
+// forever they filled tavya.io's disk: 84 snapshots, 144 GB of 193 GB, in 15 days.
+it('keeps the newest predeploy snapshots and two weeks of scheduled ones, never an operator\'s', () => {
+  const h = deployment();
+  const backups = path.join(h.deploy, 'backups');
+  const make = (name: string, daysOld = 0) => {
+    const dir = path.join(backups, name);
+    fs.mkdirSync(path.join(dir, 'control-plane'), { recursive: true });
+    const when = new Date(Date.now() - daysOld * 86_400_000);
+    fs.utimesSync(dir, when, when);
+  };
+  const predeploy = Array.from({ length: 12 }, (_, i) => `predeploy-202609${String(10 + i)}T000000Z`);
+  // Creation order must not matter: names carry the time.
+  [...predeploy].reverse().forEach(name => make(name));
+  const kept = ['20260913T132143Z', 'incident-20260919-page-latency', 'predeploy-20260901T000000Z.partial.7',
+    'scheduled-20260925T021700Z'];
+  make(kept[0]!, 30); make(kept[1]!, 30); make(kept[2]!, 30); make(kept[3]!, 3);
+  make('scheduled-20260901T021700Z', 20);
+  const result = h.run(['prune-backups']);
+  expect(result.status, result.stderr).toBe(0);
+  expect(fs.readdirSync(backups).sort()).toEqual([...kept, ...predeploy.slice(2)].sort());
+  // Nothing to prune is not an error.
+  expect(h.run(['prune-backups']).status).toBe(0);
+  fs.rmSync(backups, { recursive: true });
+  expect(h.run(['prune-backups']).status).toBe(0);
+});
+
 it('starts only after configuration validates, preserves secrets, and waits for readiness', () => {
   const h = deployment();
   const result = h.run(['up', 'example.com']);
