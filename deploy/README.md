@@ -268,12 +268,17 @@ tracked and billable in diagnostics instead of being falsely reported as free.
 `compose.turnkey.yml` is deliberately a single active control-plane writer with
 durable local object storage and an embedded PostgreSQL-backed data/Temporal cluster.
 It is the clean choice for one VPS and can serve many users, but its availability
-is that VPS plus your backup/restore policy.
+is that VPS plus your backup/restore policy. The app connects as its own `karmax`
+role, which owns the `karmax` database and nothing else; Temporal and the
+backup commands keep the `temporal` superuser. `deploy/karmax` generates the
+app's URL in `.secrets/database_url`, and `postgres/karmax-role.sql` re-applies
+the role on every start.
 
 Larger installations can use `compose.hosted.yml` with managed PostgreSQL,
 managed Temporal, S3, and one active Karmax cell. Copy `.env.example`, provide
 the listed infrastructure secrets under `deploy/.secrets` (including a complete
-PostgreSQL connection string in `database_url`), and validate with:
+PostgreSQL connection string in `database_url` for a role that owns its database
+but is not a superuser), and validate with:
 
 ```bash
 docker compose --env-file deploy/.env.example \

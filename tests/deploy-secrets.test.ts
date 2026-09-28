@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const deployDir = path.join(repoRoot, 'deploy');
@@ -29,15 +30,19 @@ function generateSecrets(): string {
     '#!/bin/sh\nfor a in "$@"; do [ "$a" = up ] && exit 1; done\nexit 0\n',
     { mode: 0o755 },
   );
+  rerunUp(sandbox);
+  return path.join(sandbox, '.secrets');
+}
+
+function rerunUp(sandbox: string) {
   try {
     execFileSync('sh', [path.join(sandbox, 'karmax'), 'up', 'karmax.example.com'], {
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      env: { ...process.env, PATH: `${path.join(sandbox, '..', 'bin')}:${process.env.PATH ?? ''}` },
       stdio: 'ignore',
     });
   } catch {
     // Expected: the stub fails the build step once configuration has happened.
   }
-  return path.join(sandbox, '.secrets');
 }
 
 describe('turnkey update deploys an exact validated revision', () => {
@@ -62,6 +67,17 @@ describe('turnkey update deploys an exact validated revision', () => {
   it('uses candidate backup code so an old backup bug cannot block its own fix', () => {
     expect(update).toContain('cmd_backup_candidate');
     expect(script).toContain('dc run --rm --no-deps app npm run backup');
+  });
+
+  // An update never runs `configure`, so a secret a new release mounts would be
+  // missing and Compose would refuse to start it; so would a restore of an
+  // older backup's secrets directory.
+  it('creates any missing secret before building an update or starting a restore', () => {
+    expect(update.indexOf('ensure_secrets')).toBeGreaterThan(update.indexOf('checkout --detach "$target"'));
+    expect(update.indexOf('ensure_secrets')).toBeLessThan(update.indexOf('dc build --pull app'));
+    const restore = script.split('cmd_restore() {')[1]?.split('\n}')[0] ?? '';
+    expect(restore.indexOf('ensure_secrets')).toBeGreaterThan(restore.indexOf('cp -R "$source/deployment-secrets"'));
+    expect(restore.indexOf('ensure_secrets')).toBeLessThan(restore.indexOf('dc up -d postgresql'));
   });
 
   it('backs up and restores the PostgreSQL application database', () => {
@@ -153,12 +169,24 @@ describe('turnkey backup publication', () => {
 
 describe('turnkey deployment secrets', () => {
   const secretsDir = generateSecrets();
-  const secrets = ['auth_secret', 'vault_key', 'world_ref_key'];
+  const secrets = ['auth_secret', 'vault_key', 'world_ref_key', 'database_url'];
 
   it('generates every secret the compose profile mounts', () => {
+    const compose = fs.readFileSync(path.join(deployDir, 'compose.turnkey.yml'), 'utf8');
+    const mounted = Object.keys(parse(compose).secrets as Record<string, unknown>);
+    expect(mounted.sort()).toEqual([...secrets].sort());
     for (const name of secrets) {
       expect(fs.existsSync(path.join(secretsDir, name)), `${name} was not generated`).toBe(true);
     }
+  });
+
+  // The app's own login (deploy/postgres/karmax-role.sh), not the superuser's.
+  it('generates the app database login once and keeps it across re-runs', () => {
+    const file = path.join(secretsDir, 'database_url');
+    const url = fs.readFileSync(file, 'utf8');
+    expect(url).toMatch(/^postgres:\/\/karmax:[0-9a-f]{64}@postgresql:5432\/karmax\n$/);
+    rerunUp(path.dirname(secretsDir));
+    expect(fs.readFileSync(file, 'utf8')).toBe(url);
   });
 
   // The app container runs as its own uid and compose bind-mounts these files

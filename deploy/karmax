@@ -62,6 +62,22 @@ write_secret() {
   secret_mode "$file"
 }
 
+# Every secret compose.turnkey.yml mounts; existing ones are kept. Updates and
+# restores call this too, so a release that mounts a new secret can start.
+# A subshell, so the umask cannot reach files a later checkout writes.
+ensure_secrets() (
+  umask 077
+  mkdir -p "$SECRETS_DIR"
+  chmod 700 "$SECRETS_DIR"
+  write_secret auth_secret
+  write_secret vault_key
+  write_secret world_ref_key
+  # The app's own PostgreSQL login, not the superuser (postgres/karmax-role.sh).
+  file="$SECRETS_DIR/database_url"
+  [ -s "$file" ] || printf 'postgres://karmax:%s@postgresql:5432/karmax\n' "$(random_hex 32)" > "$file"
+  secret_mode "$file"
+)
+
 configure() {
   requested_domain=${1:-}
   existing_domain=$(env_value KARMAX_DOMAIN)
@@ -114,11 +130,7 @@ configure() {
   fi
 
   umask 077
-  mkdir -p "$SECRETS_DIR"
-  chmod 700 "$SECRETS_DIR"
-  write_secret auth_secret
-  write_secret vault_key
-  write_secret world_ref_key
+  ensure_secrets
   {
     printf 'KARMAX_DOMAIN=%s\n' "$domain"
     printf 'KARMAX_PREVIEW_DOMAIN=%s\n' "$preview"
@@ -182,7 +194,7 @@ cmd_doctor() {
   [ -f "$ENV_FILE" ] || die 'this instance is not configured; run `./deploy/karmax up your-domain`'
   dc config --quiet
   note 'Compose configuration is valid.'
-  for secret in auth_secret vault_key world_ref_key; do
+  for secret in auth_secret vault_key world_ref_key database_url; do
     [ -s "$SECRETS_DIR/$secret" ] || die "missing secret: $secret"
   done
   note 'Durable secrets are present.'
@@ -311,6 +323,8 @@ cmd_restore() {
   cp -R "$source/deployment-secrets" "$SECRETS_DIR"
   chmod 700 "$SECRETS_DIR"
   secret_mode "$SECRETS_DIR"/*
+  # A backup taken before a secret existed restores without it.
+  ensure_secrets
   dc up -d postgresql
   attempt=0
   until dc exec -T postgresql pg_isready -U temporal -d postgres >/dev/null 2>&1; do
@@ -417,6 +431,8 @@ cmd_update() {
 
   note "Checking out validated revision $target…"
   git -C "$ROOT_DIR" checkout --detach "$target"
+  # This file is the target's own, so it knows every secret the target mounts.
+  ensure_secrets
 
   # Building does not replace the running container. It gives the one-off
   # snapshot process the candidate's backup implementation while production
