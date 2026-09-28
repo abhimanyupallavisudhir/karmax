@@ -93,7 +93,7 @@ export async function benchmarkRemoteBootstrap(turns = 8, growthKiB = 512, laten
 if (import.meta.url === `file://${process.argv[1]}`) {
   const [turns, growth, promptMs] = process.argv.slice(2).map(Number);
   const samples = await benchmarkRemoteBootstrap(turns || undefined, growth || undefined, E2B_LATENCY, promptMs || 0);
-  console.table(samples.map((sample) => { const { spans: _, ...row } = sample; return row; }));
+  console.table(samples.map(({ spans: _, ...sample }) => sample));
   if (process.env.KARMAX_BENCHMARK_SPANS) for (const sample of samples) console.log(sample.turn, JSON.stringify(sample.spans));
   const resumed = samples.slice(1).map((sample) => sample.modelStartMs).sort((a, b) => a - b);
   console.log(JSON.stringify({ latency: E2B_LATENCY, promptMs: promptMs || 0, firstTurnModelStartMs: samples[0]?.modelStartMs,
