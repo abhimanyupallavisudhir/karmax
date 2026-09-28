@@ -359,9 +359,6 @@ export class KarmaxApi {
     return this.remoteWikiReadCache ??= new RemoteWikiSnapshots(
       path.join(this.deps.contentDir ?? paths().content, '.wiki-snapshots'));
   }
-  /** A workflow id can have several unrelated runs after a lifecycle recovery.
-   * Temporal's id-only handle may resolve an earlier closed run; replacements
-   * persist their exact run id so every later query/signal targets the live run. */
   /** The run a task's signals reach now: its pin, else (legacy tasks, or one
    * mid continue-as-new) the workflow id's current run. */
   private async currentRunId(taskId: string): Promise<string | undefined> {
@@ -371,6 +368,9 @@ export class KarmaxApi {
       QUERY_TIMEOUT_MS).catch(() => undefined);
   }
 
+  /** A workflow id can have several unrelated runs after a lifecycle recovery.
+   * Temporal's id-only handle may resolve an earlier closed run; replacements
+   * persist their exact run id so every later query/signal targets the live run. */
   private async workflowHandle(taskId: string, metadata?: TaskRecord | null): Promise<any> {
     const runId = (metadata === undefined ? (await this.deps.store.taskMetadata(taskId)) : metadata)?.params?._workflowRunId;
     return this.deps.client.workflow.getHandle(taskId,
@@ -2901,16 +2901,18 @@ export class KarmaxApi {
     reason: string,
     disposition: 'replace' | 'cancel' | 'discard' = 'replace',
     gracefulTimeoutMs = 30_000,
-  ): Promise<string | undefined> {
+  ): Promise<string[]> {
     const minor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
     const graceful = minor >= 22 && disposition !== 'discard';
     // Act on a handle bound to the run resolved now: `task` may predate a
     // continue-as-new that moved the pin, and a run that continues as new
     // between resolving and signalling answers not-found. Then resolve the
-    // live run again and stop that one (WF-3/WF-4).
-    let runId: string | undefined;
+    // live run again and stop that one (WF-3/WF-4). Returns every run it
+    // acted on, the last being the one stopped.
+    const attempted: string[] = [];
     for (let attempt = 1; ; attempt++) {
-      runId = (await this.currentRunId(task.id));
+      const runId = (await this.currentRunId(task.id));
+      if (runId) attempted.push(runId);
       const handle = this.deps.client.workflow.getHandle(task.id, runId);
       let closed = false;
       let stoppedGracefully = false;
@@ -2936,7 +2938,9 @@ export class KarmaxApi {
           closed = true;
         });
       }
-      if (!closed || !runId || attempt === 3 || (await this.currentRunId(task.id)) === runId) break;
+      if (!closed || !runId || (await this.currentRunId(task.id)) === runId) break;
+      if (attempt === 3)
+        throw new Error(`${task.title} kept continuing as new while it was being stopped; try again.`);
     }
 
     // Do not trust only the projected turn: pre-1.7 account waits did not expose
@@ -2981,7 +2985,7 @@ export class KarmaxApi {
       }));
     }
     await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
-    return runId;
+    return attempted;
   }
 
   /** Setup can be terminated before a WorldHandle containing `worldLeaseId` is
@@ -3121,10 +3125,11 @@ export class KarmaxApi {
         // Stop the run as a replacement, not a cancellation: cancellation
         // cleanup closes open pull requests, silently dropping work the person
         // just declared done (task #395). No successor run follows.
-        const runId = await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
+        const runs = await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
         (await this.deps.store.kvDelete(lifecycleReplacementKey(task.id)));
-        // No successor run will supersede the stopped one's late publications.
-        if (runId) (await this.deps.store.retireViewRun(task.id, runId));
+        // No successor run will supersede the late publications of the runs
+        // the stop reached, including one that continued as new under it.
+        for (const runId of runs) (await this.deps.store.retireViewRun(task.id, runId));
       }
       if (task.params.draft) (await this.deps.store.clearDraft(taskId));
       // WF-32: `view` predates the stop. The stored view is newer for its PRs:
@@ -3190,7 +3195,7 @@ export class KarmaxApi {
         archived: false,
         _discardProgress: true,
       }));
-      const runId = stopped ?? (await this.deps.store.taskMetadata(taskId))?.params?._workflowRunId;
+      const runId = stopped?.at(-1) ?? (await this.deps.store.taskMetadata(taskId))?.params?._workflowRunId;
       if (typeof runId === 'string' && runId) (await this.deps.store.swapTaskRun(taskId, runId, ''));
       (await this.deps.store.electPrincipal(task.intentId ?? task.id));
       return (await this.getDraftView(token, taskId))!;

@@ -693,8 +693,29 @@ describe('task stage transitions', () => {
       await f.api.moveTaskStage(f.token, f.task.id, 'done');
       expect(f.signalled).toContainEqual(expect.objectContaining({ signal: 'prepareLifecycleReplacement', runId: 'run-2' }));
       expect(markers.map((marker) => JSON.parse(marker).runId)).toEqual(['run-1', 'run-2']);
-      expect(JSON.parse((await f.store.kvGet(`view-order:${f.task.id}`))!).retired).toEqual(['run-2']);
+      // A late copy of run-1's last publication must not overwrite the Done either.
+      expect(JSON.parse((await f.store.kvGet(`view-order:${f.task.id}`))!).retired).toEqual(['run-1', 'run-2']);
     });
+
+  it('refuses a Done whose run keeps continuing as new under it', async () => {
+    const f = (await fixture());
+    (await f.store.setTaskWorkflowVersion(f.task.id, '1.26.0'));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'run-1' }));
+    const getHandle = f.client.workflow.getHandle.bind(f.client.workflow);
+    vi.spyOn(f.client.workflow, 'getHandle').mockImplementation((id: string, runId?: string) => {
+      const handle = getHandle(id, runId);
+      if (id !== f.task.id || !runId) return handle;
+      // Each run hands its pin to the next as it is reached.
+      const moved = async () => {
+        const next = `run-${Number(runId.slice(4)) + 1}`;
+        (await f.store.swapTaskRun(f.task.id, runId, next));
+        throw new WorkflowNotFoundError('workflow execution already completed', f.task.id, runId);
+      };
+      return { ...handle, signal: moved, terminate: moved, result: async () => ({}) };
+    });
+    await expect(f.api.moveTaskStage(f.token, f.task.id, 'done')).rejects.toThrow(/try again/i);
+    expect((await f.store.getTask(f.task.id))?.lastView?.status).not.toBe('done');
+  });
 
   it('unpins the run a move back to Draft stopped, read when it stops', async () => {
     const f = (await fixture());
