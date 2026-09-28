@@ -1,4 +1,5 @@
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
+import type { PasskeyCredential } from '../autonomy/passkey.js';
 import { ExecutionOutput } from './execution-output.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -6821,7 +6822,7 @@ export class Gateway {
               try {
                 const decision = (await vault.access(caps, callerTaskId, item, 'use', { consume: true }));
                 if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
-                const creds = JSON.parse((await vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' }))) as any[];
+                const creds = JSON.parse((await vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' }))) as PasskeyCredential[];
                 const started = await this.passkeys.begin(async () => page, { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner,
                   onCredentials: async updated => {
                     await store.transaction(async () => {
@@ -6829,7 +6830,7 @@ export class Gateway {
                       if (!current || current.type !== 'passkey') return;
                       const secret = await vault.readSecret(current, 'passkey');
                       if (secret === undefined) return;
-                      const saved = JSON.parse(secret) as any[];
+                      const saved = JSON.parse(secret) as PasskeyCredential[];
                       for (const credential of saved) {
                         const next = updated.find(c => c.credentialId === credential.credentialId && c.privateKey === credential.privateKey);
                         if (next && Number.isSafeInteger(next.signCount) && next.signCount! > (credential.signCount ?? 0))
