@@ -3755,6 +3755,9 @@ function renderOnboarding() {
     <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
+  // A step's link opens the settings that step needs, which the expanded card
+  // would then cover; tuck it into its progress pill while the person works.
+  host.querySelectorAll('.onboarding-step a[data-spa]').forEach((link) => link.addEventListener('click', () => setOnboardingDisplay('minimized')));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-close')?.addEventListener('click', () => setOnboardingDisplay('closed'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
