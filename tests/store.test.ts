@@ -1188,3 +1188,22 @@ describe('Store', () => {
     }
   });
 });
+
+// Continue-as-new hands a task's run pin to the next run only while no
+// replacement has claimed it (WF-3, WF-4).
+it('swaps a task run pin only from its current value', async () => {
+  const store = await Store.create(':memory:');
+  try {
+    const project = await store.createProject('Pins');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'p', _workflowRunId: 'run-1' } });
+    expect(await store.swapTaskRun(task.id, 'run-0', '')).toBe(false);
+    expect(await store.swapTaskRun(task.id, 'run-1', '')).toBe(true);
+    expect(await store.swapTaskRun(task.id, '', 'run-2')).toBe(true);
+    expect(await store.swapTaskRun(task.id, '', 'run-3')).toBe(false);
+    expect((await store.taskMetadata(task.id))?.params).toMatchObject({ prompt: 'p', _workflowRunId: 'run-2' });
+    const unpinned = await store.createTask({ projectId: project.id, title: 'U', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'p' } });
+    expect(await store.swapTaskRun(unpinned.id, '', 'run-9')).toBe(true);
+  } finally { await store.close(); }
+});

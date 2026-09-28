@@ -14,7 +14,7 @@ import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
-import { applyConversationPatch, hasLiveWorldWork, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
+import { applyConversationPatch, conversationPage, hasLiveWorldWork, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -383,6 +383,10 @@ async function acquireWorkflowAgentSlot(args: {
     await args.client.workflow.getHandle(id).signal(SIG_RELEASE_AGENT, { taskId: args.taskId, turnId: args.turnId }).catch(() => undefined);
   };
 }
+
+/** A page of a continued run's transcripts: far below the 2 MB payload limit
+ * (one message may exceed it only if it already entered history by value). */
+const CONVERSATION_PAGE_BYTES = 512 * 1024;
 
 export interface RunAgentTurnArgs {
   taskId: string;
@@ -5106,6 +5110,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         || !(await store.humanMayAct(taskId, userId))) return false;
       (await recordHumanConfirmation(store, taskId, userId));
       return true;
+    },
+
+    /** A run about to continue as new unpins itself, so the platform addresses
+     * the workflow id's live run meanwhile. 'foreign': another run holds the
+     * pin (a replacement is starting), so this run must not continue. */
+    async releaseTaskRun(taskId: string): Promise<'released' | 'unpinned' | 'foreign'> {
+      const runId = activityContext.current().info.workflowExecution?.runId ?? '';
+      if (!(await store.taskMetadata(taskId))?.params?._workflowRunId) return 'unpinned';
+      return (await store.swapTaskRun(taskId, runId, '')) ? 'released' : 'foreign';
+    },
+
+    /** The next run takes the pin its predecessor released, unless another
+     * run claimed the task in between. */
+    async adoptTaskRun(taskId: string): Promise<boolean> {
+      return store.swapTaskRun(taskId, '', activityContext.current().info.workflowExecution?.runId ?? '');
+    },
+
+    /** A continued run's transcripts, in pages well inside Temporal's 2 MB
+     * payload limit (see conversationPage). */
+    async readConversationPage(taskId: string, reference: string, offset: number) {
+      return conversationPage((await conversationSnapshot(taskId, reference)), offset, CONVERSATION_PAGE_BYTES);
     },
 
     async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {

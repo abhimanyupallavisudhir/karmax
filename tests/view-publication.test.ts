@@ -4,7 +4,7 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
-import { conversationPublisher, type PublishedView } from '../src/domain/view-publication.js';
+import { conversationPage, conversationPublisher, type PublishedView } from '../src/domain/view-publication.js';
 import type { TaskView } from '../src/domain/types.js';
 
 describe('durable conversation publication', () => {
@@ -294,4 +294,25 @@ describe('durable conversation publication', () => {
       expect((await store.kvGet('view-conversation:other-task:run:0'))).toBe('preserve');
     } finally { (await store.close()); }
   });
+});
+
+// A continued run reads its predecessor's transcripts in pages, each well
+// inside Temporal's payload limit, and rebuilds them exactly (WF-4).
+it('pages a conversation across transcripts and rebuilds it exactly', () => {
+  const message = (id: string, bytes = 100) => ({ id, role: 'agent' as const, text: 'x'.repeat(bytes), ts: 1 });
+  const messages = [message('d1'), message('d2', 5_000), message('d3')];
+  const conversation = { messages, transcripts: [{ role: 'do', label: 'Do agent', messages },
+    { role: 'merge', label: 'Merge agent', messages: [message('m1'), message('m2')] }] };
+  const rebuilt = new Map<string, string[]>();
+  let offset: number | undefined = 0, pages = 0;
+  while (offset !== undefined) {
+    const page = conversationPage(conversation, offset, 1_000);
+    for (const { role, messages: part } of page.roles) rebuilt.set(role, [...(rebuilt.get(role) ?? []), ...part.map(m => m.id)]);
+    expect(page.roles.flatMap(role => role.messages).length).toBeGreaterThan(0);
+    offset = page.next;
+    pages++;
+  }
+  expect(Object.fromEntries(rebuilt)).toEqual({ do: ['d1', 'd2', 'd3'], merge: ['m1', 'm2'] });
+  // The oversized message is a page on its own rather than a stall.
+  expect(pages).toBe(3);
 });

@@ -59,9 +59,37 @@ export function applyConversationPatch(base: ViewConversation, patch: Conversati
   };
 }
 
+/** One page of a conversation snapshot, at most `limitBytes` of messages
+ * (one larger message still makes progress). `offset` counts messages across
+ * the Do transcript and then every other role's transcript, in order, so a
+ * continued run can read a transcript larger than one activity payload. */
+export function conversationPage(conversation: ViewConversation, offset: number, limitBytes: number)
+  : { roles: { role: string; messages: Message[] }[]; next?: number } {
+  const transcripts = [{ role: 'do', messages: conversation.messages },
+    ...(conversation.transcripts ?? []).filter((transcript) => transcript.role !== 'do')];
+  const roles: { role: string; messages: Message[] }[] = [];
+  let position = 0, bytes = 0, taken = 0;
+  for (const { role, messages } of transcripts) {
+    for (const message of messages) {
+      if (position++ < offset) continue;
+      const size = JSON.stringify(message).length;
+      if (taken && bytes + size > limitBytes) return { roles, next: offset + taken };
+      if (roles.at(-1)?.role !== role) roles.push({ role, messages: [] });
+      roles.at(-1)!.messages.push(message);
+      bytes += size;
+      taken++;
+    }
+  }
+  return { roles };
+}
+
 export type ConversationPublisher = ((view: TaskView) => Promise<void>) & {
   /** How `messages` extends the last acknowledged snapshot, when it does. */
   turnBase(messages: Message[], role: string): { base?: TurnConversationBase; messages: Message[] };
+  /** The acknowledged snapshot's reference, if it is exactly this conversation. */
+  acknowledges(view: ViewConversation): string | undefined;
+  /** Adopt a snapshot acknowledged by an earlier run of the same task. */
+  seed(reference: string, conversation: ViewConversation): void;
 };
 
 /** Keep immutable conversations out of repeated status activity arguments.
@@ -94,6 +122,13 @@ export function conversationPublisher(
       return count && previous
         ? { base: { reference: previous.reference, role, count }, messages: messages.slice(count) }
         : { messages };
+    },
+    acknowledges({ messages, transcripts }: ViewConversation) {
+      return previous?.json === JSON.stringify({ messages, transcripts }) ? previous.reference : undefined;
+    },
+    seed(reference: string, { messages, transcripts }: ViewConversation) {
+      const json = JSON.stringify({ messages, transcripts });
+      previous = { json, reference, conversation: JSON.parse(json) };
     },
   });
 }

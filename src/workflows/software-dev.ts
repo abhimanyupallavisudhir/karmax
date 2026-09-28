@@ -18,6 +18,8 @@ import {
   ParentClosePolicy,
   log,
   patched,
+  continueAsNew,
+  allHandlersFinished,
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
 import { ActivityCancellationType, msToNumber, type Duration } from '@temporalio/common';
@@ -50,6 +52,8 @@ import {
   GithubLandingParticipant,
   GitHubMergeAuthorization,
   TaskLandingState,
+  TaskContinuation,
+  TaskRecoveryCheckpoint,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
@@ -216,6 +220,9 @@ export interface SoftwareDevInput extends TaskInput {
   /** Test/embedding override for GitHub policy polling. Production uses the
    * durable 30-second poll from the domain contract. */
   githubPollMs?: number;
+  /** Test override for how many events a run records before it continues as
+   * new (CONTINUE_AFTER_EVENTS). */
+  continueAfterEvents?: number;
 }
 
 const MAX_RESOLVE_ATTEMPTS = 2;
@@ -246,6 +253,13 @@ const MAX_GITHUB_ERROR_POLLS = 3;
  * person is asked for guidance instead of spending agent turns—and, from v1.17,
  * blocking the front landing slot—forever. */
 const MAX_AUTOMATED_LANDING_REPAIRS = 5;
+/** A run continues as new at the top of Do once it has grown by this much since
+ * it started (or loaded a predecessor's conversation), so a task's history
+ * stays far inside Temporal's 51,200-event / 50 MB limits however long it runs. */
+const CONTINUE_AFTER_EVENTS = 4_000;
+const CONTINUE_AFTER_BYTES = 8 * 1024 * 1024;
+/** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
+const MAX_CONTINUATION_BYTES = 1024 * 1024;
 
 /**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
@@ -613,8 +627,12 @@ async function softwareDevImpl(
   // A new activity ARGUMENT is a recorded-input change, so it is versioned too.
   const identifiedAccountReturns = minor >= 10;
   const followUpWakesEscalation = minor >= 10;
+  // Continuing as new restores a run from the recovery checkpoint, whose Do
+  // entry is complete from v1.22 (restoresStagePrerequisites).
+  const continuesAsNew = minor >= 22;
   const taskId = input.taskId;
   const recovery = input.recovery;
+  const continued = recovery?.continued;
   let recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
   let stage: Stage = recoveryStage;
   let status: TaskView['status'] = 'active';
@@ -709,6 +727,9 @@ async function softwareDevImpl(
   // `settled`, `outstanding` is the not-yet-finished set, and `awaitingResponse` is the
   // children currently parked on a reply from us.
   const childHandles = new Map<string, ChildWorkflowHandle<typeof softwareDev>>();
+  // Children started before detached sub-tasks close with this run, so they
+  // rule out continuing as new while outstanding.
+  const attachedChildren = new Set<string>();
   const raises: ChildRaise[] = [];
   const settled: { childTaskId: string; stage: string; detail?: string }[] = [];
   const outstanding = new Set<string>();
@@ -1067,7 +1088,7 @@ async function softwareDevImpl(
       // The task-scope params the UI may edit right now (SPEC §5.5): declared
       // `untilUsed` fields not yet consumed. `queue` fields never appear here.
       editableParams: editableParamsNow(),
-      updatedAt: workflowInfo().historyLength,
+      updatedAt: (continued?.updatedAtBase ?? 0) + workflowInfo().historyLength,
     };
   }
 
@@ -2454,6 +2475,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       });
       subTaskIds.push(childInput.taskId);
       outstanding.add(childInput.taskId);
+      const detached = patched('software-dev-detached-subtask-cancellation-v1');
       const child = await startChild<typeof softwareDev>(
         childWorkflowType(behaviorVersion),
         {
@@ -2467,11 +2489,10 @@ Inspect the complete current diff and specifically compare its delta from the re
           // its workflow cleanup. Detach new children so the signal remains the
           // authority after the parent closes; `patched` preserves the original
           // StartChild command when replaying histories recorded before this fix.
-          ...(patched('software-dev-detached-subtask-cancellation-v1')
-            ? { parentClosePolicy: ParentClosePolicy.ABANDON }
-            : {}),
+          ...(detached ? { parentClosePolicy: ParentClosePolicy.ABANDON } : {}),
         },
       );
+      if (!detached) attachedChildren.add(childInput.taskId);
       childHandles.set(childInput.taskId, child);
       trackChild(childInput.taskId, child);
     }
@@ -2549,6 +2570,114 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
   }
 
+  // ── Continue-as-new (WF-3, WF-4) ──
+  // A long task continues as new at the top of Do, between turns, so its
+  // history stays bounded. The next run enters Do through the recovery
+  // checkpoint with `continued` carrying the rest of the in-flight state; the
+  // transcripts travel by reference to the acknowledged view publication.
+  let runStart = { events: 0, bytes: 0 };
+  let continuationRefused = false;
+  const historyGrown = () =>
+    workflowInfo().historyLength - runStart.events >= (input.continueAfterEvents ?? CONTINUE_AFTER_EVENTS)
+    || workflowInfo().historySize - runStart.bytes >= CONTINUE_AFTER_BYTES;
+
+  function continuationInput(conversation: string, runPinned: boolean): SoftwareDevInput {
+    const { recovery: _previous, ...next } = liveInput;
+    return { ...next, base, goalMode, responder: liveResponder, recovery: {
+      resumeStage: 'do', messages: [], world: world as TaskRecoveryCheckpoint['world'], session, sessionHome, seen, target,
+      prs, reviewInfo, checkoutApprovals, landing, repairValidationPending,
+      continued: {
+        conversation,
+        ...(explicitPrCycle && mergeMsgs.length ? { mergeMessages: mergeMsgs } : {}),
+        runPinned,
+        updatedAtBase: (continued?.updatedAtBase ?? 0) + workflowInfo().historyLength,
+        goalMode,
+        confirmLayers: softwareDevConfirmLayers,
+        subTasks: { ids: subTaskIds, outstanding: [...outstanding], awaitingResponse: [...awaitingResponse], raises, settled },
+        collaborations: { pending: [...pendingCollaborations], settled: [...settledCollaborations] },
+        consumed: [...consumed],
+        checkoutHeads,
+        accountPool,
+        flags: { targetLocked, pointOfNoReturnPassed, branchPreparedForPr, forceHumanRepairReview, providerQueueAccepted,
+          prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied },
+        ...(manualPrConfirmer ? { manualPrConfirmer } : {}),
+        ...(escalationAction ? { escalationAction } : {}),
+        ...(error ? { error } : {}),
+        counters: { responderRounds, subtaskNags, subagentNudges, shellNudges, landingWatchSequence, resourceReviewSequence },
+      },
+    } };
+  }
+
+  /** Continue as new if nothing in flight would be lost; otherwise keep going. */
+  async function continueRun(): Promise<void> {
+    if (retainedMergeDomains.length || [...outstanding].some((id) => attachedChildren.has(id))
+      || JSON.stringify(continuationInput('', false)).length > MAX_CONTINUATION_BYTES) {
+      continuationRefused = true;
+      return;
+    }
+    const pin = await core.releaseTaskRun(taskId);
+    if (pin === 'foreign') {
+      continuationRefused = true;
+      return;
+    }
+    // The next run reads the conversation from the last acknowledged
+    // publication, so republish until nothing changed while one was in flight.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await condition(allHandlersFinished);
+      // A cancel or replacement ends this run instead.
+      if (cancelled) break;
+      const conversation = publishConversation.acknowledges(buildView());
+      if (conversation) return continueAsNew<typeof softwareDev>(continuationInput(conversation, pin === 'released'));
+      await publish();
+    }
+    continuationRefused = !cancelled;
+    if (pin === 'released') await core.adoptTaskRun(taskId);
+  }
+
+  /** The first step of a continued run: restore what `continueRun` carried. */
+  async function resumeContinuedRun(c: TaskContinuation): Promise<void> {
+    goalMode = c.goalMode;
+    liveInput.goalMode = goalMode;
+    softwareDevConfirmLayers = c.confirmLayers;
+    subTaskIds.push(...c.subTasks.ids);
+    for (const id of c.subTasks.outstanding) outstanding.add(id);
+    for (const id of c.subTasks.awaitingResponse) awaitingResponse.add(id);
+    raises.push(...c.subTasks.raises);
+    settled.push(...c.subTasks.settled);
+    for (const id of c.collaborations.pending) pendingCollaborations.add(id);
+    for (const id of c.collaborations.settled) settledCollaborations.add(id);
+    for (const name of c.consumed) consumed.add(name);
+    checkoutHeads = { ...c.checkoutHeads };
+    accountPool = c.accountPool;
+    ({ targetLocked, pointOfNoReturnPassed, branchPreparedForPr, forceHumanRepairReview, providerQueueAccepted,
+      prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied } = c.flags);
+    manualPrConfirmer = c.manualPrConfirmer;
+    escalationAction = c.escalationAction;
+    error = c.error;
+    ({ responderRounds, subtaskNags, subagentNudges, shellNudges, landingWatchSequence, resourceReviewSequence } = c.counters);
+    if (c.runPinned) await core.adoptTaskRun(taskId);
+    const loaded = new Map<string, Message[]>();
+    let offset: number | undefined = 0;
+    while (offset !== undefined) {
+      const page: { roles: { role: string; messages: Message[] }[]; next?: number } =
+        await core.readConversationPage(taskId, c.conversation, offset);
+      for (const { role, messages } of page.roles) loaded.set(role, [...(loaded.get(role) ?? []), ...messages]);
+      offset = page.next;
+    }
+    // Follow-ups delivered while loading come after the loaded transcripts.
+    // The publisher adopts exactly the snapshot, so later writes stay deltas.
+    const roles = ['do', 'merge', 'resolve', 'confirm', 'responder'];
+    const late = roles.map((role) => [role, conversationFor(role).splice(0)] as const);
+    for (const role of roles) conversationFor(role).push(...(loaded.get(role) ?? []));
+    if (c.mergeMessages) mergeMsgs.push(...c.mergeMessages);
+    publishConversation.seed(c.conversation, { messages: msgs, transcripts: buildTranscripts() });
+    for (const [role, messages] of late) {
+      const target = conversationFor(role);
+      for (const message of messages) if (!target.some((candidate) => candidate.id === message.id)) target.push(message);
+    }
+    runStart = { events: workflowInfo().historyLength, bytes: workflowInfo().historySize };
+  }
+
   /** Tell our parent (if any) we need a decision (SPEC §5.3). Best effort — if the
    *  parent is gone the child stays human-resolvable via its own retry/confirm. */
   async function notifyParent(type: ChildRaise['type'], detail?: string) {
@@ -2567,7 +2696,8 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   try {
   // ── Setup ──
-  if (recovery && patched('software-dev-preserve-replacement-children-v1')) {
+  if (continued) await resumeContinuedRun(continued);
+  else if (recovery && patched('software-dev-preserve-replacement-children-v1')) {
     const children = await coreChild.restoreChildTasks(taskId);
     for (const child of children) {
       subTaskIds.push(child.taskId);
@@ -2774,6 +2904,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     drainChildEvents();
     await publish();
     if (cancelled) return await abort();
+    if (continuesAsNew && !continuationRefused && historyGrown() && patched('software-dev-continue-as-new-v1')) {
+      await continueRun();
+      if (cancelled) return await abort();
+    }
 
     // A human/parent may request Open PR while the task is already parked. That
     // transition uses the proposal the Do agent just produced; it must not spend

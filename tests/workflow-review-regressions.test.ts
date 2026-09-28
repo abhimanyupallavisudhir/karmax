@@ -8,6 +8,7 @@ const wf = vi.hoisted(() => ({
   timeout: undefined as unknown,
   childSignal: vi.fn(async () => undefined),
   startChild: undefined as undefined | ((...args: any[]) => any),
+  info: { runId: 'run', historyLength: 1, historySize: 0 },
 }));
 vi.mock('@temporalio/workflow', async (importOriginal) => ({
   ...await importOriginal<typeof import('@temporalio/workflow')>(),
@@ -16,7 +17,9 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
   defineQuery: (name: string) => name,
   defineUpdate: (name: string) => name,
   setHandler: (name: string, fn: (...args: any[]) => any) => wf.handlers.set(name, fn),
-  workflowInfo: () => ({ runId: 'run', historyLength: 1 }),
+  workflowInfo: () => wf.info,
+  allHandlersFinished: () => true,
+  continueAsNew: async (next: unknown) => { throw Object.assign(new Error('continued as new'), { next }); },
   patched: () => wf.patches,
   isCancellation: () => false,
   log: { warn: vi.fn() },
@@ -41,6 +44,7 @@ const input = { taskId: 'task', projectId: 'project', title: 'T', prompt: 'work'
   project: { repos: [] }, confirm: { layers: [] } } as any;
 beforeEach(() => {
   wf.childSignal.mockClear(); wf.handlers.clear(); wf.wait = undefined; wf.patches = true; wf.startChild = undefined;
+  wf.info = { runId: 'run', historyLength: 1, historySize: 0 };
   wf.activities = {
     restoreChildTasks: vi.fn(async () => []),
     createWorld: vi.fn(async () => ({ id: 'task', kind: 'worktree', root: '/tmp/test', branch: 'b', base: 'main' })),
@@ -393,4 +397,64 @@ it('LT-12: historical landing polls back off while GitHub is unchanged', async (
   };
   expect(await softwareDevV1_20(landingInput)).toEqual({ stage: 'cancelled' });
   expect(polls).toEqual(['30s', 60_000, 120_000, 240_000, 480_000, 600_000, 600_000, 600_000]);
+});
+
+it('WF-3/WF-4: a long run continues as new with its in-flight state', async () => {
+  const { applyConversationPatch, conversationPage, transcriptOf } = await import('../src/domain/view-publication.js');
+  const snapshots = new Map<string, any>();
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.publishView.mockImplementation(async (_id: string, view: any, reference: string) => {
+    snapshots.set(reference, view.conversationPatch ? applyConversationPatch(snapshots.get(view.conversationPatch.base), view.conversationPatch)
+      : view.messages ? { messages: view.messages, transcripts: view.transcripts } : snapshots.get(reference));
+  });
+  wf.activities.readConversationPage = vi.fn(async (_id: string, reference: string, offset: number) =>
+    conversationPage(snapshots.get(reference), offset, 200));
+  wf.activities.releaseTaskRun = vi.fn(async () => 'unpinned');
+  wf.activities.adoptTaskRun = vi.fn();
+  wf.activities.prepareChildTask = vi.fn(async () => ({ taskId: 'child-1' }));
+  const turns: any[] = [];
+  wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+    const base = args.messagesBase;
+    if (turns.length >= 2) throw new Error('the long run did not continue as new');
+    turns.push([...(base ? transcriptOf(snapshots.get(base.reference), 'do').slice(0, base.count) : []), ...args.messages]);
+    return turns.length === 1
+      ? { output: 'Delegating', providerCompleted: true, subTasks: [{ title: 'Child', prompt: 'Part' }] }
+      : { output: `Reply ${turns.length}`, providerCompleted: true, completed: true };
+  });
+  // Run 1 parks on its child; the child asks a question while a collaboration
+  // is pending and a person edits the target and switches to Goal.
+  wf.wait = () => {
+    wf.handlers.get('collaborationRequested')!('request-1');
+    wf.handlers.get('setTarget')!('release');
+    void wf.handlers.get('changeWorkflow')!('goal');
+    wf.handlers.get('raiseFromChild')!({ childTaskId: 'child-1', childTitle: 'Child', type: 'needs_info', detail: 'Which API?' });
+    wf.info = { ...wf.info, historyLength: 5_000 };
+  };
+  const first = await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] }, paramWindows: { target: 'untilUsed' } })
+    .catch((error) => error);
+  const next = first.next;
+  expect(next?.recovery).toMatchObject({ resumeStage: 'do', messages: [], target: 'release', seen: 2,
+    continued: { runPinned: false, goalMode: true, subTasks: { ids: ['child-1'], outstanding: ['child-1'], awaitingResponse: ['child-1'] },
+      collaborations: { pending: ['request-1'] } } });
+  expect(JSON.stringify(next).length).toBeLessThan(5_000);
+  expect(turns).toHaveLength(1);
+
+  // Run 2 loads the conversation in pages and resumes exactly there.
+  wf.handlers.clear();
+  wf.info = { runId: 'run-2', historyLength: 1, historySize: 0 };
+  wf.activities.restoreChildTasks.mockClear();
+  wf.wait = () => {
+    const view = wf.handlers.get('view')!();
+    expect(view).toMatchObject({ workflow: 'goal', targetBranch: 'release', subTasks: ['child-1'] });
+    expect(view.updatedAt).toBeGreaterThan(5_000);
+    wf.handlers.get('cancel')!();
+  };
+  expect(await softwareDevV1_26(next)).toEqual({ stage: 'cancelled' });
+  expect(wf.activities.readConversationPage.mock.calls.length).toBeGreaterThan(1);
+  expect(wf.activities.restoreChildTasks).not.toHaveBeenCalled();
+  expect(wf.activities.adoptTaskRun).not.toHaveBeenCalled();
+  expect(turns).toHaveLength(2);
+  expect(turns[1].map((m: any) => m.id)).toEqual(turns[0].map((m: any) => m.id).concat(
+    [expect.any(String), 'mode-2', expect.stringMatching(/^st-/)]));
+  expect(turns[1].at(-1).text).toContain('Which API?');
 });

@@ -3860,6 +3860,15 @@ export class Store {
     });
   }
 
+  /** Moves the task's pinned workflow run from `from` to `to` ('' is unpinned)
+   * only while it is still `from`: continue-as-new hands the pin to the next
+   * run without overwriting a replacement that claimed the task meanwhile. */
+  async swapTaskRun(taskId: string, from: string, to: string): Promise<boolean> {
+    return Number((await this.db.prepare(`UPDATE tasks SET params = json_set(params, '$._workflowRunId', json(?))
+      WHERE id = ? AND COALESCE(json_extract(params, '$._workflowRunId'), '') = ?`)
+      .run(JSON.stringify(to), taskId, from)).changes) > 0;
+  }
+
   /** Called inside the task write's transaction. Lock on PostgreSQL so two
    * autosaves cannot both mistake an existing grant for a new selection. */
   private async trackTaskCredentialSelections(taskId: string, next: Record<string, unknown>): Promise<void> {

@@ -6,6 +6,7 @@
 export type {
   TaskInput,
   TaskRecoveryCheckpoint,
+  TaskContinuation,
   TaskView,
   Stage,
   TaskStatus,
