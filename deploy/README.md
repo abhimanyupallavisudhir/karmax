@@ -301,6 +301,12 @@ a snapshot can discard work performed after it was taken. Do not run an older
 release against the migrated database or restore only one database. Validate this
 procedure on an isolated deployment before the production epoch transition.
 
+`scripts/rehearse-upgrade.sh --to <revision>` does that validation in one
+command: it installs `origin/master` in a scratch clone, seeds it through its
+API, backs it up, runs this `update`, verifies every record, and restores the
+backup onto a fresh stack. See "Rehearsing an upgrade" in the project wiki's
+ops/release-and-deploy page for what it checks and its traps.
+
 `update` checks the vault read-only with the new image after the pre-update
 backup and before switching (`npm run vault-preflight`, with the key the app
 itself reads): whether the key would be accepted, which files cannot be read,
