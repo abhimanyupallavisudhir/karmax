@@ -8,6 +8,8 @@ TypeScript.
 
 This is a faithful v1 implementation of the karmax spec, which lives in the project wiki as the `SPEC` page (open the **Wiki** tab in the console, or fetch it with `read_wiki`).
 
+**Names.** *tavya* is the hosted product at tavya.io; *karmax* is this repository and the internal identifier kept for compatibility (`KARMAX_*`, `~/.karmax`, `.karmax-injection/`); *krmax* is the console's legacy name.
+
 ## Quick start
 
 ```bash
@@ -100,7 +102,7 @@ remote target fails setup with an actionable error.
 | Config homes per (account × profile) + scrubbed env | ✅ |
 | Virtual-card **spend limits** (hard cap + review-gate threshold, reserved atomically in the database) | ✅ |
 | Cheap check-in: **PTY terminal** in the world (WebSocket) + transcript view | ✅ |
-| Immutable defaults + overlay resolution + per-workflow fallback | ✅ |
+| Immutable defaults + overlay resolution + per-workflow fallback | Library only; not wired (SPEC §9) |
 | Hosted control plane: organizations/teams/RBAC, GitHub App onboarding, runner pools, isolated previews, backup/restore, one-command VPS stack | ✅ |
 
 ## Architecture
@@ -116,7 +118,7 @@ remote target fails setup with an actionable error.
 - `src/platform/` — capabilities, scoped tokens, the `KarmaxApi` service layer, the MCP server.
 - `src/autonomy/` — credential broker + vault, config homes.
 - `src/gateway/` — HTTP/WebSocket gateway (the only thing the UI talks to).
-- `src/store/` — SQLite metadata index + safe-mode overlays.
+- `src/store/` — metadata store (SQLite; PostgreSQL when hosted). `overlays.ts` is the SPEC §9 overlay-resolution library; nothing reads it yet.
 - `web/` — the single-page console (no build step).
 
 ## Testing

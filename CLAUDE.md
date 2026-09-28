@@ -59,7 +59,7 @@ Layers around that core:
 - `src/packages/` — trusted self-hosted workflow packages: git repo → data-only `manifest.json` → code bundled into the worker; installed versions are pinned by commit SHA. Installation is global authority, not organization authority. Hosted install and restore are disabled; merging an edit never activates code automatically.
 - `src/autonomy/` — credential broker + AES-GCM vault (secrets move as handles, never plaintext), config homes per (account × profile), logins, payments.
 - `src/gateway/` — HTTP/WebSocket gateway translating requests into Temporal signal/query/update calls; the **only** thing the UI talks to.
-- `src/store/` — SQLite metadata index + safe-mode overlays.
+- `src/store/` — metadata store (SQLite; PostgreSQL when hosted). `overlays.ts` is the SPEC §9 overlay-resolution library; nothing reads it yet.
 - `web/` — single-page console with **no build step**; edit `app.js`/`index.html`/`styles.css` directly.
 
 ## Environment variables

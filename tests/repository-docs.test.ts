@@ -68,6 +68,23 @@ describe('repository guidance', () => {
     }
   });
 
+  it('does not document the removed safe-mode control or tick unwired overlays (CI-21, WK-2m)', () => {
+    let found = '';
+    try {
+      found = execFileSync('git', ['grep', '-niE', 'safe[ -]?mode', '--', '*.md', 'src', ':!src/store/overlays.ts'], {
+        cwd: new URL('..', import.meta.url), encoding: 'utf8',
+      });
+    } catch (error) {
+      if ((error as { status?: number }).status !== 1) throw error; // 1 = no match
+    }
+    expect(found.split('\n').filter(Boolean)).toEqual([]);
+    expect(read('src/store/overlays.ts')).toMatch(/not wired/i);
+    const overlays = read('README.md').split('\n').find(line => line.includes('overlay resolution'));
+    expect(overlays).toBeDefined();
+    expect(overlays).not.toContain('✅');
+    expect(read('README.md')).toMatch(/\*\*Names\.\*\* \*tavya\*[^\n]*\*karmax\*[^\n]*\*krmax\*/);
+  });
+
   it('links every tracked benchmark result from a repository doc', () => {
     const ls = (...args: string[]) => execFileSync('git', ['ls-files', ...args], {
       cwd: new URL('..', import.meta.url), encoding: 'utf8',
