@@ -277,6 +277,7 @@ export class CodexAdapter implements AgentAdapter {
         for (const m of await ctx.pullFollowUps(deliveredIndex)) {
           if (m.role !== 'system' && m.role !== 'agent') add.push({ role: 'user', content: openaiUserContent(m) });
           deliveredIndex++;
+          ctx.followUpsDelivered?.(deliveredIndex);
         }
       } catch { /* a failed poll must never break the turn */ }
       return add;
@@ -750,6 +751,7 @@ export class CodexAdapter implements AgentAdapter {
             }
           }
           deliveredIndex++;
+          ctx.followUpsDelivered?.(deliveredIndex);
         }
       } finally {
         pollLock = false;
@@ -896,6 +898,7 @@ export class CodexAdapter implements AgentAdapter {
           for (const m of await ctx.pullFollowUps(deliveredIndex)) {
             if (m.role !== 'system' && m.role !== 'agent') nextInput.push({ type: 'text', text: m.text, text_elements: [] }, ...await imageItems([m]));
             deliveredIndex++;
+            ctx.followUpsDelivered?.(deliveredIndex);
           }
         }
         if (!nextInput.length) break;

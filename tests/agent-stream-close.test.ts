@@ -35,6 +35,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 }));
 
 const { ClaudeAdapter } = await import('../src/agent/claude.js');
+const { AgentChannelLost } = await import('../src/agent/limits.js');
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -288,6 +289,28 @@ describe('Claude Agent-SDK input stream vs. the harness control channel', () => 
     const { remoteAgentEnv } = await import('../src/agent/remote-process.js');
     expect(remoteAgentEnv('claude', '/home', { CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }))
       .toMatchObject({ CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' });
+  });
+
+  // Task 388: the agent waited on a `sleep 480` for CI. The grace closed the stream at
+  // 5 minutes, the timer fired at 8, and the harness woke the model against a dead
+  // control channel — confirm_decision failed and the turn "succeeded" with nothing.
+  it('stops a harness that wakes after the channel closed, as a retryable interruption', async () => {
+    process.env.KARMAX_AGENT_BG_SETTLE_MS = '0';
+    const h = fakeHarness(async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-9' };
+      yield { type: 'system', subtype: 'task_started', task_id: 'sh-timer' };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'Waiting for CI.' }] } };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-9' };
+      await sleep(30); // the grace expires and the stream closes
+      yield { type: 'system', subtype: 'task_notification', task_id: 'sh-timer', status: 'completed' };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'CI finished; recording my decision.' }] } };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-9' };
+    });
+
+    const failure = await runTurn([]).then(() => undefined, (error: unknown) => error);
+    expect(h.current!.inputClosed).toBe(true);
+    expect(failure).toBeInstanceOf(AgentChannelLost);
+    expect((failure as InstanceType<typeof AgentChannelLost>).summary).toMatch(/background task/);
   });
 
   it('bounds the wait — a deliberately long-lived background shell cannot wedge the turn', async () => {

@@ -230,7 +230,18 @@ export interface InboxItem {
   readAt?: number;
   /** Resource-backed asks use the inbox without manufacturing a task merely to
    * carry a notification. */
-  subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string };
+  subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string }
+    | CredentialNotice;
+}
+
+/** A login only a person can restore: its sign-in lapses soon, or already did. */
+export interface CredentialNotice {
+  kind: 'credential';
+  credentialKey: string;
+  provider: string;
+  account: string;
+  reason: 'expiring' | 'signed-out';
+  expiresAt: number;
 }
 
 export interface DeliveryPreferences {

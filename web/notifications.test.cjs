@@ -43,7 +43,7 @@ eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.UR
 eval(extractConst('NOTIFY_BEHAVIOURS').replace('const NOTIFY_BEHAVIOURS =', 'global.NOTIFY_BEHAVIOURS ='));
 eval(extractConst('NOTIFY_DEFAULTS', '\n};').replace('const NOTIFY_DEFAULTS =', 'global.NOTIFY_DEFAULTS ='));
 for (const name of ['urgencyRank', 'notifyPrefs', 'setNotifyPref', 'inboxArrivals', 'announceInbox',
-  'notificationSoundPrefs', 'siteName', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'notificationsCard']) eval(extractFn(name));
+  'notificationSoundPrefs', 'siteName', 'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'inboxTitle', 'notificationsCard']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -173,6 +173,14 @@ const css = fs.readFileSync(path.join(__dirname, 'styles.css'), 'utf8');
 ok(/p\.task-sub\s*\{[^}]*display:\s*block/.test(css), 'a prose paragraph flows as prose, not as a flex row');
 ok(/\.notify-row\s+\.urgency-chip\s*\{[^}]*justify-self:\s*start/.test(css), 'the chip hugs its word in the settings grid');
 ok(!/^\.urgency-chip\s*\{[^}]*margin-left/m.test(css), 'the base chip carries no leading margin of its own');
+
+// A Claude sign-in only a person can renew names the login and what to do.
+const lapsing = { kind: 'escalated', subject: { kind: 'credential', provider: 'claude', account: 'personal',
+  reason: 'expiring', expiresAt: Date.now() + 2 * 86_400_000 - 60_000 } };
+ok(inboxTitle(lapsing, 'karmax') === 'claude:personal', 'a login notice is titled with the login');
+ok(inboxRowLabel(lapsing) === 'Sign-in expires in 2 days — renew it', 'an expiring sign-in says when and what to do');
+ok(inboxRowLabel({ ...lapsing, subject: { ...lapsing.subject, reason: 'signed-out' } }) === 'Signed out — sign in again',
+  'a lapsed sign-in says to sign in again');
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

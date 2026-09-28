@@ -9,7 +9,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -157,7 +157,8 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
   // Admission happens before a provider process exists. Temporal coordinator
   // backpressure/outages therefore cannot be an agent error and must retain
   // their retryable infrastructure classification through this outer boundary.
-  if (err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError) {
+  if (err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError
+    || err instanceof AgentChannelLost) {
     return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   }
   if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) {
@@ -853,8 +854,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
    * Git comparison. */
   async function commitsAheadOfPrBase(world: World, repo: ReturnType<typeof worldRepos>[number], base: string) {
     const local = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
-    if (local.code === 0 || base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return local;
+    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return local;
     const remoteBase = `refs/remotes/origin/${base}`;
+    const remoteKnown = (await world.exec('git', ['rev-parse', '--verify', '--quiet', `${remoteBase}^{commit}`], { cwd: repo.root })).code === 0;
+    // GitHub compares against its own copy of the target. A local target ref is
+    // frozen at world setup, so a branch that merely caught up with the newer
+    // origin target (refresh_upstream + merge) must not count as ahead.
+    if (local.code === 0 && remoteKnown) {
+      const both = await world.exec('git', ['rev-list', '--count', repo.branch, '--not', base, remoteBase], { cwd: repo.root });
+      if (both.code === 0) return both;
+    }
+    if (local.code === 0) return local;
     const remote = await world.exec('git', ['rev-list', '--count', `${remoteBase}..${repo.branch}`], { cwd: repo.root });
     if (remote.code === 0) return remote;
     if (repo.baseSha) {
@@ -1733,6 +1743,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let turnSessionKey: string | undefined;
       let resumedActivityAttempt = false;
       let activityAttempt = 1;
+      // What earlier attempts of THIS turn recorded (open_pr, sub-tasks, decisions,
+      // mid-turn deliveries). Restored so a retry never drops them.
+      let restoredJournal: import('../agent/runtime.js').TurnJournal | undefined;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -1752,6 +1765,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
         turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
+        if (actx.info.attempt > 1 && turnSessionKey) {
+          try { restoredJournal = JSON.parse((await store.kvGet(`${turnSessionKey}:journal`)) ?? 'null') ?? undefined; }
+          catch { restoredJournal = undefined; }
+        }
         // Heartbeat details are Temporal's primary retry checkpoint. The per-turn
         // SQLite key closes the small hard-kill window before a heartbeat reaches the
         // service; unlike session:<task>:<role>, it cannot accidentally pick up a
@@ -2483,6 +2500,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal,
           heartbeat,
           pullFollowUps,
+          ...(turnSessionKey ? { journal: {
+            restored: restoredJournal,
+            save: async (journal: import('../agent/runtime.js').TurnJournal) => {
+              (await store.kvSet(`${turnSessionKey}:journal`, JSON.stringify(journal)));
+            },
+          } } : {}),
           pullSecretEnv: () => pullSecretEnv?.() ?? Promise.resolve({}),
           // Coalesce the live-output stream: adapters re-emit the growing *cumulative*
           // message text, so consecutive identical/prefix emits carry no new info.
@@ -2667,6 +2690,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
         }
+        // A resumed attempt was handed only a continuation notice, so its adapter's
+        // count is not in the workflow's index space. The replaced attempt already
+        // delivered the scheduled batch plus whatever it injected mid-turn.
+        if (resumedActivityAttempt && args.role !== 'confirm') {
+          result.delivered = Math.max(restoredJournal?.delivered ?? 0, args.messages.length);
+        }
         if (args.role === 'confirm' && result.confirmDecision?.action === 'confirm' && result.confirmDecision.otherAttempts) {
           (await store.kvSet(`attempt-choice:${args.taskId}`, result.confirmDecision.otherAttempts));
         }
@@ -2688,6 +2717,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : err;
         }
+        // Tell the resumed attempt why it was interrupted, as for a sandbox freeze.
+        if (err instanceof AgentChannelLost && turnSessionKey)
+          (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify({ summary: err.summary })));
         const failure = classifyTurnError(err, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else
         // in a remote world may be the sandbox's fault, which its metrics can show.
@@ -3318,7 +3350,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to origin`
             + `${pushError ? `: ${pushError}` : ''}`);
         }
-        const { pr, created } = await api.openOrUpdate(slug, {
+        const result = await api.openOrUpdate(slug, {
           head: repo.branch, base,
           // With several branches in flight the task title alone names none of
           // them; say which pull request this one is.
@@ -3326,7 +3358,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? `${details.title?.trim() || BRAND} (${repo.name})`
             : details.title?.trim() || `${BRAND}: ${repo.branch}`,
           body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
+        }).catch((error: unknown) => {
+          // GitHub is the authority on "ahead": its target may have moved past
+          // every ref this world has seen. Nothing to propose is not a failure.
+          if (/No commits between/i.test(error instanceof Error ? error.message : String(error))) return undefined;
+          throw error;
         });
+        if (!result) {
+          (await record(handle.id, 'pr.skipped', { repo: repo.name, reason: `no commits ahead of ${base} on GitHub` }));
+          continue;
+        }
+        const { pr, created } = result;
         const ref: TaskPullRequest = {
           repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged,
           ...(pr.headSha ? { headSha: pr.headSha } : {}),
@@ -3568,14 +3610,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }));
           recordedCurrents.add(observation);
         };
-        const externalWait = async (key: string, detail: string): Promise<GitHubMergeAuthorization> => {
+        const externalWait = async (key: string, detail: string, exhausted?: string): Promise<GitHubMergeAuthorization> => {
           const previous = events.filter((event) => event.type === 'github.ci.external-wait'
             && event.payload?.key === key).length;
           (await record(handle.id, 'github.ci.external-wait', { key, slug: ref.slug, number: ref.number,
             candidateHead: ref.headSha, poll: previous + 1 }));
           if (previous + 1 >= MAX_SUPERSEDED_CI_POLLS) return {
             status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
-            detail: `${detail}\n\nGitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry. The task owns no admission slot while parked.`,
+            detail: `${detail}\n\n${exhausted ?? `GitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry.`} The task owns no admission slot while parked.`,
             eligibleUserIds: [actorUserId],
           };
           return { status: 'waiting', prs: current, actorUserId, releaseAdmission: true, detail };

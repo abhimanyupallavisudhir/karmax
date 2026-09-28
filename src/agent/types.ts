@@ -13,26 +13,26 @@ export interface PlatformToolContext {
   /** Do-agent ONLY: declare that the completed, committed proposal is ready to
    *  publish and enter Review. This is deliberately distinct from merely ending
    *  a model turn or asking a human for input. */
-  openPr(): void;
+  openPr(): void | Promise<void>;
   /** Optional structured completion summary; provider terminal success is authoritative. */
-  signalCompletion(summary?: string): void;
+  signalCompletion(summary?: string): void | Promise<void>;
   /** Optionally attach terse, click-to-verify actions/outputs for the Review stage. */
   createReviewInfo(info: ReviewInfo): void | Promise<void>;
   /** Spawn a child task the parent manages (branches off + merges back into the
    *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). */
-  createSubTask(t: { title: string; prompt: string }): void;
+  createSubTask(t: { title: string; prompt: string }): void | Promise<void>;
   /** Parent-agent ONLY: answer a child that raised to you (open_pr/comment/retry/
    *  cancel; `confirm` is a replay-compatible alias). */
-  respondToSubTask(r: SubTaskResponse): void;
+  respondToSubTask(r: SubTaskResponse): void | Promise<void>;
   /** Child-agent ONLY: raise a typed request UP to your parent (needs_info /
    *  needs_permission / needs_confirmation / blocked) and pause for its reply. */
-  raiseToParent(r: RaiseToParent): void;
+  raiseToParent(r: RaiseToParent): void | Promise<void>;
   /** Parent-agent ONLY: pause your own work until your running sub-tasks settle (or
    *  one raises). Use when you have nothing to do but wait; otherwise just keep
    *  working — sub-tasks run in the background either way. */
-  waitForSubtasks(): void;
+  waitForSubtasks(): void | Promise<void>;
   /** Persist a reusable skill (content, freely editable; SPEC §4.4). */
-  saveSkill(s: { name: string; content: string }): void;
+  saveSkill(s: { name: string; content: string }): void | Promise<void>;
   /** Do-agent ONLY: partition this task's change across another branch, checked
    *  out beside the current one and landed as its own pull request (SPEC §11.1).
    *  Performed immediately so the agent can work in it during the SAME turn; the
@@ -41,10 +41,10 @@ export interface PlatformToolContext {
   /** Resolve agent's structured verdict (RESOLVE-PLAN §3.2): a bounded recovery
    *  transition the workflow executes (resume/retryStage/gotoStage/parkUntil/escalate)
    *  instead of guessing. Also marks the resolve turn complete. */
-  resolveDecision(t: Transition): void;
+  resolveDecision(t: Transition): void | Promise<void>;
   /** Confirm agent's structured verdict at the Review gate (SPEC §5.2): confirm /
    *  revise (back to Do with a comment) / reject (cancel). Ends the confirm turn. */
-  confirmDecision(d: ConfirmDecision): void;
+  confirmDecision(d: ConfirmDecision): void | Promise<void>;
   /** Request a payment against the budget lease (SPEC §7.6). Returns the outcome:
    *  granted (settled or authorization reserved) | needs_approval |
    *  needs_funding | denied. */
@@ -86,6 +86,9 @@ export interface PlatformToolContext {
    *  Undefined when there is no live channel (a resumed retry, or a unit test with no
    *  workflow) — the adapter then just runs the snapshot it was given. */
   pullFollowUps?: (fromIndex: number) => Promise<Message[]>;
+  /** Report the absolute `msgs` index delivered after injecting follow-ups, so the
+   *  turn journal survives an interrupted attempt without re-sending them. */
+  followUpsDelivered?(delivered: number): void;
   /** Subscribe to project-secret changes during this turn (added, rotated or
    *  disabled in project settings); `input.secretEnv` is already current when a
    *  listener runs. Absent without a live channel. Returns the unsubscribe. */

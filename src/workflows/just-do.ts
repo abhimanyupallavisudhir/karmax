@@ -24,16 +24,21 @@ const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
 });
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
+// An agent turn has no wall-clock limit: long investigations and builds are
+// normal work. The 2-minute heartbeat timeout is what detects a dead worker or
+// a slept host. Temporal requires some start-to-close bound, so this one is
+// deliberately beyond any real turn.
+const AGENT_TURN_START_TO_CLOSE = '30 days';
 // Agent turns heartbeat every ~1s; a 2-minute gap = dead/slept worker → Temporal
 // retries the turn and the next attempt resumes the interrupted session (see
 // software-dev.ts / failures.ts for the full taxonomy).
 const turns = proxyActivities<coreActivities>({
-  startToCloseTimeout: '45 minutes',
+  startToCloseTimeout: AGENT_TURN_START_TO_CLOSE,
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
 });
 const cancellationAwareTurns = proxyActivities<coreActivities>({
-  startToCloseTimeout: '45 minutes',
+  startToCloseTimeout: AGENT_TURN_START_TO_CLOSE,
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
