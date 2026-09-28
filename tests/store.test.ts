@@ -64,6 +64,19 @@ describe('Store', () => {
     expect(await store.db.prepare('SELECT id FROM usage_admissions WHERE projectId=?').all(project.id)).toEqual([]);
   });
 
+  it('removes a task\'s resource checkpoint pointers with the task and the project', async () => {
+    const project = await store.createProject('Resource pointers');
+    const kept = await store.createTask({ projectId: project.id, title: 'Kept', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    const gone = await store.createTask({ projectId: project.id, title: 'Gone', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.kvSet(`resource-checkpoint:${kept.id}:attachment`, '{}');
+    await store.kvSet(`resource-checkpoint:${gone.id}:attachment`, '{}');
+    await store.deleteTask(gone.id);
+    expect(await store.kvGet(`resource-checkpoint:${gone.id}:attachment`)).toBeUndefined();
+    expect(await store.kvGet(`resource-checkpoint:${kept.id}:attachment`)).toBe('{}');
+    await store.deleteProject(project.id);
+    expect(await store.kvGet(`resource-checkpoint:${kept.id}:attachment`)).toBeUndefined();
+  });
+
   it('exports personal data without holding a database write transaction', async () => {
     vi.spyOn(store, 'getSettings').mockImplementation(async () => {
       expect(store.db.inTransaction()).toBe(false);

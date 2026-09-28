@@ -5163,7 +5163,7 @@ export class Store {
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`,
         `retention:settled:${taskId}`, `retention:view:${taskId}`]) (await exact.run(key));
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
-        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) await this.kvDeletePrefix(value);
+        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`, `resource-checkpoint:${taskId}:`]) await this.kvDeletePrefix(value);
     }
   
     });
