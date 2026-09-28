@@ -597,3 +597,26 @@ it('WF-3/WF-4: a run does not continue when its carried input would exceed the p
     .toEqual({ stage: 'cancelled' });
   expect(wf.activities.releaseTaskRun).not.toHaveBeenCalled();
 });
+
+it('WF-3: a merge-queue wait watches the position in a child, not a parent poll', async () => {
+  const world = { id: 'task', kind: 'worktree', root: '/tmp/test', branch: 'b', base: 'main', repos: [{ path: '/tmp/repo' }] };
+  Object.assign(wf.activities, {
+    accountPoolSize: vi.fn(async () => 0), checkProposal: vi.fn(async () => ({ ready: true })),
+    enqueueMerge: vi.fn(async () => undefined),
+    mergeQueuePosition: vi.fn(async () => ({ position: 2, total: 3 })),
+  });
+  const watches: any[] = [];
+  wf.startChild = (_type: unknown, options: any) => {
+    watches.push(options.args[0]);
+    return { signal: vi.fn(), result: () => new Promise(() => {}) };
+  };
+  wf.wait = () => {
+    expect(wf.timeout).toBeUndefined();
+    expect(wf.handlers.get('view')!()).toMatchObject({ mergeQueue: { position: 2, total: 3 } });
+    wf.handlers.get('cancel')!();
+  };
+  expect(await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] },
+    recovery: { resumeStage: 'merge', messages: [], world } })).toEqual({ stage: 'cancelled' });
+  expect(watches).toEqual([expect.objectContaining({ taskId: 'task', previous: { position: 2, total: 3 } })]);
+  expect(wf.activities.mergeQueuePosition).toHaveBeenCalledOnce();
+});

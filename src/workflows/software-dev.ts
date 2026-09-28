@@ -1,5 +1,6 @@
 import type { TurnPreparationActivities } from '../activities/turn-preparation.js';
 import { githubLandingWatch } from './github-landing-watch.js';
+import { mergeQueueWatch } from './merge-queue-watch.js';
 import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
 import {
@@ -254,8 +255,12 @@ const MAX_GITHUB_ERROR_POLLS = 3;
  * blocking the front landing slot—forever. */
 const MAX_AUTOMATED_LANDING_REPAIRS = 5;
 /** A run continues as new at the top of Do once it has grown by this much since
- * it started (or loaded a predecessor's conversation), so a task's history
- * stays far inside Temporal's 51,200-event / 50 MB limits however long it runs. */
+ * it started (or loaded a predecessor's conversation), so however many turns a
+ * task takes its history stays far inside Temporal's 51,200-event / 50 MB
+ * limits. Long waits outside Do wake on signals, or on child watchers that
+ * poll GitHub and the merge queue (githubLandingWatch, mergeQueueWatch) and
+ * return only on a change. Pins before v1.21 still poll GitHub in the task,
+ * backing off to ten minutes while nothing changes. */
 const CONTINUE_AFTER_EVENTS = 4_000;
 const CONTINUE_AFTER_BYTES = 8 * 1024 * 1024;
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
@@ -3536,6 +3541,26 @@ Inspect the complete current diff and specifically compare its delta from the re
       await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), githubPollDelay(pollMs, observation));
     }
   }
+  // Even an unchanged position poll recorded about 11 events every 30 s, so a
+  // long merge-queue wait reached the history limit in about 1.5 days. A child
+  // watches the position instead and returns only when it changes; the grant
+  // still wakes the task at once (WF-3).
+  let mergeQueueWatches = 0;
+  async function watchMergeQueue(domain: string, previous: TaskView['mergeQueue']): Promise<void> {
+    // A watcher that fails ends the wait too: the task's own poll surfaces it.
+    let changed = false;
+    const scope = new CancellationScope({ cancellable: true });
+    void scope.run(async () => {
+      const watcher = await startChild(mergeQueueWatch, {
+        workflowId: `${workflowInfo().workflowId}/merge-queue-watch/${workflowInfo().runId}/${mergeQueueWatches++}`,
+        args: [{ domain, taskId, previous, pollMs: MERGE_POLL }],
+        parentClosePolicy: ParentClosePolicy.TERMINATE,
+      });
+      await watcher.result();
+    }).catch(() => undefined).finally(() => { changed = true; });
+    await condition(() => mergeGranted || cancelled || changed);
+    if (!changed) scope.cancel();
+  }
   for (;;) {
     stage = 'merge';
     status = 'active';
@@ -3677,7 +3702,8 @@ Inspect the complete current diff and specifically compare its delta from the re
             mergeQueuePos = pos;
             await publish();
           }
-          await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
+          if (boundedMergeWait && patched('software-dev-merge-queue-watch-v1')) await watchMergeQueue(domain, pos);
+          else await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
         }
         if (cancelled && !mergeGranted) {
           await coordinator.cancelMerge(domain, taskId); // drop the slot we're still waiting on
