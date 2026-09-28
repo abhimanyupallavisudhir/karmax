@@ -7813,7 +7813,10 @@ export class Store {
         json_extract(tasks.params, '$._workflowRunId') runId FROM tasks
       JOIN kv settle ON settle.k='retention:settled:' || tasks.id
       WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
-        AND CAST(settle.v AS BIGINT) < ?
+        -- PostgreSQL may filter every kv row before the join narrows them, and
+        -- one non-numeric value ("developer") aborted the whole sweep. A CASE
+        -- is evaluated in order, so only settle times are ever cast.
+        AND CASE WHEN settle.k LIKE 'retention:settled:%' THEN CAST(settle.v AS BIGINT) END < ?
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id AND v='2')`)
       .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null; runId: string | null }>;
     for (const task of settled) {
