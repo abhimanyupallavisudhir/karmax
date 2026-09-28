@@ -5,6 +5,8 @@ const wf = vi.hoisted(() => ({
   activities: {} as Record<string, any>,
   wait: undefined as undefined | (() => void),
   patches: true,
+  // Patch ids that answer false even when `patches` is true.
+  absentPatches: new Set<string>(),
   timeout: undefined as unknown,
   childSignal: vi.fn(async () => undefined),
   startChild: undefined as undefined | ((...args: any[]) => any),
@@ -30,7 +32,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
   workflowInfo: () => wf.info,
   allHandlersFinished: () => true,
   continueAsNew: async (next: unknown) => { throw Object.assign(new Error('continued as new'), { next }); },
-  patched: () => wf.patches,
+  patched: (id: string) => wf.patches && !wf.absentPatches.has(id),
   isCancellation: () => false,
   log: { warn: vi.fn() },
   condition: async (predicate: () => boolean, timeout?: unknown) => {
@@ -38,7 +40,8 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
     if (!predicate()) wf.wait?.();
     if (!predicate() && timeout !== undefined) return false;
     // A handler may wait for the main flow (a continued run's conversation load).
-    for (let tick = 0; tick < 20 && !predicate(); tick++) await new Promise((resolve) => setImmediate(resolve));
+    // A pending wake (the barrier's hoisted one) stays pending while the flow runs on.
+    for (let tick = 0; tick < 500 && !predicate(); tick++) await new Promise((resolve) => setImmediate(resolve));
     if (!predicate()) throw new Error('test: unexpected wait');
     return true;
   },
@@ -57,6 +60,7 @@ const input = { taskId: 'task', projectId: 'project', title: 'T', prompt: 'work'
 beforeEach(() => {
   wf.childSignal.mockClear(); wf.handlers.clear(); wf.wait = undefined; wf.patches = true; wf.startChild = undefined;
   wf.buffered = [];
+  wf.absentPatches = new Set();
   wf.info = { runId: 'run', historyLength: 1, historySize: 0 };
   wf.activities = {
     restoreChildTasks: vi.fn(async () => []),
@@ -672,7 +676,54 @@ it('WF-3/WF-4: a child replaced under its parent is reread like a restored one',
     return { output: 'Waiting', providerCompleted: true, waitForSubtasks: true };
   });
   const waits: unknown[] = [];
-  wf.wait = () => { waits.push(wf.timeout); wf.handlers.get('cancel')!(); };
+  // The barrier's untimed wake condition is reported too; the reread is timed.
+  wf.wait = () => { if (wf.timeout === undefined) return; waits.push(wf.timeout); wf.handlers.get('cancel')!(); };
   expect(await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] } })).toEqual({ stage: 'cancelled' });
   expect(waits[0]).toBe(3_600_000);
+});
+
+/** Run 1 spawns a child and parks at the sub-task barrier, holding its handle. */
+async function parkedOnSpawnedChild(childResult: Promise<unknown>) {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child-1' }));
+  wf.startChild = () => ({ signal: vi.fn(), result: () => childResult });
+  wf.activities.runAgentTurn.mockImplementation(async () =>
+    ({ output: 'Delegating', providerCompleted: true, subTasks: [{ title: 'Child', prompt: 'Part' }] }));
+}
+
+it('WF-3/WF-4: a child replaced while its parent waits at the barrier is reread', async () => {
+  let replace!: () => void;
+  await parkedOnSpawnedChild(new Promise((resolve) => { replace = () => resolve({ stage: 'cancelled', lifecycleReplacement: true }); }));
+  const waits: unknown[] = [];
+  wf.wait = () => {
+    waits.push(wf.timeout);
+    // A person marks the child done while the parent holds its handle.
+    if (waits.length === 1) replace();
+    if (wf.timeout === 3_600_000) wf.handlers.get('cancel')!();
+  };
+  expect(await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] } })).toEqual({ stage: 'cancelled' });
+  expect(waits[0]).toBeUndefined();
+  expect(waits).toContain(3_600_000);
+  // It chose the reread without leaving the barrier for another turn.
+  expect(wf.activities.runAgentTurn).toHaveBeenCalledOnce();
+});
+
+it('WF-3/WF-4: without the forget patch a replaced child keeps its handle and the untimed wait', async () => {
+  wf.absentPatches = new Set(['software-dev-forget-replaced-child-handle-v1']);
+  await parkedOnSpawnedChild(Promise.resolve({ stage: 'cancelled', lifecycleReplacement: true }));
+  const waits: unknown[] = [];
+  wf.wait = () => { waits.push(wf.timeout); wf.handlers.get('cancel')!(); };
+  expect(await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] } })).toEqual({ stage: 'cancelled' });
+  expect(waits[0]).toBeUndefined();
+});
+
+it('WF-3/WF-4: without the reread patch a restored child takes the untimed wait', async () => {
+  wf.absentPatches = new Set(['software-dev-child-settlement-recheck-v1']);
+  const { next } = await continuedRun();
+  next.recovery.continued.subTasks = { ...next.recovery.continued.subTasks, awaitingResponse: [], raises: [] };
+  wf.activities.runAgentTurn.mockImplementation(async () => ({ output: 'Waiting', providerCompleted: true, waitForSubtasks: true }));
+  const waits: unknown[] = [];
+  wf.wait = () => { waits.push(wf.timeout); wf.handlers.get('cancel')!(); };
+  expect(await softwareDevV1_26(next)).toEqual({ stage: 'cancelled' });
+  expect(waits[0]).toBeUndefined();
 });

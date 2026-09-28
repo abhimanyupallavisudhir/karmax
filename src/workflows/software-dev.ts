@@ -752,6 +752,9 @@ async function softwareDevImpl(
   // `settled`, `outstanding` is the not-yet-finished set, and `awaitingResponse` is the
   // children currently parked on a reply from us.
   const childHandles = new Map<string, ChildWorkflowHandle<typeof softwareDev>>();
+  // Handles dropped for replaced children: a barrier already waiting without a
+  // timer chooses again, since only a reread can see such a child settle.
+  let droppedChildHandles = 0;
   // Children started before detached sub-tasks close with this run, so they
   // rule out continuing as new while outstanding.
   const attachedChildren = new Set<string>();
@@ -2508,7 +2511,10 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (durableChildSettlement && (res as { lifecycleReplacement?: boolean }).lifecycleReplacement) {
           // The child goes on in a successor run this handle cannot follow, so
           // it is reread at the barrier like a restored child.
-          if (patched('software-dev-forget-replaced-child-handle-v1')) childHandles.delete(childTaskId);
+          if (patched('software-dev-forget-replaced-child-handle-v1')) {
+            childHandles.delete(childTaskId);
+            droppedChildHandles++;
+          }
           return;
         }
         settled.push({ childTaskId, stage: (res as { stage: Stage }).stage });
@@ -3023,25 +3029,33 @@ Inspect the complete current diff and specifically compare its delta from the re
         // and re-prompt the agent (the unresolved raise is still in the conversation)
         // until it acts — SPEC §5.3 "keep prompting". With nothing awaiting us, wait
         // indefinitely for the next child event or human follow-up.
-        if (awaitingResponse.size > 0 && !needsHuman) {
-          if (boundedNags) subtaskNags++;
-          await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
-        } else if (!needsHuman && [...outstanding].some((id) => !childHandles.has(id))
-          && patched('software-dev-child-settlement-recheck-v1')) {
-          // A child restored without its handle (after continue-as-new or a
-          // replacement) is reported only by a best-effort signal, so its
-          // durable view is read again while the task waits. A wake does not
-          // wait for a read in flight.
-          for (let delay = CHILD_SETTLEMENT_RECHECK_MS; !(await condition(wake, delay));
-            delay = Math.min(delay * 2, CHILD_SETTLEMENT_RECHECK_MAX_MS)) {
-            const scope = new CancellationScope({ cancellable: true });
-            const read = scope.run(() => coreChild.settledChildTasks(taskId, [...outstanding])).catch(() => []);
-            const children = await Promise.race([read, condition(wake).then(() => undefined, () => undefined)]);
-            if (!children) { scope.cancel(); break; }
-            for (const child of children)
-              if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
+        for (let chosen = false; !chosen;) {
+          const drops = droppedChildHandles;
+          chosen = true;
+          if (awaitingResponse.size > 0 && !needsHuman) {
+            if (boundedNags) subtaskNags++;
+            await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
+          } else if (!needsHuman && [...outstanding].some((id) => !childHandles.has(id))
+            && patched('software-dev-child-settlement-recheck-v1')) {
+            // A child restored without its handle (after continue-as-new or a
+            // replacement) is reported only by a best-effort signal, so its
+            // durable view is read again while the task waits. A wake does not
+            // wait for a read in flight.
+            const woken = condition(wake).then(() => undefined, () => undefined);
+            for (let delay = CHILD_SETTLEMENT_RECHECK_MS; !(await condition(wake, delay));
+              delay = Math.min(delay * 2, CHILD_SETTLEMENT_RECHECK_MAX_MS)) {
+              const scope = new CancellationScope({ cancellable: true });
+              const read = scope.run(() => coreChild.settledChildTasks(taskId, [...outstanding])).catch(() => []);
+              const children = await Promise.race([read, woken]);
+              if (!children) { scope.cancel(); break; }
+              for (const child of children)
+                if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
+            }
+          } else {
+            await condition(() => wake() || droppedChildHandles > drops);
+            chosen = wake();
           }
-        } else await condition(wake);
+        }
         if (cancelled) return await abort();
       }
       // Otherwise the agent kept working (spawned/answered this turn) — loop and run
