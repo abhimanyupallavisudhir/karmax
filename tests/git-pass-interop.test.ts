@@ -19,9 +19,23 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'), XDG_CACHE_HOME: path.join(root, 'cache'),
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
-    PASSWORD_STORE_DIR: path.join(root, 'store'), PASSWORD_STORE_ENABLE_EXTENSIONS: 'true', GOPASS_AGE_PASSWORD: 'test-only' };
-  const run = (cmd: string, args: string[], input?: string, cwd?: string) => execFileSync(cmd === 'gopass' ? process.env.GOPASS_BIN || cmd : cmd, args,
-    { env, input, cwd, encoding: 'utf8', timeout: 30000, stdio: ['pipe', 'pipe', 'pipe'] });
+    PASSWORD_STORE_DIR: path.join(root, 'store'), PASSWORD_STORE_ENABLE_EXTENSIONS: 'true', GOPASS_AGE_PASSWORD: 'test-only',
+    GOPASS_DEBUG_LOG: path.join(root, 'gopass-debug.log') };
+  // gopass reports only "failed to encrypt" and logs the cause to its debug
+  // log (CI-44: `gopass insert` into the age mount failed once in CI and never
+  // locally), so a failing gopass command carries its own part of that log.
+  const debugLogSize = () => fs.existsSync(env.GOPASS_DEBUG_LOG) ? fs.statSync(env.GOPASS_DEBUG_LOG).size : 0;
+  const run = (cmd: string, args: string[], input?: string, cwd?: string) => {
+    const logged = debugLogSize();
+    try {
+      return execFileSync(cmd === 'gopass' ? process.env.GOPASS_BIN || cmd : cmd, args,
+        { env, input, cwd, encoding: 'utf8', timeout: 30000, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (error) {
+      if (cmd !== 'gopass' || debugLogSize() <= logged) throw error;
+      const log = fs.readFileSync(env.GOPASS_DEBUG_LOG).subarray(logged).toString('utf8').trimEnd().split('\n').slice(-60).join('\n');
+      throw new Error(`${(error as Error).message.trimEnd()}\ngopass debug log for this command:\n${log}`, { cause: error });
+    }
+  };
   try {
     run('gpg', ['--batch', '--passphrase', '', '--quick-generate-key', 'Interop <interop@example.invalid>', 'rsa2048', 'encr', '0']);
     const fingerprint = run('gpg', ['--with-colons', '--list-secret-keys']).split('\n').find(l => l.startsWith('fpr:'))!.split(':')[9]!;
