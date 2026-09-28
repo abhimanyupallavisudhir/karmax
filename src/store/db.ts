@@ -44,6 +44,7 @@ import {
   ProjectRepository,
   GitConnection,
   InboxItem,
+  CredentialNotice,
   DeliveryPreferences,
   OrganizationIdentityPolicy,
   WorldCheckpoint,
@@ -4064,7 +4065,7 @@ export class Store {
   async addAuthorizationInbox(
     organizationId: string,
     userIds: string[],
-    subject: NonNullable<InboxItem['subject']>,
+    subject: Extract<NonNullable<InboxItem['subject']>, { kind: 'avatar-authorization' }>,
     createdAt = Date.now(),
   ): Promise<void> {
     return this.db.transaction(async () => {
@@ -4092,6 +4093,41 @@ export class Store {
         .run(newId('delivery'), item.id, channel, createdAt, createdAt));
     }
   
+    });
+  }
+
+  /** Reconcile an organization's credential notices: each owner gets one critical,
+   * actionable item per notice (a repeat sweep never re-notifies), and notices that
+   * no longer apply — the login was renewed or removed — are withdrawn. */
+  async syncCredentialInbox(organizationId: string, userIds: string[], notices: CredentialNotice[],
+    createdAt = Date.now()): Promise<void> {
+    return this.db.transaction(async () => {
+
+    const ids = new Set<string>();
+    for (const notice of notices) for (const userId of new Set(userIds)) {
+      const id = `inbox_credential_${crypto.createHash('sha256')
+        .update(JSON.stringify([organizationId, userId, notice.credentialKey, notice.reason, notice.expiresAt])).digest('hex').slice(0, 24)}`;
+      ids.add(id);
+      const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+        (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
+        VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
+        id, organizationId, userId, createdAt * 1000, `credential:${notice.credentialKey}`,
+        urgencyRank('critical'), createdAt, JSON.stringify(notice)));
+      if (!Number(inserted.changes)) continue;
+      const preferences = (await this.getDeliveryPreferences(userId, organizationId));
+      const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.critical ?? preferences.email) && 'email', preferences.slack && 'slack']
+        .filter(Boolean) as string[];
+      for (const channel of channels) (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+        (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+        .run(newId('delivery'), id, channel, createdAt, createdAt));
+    }
+    const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='credential'`)
+      .all(organizationId)) as any[]).map((row) => String(row.id)).filter((id) => !ids.has(id));
+    if (stale.length) {
+      (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+      (await deleteRows(this.db, 'inbox', 'id', stale));
+    }
+
     });
   }
 

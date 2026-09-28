@@ -16270,7 +16270,17 @@ function inboxTabs() {
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
+  if (item.subject?.kind === 'credential') {
+    if (item.subject.reason === 'signed-out') return 'Signed out — sign in again';
+    const days = Math.max(0, Math.ceil((item.subject.expiresAt - Date.now()) / 86_400_000));
+    return `Sign-in expires ${days ? `in ${days} day${days === 1 ? '' : 's'}` : 'today'} — renew it`;
+  }
   return item.kind === 'update' ? (item.task?.status || 'update') : item.kind.replaceAll('-', ' ');
+}
+// What a row is about, for rows that are not a task's (resource asks, logins).
+function inboxTitle(item, fallback = item.kind) {
+  if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
+  return item.task?.title || item.resource?.name || fallback;
 }
 // Every priority is explicit; color and bars make the urgent levels scannable.
 function urgencyChip(urgency) {
@@ -16311,7 +16321,7 @@ function inboxView() {
     <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0">
       <span class="status-dot ${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}" title="${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}"></span>
       <div class="task-main">
-        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(item.task?.title || item.resource?.name || item.kind)}</div>
+        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(inboxTitle(item))}</div>
         <div class="task-sub">${inboxProjectLabel(item) ? `<span class="inbox-project" title="${esc(inboxProjectLabel(item))}">${esc(inboxProjectLabel(item))}</span>` : ''}<span class="chip">${esc(inboxRowLabel(item))}</span></div>
       </div>
       <div class="task-right">${urgencyChip(item.urgency)}<time datetime="${new Date(item.createdAt).toISOString()}" title="${esc(new Date(item.createdAt).toLocaleString())}">${esc(inboxTimeLabel(item.createdAt))}</time><button class="icon-btn inbox-read" data-inbox-toggle="${esc(item.id)}" aria-label="${item.unread ? 'Mark as read' : 'Mark as unread'}" title="${item.unread ? 'Mark as read' : 'Mark as unread'}" aria-pressed="${!item.unread}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button></div></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
@@ -16441,7 +16451,7 @@ function showVisualNotification(item) {
   const alert = document.createElement('div');
   alert.className = 'notification-alert';
   alert.dataset.id = item.id;
-  alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || 'karmax')}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
+  alert.innerHTML = `<button class="notification-open"><strong>${esc(inboxTitle(item, 'karmax'))}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
   alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(liveInboxItem(item)); };
   alert.lastElementChild.onclick = () => alert.remove();
   region.prepend(alert);
@@ -16458,7 +16468,7 @@ function showSystemNotification(item) {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
   try {
     const number = item.task?.num != null ? `#${item.task.num} · ` : '';
-    const notification = new Notification(item.task?.title || item.resource?.name || 'karmax', {
+    const notification = new Notification(inboxTitle(item, 'karmax'), {
       body: `${URGENCY_LEVELS[urgencyRank(item.urgency)].toUpperCase()} · ${number}${inboxRowLabel(item)}`,
       silent: true, // Sound is controlled separately by this browser’s per-level preference.
       tag: item.id,                                    // a restated ask replaces its own popup
@@ -16518,6 +16528,9 @@ async function openInboxItem(item) {
     markInboxItemReadLocally(item);
     api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
       .catch(() => { item.unread = true; updateBell(); });
+  }
+  if (item.subject?.kind === 'credential') {
+    return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-agents`);
   }
   if (item.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId); if (!project) return;

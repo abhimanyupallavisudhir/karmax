@@ -639,6 +639,10 @@ export class Gateway {
     // leaves a visibly connected login absent from the runnable coordinator pool.
     this.stopLoginPoolSync = deps.login?.onStateChange(async (state) => {
       await this.refreshLoginPool();
+      // A renewed sign-in withdraws its "sign in again" notice at once.
+      const { notifyCredentialAttention } = await import('../agent/credential-health.js');
+      await notifyCredentialAttention({ store: this.deps.store, configHomes: this.deps.configHomes }, Date.now(), [state.organizationId])
+        .catch(() => undefined);
       if (!state.loggedIn) return;
       const credential = enumerateCredentials(gatherCredentialSources({
         configHomes: this.deps.configHomes,
