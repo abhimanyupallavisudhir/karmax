@@ -3843,6 +3843,12 @@ export class Store {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
           .run(JSON.stringify(status), key, conversationReference, taskId));
         (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
+        // DB-2: the task row now holds this conversation, and a publication that
+        // still refers to the one it replaces is stale (`viewPublicationStale`).
+        // Keeping each superseded full copy until the task settled grew kv with
+        // the square of a long conversation's length.
+        if (current?.conversationRef)
+          (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`view-conversation:${taskId}:${current.conversationRef}`));
       }
     } else if (messages === undefined && transcripts === undefined) {
       // A status-only view (reconcile and lifecycle repairs read `lastView`

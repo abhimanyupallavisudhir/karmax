@@ -148,12 +148,11 @@ describe('durable conversation publication', () => {
       expect(writes[2]!.reference).not.toBe(writes[0]!.reference);
       expect((await store.getTask(task.id))?.lastView?.messages[0]?.text).toBe('edited in place');
 
-      // A retried old activity must read its own snapshot, not the current view.
-      await core.publishView(task.id, writes[1]!.view, writes[1]!.reference);
-      expect((await store.getTask(task.id))?.lastView?.messages[0]?.text).toContain('CI log');
-      expect((await store.getTask(task.id))?.lastView?.transcripts).toHaveLength(1);
+      // The superseded snapshot is gone (DB-2); a late retry that still refers
+      // to it is ignored by publication order (see "publication order").
+      expect((await store.kvGet(`view-conversation:${task.id}:${writes[0]!.reference}`))).toBeUndefined();
       await expect(core.publishView(task.id, writes[1]!.view, 'missing')).rejects.toThrow('snapshot is missing');
-      await expect(core.publishView(task.id, view, writes[0]!.reference)).rejects.toThrow('reference was reused');
+      await expect(core.publishView(task.id, writes[0]!.view as TaskView, writes[2]!.reference)).rejects.toThrow('reference was reused');
 
       // A replacement run writes its initial snapshot even if the old one exists.
       const restart = conversationPublisher('run-two', (v, ref) => core.publishView(task.id, v, ref));
@@ -213,7 +212,7 @@ describe('durable conversation publication', () => {
       let runId = 'run-one';
       const ctx = vi.spyOn(Context, 'current').mockImplementation(() =>
         ({ info: { workflowExecution: { runId }, activityId: `publish-${Math.random()}`, attempt: 1 } }) as any);
-      const view = (stage: TaskView['stage'], updatedAt: number, text = stage): TaskView => ({ taskId: task.id, title: 'T',
+      const view = (stage: TaskView['stage'], updatedAt: number, text: string = stage): TaskView => ({ taskId: task.id, title: 'T',
         workflow: 'software-dev', stage, status: 'active', messages: [{ id: 'm', role: 'agent', text, ts: 0 }],
         actions: [], state: {}, updatedAt });
       const stored = async () => (await store.getTask(task.id))?.lastView;
@@ -248,6 +247,32 @@ describe('durable conversation publication', () => {
         f.useRun('run-two');
         await f.core.publishView(f.task.id, f.view('review', 9));
         expect(await f.stored()).toMatchObject({ stage: 'review' });
+      } finally { await f.close(); }
+    });
+
+    // DB-2: a live task's superseded conversation snapshots used to wait for the
+    // task to settle; each full copy of a long conversation stayed in kv.
+    it('drops the superseded conversation snapshot as soon as a newer one is saved', async () => {
+      const f = await publisher();
+      const writes: { view: PublishedView; reference: string }[] = [];
+      const publish = conversationPublisher('run-one', async (view, reference) => {
+        writes.push({ view, reference });
+        await f.core.publishView(f.task.id, view, reference);
+      });
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await publish(f.view('do', 2, 'first'));
+        await publish(f.view('do', 3, 'second'));
+        await publish(f.view('do', 4, 'third'));
+        expect((await f.store.kvEntries(`view-conversation:${f.task.id}:`)).map(({ key }) => key))
+          .toEqual([`view-conversation:${f.task.id}:run-one:2`]);
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'third' }] });
+        // A late retry of a superseded status publication finds no snapshot, and
+        // must be ignored rather than fail the workflow.
+        await expect(f.core.publishView(f.task.id, writes[1]!.view, writes[1]!.reference)).resolves.toBeUndefined();
+        await expect(f.core.publishView(f.task.id, writes[2]!.view, writes[2]!.reference)).resolves.toBeUndefined();
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'third' }] });
+        expect((await f.store.kvEntries(`view-conversation:${f.task.id}:`))).toHaveLength(1);
       } finally { await f.close(); }
     });
   });
