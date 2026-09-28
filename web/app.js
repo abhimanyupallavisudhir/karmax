@@ -9645,45 +9645,55 @@ function localConversationHandoff(v, cwd, portable = false, preparedSessions = S
     }).join('')}</div>`;
 }
 
-async function openLocalCheckout(v) {
-  if (hostLocal()) return materializeLocalCheckout(v);
+// The Work-locally dialogs share one frame: a loading state while `load()` runs,
+// then `render(data)`'s body, with close, copy and conversation downloads wired.
+// Resolves to { host, data }, or null when the load failed or the dialog closed.
+async function localHandoffDialog({ loading, load, title = () => 'Work locally', render }) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
+  const show = (heading, body) => {
+    host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">${heading} <span class="q-spacer"></span><button class="icon-btn local-handoff-close" aria-label="Close">✕</button></div>
+    ${body}
   </div></div>`;
-  const wireClose = () => {
     host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
     host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
   };
-  wireClose();
-  let plan, preparedSessions;
-  try {
-    [plan, preparedSessions] = await Promise.all([
+  show('Work locally', `<div class="tf-loading modal-loading" role="status"><span class="global-search-loading">${loading}</span></div>`);
+  let data;
+  try { data = await load(); }
+  catch (error) { host.remove(); toast(error.message, true); return null; }
+  if (!host.isConnected) return null;
+  show(title(data), render(data));
+  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
+  })));
+  host.querySelectorAll('.native-conversation-download').forEach((button) =>
+    button.addEventListener('click', () => downloadNativeConversation(button)));
+  return { host, data };
+}
+
+async function openLocalCheckout(v) {
+  if (hostLocal()) return materializeLocalCheckout(v);
+  const opened = await localHandoffDialog({
+    loading: 'Preparing checkout instructions…',
+    load: () => Promise.all([
       api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`),
       api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`),
-    ]);
-  }
-  catch (error) { host.remove(); return toast(error.message, true); }
-  if (!host.isConnected) return;
-  const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
+    ]),
+    render: ([plan, preparedSessions]) => {
+      const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
+      return `<p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
     ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true, preparedSessions)}
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
     <p class="task-sub">${siteNameMarkup()} accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
-    <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
-  </div></div>`;
-  wireClose();
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
-  host.querySelectorAll('.native-conversation-download').forEach((button) =>
-    button.addEventListener('click', () => downloadNativeConversation(button)));
+    <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>`;
+    },
+  });
+  if (!opened) return;
+  const { host } = opened;
   $('#local-refresh', host)?.addEventListener('click', async (event) => {
     const button = event.currentTarget; const result = $('#local-refresh-result', host); button.disabled = true; result.textContent = 'Importing the pushed branch…';
     try {
@@ -9696,63 +9706,31 @@ async function openLocalCheckout(v) {
 
 async function openProjectCheckout(project) {
   if (!project?.id) return;
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
-  </div></div>`;
-  const wireClose = () => {
-    host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
-    host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  };
-  wireClose();
-  let plan;
-  try { plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`); }
-  catch (error) { host.remove(); return toast(error.message, true); }
-  if (!host.isConnected) return;
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to ${siteNameMarkup()}.</p>
+  await localHandoffDialog({
+    loading: 'Preparing checkout instructions…',
+    load: () => api(`/api/projects/${encodeURIComponent(project.id)}/checkout`),
+    render: (plan) => `<p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to ${siteNameMarkup()}.</p>
     <div class="section-h">First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
-    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
-  </div></div>`;
-  wireClose();
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
+    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>`,
+  });
 }
 
 async function materializeLocalCheckout(v) {
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Materializing a local checkout…</span></div>
-  </div></div>`;
-  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
-  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  let checkout, preparedSessions;
-  try {
-    checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
-    preparedSessions = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`);
-  } catch (error) { host.remove(); toast(error.message, true); return null; }
-  if (!host.isConnected) return null;
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
+  const opened = await localHandoffDialog({
+    loading: 'Materializing a local checkout…',
+    load: async () => {
+      const checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
+      return [checkout, await api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`)];
+    },
+    title: () => 'Ready locally',
+    render: ([checkout, preparedSessions]) => `<p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
     ${localConversationHandoff(v, checkout.cwd, false, preparedSessions)}
     <div class="section-h" style="margin-top:14px">Repositories</div>
-    <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
-  </div></div>`;
-  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
-  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
-  host.querySelectorAll('.native-conversation-download').forEach((button) =>
-    button.addEventListener('click', () => downloadNativeConversation(button)));
-  return checkout;
+    <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>`,
+  });
+  return opened?.data[0] ?? null;
 }
 
 async function forkCloudSessionLocally(v, button) {
