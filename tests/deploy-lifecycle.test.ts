@@ -365,6 +365,30 @@ it('refuses a release that cannot replay a running workflow, leaving production 
   expect(calls.slice(check + 1).some(call => call.endsWith(' build app'))).toBe(true);
 });
 
+// The two gates in the real updater: replay check before the backup, vault
+// preflight after it and before anything restarts.
+it('runs build, replay check, backup, vault preflight and restart in that order', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target]);
+  expect(result.status, result.stderr).toBe(0);
+  const calls = h.calls().map(args => args.join(' '));
+  const at = (text: string) => calls.findIndex(call => call.includes(text));
+  const order = ['build --pull app', 'npm run --silent replay-check', 'pg_dump', 'npm run --silent vault-preflight', 'up -d'].map(at);
+  expect(order.every(index => index >= 0)).toBe(true);
+  expect([...order].sort((a, b) => a - b)).toEqual(order);
+});
+
+it('keeps production when the vault preflight finds something, after the backup', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target], 'vault-preflight');
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain(`production remains at ${h.previous}`);
+  expect(h.git('rev-parse', 'HEAD')).toBe(h.previous);
+  const calls = h.calls().map(args => args.join(' '));
+  expect(calls.some(call => call.includes('pg_dump'))).toBe(true);
+  expect(calls.some(call => call.includes('up -d'))).toBe(false);
+});
+
 it('lets an operator skip the replay check explicitly, and says so', () => {
   const h = checkout();
   const result = h.run(['update', h.target], 'replay-check', '', { KARMAX_SKIP_REPLAY_CHECK: '1' });
