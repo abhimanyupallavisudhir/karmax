@@ -3009,7 +3009,9 @@ async function loadCollaboration() {
   S.teams = value(teams, S.teams, []);
   S.users = users.status === 'fulfilled' ? users.value || [] : S.users || [];
   S.authorizationCatalogOrganization = organizationId;
-  const failed = [members, teams, users, catalog].find((result) => result.status === 'rejected');
+  // The installation's user directory only fills in names the members already
+  // carry, and an organization owner may not read it (hosted): not a failure.
+  const failed = [members, teams, catalog].find((result) => result.status === 'rejected');
   if (failed) throw failed.reason;
 }
 
@@ -17870,6 +17872,22 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
   const paint = {
     async people() {
+      // The invite and new-team forms are static markup: they work while the
+      // pane's reads are still in flight, or after they failed.
+      wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
+      setEventHandler($('#invite-member'), 'click', async () => {
+        try {
+          const email = $('#invite-email').value;
+          const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) });
+          const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`;
+          $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`;
+          // Sent before the pane painted: its invitation read may predate this one.
+          if ($('#pending-invitations')) appendPendingInvitation(result.invitation, authorizationProjects);
+          else refresh('people');
+          $('#invite-email').value = '';
+        } catch (e) { toast(e.message, true); }
+      });
+      setEventHandler($('#create-team'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await refresh('people'); } catch (e) { toast(e.message, true); } });
       const invitations = read('invitations').catch(() => []);
       const collaborationError = await loadCollaboration().then(() => null, (error) => error);
       if (!live('people')) return;
@@ -17910,18 +17928,6 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
       $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
       $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
-      wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
-      setEventHandler($('#invite-member'), 'click', async () => {
-        try {
-          const email = $('#invite-email').value;
-          const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) });
-          const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`;
-          $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`;
-          appendPendingInvitation(result.invitation, authorizationProjects);
-          $('#invite-email').value = '';
-        } catch (e) { toast(e.message, true); }
-      });
-      setEventHandler($('#create-team'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await refresh('people'); } catch (e) { toast(e.message, true); } });
       $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
         const editor = row.querySelector('.authz-editor');
         wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {

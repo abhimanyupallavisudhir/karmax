@@ -14,7 +14,8 @@ const { chromium } = require('playwright');
     const fail = new Set();
     const project = { id: 'p', organizationId: 'o', name: 'Workspace', config: {} };
     const schema = [{ name: 'software-dev', params: [], stages: [{ key: 'do', label: 'Working' }] }];
-    let sharing = false;
+    let sharing = false, slowPane = false;
+    const invitations = [];
     await context.routeWebSocket('**/ws*', () => {});
     await context.route('http://console.test/**', async route => {
       const req = route.request(), p = new URL(req.url()).pathname;
@@ -24,6 +25,18 @@ const { chromium } = require('playwright');
       }
       const key = `${req.method()} ${p}`;
       if (fail.has(key)) return route.fulfill({ status: 503, json: { error: 'Temporarily unavailable' } });
+      // An organization owner on a hosted install may not read the installation's users.
+      if (p === '/api/users') return route.fulfill({ status: 403, json: { error: 'missing capability user:read' } });
+      if (key === 'GET /api/organizations/o/invitations') {
+        const listed = [...invitations];
+        if (slowPane) await new Promise(resolve => setTimeout(resolve, 600));
+        return route.fulfill({ json: listed });
+      }
+      if (key === 'POST /api/organizations/o/invitations') {
+        const invitation = { id: 'i1', email: req.postDataJSON().email, authorization: { level: 'developer', scope: 'organization' }, createdAt: 1 };
+        invitations.push(invitation);
+        return route.fulfill({ json: { token: 'secret', emailed: true, invitation } });
+      }
       let data = [];
       if (p === '/api/meta') data = { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [] };
       else if (p === '/api/launch') data = {};
@@ -81,6 +94,19 @@ const { chromium } = require('playwright');
     fail.delete('GET /api/organizations/o/members');
     await members.getByRole('button', { name: 'Retry' }).click();
     await members.getByText('Tester').first().waitFor();
+
+    // The installation's user directory is optional to the People pane, and
+    // Invite works as soon as it is shown, before the pane's reads land.
+    slowPane = true;
+    await page.goto('http://console.test/org/settings#settings-people');
+    await page.locator('#invite-email').fill('ivan@example.test');
+    await page.locator('#invite-member').click();
+    await page.locator('#invite-result').getByText('Invitation emailed to').waitFor();
+    await members.getByText('Tester').first().waitFor();
+    await page.locator('#pending-invitations [data-invitation="i1"]').waitFor();
+    assert.equal(await members.getByRole('button', { name: 'Retry' }).count(), 0, 'an unreadable user directory is not a failed pane');
+    await page.locator('#invite-result').getByText('Invitation emailed to').waitFor();
+    slowPane = false;
 
     // UI-23: a rejected sharing policy returns the select to the saved value.
     fail.add('PUT sharing');
