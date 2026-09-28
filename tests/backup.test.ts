@@ -708,6 +708,22 @@ describe('signed deployment backups (DB-10)', () => {
     expect(() => verifyDeploymentBackup(b.directory, { home: b.home })).toThrow(/unsigned.*--accept-unsigned-v1/);
     expect(verifyDeploymentBackup(b.directory, { home: b.home, acceptUnsignedV1: true }).signedBy).toBeUndefined();
   });
+
+  // Every snapshot the previous release's updater took has neither checksums
+  // nor signatures; after the upgrade they must still restore on the
+  // operator's word, or no pre-upgrade restore point is usable.
+  it('restores a backup from before checksums only on the operator\'s word', async () => {
+    const b = await deploymentBackup('legacy');
+    for (const file of ['SHA256SUMS', 'SHA256SUMS.sig', 'control-plane/manifest.sig']) fs.rmSync(path.join(b.directory, file));
+    expect(() => verifyDeploymentBackup(b.directory, { home: b.home })).toThrow(/no checksums.*--accept-unsigned-v1/);
+    expect(verifyDeploymentBackup(b.directory, { home: b.home, acceptUnsignedV1: true }).signedBy).toBeUndefined();
+    // Its control plane is still checked against its own manifest.
+    fs.appendFileSync(path.join(b.directory, 'control-plane', 'manifest.json'), ' ');
+    const manifest = JSON.parse(fs.readFileSync(path.join(b.directory, 'control-plane', 'manifest.json'), 'utf8'));
+    const file = path.join(b.directory, 'control-plane', 'payload', manifest.files[0].path);
+    fs.appendFileSync(file, 'tampered');
+    expect(() => verifyDeploymentBackup(b.directory, { home: b.home, acceptUnsignedV1: true })).toThrow(/integrity check failed/);
+  });
 });
 
 function makeHome(prefix: string): { root: string; home: string } {

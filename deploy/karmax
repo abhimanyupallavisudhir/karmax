@@ -407,8 +407,15 @@ cmd_restore() {
   [ -f "$source/temporal.dump" ] || die 'backup is missing temporal.dump'
   [ -f "$source/temporal-visibility.dump" ] || die 'backup is missing temporal-visibility.dump'
   [ -d "$source/deployment-secrets" ] || die 'backup is missing deployment-secrets'
-  [ -f "$source/SHA256SUMS" ] || die 'backup is missing checksums; cannot verify before restore'
-  (cd "$source" && sha256sum -c SHA256SUMS) || die 'backup checksum verification failed'
+  if [ -f "$source/SHA256SUMS" ]; then
+    (cd "$source" && sha256sum -c SHA256SUMS) || die 'backup checksum verification failed'
+  elif [ -n "$unsigned" ]; then
+    # The previous release's updater wrote no checksums; its control plane is
+    # still checked against its manifest, and every dump by pg_restore below.
+    note 'This backup predates checksums: only its control plane and the readability of its dumps can be verified.'
+  else
+    die 'backup has no checksums (it predates them); restore it only if it stayed in trusted storage, with --accept-unsigned-v1'
+  fi
   # Check both signatures, every checksum, the control-plane manifest and
   # every payload file using the candidate app, while the live containers and
   # all three databases are still untouched.

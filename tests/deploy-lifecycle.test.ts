@@ -271,6 +271,24 @@ it('verifies backup signatures first, and restores an unsigned backup only when 
   expect(accepted.some(call => call.includes('npm run restore -- --accept-unsigned-v1 /restore'))).toBe(true);
 });
 
+// The previous release's updater wrote neither checksums nor signatures.
+it('restores a snapshot from before checksums only with --accept-unsigned-v1', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'legacy');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  fs.rmSync(path.join(destination, 'SHA256SUMS'));
+  h.clear();
+  const refused = h.run(['restore', destination], '', 'RESTORE\n');
+  expect(refused.status).not.toBe(0);
+  expect(refused.stderr).toContain('--accept-unsigned-v1');
+  expect(h.calls().some(args => args.includes('down'))).toBe(false);
+  h.clear();
+  const accepted = h.run(['restore', '--accept-unsigned-v1', destination], '', 'RESTORE UNSIGNED\n');
+  expect(accepted.status, accepted.stderr).toBe(0);
+  expect(accepted.stdout).toContain('predates checksums');
+  expect(h.calls().some(args => args.join(' ').includes('npm run restore -- --accept-unsigned-v1 /restore'))).toBe(true);
+});
+
 // DB-10 review: everything a restore uses comes from a private copy that was
 // verified, not from the backup directory, which can change after the check.
 it('restores from the private copy it verified', () => {
