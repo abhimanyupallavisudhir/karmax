@@ -2408,7 +2408,6 @@ export class Gateway {
         const b = await this.body(req);
         try {
           const invitationToken = String(b.token ?? '');
-          const invited = (await store.organizationInvitationForToken(invitationToken));
           const membership = (await store.acceptOrganizationInvitation(invitationToken, subject.userId, subjectEmail));
           (await this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${subject.userId}`,
             membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']));
