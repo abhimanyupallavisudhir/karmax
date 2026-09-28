@@ -211,6 +211,7 @@ export class OnePasswordConnector implements CredentialConnector {
   constructor(
     private token: () => string | undefined,
     private exec: Exec = realExec,
+    private writer: OnePasswordSdkConnector = new OnePasswordSdkConnector(token),
   ) {}
   private env(): Record<string, string> {
     const t = this.token();
@@ -291,23 +292,15 @@ export class OnePasswordConnector implements CredentialConnector {
     }
     return { items: out, failures };
   }
-  /** Assignment edits preserve data the CLI's JSON representation cannot
-   * round-trip (notably passkeys). Never replace an item from its JSON export. */
+  /** Write-back edits one field through the SDK, with the same service-account
+   * token (AU-29). `op item edit` accepts a new value only as an argv
+   * assignment, readable by every local process from /proc, and its JSON
+   * template form replaces the whole item, losing what the CLI's export cannot
+   * round-trip (notably passkeys). The CLI names the vault holding the item. */
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
-    const assignment =
-      field === 'password'
-        ? `password=${value}`
-        : field === 'secret'
-          ? `credential=${value}`
-          : field === 'totp'
-            ? `one-time password[otp]=${value}`
-            : field === 'note'
-              ? `notesPlain=${value}`
-              : field === 'privateKey'
-                ? `private_key=${value}`
-                : undefined;
-    if (!assignment) throw new Error(`1Password write-back does not support the "${field}" field`);
-    await this.exec('op', ['item', 'edit', externalId, assignment], { env: this.env() });
+    const item = JSON.parse(await this.exec('op', ['item', 'get', externalId, '--format=json'], { env: this.env() }));
+    if (typeof item?.vault?.id !== 'string') throw new Error(`1Password item "${externalId}" has no vault`);
+    await this.writer.updateSecretIn(item.vault.id, externalId, field, value);
   }
 }
 
@@ -430,8 +423,12 @@ export class OnePasswordSdkConnector implements CredentialConnector {
   }
 
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
-    const client = await this.client();
     const [vaultId, itemId] = await this.location(externalId);
+    await this.updateSecretIn(vaultId, itemId, field, value);
+  }
+
+  async updateSecretIn(vaultId: string, itemId: string, field: VaultFieldName, value: string): Promise<void> {
+    const client = await this.client();
     const item = await client.items.get(vaultId, itemId);
     if (field === 'note') {
       item.notes = value;

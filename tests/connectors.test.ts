@@ -120,6 +120,32 @@ describe('1Password connector', () => {
     expect(pulled!.secrets).toEqual({ password: 'sw0rd', totp: 'JBSWY3DPEHPK3PXP' });
   });
 
+  // AU-29: `op item edit` takes a new value only as an argv assignment, which
+  // every local process can read from /proc; the write goes through the SDK.
+  it('writes a rotated secret back without putting it in argv', async () => {
+    const commands: string[][] = [];
+    const cli = async (cmd: string, args: string[]) => {
+      commands.push([cmd, ...args]);
+      return args.slice(0, 2).join(' ') === 'item get' ? JSON.stringify({ id: 'op1', vault: { id: 'vault1' } }) : '{}';
+    };
+    const puts: any[] = [];
+    const client: any = {
+      vaults: { list: async () => { throw new Error('the item location comes from the CLI'); } },
+      items: {
+        list: async () => [],
+        get: async (vaultId: string, itemId: string) => ({ id: itemId, vaultId, fields: [
+          { id: 'username', value: 'octo', fieldType: 'Text' }, { id: 'password', value: 'sw0rd', fieldType: 'Concealed' }] }),
+        put: async (item: any) => { puts.push(item); return item; },
+      },
+    };
+    const c = new OnePasswordConnector(() => 'tok', cli, new OnePasswordSdkConnector(() => 'tok', async () => client));
+    await c.updateSecret('op1', 'password', 'rotated-s3cret');
+    expect(JSON.stringify(commands)).not.toContain('rotated-s3cret');
+    expect(puts).toHaveLength(1);
+    expect(puts[0]).toMatchObject({ id: 'op1', vaultId: 'vault1' });
+    expect(puts[0].fields).toEqual([{ id: 'username', value: 'octo', fieldType: 'Text' }, { id: 'password', value: 'rotated-s3cret', fieldType: 'Concealed' }]);
+  });
+
   it('does not connect without a service-account token', async () => {
     const { items, broker, store } = makeVault();
     const connectors = new Connectors(store, items, broker);
@@ -1241,18 +1267,20 @@ it('publishes local pass ciphertext exclusively when another writer wins the nam
   }
 });
 
-it('uses field assignments for 1Password edits instead of destructive JSON templates', async () => {
-  const writes: any[] = [];
-  const c = new OnePasswordConnector(
-    () => 'token',
-    async (_cmd, args, opts) => {
-      writes.push({ args, opts });
-      return '{}';
-    },
-  );
+it('edits one 1Password field instead of replacing the item from a JSON template', async () => {
+  const commands: string[][] = [];
+  const puts: any[] = [];
+  const fields = [{ id: 'public_key', value: 'ssh-ed25519 AAAA', fieldType: 'Text' }, { id: 'private_key', value: 'old', fieldType: 'SshKey' }];
+  const client: any = { vaults: { list: async () => [] }, items: {
+    list: async () => [], get: async (vaultId: string, id: string) => ({ id, vaultId, fields: structuredClone(fields) }),
+    put: async (item: any) => { puts.push(item); return item; } } };
+  const c = new OnePasswordConnector(() => 'token', async (_cmd, args) => {
+    commands.push(args);
+    return JSON.stringify({ id: 'id', vault: { id: 'v' } });
+  }, new OnePasswordSdkConnector(() => 'token', async () => client));
   await c.updateSecret('id', 'privateKey', 'synthetic-key');
-  expect(writes[0].args).toEqual(['item', 'edit', 'id', 'private_key=synthetic-key']);
-  expect(writes[0].opts.input).toBeUndefined();
+  expect(commands).toEqual([['item', 'get', 'id', '--format=json']]);
+  expect(puts[0].fields).toEqual([fields[0], { ...fields[1], value: 'synthetic-key' }]);
 });
 
 it('does not let an in-flight stale import undo a completed rotation', async () => {
