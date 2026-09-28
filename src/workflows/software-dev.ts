@@ -1871,6 +1871,19 @@ async function softwareDevImpl(
       || credentialProvider === 'kimi' || credentialProvider === 'grok' || credentialProvider === 'mock'
         ? credentialProvider
         : undefined;
+    // Credential-policy allow-list for real providers (precedence + enable/disable,
+    // resolved global→project→task); mock uses the coordinator's provider fallback.
+    const resolveAllowed = async () => credentialProvider !== 'mock'
+      ? await core.resolveCredentialOrder({ taskId, projectId: input.projectId, provider: credentialProvider, role, task: liveInput }).catch(() => undefined)
+      : undefined;
+    // Histories recorded before credential re-listing resolved the first allow-list
+    // BEFORE this turn's id; later ones resolve it after. Only the run's first
+    // `agent-turn-run-identity-v1` marker is a command, so only it can tell them
+    // apart: replay reports the marker unknown here exactly when the history
+    // recorded it after that resolution, or not at all (both resolved first then).
+    // Live executions take the current order.
+    const resolvedFirst = !patched('agent-turn-run-identity-v1');
+    const firstAllowed = resolvedFirst ? await resolveAllowed() : undefined;
     const turnId = agentTurnId(taskId, turnSeq++);
     let priorStatus = status;
     let requests = 0;
@@ -1878,12 +1891,8 @@ async function softwareDevImpl(
     // The coordinator hands a parked request back when credentials change under
     // it (a new login, a policy edit); resolve the allow-list again and re-ask.
     for (;;) {
-      // Credential-policy allow-list for real providers (precedence + enable/disable,
-      // resolved global→project→task); mock uses the coordinator's provider fallback.
-      const allowed =
-        credentialProvider !== 'mock'
-          ? await core.resolveCredentialOrder({ taskId, projectId: input.projectId, provider: credentialProvider, role, task: liveInput }).catch(() => undefined)
-          : undefined;
+      // A re-ask must not reuse the first, now stale, list.
+      const allowed = requests === 0 && resolvedFirst ? firstAllowed : await resolveAllowed();
       const lease = await coordinator.leaseAccount(taskId, turnId, credentialProvider, allowed);
       if (requests++ === 0) priorStatus = status;
       status = 'waiting';
