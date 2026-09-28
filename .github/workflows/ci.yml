@@ -194,6 +194,9 @@ jobs:
       - name: Start the control-plane image and load native runtime modules
         run: docker run --rm karmax:ci node -e "require('node:sqlite'); require('node-pty')"
 
+      - name: Keep the console test suites out of the image
+        run: docker run --rm karmax:ci sh -c 'test -z "$(find /app/web -name "*.test.cjs")"'
+
       # rate_limit is a third-party module; Caddy refuses to start on a directive
       # it does not recognise, so building the edge is what makes the Caddyfile
       # below valid at all.
