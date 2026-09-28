@@ -45,6 +45,8 @@ export class PasskeyManager {
   /** Each held session keeps a browser session (in a remote world, also a
    * terminal and the world itself) open until it is released or expires. */
   constructor(private ttlMs = 180_000, private limits = { perOwner: 3, total: 64 }) {}
+  /** Sessions `begin` has admitted but not yet opened, by owner. */
+  private reserved = new Map<string, number>();
 
 
   /**
@@ -55,7 +57,18 @@ export class PasskeyManager {
    */
   async begin(page: string | PageOpener, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }): Promise<{ authenticatorId: string; origin: string }> {
     if (!opts.owner || !opts.expectDomains?.length) throw new Error('passkey sessions require an owner and target domains');
+    // Take the slot before the first await, so parallel requests cannot all pass the check.
     this.assertRoom(opts.owner);
+    this.reserved.set(opts.owner, (this.reserved.get(opts.owner) ?? 0) + 1);
+    try { return await this.open(page, opts); }
+    finally {
+      const left = (this.reserved.get(opts.owner) ?? 1) - 1;
+      if (left) this.reserved.set(opts.owner, left); else this.reserved.delete(opts.owner);
+    }
+  }
+
+  private async open(page: string | PageOpener, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }): Promise<{ authenticatorId: string; origin: string }> {
+    if (!opts.expectDomains?.length) throw new Error('passkey sessions require target domains');
     const { session, origin } = typeof page === 'string'
       ? await openPage(page, { expectDomains: opts.expectDomains })
       : await page(opts.expectDomains);
@@ -82,12 +95,13 @@ export class PasskeyManager {
     }
   }
 
-  /** Throw unless `owner` may hold one more session. */
+  /** Throw unless `owner` may hold one more session, counting ones still opening. */
   assertRoom(owner: string): void {
-    const owned = [...this.held.values()].filter((held) => held.owner === owner).length;
+    const owned = [...this.held.values()].filter((held) => held.owner === owner).length + (this.reserved.get(owner) ?? 0);
     if (owned >= this.limits.perOwner)
       throw new Error(`this task already has ${owned} passkey sessions open; save or release one first`);
-    if (this.held.size >= this.limits.total) throw new Error('too many passkey sessions are open; try again in a few minutes');
+    const opening = [...this.reserved.values()].reduce((sum, count) => sum + count, 0);
+    if (this.held.size + opening >= this.limits.total) throw new Error('too many passkey sessions are open; try again in a few minutes');
   }
 
   /** Read the credential(s) the site just wrote into the authenticator, then

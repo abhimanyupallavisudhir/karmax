@@ -38,8 +38,8 @@ describe('a local task’s own browser', () => {
     fs.mkdirSync(bin);
     fs.writeFileSync(path.join(bin, 'lsof'), `#!/bin/sh
 pid=''; port=''
-for arg in "$@"; do case "$arg" in -iTCP:*) port=\${arg#-iTCP:} ;; [0-9]*) pid=$arg ;; esac; done
-ss -ltnpH "sport = :$port" | grep -q "pid=$pid," && echo "$pid"
+for arg in "$@"; do case "$arg" in -iTCP@127.0.0.1:*) port=\${arg#-iTCP@127.0.0.1:} ;; [0-9]*) pid=$arg ;; esac; done
+[ -n "$port" ] && ss -ltnpH "src 127.0.0.1:$port" | grep -q "pid=$pid," && echo "$pid"
 `, { mode: 0o755 });
     vi.stubEnv('PATH', `${bin}:${process.env.PATH}`);
   });
@@ -87,6 +87,19 @@ ss -ltnpH "sport = :$port" | grep -q "pid=$pid," && echo "$pid"
       await settle();
       expect(localTaskBrowserUrl('task_a')).toBe('http://127.0.0.1:45112');
     } finally { Object.defineProperty(process, 'platform', { value: real }); }
+  });
+
+  // #367 review item 13: a marked process holding only an IPv6 wildcard
+  // socket on the port does not own what 127.0.0.1:N reaches.
+  it('does not count an IPv6 listener when another process owns the IPv4 one', async () => {
+    if (process.platform !== 'linux') return;
+    agent('task_a', 'custody-a');
+    browser(45121); // someone else's, on 127.0.0.1
+    const v6 = spawn(process.execPath, ['-e', `require('node:net').createServer().listen({ port: 45121, host: '::', ipv6Only: true }); ${idle}`,
+      '--', '--remote-debugging-port=45121'], { stdio: 'ignore', env: { PATH: process.env.PATH ?? '', [CUSTODY_ENV]: 'custody-a' } });
+    children.push(v6);
+    await settle();
+    expect(() => localTaskBrowserUrl('task_a')).toThrow(/no browser of its own/);
   });
 
   // #367 review item 11: the Messages and Responses rails start the browser MCP

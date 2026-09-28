@@ -106,6 +106,23 @@ describe('agent-enrolled passkeys over CDP (§8)', () => {
     }
   });
 
+  it('holds the cap against parallel requests', async () => {
+    const b = await mockBrowser();
+    const mgr = new PasskeyManager(180_000, { perOwner: 1, total: 64 });
+    const url = `http://127.0.0.1:${b.port}`;
+    const slow = async (domains: string[]) => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return (await import('../src/autonomy/cdp.js')).openPage(url, { expectDomains: domains });
+    };
+    try {
+      const results = await Promise.allSettled([1, 2, 3].map(() => mgr.begin(slow, { expectDomains: ['github.com'], mode: 'enroll', owner: 'task:a' })));
+      expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+      for (const result of results) if (result.status === 'fulfilled') await mgr.release(result.value.authenticatorId, 'task:a');
+    } finally {
+      await b.close();
+    }
+  });
+
   it('refuses enrollment when the page origin does not match the target domain', async () => {
     const b = await mockBrowser('https://evil.com');
     const mgr = new PasskeyManager();

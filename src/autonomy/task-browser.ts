@@ -26,11 +26,13 @@ const NO_BROWSER = 'this task has no browser of its own open. Open a page with t
 
 const debuggingPort = (commandLine: string) => Number(/(?:^|\s)--remote-debugging-port=(\d{1,5})(?:\s|$)/.exec(commandLine)?.[1] ?? 0);
 
-/** Loopback-reachable listening sockets on `port` (the kernel's socket inodes):
- * IPv4 on 127.0.0.1 or any address, IPv6 on any address or mapped 127.0.0.1. */
+/** The listening sockets (kernel inodes) that a connection to 127.0.0.1:`port`
+ * can reach: IPv4 on 127.0.0.1 or any address, and IPv6 mapped 127.0.0.1.
+ * IPv6 `::` rows are not counted: the launcher binds 127.0.0.1, and a
+ * process holding only `[::]:port` does not own what a fill connects to. */
 function listeningInodes(port: number): Set<string> {
   const inodes = new Set<string>();
-  const reachable = new Set(['0100007F', '00000000', '00000000000000000000000000000000', '0000000000000000FFFF00000100007F']);
+  const reachable = new Set(['0100007F', '00000000', '0000000000000000FFFF00000100007F']);
   for (const table of ['/proc/net/tcp', '/proc/net/tcp6']) {
     let text = '';
     try { text = fs.readFileSync(table, 'utf8'); } catch { continue; }
@@ -43,21 +45,23 @@ function listeningInodes(port: number): Set<string> {
   return inodes;
 }
 
-/** Does `pid` itself hold the socket listening on `port`? A process that only
- * names a port on its command line could point fills at another browser. */
+/** Does `pid` itself hold every socket 127.0.0.1:`port` reaches? A process
+ * that only names a port on its command line could point fills at another
+ * browser. */
 function ownsPort(pid: number, port: number): boolean {
   if (process.platform === 'linux') {
     const inodes = listeningInodes(port);
     if (!inodes.size) return false;
     let fds: string[] = [];
     try { fds = fs.readdirSync(`/proc/${pid}/fd`); } catch { return false; }
-    return fds.some((fd) => {
-      try { return inodes.has(/^socket:\[(\d+)\]$/.exec(fs.readlinkSync(`/proc/${pid}/fd/${fd}`))?.[1] ?? ''); }
-      catch { return false; }
-    });
+    const owned = new Set(fds.flatMap((fd) => {
+      try { return [/^socket:\[(\d+)\]$/.exec(fs.readlinkSync(`/proc/${pid}/fd/${fd}`))?.[1] ?? '']; }
+      catch { return []; }
+    }));
+    return [...inodes].every((inode) => owned.has(inode));
   }
   try {
-    return execFileSync('lsof', ['-nP', '-a', '-p', String(pid), `-iTCP:${port}`, '-sTCP:LISTEN', '-t'],
+    return execFileSync('lsof', ['-nP', '-a', '-p', String(pid), `-iTCP@127.0.0.1:${port}`, '-sTCP:LISTEN', '-t'],
       { encoding: 'utf8', timeout: 5000 }).split('\n').includes(String(pid));
   } catch { return false; } // no lsof, or no such socket: unproven
 }
