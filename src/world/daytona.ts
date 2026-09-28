@@ -84,6 +84,7 @@ export class DaytonaWorldProvider implements WorldProvider {
     private desktopSnapshot = process.env.KARMAX_DAYTONA_DESKTOP_SNAPSHOT,
     private desktopImage = process.env.KARMAX_DAYTONA_DESKTOP_IMAGE,
     private referenceKeys?: WorldReferenceKeys) {
+    // Legacy KWR1 key; new references use WorldReferenceKeys (see E2BWorldProvider).
     this.refKey = crypto.createHash('sha256').update(
       process.env.KARMAX_WORLD_REF_KEY ?? process.env.DAYTONA_API_KEY ?? 'karmax-development-world-ref',
     ).digest();
