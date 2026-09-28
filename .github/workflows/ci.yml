@@ -69,6 +69,8 @@ jobs:
       - run: npm rebuild @swc/core esbuild node-pty protobufjs
       - run: npm audit --audit-level=high
       - run: npm run typecheck
+      # No lint errors; warning and `as any` budgets only shrink (scripts/lint.ts).
+      - run: npm run lint
 
   test:
     # Each shard runs its share of the files exactly as `npm test` does

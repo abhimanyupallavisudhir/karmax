@@ -11,7 +11,7 @@ issue tracker.
 1. Write a test that fails for the bug or the missing behaviour, then make it
    pass. Integration tests use real Temporal and real git with the mock agent;
    paid live suites run only with `KARMAX_RUN_LIVE=1`.
-2. Run `npm run typecheck` and the test files you touched
+2. Run `npm run typecheck`, `npm run lint`, and the test files you touched
    (`npx vitest run tests/<file>.test.ts`). Run files that boot Temporal one at a
    time; `npm test` runs the whole suite sequentially by design.
 3. Keep workflow and coordinator changes replay-compatible (`patched()`, version
