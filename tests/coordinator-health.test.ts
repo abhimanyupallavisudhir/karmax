@@ -162,21 +162,6 @@ describe('healCoordinators', () => {
     expect((await healCoordinators(f.client, 'karmax')).wedged).toEqual([]);
   });
 
-  it('reports a wedged budget coordinator instead of resetting its spend counters', async () => {
-    const f = fakeClient({
-      running: { budgetCoordinator: [{ workflowId: 'budget-coordinator' }] },
-      query: { 'budget-coordinator': 'fail' },
-      history: { 'budget-coordinator': 'failed-nondet' },
-    });
-
-    const health = await healCoordinators(f.client, 'karmax');
-
-    expect(health.wedged).toEqual(['budget-coordinator']);
-    expect(health.rebuilt).toEqual([]);
-    expect(f.terminated).toEqual([]);
-    expect(health.reported[0]?.reason).toMatch(/already spent/i);
-  });
-
   it('reports a wedged agent queue rather than orphaning parked turns', async () => {
     // A granted agent slot is a one-shot signal, not a poll: a fresh empty queue
     // would never re-grant a turn that is already parked waiting for one.
@@ -330,4 +315,26 @@ it('probes independent coordinators with bounded concurrency (PS-6)', async () =
   expect((await healCoordinators(client as any, 'test')).checked).toBe(12);
   expect(peak).toBeGreaterThan(1);
   expect(peak).toBeLessThanOrEqual(4);
+});
+
+// WF-25 (2026-09-26 review): a coordinator nothing starts is not harmless. The
+// worker still registers it, the boot probe still queries it, and it reads as
+// an active source of authority (the budget coordinator looked like the spend
+// cap long after payments moved to database reservations).
+it('registers only coordinators that the platform actually starts', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const src = path.resolve(__dirname, '../src');
+  const names = fs.readFileSync(path.join(src, 'coordinators/names.ts'), 'utf8');
+  const constants = [...names.matchAll(/export const (\w+_WORKFLOW) = '(\w+)'/g)].map(([, constant, type]) => ({ constant, type }));
+  const bundle = fs.readFileSync(path.join(src, 'workflows/index.ts'), 'utf8');
+  const registered = [...bundle.matchAll(/export \{ (\w+) \} from '\.\.\/coordinators\//g)].map(([, type]) => type);
+  const files = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory() ? files(path.join(dir, entry.name)) : entry.name.endsWith('.ts') ? [path.join(dir, entry.name)] : []);
+  // The coordinators themselves, their names and the health probe do not start anything.
+  const callers = files(src).filter((file) => !file.includes(`${path.sep}coordinators${path.sep}`)
+    && !file.endsWith(path.join('platform', 'coordinator-health.ts')) && !file.endsWith(path.join('workflows', 'index.ts')))
+    .map((file) => fs.readFileSync(file, 'utf8')).join('\n');
+  expect(registered.sort()).toEqual(constants.map(({ type }) => type).sort());
+  expect(constants.filter(({ constant }) => !new RegExp(`\\b${constant}\\b`).test(callers)).map(({ type }) => type)).toEqual([]);
 });
