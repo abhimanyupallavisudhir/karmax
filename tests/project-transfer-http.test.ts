@@ -18,6 +18,9 @@ import * as environmentRecords from '../src/store/project-environment.js';
 import { selectProjectEnvironment } from '../src/world/project-runtime.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 
+// Bodies passed to page.evaluate run in the page; this file has no DOM lib.
+declare const document: any, window: any;
+
 let nextPort = 49500;
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const fn of cleanups.splice(0).reverse()) await fn(); });
@@ -173,7 +176,7 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
     await page.locator('.settings-nav a[href="#project-advanced"]').click();
     await page.locator('#move-project').click();
     await page.selectOption('[data-destination]', f.destination.id);
-    await page.waitForFunction("!document.querySelector('[role=dialog] [type=submit]')?.disabled");
+    await page.waitForFunction(() => !document.querySelector('[role=dialog] [type=submit]')?.disabled);
     await page.locator('[role="dialog"] [type="submit"]').click();
     await page.waitForURL('**/destination/project/settings');
     await page.locator('.settings-nav a[href="#project-advanced"]').click();
@@ -226,16 +229,16 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
       document.querySelector('#move')!.addEventListener('click', () => w.moveProject(project));
     }, { project: f.project, organization: f.destination, move });
     await page.click('#move');
-    await page.waitForFunction("!document.querySelector('[data-destination]')?.disabled");
+    await page.waitForFunction(() => !document.querySelector('[data-destination]')?.disabled);
     await page.keyboard.press('Escape');
     expect(await page.locator('[role="dialog"]').count()).toBe(0);
     expect(await page.locator('#move').evaluate(el => el === (globalThis as any).document.activeElement)).toBe(true);
     await page.click('#move');
     await page.selectOption('[data-destination]', f.destination.id);
-    await page.waitForFunction("!document.querySelector('[type=submit]')?.disabled");
+    await page.waitForFunction(() => !document.querySelector('[type=submit]')?.disabled);
     expect(await page.locator('[data-preview]').textContent()).toContain('History preserved');
     await page.setViewportSize({ width: 390, height: 844 });
-    expect(await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     if (process.env.KARMAX_TRANSFER_SCREENSHOT) await page.screenshot({ path: process.env.KARMAX_TRANSFER_SCREENSHOT });
     // A second administrator changes destination policy while the dialog is open.
     (await f.store.setSettings(`organization:${f.destination.id}`, '__common__', { prompt: 'new defaults' }));
@@ -243,11 +246,11 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
     await page.waitForSelector('[data-error] button');
     expect((await f.store.getProject(f.project.id))?.organizationId).toBe(f.source.id);
     await page.click('[data-error] button');
-    await page.waitForFunction("!document.querySelector('[type=submit]')?.disabled");
+    await page.waitForFunction(() => !document.querySelector('[type=submit]')?.disabled);
     await page.click('[type="submit"]');
-    await page.waitForFunction("Boolean(window.visited)");
+    await page.waitForFunction(() => Boolean(window.visited));
     expect((await f.store.getProject(f.project.id))?.organizationId).toBe(f.destination.id);
-    expect(await page.evaluate("window.visited")).toBe(`/moved/${f.project.id}/settings`);
+    expect(await page.evaluate(() => window.visited)).toBe(`/moved/${f.project.id}/settings`);
     expect(errors).toEqual([]);
   });
 });
