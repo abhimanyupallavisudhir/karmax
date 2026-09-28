@@ -5096,7 +5096,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
       // WF-27: an attempt that timed out still completes, and a stopped run's
       // last publication can land after its successor's. Drop what the task has
-      // already moved past, before it can rewrite a snapshot or the view.
+      // already moved past, before it can rewrite the view. A full publication
+      // still records its snapshot first: the run's next frames may refer to it.
       let order: ViewPublicationOrder | undefined;
       try {
         const runId = activityContext.current().info.workflowExecution?.runId;
@@ -5105,7 +5106,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (runId && typeof publication.updatedAt === 'number')
           order = { runId, seq: publication.updatedAt, ...(Number.isSafeInteger(revision) ? { revision } : {}) };
       } catch { /* direct invocation has no run to order by */ }
-      if (order && (await store.viewPublicationStale(taskId, order))) return;
+      const stale = order !== undefined && (await store.viewPublicationStale(taskId, order));
+      if (stale && !(conversationReference && publication.messages !== undefined)) return;
       let view: TaskView;
       if (conversationReference) {
         // Immutable, task-scoped snapshots survive worker restarts and activity
@@ -5117,9 +5119,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (existing !== undefined && existing !== json)
             throw ApplicationFailure.nonRetryable('Conversation publication reference was reused', 'view-publication');
           (await store.kvSet(key, json));
+          if (stale) return;
         }
-        if (!(await store.kvHas(key)))
+        if (!(await store.kvHas(key))) {
+          // A concurrent, newer publication of this run may have replaced and
+          // dropped the snapshot since the order check above (DB-2).
+          if (order && (await store.viewPublicationStale(taskId, order))) return;
           throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+        }
         // The store can reuse the immutable conversation directly in SQL. A
         // status publication must never parse/rewrite the historical transcript.
         view = { ...publication, messages: publication.messages ?? [] };
