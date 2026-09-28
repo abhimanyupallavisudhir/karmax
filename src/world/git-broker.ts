@@ -24,7 +24,12 @@ import { mirroredClone, type MirroredClone } from './git-mirror.js';
  * command in it inherits them. */
 const THROWAWAY_CLONE = ['-c', 'maintenance.auto=false', '-c', 'gc.auto=0'];
 
-export interface GitBrokerCredential extends GitCredential {}
+export interface GitBrokerCredential extends GitCredential {
+  /** Which tenant the credential acts for, such as an organization's
+   * enrollment of the repository. Only operations with the same scope share a
+   * host mirror of the repository (see git-mirror.ts). */
+  mirrorScope?: string;
+}
 export type GitBrokerAuth = Record<string, string> | ((repo: WorldRepo) => Promise<GitBrokerCredential>);
 /** Called with the immutable tip actually transported, never a later world HEAD. */
 export type OriginPublicationRecorder = (repo: WorldRepo, headSha: string) => void | Promise<void>;
@@ -596,7 +601,7 @@ async function authorityBundle(temp: string, repo: WorldRepo, branch: string, au
   const credential = await resolveCredential(auth, repo);
   const { env } = materializeGitCredential(temp, credential);
   let scratch;
-  try { scratch = await mirroredClone(source, path.join(temp, 'repo'), env, { branch, scratch: temp }); }
+  try { scratch = await mirroredClone(source, path.join(temp, 'repo'), env, { branch, scratch: temp, scope: mirrorScope(credential) }); }
   catch (error) { throw new Error(`could not fetch branch "${branch}": ${error instanceof Error ? error.message : String(error)}`); }
   try {
     return await createGitBundle(args => git(scratch.clone, args, { timeoutMs: 10 * 60_000 }), `refs/heads/${branch}`, bundlePath, known);
@@ -796,7 +801,7 @@ async function withTransferredRepo<T>(
     // and the objects the mirror lacks (WD-17, LT-10). The task branch stays a
     // negotiation base, so an already-published checkpoint is not sent again.
     scratch = await timed('git-broker.clone', () => mirroredClone(source, path.join(temp, 'repo'), env,
-      { branch, also: [repo.branch], scratch: temp }))
+      { branch, also: [repo.branch], scratch: temp, scope: mirrorScope(credential) }))
       .catch((error) => { throw new Error(`authenticated clone failed: ${error instanceof Error ? error.message : String(error)}`); });
     const clone = scratch.clone;
     await timed('git-broker.import-world', () => importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp));
@@ -821,6 +826,15 @@ async function withTransferredRepo<T>(
 
 async function resolveCredential(auth: GitBrokerAuth, repo: WorldRepo): Promise<GitBrokerCredential> {
   return typeof auth === 'function' ? auth(repo) : { env: auth };
+}
+
+/** A credential without an explicit scope is partitioned by the SSH identity
+ * it authenticates as (a Git profile's key file names its organization), and
+ * only credentials with neither share the unscoped mirror. */
+function mirrorScope(credential: GitBrokerCredential): string | undefined {
+  if (credential.mirrorScope) return credential.mirrorScope;
+  const identity = credential.sshKey ?? credential.env?.GIT_SSH_COMMAND;
+  return identity ? `ssh:${crypto.createHash('sha256').update(identity).digest('hex')}` : undefined;
 }
 
 function identityArgs(identity?: WorldGitIdentity): string[] {

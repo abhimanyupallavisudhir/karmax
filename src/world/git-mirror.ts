@@ -30,6 +30,12 @@ import { canonicalRepositoryIdentity } from './repository-identity.js';
  * (default 2 GiB) or 32 repositories. `0` keeps no cache: each operation's
  * mirror then lives only in its own temporary directory, as it always does off
  * Linux, where those locks are unavailable.
+ *
+ * A scratch clone can read by SHA every object its mirror holds, including
+ * those of branches origin has since deleted, so a mirror is shared only by
+ * operations with the same `scope` (the tenant's enrollment of the repository,
+ * or the SSH identity it authenticates as) and the same SSH user: `~/repo`
+ * names a different repository for each user of one host.
  */
 
 const MAX_MIRRORS = 32;
@@ -53,7 +59,7 @@ export interface MirroredClone {
  * omitted) with `refs/remotes/origin/<b>` for every other branch in `also`
  * that origin has. `branch` must exist on origin, as with `git clone --branch`. */
 export async function mirroredClone(source: string, clone: string, env: Record<string, string>,
-  options: { branch?: string; also?: string[]; scratch: string }): Promise<MirroredClone> {
+  options: { branch?: string; also?: string[]; scratch: string; scope?: string }): Promise<MirroredClone> {
   const named = [options.branch, ...(options.also ?? [])].filter((name): name is string => name !== undefined);
   for (const name of named) if (!validGitBranch(name)) throw new Error(`Git broker rejected invalid branch "${name}"`);
   const listed = await git(path.dirname(clone), ['ls-remote', '--symref', source, 'HEAD', ...named.map((name) => `refs/heads/${name}`)],
@@ -68,7 +74,8 @@ export async function mirroredClone(source: string, clone: string, env: Record<s
 
   const persistent = maxBytes() > 0 && process.platform === 'linux';
   const mirror = persistent
-    ? path.join(mirrorRoot(), `${crypto.createHash('sha256').update(canonicalRepositoryIdentity(source)).digest('hex').slice(0, 32)}.git`)
+    ? path.join(mirrorRoot(), `${crypto.createHash('sha256').update(JSON.stringify([options.scope ?? null, sshUser(source),
+      canonicalRepositoryIdentity(source)])).digest('hex').slice(0, 32)}.git`)
     : path.join(options.scratch, 'mirror.git');
   if (persistent) fs.mkdirSync(mirrorRoot(), { recursive: true });
   const releaseUpdate = persistent ? await acquireFileLock(lockFile(mirror, 'lock'), { waitMs: LOCK_WAIT_MS }) : undefined;
@@ -154,6 +161,15 @@ async function dropConflictingRefs(mirror: string, wanted: string[]): Promise<vo
     const deleted = await git(mirror, ['update-ref', '-d', ref]);
     if (deleted.code !== 0) throw new Error(deleted.stderr || deleted.stdout);
   }
+}
+
+/** The login a network remote names. Hosts resolve relative paths against
+ * that user's home, so it is part of which repository is meant. */
+function sshUser(source: string): string {
+  if (source.includes('://')) {
+    try { return decodeURIComponent(new URL(source).username); } catch { return ''; }
+  }
+  return source.match(/^([^@/:]+)@[^/:]+:/)?.[1] ?? '';
 }
 
 async function ensureMirror(mirror: string): Promise<void> {
