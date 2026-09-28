@@ -1,6 +1,7 @@
-# Workflows and deployment code run with production's secrets, so a code owner
-# reviews every change to them (enforced when branch protection requires code
-# owner review). This file is listed too, so the rule cannot be edited away.
+# Workflows, the actions they use and deployment code run with production's
+# and the live suites' secrets, so a code owner reviews every change to them
+# (enforced when branch protection requires code owner review). This file is listed too, so the rule cannot be edited away.
 /.github/workflows/ @abhimanyupallavisudhir
+/.github/actions/ @abhimanyupallavisudhir
 /deploy/ @abhimanyupallavisudhir
 /.github/CODEOWNERS @abhimanyupallavisudhir

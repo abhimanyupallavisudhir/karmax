@@ -21,7 +21,7 @@ describe('repository guidance', () => {
     // Deployment code runs on production with its secrets: an owner reviews it.
     const owners = read('.github/CODEOWNERS').split('\n').filter(line => line.trim() && !line.startsWith('#'))
       .map(line => line.trim().split(/\s+/));
-    for (const pattern of ['/.github/workflows/', '/deploy/', '/.github/CODEOWNERS'])
+    for (const pattern of ['/.github/workflows/', '/.github/actions/', '/deploy/', '/.github/CODEOWNERS'])
       expect(owners.find(([path]) => path === pattern)?.slice(1), pattern).toContain('@abhimanyupallavisudhir');
   });
 
