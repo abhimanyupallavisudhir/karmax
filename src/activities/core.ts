@@ -5138,7 +5138,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return conversationPage((await conversationSnapshot(taskId, reference)), offset, CONVERSATION_PAGE_BYTES);
     },
 
-    async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
+    async publishView(taskId: string, { conversationRetain: retain, ...publication }: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
       // WF-27: an attempt that timed out still completes, and a stopped run's
       // last publication can land after its successor's. Drop what the task has
       // already moved past, before it can rewrite the view. A full publication
@@ -5152,16 +5152,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           order = { runId, seq: publication.updatedAt, ...(Number.isSafeInteger(revision) ? { revision } : {}) };
       } catch { /* direct invocation has no run to order by */ }
       const stale = order !== undefined && (await store.viewPublicationStale(taskId, order));
-      if (stale && !(conversationReference && publication.messages !== undefined)) return;
+      if (stale && !(conversationReference && (publication.messages !== undefined || publication.conversationPatch))) return;
       let view: TaskView;
+      // Immutable, task-scoped snapshots survive worker restarts and activity
+      // retries, including retries after another publication has completed.
+      const key = `view-conversation:${taskId}:${conversationReference}`;
       if (publication.conversationPatch) {
         const { conversationPatch: patch, ...rest } = publication;
-        publication = { ...rest, ...applyConversationPatch((await conversationSnapshot(taskId, patch.base)), patch) };
+        // A retry whose snapshot is already saved needs no base: the save
+        // may have superseded it since. A stale delta still records its
+        // snapshot, which the run's next frames may refer to.
+        if (conversationReference && (await store.kvHas(key))) publication = rest;
+        else {
+          const base = (await store.kvGet(`view-conversation:${taskId}:${patch.base}`));
+          if (base === undefined && stale) return;
+          if (base === undefined) throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+          publication = { ...rest, ...applyConversationPatch(JSON.parse(base), patch) };
+        }
       }
       if (conversationReference) {
-        // Immutable, task-scoped snapshots survive worker restarts and activity
-        // retries, including retries after another publication has completed.
-        const key = `view-conversation:${taskId}:${conversationReference}`;
         if (publication.messages !== undefined) {
           const json = JSON.stringify({ messages: publication.messages, transcripts: publication.transcripts });
           const existing = (await store.kvGet(key));
@@ -5229,7 +5238,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await trace.mark(`queue.observed.${after?.state ?? 'released'}`));
         }
       }
-      if (!(await store.saveView(taskId, view, conversationReference, order))) return;
+      if (!(await store.saveView(taskId, view, conversationReference, order, retain))) return;
       await notifyChildSettlement(store, deps.client, view);
       if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
         let runId: string | undefined;

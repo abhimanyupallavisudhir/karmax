@@ -2,7 +2,10 @@ import type { Message, TaskView } from './types.js';
 
 export type ViewConversation = Pick<TaskView, 'messages' | 'transcripts'>;
 export type PublishedView = Omit<TaskView, 'messages' | 'transcripts'> & Partial<ViewConversation>
-  & { conversationPatch?: ConversationPatch };
+  & { conversationPatch?: ConversationPatch;
+    /** Earlier snapshots of the run that a delta or a turn may still read;
+     * the store keeps them when this publication supersedes them. */
+    conversationRetain?: string[] };
 
 /** A transcript as the first `keep` messages of the base snapshot's transcript
  * plus `append`. Conversations mostly grow at the end, so this is the delta. */
@@ -104,21 +107,38 @@ export function conversationPublisher(
 ): ConversationPublisher {
   let previous: { json: string; reference: string; conversation: ViewConversation } | undefined;
   let revision = 0;
+  // What the run may still read, so the store never drops it: each write in
+  // flight and its delta base, each role's current turn base, and, once deltas
+  // are written, the acknowledged snapshot the next delta will be based on.
+  let deltas = false;
+  const inFlight = new Map<number, string[]>();
+  const turnBases = new Map<string, string>();
+  let writes = 0;
   const publish = async (view: TaskView) => {
     const { messages, transcripts, ...status } = view;
     const json = JSON.stringify({ messages, transcripts });
     const cached = previous?.json === json ? previous : undefined;
     const reference = cached?.reference ?? `${runId}:${revision++}`;
     const conversation: ViewConversation = JSON.parse(json);
-    await write(cached ? status
-      : previous && options.patches?.()
-        ? { ...status, conversationPatch: diffConversation(previous.conversation, { messages, transcripts }, previous.reference) }
-        : { ...status, ...conversation }, reference);
+    const delta = !cached && previous && options.patches?.();
+    if (delta) deltas = true;
+    const id = writes++;
+    inFlight.set(id, delta ? [reference, previous!.reference] : [reference]);
+    const conversationRetain = [...new Set([...(deltas && previous ? [previous.reference] : []),
+      ...[...inFlight.values()].flat(), ...turnBases.values()])].filter((held) => held !== reference);
+    try {
+      await write({ ...(cached ? status
+        : delta ? { ...status, conversationPatch: diffConversation(previous!.conversation, { messages, transcripts }, previous!.reference) }
+          : { ...status, ...conversation }), conversationRetain }, reference);
+    } finally { inFlight.delete(id); }
     previous = { json, reference, conversation };
   };
   return Object.assign(publish, {
     turnBase(messages: Message[], role: string) {
       const count = previous ? sharedPrefix(transcriptOf(previous.conversation, role), messages) : 0;
+      // A role runs one turn at a time: its next turn releases this base.
+      if (count && previous) turnBases.set(role, previous.reference);
+      else turnBases.delete(role);
       return count && previous
         ? { base: { reference: previous.reference, role, count }, messages: messages.slice(count) }
         : { messages };
@@ -129,6 +149,7 @@ export function conversationPublisher(
     seed(reference: string, { messages, transcripts }: ViewConversation) {
       const json = JSON.stringify({ messages, transcripts });
       previous = { json, reference, conversation: JSON.parse(json) };
+      deltas = true;
     },
   });
 }

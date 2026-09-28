@@ -37,7 +37,8 @@ describe('durable conversation publication', () => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Retention');
     const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
-    const old = `view-conversation:${task.id}:run:0`;
+    // A replaced run's snapshot; the run's own older ones go when superseded.
+    const old = `view-conversation:${task.id}:earlier:0`;
     const current = `view-conversation:${task.id}:run:1`;
     await store.kvSet(old, JSON.stringify({ messages: [{ id: 'old', role: 'agent', text: 'old', ts: 1 }] }));
     await store.kvSet(current, JSON.stringify({ messages: [{ id: 'new', role: 'agent', text: 'new', ts: 2 }] }));
@@ -63,7 +64,7 @@ describe('durable conversation publication', () => {
     const project = await store.createProject('Retention');
     const task = await store.createTask({ projectId: project.id, title: 'Settled', workflow: 'software-dev',
       workflowVersion: '1.26.0', params: { prompt: 'fixture' } });
-    const old = `view-conversation:${task.id}:run:0`;
+    const old = `view-conversation:${task.id}:earlier:0`;
     const fence = `view-publication-fence:${task.id}:run:activity`;
     const day = 24 * 60 * 60 * 1000;
     try {
@@ -421,6 +422,85 @@ describe('durable conversation publication', () => {
         expect(await f.stored()).toMatchObject({ messages: [{ text: 'third' }] });
         expect((await f.store.kvEntries(`view-conversation:${f.task.id}:`)).map(({ key }) => key))
           .toEqual([`view-conversation:${f.task.id}:run-one:1`, `view-conversation:${f.task.id}:run-one:2`]);
+      } finally { await f.close(); }
+    });
+
+    // A delta names its base snapshot and a turn names the snapshot its
+    // transcript starts from; each is read again on a retry. The store may drop
+    // a superseded snapshot only once nothing the run holds can read it.
+    const snapshots = async (f: Awaited<ReturnType<typeof publisher>>) =>
+      (await f.store.kvEntries(`view-conversation:${f.task.id}:`)).map(({ key }) => key.split(':').slice(2).join(':'));
+    // `after` holds a reference's write until another has landed.
+    const deltas = (f: Awaited<ReturnType<typeof publisher>>, after: Record<string, string> = {}) => {
+      const landed = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+      const landing = (reference: string) => {
+        if (!landed.has(reference)) {
+          let resolve!: () => void;
+          landed.set(reference, { promise: new Promise<void>((done) => { resolve = done; }), resolve });
+        }
+        return landed.get(reference)!;
+      };
+      const writes: { view: PublishedView; reference: string }[] = [];
+      const publish = conversationPublisher('run-one', async (view, reference) => {
+        writes.push({ view, reference });
+        if (after[reference]) await landing(after[reference]).promise;
+        try { await f.core.publishView(f.task.id, view, reference); } finally { landing(reference).resolve(); }
+      }, { patches: () => true });
+      return { publish, writes };
+    };
+
+    it('keeps the snapshot a running turn started from until its role starts another turn', async () => {
+      const f = await publisher();
+      const { publish } = deltas(f);
+      try {
+        await publish(f.view('do', 1, 'first'));
+        expect(publish.turnBase(f.view('do', 1, 'first').messages, 'do').base?.reference).toBe('run-one:0');
+        // A follow-up republishes twice while the turn runs; its retry re-reads run-one:0.
+        await publish(f.view('do', 2, 'second'));
+        await publish(f.view('do', 3, 'third'));
+        expect((await f.core.readConversationPage(f.task.id, 'run-one:0', 0)).roles[0]!.messages[0]!.text).toBe('first');
+        publish.turnBase(f.view('do', 3, 'third').messages, 'do');
+        await publish(f.view('do', 4, 'fourth'));
+        expect(await snapshots(f)).toEqual(['run-one:2', 'run-one:3']);
+      } finally { await f.close(); }
+    });
+
+    it('keeps the base of overlapping deltas until both have landed', async () => {
+      const f = await publisher();
+      // The main loop's delta waits until an update handler's has saved.
+      const { publish } = deltas(f, { 'run-one:2': 'run-one:1' });
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await Promise.all([publish(f.view('do', 2, 'second')), publish(f.view('do', 2, 'third'))]);
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'third' }] });
+        await publish(f.view('do', 3, 'fourth'));
+        expect(await snapshots(f)).toEqual(['run-one:2', 'run-one:3']);
+      } finally { await f.close(); }
+    });
+
+    it('retries a delta whose save committed after its base was dropped', async () => {
+      const f = await publisher();
+      const { publish, writes } = deltas(f);
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await publish(f.view('do', 2, 'second'));
+        await f.store.kvDelete(`view-conversation:${f.task.id}:run-one:0`);
+        // An attempt of run-one:1 that timed out after its save committed.
+        await f.core.publishView(f.task.id, writes[1]!.view, writes[1]!.reference);
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'second' }] });
+      } finally { await f.close(); }
+    });
+
+    it('records the snapshot of a delta it drops as stale', async () => {
+      const f = await publisher();
+      // The newer delta lands first; the publisher then acknowledges the older one last.
+      const { publish } = deltas(f, { 'run-one:1': 'run-one:2' });
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await Promise.all([publish(f.view('do', 2, 'second')), publish(f.view('do', 3, 'third'))]);
+        // Later frames refer to run-one:1, the last write acknowledged.
+        await publish({ ...f.view('do', 4, 'second'), status: 'waiting' });
+        expect(await f.stored()).toMatchObject({ status: 'waiting', messages: [{ text: 'second' }] });
       } finally { await f.close(); }
     });
   });

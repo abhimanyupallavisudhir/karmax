@@ -3822,6 +3822,36 @@ export class Store {
     return true;
   }
 
+  /**
+   * DB-2: keeping each superseded full copy of a conversation until the task
+   * settled grew kv with the square of a long conversation's length. Once the
+   * task row holds `reference`, drop the snapshots nothing can read again:
+   * older ones of its run and those of runs a newer run has replaced, except
+   * what the run `retain`s (delta bases, turn transcripts and publications in
+   * flight, each read again on a retry). A newer snapshot of the run may be a
+   * concurrent publication's and is left alone.
+   */
+  private async dropSupersededSnapshots(taskId: string, reference: string, retain: string[]): Promise<void> {
+    const position = (candidate: string) => {
+      const split = candidate.lastIndexOf(':');
+      const revision = Number(candidate.slice(split + 1));
+      return split > 0 && Number.isSafeInteger(revision) ? { runId: candidate.slice(0, split), revision } : undefined;
+    };
+    const own = position(reference);
+    const raw = (await this.kvGet(`view-order:${taskId}`));
+    const retired = new Set(raw ? (JSON.parse(raw) as ViewOrderState).retired : []);
+    const prefix = `view-conversation:${taskId}:`;
+    const keys = (await this.db.prepare(`SELECT k FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
+      .all(prefix, `view-conversation:${taskId};`)) as Array<{ k: string }>;
+    for (const { k } of keys) {
+      const candidate = k.slice(prefix.length);
+      const held = position(candidate);
+      if (candidate === reference || retain.includes(candidate) || !held) continue;
+      if ((held.runId === own?.runId && held.revision < own.revision) || retired.has(held.runId))
+        (await this.db.prepare('DELETE FROM kv WHERE k=?').run(k));
+    }
+  }
+
   /** PL-10: a finished task's pending permission requests are withdrawn, and
    * their withdrawal discharges the recipients' inbox like a decision would. */
   private async withdrawPermissionRequests(projectId: string, taskId: string, status: string): Promise<void> {
@@ -3833,7 +3863,8 @@ export class Store {
   }
 
   /** Returns false, and changes nothing, for a publication `order` shows is stale. */
-  async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder): Promise<boolean> {
+  async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder,
+    retain: string[] = []): Promise<boolean> {
     return this.db.transaction(async () => {
     if (order && !(await this.admitViewPublication(taskId, order))) return false;
 
@@ -3865,12 +3896,7 @@ export class Store {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
           .run(JSON.stringify(status), key, conversationReference, taskId));
         (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
-        // DB-2: the task row now holds this conversation, and a publication that
-        // still refers to the one it replaces is stale (`viewPublicationStale`).
-        // Keeping each superseded full copy until the task settled grew kv with
-        // the square of a long conversation's length.
-        if (current?.conversationRef)
-          (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`view-conversation:${taskId}:${current.conversationRef}`));
+        (await this.dropSupersededSnapshots(taskId, conversationReference, retain));
       }
     } else if (messages === undefined && transcripts === undefined) {
       // A status-only view (reconcile and lifecycle repairs read `lastView`
