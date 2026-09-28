@@ -905,8 +905,12 @@ it('replays task histories recorded before the September workflow review fixes',
   // The child-settlement pair was recorded from 253e5cc2, before WF-31: a parent
   // whose child was held for human input and then cancelled, and the child's
   // replaced run.
+  // The sub-task-params pair was recorded from 2e2a006a, before PL-11 let
+  // create_sub_task carry params: a parent spawning a child whose Do turn ran
+  // and raised to it, then cancelled.
   for (const name of ['review-legacy-justDo', 'review-legacy-mergeOnly', 'review-legacy-softwareDev',
-    'child-settlement-prechange-parent-history', 'child-settlement-prechange-child-history']) {
+    'child-settlement-prechange-parent-history', 'child-settlement-prechange-child-history',
+    'subtask-params-prechange-parent-history', 'subtask-params-prechange-child-history']) {
     const history = temporal.api.history.v1.History.fromObject(JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8')));
     await Worker.runReplayHistory({ workflowBundle }, history);
   }
