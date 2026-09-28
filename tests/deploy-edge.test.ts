@@ -195,7 +195,7 @@ it('forwards optional Stripe Issuing settings in both deployment profiles', () =
 describe('compose provisions the PostgreSQL application database', () => {
   it('turnkey creates and connects the separate karmax database', () => {
     expect(read('temporal/setup-postgres.sh')).toContain('--db karmax create');
-    expect(read('compose.turnkey.yml')).toMatch(/KARMAX_DATABASE_URL:\s+postgres:\/\/[^\n]+\/karmax/);
+    expect(read('compose.turnkey.yml')).toContain('KARMAX_DATABASE_URL_FILE: /run/karmax-database/database_url');
   });
 
   it('managed hosting mounts the database URL as a secret', () => {

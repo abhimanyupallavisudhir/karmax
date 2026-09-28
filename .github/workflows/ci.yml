@@ -59,16 +59,11 @@ jobs:
           fi
           grep -F 'unexpected key "queue"' "$RUNNER_TEMP/actionlint-negative.log"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '22'
-          cache: npm
-
-      - run: npm ci --ignore-scripts
-      # Only these known packages need install-time work (native bindings/codegen).
-      - run: npm rebuild @swc/core esbuild node-pty protobufjs
+      - uses: ./.github/actions/install
       - run: npm audit --audit-level=high
       - run: npm run typecheck
+      # No lint errors, and no more warnings or `as any` casts than scripts/lint-budget.json allows.
+      - run: npm run lint
 
   test:
     # Each shard runs its share of the files exactly as `npm test` does
@@ -104,24 +99,28 @@ jobs:
       # Paid live suites remain opt-in. These shards run the Docker suites too.
       KARMAX_TEST_PASS_INTEROP: '1'
       KARMAX_TEST_PASS_BROWSER: '1'
-      TEMPORAL_CLI_VERSION: '1.7.2'
-      TEMPORAL_CLI_LINUX_AMD64_SHA256: 'e2f548af84e820b7d71f25fc6461a4e6a1ab7cdb6a80fde3c375641b0772375b'
       KARMAX_TEST_POSTGRES_URL: postgres://karmax_test:karmax_test@127.0.0.1:5432/karmax_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: ./.github/actions/install
+
+      - id: playwright
+        run: echo "version=$(node -p "require('playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
+      - id: browsers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          node-version: '22'
-          cache: npm
-
-      - run: npm ci --ignore-scripts
-      - run: npm rebuild @swc/core esbuild node-pty protobufjs
-
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright.outputs.version }}
       - name: Install Chromium for browser regressions
+        if: steps.browsers.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
+      # The cached browser still needs the system libraries it links against.
+      - name: Install Chromium's system libraries
+        if: steps.browsers.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
 
       - name: Install password-store interoperability tools
         run: |
@@ -133,16 +132,7 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" gopass
           sudo install "$RUNNER_TEMP/gopass" /usr/local/bin/gopass
 
-      # Integration tests boot a real Temporal dev server. src/temporal/dev-server.ts
-      # looks here by default; pinned so a CLI release cannot break the build.
-      - name: Install Temporal CLI
-        run: |
-          mkdir -p ~/.temporalio/bin
-          archive="$RUNNER_TEMP/temporal-cli.tar.gz"
-          curl -fsSL "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/temporal_cli_${TEMPORAL_CLI_VERSION}_linux_amd64.tar.gz" -o "$archive"
-          echo "${TEMPORAL_CLI_LINUX_AMD64_SHA256}  $archive" | sha256sum -c -
-          tar -xzf "$archive" -C ~/.temporalio/bin temporal
-          ~/.temporalio/bin/temporal --version
+      - uses: ./.github/actions/temporal-cli
 
       # The suite covers the current gopass release; the older one needs a
       # single extra run of the interop file, not one per shard.
@@ -182,37 +172,128 @@ jobs:
   deploy-artifacts:
     name: deploy artifacts
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # A pull request's merge commit and its base, for the scope below.
+          fetch-depth: 2
 
-      - name: Build the control-plane image
-        run: docker build -f deploy/Dockerfile -t karmax:ci .
+      # A pull request that changes only paths no image, compose file or
+      # Caddyfile reads (tests, docs, other workflows) skips the builds. Any
+      # other path builds, and so does every push, merge group and dispatch.
+      - name: Decide whether the change can affect the deployment artifacts
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          affects() {
+            while IFS= read -r file; do
+              case "$file" in
+                '') ;;
+                tests/*|docs/*|design/*|benchmarks/*|scripts/*|web/*.test.cjs) ;;
+                .github/workflows/ci.yml) return 0 ;;
+                .github/*) ;;
+                */*) return 0 ;;
+                *.md) ;;
+                *) return 0 ;;
+              esac
+            done
+            return 1
+          }
+          artifacts=true
+          if [ "$EVENT" = pull_request ]; then
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            printf '%s\n' "$changed" | affects || artifacts=false
+          fi
+          echo "artifacts=$artifacts" >> "$GITHUB_OUTPUT"
+          echo "deployment artifacts affected: $artifacts"
 
-      - name: Start the control-plane image and load native runtime modules
-        run: docker run --rm karmax:ci node -e "require('node:sqlite'); require('node-pty')"
+      # Exactly what an operator runs: Compose builds the app and edge images
+      # in parallel, then starts PostgreSQL, Temporal, the app's database role
+      # job, the hosted app and Caddy, and waits for readiness. Caddy signs
+      # *.localhost names with its own CA, so no public ACME CA is asked.
+      - name: Install the turnkey stack and boot the hosted control plane
+        if: steps.scope.outputs.artifacts == 'true'
+        run: ./deploy/karmax up karmax.localhost preview.karmax.localhost
+
+      # The Caddyfile's on-demand policy covers every name, so Caddy issues a
+      # certificate only at a real handshake, from a public CA, which a
+      # *.localhost name cannot get. Check what it can: the edge serves the
+      # configured site (redirecting to HTTPS), and reaches its upstream.
+      - name: Route the edge to the control plane
+        if: steps.scope.outputs.artifacts == 'true'
+        env:
+          COMPOSE_FILE: deploy/compose.turnkey.yml
+          COMPOSE_ENV_FILES: deploy/.turnkey.env
+        run: |
+          redirect=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' \
+            --resolve karmax.localhost:80:127.0.0.1 http://karmax.localhost/api/health/ready)
+          echo "edge: $redirect"
+          [ "$redirect" = '308 https://karmax.localhost/api/health/ready' ]
+          docker compose exec -T caddy wget -qO- http://app:4505/api/health/ready
+
+      - name: Keep the app off the PostgreSQL superuser
+        if: steps.scope.outputs.artifacts == 'true'
+        env:
+          COMPOSE_FILE: deploy/compose.turnkey.yml
+          COMPOSE_ENV_FILES: deploy/.turnkey.env
+        run: |
+          query() { docker compose exec -T postgresql psql -U temporal -d "$1" -Atc "$2"; }
+          sessions=$(query postgres "SELECT DISTINCT a.usename || ' superuser=' || r.rolsuper FROM pg_stat_activity a
+            JOIN pg_roles r ON r.rolname = a.usename WHERE a.datname = 'karmax'")
+          echo "karmax database sessions: $sessions"
+          [ "$sessions" = 'karmax superuser=false' ]
+          # The operator's own check reports the same.
+          ./deploy/karmax doctor | tee "$RUNNER_TEMP/doctor.log"
+          grep -F 'The app connects to PostgreSQL as karmax, not a superuser.' "$RUNNER_TEMP/doctor.log"
+          [ "$(query karmax "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner <> 'karmax'")" = 0 ]
+          url=$(docker compose exec -T app cat /run/karmax-database/database_url)
+          docker compose exec -T postgresql psql "${url%@*}@127.0.0.1:5432/karmax" -Atc 'SELECT 1'
+          if docker compose exec -T postgresql psql "${url%@*}@127.0.0.1:5432/temporal" -Atc 'SELECT 1' 2>/dev/null; then
+            echo "the app's role can connect to Temporal's database" >&2
+            exit 1
+          fi
+          password=$(sed -n 's/^POSTGRES_PASSWORD=//p' deploy/.turnkey.env)
+          [ -n "$password" ]
+          if docker compose exec -T app sh -c 'env; cat /run/secrets/* /run/karmax-database/*' | grep -qF "$password"; then
+            echo 'the PostgreSQL superuser password reached the app container' >&2
+            exit 1
+          fi
+
+      - name: Load native runtime modules in the image
+        if: steps.scope.outputs.artifacts == 'true'
+        run: docker run --rm karmax-app node -e "require('node:sqlite'); require('node-pty')"
+
+      - name: Keep the console test suites out of the image
+        if: steps.scope.outputs.artifacts == 'true'
+        run: docker run --rm karmax-app sh -c 'test -z "$(find /app/web -name "*.test.cjs")"'
 
       # rate_limit is a third-party module; Caddy refuses to start on a directive
       # it does not recognise, so building the edge is what makes the Caddyfile
       # below valid at all.
-      - name: Build the edge image
-        run: docker build -f deploy/Caddy.Dockerfile -t karmax-caddy:ci deploy
-
       - name: Validate the Caddyfile against the edge image
+        if: steps.scope.outputs.artifacts == 'true'
         run: |
           docker run --rm \
             -e KARMAX_DOMAIN=karmax.example.com \
             -e KARMAX_PREVIEW_DOMAIN=preview.karmax.example.com \
             -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
-            karmax-caddy:ci caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+            karmax-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
       - name: Validate both compose profiles
+        if: steps.scope.outputs.artifacts == 'true'
         run: |
           docker compose --env-file deploy/.env.example -f deploy/compose.hosted.yml config -q
           printf 'KARMAX_DOMAIN=karmax.example.com\nKARMAX_PREVIEW_DOMAIN=preview.karmax.example.com\nPOSTGRES_PASSWORD=ci\n' > "$RUNNER_TEMP/ci.env"
           docker compose --project-directory deploy --env-file "$RUNNER_TEMP/ci.env" -f deploy/compose.turnkey.yml config -q
 
-      - name: Check the operator script parses
-        run: sh -n deploy/karmax
+      - name: Show the turnkey stack after a failure
+        if: failure() && steps.scope.outputs.artifacts == 'true'
+        env:
+          COMPOSE_FILE: deploy/compose.turnkey.yml
+          COMPOSE_ENV_FILES: deploy/.turnkey.env
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail=150

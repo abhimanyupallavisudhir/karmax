@@ -1,4 +1,11 @@
 .git
+# The image copies only src, web and vendor; the rest is build-context weight.
+tests
+benchmarks
+design
+docs
+# Standalone console tests run in CI, never in production.
+web/**/*.test.cjs
 .karmax
 node_modules
 coverage
