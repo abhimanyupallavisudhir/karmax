@@ -630,6 +630,19 @@ describe('task stage transitions', () => {
       args: [{ childTaskId: child.id, stage: 'done' }] }));
   });
 
+  // WF-3/WF-4: a parent that continued as new has no handle on its child's
+  // execution; a platform-side settlement must reach it like a published one.
+  it('tells the parent when a person cancels its failed sub-task', async () => {
+    const f = (await fixture());
+    const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
+      workflowVersion: f.task.workflowVersion, params: { prompt: 'part' }, parentTaskId: f.task.id }));
+    (await f.store.saveView(child.id, { ...f.view, taskId: child.id, title: 'Child', stage: 'failed', status: 'failed' }));
+    await f.api.signalTask(f.token, child.id, 'cancel');
+    expect((await f.store.getTask(child.id))?.lastView?.status).toBe('cancelled');
+    expect(f.signalled).toContainEqual(expect.objectContaining({ id: f.task.id, signal: 'childSettled',
+      args: [{ childTaskId: child.id, stage: 'cancelled' }] }));
+  });
+
   // Task #367: the parent's Sub-tasks panel showed every finished child as
   // "In progress · setup", because finished children are archived out of the
   // live list the console resolved them from.

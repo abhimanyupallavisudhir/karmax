@@ -379,6 +379,14 @@ export class KarmaxApi {
       typeof runId === 'string' && runId ? runId : undefined);
   }
 
+  /** Settle a task the workflow can no longer settle. A parent that continued
+   * as new learns of it only from this signal, not from its child's handle. */
+  private async saveSettledView(taskId: string, view: TaskView): Promise<void> {
+    (await this.deps.store.saveView(taskId, view));
+    await notifyChildSettlement(this.deps.store, this.deps.client, view)
+      .catch((error) => console.warn(`[karmax] could not tell the parent that ${taskId} settled:`, error));
+  }
+
   private armer?: TriggerArmer;
   private collaborationNotificationRetries = new Map<string, number>();
   constructor(private deps: KarmaxApiDeps) {
@@ -4506,7 +4514,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       (await this.releaseTaskRunnerLeases(taskId));
       const latest = (await this.deps.store.getTask(taskId))?.lastView ?? heldView;
       if (!['done', 'cancelled', 'failed'].includes(latest.status)) {
-        (await this.deps.store.saveView(taskId, {
+        (await this.saveSettledView(taskId, {
           ...latest,
           stage: 'cancelled',
           status: 'cancelled',
@@ -4536,7 +4544,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         return msg;
       }
       if (signal === SIG.cancel) {
-        (await this.deps.store.saveView(taskId, {
+        (await this.saveSettledView(taskId, {
           ...terminal,
           stage: 'cancelled',
           status: 'cancelled',
@@ -4728,7 +4736,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         if (!task) throw e;
         const view = task.lastView;
         if (view && !['done', 'cancelled', 'failed'].includes(view.status)) {
-          (await this.deps.store.saveView(taskId, {
+          (await this.saveSettledView(taskId, {
             ...view,
             stage: 'cancelled',
             status: 'cancelled',
