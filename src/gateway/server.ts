@@ -73,7 +73,7 @@ import type { RemoteAccessController } from '../remote/access.js';
 import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent,
   type GithubVaultPushEvent } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
-import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
+import { credentialResource, resourceDriverCatalog, resourceSecretHandle, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
@@ -3727,11 +3727,15 @@ export class Gateway {
               const existing = resources.find((resource) =>
                 resource.name === entry.name || (resource.target.kind === 'environment' && resource.target.name === entry.name));
               if (existing) {
-                const handle = existing.credentialHandles[0] ?? `resource:${existing.id}:credential`;
+                // A new value becomes the resource's own secret; a stored
+                // handle may name someone else's (AU-40).
+                const handle = entry.value ? resourceSecretHandle(existing.id)
+                  : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
                 if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value));
                 saved.push((await store.updateResourceAttachment(existing.id, {
                   target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
                   credentialHandles: [handle], enabled: true,
+                  ...(entry.value ? { source: withoutVaultProjection(existing.source) } : {}),
                 })));
               } else {
                 if (!entry.value) continue;
@@ -3901,7 +3905,7 @@ export class Gateway {
           if (credentialResource(driver)) {
             if (!secret) return this.json(res, 400, { error: 'secret value is required for this resource driver' });
             if (!this.deps.broker) return this.json(res, 503, { error: 'credential broker is unavailable' });
-            const handle = `resource:${id}:credential`;
+            const handle = resourceSecretHandle(id);
             (await this.deps.broker.registerHandle(handle, secret));
             credentialHandles.push(handle);
           }
@@ -3998,12 +4002,20 @@ export class Gateway {
           revisions: (await store.listResourceRevisions(resource.id)).map(redactResourceRevision) });
         if (method === 'PATCH') {
           const b = await this.body(req);
+          // The server alone decides which vault handles a resource uses, since
+          // the resource grants itself their use (AU-40).
+          if (b.credentialHandles !== undefined)
+            return this.json(res, 400, { error: 'a resource\'s credential is set by sending its secret, not a vault handle' });
           try {
             let secretUpdate: { handle: string; value: string } | undefined;
+            let source = b.source && typeof b.source === 'object' ? withReservedSource(b.source, resource.source) : undefined;
             if (typeof b.secret === 'string') {
               if (!this.deps.broker) throw new Error('credential broker is unavailable');
-              const handle = resource.credentialHandles[0] ?? `resource:${resource.id}:credential`;
+              // A new value becomes the resource's own secret, never the handle
+              // it names: that may be a vault item's or someone else's.
+              const handle = resourceSecretHandle(resource.id);
               b.credentialHandles = [handle];
+              source = withoutVaultProjection(source ?? resource.source);
               secretUpdate = { handle, value: b.secret };
             }
             const next = (await store.updateResourceAttachment(resource.id, {
@@ -4011,7 +4023,7 @@ export class Gateway {
               ...(b.target !== undefined ? { target: normalizeResourceTarget(b.target, resource.driver, resource.name) } : {}),
               ...(b.access !== undefined ? { access: b.access } : {}), ...(b.isolation !== undefined ? { isolation: b.isolation } : {}),
               ...(b.publish !== undefined ? { publish: b.publish } : {}), ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
-              ...(b.source && typeof b.source === 'object' ? { source: b.source } : {}),
+              ...(source ? { source } : {}),
               ...(b.storageLocationId !== undefined && isSnapshotResourceDriver(resource.driver)
                 ? { storageLocationId: (await this.deps.resources?.storageLocationFor(resource.organizationId, String(b.storageLocationId))) }
                 : {}),
@@ -4024,7 +4036,8 @@ export class Gateway {
         if (method === 'DELETE') {
           await this.deps.resources?.deleteAttachment(resource.id);
           if (!this.deps.resources) {
-            for (const handle of resource.credentialHandles) (await this.deps.broker?.deleteHandle(handle));
+            if (resource.credentialHandles.includes(resourceSecretHandle(resource.id)))
+              (await this.deps.broker?.deleteHandle(resourceSecretHandle(resource.id)));
             (await store.deleteResourceAttachment(resource.id));
           }
           return this.json(res, 200, { deleted: true, resourceId: resource.id });
@@ -8915,6 +8928,23 @@ function parseEnvironmentValues(text: string): Array<{ name: string; value: stri
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
   const { credentialHandles, ...safe } = resource;
   return { ...safe, credentialConfigured: credentialHandles.length > 0 };
+}
+
+/** Source keys that carry a resource's provenance and authority: which vault
+ * item it projects, and whether it is a task's staged candidate. Only the
+ * server sets them; a request keeps whatever is stored. */
+const RESERVED_SOURCE_KEYS = ['vaultItemId', 'vaultField', 'vaultItemLabel', 'vaultItemType', 'candidate', 'createdByTaskId'];
+
+function withReservedSource(requested: Record<string, unknown>, stored: Record<string, unknown>): Record<string, unknown> {
+  const source = Object.fromEntries(Object.entries(requested).filter(([key]) => !RESERVED_SOURCE_KEYS.includes(key)));
+  for (const key of RESERVED_SOURCE_KEYS) if (key in stored) source[key] = stored[key];
+  return source;
+}
+
+/** A resource that now holds its own secret no longer projects a vault item. */
+function withoutVaultProjection(source: Record<string, unknown>): Record<string, unknown> {
+  const { vaultItemId: _item, vaultField: _field, vaultItemLabel: _label, vaultItemType: _type, ...rest } = source;
+  return rest;
 }
 
 function stagedResourceCandidate(resource: ResourceAttachment): boolean {

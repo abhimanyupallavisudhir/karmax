@@ -27,3 +27,6 @@ export function snapshotResource(value: ResourceAttachment | string): boolean {
 export function credentialResource(value: ResourceAttachment | string): boolean {
   return resourceDriver(typeof value === 'string' ? value : value.driver)?.dataPlane === 'credential';
 }
+
+/** The vault handle holding a project resource's own secret. */
+export function resourceSecretHandle(attachmentId: string): string { return `resource:${attachmentId}:credential`; }
