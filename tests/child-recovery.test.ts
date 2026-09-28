@@ -34,3 +34,13 @@ it('retries a child settlement when the parent signal transport is unavailable',
   await expect(notifyChildSettlement(store as any, client as any,
     { taskId: 'child', stage: 'done', status: 'done' } as any)).rejects.toBe(error);
 });
+
+it('reports the children whose durable view settled, excluding lifecycle replacement', async () => {
+  const store = { childTasks: vi.fn(async () => [
+    { id: 'live', lastView: { status: 'waiting', stage: 'review' } },
+    { id: 'replaced', lastView: { status: 'cancelled', stage: 'cancelled', state: { lifecycleReplacement: true } } },
+    ...['done', 'cancelled', 'failed'].map(status => ({ id: status, lastView: { status, stage: status } })),
+  ]) };
+  expect(await makeChildActivities(store as any).settledChildTasks('parent')).toEqual(
+    ['done', 'cancelled', 'failed'].map(status => ({ taskId: status, stage: status })));
+});

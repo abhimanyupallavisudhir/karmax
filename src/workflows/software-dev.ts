@@ -260,6 +260,7 @@ const CONTINUE_AFTER_EVENTS = 4_000;
 const CONTINUE_AFTER_BYTES = 8 * 1024 * 1024;
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
 const MAX_CONTINUATION_BYTES = 1024 * 1024;
+const CONTINUE_RETRY_EVENTS = 500;
 
 /**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
@@ -632,7 +633,12 @@ async function softwareDevImpl(
   const continuesAsNew = minor >= 22;
   const taskId = input.taskId;
   const recovery = input.recovery;
+  // A continued run starts from what its predecessor carried: signals and
+  // updates buffered for it run at `setHandler`, before the run can restore
+  // anything, and must act on that state, not overwrite it.
   const continued = recovery?.continued;
+  const carried = continued?.flags;
+  const carriedCount = continued?.counters;
   let recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
   let stage: Stage = recoveryStage;
   let status: TaskView['status'] = 'active';
@@ -644,25 +650,25 @@ async function softwareDevImpl(
   let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   let base = input.base ?? input.project.defaultBase ?? 'main';
   let goalMode = !!input.goalMode;
-  let confirmed = false;
-  let manualPrConfirmer: string | undefined;
-  let escalationAction: 'openPr' | 'confirm' | undefined;
-  let manualEscalationRequested = false;
-  let prRequested = recoveryStage === 'pr';
+  let confirmed = carried?.confirmed ?? false;
+  let manualPrConfirmer: string | undefined = continued?.manualPrConfirmer;
+  let escalationAction: 'openPr' | 'confirm' | undefined = continued?.escalationAction;
+  let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
+  let prRequested = carried?.prRequested ?? recoveryStage === 'pr';
   // checkout name -> head sha it was approved at (multi-PR Review).
   let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
-  let checkoutHeads: Record<string, string> = {};
+  let checkoutHeads: Record<string, string> = { ...continued?.checkoutHeads };
   let cancelled = false;
   let lifecycleReplacement = false;
-  let retryRequested = false;
+  let retryRequested = carried?.retryRequested ?? false;
   let resourceResolutionEpoch = 0;
   let providerChangeEpoch = 0;
   let landingWatcher: ChildWorkflowHandle<typeof githubLandingWatch> | undefined;
-  let landingWatchSequence = 0;
+  let landingWatchSequence = carriedCount?.landingWatchSequence ?? 0;
   let awaitingResourceDecision = false;
-  let resourceReviewSequence = 0;
+  let resourceReviewSequence = carriedCount?.resourceReviewSequence ?? 0;
   let applyingResources = false;
-  let resourcesApplied = false;
+  let resourcesApplied = carried?.resourcesApplied ?? false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
@@ -676,7 +682,7 @@ async function softwareDevImpl(
   let agentTurn: TaskView['agentTurn'];
   let agentTurnResumeStatus: TaskView['status'] = 'active';
   let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
-  let error: string | undefined;
+  let error: string | undefined = continued?.error;
   let terminalOrigin: Stage | undefined;
   let prs: TaskPullRequest[] = recovery?.prs?.map((candidate) => ({ ...candidate })) ?? [];
   let pr: TaskPullRequest | undefined = prs[0];
@@ -701,8 +707,8 @@ async function softwareDevImpl(
           : {}) }
     : { authorization: 'none', validation: 'none', provider: 'none' };
   let repairValidationPending = intentAuthorizedLanding && !!recovery?.repairValidationPending;
-  let forceHumanRepairReview = false;
-  let providerQueueAccepted = !frontHeldLanding && intentAuthorizedLanding
+  let forceHumanRepairReview = carried?.forceHumanRepairReview ?? false;
+  let providerQueueAccepted = carried ? carried.providerQueueAccepted : !frontHeldLanding && intentAuthorizedLanding
     && recoveryStage === 'merge'
     && (landing.provider === 'queued' || landing.provider === 'validating')
     && (!fairLanding || landing.authority === 'provider' || landing.authority === 'external');
@@ -714,14 +720,14 @@ async function softwareDevImpl(
   // storage only across one live fallback update/check/merge attempt; every Do
   // or human transition releases it before leaving Landing.
   let retainedMergeDomains: string[] = [];
-  let branchPreparedForPr = explicitPrCycle && (recoveryStage === 'review' || recoveryStage === 'merge');
+  let branchPreparedForPr = carried ? carried.branchPreparedForPr : explicitPrCycle && (recoveryStage === 'review' || recoveryStage === 'merge');
   let mergeQueuePos: { position: number; total: number } | undefined;
   // How many times we've re-prompted the agent to wait for its own in-harness
   // sub-agents this Do phase (bounded by MAX_SUBAGENT_NUDGES).
-  let subagentNudges = 0;
+  let subagentNudges = carriedCount?.subagentNudges ?? 0;
   // Same, for backgrounded shells the agent left running (bounded by MAX_SHELL_NUDGES).
-  let shellNudges = 0;
-  const subTaskIds: string[] = [];
+  let shellNudges = carriedCount?.shellNudges ?? 0;
+  const subTaskIds: string[] = [...continued?.subTasks.ids ?? []];
   // Sub-task hierarchy (SPEC §5.3). Children are managed, not blindly awaited: their
   // handles let us await completion, raised requests queue in `raises`, settlements in
   // `settled`, `outstanding` is the not-yet-finished set, and `awaitingResponse` is the
@@ -730,21 +736,22 @@ async function softwareDevImpl(
   // Children started before detached sub-tasks close with this run, so they
   // rule out continuing as new while outstanding.
   const attachedChildren = new Set<string>();
-  const raises: ChildRaise[] = [];
-  const settled: { childTaskId: string; stage: string; detail?: string }[] = [];
-  const outstanding = new Set<string>();
-  const awaitingResponse = new Set<string>();
+  const raises: ChildRaise[] = [...continued?.subTasks.raises ?? []];
+  const settled: { childTaskId: string; stage: string; detail?: string }[] = [...continued?.subTasks.settled ?? []];
+  const outstanding = new Set<string>(continued?.subTasks.outstanding);
+  const awaitingResponse = new Set<string>(continued?.subTasks.awaitingResponse);
   // Cross-task collaboration is a durable, event-driven join. The requesting
   // agent keeps working for the rest of its current turn; if it finishes before
   // the target publishes, the workflow parks here and wakes on settlement.
-  const pendingCollaborations = new Set<string>();
   /** Requests already settled — guards against a settle that beats its request. */
-  const settledCollaborations = new Set<string>();
-  let pointOfNoReturnPassed = false;
+  const settledCollaborations = new Set<string>(continued?.collaborations.settled);
+  const pendingCollaborations = new Set<string>(continued?.collaborations.pending
+    .filter((id) => !settledCollaborations.has(id)));
+  let pointOfNoReturnPassed = carried?.pointOfNoReturnPassed ?? false;
   let lifecycleTransitionBlocked = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
-  let targetLocked = restoresStagePrerequisites && !!recovery
+  let targetLocked = carried ? carried.targetLocked : restoresStagePrerequisites && !!recovery
     && (['pr', 'review', 'merge'].includes(recoveryStage) || !!recovery.prs?.length);
   let mergeGranted = false;
   let seen = recovery?.seen ?? 0; // messages the Do agent has already processed
@@ -754,7 +761,7 @@ async function softwareDevImpl(
   // process-wide Resolve-agent flag was disabled.
   const recoveredTranscript = (role: string): Message[] =>
     recovery?.transcripts?.find((t) => t.role === role)?.messages.map((m) => ({ ...m })) ?? [];
-  const mergeMsgs: Message[] = recoveredTranscript('merge');
+  const mergeMsgs: Message[] = continued?.mergeMessages?.map((m) => ({ ...m })) ?? recoveredTranscript('merge');
   const resolveMsgs: Message[] = recoveredTranscript('resolve');
   const confirmMsgs: Message[] = recoveredTranscript('confirm');
   const responderMsgs: Message[] = recoveredTranscript('responder');
@@ -768,7 +775,8 @@ async function softwareDevImpl(
   // layers separately means switching back restores the task's original gate.
   // Mutable: the Review route is `untilUsed`, so an in-flight edit replaces these
   // layers and the gate below re-reads them on every iteration (SPEC §4.5/§5.5).
-  let softwareDevConfirmLayers = confirmLayersOf(input.confirm, modeSwitching ? false : !!input.autoConfirm);
+  let softwareDevConfirmLayers = continued?.confirmLayers
+    ?? confirmLayersOf(input.confirm, modeSwitching ? false : !!input.autoConfirm);
   // Bumped by every accepted `confirm` edit. The Review gate captures it before it
   // parks; a change while parked means the route it was playing is stale, so the
   // gate replays from its first layer rather than crediting layers approved under
@@ -779,8 +787,8 @@ async function softwareDevImpl(
   // The epoch wakes a human pause so an accepted edit reroutes that same question.
   let liveResponder = input.responder;
   let responderEpoch = 0;
-  let responderRounds = 0;
-  let subtaskNags = 0;
+  let responderRounds = carriedCount?.responderRounds ?? 0;
+  let subtaskNags = carriedCount?.subtaskNags ?? 0;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, {
     accountId: string;
@@ -791,7 +799,7 @@ async function softwareDevImpl(
   }>();
   const agentSlotGrants = new Set<string>();
   let turnSeq = 0;
-  let accountPool = 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
+  let accountPool = continued?.accountPool ?? 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
   // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
   // signal aborts the in-flight agent turn instead of waiting for it to finish.
   let activeTurn: CancellationScope | undefined;
@@ -812,7 +820,7 @@ async function softwareDevImpl(
   // (provider/session) once its turn runs — its model/effort stay retunable after;
   // `confirm` once the Review gate it drives has fully passed (a gate that sends the
   // task back to Do will play again, so the route is not consumed yet).
-  const consumed = new Set<string>();
+  const consumed = new Set<string>(continued?.consumed);
   if (restoresStagePrerequisites && recoveryStage === 'merge') consumed.add('confirm');
   const isConsumed = (name: string): boolean => (name === 'target' ? targetLocked : consumed.has(name));
   const paramEditable = (name: string): boolean =>
@@ -1102,7 +1110,14 @@ async function softwareDevImpl(
     const { base, messages: rest } = publishConversation.turnBase(messages, role);
     return base ? { messages: rest, messagesBase: base } : { messages };
   };
+  // Until a continued run has loaded its conversation, the view would show an
+  // empty one: the view query refuses, publications wait, and messages that
+  // arrive meanwhile are appended after the loaded conversation.
+  let loadingConversation = !!continued;
+  const afterLoad: (() => void)[] = [];
+  const whenLoaded = (append: () => void) => { if (loadingConversation) afterLoad.push(append); else append(); };
   async function publish() {
+    if (loadingConversation) await condition(() => !loadingConversation);
     // Apply at the live edge of existing executions as well as new task pins.
     if (patched('software-dev-conversation-publication-v1')) {
       await publishConversation(buildView());
@@ -1282,7 +1297,10 @@ async function softwareDevImpl(
   const conversationFor = (role?: string): Message[] =>
     role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : role === 'confirm' ? confirmMsgs
       : role === 'responder' ? responderMsgs : msgs;
-  setHandler(viewQuery, buildView);
+  setHandler(viewQuery, () => {
+    if (loadingConversation) throw new Error('The task is loading its conversation after continuing as new; try again.');
+    return buildView();
+  });
   setHandler(agentTurnStateSignal, async (next) => {
     // Ignore a late state signal from an activity that was cancelled/retried after
     // a newer turn took ownership of the view.
@@ -1317,9 +1335,11 @@ async function softwareDevImpl(
     // Do is the default; merge/resolve queue it so it reaches that agent on its
     // next turn (each turn is fed its own accumulated transcript). A turn currently
     // running polls `pendingMessagesQuery` and injects it live (in-flight).
-    const target = conversationFor(role);
-    if (!target.some((candidate) => candidate.id === m.id))
-      target.push({ ...m, ts: m.ts || target.length });
+    whenLoaded(() => {
+      const target = conversationFor(role);
+      if (!target.some((candidate) => candidate.id === m.id))
+        target.push({ ...m, ts: m.ts || target.length });
+    });
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'followUp', role };
   });
@@ -1336,8 +1356,10 @@ async function softwareDevImpl(
   setHandler(collaborationSettledSignal, (requestId, message) => {
     settledCollaborations.add(requestId);
     pendingCollaborations.delete(requestId);
-    if (!msgs.some((candidate) => candidate.id === message.id))
-      msgs.push({ ...message, ts: message.ts || msgs.length });
+    whenLoaded(() => {
+      if (!msgs.some((candidate) => candidate.id === message.id))
+        msgs.push({ ...message, ts: message.ts || msgs.length });
+    });
   });
   setHandler(resourceResolvedSignal, () => {
     resourceResolutionEpoch++;
@@ -1443,7 +1465,7 @@ async function softwareDevImpl(
         activeTurn?.cancel();
       }
     } else if (resp.action === 'comment') {
-      if (resp.text) msgs.push({ id: `p-${msgs.length}`, role: 'user', text: resp.text, ts: msgs.length });
+      if (resp.text) whenLoaded(() => msgs.push({ id: `p-${msgs.length}`, role: 'user', text: resp.text!, ts: msgs.length }));
       retryRequested = true; // unblocks an escalated child; at Review the new msg drives it
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'followUp', role: 'do' };
@@ -1506,12 +1528,12 @@ async function softwareDevImpl(
         // and wakes a Software Dev task already waiting at Review. In the latter
         // case the workflow returns to Do instead of auto-approving potentially
         // partial work that pre-dated the mode switch.
-        msgs.push({
+        whenLoaded(() => msgs.push({
           id: `mode-${msgs.length}`,
           role: 'user',
           text: 'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.',
           ts: msgs.length,
-        });
+        }));
         if (responsiveHumanHold && humanPauseActive)
           humanPauseWake = { kind: 'workflowChange', role: 'do' };
       }
@@ -2576,10 +2598,15 @@ Inspect the complete current diff and specifically compare its delta from the re
   // checkpoint with `continued` carrying the rest of the in-flight state; the
   // transcripts travel by reference to the acknowledged view publication.
   let runStart = { events: 0, bytes: 0 };
-  let continuationRefused = false;
-  const historyGrown = () =>
-    workflowInfo().historyLength - runStart.events >= (input.continueAfterEvents ?? CONTINUE_AFTER_EVENTS)
-    || workflowInfo().historySize - runStart.bytes >= CONTINUE_AFTER_BYTES;
+  // A continuation refused for a passing reason (the pin briefly foreign, a
+  // republish racing new messages) is retried after this many more events.
+  let continueRetryAt = 0;
+  const historyGrown = () => workflowInfo().historyLength >= continueRetryAt
+    && (workflowInfo().historyLength - runStart.events >= (input.continueAfterEvents ?? CONTINUE_AFTER_EVENTS)
+      || workflowInfo().historySize - runStart.bytes >= CONTINUE_AFTER_BYTES);
+  const retryContinuationLater = () => {
+    continueRetryAt = workflowInfo().historyLength + CONTINUE_RETRY_EVENTS;
+  };
 
   function continuationInput(conversation: string, runPinned: boolean): SoftwareDevInput {
     const { recovery: _previous, ...next } = liveInput;
@@ -2610,16 +2637,12 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   /** Continue as new if nothing in flight would be lost; otherwise keep going. */
   async function continueRun(): Promise<void> {
+    // Checked again at every Do turn: children and landing slots finish, and
+    // the carried input is measured in encoded bytes, as Temporal limits it.
     if (retainedMergeDomains.length || [...outstanding].some((id) => attachedChildren.has(id))
-      || JSON.stringify(continuationInput('', false)).length > MAX_CONTINUATION_BYTES) {
-      continuationRefused = true;
-      return;
-    }
+      || new TextEncoder().encode(JSON.stringify(continuationInput('', false))).length > MAX_CONTINUATION_BYTES) return;
     const pin = await core.releaseTaskRun(taskId);
-    if (pin === 'foreign') {
-      continuationRefused = true;
-      return;
-    }
+    if (pin === 'foreign') return retryContinuationLater();
     // The next run reads the conversation from the last acknowledged
     // publication, so republish until nothing changed while one was in flight.
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -2630,31 +2653,13 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (conversation) return continueAsNew<typeof softwareDev>(continuationInput(conversation, pin === 'released'));
       await publish();
     }
-    continuationRefused = !cancelled;
+    if (!cancelled) retryContinuationLater();
     if (pin === 'released') await core.adoptTaskRun(taskId);
   }
 
-  /** The first step of a continued run: restore what `continueRun` carried. */
+  /** The first step of a continued run: load what `continueRun` carried by
+   * reference. Everything carried by value is restored where it is declared. */
   async function resumeContinuedRun(c: TaskContinuation): Promise<void> {
-    goalMode = c.goalMode;
-    liveInput.goalMode = goalMode;
-    softwareDevConfirmLayers = c.confirmLayers;
-    subTaskIds.push(...c.subTasks.ids);
-    for (const id of c.subTasks.outstanding) outstanding.add(id);
-    for (const id of c.subTasks.awaitingResponse) awaitingResponse.add(id);
-    raises.push(...c.subTasks.raises);
-    settled.push(...c.subTasks.settled);
-    for (const id of c.collaborations.pending) pendingCollaborations.add(id);
-    for (const id of c.collaborations.settled) settledCollaborations.add(id);
-    for (const name of c.consumed) consumed.add(name);
-    checkoutHeads = { ...c.checkoutHeads };
-    accountPool = c.accountPool;
-    ({ targetLocked, pointOfNoReturnPassed, branchPreparedForPr, forceHumanRepairReview, providerQueueAccepted,
-      prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied } = c.flags);
-    manualPrConfirmer = c.manualPrConfirmer;
-    escalationAction = c.escalationAction;
-    error = c.error;
-    ({ responderRounds, subtaskNags, subagentNudges, shellNudges, landingWatchSequence, resourceReviewSequence } = c.counters);
     if (c.runPinned) await core.adoptTaskRun(taskId);
     const loaded = new Map<string, Message[]>();
     let offset: number | undefined = 0;
@@ -2664,17 +2669,16 @@ Inspect the complete current diff and specifically compare its delta from the re
       for (const { role, messages } of page.roles) loaded.set(role, [...(loaded.get(role) ?? []), ...messages]);
       offset = page.next;
     }
-    // Follow-ups delivered while loading come after the loaded transcripts.
+    for (const role of ['do', 'merge', 'resolve', 'confirm', 'responder'])
+      conversationFor(role).push(...(loaded.get(role) ?? []));
     // The publisher adopts exactly the snapshot, so later writes stay deltas.
-    const roles = ['do', 'merge', 'resolve', 'confirm', 'responder'];
-    const late = roles.map((role) => [role, conversationFor(role).splice(0)] as const);
-    for (const role of roles) conversationFor(role).push(...(loaded.get(role) ?? []));
-    if (c.mergeMessages) mergeMsgs.push(...c.mergeMessages);
     publishConversation.seed(c.conversation, { messages: msgs, transcripts: buildTranscripts() });
-    for (const [role, messages] of late) {
-      const target = conversationFor(role);
-      for (const message of messages) if (!target.some((candidate) => candidate.id === message.id)) target.push(message);
-    }
+    loadingConversation = false;
+    for (const append of afterLoad.splice(0)) append();
+    // The predecessor learned of a child that failed or was terminated from
+    // its handle, which this run lacks; the child's durable view still says.
+    if (outstanding.size) for (const child of await coreChild.settledChildTasks(taskId))
+      if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
     runStart = { events: workflowInfo().historyLength, bytes: workflowInfo().historySize };
   }
 
@@ -2904,7 +2908,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     drainChildEvents();
     await publish();
     if (cancelled) return await abort();
-    if (continuesAsNew && !continuationRefused && historyGrown() && patched('software-dev-continue-as-new-v1')) {
+    if (continuesAsNew && historyGrown() && patched('software-dev-continue-as-new-v1')) {
       await continueRun();
       if (cancelled) return await abort();
     }

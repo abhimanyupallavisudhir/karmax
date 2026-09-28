@@ -9,6 +9,9 @@ const wf = vi.hoisted(() => ({
   childSignal: vi.fn(async () => undefined),
   startChild: undefined as undefined | ((...args: any[]) => any),
   info: { runId: 'run', historyLength: 1, historySize: 0 },
+  // Signals and updates that reach a run before it registers their handlers,
+  // dispatched at registration as the SDK does.
+  buffered: [] as [string, unknown[]][],
 }));
 vi.mock('@temporalio/workflow', async (importOriginal) => ({
   ...await importOriginal<typeof import('@temporalio/workflow')>(),
@@ -16,7 +19,14 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
   defineSignal: (name: string) => name,
   defineQuery: (name: string) => name,
   defineUpdate: (name: string) => name,
-  setHandler: (name: string, fn: (...args: any[]) => any) => wf.handlers.set(name, fn),
+  setHandler: (name: string, fn: (...args: any[]) => any, options?: { validator?: (...args: any[]) => void }) => {
+    wf.handlers.set(name, fn);
+    for (const [signal, args] of wf.buffered.filter(([signal]) => signal === name)) {
+      wf.buffered.splice(wf.buffered.findIndex(([candidate]) => candidate === signal), 1);
+      options?.validator?.(...args);
+      void fn(...args);
+    }
+  },
   workflowInfo: () => wf.info,
   allHandlersFinished: () => true,
   continueAsNew: async (next: unknown) => { throw Object.assign(new Error('continued as new'), { next }); },
@@ -27,6 +37,8 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
     wf.timeout = timeout;
     if (!predicate()) wf.wait?.();
     if (!predicate() && timeout !== undefined) return false;
+    // A handler may wait for the main flow (a continued run's conversation load).
+    for (let tick = 0; tick < 20 && !predicate(); tick++) await new Promise((resolve) => setImmediate(resolve));
     if (!predicate()) throw new Error('test: unexpected wait');
     return true;
   },
@@ -44,9 +56,11 @@ const input = { taskId: 'task', projectId: 'project', title: 'T', prompt: 'work'
   project: { repos: [] }, confirm: { layers: [] } } as any;
 beforeEach(() => {
   wf.childSignal.mockClear(); wf.handlers.clear(); wf.wait = undefined; wf.patches = true; wf.startChild = undefined;
+  wf.buffered = [];
   wf.info = { runId: 'run', historyLength: 1, historySize: 0 };
   wf.activities = {
     restoreChildTasks: vi.fn(async () => []),
+    settledChildTasks: vi.fn(async () => []),
     createWorld: vi.fn(async () => ({ id: 'task', kind: 'worktree', root: '/tmp/test', branch: 'b', base: 'main' })),
     publishView: vi.fn(async () => undefined),
     accountPoolSize: vi.fn(async () => 1),
@@ -457,4 +471,129 @@ it('WF-3/WF-4: a long run continues as new with its in-flight state', async () =
   expect(turns[1].map((m: any) => m.id)).toEqual(turns[0].map((m: any) => m.id).concat(
     [expect.any(String), 'mode-2', expect.stringMatching(/^st-/)]));
   expect(turns[1].at(-1).text).toContain('Which API?');
+});
+
+/** Run 1 delegates to a child, which asks a question while a collaboration is
+ * pending, and continues as new: returns the next run's input. */
+async function continuedRun(taskInput = input) {
+  const { applyConversationPatch, conversationPage, transcriptOf } = await import('../src/domain/view-publication.js');
+  const snapshots = new Map<string, any>();
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.publishView.mockImplementation(async (_id: string, view: any, reference: string) => {
+    snapshots.set(reference, view.conversationPatch ? applyConversationPatch(snapshots.get(view.conversationPatch.base), view.conversationPatch)
+      : view.messages ? { messages: view.messages, transcripts: view.transcripts } : snapshots.get(reference));
+  });
+  wf.activities.readConversationPage = vi.fn(async (_id: string, reference: string, offset: number) =>
+    conversationPage(snapshots.get(reference), offset, 200));
+  wf.activities.releaseTaskRun = vi.fn(async () => 'unpinned');
+  wf.activities.adoptTaskRun = vi.fn();
+  wf.activities.prepareChildTask = vi.fn(async () => ({ taskId: 'child-1' }));
+  const turns: any[][] = [];
+  const full = (args: any) => [...(args.messagesBase ? transcriptOf(snapshots.get(args.messagesBase.reference), 'do')
+    .slice(0, args.messagesBase.count) : []), ...args.messages];
+  wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+    turns.push(full(args));
+    return { output: 'Delegating', providerCompleted: true, subTasks: [{ title: 'Child', prompt: 'Part' }] };
+  });
+  wf.wait = () => {
+    wf.handlers.get('collaborationRequested')!('request-1');
+    wf.handlers.get('raiseFromChild')!({ childTaskId: 'child-1', childTitle: 'Child', type: 'needs_info', detail: 'Which API?' });
+    wf.info = { ...wf.info, historyLength: 5_000 };
+  };
+  const first = await softwareDevV1_26({ ...taskInput, project: { repos: ['/tmp/repo'] } }).catch((error) => error);
+  expect(first.next?.recovery?.continued).toBeDefined();
+  wf.handlers.clear();
+  wf.info = { runId: 'run-2', historyLength: 1, historySize: 0 };
+  return { next: first.next, turns, full };
+}
+
+it('WF-3/WF-4: signals that reach a continued run before it loads keep their effect', async () => {
+  const { next, turns, full } = await continuedRun();
+  // The child failed while run 1 continued; the collaboration settles and a
+  // person writes before run 2 has loaded the conversation.
+  wf.activities.restoreChildTasks.mockResolvedValue([]);
+  wf.activities.settledChildTasks = vi.fn(async () => [{ taskId: 'child-1', stage: 'failed' }]);
+  wf.buffered = [['collaborationSettled', ['request-1', { id: 'collab-1', role: 'user', text: 'Collaboration result', ts: 0 }]],
+    ['followUp', [{ id: 'u-late', role: 'user', text: 'Also check the docs', ts: 0 }]]];
+  const loading: unknown[] = [];
+  const pages = wf.activities.readConversationPage.getMockImplementation()!;
+  wf.activities.readConversationPage.mockImplementation(async (...args: any[]) => {
+    loading.push(wf.activities.publishView.mock.calls.length);
+    expect(() => wf.handlers.get('view')!()).toThrow('loading');
+    return pages(...args);
+  });
+  const published = wf.activities.publishView.mock.calls.length;
+  wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+    turns.push(full(args));
+    return { output: 'Done', providerCompleted: true };
+  });
+  let parked: any;
+  wf.wait = () => { parked = wf.handlers.get('view')!(); wf.handlers.get('cancel')!(); };
+  expect(await softwareDevV1_26(next)).toEqual({ stage: 'cancelled' });
+  // Nothing was published before the conversation was loaded.
+  expect(loading.every((count) => count === published)).toBe(true);
+  // Neither the settled collaboration nor the failed child holds the task.
+  expect(parked).toMatchObject({ stage: 'do', waitingFor: { kind: 'human', detail: 'Done' } });
+  const delivered = turns[1]!.map((m: any) => m.text);
+  expect(delivered).toEqual(expect.arrayContaining(['Collaboration result', 'Also check the docs',
+    expect.stringContaining('Sub-task child-1 finished: failed')]));
+});
+
+it('WF-3/WF-4: a mode switch that reaches a continued run first is kept and published once loaded', async () => {
+  const { next, turns, full } = await continuedRun();
+  wf.wait = undefined;
+  wf.buffered = [['changeWorkflow', ['goal']]];
+  wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+    turns.push(full(args));
+    wf.handlers.get('cancel')!();
+    return {};
+  });
+  await softwareDevV1_26(next);
+  expect(wf.handlers.get('view')!()).toMatchObject({ workflow: 'goal' });
+  const run2 = wf.activities.publishView.mock.calls.filter((call: any[]) => call[2]?.startsWith('run-2:'));
+  // Every publication of run 2 carries the whole conversation, never just the mode message.
+  expect(run2.every((call: any[]) => !call[1].messages || call[1].messages.length > 1)).toBe(true);
+  const ids = turns[1]!.map((m: any) => m.id);
+  expect(ids.slice(0, turns[0]!.length + 1)).toEqual([...turns[0]!.map((m: any) => m.id), expect.any(String)]);
+  expect(ids).toContainEqual(expect.stringMatching(/^mode-/));
+  expect(new Set(ids).size).toBe(ids.length);
+});
+
+it('WF-3/WF-4: a refused continuation is retried once the run has grown further', async () => {
+  const { applyConversationPatch } = await import('../src/domain/view-publication.js');
+  const snapshots = new Map<string, any>();
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.publishView.mockImplementation(async (_id: string, view: any, reference: string) => {
+    snapshots.set(reference, view.conversationPatch ? applyConversationPatch(snapshots.get(view.conversationPatch.base), view.conversationPatch)
+      : view.messages ? { messages: view.messages, transcripts: view.transcripts } : snapshots.get(reference));
+  });
+  // A replacement briefly held the pin, then released it.
+  wf.activities.releaseTaskRun = vi.fn().mockResolvedValueOnce('foreign').mockResolvedValue('unpinned');
+  let turns = 0;
+  wf.activities.runAgentTurn.mockImplementation(async () => {
+    if (++turns > 4) throw new Error('the run never continued as new');
+    wf.info = { ...wf.info, historyLength: wf.info.historyLength + 3_000 };
+    return { output: `Reply ${turns}`, providerCompleted: true };
+  });
+  wf.wait = () => wf.handlers.get('followUp')!({ id: `u${turns}`, role: 'user', text: 'More', ts: turns });
+  const result = await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] },
+    confirm: { layers: [{ kind: 'human' }] } }).catch((error) => error);
+  expect(result.next?.recovery?.continued).toBeDefined();
+  expect(wf.activities.releaseTaskRun).toHaveBeenCalledTimes(2);
+});
+
+it('WF-3/WF-4: a run does not continue when its carried input would exceed the payload budget in bytes', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  wf.activities.releaseTaskRun = vi.fn(async () => 'unpinned');
+  let turns = 0;
+  wf.activities.runAgentTurn.mockImplementation(async () => {
+    if (++turns === 2) wf.handlers.get('cancel')!();
+    wf.info = { ...wf.info, historyLength: wf.info.historyLength + 5_000 };
+    return { output: `Reply ${turns}`, providerCompleted: true };
+  });
+  wf.wait = () => wf.handlers.get('followUp')!({ id: `u${turns}`, role: 'user', text: 'More', ts: turns });
+  // 400,000 characters, but 1.2 MB once encoded.
+  expect(await softwareDevV1_26({ ...input, prompt: '€'.repeat(400_000), project: { repos: ['/tmp/repo'] } }))
+    .toEqual({ stage: 'cancelled' });
+  expect(wf.activities.releaseTaskRun).not.toHaveBeenCalled();
 });
