@@ -10,9 +10,7 @@ import { sourceTextAssertions, testFiles } from './helpers/source-text-assertion
  * that converts leaves the list. Lower a number when you remove assertions.
  */
 const REMAINING: Record<string, number> = {
-  'tests/account-diagnostics-ui.test.ts': 5,
   'tests/provider-connections-ui.test.ts': 9,
-  'tests/ui-agent-settings.test.ts': 5,
   'tests/ui-deverbosification.test.ts': 9,
   'tests/web-confirmer.test.ts': 10,
 };
