@@ -11004,7 +11004,7 @@ function mergeQueuePanel() {
           const pos = v.mergeQueue?.position;
           const merging = !!v.state?.mergeGranted;
           const canMove = !merging && !!domain;
-          return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
+          return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel(t, merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued', merging ? null : pos))}" ${canMove ? 'draggable="true"' : ''}>
         ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
         <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued'}</span></div>
@@ -11025,7 +11025,7 @@ function mergeQueuePanel() {
         const route = participant
           ? `<span class="branch">${esc(participant.slug)}</span> → <span class="branch">${esc(participant.target)}</span>`
           : `<span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span>`;
-        return `<div class="queue-item" data-id="${t.id}" tabindex="0">
+        return `<div class="queue-item" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(queueRowLabel(t, `${authority} ${state}`))}">
           <span class="drag-handle placeholder"></span><span class="pos">⇱</span>
           <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${esc(authority)} ${esc(state)}</span></div>
             <div class="task-sub">${route}${v.landing?.detail ? ` · ${esc(v.landing.detail)}` : ''}</div></div>
@@ -11033,6 +11033,11 @@ function mergeQueuePanel() {
       }).join('')}</div>`
     : '';
   return `${internal}${provider}`;
+}
+
+// A queue row's accessible name: the task, and where it stands in the queue.
+function queueRowLabel(task, state, position) {
+  return [`${task.num != null ? `#${task.num} ` : ''}${task.title}`, state, position > 0 ? `position ${position}` : ''].filter(Boolean).join(' · ');
 }
 
 function agentQueuePanel() {
@@ -11044,7 +11049,7 @@ function agentQueuePanel() {
       const task = taskRecord(x.taskId);
       const title = x.title || task?.title || `Task ${String(x.taskId || '').slice(0, 8)}`;
       const num = task?.num != null ? `<span class="task-num">#${task.num}</span> ` : '';
-      return `<div class="queue-item ${x.active ? 'current' : ''}" data-agent-turn="${esc(x.turnId)}" data-id="${esc(x.taskId)}" tabindex="0" ${x.active ? '' : 'draggable="true"'}>
+      return `<div class="queue-item ${x.active ? 'current' : ''}" data-agent-turn="${esc(x.turnId)}" data-id="${esc(x.taskId)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel({ num: task?.num, title }, x.active ? 'active lease' : 'queued', x.active ? null : i - active.length + 1))}" ${x.active ? '' : 'draggable="true"'}>
         ${x.active ? '<span class="drag-handle placeholder"></span>' : '<span class="drag-handle" title="Drag to reorder">⠿</span>'}
         <span class="pos">${x.active ? '▶' : `#${i - active.length + 1}`}</span>
         <div style="flex:1"><div class="task-title">${num}${esc(title)} <span class="chip">${x.active ? 'active lease' : 'queued'}</span></div>
