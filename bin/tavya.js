@@ -51,16 +51,16 @@ ws.on('message', (data) => {
 ws.on('close', (code, reason) => {
   restore();
   process.stdout.off('resize', resize);
-  if (code !== 1000 && reason) process.stderr.write(`\nkarmax attach: ${reason.toString()}\n`);
+  if (code !== 1000 && reason) process.stderr.write(`\ntavya attach: ${reason.toString()}\n`);
   process.exit(code === 1000 || code === 1005 ? 0 : 1);
 });
-ws.on('error', (error) => { restore(); process.stderr.write(`karmax attach: ${error.message}\n`); });
+ws.on('error', (error) => { restore(); process.stderr.write(`tavya attach: ${error.message}\n`); });
 process.on('SIGINT', () => ws.close());
 process.on('SIGTERM', () => ws.close());
 process.on('exit', restore);
 
 function usage(error) {
   if (error) process.stderr.write(`${error}\n\n`);
-  process.stderr.write('Usage: karmax attach <task-id> --url <karmax-url> --ticket <one-time-ticket>\n');
+  process.stderr.write('Usage: tavya attach <task-id> --url <tavya-url> --ticket <one-time-ticket>\n');
   process.exit(error ? 1 : 0);
 }

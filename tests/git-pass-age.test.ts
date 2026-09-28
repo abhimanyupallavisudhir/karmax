@@ -93,8 +93,8 @@ describe('age and mounted Git password stores', () => {
     const f = fixture();
     const outside = path.join(f.root, 'outside');
     fs.mkdirSync(outside);
-    fs.symlinkSync(outside, path.join(f.seed, 'karmax'));
-    run('git', ['add', 'karmax'], f.seed);
+    fs.symlinkSync(outside, path.join(f.seed, 'tavya'));
+    run('git', ['add', 'tavya'], f.seed);
     run('git', ['commit', '-m', 'symlink fixture'], f.seed);
     run('git', ['push'], f.seed);
     const c = connector(f.config, f.root);
@@ -191,7 +191,7 @@ describe('age and mounted Git password stores', () => {
       ['passkey', 'passkey', '{"credentialId":"id","privateKey":"key"}'],
     ] as const) {
       const item = {
-        externalId: `karmax/stable-${type}`,
+        externalId: `tavya/stable-${type}`,
         type,
         label: 'Duplicate label',
         username: 'alice',

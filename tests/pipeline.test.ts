@@ -663,8 +663,8 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(beFile.code).toBe(0);
     expect(beFile.stdout).toContain('serve');
     // and a real merge commit exists in each repo (point of no return, per repo)
-    expect((await git(fe, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge karmax/${taskId} into main`));
-    expect((await git(be, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge karmax/${taskId} into main`));
+    expect((await git(fe, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge tavya/${taskId} into main`));
+    expect((await git(be, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge tavya/${taskId} into main`));
   });
 
   it('multi-PR: the agent adds a second branch, and BOTH land as their own merges', async () => {
@@ -722,8 +722,8 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:core.js'])).code).toBe(0);
     expect((await git(repo, ['show', 'main:README.md'])).code).toBe(0);
     const log = (await git(repo, ['log', '--oneline', 'main'])).stdout;
-    expect(log).toMatch(new RegExp(`merge karmax/${taskId} into main`));
-    expect(log).toMatch(new RegExp(`merge karmax/${taskId}-docs into main`));
+    expect(log).toMatch(new RegExp(`merge tavya/${taskId} into main`));
+    expect(log).toMatch(new RegExp(`merge tavya/${taskId}-docs into main`));
   });
 
   it('returns to Do on a follow-up, then merges after confirm', async () => {

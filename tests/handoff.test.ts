@@ -44,7 +44,7 @@ describe('hosted/local Git handoff', () => {
     (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
     const task = (await store.createTask({ projectId: project.id, title: 'Fix auth', workflow: 'software-dev', workflowVersion: '1.0.0',
       params: { prompt: 'fix auth' } as any }));
-    const branch = `karmax/${task.id}`;
+    const branch = `tavya/${task.id}`;
     (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting',
       actions: [], state: {}, messages: [], branch, base: 'main', waitingFor: { kind: 'human' }, updatedAt: 1 } as any));
     (await store.registerWorld({ kind: 'e2b', id: task.id, root: '/workspace', branch, base: 'main', repo: repository.sshUrl,
@@ -73,7 +73,7 @@ describe('hosted/local Git handoff', () => {
 
     const plan = (await new WorldHandoffService(store, new WorldRegistry(), {} as any).projectCheckout(project.id));
 
-    expect(plan.workspace).toBe('karmax-platform-tools');
+    expect(plan.workspace).toBe('tavya-platform-tools');
     expect(plan.repositories).toEqual([expect.objectContaining({ name: 'app', branch: 'trunk' })]);
     expect(plan.cloneScript).toContain("git clone --branch 'trunk' --single-branch 'git@github.com:acme/app.git' 'app'");
     expect(plan.updateScript).toContain("git -C 'app' merge --ff-only 'origin/trunk'");
@@ -87,7 +87,7 @@ describe('hosted/local Git handoff', () => {
     const seed = path.join(dir, 'seed');
     const cloud = path.join(dir, 'cloud');
     const laptop = path.join(dir, 'laptop');
-    const branch = 'karmax/task-7';
+    const branch = 'tavya/task-7';
     fs.mkdirSync(seed);
     await gitOrThrow(dir, ['init', '--bare', '-q', remote]);
     await gitOrThrow(seed, ['init', '-q', '-b', 'main']);
@@ -128,7 +128,7 @@ describe('hosted/local Git handoff', () => {
     const seed = path.join(dir, 'seed');
     const cloud = path.join(dir, 'cloud');
     const localRoot = path.join(dir, 'local');
-    const branch = 'karmax/task-cloud';
+    const branch = 'tavya/task-cloud';
     fs.mkdirSync(seed);
     await gitOrThrow(dir, ['init', '--bare', '-q', remote]);
     await gitOrThrow(seed, ['init', '-q', '-b', 'main']);
@@ -232,7 +232,7 @@ describe('hosted/local Git handoff', () => {
     const source = path.join(dir, 'source');
     const cloud = path.join(dir, 'cloud');
     const localRoot = path.join(dir, 'local');
-    const branch = 'karmax/task-local-source';
+    const branch = 'tavya/task-local-source';
     fs.mkdirSync(source);
     await gitOrThrow(dir, ['init', '--bare', '-q', remote]);
     await gitOrThrow(source, ['init', '-q', '-b', 'main']);

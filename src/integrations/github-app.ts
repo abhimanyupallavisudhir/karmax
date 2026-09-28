@@ -10,6 +10,7 @@ import { githubPrWebhookObservationKey, pullRequestWebhookEvent, reconcilePullRe
 import { GithubActionsApi } from './github-actions.js';
 import { githubActionsRunIdFromUrl } from './github-actions.js';
 import { observeDeploymentWorkflowRun } from './github-deployment-monitor.js';
+import { taskIdOfBranch, BRAND } from '../domain/brand.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
 export const GITHUB_APP_WEBHOOK_SECRET_HANDLE = 'github-app:webhook-secret';
@@ -442,11 +443,11 @@ export class GitHubAppService {
   manifest(publicUrl: string, state: string): { action: string; manifest: Record<string, unknown> } {
     const parsed = new URL(publicUrl);
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password)
-      throw new Error('Krmax needs an http(s) browser URL to set up GitHub');
+      throw new Error(`${BRAND} needs an http(s) browser URL to set up GitHub`);
     const origin = parsed.origin;
     const hostname = new URL(origin).hostname.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 35) || 'host';
     const manifest: Record<string, unknown> = {
-      name: `Krmax ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
+      name: `${BRAND} ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
       url: origin,
       public: this.options.publicApp === true,
       // Keep the CSRF state in the path. GitHub's manifest validator is
@@ -864,11 +865,11 @@ export class GitHubAppService {
     if (!connection) return 'Reconnect this repository through the GitHub App, then retry the task.';
     const observed = await this.workflowPermissionStatus(connection);
     if (observed.app !== 'write') {
-      return `The installation operator must grant the krmax GitHub App Workflows: read and write at ${observed.appSettingsUrl}. `
+      return `The installation operator must grant the ${BRAND} GitHub App Workflows: read and write at ${observed.appSettingsUrl}. `
         + `Then the owner of ${connection.accountLogin} must approve the updated App permission at ${observed.installationSettingsUrl}. Retry the task after both steps.`;
     }
     if (observed.installation !== 'write') {
-      return `The krmax GitHub App now requests Workflows: read and write, but ${connection.accountLogin} has not approved it. `
+      return `The ${BRAND} GitHub App now requests Workflows: read and write, but ${connection.accountLogin} has not approved it. `
         + `Approve the updated App permission at ${observed.installationSettingsUrl}, then retry the task.`;
     }
     return 'GitHub reports Workflows: read and write as approved. Refresh the GitHub connection in organization settings and retry the task; if GitHub still rejects it, review the App installation on GitHub.';
@@ -1023,7 +1024,7 @@ export class GitHubAppService {
       // The PR lifecycle karmax itself started: correlated back to its task so
       // the timeline shows it and `event` triggers can fire on it. Correlation is
       // by branch name, which anyone can pick — so the task must also belong to
-      // the tenant that installed this App, or a `karmax/<id>` branch pushed to
+      // the tenant that installed this App, or a `tavya/<id>` branch pushed to
       // any repo would inject events into someone else's task.
       const prEvent = pullRequestWebhookEvent(event, payload);
       if (!prEvent || !(await this.ownsTask(connection.organizationId, prEvent.taskId)))
@@ -1075,7 +1076,9 @@ export class GitHubAppService {
       ...(Array.isArray(workflowRun?.pull_requests) ? workflowRun.pull_requests : []),
       ...(Array.isArray(checkRun?.pull_requests) ? checkRun.pull_requests : []),
     ].map((pr: any) => String(pr?.head?.ref ?? pr?.head?.label ?? ''));
-    const originatingTaskId = headRefs.map((ref) => ref.match(/(?:^|:)karmax\/(task_[A-Za-z0-9_-]+)/)?.[1]).find(Boolean);
+    // A head label is `owner:branch`; a ref is the bare branch.
+    const originatingTaskId = headRefs.map((ref) => taskIdOfBranch(ref.slice(ref.indexOf(':') + 1)))
+      .find((id) => id && /^task_[A-Za-z0-9_-]+$/.test(id));
     const base = {
       repository: `${repository.owner}/${repository.name}`,
       repositoryId: repository.id,

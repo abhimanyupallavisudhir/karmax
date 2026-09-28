@@ -38,15 +38,15 @@ describe('WorktreeProvider (real git)', () => {
   it('creates an isolated worktree on a karmax branch off the base', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'abc', repo, base: 'main', target: 'main' });
-    expect(world.handle.branch).toBe('karmax/abc');
+    expect(world.handle.branch).toBe('tavya/abc');
     expect(fs.existsSync(world.handle.root)).toBe(true);
-    expect(await currentBranch(world.handle.root)).toBe('karmax/abc');
+    expect(await currentBranch(world.handle.root)).toBe('tavya/abc');
     // base file is present in the worktree
     expect(await world.readFile('index.js')).toContain('console.log');
     await world.destroy();
     expect(fs.existsSync(world.handle.root)).toBe(false);
     // branch is preserved after destroy
-    expect((await git(repo, ['rev-parse', '--verify', 'karmax/abc'])).code).toBe(0);
+    expect((await git(repo, ['rev-parse', '--verify', 'tavya/abc'])).code).toBe(0);
   });
 
   it('tags remote sandbox transport failures for outage-tolerant workflow backoff', async () => {
@@ -79,7 +79,7 @@ describe('WorktreeProvider (real git)', () => {
     const task = (await store.createTask({ projectId: project.id, title: 'Blocked', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'x' } as any }));
     const handle = (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id,
-      generation: 1, root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`,
+      generation: 1, root: '/workspace', workspaceRoot: '/workspace', branch: `tavya/${task.id}`,
       base: 'main', meta: { projectId: project.id } }, project.id)) as any;
     let parked = false;
     const worlds = new WorldRegistry();
@@ -248,7 +248,7 @@ describe('WorktreeProvider (real git)', () => {
       const handle = await core.createWorld({ taskId: task.id, repos: sources, base: 'main', target: 'main', kind: 'worktree' });
       expect(handle.repos).toHaveLength(multiple ? 3 : 2);
       expect(handle.repos!.find((candidate) => candidate.role === 'project-wiki')).toMatchObject({
-        branch: `karmax/${task.id}`, base: 'main', target: 'main',
+        branch: `tavya/${task.id}`, base: 'main', target: 'main',
       });
       const cwd = handle.workdir ?? handle.root;
       expect(cwd).toBe(multiple ? handle.root : handle.repos!.find((candidate) => candidate.role !== 'project-wiki')!.root);
@@ -379,7 +379,7 @@ describe('WorktreeProvider (real git)', () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'nobase', repo, base: 'develop', target: 'main' });
     // The world is still usable — it forked off HEAD.
-    expect(await currentBranch(world.handle.root)).toBe('karmax/nobase');
+    expect(await currentBranch(world.handle.root)).toBe('tavya/nobase');
     expect(await world.readFile('index.js')).toContain('console.log');
     // …but the ignored base is surfaced, not swallowed.
     expect(world.handle.warnings).toBeTruthy();
@@ -422,7 +422,7 @@ describe('WorktreeProvider (real git)', () => {
     const world = await provider.create({ taskId: 'exec1', repo, base: 'main' });
     const r = await world.exec('git', ['rev-parse', '--abbrev-ref', 'HEAD']);
     expect(r.code).toBe(0);
-    expect(r.stdout.trim()).toBe('karmax/exec1');
+    expect(r.stdout.trim()).toBe('tavya/exec1');
     await world.destroy();
   });
 

@@ -413,7 +413,7 @@ async function justDoImpl(
     const resourceOnly = resourceOnlyFinalization
       && await core.checkpointResourceOnlyWork(world as any, input.project.repos ?? []);
     if (!resourceOnly) {
-      const result = await core.commitWork(world as any, `karmax: ${input.title}`);
+      const result = await core.commitWork(world as any, `tavya: ${input.title}`);
       if (resourceOnlyFinalization && !result.committed)
         throw ApplicationFailure.nonRetryable('task work was not committed; retaining the world for recovery');
       if (remoteWorldProvider(world.provider ?? world.kind)) await core.publishTaskBranch(world as any);

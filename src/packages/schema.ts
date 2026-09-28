@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { WorkflowManifest } from '../contrib/manifests.js';
 import { deploymentConfig } from '../config/deployment.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Runtime validation for a workflow manifest (PLAN item 21). A loaded package is
@@ -83,7 +84,7 @@ export function parseManifest(data: unknown): WorkflowManifest {
  *  refused there (bundled manifests are unaffected). */
 export function assertHostSafe(manifest: WorkflowManifest): void {
   if (manifest.agentMcp?.length && deploymentConfig().hosted)
-    throw new Error('hosted karmax does not accept workflow packages that declare agentMcp servers (they would run commands on the shared control plane)');
+    throw new Error(`hosted ${BRAND} does not accept workflow packages that declare agentMcp servers (they would run commands on the shared control plane)`);
 }
 
 /** Non-throwing validation with a flat, human-readable error string. */

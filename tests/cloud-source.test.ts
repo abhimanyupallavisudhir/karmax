@@ -82,11 +82,11 @@ describe('cloud repository source resolution', () => {
         const sources: string[] = spec.repos ?? [spec.repo];
         return {
           handle: {
-            kind: 'fake-cloud', id: spec.taskId, root: '/workspace', branch: `karmax/${spec.taskId}`, base: spec.base,
+            kind: 'fake-cloud', id: spec.taskId, root: '/workspace', branch: `tavya/${spec.taskId}`, base: spec.base,
             repos: sources.map((repo, index) => ({
               name: index === 0 ? 'app' : 'project-wiki', repo, localPath: spec.copySources?.[index],
               root: `/workspace/${index === 0 ? 'app' : 'project-wiki'}`,
-              branch: `karmax/${spec.taskId}`, base: spec.base,
+              branch: `tavya/${spec.taskId}`, base: spec.base,
             })),
           },
           async destroy() {},
@@ -151,9 +151,9 @@ describe('cloud repository source resolution', () => {
         workflow: 'software-dev', workflowVersion: '1.0.0', parentTaskId: task.id,
         params: { prompt: 'continue parent work' } }));
       await core.createWorld({ taskId: child.id, repos: [app],
-        base: `karmax/${task.id}`, target: `karmax/${task.id}`, kind: 'fake-cloud' });
+        base: `tavya/${task.id}`, target: `tavya/${task.id}`, kind: 'fake-cloud' });
       expect(received.repositoryBranches['git@github.com:acme/app.git'])
-        .toEqual({ base: `karmax/${task.id}`, target: `karmax/${task.id}` });
+        .toEqual({ base: `tavya/${task.id}`, target: `tavya/${task.id}` });
     } finally {
       (await store.close());
     }
@@ -202,10 +202,10 @@ describe('cloud repository source resolution', () => {
         const sources: string[] = spec.repos ?? [spec.repo];
         return {
           handle: {
-            kind: 'fake-local', id: spec.taskId, root: '/workspace', branch: `karmax/${spec.taskId}`, base: spec.base,
+            kind: 'fake-local', id: spec.taskId, root: '/workspace', branch: `tavya/${spec.taskId}`, base: spec.base,
             repos: sources.map((repo, index) => ({
               name: index === 0 ? 'app' : 'project-wiki', repo, root: `/workspace/${index}`,
-              branch: `karmax/${spec.taskId}`, base: spec.base,
+              branch: `tavya/${spec.taskId}`, base: spec.base,
             })),
           },
           async destroy() {},

@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import { WebSocketServer } from 'ws';
 
-describe('karmax attach CLI', () => {
+describe('tavya attach CLI', () => {
   it('relays terminal input, output, and resize frames', async () => {
     const server = new WebSocketServer({ port: 0 });
     await once(server, 'listening');
@@ -21,7 +21,7 @@ describe('karmax attach CLI', () => {
         if (frame.type === 'input') socket.close(1000);
       });
     });
-    const child = spawn(process.execPath, [path.resolve('bin/karmax.js'), 'attach', 'task-7',
+    const child = spawn(process.execPath, [path.resolve('bin/tavya.js'), 'attach', 'task-7',
       '--url', `http://127.0.0.1:${address.port}`, '--ticket', 'once'], { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });

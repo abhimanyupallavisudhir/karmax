@@ -3,6 +3,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { paths } from '../config/paths.js';
 import { acquireFileLock } from './file-lock.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Duplicate app-instance detection (karmax#4). The July-5 OOM had 14 concurrent
@@ -82,7 +83,7 @@ function lockInstance(dir: string): (() => void) | undefined {
   if (result.status !== 0) {
     fs.closeSync(fd);
     if (result.status === 73) throw new Error(duplicateInstanceMessage(paths().home, []));
-    throw new Error(`could not acquire the krmax instance lock (Linux requires util-linux/flock): ${result.error?.message ?? result.stderr.trim()}`);
+    throw new Error(`could not acquire the ${BRAND} instance lock (Linux requires util-linux/flock): ${result.error?.message ?? result.stderr.trim()}`);
   }
   return () => fs.closeSync(fd);
 }
@@ -148,7 +149,7 @@ export interface InstanceRegistration {
 
 export function duplicateInstanceMessage(home: string, others: number[]): string {
   const owner = others.length ? `pid${others.length === 1 ? '' : 's'} ${others.join(', ')}` : 'exclusive process lock is held';
-  return `another krmax app instance is already running against ${home} (${owner}). `
+  return `another ${BRAND} app instance is already running against ${home} (${owner}). `
     + 'Stop that instance before starting another; concurrent workers can steal activities and corrupt workflow coherence.';
 }
 

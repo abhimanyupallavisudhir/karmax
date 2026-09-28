@@ -14,6 +14,7 @@ import { withTimeout } from '../util/timeout.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { localProviderCli } from './provider-cli.js';
 import { createCustodyEnv, killAgent } from './custody.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Proactive quota (RESOLVE-PLAN §2 / #6). `claude -p '/usage'` prints a parseable
@@ -523,7 +524,7 @@ async function runCodexUsageCli(configHome: string | undefined, timeoutMs: numbe
   child.once('exit', untrack);
   try {
     await withTimeout(client.request('initialize', {
-      clientInfo: { name: 'karmax-usage-probe', title: 'karmax', version: '1.0.0' },
+      clientInfo: { name: `${BRAND}-usage-probe`, title: BRAND, version: '1.0.0' },
       capabilities: null,
     }), timeoutMs);
     client.notify('initialized');

@@ -434,10 +434,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(prs).toHaveLength(1);
     expect(prs[0].title).toBe('Add a greeter');
     expect(prs[0].body).toContain('greet.js');
-    expect(prs[0].head.ref).toBe(`karmax/${taskId}`);
+    expect(prs[0].head.ref).toBe(`tavya/${taskId}`);
     // The branch reached origin, the merge landed, and the PR was reconciled.
     const origin = path.join(originDir, 'app.git');
-    expect((await git(origin, ['rev-parse', '--verify', `karmax/${taskId}`])).code).toBe(0);
+    expect((await git(origin, ['rev-parse', '--verify', `tavya/${taskId}`])).code).toBe(0);
     expect((await git(origin, ['show', 'main:greet.js'])).stdout).toContain('export const g');
     expect(prs[0].state).toBe('closed');
     expect(comments.map((c) => c.body).join('\n')).toContain('merged this branch into `main`');
@@ -475,11 +475,11 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect((await handle.result()).stage).toBe('done');
 
     expect(prs).toHaveLength(1);
-    expect(prs[0].head.ref).toBe(`karmax/${taskId}`);
+    expect(prs[0].head.ref).toBe(`tavya/${taskId}`);
     const origin = path.join(originDir, 'uncommitted.git');
     // The proposed remote branch already contains the Merge agent's commit;
     // preparation did not happen only after the PR had captured an empty head.
-    expect((await git(origin, ['show', `karmax/${taskId}:kablooga.md`])).stdout)
+    expect((await git(origin, ['show', `tavya/${taskId}:kablooga.md`])).stdout)
       .toContain('# Kablooga');
     expect((await git(origin, ['show', 'main:kablooga.md'])).stdout)
       .toContain('# Kablooga');
@@ -594,7 +594,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       expect(turns).toBe(scenario === 'recorded checkpoint' ? 1 : 2);
       expect((await h.store.eventsOfType(task.id, 'resolve.auto'))).toHaveLength(0);
       const origin = remoteBySlug.get(SLUG)!;
-      const head = (await git(origin, ['rev-parse', `karmax/${task.id}`])).stdout.trim();
+      const head = (await git(origin, ['rev-parse', `tavya/${task.id}`])).stdout.trim();
       expect(review.pr.headSha).toBe(head);
       expect((await git(origin, ['rev-parse', `${head}^{tree}`])).stdout.trim())
         .toBe((await git(repo, ['rev-parse', `${amendedHead}^{tree}`])).stdout.trim());
@@ -1203,8 +1203,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       const survivorIndex = 1 - cancelledIndex;
       const cancelledTask = [first, second][cancelledIndex]!;
       const survivor = [first, second][survivorIndex]!;
-      const cancelledPr = prs.find((pr) => pr.head.ref === `karmax/${cancelledTask.id}`)!;
-      const survivingPr = prs.find((pr) => pr.head.ref === `karmax/${survivor.id}`)!;
+      const cancelledPr = prs.find((pr) => pr.head.ref === `tavya/${cancelledTask.id}`)!;
+      const survivingPr = prs.find((pr) => pr.head.ref === `tavya/${survivor.id}`)!;
       await handles[cancelledIndex]!.signal('cancel');
       expect(await handles[cancelledIndex]!.result()).toMatchObject({ stage: 'cancelled' });
       // Cancellation closes its PR; GitHub removes a closed PR from its queue.
@@ -1331,7 +1331,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => {
       const current = await view(handle);
       return `${current.stage}/${current.messages.at(-1)?.text ?? ''}`;
-    }, { timeout: 30_000 }).toMatch(/do\/.*released every Karmax admission slot/is);
+    }, { timeout: 30_000 }).toMatch(/do\/.*released every tavya admission slot/is);
     const repairing = await view(handle);
     expect(repairing.mergeQueue).toBeUndefined();
     expect(repairing.state.mergeDomains).toBeUndefined();
@@ -1704,7 +1704,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect((await handle.result()).stage).toBe('done');
 
     const origin = path.join(originDir, 'post-pr-conflict.git');
-    expect((await git(origin, ['show', `karmax/${taskId}:conflict.txt`])).stdout)
+    expect((await git(origin, ['show', `tavya/${taskId}:conflict.txt`])).stdout)
       .toBe('resolved after PR\n');
     expect((await git(origin, ['show', 'main:conflict.txt'])).stdout)
       .toBe('resolved after PR\n');
@@ -1738,7 +1738,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
     // The PR still opens — that half of the stage is version-independent.
     expect(prs).toHaveLength(1);
-    expect(prs[0].head.ref).toBe(`karmax/${taskId}`);
+    expect(prs[0].head.ref).toBe(`tavya/${taskId}`);
     // …but nothing reconciles it, exactly as this version's history recorded.
     expect(prs[0].state).toBe('open');
     expect(comments).toEqual([]);

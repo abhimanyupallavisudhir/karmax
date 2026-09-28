@@ -41,7 +41,7 @@ describe('capability model + attenuation (SPEC §8.2)', () => {
   it("a sub-task's grant scopes merge to EXACTLY the parent branch, not merge-into:* (SPEC §5.3/§8.2)", () => {
     // Mirrors prepareChildTask: delegation caps attenuated by the parent's grant,
     // merge scoped to the parent's own branch.
-    const parentBranch = 'karmax/task_parent';
+    const parentBranch = 'tavya/task_parent';
     const collaboration = ['task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
       'task:conversation:read', 'task:conversation:fork', 'task:conversation:message'];
     const delegation = attenuate(['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', ...collaboration], ['*']);
@@ -52,7 +52,7 @@ describe('capability model + attenuation (SPEC §8.2)', () => {
     // … but the child may merge into ONLY its parent's branch.
     expect(allows(eff, `merge-into:${parentBranch}`)).toBe(true);
     expect(allows(eff, 'merge-into:main')).toBe(false);
-    expect(allows(eff, 'merge-into:karmax/task_sibling')).toBe(false);
+    expect(allows(eff, 'merge-into:tavya/task_sibling')).toBe(false);
     expect(allows(eff, 'merge-into:*')).toBe(false);
     // Delegation caps survive so it can run its own Do/Review/sub-tasks.
     expect(allows(eff, 'create-sub-task')).toBe(true);

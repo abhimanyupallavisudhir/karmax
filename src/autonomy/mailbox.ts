@@ -1,3 +1,4 @@
+import { BRAND } from '../domain/brand.js';
 /**
  * Organization-scoped mailbox providers (PLAN-passwords.md §8). AgentMail is
  * the intentionally small product surface; the IMAP and push implementations
@@ -83,8 +84,8 @@ export class SelfManagedDomainProvider implements MailboxProvider {
     return {
       name: this.name, label: 'Your own domain', kind: 'domain', connected: !!domain, domain,
       help: domain
-        ? `Agents use addresses on ${domain}. Forward that domain's inbound email to karmax (e.g. Cloudflare Email Routing — free).`
-        : 'Use a domain you already own: enter it, then forward its inbound email to karmax.',
+        ? `Agents use addresses on ${domain}. Forward that domain's inbound email to ${BRAND} (e.g. Cloudflare Email Routing — free).`
+        : `Use a domain you already own: enter it, then forward its inbound email to ${BRAND}.`,
     };
   }
   connect(input: ConnectInput): ConnectResult {
@@ -112,7 +113,7 @@ export class HostedMailboxProvider implements MailboxProvider {
       name: this.name, label: 'Hosted inbox', kind: 'apiKey', connected, domain,
       help: connected
         ? (config.fixedAddress ? `Connected via ${config.fixedAddress} — organizations get +tagged addresses on it.` : `Connected. Agents get addresses on ${domain}.`)
-        : 'No domain needed: an inbound-email service gives you an address or domain on THEIR domain and POSTs incoming mail to a URL. Paste what they gave you, and paste karmax’s webhook URL (shown below) into their settings.',
+        : `No domain needed: an inbound-email service gives you an address or domain on THEIR domain and POSTs incoming mail to a URL. Paste what they gave you, and paste ${BRAND}’s webhook URL (shown below) into their settings.`,
     };
   }
   connect(input: ConnectInput): ConnectResult {
@@ -151,8 +152,8 @@ export class ImapMailboxProvider implements MailboxProvider {
     return {
       name: this.name, label: 'IMAP mailbox (pull)', kind: 'apiKey', connected, domain: config.fixedAddress?.split('@')[1],
       help: connected
-        ? `Connected to ${config.fixedAddress}. karmax polls it; organizations get +tagged sub-addresses. Your provider must allow +sub-addressing (Gmail, Fastmail, most do).`
-        : 'Works even on localhost. Connect any IMAP mailbox (a spare Gmail with an app-password is easiest): address, IMAP host/port, username, and password. karmax polls it — nothing needs to reach you.',
+        ? `Connected to ${config.fixedAddress}. ${BRAND} polls it; organizations get +tagged sub-addresses. Your provider must allow +sub-addressing (Gmail, Fastmail, most do).`
+        : `Works even on localhost. Connect any IMAP mailbox (a spare Gmail with an app-password is easiest): address, IMAP host/port, username, and password. ${BRAND} polls it — nothing needs to reach you.`,
     };
   }
   connect(input: ConnectInput): ConnectResult {
@@ -163,7 +164,7 @@ export class ImapMailboxProvider implements MailboxProvider {
     if (!host) return { status: 'unavailable', detail: 'enter the IMAP host, e.g. imap.gmail.com' };
     const port = Number(input.imapPort) || 993;
     const secure = input.imapSecure !== false;
-    return { status: 'connected', detail: `Connected. karmax will poll ${address} for agent mail.`,
+    return { status: 'connected', detail: `Connected. ${BRAND} will poll ${address} for agent mail.`,
       config: { provider: this.name, fixedAddress: address, imap: { host, port, user: input.imapUser?.trim() || address, secure } } };
   }
   domainFor(config: MailboxConfig): string | undefined {

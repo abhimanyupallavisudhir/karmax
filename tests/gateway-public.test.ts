@@ -7,7 +7,7 @@ const remoteWorld = {
   kind: 'e2b',
   id: 'sandbox-secret-id',
   root: '/home/user/project',
-  branch: 'karmax/task-1',
+  branch: 'tavya/task-1',
   base: 'main',
   repo: 'git@github.com:acme/private.git',
   meta: { trafficAccessToken: 'secret' },

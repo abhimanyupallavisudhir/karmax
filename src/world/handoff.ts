@@ -20,6 +20,7 @@ import { git } from './git.js';
 import { paths } from '../config/paths.js';
 import { materializeGitCredential } from './git-credential.js';
 import { sameRepository } from './repository-identity.js';
+import { BRAND } from '../domain/brand.js';
 
 export interface LocalCheckoutPlan {
   taskId: string;
@@ -257,7 +258,7 @@ export class WorldHandoffService {
       return { id: entry.repository.id, name: inWorld?.name ?? entry.repository.name, sshUrl: entry.repository.sshUrl,
         branch: inWorld?.branch ?? branch, base, target: inWorld?.target ?? entry.targetBranch ?? base };
     });
-    const workspace = `karmax-${task.num ?? task.id}`;
+    const workspace = `${BRAND}-${task.num ?? task.id}`;
     const clone = ['set -eu', `mkdir -p ${sh(workspace)}`, `cd ${sh(workspace)}`];
     const update = ['set -eu', `cd ${sh(workspace)}`];
     const push = ['set -eu', `cd ${sh(workspace)}`];
@@ -288,7 +289,7 @@ export class WorldHandoffService {
       branch: repository.defaultBranch,
     }));
     const slug = safeName(project.name.toLowerCase()).replace(/^-+|-+$/g, '') || safeName(project.id);
-    const workspace = `karmax-${slug}`;
+    const workspace = `${BRAND}-${slug}`;
     const clone = ['set -eu', `mkdir -p ${sh(workspace)}`, `cd ${sh(workspace)}`];
     const update = ['set -eu', `cd ${sh(workspace)}`];
     for (const repository of repositories) {

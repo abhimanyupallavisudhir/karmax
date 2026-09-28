@@ -8,6 +8,7 @@ import {
   compactSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
 import { URGENCY_LEVELS } from '../domain/types.js';
+import { BRAND } from '../domain/brand.js';
 
 /** Provider-neutral tool descriptor (mapped to OpenAI / MCP shapes per adapter). */
 export interface ToolSchema {
@@ -164,7 +165,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'save_skill',
-    description: 'Save a reusable skill (markdown content) for future tasks. This writes INSTALLATION-WIDE global state — visible to every project and organization on this karmax, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
+    description: `Save a reusable skill (markdown content) for future tasks. This writes INSTALLATION-WIDE global state — visible to every project and organization on this ${BRAND}, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).`,
     parameters: {
       type: 'object',
       properties: { name: { type: 'string' }, content: { type: 'string' } },
@@ -264,7 +265,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_credential',
     description:
-      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that list_credentials does not show, identified by item_id or the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
+      `Ask for access to a credential in the user's vault (a site login, API key, SSH key, or .env bag) that list_credentials does not show, identified by item_id or the site's domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — ${BRAND} automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human's own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then ${BRAND} resumes the task.`,
     parameters: {
       type: 'object',
       properties: {
@@ -281,7 +282,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'fill_credential',
     description:
-      'Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: karmax resolves it and types it over CDP, verifying the page origin matches the credential\'s domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). The karmax browser MCP already runs a Chrome that exposes the DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+      `Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: ${BRAND} resolves it and types it over CDP, verifying the page origin matches the credential's domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). The ${BRAND} browser MCP already runs a Chrome that exposes the DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
     parameters: {
       type: 'object',
       properties: {
@@ -376,7 +377,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'enroll_passkey',
     description:
-      'Enroll a NEW passkey that belongs to karmax on the account open in your browser (you cannot use the user\'s own passkeys — the OS biometric is theirs). karmax prepares a virtual authenticator (origin-verified against `domain`); you then trigger the site\'s "create a passkey / add passkey" button; then call save_passkey with the returned authenticator_id. After this, use_passkey logs in with no 2FA prompt.',
+      'Enroll a NEW passkey that belongs to tavya on the account open in your browser (you cannot use the user\'s own passkeys — the OS biometric is theirs). tavya prepares a virtual authenticator (origin-verified against `domain`); you then trigger the site\'s "create a passkey / add passkey" button; then call save_passkey with the returned authenticator_id. After this, use_passkey logs in with no 2FA prompt.',
     parameters: {
       type: 'object',
       properties: {
@@ -403,7 +404,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'use_passkey',
     description:
-      'Log in with a karmax-enrolled passkey: karmax loads the stored credential into a virtual authenticator on the page; you then trigger the site\'s "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticator_id (call the passkey release route when done), or needs_approval/not_in_vault.',
+      `Log in with a ${BRAND}-enrolled passkey: ${BRAND} loads the stored credential into a virtual authenticator on the page; you then trigger the site's "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticator_id (call the passkey release route when done), or needs_approval/not_in_vault.`,
     parameters: {
       type: 'object',
       properties: {
@@ -528,7 +529,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'connect_world_provider',
-    description: 'Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted Karmax vault and never returned.',
+    description: `Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted ${BRAND} vault and never returned.`,
     parameters: {
       type: 'object',
       properties: {
@@ -622,7 +623,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'request_agent_action',
-    description: 'Ask another task agent to publish its branch in the background. Returns a durable request id immediately; Karmax injects completion or failure into this conversation. Continue other work and do not poll.',
+    description: `Ask another task agent to publish its branch in the background. Returns a durable request id immediately; ${BRAND} injects completion or failure into this conversation. Continue other work and do not poll.`,
     parameters: {
       type: 'object',
       properties: {
@@ -672,7 +673,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_permission',
     description:
-      'Request exact Karmax capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ' +
+      `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
       'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
       'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
       'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task.',
@@ -723,7 +724,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'list_events',
-    description: 'Read durable karmax events for a task after an optional sequence number.',
+    description: `Read durable ${BRAND} events for a task after an optional sequence number.`,
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, since: { type: 'number' } }, required: ['task_id'] },
   },
   {
@@ -784,7 +785,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'platform_request',
-    description: 'Call any authenticated karmax /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, safe mode, and more). Authorization is always enforced, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused. Call describe_platform when unsure.',
+    description: `Call any authenticated ${BRAND} /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, safe mode, and more). Authorization is always enforced, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused. Call describe_platform when unsure.`,
     parameters: {
       type: 'object',
       properties: {
@@ -880,7 +881,7 @@ export function platformToolHandlers(
   workEnv?: () => Record<string, string>,
 ): Record<string, (args: any) => Promise<string>> {
   const platformRequest = (method: string, requestPath: string, body?: unknown) => {
-    if (!ctx.platformRequest) throw new Error('karmax gateway is unavailable to this agent');
+    if (!ctx.platformRequest) throw new Error(`${BRAND} gateway is unavailable to this agent`);
     return ctx.platformRequest(method, requestPath, body);
   };
   const handlers: Record<string, (args: any) => Promise<string>> = {
