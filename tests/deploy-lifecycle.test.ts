@@ -91,6 +91,10 @@ it.each(['cp app:', 'pg_dump -U temporal -Fc temporal'])('removes partial backup
   expect(h.calls().some(args => args.includes('down'))).toBe(false);
 });
 
+const LIVE = ['karmax', 'temporal', 'temporal_visibility'];
+const into = (args: string[]) => args.includes('pg_restore') && args.includes('-d') ? args[args.indexOf('-d') + 1] : undefined;
+const dropsLive = (args: string[]) => args.includes('dropdb') && LIVE.includes(args.at(-1)!);
+
 it('verifies every restore input before stopping services, and waits for the restored app', () => {
   const h = deployment();
   const destination = path.join(h.root, 'snapshot with spaces');
@@ -101,12 +105,53 @@ it('verifies every restore input before stopping services, and waits for the res
   const calls = h.calls();
   const stopped = calls.findIndex(args => args.includes('down'));
   expect(stopped).toBeGreaterThan(0);
-  expect(calls.slice(0, stopped).filter(args => args.includes('pg_restore'))).toHaveLength(3);
+  expect(calls.slice(0, stopped).filter(args => args.includes('pg_restore') && args.includes('/dev/null'))).toHaveLength(3);
   expect(calls.slice(0, stopped).some(args => args.includes('--verify'))).toBe(true);
-  expect(calls.slice(stopped).filter(args => args.includes('dropdb'))).toHaveLength(3);
+  expect(calls.slice(stopped).filter(dropsLive)).toHaveLength(3);
   expect(calls.slice(stopped).some(args => args.includes('restore') && !args.includes('--verify'))).toBe(true);
   expect(result.stdout).toContain('Restore complete');
 });
+
+// A new dump names the karmax role as owner, which a fresh PostgreSQL volume
+// does not have: pg_restore failed after all three databases were dropped, and
+// the stack stayed down with Temporal's databases empty.
+it('restores every dump into a staging database before stopping or dropping anything', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  h.clear();
+  const result = h.run(['restore', destination], '', 'RESTORE\n');
+  expect(result.status, result.stderr).toBe(0);
+  const calls = h.calls();
+  const staged = calls.filter(into);
+  expect(staged.map(into)).toEqual(['karmax_restore', 'temporal_restore', 'temporal_visibility_restore']);
+  // Owners and grants are the role job's to apply on the next start.
+  for (const args of staged) expect(args, into(args)).toEqual(expect.arrayContaining(['--no-owner', '--no-privileges']));
+  const lastStaged = calls.lastIndexOf(staged.at(-1)!);
+  expect(calls.findIndex(args => args.includes('down'))).toBeGreaterThan(lastStaged);
+  expect(calls.findIndex(dropsLive)).toBeGreaterThan(lastStaged);
+  const renames = calls.map(args => args.join(' ')).filter(call => call.includes('RENAME TO'));
+  expect(renames.map(call => /ALTER DATABASE (\w+) RENAME TO (\w+)/.exec(call)?.slice(1))).toEqual(LIVE.map(db => [`${db}_restore`, db]));
+});
+
+it.each(['-d karmax_restore', '-d temporal_visibility_restore', 'createdb -U temporal temporal_restore'])(
+  'keeps the live databases, services and secrets when staging fails: %s', fail => {
+    const h = deployment();
+    const destination = path.join(h.root, 'snapshot');
+    expect(h.run(['backup', destination]).status).toBe(0);
+    fs.writeFileSync(path.join(destination, 'deployment-secrets', 'vault_key'), 'restored-vault_key');
+    spawnSync('sh', ['-c', 'sha256sum *.dump deployment-secrets/* > SHA256SUMS'], { cwd: destination });
+    h.clear();
+    const result = h.run(['restore', destination], fail, 'RESTORE\n');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/nothing on this instance was changed/);
+    const calls = h.calls();
+    expect(calls.some(args => args.includes('down') || dropsLive(args))).toBe(false);
+    expect(calls.filter(args => args.includes('dropdb')).map(args => args.at(-1)).slice(-3))
+      .toEqual(LIVE.map(db => `${db}_restore`));
+    expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
+    expect(fs.readdirSync(h.deploy).filter(name => name.startsWith('.secrets'))).toEqual(['.secrets']);
+  });
 
 it.each(['npm run restore -- --verify', 'pg_restore -f /dev/null'])('leaves services and secrets untouched when restore validation fails: %s', fail => {
   const h = deployment();

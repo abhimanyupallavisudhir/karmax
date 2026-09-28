@@ -76,14 +76,14 @@ describe('turnkey update deploys an exact validated revision', () => {
     expect(update.indexOf('ensure_secrets')).toBeGreaterThan(update.indexOf('checkout --detach "$target"'));
     expect(update.indexOf('ensure_secrets')).toBeLessThan(update.indexOf('dc build --pull app'));
     const restore = script.split('cmd_restore() {')[1]?.split('\n}')[0] ?? '';
-    expect(restore.indexOf('ensure_secrets')).toBeGreaterThan(restore.indexOf('cp -R "$source/deployment-secrets"'));
-    expect(restore.indexOf('ensure_secrets')).toBeLessThan(restore.indexOf('dc up -d postgresql'));
+    expect(restore.indexOf('ensure_secrets')).toBeGreaterThan(restore.indexOf('mv "$staged_secrets" "$SECRETS_DIR"'));
+    expect(restore.indexOf('ensure_secrets')).toBeLessThan(restore.lastIndexOf('dc up -d postgresql'));
   });
 
   it('backs up and restores the PostgreSQL application database', () => {
     expect(script).toContain('pg_dump -U temporal -Fc karmax');
-    expect(script).toContain('pg_restore -U temporal -d karmax');
-    expect(script).toContain('for database in karmax temporal temporal_visibility');
+    expect(script).toContain('for dump in karmax temporal temporal-visibility');
+    expect(script).toContain('pg_restore -U temporal --no-owner --no-privileges -d "$database"');
   });
 
   it('applies a staged domain migration transactionally with the validated update', () => {

@@ -232,10 +232,15 @@ copy files out before editing them. The live data volume is never linked to a
 backup. The release workflow also retains its existing 14-day age limit.
 
 `restore` verifies the control-plane payload, PostgreSQL dumps, and deployment
-secrets before stopping the running instance or changing data. It restores the
-Karmax and Temporal databases, reapplies the current Temporal schema, and retains the
-destination's domain. It requires typing `RESTORE` and will not delete Docker
-volumes as part of ordinary `down` or `update` operations.
+secrets, then restores every dump into a staging database (`karmax_restore`,
+…) beside the live ones. Only when all of them restored does it stop the
+instance, drop the live databases and rename the staged ones into place; a
+failure before that leaves the instance as it was. Dumps are restored without
+owners or grants, so a new host or an empty PostgreSQL volume works; the next
+start hands the karmax database back to the app's role. It reapplies the
+current Temporal schema and retains the destination's domain. It requires
+typing `RESTORE` and will not delete Docker volumes as part of ordinary `down`
+or `update` operations.
 
 ### Rollback compatibility
 

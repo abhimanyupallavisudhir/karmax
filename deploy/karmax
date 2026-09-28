@@ -328,11 +328,40 @@ cmd_restore() {
   read answer
   [ "$answer" = RESTORE ] || die 'restore cancelled'
 
+  # Nothing live changes until every database has been restored beside it,
+  # into <name>_restore, and the secrets have been copied beside theirs. A dump
+  # can fail only now: it may name a role this PostgreSQL does not have (a
+  # fresh volume has no karmax role), so it is restored without owners or
+  # grants; the karmax-database job hands everything to the app's role on the
+  # next start. A failure here leaves the instance exactly as it was.
+  staged_secrets="$SECRETS_DIR.restore.$$"
+  drop_staging() {
+    rm -rf "$staged_secrets"
+    for database in karmax temporal temporal_visibility; do
+      dc exec -T postgresql dropdb --if-exists -U temporal --force "${database}_restore" || true
+    done
+  }
+  abandon() { drop_staging; die "$1; nothing on this instance was changed"; }
+  cp -R "$source/deployment-secrets" "$staged_secrets" || abandon 'could not copy the deployment secrets'
+  chmod 700 "$staged_secrets" && secret_mode "$staged_secrets"/* || abandon 'could not protect the deployment secrets'
+  dc up -d postgresql || abandon 'PostgreSQL did not start'
+  attempt=0
+  until dc exec -T postgresql pg_isready -U temporal -d postgres >/dev/null 2>&1; do
+    attempt=$((attempt + 1)); [ "$attempt" -lt 60 ] || abandon 'PostgreSQL did not become ready'; sleep 2
+  done
+  for dump in karmax temporal temporal-visibility; do
+    database=$(printf '%s' "$dump" | tr - _)_restore
+    dc exec -T postgresql dropdb --if-exists -U temporal --force "$database" \
+      && dc exec -T postgresql createdb -U temporal "$database" \
+      || abandon "could not create $database"
+    [ -f "$source/$dump.dump" ] || continue
+    dc exec -T postgresql pg_restore -U temporal --no-owner --no-privileges -d "$database" < "$source/$dump.dump" \
+      || abandon "$dump.dump did not restore"
+  done
+
   dc down
   rm -rf "$SECRETS_DIR"
-  cp -R "$source/deployment-secrets" "$SECRETS_DIR"
-  chmod 700 "$SECRETS_DIR"
-  secret_mode "$SECRETS_DIR"/*
+  mv "$staged_secrets" "$SECRETS_DIR"
   # A backup taken before a secret existed restores without it.
   ensure_secrets
   dc up -d postgresql
@@ -342,13 +371,9 @@ cmd_restore() {
   done
   for database in karmax temporal temporal_visibility; do
     dc exec -T postgresql dropdb --if-exists -U temporal --force "$database"
-    dc exec -T postgresql createdb -U temporal "$database"
+    dc exec -T postgresql psql -U temporal -d postgres -v ON_ERROR_STOP=1 \
+      -c "ALTER DATABASE ${database}_restore RENAME TO $database"
   done
-  if [ -f "$source/karmax.dump" ]; then
-    dc exec -T postgresql pg_restore -U temporal -d karmax < "$source/karmax.dump"
-  fi
-  dc exec -T postgresql pg_restore -U temporal -d temporal < "$source/temporal.dump"
-  dc exec -T postgresql pg_restore -U temporal -d temporal_visibility < "$source/temporal-visibility.dump"
   dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore -- /restore
   dc up -d --remove-orphans
   wait_ready || die 'Karmax failed its readiness check after restore'
