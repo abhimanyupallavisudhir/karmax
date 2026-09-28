@@ -56,6 +56,17 @@ These files need **no** Temporal server (fast, cheap, run them freely):
 These boot a Temporal dev server (heavier, one at a time):
 `temporal`, `pipeline`, `workflows`, `gateway`, `autonomy`, `live-agent`.
 
+Hosted deployments run on PostgreSQL. Store-level suites that cover tenancy,
+billing or core store state run on both databases through
+`tests/helpers/store-backends.ts` (`describe.each(storeBackends)`): SQLite
+always, and PostgreSQL too when `KARMAX_TEST_POSTGRES_URL` is set, as it is on
+every CI shard. Each PostgreSQL store gets a schema of its own, dropped when
+its test ends. Locally:
+
+```bash
+KARMAX_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:5432/db npx vitest run tests/store.test.ts
+```
+
 ## CI
 
 CI (`.github/workflows/ci.yml`) splits the suite across parallel runners with

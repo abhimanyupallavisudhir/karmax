@@ -1,5 +1,5 @@
-import { afterEach, expect, it, vi } from 'vitest';
-import { Store } from '../src/store/db.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { storeBackends, type StoreBackend } from './helpers/store-backends.js';
 import { Gateway } from '../src/gateway/server.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
@@ -23,8 +23,8 @@ const users = {
   unverified: { id: 'unverified', name: 'No email', email: '' },
 };
 
-async function boot() {
-  const store = await Store.create(':memory:');
+async function boot(open: StoreBackend['open']) {
+  const store = await open();
   const tokens = new TokenAuthority(), worlds = new WorldRegistry();
   const client = { workflow: { getHandle: () => ({ query: async () => [] }) } } as any;
   const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test' });
@@ -61,69 +61,71 @@ async function boot() {
   return { store, authorization, server, organization, syncSeats, as, invite };
 }
 
-it('joins the invited organization with the invitation\'s authorization and syncs seats', async () => {
-  const { store, authorization, organization, syncSeats, as, invite } = await boot();
-  const token = await invite('invitee@example.test', { level: 'viewer' });
-  // Not yet a member: the organization is closed to the invitee.
-  expect((await as('invitee')(`/api/organizations/${organization.id}/members`)).status).toBe(403);
+describe.each(storeBackends)('invitation acceptance over HTTP ($name)', ({ open }) => {
+  it('joins the invited organization with the invitation\'s authorization and syncs seats', async () => {
+    const { store, authorization, organization, syncSeats, as, invite } = await boot(open);
+    const token = await invite('invitee@example.test', { level: 'viewer' });
+    // Not yet a member: the organization is closed to the invitee.
+    expect((await as('invitee')(`/api/organizations/${organization.id}/members`)).status).toBe(403);
 
-  const accepted = await as('invitee')('/api/invitations/accept', { token });
-  expect(accepted.status).toBe(200);
-  expect(await accepted.json()).toMatchObject({ organizationId: organization.id, userId: 'invitee', role: 'member' });
-  expect(await store.organizationMembership(organization.id, 'invitee')).toMatchObject({ role: 'member' });
-  const caps = await authorization.capabilitiesAsync('user:invitee', undefined, organization.id);
-  expect(caps).toContain('organization:member:read');
-  expect(caps).not.toContain('organization:member:write');
-  expect((await as('invitee')(`/api/organizations/${organization.id}/members`)).status).toBe(200);
-  await vi.waitFor(() => expect(syncSeats).toHaveBeenCalledWith(organization.id));
-  expect((await store.listOrganizationInvitations(organization.id))[0]!.acceptedAt).toEqual(expect.any(Number));
-});
-
-it('refuses a used, expired, forged or someone else\'s invitation as a 400 without granting access', async () => {
-  const { store, authorization, organization, syncSeats, as, invite } = await boot();
-  const accept = (userId: string, token: string) => as(userId)('/api/invitations/accept', { token });
-  const token = await invite('invitee@example.test');
-
-  const wrongPerson = await accept('stranger', token);
-  expect(wrongPerson.status).toBe(400);
-  expect((await wrongPerson.json() as any).error).toMatch(/different email/);
-  expect(await store.organizationMembership(organization.id, 'stranger')).toBeUndefined();
-  expect(await authorization.capabilitiesAsync('user:stranger', undefined, organization.id)).toEqual([]);
-
-  // The failed attempt did not consume the invitation; the right person can still use it once.
-  expect((await accept('invitee', token)).status).toBe(200);
-  const reused = await accept('invitee', token);
-  expect(reused.status).toBe(400);
-  expect((await reused.json() as any).error).toMatch(/already used/);
-
-  const forged = await accept('stranger', 'ki_not-a-real-token');
-  expect(forged.status).toBe(400);
-  expect((await forged.json() as any).error).toMatch(/invalid/);
-  expect((await accept('stranger', '')).status).toBe(400);
-
-  const expired = await store.createOrganizationInvitation({ organizationId: organization.id,
-    email: 'stranger@example.test', invitedBy: 'user:owner', ttlMs: -1 });
-  const late = await accept('stranger', expired.token);
-  expect(late.status).toBe(400);
-  expect((await late.json() as any).error).toMatch(/expired/);
-  expect(await store.organizationMembership(organization.id, 'stranger')).toBeUndefined();
-  expect(syncSeats).toHaveBeenCalledTimes(1);
-});
-
-it('requires a signed-in person with a verified email', async () => {
-  const { store, server, organization, invite } = await boot();
-  const token = await invite('invitee@example.test');
-  const anonymous = await fetch(`${server.url}/api/invitations/accept`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }),
+    const accepted = await as('invitee')('/api/invitations/accept', { token });
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toMatchObject({ organizationId: organization.id, userId: 'invitee', role: 'member' });
+    expect(await store.organizationMembership(organization.id, 'invitee')).toMatchObject({ role: 'member' });
+    const caps = await authorization.capabilitiesAsync('user:invitee', undefined, organization.id);
+    expect(caps).toContain('organization:member:read');
+    expect(caps).not.toContain('organization:member:write');
+    expect((await as('invitee')(`/api/organizations/${organization.id}/members`)).status).toBe(200);
+    await vi.waitFor(() => expect(syncSeats).toHaveBeenCalledWith(organization.id));
+    expect((await store.listOrganizationInvitations(organization.id))[0]!.acceptedAt).toEqual(expect.any(Number));
   });
-  expect(anonymous.status).toBe(401);
 
-  const noEmail = await fetch(`${server.url}/api/invitations/accept`, {
-    method: 'POST', headers: { 'content-type': 'application/json', cookie: 'fixture=unverified' },
-    body: JSON.stringify({ token }),
+  it('refuses a used, expired, forged or someone else\'s invitation as a 400 without granting access', async () => {
+    const { store, authorization, organization, syncSeats, as, invite } = await boot(open);
+    const accept = (userId: string, token: string) => as(userId)('/api/invitations/accept', { token });
+    const token = await invite('invitee@example.test');
+
+    const wrongPerson = await accept('stranger', token);
+    expect(wrongPerson.status).toBe(400);
+    expect((await wrongPerson.json() as any).error).toMatch(/different email/);
+    expect(await store.organizationMembership(organization.id, 'stranger')).toBeUndefined();
+    expect(await authorization.capabilitiesAsync('user:stranger', undefined, organization.id)).toEqual([]);
+
+    // The failed attempt did not consume the invitation; the right person can still use it once.
+    expect((await accept('invitee', token)).status).toBe(200);
+    const reused = await accept('invitee', token);
+    expect(reused.status).toBe(400);
+    expect((await reused.json() as any).error).toMatch(/already used/);
+
+    const forged = await accept('stranger', 'ki_not-a-real-token');
+    expect(forged.status).toBe(400);
+    expect((await forged.json() as any).error).toMatch(/invalid/);
+    expect((await accept('stranger', '')).status).toBe(400);
+
+    const expired = await store.createOrganizationInvitation({ organizationId: organization.id,
+      email: 'stranger@example.test', invitedBy: 'user:owner', ttlMs: -1 });
+    const late = await accept('stranger', expired.token);
+    expect(late.status).toBe(400);
+    expect((await late.json() as any).error).toMatch(/expired/);
+    expect(await store.organizationMembership(organization.id, 'stranger')).toBeUndefined();
+    expect(syncSeats).toHaveBeenCalledTimes(1);
   });
-  expect(noEmail.status).toBe(400);
-  expect((await noEmail.json() as any).error).toMatch(/verified account/);
-  expect(await store.organizationInvitationForToken(token)).toMatchObject({ acceptedAt: undefined });
-  expect((await store.listOrganizationMemberships(organization.id)).map((member) => member.userId)).toEqual(['owner']);
+
+  it('requires a signed-in person with a verified email', async () => {
+    const { store, server, organization, invite } = await boot(open);
+    const token = await invite('invitee@example.test');
+    const anonymous = await fetch(`${server.url}/api/invitations/accept`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }),
+    });
+    expect(anonymous.status).toBe(401);
+
+    const noEmail = await fetch(`${server.url}/api/invitations/accept`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: 'fixture=unverified' },
+      body: JSON.stringify({ token }),
+    });
+    expect(noEmail.status).toBe(400);
+    expect((await noEmail.json() as any).error).toMatch(/verified account/);
+    expect(await store.organizationInvitationForToken(token)).toMatchObject({ acceptedAt: undefined });
+    expect((await store.listOrganizationMemberships(organization.id)).map((member) => member.userId)).toEqual(['owner']);
+  });
 });

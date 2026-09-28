@@ -6,11 +6,12 @@ import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { Store, isReviewRequestEvent, deleteRows } from '../src/store/db.js';
+import { storeBackends } from './helpers/store-backends.js';
 
-describe('Store', () => {
+describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
   let store: Store;
   beforeEach(async () => {
-    store = (await Store.create(':memory:'));
+    store = (await open());
   });
 
   // A parent's Sub-tasks panel reads its children from here: a finished child is
@@ -94,10 +95,10 @@ describe('Store', () => {
     const prepare = vi.spyOn(store.db, 'prepare');
     expect(await store.kvEntries('case:A')).toEqual([{ key: 'case:A', value: 'one' }]);
     expect(await store.kvEntries('case%')).toEqual([{ key: 'case%literal', value: 'three' }]);
-    expect(prepare.mock.calls.some(([sql]) => /FROM kv WHERE k >= \? AND k < \?/.test(sql))).toBe(true);
+    expect(prepare.mock.calls.some(([sql]) => /FROM kv WHERE k(?: COLLATE "C")? >= \? AND k(?: COLLATE "C")? < \?/.test(sql))).toBe(true);
   });
 
-  it('indexes event type with task id for inbox and approval scans', async () => {
+  it.skipIf(name !== 'SQLite')('indexes event type with task id for inbox and approval scans', async () => {
     const indexes = await store.db.prepare('PRAGMA index_list(events)').all() as Array<{ name: string }>;
     expect(indexes.map((row) => row.name)).toContain('idx_events_type');
   });
@@ -110,7 +111,7 @@ describe('Store', () => {
     expect(queries.some((sql) => /SELECT id, config FROM projects|SELECT k, v FROM kv WHERE k LIKE 'vault:items/.test(sql))).toBe(false);
   });
 
-  it('expires old events and audit entries while retaining recent history', async () => {
+  it.skipIf(name !== 'SQLite')('expires old events and audit entries while retaining recent history', async () => {
     expect(((await store.db.prepare('PRAGMA synchronous').get()) as { synchronous: number }).synchronous).toBe(1);
     const now = Date.UTC(2026, 8, 26);
     const project = await store.createProject('Retention');
@@ -167,7 +168,7 @@ describe('Store', () => {
     expect(queries.some((sql) => sql.includes('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL'))).toBe(false);
   });
 
-  it('backfills indexed scopes on legacy durable tokens', async () => {
+  it.skipIf(name !== 'SQLite')('backfills indexed scopes on legacy durable tokens', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-token-scope-'));
     const file = path.join(dir, 'store.db');
     const legacy = new DatabaseSync(file);
@@ -197,14 +198,14 @@ describe('Store', () => {
     const sql = prepare.mock.calls.map(([statement]) => String(statement));
     prepare.mockRestore();
     expect(sql.filter((statement) => /FROM kv WHERE substr\(k/.test(statement))).toEqual([]);
-    expect(sql.some((statement) => /FROM kv WHERE k >= \? AND k < \?/.test(statement))).toBe(true);
+    expect(sql.some((statement) => /FROM kv WHERE k(?: COLLATE "C")? >= \? AND k(?: COLLATE "C")? < \?/.test(statement))).toBe(true);
     expect(await store.kvGet(`turnsession:${task.id}#1`)).toBeUndefined();
     expect(await store.kvGet(`conversation-share:share-${task.id}`)).toBeUndefined();
     expect(await store.kvGet(`turnsession:${kept.id}#1`)).toBeUndefined();
     expect(await store.kvGet(`conversation-share:share-${kept.id}`)).toBe('y');
   });
 
-  it('repairs unclassified usage at each boot through an index of only those rows (PS-5)', async () => {
+  it.skipIf(name !== 'SQLite')('repairs unclassified usage at each boot through an index of only those rows (PS-5)', async () => {
     const insert = (id: string, costMicros: number) => store.db.prepare(`INSERT INTO usage_events
       (id, organizationId, provider, kind, quantity, unit, costMicros, startedAt, endedAt, costClassification)
       VALUES (?, 'org_personal', 'anthropic', 'model.tokens', 1, 'token', ?, 0, 1, 'none')`).run(id, costMicros);
@@ -230,7 +231,7 @@ describe('Store', () => {
       base: 'main', _authorization: { capabilities: ['new'] }, nullable: null });
   });
 
-  it('defaults and migrates hosted projects to PR delivery while rejecting new local-only writes', async () => {
+  it.skipIf(name !== 'SQLite')('defaults and migrates hosted projects to PR delivery while rejecting new local-only writes', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-hosted-remote-'));
     const dbPath = path.join(dir, 'karmax.db');
     const previous = process.env.KARMAX_DEPLOYMENT;
@@ -259,7 +260,7 @@ describe('Store', () => {
     }
   });
 
-  it('removes legacy E2B lease estimates while preserving reconciled executions', async () => {
+  it.skipIf(name !== 'SQLite')('removes legacy E2B lease estimates while preserving reconciled executions', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-e2b-usage-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = (await Store.create(dbPath));
@@ -295,7 +296,7 @@ describe('Store', () => {
     expect((await store.usageSummary('org_personal', boundary, boundary + 10_000)).costMicros).toBe(50);
   });
 
-  it('preserves configured turn caps when migrating role-default profiles', async () => {
+  it.skipIf(name !== 'SQLite')('preserves configured turn caps when migrating role-default profiles', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     // an older build persisted a role default with maxTurns
@@ -313,7 +314,7 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('backfills folder-as-domain metadata on legacy pass-connector vault items', async () => {
+  it.skipIf(name !== 'SQLite')('backfills folder-as-domain metadata on legacy pass-connector vault items', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-domain-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s1 = (await Store.create(dbPath));
@@ -348,7 +349,7 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('migrates expanded legacy project infrastructure defaults back to organization inheritance', async () => {
+  it.skipIf(name !== 'SQLite')('migrates expanded legacy project infrastructure defaults back to organization inheritance', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-policy-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = {
@@ -377,7 +378,7 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('adds tag descriptions to an existing tag catalogue', async () => {
+  it.skipIf(name !== 'SQLite')('adds tag descriptions to an existing tag catalogue', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-tag-description-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = (await Store.create(dbPath));
@@ -395,7 +396,7 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('backfills kind-less tags to topic on an existing catalogue', async () => {
+  it.skipIf(name !== 'SQLite')('backfills kind-less tags to topic on an existing catalogue', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-tag-kind-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = (await Store.create(dbPath));
@@ -567,7 +568,7 @@ describe('Store', () => {
     await expect((async () => (await store.projectFolderProjects(sibling.id, 'Work/Customers')))()).rejects.toThrow(/does not belong/i);
   });
 
-  it('keeps creation order for projects that predate the sidebar ordering column', async () => {
+  it.skipIf(name !== 'SQLite')('keeps creation order for projects that predate the sidebar ordering column', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-ord-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = (await Store.create(dbPath));
@@ -616,7 +617,7 @@ describe('Store', () => {
   });
 
   it('keeps organization names unique across organizations and users', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     store.connectUserNames(() => [{ id: 'alice', name: 'Alice' }]);
     const acme = (await store.createOrganization({ name: 'Acme' }));
 
@@ -626,7 +627,7 @@ describe('Store', () => {
     expect((await store.createOrganization({ name: 'Alice', kind: 'personal', ownerUserId: 'alice' })).name).toBe('Alice');
   });
 
-  it('disambiguates organization names that predate the unique-name index', async () => {
+  it.skipIf(name !== 'SQLite')('disambiguates organization names that predate the unique-name index', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-org-name-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     try {
@@ -701,7 +702,7 @@ describe('Store', () => {
     expect((await store.getTask(second.id))!.params.confirm).toEqual({ mode: 'human' }); // mirrored onto every attempt
   });
 
-  it('does not turn persisted attempts into top-level tasks on restart', async () => {
+  it.skipIf(name !== 'SQLite')('does not turn persisted attempts into top-level tasks on restart', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-attempt-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s1 = (await Store.create(dbPath));
@@ -792,7 +793,7 @@ describe('Store', () => {
     expect((await store.getTaskByNum(p.id, 1))!.id).toBe(first.id);
   });
 
-  it('backfills per-project task numbers for rows created before the column existed', async () => {
+  it.skipIf(name !== 'SQLite')('backfills per-project task numbers for rows created before the column existed', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-num-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s1 = (await Store.create(dbPath));
@@ -836,7 +837,7 @@ describe('Store', () => {
     expect((await store.getTask(t.id))!.notes).toBeUndefined(); // empty clears
   });
 
-  it('adds the notes column to a pre-existing database on reopen', async () => {
+  it.skipIf(name !== 'SQLite')('adds the notes column to a pre-existing database on reopen', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-notes-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s1 = (await Store.create(dbPath));
@@ -1033,7 +1034,7 @@ describe('Store', () => {
     expect((await store.listProfiles())).toHaveLength(1);
   });
 
-  it('opens with a busy timeout so lock collisions wait instead of failing', async () => {
+  it.skipIf(name !== 'SQLite')('opens with a busy timeout so lock collisions wait instead of failing', async () => {
     expect(((await store.db.prepare('PRAGMA busy_timeout').get()) as any).timeout).toBe(5000);
   });
 
@@ -1171,12 +1172,13 @@ describe('Store', () => {
     // used to make deleteProject a hard error for a large project.
     const ids = Array.from({ length: 40_000 }, (_, i) => `t_${i}`);
     (await store.db.prepare("INSERT INTO task_tags (taskId, tagId) VALUES ('t_5', 'tag_x')").run());
-    expect(() => deleteRows(store.db as any, 'task_tags', 'taskId', ids)).not.toThrow();
+    (await store.db.prepare("INSERT INTO task_tags (taskId, tagId) VALUES ('t_39999', 'tag_x')").run());
+    await expect(deleteRows(store.db as any, 'task_tags', 'taskId', ids)).resolves.toBeUndefined();
     expect(Number(((await store.db.prepare('SELECT COUNT(*) n FROM task_tags').get()) as any).n)).toBe(0);
     expect(project.id).toBeTruthy();
   });
 
-  it('a write waits out another process holding the write lock (no "database is locked")', async () => {
+  it.skipIf(name !== 'SQLite')('a write waits out another process holding the write lock (no "database is locked")', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-lock-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s = (await Store.create(dbPath));
