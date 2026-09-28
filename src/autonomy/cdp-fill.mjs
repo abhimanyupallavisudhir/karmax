@@ -16,7 +16,13 @@
  *   argv[3] expectDomains   comma-separated domains the page origin must match
  *   argv[4] cdpUrl          loopback DevTools endpoint (default 127.0.0.1:9222)
  * On success prints {"origin":"https://..."} to stdout; on failure prints
- * {"error":"..."} and exits 1. Uses only Node built-ins and a hand-rolled
+ * {"error":"..."} and exits 1.
+ *
+ * `--bridge <nonce> <expectDomains> <cdpUrl>` instead relays the matching
+ * page's CDP session over this process's terminal (world-fill.ts
+ * openWorldPage), so the gateway can hold a passkey authenticator in a remote
+ * world's browser across the agent's click. Lines in are base64 CDP messages;
+ * lines out are `@@<nonce>@@ <json>`, which the command's own echo never is. Uses only Node built-ins and a hand-rolled
  * WebSocket client over node:net, so it runs on the sandbox's own node — the
  * default E2B template ships Node 20, which has no global WebSocket.
  */
@@ -77,6 +83,9 @@ function wsClient(wsUrl) {
       sock.write(Buffer.concat([head, mask, masked]));
     };
 
+    let closed;
+    const ended = new Promise((resolve) => { closed = resolve; });
+    sock.on('close', () => closed());
     const onMessage = (text) => {
       for (const l of listeners) l(text);
     };
@@ -136,6 +145,7 @@ function wsClient(wsUrl) {
           setTimeout(() => { if (pending.delete(id)) rej(new Error(`CDP ${method} timed out`)); }, TIMEOUT);
         }),
         close: () => sock.destroy(),
+        raw: { send: (text) => sendFrame(0x1, Buffer.from(text)), listen: (listener) => listeners.add(listener), ended },
       };
     };
 
@@ -154,22 +164,51 @@ function wsClient(wsUrl) {
 
 const connect = wsClient;
 
-async function main() {
-  if (!expectDomains.length) fail('browser fill requires credential domains');
-  const checkOnly = process.argv[5] === '--check';
-  const secret = await readStdin();
-  if (!checkOnly && !secret) fail('no secret on stdin');
+/** The page whose target-list url matches `domains`; its live origin is checked by the caller. */
+async function findPage(cdpUrl, domains) {
   const base = assertLoopback(cdpUrl);
   const list = await (await fetch(new URL('/json/list', base), { signal: AbortSignal.timeout(TIMEOUT) })).json();
   if (process.env.KARMAX_CDP_DEBUG)
     process.stderr.write(`[cdp-fill] /json/list: ${JSON.stringify(list.map((t) => ({ type: t.type, url: t.url, ws: !!t.webSocketDebuggerUrl })))}\n`);
   const pages = list.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-  const page = expectDomains.length
-    ? pages.find((t) => { try { return expectDomains.some((d) => domainMatches(new URL(t.url).hostname, d)); } catch { return false; } })
+  const page = domains.length
+    ? pages.find((t) => { try { return domains.some((d) => domainMatches(new URL(t.url).hostname, d)); } catch { return false; } })
     : pages[0];
-  if (!page) fail(expectDomains.length
-    ? `no open page matches ${expectDomains.join(', ')} — navigate to the login page first`
+  if (!page) throw new Error(domains.length
+    ? `no open page matches ${domains.join(', ')} — navigate to the login page first`
     : 'no open page at the CDP endpoint');
+  return page;
+}
+
+async function bridge(nonce, domainCsv, bridgeCdpUrl) {
+  const emit = (message) => process.stdout.write(`@@${nonce}@@ ${JSON.stringify(message)}\n`);
+  try {
+    const domains = domainCsv.split(',').map((s) => s.trim()).filter(Boolean);
+    if (!/^[0-9a-f]{16,}$/.test(nonce) || !domains.length) throw new Error('bridge needs a nonce and target domains');
+    const session = await connect((await findPage(bridgeCdpUrl, domains)).webSocketDebuggerUrl);
+    session.raw.listen((text) => emit({ cdp: text }));
+    session.raw.ended.then(() => process.exit(0));
+    let pending = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => {
+      pending += chunk;
+      for (let end; (end = pending.search(/[\r\n]/)) >= 0; pending = pending.slice(end + 1)) {
+        const line = pending.slice(0, end).trim();
+        if (line) session.raw.send(Buffer.from(line, 'base64').toString('utf8'));
+      }
+    });
+    process.stdin.on('end', () => { session.close(); process.exit(0); });
+    emit({ ready: true });
+  } catch (e) { emit({ error: e?.message ?? String(e) }); process.exit(1); }
+}
+
+async function main() {
+  if (!expectDomains.length) fail('browser fill requires credential domains');
+  const checkOnly = process.argv[5] === '--check';
+  const secret = await readStdin();
+  if (!checkOnly && !secret) fail('no secret on stdin');
+  let page;
+  try { page = await findPage(cdpUrl, expectDomains); } catch (e) { fail(e.message); }
 
   const session = await connect(page.webSocketDebuggerUrl);
   try {
@@ -200,4 +239,5 @@ async function main() {
   }
 }
 
-main().then(() => process.exit(0)).catch((e) => fail(e?.message ?? String(e)));
+if (process.argv[2] === '--bridge') void bridge(process.argv[3] ?? '', process.argv[4] ?? '', process.argv[5] ?? '');
+else main().then(() => process.exit(0)).catch((e) => fail(e?.message ?? String(e)));

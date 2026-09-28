@@ -480,7 +480,7 @@ export class CodexAdapter implements AgentAdapter {
     const child: any = remote
       ? spawnRemoteAgentProcess({ world: runtimeWorld, provider: 'codex', command: cmd, args: ['app-server', ...mcpFlags], cwd, env, signal: ctx.signal })
       : spawn(cmd, ['app-server', ...mcpFlags], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
-    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
+    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', taskId: input.world.handle.id, role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
     const platformHandlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     let stderr = '';

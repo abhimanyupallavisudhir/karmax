@@ -93,13 +93,27 @@ describe('credential selection ranking through HTTP', () => {
         headers: { authorization: `Bearer ${agent.token}` },
       });
       expect(await managedProviders.json()).toHaveProperty('webhookUrl');
+      // AU-12/AU-14: a passkey ceremony runs in the calling task's own browser,
+      // never at an endpoint the agent names.
+      const enroll = async () => {
+        const response = await fetch(`${running.url}/api/vault/passkey/enroll`, {
+          method: 'POST', headers: { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ domain: 'example.com', cdpUrl: 'http://127.0.0.1:1' }),
+        });
+        expect(response.status).toBe(400);
+        return (await response.json() as any).error as string;
+      };
+      expect(await enroll()).toMatch(/call this from a task that has a world/);
+      const view = { taskId: task.id, title: 'Fill', workflow: 'just-do', stage: 'do', status: 'active' } as any;
+      await store.saveView(task.id, { ...view, worldPath: home, branch: 'karmax/fill' });
+      expect(await enroll()).toMatch(/no agent of this task is running/);
       (gateway as any).deps.hosted = true;
-      const remotePasskey = await fetch(`${running.url}/api/vault/passkey/enroll`, {
-        method: 'POST', headers: { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ domain: 'example.com', cdpUrl: 'http://127.0.0.1:1' }),
-      });
-      expect(remotePasskey.status).toBe(400);
-      expect((await remotePasskey.json() as any).error).toMatch(/remote passkey sessions/);
+      expect(await enroll()).toMatch(/hosted passkeys run in the task's remote world/);
+      const opened: any[] = [];
+      (gateway as any).openTaskWorldPage = async (...args: any[]) => { opened.push(args); throw new Error('world page opened'); };
+      await store.saveView(task.id, { ...view, world: { kind: 'container', id: task.id, root: home, branch: 'karmax/fill', base: 'main' } });
+      expect(await enroll()).toBe('world page opened');
+      expect(opened).toEqual([[task.id, expect.objectContaining({ kind: 'container' }), ['example.com']]]);
 
 
     } finally {

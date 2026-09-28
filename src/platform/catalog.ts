@@ -235,7 +235,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/vault/import/bitwarden (one-time plaintext Bitwarden JSON export; idempotent by Bitwarden item id; encrypted immediately and the request body is not retained as a file)',
     'POST /api/vault/store (agent write-back of a newly created credential; body {id?, type, label, domains?, username?, secrets?})',
     'POST /api/vault/resolve (plaintext reveal, per-item grant + policy gated; body {itemId?|domain?, field?})',
-    'POST /api/vault/fill (zero-exposure browser fill via CDP; body {itemId?|domain?, field?, selector, cdpUrl?})',
+    'POST /api/vault/fill (zero-exposure fill into the calling task\'s own browser; body {itemId?|domain?, field?, selector})',
     'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access or report a wrong secret; body {itemId?|domain?, field?, mode?, kind?: access|reset, why, urgency?}; approval is high urgency by default)',
     'POST /api/vault/requests/:id/resolve (credential:write: body {action: once|task|always|deny, itemId?})',
     'GET /api/vault/connectors (hosted 1Password + Git-backed pass; host-local Bitwarden/1Password/pass where available)',

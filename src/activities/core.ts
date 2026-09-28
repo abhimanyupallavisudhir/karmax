@@ -80,6 +80,7 @@ import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
 import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
+import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
@@ -2704,7 +2705,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 onSpend: async (req: any, outcome: any) => { await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }); },
                 fillPaymentCard: async (fill: {
                   requestId: string;
-                  cdpUrl: string;
                   selectors: import('../autonomy/card-fill.js').CardFillSelectors;
                 }) => {
                   const { request, domain } = await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).claimFill({
@@ -2727,31 +2727,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   const expected = [domain];
                   let origin: string;
                   // Fill the browser the agent's MCP drives: inside the world whenever
-                  // the agent itself runs there (cloud sandboxes and containers).
+                  // the agent itself runs there (cloud sandboxes and containers), else
+                  // the one this task's agent launched on the host (AU-32).
                   if (isRemoteAgentWorld(world)) {
                     origin = (await fillCardInWorld(world, {
-                      cdpUrl: fill.cdpUrl, domain, selectors: fill.selectors, details,
+                      cdpUrl: WORLD_CDP_URL, domain, selectors: fill.selectors, details,
                     })).origin;
                   } else {
-                    origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.number,
+                    const cdpUrl = localTaskBrowserUrl(args.taskId);
+                    origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.number,
                       text: details.number, expectDomains: expected })).origin;
                     const month = String(details.expMonth).padStart(2, '0');
                     if (fill.selectors.expiry) {
-                      origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.expiry,
+                      origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.expiry,
                         text: `${month}/${String(details.expYear).slice(-2)}`, expectDomains: expected })).origin;
                     } else {
-                      origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.expMonth!,
+                      origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.expMonth!,
                         text: month, expectDomains: expected })).origin;
-                      origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.expYear!,
+                      origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.expYear!,
                         text: String(details.expYear), expectDomains: expected })).origin;
                     }
-                    origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.cvc,
+                    origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.cvc,
                       text: details.cvc, expectDomains: expected })).origin;
                     // Billing fields, where the card carries one and the form asks.
                     for (const field of BILLING_FIELDS) {
                       const selector = fill.selectors[field];
                       const value = details.billing?.[field];
-                      if (selector && value) origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl,
+                      if (selector && value) origin = (await fillViaCdp({ cdpUrl,
                         selector, text: value, expectDomains: expected })).origin;
                     }
                   }

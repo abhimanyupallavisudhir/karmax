@@ -61,7 +61,6 @@ export interface PlatformToolContext {
    * Card details remain in the trusted activity process and never enter model IO. */
   fillPaymentCard?(args: {
     requestId: string;
-    cdpUrl: string;
     selectors: import('../autonomy/card-fill.js').CardFillSelectors;
   }): Promise<{ filled: true; origin: string }>;
   /** Call the capability-checked karmax gateway under this turn's scoped token. */

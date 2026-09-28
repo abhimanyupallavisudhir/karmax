@@ -70,7 +70,7 @@ import { worldHandleForView } from '../world/resolve.js';
 import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
 import { createCodexConversationExport, readCodexConversationExport } from '../store/conversation-exports.js';
 import type { AccessMode, AccessStatus, VaultFieldName } from '../autonomy/vault-items.js';
-import { defaultCdpUrl } from '../autonomy/cdp-endpoint.js';
+import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { newId } from '../util/id.js';
 import { DurableEventFanout } from './fanout.js';
 import { authorizationChanged, authorizationEpoch } from '../store/authorization-epoch.js';
@@ -84,7 +84,7 @@ import { credentialResource, resourceDriverCatalog, snapshotResource } from '../
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/repository.js';
-import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
+import { worldRepos, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
@@ -6559,7 +6559,7 @@ export class Gateway {
           };
           try {
             const origin = await this.fillCredential(callerTaskId, {
-              selector: String(b.selector ?? ''), cdpUrl: b.cdpUrl, expectDomains: item.domains, resolveText,
+              selector: String(b.selector ?? ''), expectDomains: item.domains, resolveText,
             });
             return this.json(res, 200, { status: 'granted', itemId: item.id, filled: true, origin });
           } catch (e) {
@@ -6695,12 +6695,16 @@ export class Gateway {
 
         // ── agent-enrolled passkeys (§8) ──
         if (p.startsWith('/api/vault/passkey')) {
-          const passkeyTask = callerTaskId ? await store.getTask(callerTaskId) : undefined;
-          const passkeyWorld = passkeyTask ? worldHandleForView(passkeyTask.lastView, callerTaskId!,
-            await store.effectiveProjectConfig(passkeyTask.projectId)) : undefined;
-          if (this.deps.hosted || (passkeyWorld && (worldHandleIsRemote(passkeyWorld)
-            || this.deps.worlds.get(passkeyWorld.kind)?.capabilities?.remote)))
-            return this.json(res, 400, { error: 'passkeys require a local browser; remote passkey sessions are not available yet' });
+          // A passkey ceremony runs in the calling task's own browser (AU-12,
+          // AU-14): its world's, relayed over a world terminal, or on this host
+          // the one its agent launched.
+          const passkeyWorld = await this.taskWorldHandle(callerTaskId);
+          if (!passkeyWorld) return this.json(res, 400, { error: 'passkeys run in a task\'s own browser; call this from a task that has a world' });
+          const inWorld = this.agentRunsInWorld(passkeyWorld);
+          if (this.deps.hosted && !inWorld) return this.json(res, 400, { error: 'hosted passkeys run in the task\'s remote world' });
+          const passkeyPage = inWorld
+            ? (domains: string[]) => this.openTaskWorldPage(callerTaskId!, passkeyWorld, domains)
+            : async (domains: string[]) => (await import('../autonomy/cdp.js')).openPage(localTaskBrowserUrl(callerTaskId), { expectDomains: domains });
           const passkeyOwner = JSON.stringify([organizationId, principal, callerTaskId]);
           if (!this.passkeys) {
             const { PasskeyManager } = await import('../autonomy/passkey.js');
@@ -6711,7 +6715,7 @@ export class Gateway {
           try {
             if (p === '/api/vault/passkey/enroll' && method === 'POST') {
               const domains = Array.isArray(b.domains) ? b.domains.map(String) : b.domain ? [String(b.domain)] : undefined;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'enroll', owner: passkeyOwner });
+              const started = await this.passkeys.begin(passkeyPage, { expectDomains: domains, mode: 'enroll', owner: passkeyOwner });
               return this.json(res, 200, { ...started, next: 'trigger the site\'s "create a passkey" button in the browser, then POST /api/vault/passkey/save with this authenticatorId' });
             }
             if (p === '/api/vault/passkey/save' && method === 'POST') {
@@ -6738,7 +6742,7 @@ export class Gateway {
               if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
               const creds = JSON.parse((await vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' }))) as any[];
               const domains = item.domains;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner,
+              const started = await this.passkeys.begin(passkeyPage, { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner,
                 onCredentials: async updated => {
                   await store.transaction(async () => {
                     const current = await vault.get(item.id);
@@ -8533,29 +8537,52 @@ export class Gateway {
    * so the fill runs INSIDE the world via `world.exec`, the secret handed over
    * stdin (never argv/env/a file). The agent still controls its browser. Either way
    * the live page origin is re-verified against the item's domains before typing.
+   * The browser is always the calling task's own, never one the agent names
+   * (AU-14): its world's, or on the host the one its agent launched.
    */
   private async fillCredential(callerTaskId: string | undefined, args: {
-    selector: string; cdpUrl?: unknown; expectDomains?: string[]; resolveText: () => string | Promise<string>;
+    selector: string; expectDomains?: string[]; resolveText: () => string | Promise<string>;
   }): Promise<string> {
-    const cdpUrl = String(args.cdpUrl ?? defaultCdpUrl());
-    const task = callerTaskId ? (await this.deps.store.getTask(callerTaskId)) : undefined;
-    const handle = task
-      ? worldHandleForView(task.lastView, callerTaskId!, (await this.deps.store.effectiveProjectConfig(task.projectId)))
-      : undefined;
-    const remote = !!handle && (worldHandleIsRemote(handle) || !!this.deps.worlds.get(handle.kind)?.capabilities?.remote);
-    if (handle && remote) {
+    const handle = await this.taskWorldHandle(callerTaskId);
+    if (handle && this.agentRunsInWorld(handle)) {
       let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
       try {
         access = this.deps.worldAccess ? await this.deps.worldAccess.open(callerTaskId!, handle) : undefined;
         const world = access?.world ?? await this.deps.worlds.open(handle);
         const { fillInWorld } = await import('../autonomy/world-fill.js');
-        return (await fillInWorld(world, { selector: args.selector, expectDomains: args.expectDomains, cdpUrl, resolveText: args.resolveText })).origin;
+        return (await fillInWorld(world, { selector: args.selector, expectDomains: args.expectDomains, cdpUrl: WORLD_CDP_URL, resolveText: args.resolveText })).origin;
       } finally {
         await access?.release();
       }
     }
     const { fillViaCdp } = await import('../autonomy/fill.js');
-    return (await fillViaCdp({ cdpUrl, selector: args.selector, resolveText: args.resolveText, expectDomains: args.expectDomains })).origin;
+    return (await fillViaCdp({ cdpUrl: localTaskBrowserUrl(callerTaskId), selector: args.selector, resolveText: args.resolveText, expectDomains: args.expectDomains })).origin;
+  }
+
+  /** A page session in the task world's browser, holding the world open until it closes. */
+  private async openTaskWorldPage(taskId: string, handle: WorldHandle, expectDomains: string[]) {
+    const access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+    let released = false;
+    const release = async () => { if (!released) { released = true; await access?.release(); } };
+    try {
+      const world = access?.world ?? await this.deps.worlds.open(handle);
+      const { openWorldPage } = await import('../autonomy/world-fill.js');
+      return await openWorldPage(world, { expectDomains, cdpUrl: WORLD_CDP_URL, onClose: release });
+    } catch (e) {
+      await release();
+      throw e;
+    }
+  }
+
+  private async taskWorldHandle(taskId: string | undefined) {
+    const task = taskId ? (await this.deps.store.getTask(taskId)) : undefined;
+    return task ? worldHandleForView(task.lastView, taskId!, (await this.deps.store.effectiveProjectConfig(task.projectId))) : undefined;
+  }
+
+  /** Does the task's agent — and so its browser — run inside its world (a cloud
+   *  sandbox or a container) rather than on this host? */
+  private agentRunsInWorld(handle: WorldHandle): boolean {
+    return handle.kind === 'container' || worldHandleIsRemote(handle) || !!this.deps.worlds.get(handle.kind)?.capabilities?.remote;
   }
 
   private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {

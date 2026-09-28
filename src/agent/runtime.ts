@@ -57,7 +57,6 @@ export interface RunTurnDeps {
   platformRequest?: (method: string, path: string, body?: unknown) => Promise<unknown>;
   fillPaymentCard?: (args: {
     requestId: string;
-    cdpUrl: string;
     selectors: import('../autonomy/card-fill.js').CardFillSelectors;
   }) => Promise<{ filled: true; origin: string }>;
 }

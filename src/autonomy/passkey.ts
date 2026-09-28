@@ -25,6 +25,10 @@ export interface PasskeyCredential {
   signCount?: number;
 }
 
+/** Opens an origin-verified session on the task browser's page for `expectDomains`:
+ *  a loopback CDP URL on this host, or `openWorldPage` in a remote world. */
+export type PageOpener = (expectDomains: string[]) => Promise<{ session: CdpSession; origin: string }>;
+
 const AUTH_OPTIONS = {
   protocol: 'ctap2',
   transport: 'internal',
@@ -42,13 +46,16 @@ export class PasskeyManager {
 
 
   /**
-   * Prepare a virtual authenticator on the page (origin-verified). For `login`,
+   * Prepare a virtual authenticator on the page (origin-verified), in the task's
+   * own browser. For `login`,
    * the stored credential is loaded so the agent can immediately sign in. The
    * session stays open (held under TTL) until `harvest`/`release`.
    */
-  async begin(cdpUrl: string, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }): Promise<{ authenticatorId: string; origin: string }> {
+  async begin(page: string | PageOpener, opts: { expectDomains?: string[]; mode: 'enroll' | 'login'; credential?: PasskeyCredential; owner: string; onCredentials?: (credentials: PasskeyCredential[]) => Promise<void> }): Promise<{ authenticatorId: string; origin: string }> {
     if (!opts.owner || !opts.expectDomains?.length) throw new Error('passkey sessions require an owner and target domains');
-    const { session, origin } = await openPage(cdpUrl, { expectDomains: opts.expectDomains });
+    const { session, origin } = typeof page === 'string'
+      ? await openPage(page, { expectDomains: opts.expectDomains })
+      : await page(opts.expectDomains);
     try {
       await session.call('WebAuthn.enable', { enableUI: false });
       const added = await session.call('WebAuthn.addVirtualAuthenticator', { options: AUTH_OPTIONS });
