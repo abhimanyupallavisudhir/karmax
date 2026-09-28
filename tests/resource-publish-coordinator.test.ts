@@ -95,14 +95,23 @@ describe('resource publish coordinator', () => {
       if (promoteRevision.mock.calls.length === 1) await gate;
       return cas(...args);
     });
+    // Promotions still in flight when an assertion fails would keep calling
+    // Temporal after the harness closes its client (an unhandled "Channel has
+    // been shut down" in whichever test file runs next).
+    const pending: Promise<unknown>[] = [];
     try {
       const firstPromotion = h.resources.promote(first.task.id, attachment.id);
+      pending.push(firstPromotion);
       await expect.poll(async () => (await view(attachment.id).catch(() => undefined))?.current?.taskId,
         { timeout: 15_000 }).toBe(first.task.id);
       const secondPromotion = h.resources.promote(second.task.id, attachment.id);
+      pending.push(secondPromotion);
       const secondOutcome = secondPromotion.then(() => 'promoted', (error: Error) => error.message);
       await expect.poll(async () => (await view(attachment.id)).queue.map((item) => item.taskId), { timeout: 15_000 })
         .toEqual([second.task.id]);
+      // The first still snapshots its files between taking the lease and its
+      // CAS; on a loaded machine the second is queued before that CAS starts.
+      await expect.poll(() => promoteRevision.mock.calls.length, { timeout: 15_000 }).toBe(1);
       // The second task is parked in the queue, not racing the first one's CAS.
       expect(promoteRevision).toHaveBeenCalledTimes(1);
 
@@ -127,6 +136,7 @@ describe('resource publish coordinator', () => {
     } finally {
       promoteRevision.mockRestore();
       open();
+      await Promise.race([Promise.allSettled(pending), new Promise((resolve) => setTimeout(resolve, 30_000))]);
     }
   }, 120_000);
 });
