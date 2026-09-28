@@ -1,0 +1,214 @@
+{
+ "benchmark": "benchmarks/remote-bootstrap.ts 6 512 [promptMs]",
+ "date": "2026-09-28",
+ "items": [
+  "LT-1",
+  "AD-12",
+  "AD-13"
+ ],
+ "latency": {
+  "roundTripMs": 180,
+  "bytesPerMs": 10000,
+  "cliStartMs": 900,
+  "accountReadMs": 700
+ },
+ "note": "Fake Codex app-server in a directory sandbox; no sandbox, model or credit. before = 447a8190 (adapter only; its turns had no overlap, so with an 800 ms prompt preparation they take 800 ms longer). after = this branch.",
+ "before": [
+  {
+   "turn": 1,
+   "modelStartMs": 4822,
+   "exportMs": 861,
+   "roundTrips": 18,
+   "uploadedKiB": 13,
+   "downloadedKiB": 742,
+   "cliStarts": 2,
+   "historyKiB": 555
+  },
+  {
+   "turn": 2,
+   "modelStartMs": 7085,
+   "exportMs": 1066,
+   "roundTrips": 26,
+   "uploadedKiB": 1127,
+   "downloadedKiB": 2908,
+   "cliStarts": 2,
+   "historyKiB": 1067
+  },
+  {
+   "turn": 3,
+   "modelStartMs": 7604,
+   "exportMs": 1340,
+   "roundTrips": 26,
+   "uploadedKiB": 2150,
+   "downloadedKiB": 4954,
+   "cliStarts": 2,
+   "historyKiB": 1578
+  },
+  {
+   "turn": 4,
+   "modelStartMs": 7909,
+   "exportMs": 1141,
+   "roundTrips": 26,
+   "uploadedKiB": 3173,
+   "downloadedKiB": 7001,
+   "cliStarts": 2,
+   "historyKiB": 2090
+  },
+  {
+   "turn": 5,
+   "modelStartMs": 8216,
+   "exportMs": 1465,
+   "roundTrips": 26,
+   "uploadedKiB": 4197,
+   "downloadedKiB": 9047,
+   "cliStarts": 2,
+   "historyKiB": 2601
+  },
+  {
+   "turn": 6,
+   "modelStartMs": 8430,
+   "exportMs": 1665,
+   "roundTrips": 26,
+   "uploadedKiB": 5220,
+   "downloadedKiB": 11094,
+   "cliStarts": 2,
+   "historyKiB": 3113
+  }
+ ],
+ "after": [
+  {
+   "turn": 1,
+   "modelStartMs": 2415,
+   "exportMs": 936,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 741,
+   "cliStarts": 1,
+   "historyKiB": 555
+  },
+  {
+   "turn": 2,
+   "modelStartMs": 2446,
+   "exportMs": 889,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 1067
+  },
+  {
+   "turn": 3,
+   "modelStartMs": 2444,
+   "exportMs": 884,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 1578
+  },
+  {
+   "turn": 4,
+   "modelStartMs": 2437,
+   "exportMs": 867,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 2090
+  },
+  {
+   "turn": 5,
+   "modelStartMs": 2438,
+   "exportMs": 892,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 2601
+  },
+  {
+   "turn": 6,
+   "modelStartMs": 2444,
+   "exportMs": 868,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 3113
+  }
+ ],
+ "afterWithPromptPreparation800ms": [
+  {
+   "turn": 1,
+   "modelStartMs": 2971,
+   "exportMs": 863,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 741,
+   "cliStarts": 1,
+   "historyKiB": 555
+  },
+  {
+   "turn": 2,
+   "modelStartMs": 2966,
+   "exportMs": 936,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 1067
+  },
+  {
+   "turn": 3,
+   "modelStartMs": 2967,
+   "exportMs": 904,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 1578
+  },
+  {
+   "turn": 4,
+   "modelStartMs": 2967,
+   "exportMs": 906,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 2090
+  },
+  {
+   "turn": 5,
+   "modelStartMs": 2964,
+   "exportMs": 924,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 2601
+  },
+  {
+   "turn": 6,
+   "modelStartMs": 2979,
+   "exportMs": 892,
+   "roundTrips": 10,
+   "execsBeforeModel": 1,
+   "uploadedKiB": 9,
+   "downloadedKiB": 684,
+   "cliStarts": 1,
+   "historyKiB": 3113
+  }
+ ]
+}
