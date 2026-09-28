@@ -357,6 +357,8 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
 }
 
 type DownloadableProvider = 'claude' | 'codex';
+/** Pending decisions per task: those that still notify, and all of them. */
+type ApprovalCounts = Map<string, { notify: number; pending: number }>;
 
 function downloadableProvider(value: unknown): DownloadableProvider | undefined {
   return value === 'claude' || value === 'codex' ? value : undefined;
@@ -835,32 +837,38 @@ export class Gateway {
   }
 
   /** Read each organization request ledger once per response, not once per row.
-   * Task list projections must never hydrate every task's transcript again. */
-  private async approvalCounts(organizationId: string): Promise<Map<string, number>> {
-    const counts = new Map<string, number>();
-    const add = (taskId: string | undefined) => {
-      if (taskId) counts.set(taskId, (counts.get(taskId) ?? 0) + 1);
+   * Task list projections must never hydrate every task's transcript again.
+   * `notify` leaves out decisions dismissed from the inbox; `pending` keeps them,
+   * because a dismissed decision still blocks its agent. */
+  private async approvalCounts(organizationId: string): Promise<ApprovalCounts> {
+    const counts: ApprovalCounts = new Map();
+    const add = (taskId: string | undefined, dismissed = false) => {
+      if (!taskId) return;
+      const count = counts.get(taskId) ?? { notify: 0, pending: 0 };
+      count.pending += 1;
+      if (!dismissed) count.notify += 1;
+      counts.set(taskId, count);
     };
     for (const request of (await new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
       .requests({ status: 'pending' }))) add(request.taskId);
     for (const request of (await new PermissionRequests(this.deps.store, organizationId).requests({ status: 'pending' })))
-      if (!request.dismissed) add(request.taskId);
+      add(request.taskId, !!request.dismissed);
     for (const request of (await new AuthorizationRequests(this.deps.store, organizationId).requests({ status: 'pending' })))
-      if (!request.dismissed && request.target.kind === 'task') add(request.target.taskId);
+      if (request.target.kind === 'task') add(request.target.taskId, !!request.dismissed);
     for (const connection of (await this.connections()?.all()) ?? [])
       if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId);
     return counts;
   }
 
   private async withApprovalRequests(view: TaskView | undefined, taskId: string,
-    counts?: Map<string, number>): Promise<TaskView | undefined> {
+    counts?: ApprovalCounts): Promise<TaskView | undefined> {
     if (!view) return view;
     if (!counts) {
       const organizationId = (await this.deps.store.taskAttribution(taskId))?.organizationId;
       counts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
     }
-    const count = counts.get(taskId) ?? 0;
-    return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
+    const count = counts.get(taskId);
+    return { ...view, approvalRequests: count?.notify || undefined, pendingDecisions: count?.pending || undefined };
   }
 
   private async credentialRequestView(request: CredentialAccessRequest, organizationId: string): Promise<CredentialAccessRequest> {
@@ -4558,7 +4566,7 @@ export class Gateway {
               includeArchived: url.searchParams.get('includeArchived') === '1', limit, offset,
             });
             const organizationId = (await store.getProject(projectId))?.organizationId;
-            const counts = organizationId ? (await this.approvalCounts(organizationId)) : new Map<string, number>();
+            const counts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
             return this.json(res, 200, { ...result, tasks: (await __asyncCollections.map(result.tasks, async task => ({ ...task,
               lastView: (await this.withApprovalRequests(task.lastView, task.id, counts)) }))) });
           }
@@ -4588,7 +4596,7 @@ export class Gateway {
           // request into thousands of synchronous SQLite reads. Drawer-only fields
           // (including stageTransitions) are resolved by the single-task endpoint.
           const organizationId = (await store.getProject(projectId))?.organizationId;
-          const approvalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map<string, number>();
+          const approvalCounts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
           const listed = (await __asyncCollections.map(page, async (t) => ({
             ...t,
             lastView: trimListView((await this.withApprovalRequests(t.lastView, t.id, approvalCounts))),

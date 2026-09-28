@@ -6970,8 +6970,12 @@ async function refreshTaskHistory(taskId) {
 const TASK_WALK_SETTLE_MS = 150;
 
 // Approval decisions load for the pages that show them: a task with pending
-// requests, or its Approvals tab (UI-6). Vault item names only label credential
-// requests, so they load only when there are some.
+// decisions (dismissed ones too: the conversation keeps them, because the agent
+// still waits), or its Approvals tab (UI-6). Vault item names only label
+// credential requests, so they load only when there are some.
+function showsTaskApprovals(view) {
+  return !!(view.approvalRequests || view.pendingDecisions || S.taskTab === 'approvals');
+}
 function ensureTaskApprovals(taskId) {
   if (S.taskApprovalsFor === taskId) return Promise.resolve();
   const epoch = S.taskOpenEpoch;
@@ -7019,8 +7023,9 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   renderTaskLoadingPage(rec);
   // j/k outpaces loading: each step paints its title at once, and only the task
   // the walk settles on is fetched (UI-6).
-  const walking = !!S.taskWalkTarget;
-  if (S.taskWalkTarget === taskId) S.taskWalkTarget = null;
+  // Any other open (a click, Back, a superseded route) ends the walk.
+  const walking = S.taskWalkTarget === taskId;
+  S.taskWalkTarget = null;
   if (walking) {
     await new Promise((resolve) => setTimeout(resolve, TASK_WALK_SETTLE_MS));
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
@@ -7087,7 +7092,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(S.view);
     renderTaskPage();
-    if (S.view.approvalRequests || S.taskTab === 'approvals') ensureTaskApprovals(taskId);
+    if (showsTaskApprovals(S.view)) ensureTaskApprovals(taskId);
 
     const [events, widgets, sessions, attempts, explanationSettings, explanationEvents, connections] = await details;
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
@@ -7140,18 +7145,21 @@ async function refreshTask(reason = 'all') {
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
     const approvals = S.taskApprovalsFor === id;
+    // Only what this refresh fetched is written back; the rest (undefined) keeps
+    // whatever landed meanwhile, e.g. the approvals ensureTaskApprovals loaded.
+    const load = (wanted, url) => wanted ? api(url).catch(() => undefined) : undefined;
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       // Widgets are resolved against the view (the Overview's stage and changed
       // files), so every lifecycle publication re-resolves them.
-      has(/view\.updated|review|stage|turn\.result/) ? api(`/api/tasks/${id}/widgets`).catch(() => S.widgets) : S.widgets,
-      has(/session|turn.result|stage/) ? api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions) : S.sessions,
-      has(/attempt|turn.result|merge.result/) ? api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup) : S.attemptGroup,
-      approvals && has(/credential\.approval/) ? api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests) : S.approvalRequests,
-      approvals && has(/permission\.approval/) ? api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests) : S.permissionRequests,
-      approvals && has(/authorization\.approval/) ? api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests) : S.authorizationRequests,
-      approvals && has(/credential\.approval/) ? api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems) : S.approvalItems,
-      has(/^connection\./) ? api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []) : S.connections,
+      load(has(/view\.updated|review|stage|turn\.result/), `/api/tasks/${id}/widgets`),
+      load(has(/session|turn.result|stage/), `/api/tasks/${id}/sessions?metadata=1`),
+      load(has(/attempt|turn.result|merge.result/), `/api/tasks/${id}/attempts`),
+      load(approvals && has(/credential\.approval/), `/api/vault/requests?${approvalQuery}`),
+      load(approvals && has(/permission\.approval/), `/api/permission-requests?${approvalQuery}`),
+      load(approvals && has(/authorization\.approval/), `/api/authorization-requests?${approvalQuery}`),
+      load(approvals && has(/credential\.approval/), `/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`),
+      load(has(/^connection\./), `/api/connections?${approvalQuery}`),
     ]);
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
@@ -7161,15 +7169,9 @@ async function refreshTask(reason = 'all') {
       return;
     }
     S.view = pendingCancellationView(view, id);
-    S.widgets = widgets;
-    S.sessions = sessions;
-    S.attemptGroup = attempts;
-    S.approvalRequests = approvalRequests;
-    S.permissionRequests = permissionRequests;
-    S.authorizationRequests = authorizationRequests;
-    S.approvalItems = approvalItems;
-    S.connections = connections;
-    if (!approvals && (S.view.approvalRequests || S.taskTab === 'approvals')) ensureTaskApprovals(id);
+    Object.assign(S, Object.fromEntries(Object.entries({ widgets, sessions, attemptGroup: attempts, approvalRequests,
+      permissionRequests, authorizationRequests, approvalItems, connections }).filter(([, value]) => value !== undefined)));
+    if (!approvals && showsTaskApprovals(S.view)) ensureTaskApprovals(id);
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -8778,7 +8780,7 @@ function overviewTab(v) {
          ${v.reviewInfo?.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
          ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
-         ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" src="/api/tasks/${encodeURIComponent(v.taskId)}/review-info.html" title="Review details"></iframe>` : ''}
+         ${v.reviewInfo?.html ? `<iframe id="review-info-frame" data-live-key="${esc(v.taskId)}:${contentKey(v.reviewInfo.html)}" sandbox="allow-scripts" src="/api/tasks/${encodeURIComponent(v.taskId)}/review-info.html" title="Review details"></iframe>` : ''}
          ${v.stage === 'review' ? `${resourceReviewPlaceholder()}<div id="review-resource-inventory"><div class="task-sub" role="status">Inspecting ignored output…</div></div>` : ''}
        </div>`
     : '';
@@ -9973,6 +9975,14 @@ function agentTurnStateText(v) {
 function humanWaitDetail(v) {
   if (v?.status !== 'waiting' || v.waitingFor?.kind !== 'human') return '';
   return typeof v.waitingFor.detail === 'string' ? v.waitingFor.detail.trim() : '';
+}
+
+// A short fingerprint (FNV-1a) of content a live section was built from: a
+// retained review frame reloads only when its document changed.
+function contentKey(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return `${text.length.toString(36)}-${(hash >>> 0).toString(36)}`;
 }
 
 // Provider streams and workflow snapshots may normalize line endings
