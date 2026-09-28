@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { prepareCodexHistory, selectCodexHistoryCopy } from '../src/agent/codex-history.js';
 import { installLocalCodexSnapshot, publishLocalCodexHistory, readLocalCodexHistory } from '../src/agent/codex-history-files.js';
 import { createCodexConversationExport, readCodexConversationExport } from '../src/store/conversation-exports.js';
@@ -103,4 +103,23 @@ it('binds export downloads to frozen content and the task/role authorization sco
   expect((await readCodexConversationExport(objects, 'task_a', 'do', first.exportId)).data).toEqual(first.data);
   await expect(readCodexConversationExport(objects, 'task_b', 'do', first.exportId)).rejects.toThrow();
   await expect(readCodexConversationExport(objects, 'task_a', 'merge', first.exportId)).rejects.toThrow();
+});
+
+it('AD-13 validates only what a history gained since it was last validated', async () => {
+  const id = '33333333-3333-4333-8333-333333333333';
+  const file = `sessions/rollout-2026-09-09T00-00-00-${id}.jsonl`;
+  const records = [meta(id), ...Array.from({ length: 200 }, (_, i) => message(i + 1, `turn ${i} 1.5`))];
+  const read = (content: Buffer) => async () => ({ file, content });
+  expect(await prepareCodexHistory(id, read(jsonl(records)))).toBeUndefined();
+  const grown = [...records, message(201, 'next'), message(202, 'next')];
+  const parse = vi.spyOn(JSON, 'parse');
+  expect(await prepareCodexHistory(id, read(jsonl(grown)))).toBeUndefined();
+  expect(parse.mock.calls.length).toBeLessThanOrEqual(2);
+  parse.mockRestore();
+  // A new tool set still snapshots every record, not just the new ones.
+  const snapshot = (await prepareCodexHistory(id, read(jsonl(grown)), { dynamicTools: [{ name: 'new_tool' }] }))!;
+  expect(snapshot.content.toString().trim().split('\n').map((line) => JSON.parse(line).ordinal)).toEqual(grown.map((_, i) => i));
+  // A prefix that changed underneath is validated again from the start.
+  const rewritten = [...grown.slice(0, 100), message(150, 'rewritten'), ...grown.slice(101)];
+  await expect(prepareCodexHistory(id, read(jsonl(rewritten)))).rejects.toThrow('unsupported ordinal sequence');
 });
