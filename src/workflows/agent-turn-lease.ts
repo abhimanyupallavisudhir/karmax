@@ -9,7 +9,7 @@ import {
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { limitFailureClassification } from './failures.js';
-import { SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED } from '../coordinators/names.js';
+import { RELIST_ACCOUNT_GRANT, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED } from '../coordinators/names.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 import type { AgentRole, TaskInput, TaskView, WorldHandleLike } from './contract.js';
 import { agentTurnId } from './turn-id.js';
@@ -241,32 +241,40 @@ export function createAgentTurnLeaser(
       const resolved = await core.resolveProvider({ role, task: host.task() }).catch(() => undefined);
       const credentialProvider = typeof resolved === 'string' && resolved ? resolved : undefined;
       if (!credentialProvider) return admitted(turnId, role, undefined, fn);
-      const allowed =
-        credentialProvider !== 'mock'
-          ? await core.resolveCredentialOrder({ taskId: host.taskId, projectId: host.projectId, provider: credentialProvider, role, task: host.task() }).catch(() => undefined)
-          : undefined;
       const provider =
         credentialProvider === 'claude' || credentialProvider === 'codex' || credentialProvider === 'opencode'
         || credentialProvider === 'kimi' || credentialProvider === 'grok' || credentialProvider === 'mock'
           ? credentialProvider
           : undefined;
 
-      const lease = await coord.leaseAccount(host.taskId, turnId, credentialProvider, allowed);
-      const beforeWait = host.status();
-      host.setStatus('waiting');
-      // Historical activity results decode as undefined and retain their recorded
-      // account-wait publication. New executions distinguish a real parked lease
-      // from an immediate grant without changing the workflow command sequence.
-      host.setWaitingFor(lease?.waiting === false
-        ? { kind: 'agentSlot', provider, detail: 'Starting agent' }
-        : { kind: 'account', provider: credentialProvider,
-            ...(lease?.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
-            ...(lease?.detail ? { detail: lease.detail } : {}) });
-      await host.publish();
-      await condition(() => grants.has(turnId) || host.cancelled());
-      const grant = grants.get(turnId);
-      grants.delete(turnId);
-      if (host.cancelled() && !grant) {
+      let beforeWait = host.status();
+      let requests = 0;
+      let grant: Grant | undefined;
+      // A parked request is handed back when credentials change under it (a new
+      // login, a policy edit); resolve the allow-list again and re-ask.
+      for (;;) {
+        const allowed =
+          credentialProvider !== 'mock'
+            ? await core.resolveCredentialOrder({ taskId: host.taskId, projectId: host.projectId, provider: credentialProvider, role, task: host.task() }).catch(() => undefined)
+            : undefined;
+        const lease = await coord.leaseAccount(host.taskId, turnId, credentialProvider, allowed);
+        if (requests++ === 0) beforeWait = host.status();
+        host.setStatus('waiting');
+        // Historical activity results decode as undefined and retain their recorded
+        // account-wait publication. New executions distinguish a real parked lease
+        // from an immediate grant without changing the workflow command sequence.
+        host.setWaitingFor(lease?.waiting === false
+          ? { kind: 'agentSlot', provider, detail: 'Starting agent' }
+          : { kind: 'account', provider: credentialProvider,
+              ...(lease?.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+              ...(lease?.detail ? { detail: lease.detail } : {}) });
+        await host.publish();
+        await condition(() => grants.has(turnId) || host.cancelled());
+        grant = grants.get(turnId);
+        grants.delete(turnId);
+        if (grant?.accountId !== RELIST_ACCOUNT_GRANT || host.cancelled()) break;
+      }
+      if (host.cancelled() && (!grant || grant.accountId === RELIST_ACCOUNT_GRANT)) {
         await coord.cancelAccount(host.taskId, turnId).catch(() => undefined);
         host.setWaitingFor(undefined);
         host.setStatus(beforeWait === 'waiting' ? 'active' : beforeWait);

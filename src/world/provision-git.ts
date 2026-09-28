@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import type { WorldRepo, WorldSpec } from './types.js';
 import { git, isGitRepo } from './git.js';
+import { taskBranch, BRAND } from '../domain/brand.js';
 
 /** Minimal command/file surface a cloud sandbox exposes during trusted
  * provisioning. Adapters normalize the provider SDK's result shape and convert
@@ -125,7 +126,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   const repos = await concurrentMap(sources, 3, async (source, index): Promise<WorldRepo> => {
     const recorded = spec.checkouts?.[index];
     const repoSpec = { ...spec, ...recorded };
-    const branch = recorded?.branch ?? spec.branch ?? `karmax/${spec.taskId}`;
+    const branch = recorded?.branch ?? spec.branch ?? taskBranch(spec.taskId);
     const branchPolicy = recorded ?? spec.repositoryBranches?.[source];
     let base = branchPolicy?.base ?? spec.base;
     let targetBranch = branchPolicy?.target ?? spec.target;
@@ -276,7 +277,7 @@ async function cloneWithRetry(target: ProvisionTarget, command: string, repoRoot
 async function configureRepo(target: ProvisionTarget, root: string, spec: WorldSpec, branch: string,
   hasOrigin: boolean, requestedRemoteRefExists = false, base = spec.base): Promise<void> {
   const identity = spec.gitIdentity;
-  await runOrThrow(target, `git -C ${quote(root)} config user.name ${quote(identity?.name ?? 'karmax')} && git -C ${quote(root)} config user.email ${quote(identity?.email ?? 'karmax@localhost')}`);
+  await runOrThrow(target, `git -C ${quote(root)} config user.name ${quote(identity?.name ?? BRAND)} && git -C ${quote(root)} config user.email ${quote(identity?.email ?? `${BRAND}@localhost`)}`);
   // Commit signing stays in the trusted Git broker. Leaving a long-lived signing
   // key in an agent-controlled world would make the isolation boundary moot.
   if (!hasOrigin) return;

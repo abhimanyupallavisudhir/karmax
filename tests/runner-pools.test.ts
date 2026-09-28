@@ -143,7 +143,7 @@ describe('runner capacity and world lifecycle', () => {
     const task = (await store.createTask({ projectId: project.id, title: 'Still working', workflow: 'software-dev',
       workflowVersion: '1.25.0', params: { prompt: 'x' } as any }));
     const handle = (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
+      root: '/workspace', workspaceRoot: '/workspace', branch: `tavya/${task.id}`, base: 'main',
       meta: { projectId: project.id } }, project.id));
     (await store.setWorldState(handle, 'parked'));
     const stale = (await store.requestWorldLease({ runnerPoolId: 'tiny', organizationId: organization.id,
@@ -165,7 +165,7 @@ describe('runner capacity and world lifecycle', () => {
     const task = (await store.createTask({ projectId: project.id, title: 'Waking', workflow: 'software-dev',
       workflowVersion: '1.25.0', params: { prompt: 'x' } as any }));
     const handle = (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
+      root: '/workspace', workspaceRoot: '/workspace', branch: `tavya/${task.id}`, base: 'main',
       meta: { projectId: project.id } }, project.id));
     (await store.setWorldState(handle, 'parked'));
     const runners = new RunnerPoolService(store);
@@ -186,7 +186,7 @@ describe('runner capacity and world lifecycle', () => {
     (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'done',
       status: 'done', messages: [], actions: [], state: {}, updatedAt: Date.now() }));
     const handle = (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
+      root: '/workspace', workspaceRoot: '/workspace', branch: `tavya/${task.id}`, base: 'main',
       meta: { projectId: project.id } }, project.id));
     const runners = new RunnerPoolService(store);
     const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
@@ -521,7 +521,7 @@ describe('runner capacity and world lifecycle', () => {
     const task = (await store.createTask({ projectId: project.id, title: 'Inspect', workflow: 'just-do',
       workflowVersion: '1.0.0', params: { prompt: 'x' } as any }));
     const handle = (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
+      root: '/workspace', workspaceRoot: '/workspace', branch: `tavya/${task.id}`, base: 'main',
       meta: { projectId: project.id } }, project.id)) as any;
     let parked = 0;
     const world = { handle, listFiles: async () => [], readFile: async () => '', readFileBuffer: async () => Buffer.alloc(0),
@@ -566,7 +566,7 @@ describe('runner capacity and world lifecycle', () => {
     // Replace the built-in provider with one whose control plane lost the sandbox.
     worlds.register({ kind: 'e2b', parkable: true, async probe() { return 'missing'; } } as any);
     const handle = (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: 'task-reconcile', generation: 1,
-      root: '/w', workspaceRoot: '/w', branch: 'karmax/task-reconcile', base: 'main', meta: {} }, project.id));
+      root: '/w', workspaceRoot: '/w', branch: 'tavya/task-reconcile', base: 'main', meta: {} }, project.id));
     expect(handle.generation).toBe(1);
     const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
     await lifecycle.sweep(Date.now() + 60 * 60_000);
@@ -579,9 +579,9 @@ describe('runner capacity and world lifecycle', () => {
     const worlds = new WorldRegistry();
     worlds.register({ kind: 'e2b', parkable: true, async probe() { return undefined; } } as any);
     (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: 'task-unknown', generation: 1,
-      root: '/w', workspaceRoot: '/w', branch: 'karmax/task-unknown', base: 'main', meta: {} }, project.id));
+      root: '/w', workspaceRoot: '/w', branch: 'tavya/task-unknown', base: 'main', meta: {} }, project.id));
     (await store.registerWorld({ version: 2, kind: 'memory', provider: 'memory', id: 'task-local', generation: 1,
-      root: '/w', workspaceRoot: '/w', branch: 'karmax/task-local', base: 'main', meta: {} }, project.id));
+      root: '/w', workspaceRoot: '/w', branch: 'tavya/task-local', base: 'main', meta: {} }, project.id));
     const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
     await lifecycle.sweep(Date.now() + 60 * 60_000);
     expect((await store.worldState('task-unknown'))).toBe('ready');
@@ -631,7 +631,7 @@ describe('runner capacity and world lifecycle', () => {
     const task = (await store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'x' } as any }));
     const handle = (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/w', workspaceRoot: '/w', branch: `karmax/${task.id}`, base: 'main', sealedProviderRef: 'sealed-current',
+      root: '/w', workspaceRoot: '/w', branch: `tavya/${task.id}`, base: 'main', sealedProviderRef: 'sealed-current',
       meta: {} }, project.id));
     const destroyed: string[] = [];
     const worlds = new WorldRegistry();
@@ -699,7 +699,7 @@ describe('runner capacity and world lifecycle', () => {
     const runners = new RunnerPoolService(store);
     const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
     (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main', meta: {} }, project.id));
+      root: '/workspace', workspaceRoot: '/workspace', branch: `tavya/${task.id}`, base: 'main', meta: {} }, project.id));
     (await store.createExecution({ id: 'execution-1', organizationId: organization.id, projectId: project.id,
       taskId: task.id, worldId: task.id, generation: 1, kind: 'terminal', label: 'Terminal',
       server: false, openUrls: [], runnerLeaseId: lease.leaseId, state: 'running', heartbeatAt: 1, startedAt: 1 }));

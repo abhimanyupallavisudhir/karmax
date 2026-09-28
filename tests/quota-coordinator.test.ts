@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
-import { accountCoordinatorId } from '../src/coordinators/names.js';
+import { accountCoordinatorId, SIG_ACCOUNT_GRANTED } from '../src/coordinators/names.js';
 import { newId } from '../src/util/id.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 
@@ -34,6 +34,16 @@ describe('account coordinator — quota engine', () => {
     const id = newId('task');
     const h2 = await h.client.workflow.start('pingWorkflow', { taskQueue: TASK_QUEUE, workflowId: id, args: ['x'] });
     return { id, h: h2 };
+  };
+  // The account ids a grantee was sent, in order ('(relist)' asks it to re-request).
+  const grants = async (taskId: string) => {
+    const history = await h.client.workflow.getHandle(taskId).fetchHistory();
+    return (history.events ?? []).flatMap((event: any) => {
+      const signal = event.workflowExecutionSignaledEventAttributes;
+      if (signal?.signalName !== SIG_ACCOUNT_GRANTED) return [];
+      const payload = signal.input?.payloads?.[0]?.data;
+      return [JSON.parse(Buffer.from(payload).toString('utf8')).accountId];
+    });
   };
   const A = (over: any = {}) => ({ id: 'A', configHome: '/tmp/A', provider: 'claude', maxConcurrent: 1, inUse: 0, status: 'available', ...over });
 
@@ -239,14 +249,82 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
-  it('DENIES a request whose only allowed credential needs attention (task escalates, not parks)', async () => {
+  // Every allowed credential needing a person used to DENY the turn, which
+  // escalated the task with an error. A credential wall is a wait like quota:
+  // the request parks and is granted the moment a credential recovers.
+  it('parks a request whose only allowed credential needs attention, then grants it on recovery', async () => {
     const coord = await startCoord([A({ id: 'A' })]);
     await coord.signal('setAccountAvailability', { accountId: 'A', status: 'needs-attention' });
     const g = await grantee();
     await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', allowed: ['A'] });
-    // Denied → the request is dequeued (not parked forever); nothing is leased for use.
-    await expect.poll(async () => (await accounts()).waiting, { timeout: 5000 }).toBe(0);
-    expect((await acct('A')).inUse).toBe(0);
+    // A query can reach the run that is still continuing as new (the lease
+    // activity retries that acknowledgement the same way).
+    await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
+      waiting: true, detail: 'Every allowed credential needs attention — sign in again or add one',
+    });
+    expect(await grants(g.id)).toEqual([]);
+    await coord.signal('setAccountAvailability', { accountId: 'A', status: 'available', onlyIfStatus: 'needs-attention' });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
+    await expect.poll(() => grants(g.id), { timeout: 10_000 }).toEqual(['A']);
+    await g.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  it('asks a parked request to re-list its credentials when a new credential registers', async () => {
+    const coord = await startCoord([A({ id: 'A', status: 'needs-attention' })]);
+    const walled = await grantee();
+    await coord.signal('leaseAccount', { taskId: walled.id, turnId: 'wall', allowed: ['missing:org_personal:claude'] });
+    const quota = await grantee();
+    await coord.signal('reportExhausted', { accountId: 'A', window: '5h', resetAt: Date.now() + 3_600_000 });
+    await coord.signal('leaseAccount', { taskId: quota.id, turnId: 'quota', allowed: ['A'] });
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 10_000 }).toBe(2);
+
+    await coord.signal('registerAccounts', { accounts: [
+      { id: 'A', configHome: '/tmp/A', provider: 'claude', kind: 'login' },
+      { id: 'B', configHome: '/tmp/B', provider: 'claude', kind: 'login' },
+    ] });
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 10_000 }).toBe(0);
+    await expect.poll(() => grants(walled.id), { timeout: 10_000 }).toEqual(['(relist)']);
+    await expect.poll(() => grants(quota.id), { timeout: 10_000 }).toEqual(['(relist)']);
+    expect((await acct('B')).inUse).toBe(0); // policy decides; the coordinator never guesses
+
+    // Re-resolved against today's credentials, the quota wait takes the new login.
+    await coord.signal('leaseAccount', { taskId: quota.id, turnId: 'quota', allowed: ['A', 'B'] });
+    await expect.poll(() => grants(quota.id), { timeout: 10_000 }).toEqual(['(relist)', 'B']);
+    await walled.h.signal('finish');
+    await quota.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  // Ids alone cannot tell the coordinator a parked allow-list is stale: a login
+  // signed back in keeps its id, and one added before a deploy is already known.
+  it('re-lists parked requests on every credential sync, even of known credentials', async () => {
+    const coord = await startCoord([A({ id: 'A' }), A({ id: 'B', status: 'exhausted', resetAt: Date.now() + 3_600_000 })]);
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', allowed: ['B'] });
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 10_000 }).toBe(1);
+    await coord.signal('registerAccounts', { accounts: [
+      { id: 'A', configHome: '/tmp/A', provider: 'claude', kind: 'login' },
+      { id: 'B', configHome: '/tmp/B', provider: 'claude', kind: 'login' },
+    ] });
+    await expect.poll(() => grants(g.id), { timeout: 10_000 }).toEqual(['(relist)']);
+    expect((await accounts()).waiting).toBe(0);
+    // With nothing parked, a sync sends nothing.
+    await coord.signal('registerAccounts', { accounts: [{ id: 'A', configHome: '/tmp/A', provider: 'claude', kind: 'login' }] });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(await grants(g.id)).toEqual(['(relist)']);
+    await g.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  it('re-lists parked requests when a credential policy changes', async () => {
+    const coord = await startCoord([A({ id: 'A', status: 'manual-off' })]);
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', allowed: ['A'] });
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 10_000 }).toBe(1);
+    await makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE }).relistAccountLeases();
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 10_000 }).toBe(0);
+    await expect.poll(() => grants(g.id), { timeout: 10_000 }).toEqual(['(relist)']);
     await g.h.signal('finish');
     await coord.terminate('done');
   });
@@ -349,12 +427,15 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
-  it('also DENIES provider-fallback requests when every compatible credential needs attention', async () => {
+  it('also parks provider-fallback requests when every compatible credential needs attention', async () => {
     const coord = await startCoord([A({ id: 'A', status: 'needs-attention' })]);
     const g = await grantee();
     await coord.signal('leaseAccount', { taskId: g.id, turnId: 'fallback', provider: 'claude' });
-    await expect.poll(async () => (await accounts()).waiting, { timeout: 5000 }).toBe(0);
-    expect((await acct('A')).inUse).toBe(0);
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 5000 }).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(await grants(g.id)).toEqual([]);
+    await coord.signal('setAccountAvailability', { accountId: 'A', status: 'available' });
+    await expect.poll(async () => grants(g.id), { timeout: 10_000 }).toEqual(['A']);
     await g.h.signal('finish');
     await coord.terminate('done');
   });

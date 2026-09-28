@@ -438,6 +438,22 @@ export function claudeAccessTokenExpiresAt(home: string): number | undefined {
   return undefined;
 }
 
+/** When a Claude login's sign-in itself expires. The refresh token has a fixed
+ * lifetime (about four weeks from sign-in, not extended by refreshes); after it
+ * Anthropic signs the login out and only signing in again restores it. */
+export function claudeSignInExpiresAt(home: string): number | undefined {
+  for (const rel of ['.credentials.json', '.claude/.credentials.json']) {
+    try {
+      const oauth = JSON.parse(fs.readFileSync(path.join(home, rel), 'utf8'))?.claudeAiOauth;
+      const value = Number(oauth?.refreshTokenExpiresAt);
+      if (typeof oauth?.refreshToken === 'string' && oauth.refreshToken && Number.isFinite(value) && value > 0) return value;
+    } catch {
+      /* try the other native credential location */
+    }
+  }
+  return undefined;
+}
+
 /** Claude leaves a structurally valid but empty `.credentials.json` behind after
  * logout. File existence alone therefore makes a logged-out account look connected
  * and prevents Connect from launching OAuth again. A refresh token remains useful

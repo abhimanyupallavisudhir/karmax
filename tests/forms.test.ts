@@ -403,6 +403,6 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
       else process.env.KARMAX_HOST_LOCAL = previous;
     }
     expect(response.status).toBe(400);
-    expect((await J(response)).error).toContain('only on a host-local Karmax');
+    expect((await J(response)).error).toContain('only on a host-local tavya');
   });
 });

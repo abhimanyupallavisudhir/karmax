@@ -503,7 +503,7 @@ describe('zero-exposure CDP fill (§5B)', () => {
       cdpUrl: `http://127.0.0.1:${port}`,
       selector: '#password',
       text: 's3cret', expectDomains: ['example.com'],
-    })).rejects.toThrow(/Karmax-managed chrome-devtools browser.*cdpUrl/);
+    })).rejects.toThrow(/tavya-managed chrome-devtools browser.*cdpUrl/);
   });
 });
 

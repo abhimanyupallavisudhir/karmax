@@ -6,6 +6,7 @@ import type { StorageLocation, StorageLocationUsage } from '../domain/types.js';
 import type { Store } from './db.js';
 import { S3ObjectStore, type ObjectStore } from './objects.js';
 import { newId } from '../util/id.js';
+import { BRAND } from '../domain/brand.js';
 
 export function managedStorageLocationId(organizationId: string): string {
   return `storage-managed-${organizationId}`;
@@ -72,10 +73,11 @@ export class StorageLocationService {
     const endpoint = normalizedEndpoint(input.endpoint, this.allowPrivateEndpoints);
     const bucket = input.bucket.trim();
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,254}$/.test(bucket)) throw new Error('invalid S3 bucket');
-    const prefix = normalizedPrefix(input.prefix ?? `karmax/${organizationId}`);
     const existing = input.id ? (await this.store.getStorageLocation(input.id)) : undefined;
     if (existing && (existing.organizationId !== organizationId || existing.kind !== 's3'))
       throw new Error('storage location does not belong to organization');
+    // Reconnecting without a prefix keeps the objects already written under the old one.
+    const prefix = normalizedPrefix(input.prefix ?? existing?.config.prefix ?? `${BRAND}/${organizationId}`);
     const id = existing?.id ?? newId('storage');
     const handle = existing?.credentialHandle ?? `storage:${id}:s3`;
     if (input.accessKeyId || input.secretAccessKey) {

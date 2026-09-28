@@ -146,9 +146,9 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
 
     const organization = new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_acme');
     expect((await organization.saveAutomationIdentity({ userName: 'Acme Bot' }))).toMatchObject({
-      userName: 'Acme Bot', userEmail: 'krmax+org-acme@localhost', customIdentity: { userName: 'Acme Bot' },
+      userName: 'Acme Bot', userEmail: 'tavya+org-acme@localhost', customIdentity: { userName: 'Acme Bot' },
     });
-    expect((await organization.saveAutomationIdentity({}))).toMatchObject({ userName: 'krmax' });
+    expect((await organization.saveAutomationIdentity({}))).toMatchObject({ userName: 'tavya' });
   });
 
   it('lets an empty organization link its default to an authorized user profile without copying secrets', async () => {
@@ -503,7 +503,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
       const committed = await git(cwd, ['commit', '-q', '-m', 'tenant']);
       expect(committed.code, committed.stderr).toBe(0);
       expect((await git(cwd, ['log', '-1', '--format=%an <%ae>'])).stdout.trim())
-        .toBe(`krmax <krmax+${organization.id.replace(/[^a-z0-9.-]/gi, '-')}@localhost>`);
+        .toBe(`tavya <tavya+${organization.id.replace(/[^a-z0-9.-]/gi, '-')}@localhost>`);
       await core.destroyWorld(handle);
     } finally {
       delete process.env.KARMAX_HOME;

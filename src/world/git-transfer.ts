@@ -21,7 +21,7 @@ export async function gitTransferCheck(result: Promise<ExecResult>): Promise<str
  * negotiation even for repositories with thousands of branches. Missing a
  * common tip affects efficiency, never correctness. */
 export async function knownGitCommits(run: GitRunner, extra: string[] = [], preferredRefs: string[] = []): Promise<string[]> {
-  const refs = await gitTransferCheck(run(['for-each-ref', '--sort=-committerdate', '--count=64', '--format=%(objectname)', 'refs/heads', 'refs/remotes', 'refs/karmax/tasks']));
+  const refs = await gitTransferCheck(run(['for-each-ref', '--sort=-committerdate', '--count=64', '--format=%(objectname)', 'refs/heads', 'refs/remotes', 'refs/tavya/tasks', 'refs/karmax/tasks']));
   for (const ref of preferredRefs) {
     const result = await run(['rev-parse', '--verify', `${ref}^{commit}`]);
     if (result.code === 0) extra = [...extra, result.stdout.trim()];

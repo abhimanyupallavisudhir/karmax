@@ -109,7 +109,7 @@ describe('live project repository enrollment', () => {
       expect.objectContaining({ repo: 'empty', branch: parent.handle.branch }),
     ]));
     const childRepo = child.handle.repos!.find((candidate) => candidate.name === 'empty')!;
-    expect((await git(childRepo.root, ['show', `refs/karmax/tasks/${parentTask.id}/empty:implementation.txt`])).stdout)
+    expect((await git(childRepo.root, ['show', `refs/tavya/tasks/${parentTask.id}/empty:implementation.txt`])).stdout)
       .toContain('from parent');
     expect((await store.eventsSince(parentTask.id, 0)).find((event) => event.type === 'push.branch')?.payload)
       .toMatchObject({ repos: ['first', 'second', 'empty'] });
@@ -128,9 +128,9 @@ describe('live project repository enrollment', () => {
       projectId: project.id, title: 'Running', workflow: 'software-dev', workflowVersion: '1.0.0',
       params: { prompt: 'attach it' },
     }));
-    const flat = { kind: 'e2b', id: task.id, root: '/workspace', branch: `karmax/${task.id}`, base: 'main',
+    const flat = { kind: 'e2b', id: task.id, root: '/workspace', branch: `tavya/${task.id}`, base: 'main',
       repos: [{ name: 'existing', repo: 'git@github.com:example/existing.git', root: '/workspace',
-        branch: `karmax/${task.id}`, base: 'main' }] } as any;
+        branch: `tavya/${task.id}`, base: 'main' }] } as any;
     (await store.registerWorld(flat, project.id));
     const world = { handle: flat, exec: async () => ({ code: 1, stdout: '', stderr: '' }) } as any;
     const tokens = new TokenAuthority(store);

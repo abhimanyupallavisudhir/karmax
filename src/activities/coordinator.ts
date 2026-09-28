@@ -26,6 +26,7 @@ import {
   mergeQueueId,
   agentQueueId,
   accountCoordinatorId,
+  SIG_RELIST_ACCOUNT_LEASES,
 } from '../coordinators/names.js';
 
 type AccountProvider = string;
@@ -299,6 +300,14 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signal: SIG_REGISTER_ACCOUNTS,
         signalArgs: [{ accounts }],
       });
+    },
+    /** A credential policy changed: parked requests re-resolve their allow-lists. */
+    async relistAccountLeases(): Promise<void> {
+      try {
+        await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_RELIST_ACCOUNT_LEASES);
+      } catch {
+        /* no coordinator yet — nothing is parked */
+      }
     },
     /** Request a credential lease for a turn (the coordinator signals the task back).
      *  `allowed` = the credential policy's ordered, enabled keys for this turn; the

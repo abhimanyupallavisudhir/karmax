@@ -7,6 +7,7 @@
  * they can enter an agent conversation.
  */
 import net from 'node:net';
+import { BRAND } from '../domain/brand.js';
 
 export type GithubActionsStatus =
   | 'completed' | 'action_required' | 'cancelled' | 'failure' | 'neutral'
@@ -459,7 +460,7 @@ export class GithubActionsApi {
       this.seenTokens.add(token);
       return this.fetcher(`${this.apiBase}${pathname}`, { ...init, redirect: 'manual', headers: {
         accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
-        'x-github-api-version': '2022-11-28', 'user-agent': 'karmax', ...(init.headers ?? {}),
+        'x-github-api-version': '2022-11-28', 'user-agent': BRAND, ...(init.headers ?? {}),
       }, signal: AbortSignal.timeout(30000) }).catch(() => { throw new GithubActionsApiError(502, 'GitHub Actions request failed'); });
     };
     let response = await once();

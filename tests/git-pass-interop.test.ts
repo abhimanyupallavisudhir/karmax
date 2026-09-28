@@ -94,7 +94,7 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
       ['passkey', 'passkey', '{"credentialId":"test"}'],
     ] as const) {
       const entry = {
-        externalId: `karmax/local-${type}`,
+        externalId: `tavya/local-${type}`,
         type,
         label: 'same label',
         fields: [field],
