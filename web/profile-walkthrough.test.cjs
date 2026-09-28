@@ -59,7 +59,7 @@ test('ordinary users can restart their own walkthrough and immediately refresh i
 });
 
 function onboardingContext() {
-  const host = { hidden: false, innerHTML: '' };
+  const host = { hidden: false, innerHTML: '', querySelectorAll: () => [] };
   let timer;
   const ctx = vm.createContext({
     S: { meta: { hosted: true }, organizationId: 'org1', user: { id: 'user1' } },
@@ -158,13 +158,17 @@ function beginNavigation(ctx) {
   vm.runInContext(source.slice(start, end) + '\n}\napplyRoute();', ctx);
 }
 
-test('navigation removes completion feedback and returning does not restore it', async () => {
-  const { ctx, host } = onboardingContext();
+// Creating the first project finishes setup and opens that project, often
+// before the notice has been seen: it outlives navigation and leaves on its own.
+test('the completion notice outlives the navigation that finished setup, then leaves for good', async () => {
+  const { ctx, host, tick } = onboardingContext();
   unfinishedOnboarding(ctx);
   ctx.api = async () => finishedOnboarding;
   await vm.runInContext('refreshOnboarding()', ctx);
-  assert.equal(host.hidden, false);
   beginNavigation(ctx);
+  assert.equal(host.hidden, false);
+  assert.match(host.innerHTML, /Setup complete/);
+  await tick();
   assert.equal(host.hidden, true);
   await vm.runInContext('refreshOnboarding()', ctx);
   beginNavigation(ctx);
@@ -185,9 +189,6 @@ test('setup finished by an action that then navigates still says so on the new p
   await pending;
   assert.equal(host.hidden, false);
   assert.match(host.innerHTML, /Setup complete/);
-  // The next navigation still removes it for good.
-  beginNavigation(ctx);
-  assert.equal(host.hidden, true);
 });
 
 test('finishing a replay through Done also shows completion feedback', async () => {
@@ -221,4 +222,28 @@ test('the header minus minimizes and the header close hides the guide', async ()
     assert.equal(host.hidden, display === 'closed');
     if (display === 'minimized') assert.match(host.innerHTML, /Finish setup/);
   }
+});
+
+test('a step link tucks the guide away so the settings it opens stay usable', async () => {
+  const { ctx, host } = onboardingContext();
+  unfinishedOnboarding(ctx);
+  ctx.S.onboarding.steps = { github: {}, agentLogin: {}, e2b: {}, optional: {}, project: {} };
+  const links = [];
+  host.querySelectorAll = (selector) => {
+    assert.equal(selector, '.onboarding-step a[data-spa]');
+    return (host.innerHTML.match(/<a class="btn sm" data-spa/g) || []).map(() => {
+      const link = { addEventListener: (_event, fn) => { link.click = fn; } };
+      links.push(link);
+      return link;
+    });
+  };
+  ctx.$ = selector => selector === '#hosted-onboarding' ? host : null;
+  Object.assign(ctx, { siteNameMarkup: () => 'Tavya', globalRoute: () => '/settings', esc: String, newProject: () => {} });
+  vm.runInContext('renderOnboarding()', ctx);
+  assert.equal(links.length, 5);
+  const calls = [];
+  ctx.api = async (...args) => { calls.push(args); return { ...ctx.S.onboarding, display: 'minimized' }; };
+  await links[1].click();
+  assert.deepEqual(JSON.parse(calls[0][1].body), { display: 'minimized', finishReplay: false });
+  assert.match(host.innerHTML, /Finish setup/);
 });

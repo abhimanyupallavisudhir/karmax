@@ -49,6 +49,25 @@ describe('durable scoped tokens', () => {
 
 });
 
+// A scope naming a task and a different project is a caller mistake or a
+// spoofing attempt; the task's own project decides, and the mismatch is refused.
+it('refuses a scope whose task belongs to a different project', async () => {
+  const store = await Store.create(':memory:');
+  try {
+    const organization = await store.createOrganization({ name: 'Tenant', ownerUserId: 'owner' });
+    const mine = await store.createProject('Mine', {}, organization.id);
+    const theirs = await store.createProject('Theirs', {}, (await store.createOrganization({ name: 'Other', ownerUserId: 'other' })).id);
+    const foreign = await store.createTask({ projectId: theirs.id, title: 'Theirs', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'x' } });
+    const own = await store.createTask({ projectId: mine.id, title: 'Mine', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'x' } });
+    const authority = new TokenAuthority(store);
+    const { token } = await authority.mintPrincipal('user:owner', ['task:read'], mine.id, 60_000, organization.id);
+    expect((await authority.check(token, 'task:read', { projectId: mine.id, taskId: own.id })).ok).toBe(true);
+    const spoofed = await authority.check(token, 'task:read', { projectId: mine.id, taskId: foreign.id });
+    expect(spoofed.ok).toBe(false);
+    expect(spoofed.reason).toMatch(/another project/);
+  } finally { await store.close(); }
+});
+
 it('keeps persisted tokens out of the process map (PS-9)', async () => {
   const store = await Store.create(':memory:');
   try {

@@ -502,7 +502,6 @@ function renderRouteLoadingPage(title, label = 'Loading…') {
 }
 
 async function applyRoute() {
-  if (S.onboardingCompletion) dismissOnboardingCompletion();
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
@@ -3639,10 +3638,10 @@ async function refreshOnboarding() {
   renderOnboarding();
 }
 
-// Completion feedback lasts until the next navigation (applyRoute) and is
-// deliberately absent from both the saved preference and browser storage. The
-// step that finishes setup may itself navigate (a new project opens), so a
-// response that lands on the next page still confirms it.
+// Completion feedback is a short-lived notice, deliberately absent from both
+// the saved preference and browser storage. The step that finishes setup may
+// itself navigate (a new project opens), before or after this response lands,
+// so the notice outlives navigation and leaves on its own (renderOnboarding).
 function acceptOnboardingStatus(status) {
   const previous = S.onboarding;
   if (status.complete && previous?.visible && !previous.complete
@@ -3655,6 +3654,8 @@ function acceptOnboardingStatus(status) {
 }
 
 function dismissOnboardingCompletion() {
+  clearTimeout(S.onboardingCompletionTimer);
+  S.onboardingCompletionTimer = null;
   S.onboardingCompletion = null;
   renderOnboarding();
 }
@@ -3704,6 +3705,7 @@ function renderOnboarding() {
     && completion.userId === S.user?.id && S.meta?.hosted) {
     clearTimeout(S.onboardingTimer);
     S.onboardingTimer = null;
+    S.onboardingCompletionTimer ??= setTimeout(dismissOnboardingCompletion, 8_000);
     host.hidden = false;
     host.innerHTML = `<div class="onboarding-minimized onboarding-complete" role="status">
       <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
@@ -3713,6 +3715,9 @@ function renderOnboarding() {
     $('#onboarding-complete-close')?.addEventListener('click', dismissOnboardingCompletion);
     return;
   }
+  // The notice is gone some other way (sign-out, another organization, setup
+  // reopened): its timer must not cut a later notice short.
+  if (S.onboardingCompletionTimer) { clearTimeout(S.onboardingCompletionTimer); S.onboardingCompletionTimer = null; }
   if (!state?.visible || state.organizationId !== S.organizationId) {
     clearTimeout(S.onboardingTimer);
     S.onboardingTimer = null;
@@ -3755,6 +3760,9 @@ function renderOnboarding() {
     <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
+  // A step's link opens the settings that step needs, which the expanded card
+  // would then cover; tuck it into its progress pill while the person works.
+  host.querySelectorAll('.onboarding-step a[data-spa]').forEach((link) => link.addEventListener('click', () => setOnboardingDisplay('minimized')));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-close')?.addEventListener('click', () => setOnboardingDisplay('closed'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
@@ -19172,7 +19180,9 @@ function renderLogin() {
       location.href = result.url;
     } catch (error) { $('#login-err').textContent = error.message; }
   });
-  $('#signup-open').addEventListener('click', () => openPublicAuth('/signup', renderSignup));
+  // An invitee stays on the invitation link: boot() accepts it once the account
+  // exists, and /signup would drop its token.
+  $('#signup-open').addEventListener('click', () => S.pendingInvite ? renderSignup() : openPublicAuth('/signup', renderSignup));
   $('#forgot-open')?.addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
@@ -19305,7 +19315,7 @@ function renderSignup() {
   $('#signup-btn').addEventListener('click', go);
   wireSocialBtn('signup-google-btn', 'google', '#signup-err', true);
   wireSocialBtn('signup-github-btn', 'github', '#signup-err', true);
-  $('#signup-back').addEventListener('click', () => openPublicAuth('/login', renderLogin));
+  $('#signup-back').addEventListener('click', () => S.pendingInvite ? renderLogin() : openPublicAuth('/login', renderLogin));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
