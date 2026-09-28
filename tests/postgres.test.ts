@@ -235,7 +235,7 @@ integration('PostgreSQL cutover', () => {
         params: { prompt: 'fixture', _workflowRunId: 'run' } });
       await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
         stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
-      for (const [key, value] of [['authz:default:global', 'developer'], ['git:onboarding:x', 'seen'], ['session:x', 'mock-1']])
+      for (const [key, value] of [['authz:default:global', 'developer'], ['git:onboarding:x', 'seen'], ['session:x', 'mock-1']] as const)
         await store.kvSet(key, value);
       await store.kvSet(`turnsession:${task.id}:run#1`, 'x');
       await store.kvSet(`retention:settled:${task.id}`, String(Date.now() - 8 * 86_400_000));
