@@ -283,3 +283,35 @@ it('WF-14: caps unanswered child nags and leaves a responsive human wait', async
   await softwareDevV1_26({ ...input, recovery: { messages: [], resumeStage: 'do' } });
   expect(waits).toBeGreaterThanOrEqual(4);
 });
+
+it('WF-4: a turn records its new messages, not the whole conversation', async () => {
+  wf.activities.accountPoolSize.mockResolvedValue(0);
+  const snapshots = new Map<string, any>();
+  const { applyConversationPatch, transcriptOf } = await import('../src/domain/view-publication.js');
+  wf.activities.publishView.mockImplementation(async (_id: string, view: any, reference: string) => {
+    snapshots.set(reference, view.conversationPatch
+      ? applyConversationPatch(snapshots.get(view.conversationPatch.base), view.conversationPatch)
+      : view.messages ? { messages: view.messages, transcripts: view.transcripts } : snapshots.get(reference));
+  });
+  const turns: any[] = [];
+  wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+    const base = args.messagesBase ? transcriptOf(snapshots.get(args.messagesBase.reference), 'do')
+      .slice(0, args.messagesBase.count) : [];
+    turns.push({ ...args, fullMessages: [...base, ...args.messages] });
+    return { output: `Reply ${turns.length} ${'r'.repeat(2_000)}`, providerCompleted: true };
+  });
+  wf.wait = () => {
+    if (turns.length >= 4) return wf.handlers.get('cancel')!();
+    wf.handlers.get('followUp')!({ id: `u${turns.length}`, role: 'user', text: `Follow-up ${turns.length}`, ts: turns.length });
+  };
+  await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] } });
+  expect(turns).toHaveLength(4);
+  // The last turn still receives the whole conversation, delivered by reference.
+  expect(turns[3].fullMessages.map((m: any) => m.id)).toEqual(['m0', 'a1', 'u1', 'a3', 'u2', 'a5', 'u3']);
+  expect(turns[3].messagesBase).toMatchObject({ role: 'do', count: 7 });
+  expect(turns[3].messages).toEqual([]);
+  const writes = wf.activities.publishView.mock.calls.map((call: any[]) => call[1]);
+  expect(writes.filter((view: any) => view.messages)).toHaveLength(1);
+  for (const view of writes.filter((view: any) => view.conversationPatch))
+    expect(JSON.stringify(view.conversationPatch).length).toBeLessThan(3_000);
+});

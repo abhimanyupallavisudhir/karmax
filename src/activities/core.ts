@@ -14,7 +14,7 @@ import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
-import { hasLiveWorldWork, type PublishedView, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
+import { applyConversationPatch, hasLiveWorldWork, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -389,6 +389,9 @@ export interface RunAgentTurnArgs {
   role: AgentRole;
   worldHandle: WorldHandle;
   messages: Message[];
+  /** `messages` continue this acknowledged conversation snapshot, so a turn's
+   * input costs its new messages rather than the whole transcript (WF-4). */
+  messagesBase?: TurnConversationBase;
   session?: string;
   /** How many leading `messages` the resumed `session` already holds — forwarded to
    *  the adapter so a resumed turn sends only the delta, not the whole transcript. */
@@ -518,6 +521,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const seq = (await store.appendEvent(ev));
     deps.bus?.emit({ ...ev, seq });
     return seq;
+  }
+
+  /** An acknowledged conversation publication; patches and turn transcripts
+   * are expressed against one, so it must exist while the task is live. */
+  async function conversationSnapshot(taskId: string, reference: string): Promise<ViewConversation> {
+    const json = (await store.kvGet(`view-conversation:${taskId}:${reference}`));
+    if (json === undefined)
+      throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+    return JSON.parse(json);
   }
 
   /** JIT env for remote git/gh operations in this world (wiki plans/PLAN-git-config §4B):
@@ -1703,7 +1715,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : [`missing:${organizationId}:${missingNamespace}`];
     },
 
-    async runAgentTurn(args: RunAgentTurnArgs) {
+    async runAgentTurn({ messagesBase: base, ...input }: RunAgentTurnArgs) {
+      const args: RunAgentTurnArgs = base ? { ...input, messages: [
+        ...transcriptOf((await conversationSnapshot(input.taskId, base.reference)), base.role).slice(0, base.count),
+        ...input.messages] } : input;
       const attemptStarted = Date.now();
       let timingAttempt = 1, timingTurnId = args.agentTurnId;
       let timingSignal: AbortSignal | undefined;
@@ -5095,6 +5110,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
       let view: TaskView;
+      if (publication.conversationPatch) {
+        const { conversationPatch: patch, ...rest } = publication;
+        publication = { ...rest, ...applyConversationPatch((await conversationSnapshot(taskId, patch.base)), patch) };
+      }
       if (conversationReference) {
         // Immutable, task-scoped snapshots survive worker restarts and activity
         // retries, including retries after another publication has completed.

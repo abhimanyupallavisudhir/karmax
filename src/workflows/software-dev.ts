@@ -56,7 +56,7 @@ import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorl
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
-import { conversationPublisher } from '../domain/view-publication.js';
+import { conversationPublisher, type TurnConversationBase } from '../domain/view-publication.js';
 
 const coreChild = proxyActivities<childActivities>({ startToCloseTimeout: '20 seconds' });
 const resourceActivities = proxyActivities<coreActivities>({
@@ -1071,8 +1071,16 @@ async function softwareDevImpl(
     };
   }
 
+  // Deltas and turn references keep each turn's history cost to its new
+  // messages instead of re-recording the whole transcript (WF-4).
   const publishConversation = conversationPublisher(workflowInfo().runId,
-    (view, reference) => publishTaskView(core, taskId, view, reference));
+    (view, reference) => publishTaskView(core, taskId, view, reference),
+    { patches: () => patched('software-dev-conversation-delta-v1') });
+  const turnMessages = (messages: Message[], role: AgentRole): { messages: Message[]; messagesBase?: TurnConversationBase } => {
+    if (!patched('software-dev-turn-conversation-reference-v1')) return { messages };
+    const { base, messages: rest } = publishConversation.turnBase(messages, role);
+    return base ? { messages: rest, messagesBase: base } : { messages };
+  };
   async function publish() {
     // Apply at the live edge of existing executions as well as new task pins.
     if (patched('software-dev-conversation-publication-v1')) {
@@ -1627,7 +1635,7 @@ async function softwareDevImpl(
                   worldHandle: world as any,
                   // Include the resolve agent's full transcript so a human follow-up
                   // addressed to it (SPEC §5.6) reaches it on this turn.
-                  messages: resolveMsgs,
+                  ...turnMessages(resolveMsgs, 'resolve'),
                   task: liveInput,
                   bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
                   accountConfigHome,
@@ -2068,7 +2076,7 @@ async function softwareDevImpl(
           taskId,
           role: 'do',
           worldHandle: world as any,
-          messages: msgs,
+          ...turnMessages(msgs, 'do'),
           session: resume,
           deliveredMessages: resume ? seen : 0,
           task: liveInput,
@@ -2157,7 +2165,7 @@ async function softwareDevImpl(
         worldHandle: world as any,
         // Feed the Merge agent its full transcript so a retry has the rejection
         // context and role-addressed human follow-ups are not lost.
-        messages: mergeMsgs,
+        ...turnMessages(mergeMsgs, 'merge'),
         session: sessionMatchesHome(accountConfigHome) ? session : undefined,
         task: liveInput,
         bindings: { reviewInfo: reviewInfo?.summary ?? '' },
@@ -2226,7 +2234,7 @@ async function softwareDevImpl(
           taskId,
           role: 'confirm',
           worldHandle: world as any,
-          messages: confirmMsgs,
+          ...turnMessages(confirmMsgs, 'confirm'),
           task: liveInput,
           bindings: {
             reviewInfo: reviewInfo?.summary ?? '',
@@ -2292,7 +2300,7 @@ async function softwareDevImpl(
         taskId,
         role: 'responder',
         worldHandle: world as any,
-        messages: responderMsgs,
+        ...turnMessages(responderMsgs, 'responder'),
         task: liveInput,
         bindings: { transcript: lastOutputs(msgs) },
         accountConfigHome,

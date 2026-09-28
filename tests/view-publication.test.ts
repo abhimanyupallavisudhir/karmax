@@ -164,6 +164,65 @@ describe('durable conversation publication', () => {
     } finally { (await store.close()); }
   });
 
+  it('WF-4: writes a grown or edited conversation as a delta of its acknowledged snapshot', async () => {
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Publication', {}));
+    const task = (await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x' } }));
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    const writes: PublishedView[] = [];
+    const publish = conversationPublisher('run', async (view, reference) => {
+      writes.push(view);
+      await core.publishView(task.id, view, reference);
+    }, { patches: () => true });
+    const messages: TaskView['messages'] = [{ id: 'm0', role: 'user', text: 'CI log '.repeat(25_000), ts: 0 }];
+    const view: TaskView = { taskId: task.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'active',
+      messages, transcripts: [{ role: 'do', label: 'Do', messages }], actions: [], state: {}, updatedAt: 1 };
+    const saved = async () => (await store.getTask(task.id))?.lastView;
+    try {
+      await publish(view);
+      messages.push({ id: 'a1', role: 'agent', text: 'Fixed.', ts: 1 });
+      view.transcripts!.push({ role: 'confirm', label: 'Confirm', messages: [{ id: 'c0', role: 'user', text: 'Review', ts: 0 }] });
+      await publish({ ...view, updatedAt: 2 });
+      expect(writes[1]!.messages).toBeUndefined();
+      expect(JSON.stringify(writes[1]).length).toBeLessThan(1_000);
+      expect((await saved())?.messages).toEqual(messages);
+      expect((await saved())?.transcripts).toEqual(view.transcripts);
+      messages[0]!.text = 'edited in place';
+      await publish({ ...view, updatedAt: 3 });
+      expect(writes[2]!.conversationPatch?.messages).toMatchObject({ keep: 0 });
+      expect((await saved())?.messages.map(m => m.text)).toEqual(['edited in place', 'Fixed.']);
+      await expect(core.publishView(task.id, { ...writes[2]!, conversationPatch: { ...writes[2]!.conversationPatch!, base: 'gone' } },
+        'run:9')).rejects.toThrow('snapshot is missing');
+    } finally { (await store.close()); }
+  });
+
+  it('WF-4: a turn reads the transcript it references from the acknowledged snapshot', async () => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Turns');
+    const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'fixture' } });
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    vi.spyOn(worlds, 'open').mockResolvedValue(world);
+    let delivered: string[] = [];
+    const core = makeCoreActivities({ store, worlds, profiles: new ProfileResolver(store, 'mock'),
+      adapters: new Map([['mock', { provider: 'mock', runTurn: async (input: any) => {
+        delivered = input.messages.map((m: any) => m.text);
+        return { output: 'done', termination: { kind: 'success', status: 'fixture' } };
+      } }]]) as any });
+    try {
+      await store.kvSet(`view-conversation:${task.id}:run:3`, JSON.stringify({
+        messages: [{ id: 'm0', role: 'user', text: 'first', ts: 0 }, { id: 'a1', role: 'agent', text: 'second', ts: 1 },
+          { id: 'x', role: 'user', text: 'not part of this turn', ts: 2 }] }));
+      await core.runAgentTurn({ taskId: task.id, role: 'do', agentSlotGranted: true, worldHandle: world.handle,
+        messagesBase: { reference: 'run:3', role: 'do', count: 2 }, messages: [{ id: 'u2', role: 'user', text: 'third', ts: 2 }],
+        task: { taskId: task.id, projectId: project.id, title: 'Work', prompt: 'work', project: {}, agents: { do: { provider: 'mock' } } } } as any);
+      expect(delivered).toEqual(['first', 'second', 'third']);
+    } finally { vi.restoreAllMocks(); await world.destroy(); await store.close(); }
+  });
+
   it.each(['before', 'after'])('keeps critical escalation intact when replacement bootstrap publishes %s the ask', async (order) => {
     const store = (await Store.create(':memory:'));
     const organization = (await store.createOrganization({ name: 'Notifications', ownerUserId: 'owner' }));
