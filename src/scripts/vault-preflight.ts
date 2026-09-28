@@ -14,7 +14,13 @@ import { inspectVault } from '../autonomy/vault.js';
 hydrateEnvFile(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
 hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
 const dir = process.argv[2] ?? paths().vault;
-const report = inspectVault(dir);
+let report: ReturnType<typeof inspectVault>;
+try { report = inspectVault(dir); }
+catch (error) {
+  // Whatever stops the inspection would stop the boot too: fatal, not a stack trace.
+  console.log(`cannot inspect the vault: ${(error as Error).message}`);
+  process.exit(4);
+}
 const lines: string[] = [];
 if (report.key === 'refused') lines.push(`vault key REFUSED: ${report.refusal}`);
 else if (report.fatal) lines.push(`cannot open the vault: ${report.fatal}`);
@@ -26,4 +32,4 @@ else {
     + 'they can be rewritten only smaller (the CVC split does)');
 }
 console.log(lines.join('\n'));
-process.exit(report.key !== 'accepted' || report.unreadable.length ? 4 : report.quarantine.length ? 3 : 0);
+process.exit(report.key !== 'accepted' || report.fatal || report.unreadable.length ? 4 : report.quarantine.length ? 3 : 0);

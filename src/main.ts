@@ -20,7 +20,7 @@ import { openStore } from './store/db.js';
 import { defaultProvider } from './agent/adapters.js';
 import { KarmaxBus } from './contrib/bus.js';
 import { CredentialBroker } from './autonomy/broker.js';
-import { Vault } from './autonomy/vault.js';
+import { Vault, recordQuarantine } from './autonomy/vault.js';
 import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
 import { GitProfiles, inheritPersonalGithubProfile, userGitScope } from './autonomy/git-profiles.js';
 import { KarmaxApi } from './platform/api.js';
@@ -176,10 +176,7 @@ async function main() {
   const vault = new Vault(p.vault);
   // Binds ciphertext written before AU-27 to its handle; what will not open is quarantined, loudly.
   // Reported until audited, so a crash between quarantine and audit still reaches the log.
-  const { quarantined } = await vault.migrate();
-  for (const entry of quarantined)
-    (await store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
-  vault.acknowledgeQuarantine(quarantined);
+  await recordQuarantine(vault, (entry) => store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
   const broker = new CredentialBroker(vault);
   await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker); // AU-31
   (await import('./autonomy/vault-items.js')).removeLegacyKeyCopies(p.state); // AU-33

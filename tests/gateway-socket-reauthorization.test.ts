@@ -322,3 +322,13 @@ describe('a ticket terminal ends with the session that asked for it', () => {
     } finally { await h.close(); }
   });
 });
+
+// Round 5, item 6: a re-check whose lookup hangs times out, and is not a refusal.
+it('keeps re-checking after a lookup that hangs', async () => {
+  const { keepAuthorized, socketLifetime } = await import('../src/gateway/socket-lifetime.js');
+  const ws = socket();
+  let calls = 0;
+  keepAuthorized(ws, socketLifetime(ws), () => { calls++; return calls === 1 ? new Promise<boolean>(() => {}) : Promise.resolve(false); }, 50, 100);
+  await vi.waitFor(() => expect(closedWith(ws)).toBe(4403), { timeout: 2_000 });
+  expect(calls).toBeGreaterThanOrEqual(2);
+});

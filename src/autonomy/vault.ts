@@ -77,7 +77,17 @@ export function inspectVault(dir: string): VaultInspection {
     return { ...(error instanceof VaultKeyRefused ? { key: 'refused', refusal: message } : { key: 'unchecked', fatal: message }),
       bound: false, rebind: 0, quarantine: [], unreadable: [] };
   }
-  return vault.inspect();
+  try { return vault.inspect(); }
+  catch (error) { return { key: 'accepted', fatal: (error as Error).message, bound: false, rebind: 0, quarantine: [], unreadable: [] }; }
+}
+
+/** Append each quarantined entry to the audit log, and acknowledge it right
+ * after: a crash between the two audits at most that one entry again. */
+export async function recordQuarantine(vault: Vault, append: (entry: QuarantinedEntry) => Promise<unknown>): Promise<void> {
+  for (const entry of (await vault.migrate()).quarantined) {
+    await append(entry);
+    vault.acknowledgeQuarantine([entry]);
+  }
 }
 
 /** Write `data` to a synced temporary beside `file` and rename it into place;
@@ -180,7 +190,10 @@ export class Vault {
     }
     // Bound secrets, or a moved secrets.json, mean this vault was bound: its
     // canary was lost, not absent, and unbound ciphertext in it is planted.
-    this.bound = this.moved() || secrets.some(({ blob }) => blob.startsWith('v2.'));
+    // Not while secrets.json is still the source of truth: bound entries then
+    // come from an interrupted move, and the map may have changed since.
+    const mapIsSource = !this.migrated() && fs.existsSync(this.dbPath);
+    this.bound = this.moved() || (!mapIsSource && secrets.some(({ blob }) => blob.startsWith('v2.')));
     this.writeCanary();
   }
 
@@ -355,11 +368,19 @@ export class Vault {
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
   }
 
+  /** An entry file's text, or undefined when there is none. Anything but a
+   * missing file (a directory it cannot read, an I/O error) throws: taking it
+   * for an absent secret would make every secret look deleted. */
+  private readEntryFile(handle: string): string | undefined {
+    try { return fs.readFileSync(this.entryPath(handle), 'utf8'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  }
+
   private readEntry(handle: string): string | undefined {
-    const file = this.entryPath(handle);
-    if (fs.existsSync(file)) {
+    const raw = this.readEntryFile(handle);
+    if (raw !== undefined) {
       let entry: { handle?: unknown; blob?: unknown };
-      try { entry = JSON.parse(fs.readFileSync(file, 'utf8')); }
+      try { entry = JSON.parse(raw); }
       catch { throw new Error(`vault entry for ${handle} is unreadable; restore it from a backup`); }
       if (entry?.handle !== handle || typeof entry.blob !== 'string') throw new Error('vault entry is corrupt');
       return entry.blob as string;
@@ -369,9 +390,9 @@ export class Vault {
   }
 
   private history(handle: string): string[] {
-    const file = this.entryPath(handle);
-    if (!fs.existsSync(file)) return [];
-    const previous = JSON.parse(fs.readFileSync(file, 'utf8')).previous ?? [];
+    const raw = this.readEntryFile(handle);
+    if (raw === undefined) return [];
+    const previous = JSON.parse(raw).previous ?? [];
     if (!Array.isArray(previous) || previous.length > 5 || previous.some(blob => typeof blob !== 'string'))
       throw new Error('vault history is corrupt');
     return previous;
@@ -604,11 +625,11 @@ export class Vault {
   async put(handle: string, secret: string, options: { history?: boolean } = {}): Promise<void> {
     await this.mutate(() => {
       const prior = this.readEntry(handle);
-      // A rewrite that shrinks a stored secret is always allowed: the previous
+      // A rewrite that strictly shrinks a stored secret is always allowed: the previous
       // release stored card billing fields with no limit, and their CVC must
       // still come out (AU-31). Anything else keeps the limit.
       const bytes = Buffer.byteLength(secret, 'utf8');
-      if (bytes > SECRET_LIMIT && !(prior !== undefined && bytes <= Buffer.byteLength(this.decrypt(prior, handle), 'utf8')))
+      if (bytes > SECRET_LIMIT && !(prior !== undefined && bytes < Buffer.byteLength(this.decrypt(prior, handle), 'utf8')))
         this.validateSecret(secret);
       if (options.history === false) return this.writeEntry(handle, this.encrypt(secret, handle));
       if (prior !== undefined && this.decrypt(prior, handle) === secret) return;

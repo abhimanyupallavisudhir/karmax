@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Vault, inspectVault } from '../src/autonomy/vault.js';
+import { Vault, inspectVault, recordQuarantine } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { separateStoredCardCvcs } from '../src/autonomy/payments.js';
 
@@ -609,5 +609,84 @@ describe('the preflight, round 4', () => {
     expect(run(dir, { KARMAX_VAULT_KEY: 'not-the-key-this-vault-was-created-with' }).status).toBe(4);
     foreignEntry(dir, 'foreign');
     expect(run(dir).status).toBe(3);
+  });
+});
+
+// #367 review, round 5.
+describe('the first boot, round 5', () => {
+  function masterVault(secrets: Record<string, string>, key = crypto.randomBytes(32)) {
+    const dir = directory();
+    fs.writeFileSync(path.join(dir, 'vault.key'), key, { mode: 0o600 });
+    const map: Record<string, string> = {};
+    for (const [handle, plain] of Object.entries(secrets)) map[handle] = legacyBlob(key, plain);
+    fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify(map), { mode: 0o600 });
+    return { dir, key };
+  }
+
+  // Item 2: an unreadable entries/ is an error, never an empty vault.
+  it('fails loudly, and preflights as fatal, when entries/ cannot be read', async () => {
+    const { dir } = masterVault({ kept: 'value' });
+    await new Vault(dir).migrate();
+    fs.chmodSync(path.join(dir, 'entries'), 0o000);
+    try {
+      const vault = new Vault(dir, { readOnly: true });
+      expect(() => vault.has('kept')).toThrow(/EACCES/);
+      expect(() => vault.reveal('kept')).toThrow(/EACCES/);
+      const report = inspectVault(dir);
+      expect(report.fatal).toMatch(/EACCES/);
+      const run = spawnSync(process.execPath, ['--import', 'tsx', 'src/scripts/vault-preflight.ts', dir],
+        { encoding: 'utf8', env: { ...process.env, KARMAX_VAULT_KEY: '' } });
+      expect(run.status).toBe(4);
+      expect(run.stdout).toMatch(/cannot (open|inspect) the vault.*EACCES/s);
+    } finally { fs.chmodSync(path.join(dir, 'entries'), 0o700); }
+  });
+
+  // Item 3: while secrets.json is the source of truth, stale bound entries do not bind it.
+  it('keeps the map as the source of truth after a crash and a lost canary', async () => {
+    const { dir, key } = masterVault({ 'github-token': 'old-token', deleted: 'gone' });
+    const rename = fs.renameSync;
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(to).endsWith('secrets.json')) throw new Error('crash');
+      return rename(from, to);
+    });
+    await expect(new Vault(dir).migrate()).rejects.toThrow('crash');
+    spy.mockRestore();
+    fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify({ 'github-token': legacyBlob(key, 'rotated-token'), added: legacyBlob(key, 'new') }));
+    fs.rmSync(path.join(dir, 'vault.canary'));
+    expect(inspectVault(dir)).toMatchObject({ key: 'accepted', bound: false, quarantine: [] });
+    const vault = new Vault(dir);
+    const { quarantined } = await vault.migrate();
+    expect(quarantined).toEqual([]);
+    expect(vault.reveal('github-token')).toBe('rotated-token');
+    expect(vault.reveal('added')).toBe('new');
+    expect(vault.reveal('deleted')).toBeUndefined();
+  });
+
+  // Item 4: each quarantined file is audited once, even across a crash.
+  it('acknowledges each quarantined file as soon as it is audited', async () => {
+    const { dir } = masterVault({ kept: 'value' });
+    const map = JSON.parse(fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8'));
+    map.a = legacyBlob(crypto.randomBytes(32), 'x');
+    map.b = legacyBlob(crypto.randomBytes(32), 'y');
+    fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify(map));
+    const audited: string[] = [];
+    await expect(recordQuarantine(new Vault(dir), async (entry) => {
+      if (audited.length === 1) throw new Error('crash');
+      audited.push(entry.file);
+    })).rejects.toThrow('crash');
+    await recordQuarantine(new Vault(dir), async (entry) => { audited.push(entry.file); });
+    expect(audited).toHaveLength(2);
+    expect(new Set(audited).size).toBe(2);
+  });
+
+  // Item 5: an over-limit secret may only shrink.
+  it('refuses a same-size rewrite of an over-limit secret', async () => {
+    const big = 'x'.repeat(70_000);
+    const { dir } = masterVault({ big });
+    const vault = new Vault(dir);
+    await vault.migrate();
+    await expect(vault.put('big', 'y'.repeat(70_000))).rejects.toThrow(/size limit/);
+    await vault.put('big', 'z'.repeat(69_999));
+    expect(vault.reveal('big')).toBe('z'.repeat(69_999));
   });
 });

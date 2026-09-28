@@ -37,7 +37,14 @@ export function socketLifetime(socket: WebSocket) {
  * that fails to run is not a refusal; the next one decides.
  */
 export function keepAuthorized(socket: WebSocket, lifetime: ReturnType<typeof socketLifetime>,
-  allowed: () => Promise<boolean>, intervalMs = 5_000): void {
+  allowed: () => Promise<boolean>, intervalMs = 5_000, timeoutMs = 10_000): void {
+  // A lookup that hangs must not pause every later check: it times out, and
+  // like a lookup that fails, a timed-out check is not a refusal.
+  const decide = () => new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(true), timeoutMs);
+    timer.unref?.();
+    allowed().then(resolve, () => resolve(true)).finally(() => clearTimeout(timer));
+  });
   let running: Promise<void> | undefined;
   let again = false;
   // A close frame only starts a handshake the client may ignore: stop what the
@@ -53,7 +60,7 @@ export function keepAuthorized(socket: WebSocket, lifetime: ReturnType<typeof so
       do {
         again = false;
         if (lifetime.closed) return;
-        if (!(await allowed().catch(() => true)) && !lifetime.closed) { withdraw(); return; }
+        if (!(await decide()) && !lifetime.closed) { withdraw(); return; }
       } while (again);
     })().finally(() => { running = undefined; });
   };
