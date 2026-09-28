@@ -284,6 +284,31 @@ describe('hosted agent-run admission integration', () => {
       .toEqual({ state: 'active' });
   });
 
+  // WF-3: a plan-blocked turn waits for this reconciler to restore capacity;
+  // one wedged task workflow must not hold up every organization after it.
+  it('moves on to the next organization when a task view query hangs', async () => {
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const wedged = (await store.createOrganization({ name: 'Wedged', ownerUserId: 'owner' }));
+    const next = (await store.createOrganization({ name: 'Next', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Product', {}, wedged.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Wedged', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'Run' } }));
+    (await store.admitAgentUsage({ id: `${task.id}#0`, organizationId: wedged.id,
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' }));
+    const signalled: string[] = [];
+    const client = { workflow: { getHandle: vi.fn((id: string) => id.startsWith('agent-queue:')
+      ? { signal: vi.fn(async () => { signalled.push(id); }),
+          query: vi.fn(async () => ({ capacity: 1, current: [], queue: [] })) }
+      : { query: vi.fn(() => new Promise(() => {})) }) } } as any;
+    const reconciler = new EntitlementQueueReconciler({ store, client, intervalMs: 0, queryTimeoutMs: 50 });
+    (await reconciler.start());
+    await vi.waitFor(() => expect(signalled).toContain(`agent-queue:${next.id}`), { timeout: 2_000 });
+    expect((await store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(`${task.id}#0`)))
+      .toEqual({ state: 'active' });
+    await reconciler.stop();
+    (await store.close());
+  });
+
   it('preserves pre-durable usage admissions whose workflow view has no turn identity', async () => {
     const store = (await Store.create(':memory:', { hosted: true }));
     const organization = (await store.createOrganization({ name: 'Historical workflow', ownerUserId: 'owner' }));
