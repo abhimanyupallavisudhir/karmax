@@ -35,7 +35,9 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 const PORT = Number(process.env.KARMAX_CDP_PORT) || 9222;
-const VERSION = process.env.KARMAX_CDP_MCP_VERSION || 'latest';
+// Never `latest`: an unreviewed release would run with the agent's browser.
+// Keep in step with CHROME_DEVTOOLS_MCP_VERSION (src/autonomy/config-homes.ts).
+const VERSION = process.env.KARMAX_CDP_MCP_VERSION || '1.6.0';
 // In a remote sandbox the chrome-devtools-mcp binary is already baked/installed;
 // point at it directly instead of resolving through npx.
 const MCP_BIN = process.env.KARMAX_CDP_MCP_BIN || '';
