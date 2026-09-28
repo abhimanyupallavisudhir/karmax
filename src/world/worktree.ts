@@ -15,6 +15,7 @@ import { openLocalPty, startLocalProcess, runLocalCommand } from './local-execut
 import { addCheckoutWith } from './checkout.js';
 import { materializeGitCredential } from './git-credential.js';
 import { readRegularFilePrefix } from './file-prefix.js';
+import { taskBranch } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
 const managedRepoClones = new Map<string, Promise<string>>();
@@ -32,7 +33,7 @@ function listPlainFiles(root: string, relative = ''): string[] {
 
 /**
  * Local git-worktree world (SPEC §11.2, the default backend). Each task gets an
- * isolated worktree on a `karmax/<taskId>` branch off the project's base. Work
+ * isolated worktree on a `tavya/<taskId>` branch off the project's base. Work
  * is committed and merged into the target branch — the real deliverable lands in
  * the user's repo. The worktree dir is removed at destroy; the branch is kept so
  * the attempt stays inspectable in git history.
@@ -49,7 +50,7 @@ export class WorktreeProvider implements WorldProvider {
 
   async create(spec: WorldSpec): Promise<World> {
     fs.mkdirSync(this.home, { recursive: true });
-    const branch = spec.checkouts?.[0]?.branch ?? spec.branch ?? `karmax/${spec.taskId}`;
+    const branch = spec.checkouts?.[0]?.branch ?? spec.branch ?? taskBranch(spec.taskId);
     const root = path.join(this.home, spec.taskId);
 
     // Normalize the configured sources: `repos` (multi) wins over `repo` (legacy single).
@@ -139,7 +140,7 @@ export class WorktreeProvider implements WorldProvider {
   }
 
   /**
-   * Add a `karmax/<taskId>` worktree for one repo at `wt`, off `spec.base`
+   * Add a `tavya/<taskId>` worktree for one repo at `wt`, off `spec.base`
    * (falling back to HEAD if that ref is absent). Returns the `WorldRepo` record.
    */
   private async addWorktree(repo: string, wt: string, name: string, branch: string, spec: WorldSpec,

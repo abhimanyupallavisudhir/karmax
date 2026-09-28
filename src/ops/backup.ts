@@ -6,6 +6,7 @@ import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { paths } from '../config/paths.js';
 import { scanInstances } from '../util/instance.js';
 import { signBackupBytes, verifyBackupBytes } from './backup-signing.js';
+import { BRAND } from '../domain/brand.js';
 
 const sqlite = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
@@ -109,7 +110,7 @@ export async function createBackup(options: {
     // Name a remedy the operator can actually carry out. "pass allowRunning"
     // described an API option that the `npm run backup` CLI had no flag for, so
     // the only way out of this error did not exist from where they were standing.
-    throw new Error(`stop Krmax before taking a backup (live app pids: ${live.join(', ')}), `
+    throw new Error(`stop ${BRAND} before taking a backup (live app pids: ${live.join(', ')}), `
       + 'or re-run with `npm run backup -- --allow-running` to accept a snapshot '
       + 'that is not point-in-time consistent');
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -201,7 +202,7 @@ function readManifest(directory: string, options: BackupTrust & { home?: string 
   const bytes = fs.readFileSync(path.join(directory, 'manifest.json'));
   const manifest = JSON.parse(bytes.toString('utf8')) as BackupManifest;
   if (manifest.format !== 'karmax-backup' || manifest.version !== 1 || !Array.isArray(manifest.files))
-    throw new Error('unsupported or invalid Krmax backup manifest');
+    throw new Error(`unsupported or invalid ${BRAND} backup manifest`);
   let signature: string | undefined;
   try { signature = fs.readFileSync(path.join(directory, 'manifest.sig'), 'utf8'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
@@ -296,7 +297,7 @@ export async function restoreBackup(source: string, options: BackupTrust & { hom
     // components under a live process, which corrupts rather than merely tears.
     // "Krmax" not "karmax": this is operator-facing output, which carries the
     // brand (see the naming note in the SPEC, and tests/brand.test.ts).
-    throw new Error(`stop Krmax before restore (live app pids: ${running.join(', ')})`);
+    throw new Error(`stop ${BRAND} before restore (live app pids: ${running.join(', ')})`);
 
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const nonce = `${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;

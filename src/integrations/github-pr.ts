@@ -14,6 +14,7 @@
 
 import { createHash } from 'node:crypto';
 import type { TaskPullRequest, TaskView } from '../domain/types.js';
+import { taskIdOfBranch, BRAND } from '../domain/brand.js';
 
 export interface GithubPullRequest {
   number: number;
@@ -41,6 +42,15 @@ export interface GithubMergeResult {
 export interface GithubRefUpdateResult {
   updated: boolean;
   message: string;
+}
+
+export interface GithubComparison {
+  /** Commits `head` has that `base` lacks. */
+  aheadBy: number;
+  /** Commits `base` has that `head` lacks: above zero, `head` never saw base's tip. */
+  behindBy: number;
+  /** The commit GitHub resolved `base` to for this comparison. */
+  baseSha?: string;
 }
 
 export interface GithubBranchUpdateResult {
@@ -203,11 +213,8 @@ export function githubSlug(remote: string): string | undefined {
   return match?.[1];
 }
 
-/** The task branch a PR head belongs to, for correlating GitHub back to karmax. */
-export function taskIdOfBranch(branch: string | undefined): string | undefined {
-  const match = branch?.match(/^karmax\/(.+)$/);
-  return match?.[1];
-}
+/** The task a PR head belongs to (re-exported for existing importers). */
+export { taskIdOfBranch };
 
 function normalize(raw: any): GithubPullRequest {
   return {
@@ -311,6 +318,18 @@ export class GithubPrApi {
       }
     }
     throw new Error('cannot verify comment receipt within the pull request comment limit');
+  }
+
+  /** How `head` relates to `base`. A branch `base` is compared at its live
+   * tip, which the PR's own base commit may not yet reflect. */
+  async compare(slug: string, base: string, head: string): Promise<GithubComparison> {
+    const value = await this.request<any>(
+      `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`);
+    const aheadBy = Number(value?.ahead_by);
+    const behindBy = Number(value?.behind_by);
+    if (!Number.isSafeInteger(aheadBy) || aheadBy < 0 || !Number.isSafeInteger(behindBy) || behindBy < 0)
+      throw new Error(`GitHub did not report how ${head} relates to ${base}`);
+    return { aheadBy, behindBy, ...(value?.base_commit?.sha ? { baseSha: String(value.base_commit.sha) } : {}) };
   }
 
   /** Mirror an explicit krmax Human-confirm decision into GitHub's native PR
@@ -648,7 +667,7 @@ export class GithubPrApi {
       return this.fetcher(`${this.apiBase}${pathname}`, { ...init, headers: {
         accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
         'x-github-api-version': '2022-11-28', 'content-type': 'application/json',
-        'user-agent': 'karmax', ...(init.headers ?? {}),
+        'user-agent': BRAND, ...(init.headers ?? {}),
       } });
     };
     let response = await send();

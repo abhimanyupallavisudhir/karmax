@@ -2170,7 +2170,7 @@ esac
         }),
       })).json();
       expect(created.writeBack).toEqual([
-        { connector: 'pass', externalId: `karmax/${created.id}.login` },
+        { connector: 'pass', externalId: `tavya/${created.id}.login` },
       ]);
       expect(fs.readFileSync(entryFile, 'utf8')).toBe('initial\nusername: agent@example.com\n');
 
@@ -2201,7 +2201,7 @@ esac
         });
         expect(response.status).toBe(200);
         const saved: any = await response.json();
-        expect(saved.writeBack).toEqual([{connector:'pass',externalId:`karmax/${saved.itemId}.passkey`}]);
+        expect(saved.writeBack).toEqual([{connector:'pass',externalId:`tavya/${saved.itemId}.passkey`}]);
         expect(parsePassItem(fs.readFileSync(entryFile,'utf8')).secrets.passkey).toBe(JSON.stringify(credentials));
       } finally { harvest.mockRestore(); }
 

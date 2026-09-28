@@ -34,6 +34,7 @@ import { worldWorkingDirectory } from '../world/types.js';
 import { recoverClaudeToolInputs } from './claude-history.js';
 import { ensureClaudeAccessTokenFresh, refreshClaudeAccessToken } from './usage.js';
 import { boundedStartupProbe, startupStderrSummary } from './startup-diagnostics.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -306,7 +307,8 @@ export class ClaudeAdapter implements AgentAdapter {
         ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'failed',
           title: 'Could not refresh Claude access token',
           detail: activityDetail(refreshError instanceof Error ? refreshError.message : refreshError) });
-        throw error;
+        // A signed-out login is the more precise diagnosis than the expiry.
+        throw refreshError instanceof ProviderFailure ? refreshError : error;
       }
       if (ctx.signal?.aborted) throw error;
       ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'completed',
@@ -342,7 +344,7 @@ export class ClaudeAdapter implements AgentAdapter {
       const here = path.dirname(fileURLToPath(import.meta.url));
       if (!fs.existsSync(here)) {
         throw new Error(
-          `krmax is running from a deleted directory (${here}) — an orphaned app instance, ` +
+          `${BRAND} is running from a deleted directory (${here}) — an orphaned app instance, ` +
             `likely booted from a task world that has since merged and been removed (karmax#3). ` +
             `Kill this process (pid ${process.pid}); it is poisoning the shared task queue. ` +
             `Original error: ${String(e)}`,

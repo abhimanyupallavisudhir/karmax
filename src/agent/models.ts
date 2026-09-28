@@ -11,6 +11,7 @@ import { withTimeout } from '../util/timeout.js';
 import type { Provider } from '../domain/types.js';
 import type { AcpProvider } from './provider-registry.js';
 import { selectAcpAuthMethod } from './acp.js';
+import { BRAND } from '../domain/brand.js';
 
 export interface AvailableModel {
   id: string;
@@ -102,7 +103,7 @@ export async function claudeApiModels(
       ...(oauthToken ? { authorization: `Bearer ${oauthToken}`, 'anthropic-beta': 'oauth-2025-04-20' } : {}),
       ...(apiKey ? { 'x-api-key': apiKey } : {}),
       'anthropic-version': '2023-06-01',
-      'user-agent': 'karmax-model-picker/1.0',
+      'user-agent': `${BRAND}-model-picker/1.0`,
     },
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -201,7 +202,7 @@ export async function codexModels(configHome?: string, timeoutMs = 10_000): Prom
   child.once('close', () => client.close());
   try {
     await withTimeout(client.request('initialize', {
-      clientInfo: { name: 'karmax-model-picker', title: 'karmax', version: '1.0.0' },
+      clientInfo: { name: `${BRAND}-model-picker`, title: BRAND, version: '1.0.0' },
       capabilities: null,
     }), timeoutMs);
     client.notify('initialized');
@@ -268,7 +269,7 @@ export async function acpModels(
     : process.env.KARMAX_GROK_CMD ?? 'grok';
   const args = provider === 'kimi' ? ['acp'] : ['--no-auto-update', 'agent', 'stdio'];
   const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'ignore'] });
-  const app = client({ name: 'karmax-model-picker' })
+  const app = client({ name: `${BRAND}-model-picker` })
     .onRequest(methods.client.session.requestPermission, () => ({ outcome: { outcome: 'cancelled' as const } }))
     .onRequest(methods.client.fs.readTextFile, () => ({ content: '' }))
     .onRequest(methods.client.fs.writeTextFile, () => ({}));
@@ -282,7 +283,7 @@ export async function acpModels(
       const init = await agent.request(methods.agent.initialize, {
         protocolVersion: PROTOCOL_VERSION,
         clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
-        clientInfo: { name: 'karmax-model-picker', version: '1.0.0' },
+        clientInfo: { name: `${BRAND}-model-picker`, version: '1.0.0' },
       });
       if (init.protocolVersion !== PROTOCOL_VERSION) return [];
       if (init.authMethods?.length) {

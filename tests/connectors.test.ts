@@ -551,7 +551,7 @@ describe('Connectors sync into the vault (§9)', () => {
     const connector = {
       name: 'test',
       describe: async () => ({ name: 'test', label: 'Test', available: true, canPush: false, detail: 'ready' }),
-      list: async () => [{ externalId: 'karmax/created', type: 'login' as const, label: 'Created',
+      list: async () => [{ externalId: 'tavya/created', type: 'login' as const, label: 'Created',
         fields: ['password' as const], changedAt: 2 }],
       pull: async (externalIds: string[]) => ({ items: externalIds.map((externalId) => ({ externalId,
         type: 'login' as const, label: 'Created', fields: ['password' as const], changedAt: 2,
@@ -561,13 +561,13 @@ describe('Connectors sync into the vault (§9)', () => {
     connectors.register(connector);
     const created = (await items.save({ type: 'login', label: 'Created', secrets: { password: 'generated' },
       provenance: { source: 'task:signup', taskId: 'signup' } }));
-    items.setExternalId(created.id, 'test', 'karmax/created');
+    items.setExternalId(created.id, 'test', 'tavya/created');
     (await connectors.setAutoSync('test', { importNew: true }));
 
     const result = await connectors.autoSync('test', 'github-push');
     expect(result).toMatchObject({ count: 0, skipped: 1 });
     expect((await items.list())).toHaveLength(1);
-    expect((await items.get(created.id))?.provenance.externalIds).toEqual({ test: 'karmax/created' });
+    expect((await items.get(created.id))?.provenance.externalIds).toEqual({ test: 'tavya/created' });
   });
 
   /** A `pass` store on disk + an exec that "decrypts" by reading the file, so
@@ -836,7 +836,7 @@ describe('Connectors sync into the vault (§9)', () => {
     const pushed: any[] = [];
     const c = new PassConnector(scriptedExec({ 'pass insert': '' }));
     // stub push to capture (PassConnector.push shells out; capture the secrets)
-    (c as any).push = async (item: any) => { pushed.push(item); return { externalId: 'karmax/new' }; };
+    (c as any).push = async (item: any) => { pushed.push(item); return { externalId: 'tavya/new' }; };
     const connectors = new Connectors(store, items, broker);
     connectors.register(c);
     const created = (await items.save({ type: 'login', label: 'made by agent', secrets: { password: 'genpw' }, provenance: { source: 'task:t1', taskId: 't1' } }));
@@ -845,10 +845,10 @@ describe('Connectors sync into the vault (§9)', () => {
     expect(await connectors.writeBack('pass', created.id)).toBeUndefined();
     (await connectors.setConfig('pass', { writeBack: true }));
     const result = await connectors.writeBack('pass', created.id);
-    expect(result?.externalId).toBe('karmax/new');
+    expect(result?.externalId).toBe('tavya/new');
     expect(pushed[0].secrets.password).toBe('genpw');
-    expect((await items.get(created.id))!.provenance.externalId).toBe('karmax/new');
-    expect((await items.get(created.id))!.provenance.externalIds).toEqual({ pass: 'karmax/new' });
+    expect((await items.get(created.id))!.provenance.externalId).toBe('tavya/new');
+    expect((await items.get(created.id))!.provenance.externalIds).toEqual({ pass: 'tavya/new' });
   });
 
   it('automatically applies enabled connector write-back and propagates later rotations', async () => {
@@ -858,7 +858,7 @@ describe('Connectors sync into the vault (§9)', () => {
     const connector = new PassConnector(scriptedExec({}));
     (connector as any).push = async (item: any) => {
       pushed.push(item);
-      return { externalId: 'karmax/automatic' };
+      return { externalId: 'tavya/automatic' };
     };
     (connector as any).updateSecret = async (externalId: string, field: string, value: string) => {
       updated.push({ externalId, field, value });
@@ -872,11 +872,11 @@ describe('Connectors sync into the vault (§9)', () => {
     }));
 
     expect(await connectors.writeBackCreated(created.id)).toEqual([
-      { connector: 'pass', externalId: 'karmax/automatic' },
+      { connector: 'pass', externalId: 'tavya/automatic' },
     ]);
     expect(pushed).toHaveLength(1);
     expect(pushed[0].secrets.password).toBe('generated');
-    expect((await items.get(created.id))!.provenance.externalIds).toEqual({ pass: 'karmax/automatic' });
+    expect((await items.get(created.id))!.provenance.externalIds).toEqual({ pass: 'tavya/automatic' });
 
     (await items.save({ id: created.id, type: 'login', secrets: { password: 'rotated' } }));
     expect(await connectors.propagate(created.id, ['password'])).toEqual({
@@ -884,7 +884,7 @@ describe('Connectors sync into the vault (§9)', () => {
       fields: ['password'],
     });
     expect(updated).toEqual([
-      { externalId: 'karmax/automatic', field: 'password', value: 'rotated' },
+      { externalId: 'tavya/automatic', field: 'password', value: 'rotated' },
     ]);
   });
 
@@ -1303,14 +1303,14 @@ it('publishes local pass ciphertext exclusively when another writer wins the nam
     const c = new PassConnector(async (_cmd, args, opts) => {
       expect(args).toEqual(['insert', '-m', 'export']);
       fs.writeFileSync(path.join(opts!.env!.PASSWORD_STORE_DIR!, 'export.gpg'), 'our ciphertext');
-      fs.writeFileSync(path.join(root, 'karmax', 'same.gpg'), 'other ciphertext');
+      fs.writeFileSync(path.join(root, 'tavya', 'same.gpg'), 'other ciphertext');
       return '';
     }, root);
     await expect(
-      c.push({ externalId: 'karmax/same', type: 'note', label: 'same', fields: ['note'], secrets: { note: 'ours' } }),
+      c.push({ externalId: 'tavya/same', type: 'note', label: 'same', fields: ['note'], secrets: { note: 'ours' } }),
     ).rejects.toThrow();
-    expect(fs.readFileSync(path.join(root, 'karmax', 'same.gpg'), 'utf8')).toBe('other ciphertext');
-    expect(fs.readdirSync(path.join(root, 'karmax'))).toEqual(['same.gpg']);
+    expect(fs.readFileSync(path.join(root, 'tavya', 'same.gpg'), 'utf8')).toBe('other ciphertext');
+    expect(fs.readdirSync(path.join(root, 'tavya'))).toEqual(['same.gpg']);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

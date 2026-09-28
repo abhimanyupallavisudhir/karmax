@@ -1,9 +1,10 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -142,6 +143,123 @@ describe('turnkey restore preflight', () => {
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+/** A sandbox holding the real operator script, a `.turnkey.env`, and a `bin`
+ *  of stubs that shadows the host's commands. */
+function operatorSandbox(stubs: Record<string, string>) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-operator-'));
+  const sandbox = path.join(home, 'deploy');
+  const bin = path.join(home, 'bin');
+  fs.mkdirSync(sandbox);
+  fs.mkdirSync(bin);
+  for (const file of ['karmax', 'compose.turnkey.yml']) fs.copyFileSync(path.join(deployDir, file), path.join(sandbox, file));
+  fs.writeFileSync(path.join(sandbox, '.turnkey.env'), 'KARMAX_DOMAIN=example.test\n', { mode: 0o600 });
+  for (const [name, body] of Object.entries(stubs)) fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  const run = (args: string[], input = '') => spawnSync('sh', [path.join(sandbox, 'karmax'), ...args], {
+    input, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+  });
+  const log = () => fs.existsSync(path.join(home, 'docker.log')) ? fs.readFileSync(path.join(home, 'docker.log'), 'utf8') : '';
+  return { home, sandbox, run, log };
+}
+
+describe('turnkey operator robustness', () => {
+  const homes: string[] = [];
+  afterAll(() => { for (const home of homes) fs.rmSync(home, { recursive: true, force: true }); });
+  const tracked = (stubs: Record<string, string>) => { const box = operatorSandbox(stubs); homes.push(box.home); return box; };
+
+  // chmod fails for anyone but a file's owner even when it would change
+  // nothing, and a secret `sudo ./deploy/karmax up` created belongs to root:
+  // every later deploy stopped at "could not write its secrets".
+  it('leaves an already-readable secret it may not chmod alone', () => {
+    const box = tracked({
+      docker: 'printf \'%s\\n\' "$*" >> "$(dirname "$0")/../docker.log"; for a in "$@"; do [ "$a" = up ] && exit 1; done; exit 0',
+      chmod: 'for a in "$@"; do case "$a" in */.secrets/*) echo "chmod: $a: Operation not permitted" >&2; exit 1;; esac; done; exec /bin/chmod "$@"',
+    });
+    const secrets = path.join(box.sandbox, '.secrets');
+    fs.mkdirSync(secrets, { mode: 0o700 });
+    for (const name of ['auth_secret', 'vault_key', 'world_ref_key']) fs.writeFileSync(path.join(secrets, name), 'ab'.repeat(48), { mode: 0o644 });
+    const result = box.run(['up', 'example.test']);
+    expect(result.stderr).not.toContain('Operation not permitted');
+    expect(box.log()).toContain('up -d --build --remove-orphans');
+  });
+
+  it('still refuses a secret the app could not read', () => {
+    const box = tracked({
+      docker: 'printf \'%s\\n\' "$*" >> "$(dirname "$0")/../docker.log"; for a in "$@"; do [ "$a" = up ] && exit 1; done; exit 0',
+      chmod: 'for a in "$@"; do case "$a" in */.secrets/*) echo "chmod: $a: Operation not permitted" >&2; exit 1;; esac; done; exec /bin/chmod "$@"',
+    });
+    const secrets = path.join(box.sandbox, '.secrets');
+    fs.mkdirSync(secrets, { mode: 0o700 });
+    for (const name of ['auth_secret', 'vault_key', 'world_ref_key']) fs.writeFileSync(path.join(secrets, name), 'ab'.repeat(48), { mode: 0o600 });
+    const result = box.run(['up', 'example.test']);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('Operation not permitted');
+    expect(box.log()).not.toContain('up -d');
+  });
+
+  // Only the app names its sessions `karmax`; an operator's psql or a backup's
+  // pg_dump on the karmax database used to read as "the app is the superuser".
+  it('asks PostgreSQL only about the app\'s own sessions, and checks HTTPS even when that fails', () => {
+    const box = tracked({
+      docker: 'printf \'%s\\n\' "$*" >> "$(dirname "$0")/../docker.log"; case "$*" in *psql*) echo "connection refused" >&2; exit 2;; esac; exit 0',
+      curl: 'exit 7',
+    });
+    fs.mkdirSync(path.join(box.sandbox, '.secrets'), { mode: 0o700 });
+    for (const name of ['auth_secret', 'vault_key', 'world_ref_key']) fs.writeFileSync(path.join(box.sandbox, '.secrets', name), 'x');
+    const result = box.run(['doctor']);
+    expect(result.status, result.stderr).toBe(0);
+    expect(box.log()).toContain("application_name = 'karmax'");
+    expect(result.stderr).toContain('could not ask PostgreSQL');
+    expect(result.stdout).toContain('Public HTTPS is not reachable yet');
+  });
+
+  /** A backup that passes every check before the prompt, with `dumpKiB` of
+   *  dumps, on a PostgreSQL disk with `freeKiB` available. */
+  function restorable(dumpKiB: number, freeKiB: number) {
+    const box = tracked({
+      docker: `printf '%s\\n' "$*" >> "$(dirname "$0")/../docker.log"
+case "$*" in *"df -Pk"*) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\noverlay 99999999 1 ${freeKiB} 1%% /var/lib/postgresql/data\\n';; esac
+exit 0`,
+    });
+    const backup = path.join(box.home, 'backup');
+    fs.mkdirSync(path.join(backup, 'control-plane'), { recursive: true });
+    fs.mkdirSync(path.join(backup, 'deployment-secrets'));
+    fs.writeFileSync(path.join(backup, 'control-plane', 'manifest.json'), '{}');
+    fs.writeFileSync(path.join(backup, 'deployment-secrets', 'auth_secret'), 'x');
+    for (const dump of ['karmax', 'temporal', 'temporal-visibility']) {
+      fs.writeFileSync(path.join(backup, `${dump}.dump`), crypto.randomBytes(dumpKiB * 1024 / 4));
+    }
+    execFileSync('sh', ['-c', 'sha256sum *.dump deployment-secrets/* > SHA256SUMS'], { cwd: backup });
+    return { ...box, backup };
+  }
+
+  // Staging holds a second copy of every database beside the live ones, on the
+  // disk that also takes the live write-ahead log: filling it stops the
+  // running instance too.
+  it('refuses a restore whose dumps alone exceed the free space', () => {
+    const box = restorable(256, 128);
+    const result = box.run(['restore', box.backup], 'RESTORE\n');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/not enough free space/i);
+    expect(box.log()).not.toMatch(/\bdown\b|dropdb|createdb/);
+  });
+
+  it('warns before the prompt when the restored databases may not fit', () => {
+    const box = restorable(256, 512);
+    const result = box.run(['restore', box.backup], 'no\n');
+    expect(result.stderr).toMatch(/may not fit/i);
+    expect(result.stderr).toContain('restore cancelled');
+    expect(result.stderr.indexOf('may not fit')).toBeLessThan(result.stderr.indexOf('restore cancelled'));
+    expect(box.log()).not.toMatch(/\bdown\b|dropdb|createdb/);
+  });
+
+  it('asks without a warning when there is room', () => {
+    const box = restorable(256, 64 * 1024);
+    const result = box.run(['restore', box.backup], 'no\n');
+    expect(result.stderr).not.toMatch(/may not fit|not enough free space/i);
+    expect(result.stderr).toContain('restore cancelled');
   });
 });
 

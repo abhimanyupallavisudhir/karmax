@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * The org/project wiki (skills, memories, and prompts — one system).
@@ -99,7 +100,7 @@ export const BUILTIN_WIKI_ENTRIES: WikiPage[] = [
     name: 'How to work',
     path: `${BUILTIN_WIKI_PREFIX}/how-to-work`,
     kind: 'skill',
-    description: 'Built-in krmax working instructions, sent to every agent.',
+    description: `Built-in ${BRAND} working instructions, sent to every agent.`,
     labels: [DEFAULT_LABEL],
     importance: 1000,
     builtin: true,

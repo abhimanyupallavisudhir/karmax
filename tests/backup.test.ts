@@ -415,9 +415,9 @@ describe('control-plane backup', () => {
   });
 
   it.each([
-    ['another format', (m: any) => { m.format = 'tarball'; }, 'unsupported or invalid Krmax backup manifest'],
-    ['a newer version', (m: any) => { m.version = 2; }, 'unsupported or invalid Krmax backup manifest'],
-    ['no file list', (m: any) => { delete m.files; }, 'unsupported or invalid Krmax backup manifest'],
+    ['another format', (m: any) => { m.format = 'tarball'; }, 'unsupported or invalid tavya backup manifest'],
+    ['a newer version', (m: any) => { m.version = 2; }, 'unsupported or invalid tavya backup manifest'],
+    ['no file list', (m: any) => { delete m.files; }, 'unsupported or invalid tavya backup manifest'],
     ['a path escaping the payload', (m: any) => { m.files[0].path = '../manifest.json'; }, 'backup path escapes payload: ../manifest.json'],
     ['an absolute path', (m: any) => { m.files[0].path = '/etc/passwd'; }, 'invalid backup path: /etc/passwd'],
     ['a backslash path', (m: any) => { m.files[0].path = 'vault\\\\value'; }, 'invalid backup path'],
@@ -448,7 +448,7 @@ describe('control-plane backup', () => {
     write(home, 'vault/value', 'live');
     write(home, `state/instances/${process.ppid}.pid`, JSON.stringify({ pid: process.ppid, home }));
     const error = await restoreBackup(path.join(root, 'snapshot'), { home }).catch((e: Error) => e);
-    expect((error as Error).message).toBe(`stop Krmax before restore (live app pids: ${process.ppid})`);
+    expect((error as Error).message).toBe(`stop tavya before restore (live app pids: ${process.ppid})`);
     expect(fs.readFileSync(path.join(home, 'vault', 'value'), 'utf8')).toBe('live');
   });
 

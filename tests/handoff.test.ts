@@ -32,6 +32,39 @@ describe('hosted/local Git handoff', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // The project wiki is never part of a development checkout, so a wiki
+  // citation used to fail with "local checkout does not contain the requested
+  // repository" (task 367). It names a wiki entry and opens in the wiki view.
+  it('resolves a citation inside the project-wiki checkout to its wiki entry', async () => {
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Platform', { worldProvider: 'e2b' }, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Review', workflow: 'software-dev', workflowVersion: '1.0.0',
+      params: { prompt: 'review' } as any }));
+    const branch = `karmax/${task.id}`;
+    // The agent works inside the development checkout; its prompt lists the
+    // wiki beside it, at the world root.
+    (await store.registerWorld({ kind: 'e2b', id: task.id, root: '/home/user/acme', workdir: '/home/user/acme/app', branch, base: 'main',
+      repos: [
+        { name: 'app', repo: 'git@github.com:acme/app.git', root: '/home/user/acme/app', branch, base: 'main', target: 'main' },
+        { name: 'acme-wiki', role: 'project-wiki', repo: 'git@github.com:acme/acme-wiki.git', root: '/home/user/acme/acme-wiki',
+          branch, base: 'main', target: 'main' },
+      ] }, project.id));
+    const handoff = new WorldHandoffService(store, new WorldRegistry(), {} as any);
+    expect(await handoff.wikiCitation(task.id, 'acme-wiki/reviews/2026-09-26/SKILL.md'))
+      .toEqual({ wiki: { path: 'reviews/2026-09-26' } });
+    expect(await handoff.wikiCitation(task.id, '/home/user/acme/acme-wiki/notes/MEMORY.md'))
+      .toEqual({ wiki: { path: 'notes' } });
+    expect(await handoff.wikiCitation(task.id, 'acme-wiki/reviews/2026-09-26/diagram.png'))
+      .toEqual({ wiki: { path: 'reviews/2026-09-26' } });
+    expect(await handoff.wikiCitation(task.id, 'acme-wiki/reviews')).toEqual({ wiki: { path: 'reviews' } });
+    expect(await handoff.wikiCitation(task.id, '../acme-wiki/notes/SKILL.md')).toEqual({ wiki: { path: 'notes' } });
+    expect(await handoff.wikiCitation(task.id, 'src/index.ts')).toBeUndefined();
+    expect(await handoff.wikiCitation(task.id, '/home/user/acme/app/src/index.ts')).toBeUndefined();
+    expect(await handoff.wikiCitation(task.id, '/etc/passwd')).toBeUndefined();
+    (await store.close());
+  });
+
   it('produces a secret-free SSH checkout plan for every attached repository', async () => {
     const store = (await Store.create(':memory:'));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
@@ -44,7 +77,7 @@ describe('hosted/local Git handoff', () => {
     (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
     const task = (await store.createTask({ projectId: project.id, title: 'Fix auth', workflow: 'software-dev', workflowVersion: '1.0.0',
       params: { prompt: 'fix auth' } as any }));
-    const branch = `karmax/${task.id}`;
+    const branch = `tavya/${task.id}`;
     (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting',
       actions: [], state: {}, messages: [], branch, base: 'main', waitingFor: { kind: 'human' }, updatedAt: 1 } as any));
     (await store.registerWorld({ kind: 'e2b', id: task.id, root: '/workspace', branch, base: 'main', repo: repository.sshUrl,
@@ -73,7 +106,7 @@ describe('hosted/local Git handoff', () => {
 
     const plan = (await new WorldHandoffService(store, new WorldRegistry(), {} as any).projectCheckout(project.id));
 
-    expect(plan.workspace).toBe('karmax-platform-tools');
+    expect(plan.workspace).toBe('tavya-platform-tools');
     expect(plan.repositories).toEqual([expect.objectContaining({ name: 'app', branch: 'trunk' })]);
     expect(plan.cloneScript).toContain("git clone --branch 'trunk' --single-branch 'git@github.com:acme/app.git' 'app'");
     expect(plan.updateScript).toContain("git -C 'app' merge --ff-only 'origin/trunk'");
@@ -87,7 +120,7 @@ describe('hosted/local Git handoff', () => {
     const seed = path.join(dir, 'seed');
     const cloud = path.join(dir, 'cloud');
     const laptop = path.join(dir, 'laptop');
-    const branch = 'karmax/task-7';
+    const branch = 'tavya/task-7';
     fs.mkdirSync(seed);
     await gitOrThrow(dir, ['init', '--bare', '-q', remote]);
     await gitOrThrow(seed, ['init', '-q', '-b', 'main']);
@@ -128,7 +161,7 @@ describe('hosted/local Git handoff', () => {
     const seed = path.join(dir, 'seed');
     const cloud = path.join(dir, 'cloud');
     const localRoot = path.join(dir, 'local');
-    const branch = 'karmax/task-cloud';
+    const branch = 'tavya/task-cloud';
     fs.mkdirSync(seed);
     await gitOrThrow(dir, ['init', '--bare', '-q', remote]);
     await gitOrThrow(seed, ['init', '-q', '-b', 'main']);
@@ -232,7 +265,7 @@ describe('hosted/local Git handoff', () => {
     const source = path.join(dir, 'source');
     const cloud = path.join(dir, 'cloud');
     const localRoot = path.join(dir, 'local');
-    const branch = 'karmax/task-local-source';
+    const branch = 'tavya/task-local-source';
     fs.mkdirSync(source);
     await gitOrThrow(dir, ['init', '--bare', '-q', remote]);
     await gitOrThrow(source, ['init', '-q', '-b', 'main']);

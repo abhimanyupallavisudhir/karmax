@@ -20,6 +20,7 @@ import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 import { exposeRemoteNodeCommand, installRemoteNodeCommand, PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from './remote-node.js';
 import { collectStartupProbe, StartupProtocolTrace } from './startup-diagnostics.js';
+import { BRAND } from '../domain/brand.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
@@ -79,7 +80,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   const browser = browserOverride === 'none' ? undefined : configuredBrowser(localHome, provider);
   // Without a browser the Codex config is known now and uploads with the rest.
   const codexConfig = provider === 'codex' && !browser ? remoteCodexConfig(localHome) : undefined;
-  const files = [...configFiles(localHome, provider).filter(file => provider !== 'codex' || file.relative !== 'config.toml'),
+  const files = [...configFiles(localHome).filter(file => provider !== 'codex' || file.relative !== 'config.toml'),
     ...(codexConfig === undefined ? [] : [{ relative: 'config.toml', content: Buffer.from(codexConfig) }])];
   async function seed(file: { relative: string; content: Buffer }) {
     const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
@@ -187,7 +188,7 @@ const browserFailures = new WeakSet<object>();
  * repair's message quotes the sandbox's output, which may name any error, and
  * a command that timed out may still be running there. */
 function lostConnection(error: unknown): boolean {
-  for (let current = error, depth = 0; current && typeof current === 'object' && depth < 4; current = (current as any).cause, depth++) {
+  for (let current = error, depth = 0; current && typeof current === 'object' && depth < 4; current = (current as { cause?: unknown }).cause, depth++) {
     const { code, name } = current as { code?: unknown; name?: unknown };
     if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'EAI_AGAIN'].includes(String(code))
       || name === 'SandboxNotFoundError') return true;
@@ -1047,7 +1048,7 @@ export class RemoteSpawnedProcess extends EventEmitter {
   }
 }
 
-function configFiles(root: string, provider: Provider): Array<{ relative: string; content: Buffer }> {
+function configFiles(root: string): Array<{ relative: string; content: Buffer }> {
   const files: Array<{ relative: string; content: Buffer }> = [];
   const walk = (dir: string, relative = '') => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -1489,7 +1490,7 @@ async function repairBrowser(world: World, runtimeBin: string | undefined, probe
               ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 60_000,
           })
         : dependencyInstall;
-      if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a Krmax browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
+      if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a ${BRAND} browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
     }
   }
   return { chromium, bin: resolvedBin, cache: resolvedCache };

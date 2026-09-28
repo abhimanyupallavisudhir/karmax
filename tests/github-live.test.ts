@@ -102,7 +102,7 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
 
   it('opens, updates and closes a real pull request through the REST client', async () => {
     const local = await cloneFixture('client');
-    const branch = `karmax/${newId('task')}`;
+    const branch = `tavya/${newId('task')}`;
     branches.push(branch);
     await gitOrThrow(local, ['checkout', '-q', '-b', branch]);
     fs.writeFileSync(path.join(local, `${branch.split('/')[1]}.txt`), 'client round-trip\n');
@@ -136,7 +136,7 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
   it('runs the whole PR stage against GitHub: branch pushed, PR opened, reconciled after the merge', async () => {
     const local = await cloneFixture('pipeline');
     const taskId = newId('task');
-    const branch = `karmax/${taskId}`;
+    const branch = `tavya/${taskId}`;
     branches.push(branch);
     const file = `${taskId}.js`;
 
@@ -185,7 +185,7 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
     expect(live.state).toBe('closed');
     expect(ref.state).toBe('closed');
     const comments = await pexec('gh', ['api', `/repos/${slug}/issues/${ref.number}/comments`, '--jq', '.[].body']);
-    expect(comments.stdout).toMatch(/karmax/i);
+    expect(comments.stdout).toMatch(/tavya/i);
     expect(comments.stdout).toContain(mainBranch);
   }, 300_000);
 });

@@ -64,7 +64,18 @@ random_hex() { od -An -N"${1:-48}" -tx1 /dev/urandom | tr -d ' \n'; }
 # deploy/Dockerfile) which matches no host user — so a 0600 secret is
 # unreadable exactly where it is needed. $SECRETS_DIR stays 0700, which is what
 # actually keeps other users on the host out: they cannot traverse into it.
-secret_mode() { chmod 644 "$@"; }
+secret_mode() { set_mode 644 "$@"; }
+
+# chmod fails for anyone but a file's owner even when it would change nothing,
+# and a secret `sudo ./deploy/karmax up` created belongs to root; so only a
+# mode that differs is changed.
+set_mode() {
+  wanted_mode=$1; shift
+  for mode_target in "$@"; do
+    [ -n "$(find "$mode_target" -prune -perm "$wanted_mode" 2>/dev/null)" ] \
+      || chmod "$wanted_mode" "$mode_target" || return 1
+  done
+}
 
 write_secret() {
   file="$SECRETS_DIR/$1"
@@ -78,7 +89,7 @@ write_secret() {
 # does not apply.
 ensure_secrets() (
   umask 077
-  mkdir -p "$SECRETS_DIR" && chmod 700 "$SECRETS_DIR" || exit 1
+  mkdir -p "$SECRETS_DIR" && set_mode 700 "$SECRETS_DIR" || exit 1
   for secret in auth_secret vault_key world_ref_key; do
     write_secret "$secret" || exit 1
   done
@@ -195,6 +206,28 @@ cmd_up() {
   print_finish
 }
 
+# A KARMAX_DATABASE_URL left in the app's karmax.env wins over the role's URL,
+# so ask PostgreSQL what the app actually connected as. The app names its
+# sessions, so an operator's psql or a backup's pg_dump does not count. Never
+# fails: it only reports.
+report_app_role() {
+  sessions=$(dc exec -T postgresql psql -U temporal -d postgres -Atc "SELECT DISTINCT a.usename, r.rolsuper
+    FROM pg_stat_activity a JOIN pg_roles r ON r.rolname = a.usename
+    WHERE a.datname = 'karmax' AND a.application_name = 'karmax'" < /dev/null) || {
+    echo 'karmax: warning: could not ask PostgreSQL which role the app connects as' >&2
+    return 0
+  }
+  [ -n "$sessions" ] || { note 'The app has no connection to the karmax database right now.'; return 0; }
+  printf '%s\n' "$sessions" | while IFS='|' read -r role superuser; do
+    [ -n "$role" ] || continue
+    if [ "$superuser" = t ]; then
+      echo "karmax: warning: the app connects to PostgreSQL as the superuser $role. Remove KARMAX_DATABASE_URL from /var/lib/karmax/karmax.env and restart the app." >&2
+    else
+      note "The app connects to PostgreSQL as $role, not a superuser."
+    fi
+  done
+}
+
 cmd_doctor() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured; run `./deploy/karmax up your-domain`'
@@ -205,20 +238,7 @@ cmd_doctor() {
   done
   note 'Durable secrets are present.'
   dc ps
-  # A KARMAX_DATABASE_URL left in the app's karmax.env wins over the role's
-  # URL, so check what the app actually connected as.
-  sessions=$(dc exec -T postgresql psql -U temporal -d postgres -Atc "SELECT DISTINCT a.usename, r.rolsuper
-    FROM pg_stat_activity a JOIN pg_roles r ON r.rolname = a.usename WHERE a.datname = 'karmax'") \
-    || die 'could not query PostgreSQL'
-  [ -n "$sessions" ] || note 'The app has no connection to the karmax database right now.'
-  printf '%s\n' "$sessions" | while IFS='|' read -r role superuser; do
-    [ -n "$role" ] || continue
-    if [ "$superuser" = t ]; then
-      echo "karmax: warning: the app connects to PostgreSQL as the superuser $role. Remove KARMAX_DATABASE_URL from /var/lib/karmax/karmax.env and restart the app." >&2
-    else
-      note "The app connects to PostgreSQL as $role, not a superuser."
-    fi
-  done
+  report_app_role
   domain=$(env_value KARMAX_DOMAIN)
   if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 "https://$domain/api/health/ready" >/dev/null 2>&1; then
     note "Public HTTPS health check passed for $domain."
@@ -363,6 +383,19 @@ cmd_restore() {
     dc run --rm --no-deps -T postgresql pg_restore -f /dev/null < "$source/$dump.dump" \
       || die "PostgreSQL dump verification failed: $dump.dump"
   done
+  # Staging holds a second copy of every database beside the live ones, on the
+  # disk that also takes the live write-ahead log, so filling it would stop the
+  # running instance too. A database restores to at least the size of its
+  # compressed dump, and usually a few times it.
+  dumps_kb=$(du -k "$source"/*.dump | awk '{ total += $1 } END { print total + 0 }')
+  free_kb=$(dc run --rm --no-deps -T postgresql df -Pk /var/lib/postgresql/data < /dev/null | awk 'NR == 2 { print $4 }')
+  case "$free_kb" in
+    ''|*[!0-9]*) note "Could not read the free space on PostgreSQL's disk." ;;
+    *)
+      [ "$free_kb" -ge "$dumps_kb" ] || die "not enough free space to stage the restore: PostgreSQL's disk has $((free_kb / 1024)) MiB free for $((dumps_kb / 1024)) MiB of dumps"
+      [ "$free_kb" -ge $((dumps_kb * 4)) ] || echo "karmax: warning: the restored databases may not fit: PostgreSQL's disk has $((free_kb / 1024)) MiB free for $((dumps_kb / 1024)) MiB of dumps, which usually restore to a few times that. Running out would stop the running instance too." >&2
+      ;;
+  esac
   confirm=RESTORE
   if [ -n "$unsigned" ]; then
     echo 'This backup is unsigned: nothing proves it has not been altered since it was taken.'
@@ -563,6 +596,7 @@ cmd_update() {
   if dc up -d --remove-orphans && wait_ready; then
     cleanup_migration
     migration_backup=''
+    report_app_role || true
     note "Update complete at $target."
     return 0
   fi
@@ -589,6 +623,29 @@ cmd_update() {
   die "deployment $target failed and automatic rollback to $previous also failed"
 }
 
+# The superuser password: Temporal and the setup jobs connect with it, and
+# releases before the karmax role gave it to the app as well. The new value
+# travels on psql's stdin and in files, never on a command line `ps` shows.
+cmd_rotate_postgres_password() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  password=$(random_hex 32)
+  staged="$ENV_FILE.rotate.$$"
+  if ! (umask 077 && { sed '/^POSTGRES_PASSWORD=/d' "$ENV_FILE" && printf 'POSTGRES_PASSWORD=%s\n' "$password"; } > "$staged"); then
+    rm -f "$staged"; die 'could not stage the new password; nothing was changed'
+  fi
+  if ! printf "ALTER ROLE temporal PASSWORD '%s';\n" "$password" \
+      | dc exec -T postgresql psql -U temporal -d postgres -v ON_ERROR_STOP=1 -q; then
+    rm -f "$staged"; die 'PostgreSQL refused the new password; nothing was changed'
+  fi
+  mv "$staged" "$ENV_FILE"
+  note 'Password changed. Restarting PostgreSQL and Temporal with it…'
+  dc up -d --no-build --remove-orphans
+  wait_ready || die 'Karmax failed its readiness check after the password change'
+  report_app_role
+  note 'PostgreSQL password rotated.'
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./deploy/karmax COMMAND
@@ -602,6 +659,7 @@ Usage: ./deploy/karmax COMMAND
                                Verify signatures and restore a complete snapshot
   update [--accept-vault-findings] [REVISION]
                                Backup, check the vault, deploy an exact master revision, and restart
+  rotate-postgres-password      Replace PostgreSQL's superuser password
   down                          Stop everything without deleting durable data
 EOF
 }
@@ -616,6 +674,7 @@ case "$command" in
   backup) cmd_backup "$@" ;;
   restore) cmd_restore "$@" ;;
   update) cmd_update "$@" ;;
+  rotate-postgres-password) cmd_rotate_postgres_password "$@" ;;
   down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;
   help|-h|--help) usage ;;
   *) usage >&2; die "unknown command: $command" ;;

@@ -1,5 +1,6 @@
 import type { World, WorldRepo } from './types.js';
 import { worldRepos, worldRepoTarget } from './types.js';
+import { BRAND } from '../domain/brand.js';
 
 export interface TaskBranchAncestryResult {
   repaired: Array<{ repo: string; previousHead: string; head: string; baseSha: string; targetSha: string }>;
@@ -51,7 +52,7 @@ export async function ensureTaskBranchAncestry(
     if (status.code !== 0 || status.stdout.trim()) {
       errors[repo.name] = ancestryViolation(repo,
         status.code === 0
-          ? 'the checkout has uncommitted changes, so Karmax cannot safely repair its ancestry'
+          ? `the checkout has uncommitted changes, so ${BRAND} cannot safely repair its ancestry`
           : `the checkout could not be inspected: ${status.stderr || status.stdout}`);
       continue;
     }
@@ -72,7 +73,7 @@ export async function ensureTaskBranchAncestry(
     const related = await world.exec('git', ['merge-base', repo.baseSha, resolvedTarget], { cwd: repo.root });
     if (related.code !== 0 || !related.stdout.trim()) {
       errors[repo.name] = ancestryViolation(repo,
-        `selected target "${target}" has unrelated history; Karmax will not join the histories automatically`);
+        `selected target "${target}" has unrelated history; ${BRAND} will not join the histories automatically`);
       continue;
     }
     const [candidateRoots, targetRoots] = await Promise.all([
@@ -80,14 +81,14 @@ export async function ensureTaskBranchAncestry(
       rootCommits(world, repo, resolvedTarget),
     ]);
     if (!candidateRoots || !targetRoots) {
-      errors[repo.name] = ancestryViolation(repo, 'Karmax could not inspect the candidate history roots');
+      errors[repo.name] = ancestryViolation(repo, `${BRAND} could not inspect the candidate history roots`);
       continue;
     }
     const acceptedRoots = new Set(targetRoots);
     const foreignRoots = candidateRoots.filter((root) => !acceptedRoots.has(root));
     if (foreignRoots.length) {
       errors[repo.name] = ancestryViolation(repo,
-        'the candidate contains history unrelated to the selected target; Karmax will not admit it through ancestry repair');
+        `the candidate contains history unrelated to the selected target; ${BRAND} will not admit it through ancestry repair`);
       continue;
     }
     plans.push({ repo, head: headSha, baseSha: repo.baseSha, targetSha: resolvedTarget });
@@ -104,11 +105,11 @@ export async function ensureTaskBranchAncestry(
       'commit-tree', `${plan.head}^{tree}`,
       '-p', plan.head,
       '-p', plan.baseSha,
-      '-m', 'karmax: preserve provisioned task ancestry',
+      '-m', `${BRAND}: preserve provisioned task ancestry`,
     ], { cwd: repo.root });
     if (commit.code !== 0 || !commit.stdout.trim()) {
       errors[repo.name] = ancestryViolation(repo,
-        `Karmax could not create the content-neutral ancestry repair: ${commit.stderr || commit.stdout}`);
+        `${BRAND} could not create the content-neutral ancestry repair: ${commit.stderr || commit.stdout}`);
       break;
     }
     prepared.push({ ...plan, next: commit.stdout.trim() });
@@ -121,7 +122,7 @@ export async function ensureTaskBranchAncestry(
     const updated = await world.exec('git', ['update-ref', ref, plan.next, plan.head], { cwd: repo.root });
     if (updated.code !== 0) {
       errors[repo.name] = ancestryViolation(repo,
-        'the task branch moved while Karmax was checking it; inspect the concurrent change and retry');
+        `the task branch moved while ${BRAND} was checking it; inspect the concurrent change and retry`);
       break;
     }
     repaired.push({ repo: repo.name, previousHead: plan.head, head: plan.next,
@@ -152,5 +153,5 @@ async function resolveTarget(world: World, repo: WorldRepo, target: string): Pro
 function ancestryViolation(repo: WorldRepo, detail: string): string {
   const recorded = repo.baseSha ? repo.baseSha.slice(0, 12) : 'unknown';
   return `local recorded-base ancestry violation for branch "${repo.branch}" (base ${recorded}): ${detail}. `
-    + 'Karmax did not publish this branch; reconnecting GitHub will not help. Preserve the initially provisioned HEAD as an ancestor, integrate the selected target normally, then retry.';
+    + `${BRAND} did not publish this branch; reconnecting GitHub will not help. Preserve the initially provisioned HEAD as an ancestor, integrate the selected target normally, then retry.`;
 }
