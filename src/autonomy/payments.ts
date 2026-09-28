@@ -1333,7 +1333,7 @@ export async function validatePaymentPolicy(store: Store, projectId: string | un
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid payment policy');
   const p = value as PaymentPolicy;
   if (p.budget !== null && (!Number.isSafeInteger(p.budget) || p.budget < 0))
-    throw new Error('Budget must be a non-negative whole amount in the currency's smallest unit');
+    throw new Error('Budget must be a non-negative whole amount in the smallest unit of its currency');
   if (p.currency !== undefined && (typeof p.currency !== 'string' || !/^[a-z]{3}$/.test(p.currency)))
     throw new Error('Budget currency must be a three-letter ISO 4217 code, e.g. "usd"');
   const cards = (await store.listCards(projectId, organizationId));
