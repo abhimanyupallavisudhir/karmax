@@ -169,3 +169,25 @@ it('LT-1 prepares the sandbox while the turn prompt is built, and the adapter re
     expect(meter.cliStarts).toEqual(['app-server']);
   } finally { await store.close(); }
 });
+
+it('AD-12 writes a remote work environment without its own sandbox commands once the world is prepared', async () => {
+  const { claudeWorkEnvironment } = await import('../src/agent/work-environment.js');
+  const { prewarmRemoteAgentHome } = await import('../src/agent/remote-process.js');
+  const root = temp('karmax-sandbox-'), localHome = temp('karmax-claude-home-');
+  stageRemoteRuntime(root);
+  const meter = newMeter();
+  const world = directorySandbox(root, meter);
+  prewarmRemoteAgentHome(world, 'claude', localHome);
+  const input = { world, secretEnv: { API_TOKEN: 'secret-value' } } as any;
+  const work = await claudeWorkEnvironment(input, true);
+  // The bootstrap (prewarmed beside prompt preparation) made the parent private.
+  expect(meter.execs.filter((command) => !command.includes('KARMAX_SYSTEM_CODEX_CONFIG') && !command.includes('chmod 700'))).toEqual([]);
+  const parent = path.join(root, '.karmax-injection/work-env');
+  expect(fs.statSync(parent).mode & 0o777).toBe(0o700);
+  const [directory] = fs.readdirSync(parent);
+  expect(fs.readFileSync(path.join(parent, directory!, 'env.sh'), 'utf8')).toBe("export API_TOKEN='secret-value'\n");
+  await work.update();
+  expect(fs.readdirSync(path.join(parent, directory!))).toEqual(['env.sh']);
+  await work.cleanup();
+  expect(fs.readdirSync(parent)).toEqual([]);
+});

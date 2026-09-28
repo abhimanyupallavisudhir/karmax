@@ -154,6 +154,15 @@ export function prewarmRemoteAgentHome(world: World, provider: Provider, localHo
 
 const prewarmed = new WeakMap<World, { key: string; bootstrap: Promise<RemoteBootstrap> }>();
 
+const workDirectory = (world: World) => path.posix.join(world.handle.root, '.karmax-injection/work-env');
+
+/** The world's private work-environment directory, when this turn's early
+ * bootstrap (which also git-excludes it) has already made it (AD-12). */
+export async function preparedRemoteWorkDirectory(world: World): Promise<string | undefined> {
+  const runtimeWorld = world.withoutProjectEnvironment?.() ?? world;
+  const early = prewarmed.get(runtimeWorld);
+  return early && await early.bootstrap.then(() => true, () => false) ? workDirectory(runtimeWorld) : undefined;
+}
 
 /** Every copy of a native history the sandbox holds, measured in place. */
 export interface RemoteHistoryCopy {
@@ -238,9 +247,9 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
     // `git add -A` without modifying the user's tracked .gitignore.
     "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true",
     ...(request.home && request.quiesce ? [`( ${quiesceCommand(request.home)} ) || exit ${BOOTSTRAP_QUIESCE}`] : []),
-    // Credentials land only inside a private home: upload creates files and
-    // directories with the sandbox's default modes.
-    ...(request.home ? [`( mkdir -p ${quote(request.home)} && find ${quote(request.home)} -type d -exec chmod 700 {} + && find ${quote(request.home)} -type f -exec chmod 600 {} + ) || exit ${BOOTSTRAP_PROTECT}`] : []),
+    // Credentials and work environments land only inside private directories:
+    // upload creates files and directories with the sandbox's default modes.
+    ...(request.home ? [`( mkdir -p ${quote(request.home)} ${quote(workDirectory(world))} && chmod 700 ${quote(workDirectory(world))} && find ${quote(request.home)} -type d -exec chmod 700 {} + && find ${quote(request.home)} -type f -exec chmod 600 {} + ) || exit ${BOOTSTRAP_PROTECT}`] : []),
     ...(request.inventory ? [`${historyInventoryCommand(path.posix.join(runtime.bin, 'node'), request.inventory)} || true`] : []),
     ...(request.systemCodexConfig ? [`if [ -e /etc/codex ]; then printf '\\n%s\\n' ${SYSTEM_CODEX_CONFIG}; fi`] : []),
     'exit 0',

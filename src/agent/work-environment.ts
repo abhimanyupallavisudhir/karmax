@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import type { TurnInput } from './types.js';
-import { isRemoteAgentWorld } from './remote-process.js';
+import { isRemoteAgentWorld, preparedRemoteWorkDirectory } from './remote-process.js';
 import { ensureWorldExcluded } from '../world/secret-exclude.js';
 
 /** Application credentials belong to work commands, never to the model client.
@@ -64,12 +64,17 @@ export async function claudeWorkEnvironment(input: TurnInput, live = false) {
     } else fs.rmSync(directory, { recursive: true, force: true });
   };
   try {
-    if (typeof world.exec === 'function') await ensureWorldExcluded(world, '.karmax-injection');
-    if (remote) {
+    // A remote world's bootstrap, when it already ran beside prompt preparation,
+    // git-excluded and privatized the parent: nothing is asked of the sandbox.
+    const prepared = remote && await preparedRemoteWorkDirectory(world);
+    if (!prepared && typeof world.exec === 'function') await ensureWorldExcluded(world, '.karmax-injection');
+    if (remote && !prepared) {
       const created = await world.exec('mkdir', ['-p', '-m', '700', directory]);
       if (created.code !== 0) throw new Error('Could not prepare private work environment');
-    } else fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    await write();
+    } else if (!remote) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    // No command reads the first version yet, so it needs no atomic rename.
+    if (remote) await world.writeFile(`${relative}/env.sh`, content());
+    else await write();
   } catch (error) { await cleanup(); throw error; }
   // A source statement avoids copying secret values into Claude's persistent
   // shell snapshot. Native SessionStart hooks run on fresh, resume and fork.
