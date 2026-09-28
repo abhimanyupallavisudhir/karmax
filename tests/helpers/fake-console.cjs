@@ -42,6 +42,9 @@ async function fakeConsole(context, { origin = 'http://console.test', project, t
     if (p === '/api/schema') return schema;
     if (p === '/api/contributions') return { slots: [], commands: [], events: [] };
     if (p === '/api/models') return { providers: [] };
+    // Organization settings panes read objects, not lists.
+    if (p === `/api/organizations/${organization.id}/roles`) return { profiles: [], canCreate: false };
+    if (p === `/api/organizations/${organization.id}/payments/providers`) return { providers: [] };
     if (p.endsWith('/defaults')) return { effective: {}, inherited: {} };
     if (p === `/api/projects/${project.id}/tasks`) return tasks;
     if (p === `/api/projects/${project.id}/search`) return { tasks, total: tasks.length };
