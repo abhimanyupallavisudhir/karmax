@@ -3816,6 +3816,7 @@ export class Store {
     // an already-finished task is not a repeated delete over the same rows.
     const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
     if (settledNow) (await this.pruneAgentOutput(taskId));
+    if (['done', 'cancelled', 'failed'].includes(view.status)) (await this.retireTaskSpendRequests(taskId, view.status));
     // `retentionSweep` measures its window from here: a workflow's `updatedAt`
     // is its history length, not a time. Resuming the task restarts the clock.
     if (['done', 'cancelled', 'failed'].includes(view.status))
@@ -7256,6 +7257,25 @@ export class Store {
       WHERE cardId=? AND status='authorized' AND amount>=? AND expiresAt>?
       ORDER BY CASE WHEN amount=? THEN 0 ELSE 1 END, createdAt`).all(cardId, amount, Date.now(), amount)) as any[];
     return rows.find((row) => paymentMerchantMatches(row.merchant, merchant));
+  
+    });
+  }
+  /** A task that has ended no longer wants what it asked a human to approve
+   * (AU-35): its waiting requests are denied rather than left actionable. */
+  async retireTaskSpendRequests(taskId: string, status: string): Promise<number> {
+    return this.db.transaction(async () => {
+
+    const waiting = await this.db.prepare(`SELECT id, projectId, cardId, amount, status FROM payment_spend_requests
+      WHERE taskId=? AND status IN ('pending_approval', 'needs_funding')`).all(taskId) as any[];
+    const now = Date.now();
+    for (const request of waiting) {
+      await this.db.prepare(`UPDATE payment_spend_requests SET status='denied', reason=?, resolvedBy='system:payments', updatedAt=?
+        WHERE id=? AND status=?`).run(`task ${status} before approval`, now, request.id, request.status);
+      await this.appendAudit({ ts: now, principalId: 'system:payments', action: 'payment.request.retired',
+        scopeKey: `project:${request.projectId}`, detail: { requestId: request.id, taskId, cardId: request.cardId,
+          amount: request.amount, previousStatus: request.status, taskStatus: status } });
+    }
+    return waiting.length;
   
     });
   }

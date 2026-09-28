@@ -172,6 +172,24 @@ describe('BudgetService over the vault-card rail', () => {
     const settled = await budget.settleApproved({ projectId, taskId: task_t2.id , capabilities: ['use-card:*'] }, { amount: 4_000, cardId: card.id });
     expect(settled.status).toBe('granted');
   });
+
+  // AU-35: a spend waiting for a human belongs to the task that asked for it.
+  it('retires pending spend when its task ends, and never approves spend for an ended task', async () => {
+    const card = await provision(50_000);
+    (await store.setSettings(projectId, 'payments', { budget: 1_000 }));
+    const task = await store.createTask({ projectId, title: 'buyer', workflow: 'just-do', workflowVersion: '1',
+      params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+    const ctx = { projectId, taskId: task.id, capabilities: ['use-card:*'] };
+    const pending = await budget.request(ctx, { amount: 5_000, cardId: card.id });
+    expect(pending.status).toBe('needs_approval');
+    (await store.saveView(task.id, { taskId: task.id, stage: 'cancelled', status: 'cancelled', actions: [], state: {} } as any));
+    expect((await store.getPaymentSpendRequest(pending.requestId!))).toMatchObject({ status: 'denied', resolvedBy: 'system:payments' });
+    // Even a request left pending (e.g. before this retirement existed) cannot be approved.
+    (await store.updatePaymentSpendRequest(pending.requestId!, { status: 'pending_approval' }));
+    expect(await budget.approve(pending.requestId!, 'user:owner')).toMatchObject({ status: 'denied', reason: 'the task has ended' });
+    expect((await store.getPaymentSpendRequest(pending.requestId!)).status).toBe('denied');
+    expect((await store.paymentSpent(task.id))).toBe(0);
+  });
 });
 
 describe('secure fill is provider-agnostic', () => {

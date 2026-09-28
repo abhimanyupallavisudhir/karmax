@@ -1154,6 +1154,12 @@ export class BudgetService {
     const request = (await this.store.getPaymentSpendRequest(requestId));
     if (!request) return { status: 'denied', reason: 'spend request not found' };
     if (!['pending_approval', 'needs_funding'].includes(request.status)) return this.result(request);
+    // Spend belongs to the task that asked for it (AU-35); an ended task's
+    // request is retired, not charged to a card nobody will use.
+    const task = await this.store.getTask(request.taskId);
+    if (!task || ['done', 'failed', 'cancelled'].includes(task.lastView?.status ?? ''))
+      return this.result((await this.store.updatePaymentSpendRequest(request.id,
+        { status: 'denied', reason: 'the task has ended', resolvedBy })));
     const card = request.cardId
       ? (await this.store.getCard(request.cardId)) as Card | undefined
       : (await this.cards({
