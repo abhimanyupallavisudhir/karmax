@@ -7256,8 +7256,9 @@ export class Store {
   async setPaymentSpendRequestCard(id: string, cardId: string, currency?: string): Promise<void> {
     return this.db.transaction(async () => {
 
-    (await this.db.prepare('UPDATE payment_spend_requests SET cardId=?, currency=COALESCE(?, currency), updatedAt=? WHERE id=?')
-      .run(cardId, currency ?? null, Date.now(), id));
+    (await (currency
+      ? this.db.prepare('UPDATE payment_spend_requests SET cardId=?, currency=?, updatedAt=? WHERE id=?').run(cardId, currency, Date.now(), id)
+      : this.db.prepare('UPDATE payment_spend_requests SET cardId=?, updatedAt=? WHERE id=?').run(cardId, Date.now(), id)));
   
     });
   }
