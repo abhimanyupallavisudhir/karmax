@@ -257,7 +257,9 @@ describe('account coordinator — quota engine', () => {
     await coord.signal('setAccountAvailability', { accountId: 'A', status: 'needs-attention' });
     const g = await grantee();
     await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', allowed: ['A'] });
-    expect(await coord.query('accountLease', { taskId: g.id })).toEqual({
+    // A query can reach the run that is still continuing as new (the lease
+    // activity retries that acknowledgement the same way).
+    await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
       waiting: true, detail: 'Every allowed credential needs attention — sign in again or add one',
     });
     expect(await grants(g.id)).toEqual([]);
