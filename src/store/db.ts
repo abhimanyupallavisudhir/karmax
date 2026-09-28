@@ -3883,7 +3883,7 @@ export class Store {
 
   /** Returns false, and changes nothing, for a publication `order` shows is stale. */
   async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder,
-    retain: string[] = []): Promise<boolean> {
+    retain?: string[]): Promise<boolean> {
     return this.db.transaction(async () => {
     if (order && !(await this.admitViewPublication(taskId, order))) return false;
 
@@ -3923,7 +3923,10 @@ export class Store {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
           .run(JSON.stringify(status), key, conversationReference, taskId));
         (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
-        (await this.dropSupersededSnapshots(taskId, conversationReference, retain));
+        // Only a publisher that says what it still reads may drop snapshots:
+        // one the previous release scheduled before a deploy says nothing, and
+        // the run's next delta or turn may build on what it would drop.
+        if (retain) (await this.dropSupersededSnapshots(taskId, conversationReference, retain));
       }
     } else if (messages === undefined && transcripts === undefined) {
       // A status-only view (reconcile and lifecycle repairs read `lastView`

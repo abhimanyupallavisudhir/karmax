@@ -515,6 +515,32 @@ describe('durable conversation publication', () => {
       } finally { await f.close(); }
     });
 
+    // At a deploy, a publication the old code scheduled completes on the new
+    // worker without saying what the run still reads; the new code's delta
+    // against the previous snapshot must still find it.
+    it('drops no snapshot for a publication that names none it keeps', async () => {
+      const f = await publisher();
+      let released!: () => void;
+      const oldWriteLanded = new Promise<void>((resolve) => { released = resolve; });
+      const publish = conversationPublisher('run-one', async (view, reference) => {
+        if (reference === 'run-one:2') {
+          // Scheduled before the deploy: a full conversation and no list.
+          const { conversationRetain: _, conversationPatch: __, ...old } = view;
+          await f.core.publishView(f.task.id, { ...old, messages: f.view('do', 3, 'third').messages }, reference);
+          released();
+        } else {
+          if (reference === 'run-one:3') await oldWriteLanded;
+          await f.core.publishView(f.task.id, view, reference);
+        }
+      }, { patches: () => true });
+      try {
+        await publish(f.view('do', 1, 'first'));
+        await publish(f.view('do', 2, 'second'));
+        await Promise.all([publish(f.view('do', 3, 'third')), publish(f.view('do', 4, 'fourth'))]);
+        expect(await f.stored()).toMatchObject({ messages: [{ text: 'fourth' }] });
+      } finally { await f.close(); }
+    });
+
     it('records the snapshot of a delta it drops as stale', async () => {
       const f = await publisher();
       // The newer delta lands first; the publisher then acknowledges the older one last.
