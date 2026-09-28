@@ -380,17 +380,43 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
   return { limited: true, kind: 'quota', window, ...(resetHint ? { resetHint } : {}), ...(note ? { note } : {}) };
 }
 
+/** An API-key throttle (HTTP 429, or a rate-limit error inside the stream) and
+ * how long the provider asked the client to wait, in whole seconds. */
+export interface ApiThrottle { retryAfterSeconds?: number }
+
+/** Read the wait an API response asks for (AD-3), the way the providers' own
+ * SDKs do: OpenAI's `retry-after-ms`, then `Retry-After` as delta-seconds or an
+ * HTTP date. Undefined for anything but a 429. */
+export function apiThrottle(res: { status: number; headers: Headers }, nowMs = Date.now()): ApiThrottle | undefined {
+  if (res.status !== 429) return undefined;
+  const ms = Number(res.headers.get('retry-after-ms'));
+  const raw = res.headers.get('retry-after')?.trim();
+  const seconds = res.headers.has('retry-after-ms') && Number.isFinite(ms) ? ms / 1000
+    : raw && /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw)
+      : raw ? (Date.parse(raw) - nowMs) / 1000 : NaN;
+  return seconds > 0 && seconds <= 14 * 24 * 3600 ? { retryAfterSeconds: Math.ceil(seconds) } : {};
+}
+
 /** Convert a provider message into a typed failure when it is recognizable, while
  * leaving unrelated provider errors alone. This is the human-wording fallback; a
- * structured provider signal should call `providerFailure` directly. */
+ * structured provider signal should call `providerFailure` directly.
+ *
+ * `throttle` marks an API-key rate limit. Those windows are seconds to a minute,
+ * so the reset comes from the provider's Retry-After, else any reset the message
+ * names, else one minute — never the five-hour subscription fallback, which
+ * parked a merely throttled key's login for the rest of the afternoon. */
 export function providerErrorFromMessage(
   provider: ProviderFailureMetadata['provider'],
   message: string,
   source: ProviderFailureSource = 'message',
+  throttle?: ApiThrottle,
 ): Error {
   if (isProviderPolicyRejection(message, { providerOrigin: true })) return new ProviderPolicyFailure(message, provider);
   const cls = classifyLimitError(message, { providerOrigin: true });
   if (!cls.limited) return new Error(message);
+  if (throttle && !cls.hard) {
+    cls.resetHint = throttle.retryAfterSeconds ? `in ${throttle.retryAfterSeconds}s` : cls.resetHint ?? 'in 60s';
+  }
   const diagnostic = nativeProviderDiagnostic(message);
   return new ProviderFailure(message, {
     kind: cls.kind ?? 'quota',

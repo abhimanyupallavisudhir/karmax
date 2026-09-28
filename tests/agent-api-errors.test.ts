@@ -8,6 +8,36 @@ afterEach(() => { vi.unstubAllGlobals(); state.close.mockReset(); });
 for (const provider of ['claude', 'codex'] as const) describe(`${provider} API tool failures`, () => {
   const input: any = { profile: { provider }, world: { handle: { root: '/tmp' } }, role: 'do', messages: [], systemPrompt: 'test', resolvedAuth: { apiKey: 'fake' } };
   const adapter = () => provider === 'claude' ? new ClaudeAdapter() : new CodexAdapter();
+  // AD-3: an API key's per-minute throttle must not park its login for the
+  // five-hour subscription window. The provider's own Retry-After wins; an
+  // unqualified 429 waits a minute. Hard quota exhaustion stays hard.
+  it.each<{ headers: Record<string, string>; detail: string; resetHint: string | RegExp }>([
+    { headers: { 'retry-after': '12' }, detail: 'rate limit exceeded', resetHint: 'in 12s' },
+    { headers: { 'retry-after-ms': '2500', 'retry-after': '9' }, detail: 'rate limit exceeded', resetHint: 'in 3s' },
+    { headers: { 'retry-after': new Date(Date.now() + 90_000).toUTCString() }, detail: 'too many requests', resetHint: /^in (8[89]|9[01])s$/ },
+    { headers: {}, detail: 'too many requests', resetHint: 'in 60s' },
+    { headers: { 'retry-after': 'soon' }, detail: 'rate limit exceeded', resetHint: 'in 60s' },
+  ])('waits out an API throttle as the provider asks ($resetHint)', async ({ headers, detail, resetHint }) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(detail, { status: 429, headers })));
+    const failure: any = await adapter().runTurn(input, { emit() {} } as any).catch((error) => error);
+    expect(failure).toMatchObject({ name: 'ProviderFailure', metadata: { kind: 'quota', permanence: 'transient' } });
+    expect(failure.metadata.resetHint).toMatch(resetHint);
+  });
+  it('keeps exhausted API credit hard, without a throttle wait', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}',
+      { status: 429, headers: { 'retry-after': '5' } })));
+    const failure: any = await adapter().runTurn(input, { emit() {} } as any).catch((error) => error);
+    expect(failure.metadata).toMatchObject({ kind: 'quota', permanence: 'hard' });
+    expect(failure.metadata.resetHint).toBeUndefined();
+  });
+  it('waits a minute when the throttle arrives inside the stream', async () => {
+    const event = provider === 'claude'
+      ? 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}\n\n'
+      : 'data: {"type":"error","code":"rate_limit_exceeded","message":"Rate limit reached for requests"}\n\n';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(event, { status: 200, headers: { 'content-type': 'text/event-stream' } })));
+    const failure: any = await adapter().runTurn(input, { emit() {} } as any).catch((error) => error);
+    expect(failure.metadata).toMatchObject({ kind: 'quota', permanence: 'transient', resetHint: 'in 60s' });
+  });
   it('returns failed tools to the model and does not treat failed completion as success', async () => {
     const bodies: any[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_url, init) => {

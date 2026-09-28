@@ -17,6 +17,7 @@ import { agentMcpToConfig } from '../contrib/manifests.js';
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
 import {
   ProviderFailure,
+  apiThrottle,
   classifyLimitError,
   isTransportError,
   providerErrorFromMessage,
@@ -165,7 +166,7 @@ export class ClaudeAdapter implements AgentAdapter {
         });
         if (!res.ok) {
           const message = `Anthropic API ${res.status}: ${(await res.text()).slice(0, 500)}`;
-          throw providerErrorFromMessage('claude', message, 'structured');
+          throw providerErrorFromMessage('claude', message, 'structured', apiThrottle(res));
         }
         const data = await readAnthropicMessage(res, (text) => ctx.emit(text, 'assistant'));
         (await (await currentTiming())?.markOnce('first.output'));

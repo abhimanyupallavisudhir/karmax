@@ -160,7 +160,8 @@ export async function readAnthropicMessage(res: Response, onText: TextListener):
         return { ...message, content };
       case 'error': {
         const status = ANTHROPIC_ERROR_STATUS[event.error?.type] ?? 'stream error';
-        throw providerErrorFromMessage('claude', `Anthropic API ${status}: ${data.slice(0, 500)}`, 'structured');
+        throw providerErrorFromMessage('claude', `Anthropic API ${status}: ${data.slice(0, 500)}`, 'structured',
+          status === 429 ? {} : undefined);
       }
       default:
         break; // ping and future event types
@@ -177,8 +178,11 @@ const OPENAI_ERROR_STATUS: Record<string, number> = {
 /** A stream `error` event, or a response that failed mid-generation, reads
  * exactly like the same error returned as an HTTP status before the stream
  * began, so a transient outage is still retried (#396 review item 4). */
-const openAiStreamFailure = (error: Record<string, unknown>) => providerErrorFromMessage('codex',
-  `OpenAI Responses API ${OPENAI_ERROR_STATUS[String(error.code)] ?? 'stream error'}: ${JSON.stringify({ error }).slice(0, 500)}`, 'structured');
+const openAiStreamFailure = (error: Record<string, unknown>) => {
+  const status = OPENAI_ERROR_STATUS[String(error.code)];
+  return providerErrorFromMessage('codex', `OpenAI Responses API ${status ?? 'stream error'}: ${JSON.stringify({ error }).slice(0, 500)}`,
+    'structured', status === 429 ? {} : undefined);
+};
 
 /** OpenAI Responses API: `stream: true` → its terminal event's response object,
  * which is the same object `res.json()` returns (status, output, usage). */
