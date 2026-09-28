@@ -2938,8 +2938,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // `<base>...HEAD` would drop along with every uncommitted change.
         const forkPoint = await world.exec('git', ['merge-base', repoBase, 'HEAD'], { cwd: repo.root });
         const since = forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : repoBase;
-        const tracked = await world.exec('git', ['diff', '--name-only', since], { cwd: repo.root });
-        const untracked = await world.exec('git', ['ls-files', '--others', '--exclude-standard'], { cwd: repo.root });
+        // NUL-separated output is never C-quoted, whatever the world's Git config
+        // (non-ASCII, quotes and newlines in names survive verbatim; WD-27).
+        const tracked = await world.exec('git', ['diff', '-z', '--name-only', since], { cwd: repo.root });
+        const untracked = await world.exec('git', ['ls-files', '-z', '--others', '--exclude-standard'], { cwd: repo.root });
         // A companion wiki must not make the sole development checkout appear
         // artificially nested. Keep a stable prefix for wiki changes, while
         // genuine multi-development-repo worlds retain repository prefixes.
@@ -2949,8 +2951,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? `${repo.name}/`
             : '';
         changedFiles.push(
-          ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file}`),
-          ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file} (new)`),
+          ...tracked.stdout.split('\0').filter(Boolean).map((file) => `${prefix}${file}`),
+          ...untracked.stdout.split('\0').filter(Boolean).map((file) => `${prefix}${file} (new)`),
         );
       }
       const bounded = reviewFiles(changedFiles);
@@ -2972,11 +2974,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const dirty: string[] = [];
       const conflicts: string[] = [];
       for (const repo of worldRepos(world.handle)) {
-        const unresolved = await world.exec('git', ['diff', '--name-only', '--diff-filter=U'], { cwd: repo.root });
+        const unresolved = await world.exec('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '--diff-filter=U'], { cwd: repo.root });
         if (unresolved.stdout.trim()) {
           conflicts.push(...unresolved.stdout.trim().split('\n').filter(Boolean).map((file) => `${repo.name}/${file}`));
         }
-        const status = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+        const status = await world.exec('git', ['-c', 'core.quotePath=false', 'status', '--porcelain'], { cwd: repo.root });
         if (status.code !== 0) {
           return { ready: false, note: `could not inspect checkout "${repo.name}": ${status.stderr || status.stdout || 'git status failed'}` };
         }
