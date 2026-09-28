@@ -210,7 +210,7 @@ release their execution lease when finished.
 ./deploy/karmax doctor              # Compose, secrets, containers, database role, DNS/HTTPS
 ./deploy/karmax status
 ./deploy/karmax logs                # or: logs temporal
-./deploy/karmax backup              # deploy/backups/<UTC timestamp>
+./deploy/karmax backup              # deploy/backups/manual-<UTC timestamp>
 ./deploy/karmax prune-backups       # drop automatic snapshots past retention
 ./deploy/karmax update              # backup, validate commit ancestry, rebuild
 ./deploy/karmax down                # preserves all volumes and certificates
@@ -233,10 +233,11 @@ directories as immutable; copy files out before editing them. The live data
 volume is never linked to a backup.
 
 Automatic snapshots are pruned: `update` keeps the newest 10 `predeploy-*`
-snapshots, and the daily `scheduled-*` snapshots are kept for 14 days. A
-successful update also prunes dangling images and caps the Docker build cache
-at 8 GB. Snapshots with any other name (`backup` without a directory, or one
-you name) are never deleted automatically.
+snapshots, and the daily `scheduled-*` snapshots are kept for 14 days, as are
+the bare `<UTC timestamp>` snapshots earlier updaters took. A successful update
+also prunes dangling images and caps the Docker build cache at 8 GB. Snapshots
+with any other name (`manual-*` from `backup`, or a directory you choose) are
+never deleted automatically.
 
 `restore` verifies the control-plane payload, PostgreSQL dumps, and deployment
 secrets, then restores every dump into a staging database (`karmax_restore`,

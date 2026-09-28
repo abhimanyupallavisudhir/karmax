@@ -46,6 +46,13 @@ if (args.includes('pg_restore') || (args.includes('run') && !args.includes('-T')
   return { root, deploy, run, calls, clear: () => fs.writeFileSync(log, '') };
 }
 
+it('names a backup taken without a destination as the operator\'s, so pruning keeps it', () => {
+  const h = deployment();
+  const result = h.run(['backup']);
+  expect(result.status, result.stderr).toBe(0);
+  expect(fs.readdirSync(path.join(h.deploy, 'backups'))).toEqual([expect.stringMatching(/^manual-\d{8}T\d{6}Z$/)]);
+});
+
 it('publishes a complete backup atomically and verifies its checksums (CI-37)', () => {
   const h = deployment();
   const destination = path.join(h.root, 'snapshot');
@@ -71,10 +78,12 @@ it('keeps the newest predeploy snapshots and two weeks of scheduled ones, never 
   const predeploy = Array.from({ length: 12 }, (_, i) => `predeploy-202609${String(10 + i)}T000000Z`);
   // Creation order must not matter: names carry the time.
   [...predeploy].reverse().forEach(name => make(name));
-  const kept = ['20260913T132143Z', 'incident-20260919-page-latency', 'predeploy-20260901T000000Z.partial.7',
-    'scheduled-20260925T021700Z'];
-  make(kept[0]!, 30); make(kept[1]!, 30); make(kept[2]!, 30); make(kept[3]!, 3);
-  make('scheduled-20260901T021700Z', 20);
+  // Unprefixed stamps are the previous updater's automatic snapshots: they age
+  // out like scheduled ones. Operator backups are named and kept.
+  const kept = ['20260927T073452Z', 'manual-20260901T000000Z', 'incident-20260919-page-latency',
+    'predeploy-20260901T000000Z.partial.7', 'scheduled-20260925T021700Z'];
+  make(kept[0]!, 3); make(kept[1]!, 30); make(kept[2]!, 30); make(kept[3]!, 30); make(kept[4]!, 3);
+  make('scheduled-20260901T021700Z', 20); make('20260913T132143Z', 15);
   const result = h.run(['prune-backups']);
   expect(result.status, result.stderr).toBe(0);
   expect(fs.readdirSync(backups).sort()).toEqual([...kept, ...predeploy.slice(2)].sort());
