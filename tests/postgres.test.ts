@@ -20,6 +20,39 @@ const url = process.env.KARMAX_TEST_POSTGRES_URL;
 const integration = url ? describe : describe.skip;
 const admin = url ? new Pool({ connectionString: url }) : undefined;
 
+/**
+ * Hold an exclusive lock on `table` in another session until `release()`.
+ * `waiting()` resolves once some other backend is blocked on it, so a test
+ * asserts that a read is still pending only after the read has reached the
+ * lock, however slowly the runner got there. The holder's own sleep bounds the
+ * lock server-side if a regression blocks the JS event loop.
+ */
+async function holdLock(table: string) {
+  const blocker = await admin!.connect();
+  const pid = (await blocker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid as number;
+  await blocker.query('BEGIN');
+  await blocker.query(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`);
+  let slept = false;
+  const held = blocker.query('SELECT pg_sleep(10)').catch(() => undefined).finally(() => { slept = true; });
+  let released: Promise<void> | undefined;
+  return {
+    waiting: () => vi.waitFor(async () => {
+      const { rows } = await admin!.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+        WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))`, [pid]);
+      expect(rows[0].n).toBeGreaterThan(0);
+    }, { timeout: 5_000 }),
+    release: () => released ??= (async () => {
+      // A cancel that lands before the sleep starts is lost; repeat until it ends.
+      while (!slept) {
+        await admin!.query('SELECT pg_cancel_backend($1)', [pid]);
+        await Promise.race([held, new Promise((resolve) => setTimeout(resolve, 50))]);
+      }
+      await blocker.query('ROLLBACK');
+      blocker.release();
+    })(),
+  };
+}
+
 integration('PostgreSQL cutover', () => {
   beforeEach(async () => {
     await admin!.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
@@ -430,49 +463,44 @@ integration('PostgreSQL cutover', () => {
 
   it('keeps the event loop live while a native permission lookup waits for the database', async () => {
     const store = (await Store.create(url!));
-    const blocker = await admin!.connect();
+    let lock: Awaited<ReturnType<typeof holdLock>> | undefined;
     try {
       const authorization = (await AuthorizationService.create(store));
       (await authorization.grant('root', { principalId: 'user:reader', scopeKey: 'global', profileId: 'god' }));
       (await store.kvSet('permission-probe', 'ready'));
       await authorization.capabilitiesAsync('user:reader');
-      await blocker.query('BEGIN');
-      await blocker.query('LOCK TABLE authorization_profiles IN ACCESS EXCLUSIVE MODE');
-      const unlock = blocker.query('SELECT pg_sleep(0.4); COMMIT');
+      lock = await holdLock('authorization_profiles');
       let complete = false;
       const reading = authorization.capabilitiesAsync('user:reader').then(caps => { complete = true; return caps; });
-      await new Promise(resolve => setTimeout(resolve, 20));
+      await lock.waiting();
       expect(complete).toBe(false);
       expect(await store.kvGetAsync('permission-probe')).toBe('ready');
       expect(complete).toBe(false);
-      await unlock;
+      await lock.release();
       expect(await reading).toEqual(['*']);
-    } finally { await blocker.query('ROLLBACK'); blocker.release(); (await store.close()); }
+    } finally { await lock?.release(); (await store.close()); }
   });
 
   it('keeps timers and independent reads live while a task-table lock delays detail and full-list reads', async () => {
     const store = (await Store.create(url!));
-    const blocker = await admin!.connect();
+    let lock: Awaited<ReturnType<typeof holdLock>> | undefined;
     try {
       const project = (await store.createProject('Blocked read'));
       const task = (await store.createTask({ projectId: project.id, title: 'Lock fixture', workflow: 'just-do',
         workflowVersion: '1', params: { prompt: 'fixture' } }));
       (await store.kvSet('unrelated-read', 'ready'));
       await store.taskMetadataAsync(task.id); // establish the pool before timing the lock
-      await blocker.query('BEGIN');
-      await blocker.query('LOCK TABLE tasks IN ACCESS EXCLUSIVE MODE');
-      // Server-side release also bounds this test if a regression blocks JS timers.
-      const unlock = blocker.query('SELECT pg_sleep(0.4); COMMIT');
+      lock = await holdLock('tasks');
       let finished = false;
       const read = Promise.all([store.taskMetadataAsync(task.id), store.listTasksAsync(project.id)])
         .then(([value, tasks]) => { expect(tasks.map(t => t.id)).toEqual([task.id]); finished = true; return value; });
-      await new Promise(resolve => setTimeout(resolve, 20));
+      await lock.waiting();
       expect(finished).toBe(false);
       expect(await store.kvGetAsync('unrelated-read')).toBe('ready');
       expect(finished).toBe(false);
-      await unlock;
+      await lock.release();
       expect((await read)?.id).toBe(task.id);
-    } finally { await blocker.query('ROLLBACK'); blocker.release(); (await store.close()); }
+    } finally { await lock?.release(); (await store.close()); }
   });
 
   it('looks up usage IDs in bounded batches and task ownership without loading views', async () => {
