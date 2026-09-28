@@ -3176,14 +3176,14 @@ export class KarmaxApi {
         await opened?.destroy().catch(() => undefined);
       }
       (await this.deps.store.kvDelete(`attempt-choice:${taskId}`));
-      const draftParams = { ...task.params };
-      delete (draftParams as any)._workflowRunId;
       (await this.deps.store.updateTaskParams(taskId, {
-        ...draftParams,
+        ...task.params,
         draft: true,
         archived: false,
         _discardProgress: true,
       }));
+      const runId = task.params._workflowRunId;
+      if (typeof runId === 'string' && runId) (await this.deps.store.swapTaskRun(taskId, runId, ''));
       (await this.deps.store.electPrincipal(task.intentId ?? task.id));
       return (await this.getDraftView(token, taskId))!;
     }

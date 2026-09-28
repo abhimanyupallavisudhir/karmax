@@ -260,7 +260,7 @@ describe('task stage transitions', () => {
 
   it('keeps the winning run reachable when an overlapping resume finishes preparing too late', async () => {
     const f = (await fixture());
-    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'old-run' }));
     (await f.store.saveView(f.task.id, {
       ...f.view, status: 'waiting', waitingFor: { kind: 'human' },
       state: { ...f.view.state, humanPauseOrigin: 'do' },
@@ -317,7 +317,7 @@ describe('task stage transitions', () => {
 
   it('does not roll back a run reference when an authorization update completes late', async () => {
     const f = (await fixture());
-    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'old-run' }));
     vi.spyOn(f.client.workflow, 'getHandle').mockReturnValue({
       async executeUpdate() {
         (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'new-run', priority: 4 }));
@@ -535,7 +535,7 @@ describe('task stage transitions', () => {
   it('interlocks a graceful old-run shutdown until its replacement is durable', async () => {
     const f = (await fixture());
     (await f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev')));
-    (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' }));
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'old-run' }));
     let markedRun: string | undefined;
     f.setGracefulResult(async () => {
       const raw = (await f.store.kvGet(lifecycleReplacementKey(f.task.id)));

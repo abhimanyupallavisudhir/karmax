@@ -3947,11 +3947,19 @@ export class Store {
     });
   }
 
+  /** Replace a task's params, except its run pin: `params` is usually an
+   * earlier read, and only a start, recovery or continue-as-new moves the pin
+   * (patchTaskParams / swapTaskRun). Putting back a closed run's id would
+   * send every later signal, query and lifecycle action to that closed run. */
   async updateTaskParams(taskId: string, params: TaskParams) {
     return this.db.transaction(async () => {
 
     await this.trackTaskCredentialSelections(taskId, params);
-    (await this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId));
+    const { _workflowRunId: _read, ...rest } = params as Record<string, unknown>;
+    const pinned = ((await this.db.prepare(`SELECT json_extract(params, '$._workflowRunId') runId FROM tasks WHERE id = ?`)
+      .get(taskId)) as { runId?: unknown } | undefined)?.runId;
+    (await this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?')
+      .run(JSON.stringify(typeof pinned === 'string' ? { ...rest, _workflowRunId: pinned } : rest), taskId));
   
     });
   }

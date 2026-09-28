@@ -16,7 +16,7 @@ import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
 import { applyConversationPatch, conversationPage, hasLiveWorldWork, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
-import type { Client } from '@temporalio/client';
+import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
@@ -525,6 +525,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const seq = (await store.appendEvent(ev));
     deps.bus?.emit({ ...ev, seq });
     return seq;
+  }
+
+  /** The task's pin when it names a run of the task that is no longer running
+   * (an older whole-params write restored it): the live run may replace it.
+   * Only one run of a workflow id runs at a time, so that run is this one. */
+  async function closedRunPin(taskId: string): Promise<string | undefined> {
+    const pinned = (await store.taskMetadata(taskId))?.params?._workflowRunId;
+    if (typeof pinned !== 'string' || !pinned || !deps.client) return undefined;
+    try {
+      return (await deps.client.workflow.getHandle(taskId, pinned).describe()).status.name === 'RUNNING' ? undefined : pinned;
+    } catch (error) {
+      return error instanceof WorkflowNotFoundError ? pinned : undefined;
+    }
   }
 
   /** An acknowledged conversation publication; patches and turn transcripts
@@ -5123,13 +5136,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async releaseTaskRun(taskId: string): Promise<'released' | 'unpinned' | 'foreign'> {
       const runId = activityContext.current().info.workflowExecution?.runId ?? '';
       if (!(await store.taskMetadata(taskId))?.params?._workflowRunId) return 'unpinned';
-      return (await store.swapTaskRun(taskId, runId, '')) ? 'released' : 'foreign';
+      if (await store.swapTaskRun(taskId, runId, '')) return 'released';
+      const stale = (await closedRunPin(taskId));
+      return stale && (await store.swapTaskRun(taskId, stale, '')) ? 'released' : 'foreign';
     },
 
     /** The next run takes the pin its predecessor released, unless another
      * run claimed the task in between. */
     async adoptTaskRun(taskId: string): Promise<boolean> {
-      return store.swapTaskRun(taskId, '', activityContext.current().info.workflowExecution?.runId ?? '');
+      const runId = activityContext.current().info.workflowExecution?.runId ?? '';
+      if (await store.swapTaskRun(taskId, '', runId)) return true;
+      const stale = (await closedRunPin(taskId));
+      return !!stale && (await store.swapTaskRun(taskId, stale, runId));
     },
 
     /** A continued run's transcripts, in pages well inside Temporal's 2 MB

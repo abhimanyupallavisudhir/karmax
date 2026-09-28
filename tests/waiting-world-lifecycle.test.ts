@@ -55,7 +55,7 @@ describe('cancelled-world recovery', () => {
     if (change === 'active') await f.store.saveView(f.task.id, { ...f.view, status: 'active' });
     if (change === 'hibernated') await f.store.setWorldState(f.handle, 'hibernated');
     if (change === 'run') {
-      await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'replacement' });
+      await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'replacement' });
       vi.spyOn(Context, 'current').mockReturnValue({ info: { workflowExecution: { runId: 'old' } } } as any);
     }
     if (change === 'access') release = await f.worlds.holdAccess(f.handle.id);
@@ -99,7 +99,7 @@ describe('separate waiting-world maintenance', () => {
     if (change === 'status') (await f.store.saveView(f.task.id, { ...f.view, status: 'active' }));
     if (change === 'generation') (await f.store.registerWorld({ ...f.handle, generation: 2 }, f.project.id));
     if (change === 'run') {
-      (await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'new-run' }));
+      (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'new-run' }));
       vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal,
         info: { workflowExecution: { runId: 'old-run' } } } as any);
     }
