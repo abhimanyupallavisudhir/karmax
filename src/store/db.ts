@@ -78,6 +78,7 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
+import { paymentMerchantMatches } from '../util/payment-merchant.js';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -7247,18 +7248,14 @@ export class Store {
   
     });
   }
-  async findPaymentAuthorization(cardId: string, amount: number, merchant?: string): Promise<any> {
+  async findPaymentAuthorization(cardId: string, amount: number, merchant: { name?: string; url?: string } = {}): Promise<any> {
     return this.db.transaction(async () => {
 
     (await this.expirePaymentSpendRequests());
     const rows = (await this.db.prepare(`SELECT * FROM payment_spend_requests
       WHERE cardId=? AND status='authorized' AND amount>=? AND expiresAt>?
       ORDER BY CASE WHEN amount=? THEN 0 ELSE 1 END, createdAt`).all(cardId, amount, Date.now(), amount)) as any[];
-    const normalized = normalizePaymentMerchant(merchant);
-    return rows.find((row) => {
-      const expected = normalizePaymentMerchant(row.merchant);
-      return !expected || !normalized || normalized.includes(expected) || expected.includes(normalized);
-    });
+    return rows.find((row) => paymentMerchantMatches(row.merchant, merchant));
   
     });
   }
@@ -7820,10 +7817,6 @@ function cardRow(r: any) {
     last4: r.last4 ?? undefined,
     createdAt: r.createdAt,
   };
-}
-
-function normalizePaymentMerchant(value: unknown): string {
-  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 function resourceAttachmentRow(row: any): ResourceAttachment {

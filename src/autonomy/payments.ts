@@ -734,7 +734,8 @@ export class StripeIssuingProvider implements PaymentProvider {
         && String(object.currency ?? card.currency ?? 'usd').toLowerCase() === String(card.currency ?? 'usd').toLowerCase()) {
         // `amount` is what the rail is really authorizing, which the reservation
         // is only an upper bound on — consume it at that figure, not at the bound.
-        const request = (await this.store!.findPaymentAuthorization(card.id, amount, merchant));
+        const request = (await this.store!.findPaymentAuthorization(card.id, amount,
+          { name: object.merchant_data?.name, url: object.merchant_data?.url }));
         if (request && (await this.store!.consumePaymentAuthorization(request.id, object.id, amount))) {
           decision = { approved: true };
           (await this.store!.upsertPaymentTransaction({
