@@ -5,11 +5,11 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../src/agent/codex.js';
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { ensureRemoteBrowser, ensureRemoteNode, prewarmRemoteAgentHome, remoteAgentHomeRelative, seedRemoteAgentHome,
+import { ensureRemoteBrowser, ensureRemoteNode, prewarmRemoteAgentHome, remoteAgentHomeRelative, seedRemoteAgentHome, spawnRemoteAgentProcess,
   syncRemoteAgentHome } from '../src/agent/remote-process.js';
 import { CodexHistoryError } from '../src/agent/codex-history.js';
 import { KARMAX_TOKEN_FILE, PLAYWRIGHT_VERSION } from '../src/autonomy/config-homes.js';
-import type { ExecResult } from '../src/world/types.js';
+import type { ExecResult, World } from '../src/world/types.js';
 import { prepareConnections } from '../src/mcp/connections/runtime.js';
 import { directorySandbox, freshCodexHome, newMeter, NO_LATENCY, sandboxRollout, stageBakedBrowser, stageBakedRuntime, stageRemoteRuntime,
   type SandboxLatency } from './helpers/directory-sandbox.js';
@@ -393,7 +393,7 @@ it('starts a Codex turn when the work-environment directory cannot be made', asy
   await fixture.turn();
 });
 
-it('reruns a prewarmed bootstrap that failed, and starts its own beside one it cannot use', async () => {
+it('reruns a prewarmed bootstrap that failed, and does not wait for one it cannot use', async () => {
   const root = temp('karmax-sandbox-'), localHome = temp('karmax-codex-home-');
   stageRemoteRuntime(root);
   let bootstraps = 0;
@@ -402,20 +402,13 @@ it('reruns a prewarmed bootstrap that failed, and starts its own beside one it c
   prewarmRemoteAgentHome(failing, 'codex', localHome);
   await seedRemoteAgentHome(failing, 'codex', localHome);
   expect(bootstraps).toBe(2);
-  // A prewarm for another session is still running: the seed runs its own
-  // bootstrap now, and returns (so the agent starts) once that one settled.
-  let own = Infinity;
-  const started = performance.now();
-  const slow = directorySandbox(root, newMeter(), { intercept: (_command, args) => {
-    if (!args.some((arg) => arg.includes('KARMAX_SYSTEM_CODEX_CONFIG'))) return undefined;
-    if (args.some((arg) => arg.includes(THREAD))) return new Promise<ExecResult>((resolve) => setTimeout(() => resolve({ code: 1, stdout: '', stderr: '' }), 1500));
-    own = performance.now() - started;
-    return undefined;
-  } });
+  // A prewarm for another session is still running; the seed runs its own now.
+  const slow = directorySandbox(root, newMeter(), { intercept: (_command, args) => args.some((arg) => arg.includes('KARMAX_SYSTEM_CODEX_CONFIG'))
+    && args.some((arg) => arg.includes(THREAD)) ? new Promise<ExecResult>((resolve) => setTimeout(() => resolve({ code: 1, stdout: '', stderr: '' }), 3000)) : undefined });
   prewarmRemoteAgentHome(slow, 'codex', localHome, THREAD);
+  const started = performance.now();
   await seedRemoteAgentHome(slow, 'codex', localHome);
-  expect(own).toBeLessThan(1000);
-  expect(performance.now() - started).toBeGreaterThanOrEqual(1500);
+  expect(performance.now() - started).toBeLessThan(2000);
 });
 
 it('shares a prewarmed bootstrap with MCP connection preparation', async () => {
@@ -521,23 +514,39 @@ it('LT-22 reuses a verified baked browser without a prewarmed bootstrap, and rep
 // Second review round: locks, a superseded prewarm and prewarm failures.
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-it('never lets a superseded prewarm stop the agent the seed prepared for', async () => {
+it('never lets an orphaned prewarm stop the agent launched after it was requested', async () => {
   const root = temp('karmax-sandbox-'), localHome = temp('karmax-codex-home-');
   stageRemoteRuntime(root);
-  let release!: () => void;
-  const held = new Promise<undefined>((resolve) => { release = () => resolve(undefined); });
-  // A prewarm for another session is queued by the provider; the seed's own bootstrap is not.
-  const world = directorySandbox(root, newMeter(), { intercept: (_command, args) =>
-    args.some((arg) => arg.includes('KARMAX_SYSTEM_CODEX_CONFIG')) && args.some((arg) => arg.includes(THREAD)) ? held : undefined });
+  const meter = newMeter();
+  // The prewarm's stream drops at once, but E2B does not kill the command: its
+  // script still starts in the sandbox, 1.2 s later, after the agent launched.
+  let orphaned = false;
+  const world: World = directorySandbox(root, meter, { intercept: (_command, args) => {
+    if (orphaned || !args.some((arg) => arg.includes('KARMAX_SYSTEM_CODEX_CONFIG')) || !args.some((arg) => arg.includes(THREAD))) return undefined;
+    orphaned = true;
+    setTimeout(() => { void world.exec(_command, args).then(() => { orphanDone = true; }); }, 1200);
+    return Promise.reject(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+  } });
+  let orphanDone = false;
   prewarmRemoteAgentHome(world, 'codex', localHome, THREAD);
-  setTimeout(release, 400);
   const home = await seedRemoteAgentHome(world, 'codex', localHome);
-  // The launcher starts the agent and records it, as spawnRemoteAgentProcess does.
-  const agent = spawn('bash', ['-c', 'exec -a codex-app-server sleep 30'], { detached: true, stdio: 'ignore' });
+  // Launch the agent through the real launcher, with the agent itself stubbed.
+  spawnRemoteAgentProcess({ world, provider: 'codex', command: 'codex', args: ['app-server'], cwd: root, env: { CODEX_HOME: home.absolute } });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const stubs = temp('karmax-stubs-');
+  fs.writeFileSync(path.join(stubs, 'stty'), '#!/bin/bash\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(stubs, 'sh'), '#!/bin/bash\n[ "$1" = -c ] && exec -a codex-app-server sleep 30\nexit 0\n', { mode: 0o755 });
+  const launcher = path.join(stubs, 'launch.sh');
+  fs.writeFileSync(launcher, meter.launches[0]!);
+  const agent = spawn('/bin/bash', [launcher], { env: { PATH: `${stubs}:${process.env.PATH}` }, detached: true, stdio: 'ignore' });
   try {
-    fs.writeFileSync(path.join(root, home.relative, 'karmax-agent.pid'), `${agent.pid}\n`);
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    for (let i = 0; i < 100 && !orphanDone; i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(orphanDone).toBe(true);
     expect(alive(agent.pid!)).toBe(true);
+    // A bootstrap requested after the launch (the next turn, a retry) still stops it.
+    const exited = new Promise((resolve) => agent.once('exit', resolve));
+    await seedRemoteAgentHome(directorySandbox(root, newMeter()), 'codex', localHome);
+    await expect(Promise.race([exited.then(() => 'stopped'), new Promise((resolve) => setTimeout(() => resolve('running'), 5000))])).resolves.toBe('stopped');
   } finally { agent.kill('SIGKILL'); }
 });
 
@@ -579,18 +588,21 @@ it('installs browser tools under a lock, so two turns never repair one sandbox a
 });
 
 it.each([
-  ['reports a prewarmed browser repair failure instead of repeating it', { code: 1, stdout: '', stderr: 'npm ERR! 404 Not Found' }, 1],
-  ['repeats a prewarmed browser repair that lost its transport', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), 2],
-])('%s', async (_, failure, attempts) => {
+  ['reports a prewarmed browser repair failure instead of repeating it', { code: 1, stdout: '', stderr: 'npm ERR! 404 Not Found' }, 1, /npm ERR! 404/],
+  ['does not take npm output that mentions a reset connection for a lost transport', { code: 1, stdout: '', stderr: 'npm ERR! network ECONNRESET' }, 1, /npm ERR! network ECONNRESET/],
+  ['does not repeat a prewarmed browser repair whose command timed out', Object.assign(new Error('world command timed out'), { name: 'TimeoutError' }), 1, /timed out/],
+  ['repeats a prewarmed browser repair that lost its transport', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), 2, /npm ERR! 404/],
+])('%s', async (_, failure, attempts, message) => {
   const root = temp('karmax-sandbox-'), localHome = temp('karmax-codex-home-');
   stageRemoteRuntime(root);
   let installs = 0;
   const world = directorySandbox(root, newMeter(), { intercept: (_command, args) => {
     if (!args.some((arg) => arg.includes('npm install --prefix') && arg.includes('playwright@'))) return undefined;
     installs++;
-    return failure instanceof Error && installs === 1 ? Promise.reject(failure) : { code: 1, stdout: '', stderr: 'npm ERR! 404 Not Found' };
+    if (installs > 1) return { code: 1, stdout: '', stderr: 'npm ERR! 404 Not Found' };
+    return failure instanceof Error ? Promise.reject(failure) : failure;
   } });
   prewarmRemoteAgentHome(world, 'codex', localHome, undefined, BROWSER);
-  await expect(ensureRemoteBrowser(world, 'chrome-devtools')).rejects.toThrow(/remote browser installation failed: npm ERR! 404/);
+  await expect(ensureRemoteBrowser(world, 'chrome-devtools')).rejects.toThrow(message);
   expect(installs).toBe(attempts);
 });

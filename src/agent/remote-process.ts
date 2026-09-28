@@ -20,7 +20,6 @@ import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 import { exposeRemoteNodeCommand, installRemoteNodeCommand, PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from './remote-node.js';
 import { collectStartupProbe, StartupProtocolTrace } from './startup-diagnostics.js';
-import { isTransportError } from './limits.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
@@ -93,12 +92,11 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   // The bootstrap also stops a previous writer and protects the home, so
   // nothing below lands before either. One prewarmed for this very home,
   // session and history is used once; a failed one is rerun at once, and one
-  // prewarmed for something else does not delay this one (the runtime
-  // installation it may still be running is locked in the sandbox). It too
-  // stops the home's writer, though, so it must settle before the agent starts.
+  // prewarmed for something else is not waited for: the runtime installation
+  // it may still be running is locked in the sandbox, and it stops only a
+  // writer launched before it was requested, never the agent this seed starts.
   const early = bootstraps.get(world);
   const reused = early?.key === request.key ? early!.bootstrap.catch(() => undefined) : undefined;
-  const superseded = early?.key !== undefined && early.key !== request.key ? early.bootstrap.catch(() => undefined) : undefined;
   const own = (async () => (await reused) ?? runBootstrap(world, request))();
   bootstraps.set(world, { bootstrap: own, ...(early?.browser ? { browser: early.browser } : {}) });
   const bootstrap = await timed('bootstrap.prepare', () => own);
@@ -112,7 +110,6 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
     timed('bootstrap.seed-files', () => mapBatches(files, seed)),
     // A safety net, not a requirement: never fail a turn over it.
     installMemoryGuard(world).catch(() => undefined),
-    superseded && timed('bootstrap.superseded', () => superseded),
     provider !== 'codex'
       // A transcript the sandbox holds already, or has extended, stays as it is.
       ? timed('bootstrap.history', () => mapBatches(history.filter(file => {
@@ -185,6 +182,18 @@ interface WorldBootstrap {
 const bootstraps = new WeakMap<World, WorldBootstrap>();
 /** Browser readiness a prewarm tried and failed: reported, not repeated. */
 const browserFailures = new WeakSet<object>();
+
+/** The connection to the sandbox broke, by the error's structure alone: a
+ * repair's message quotes the sandbox's output, which may name any error, and
+ * a command that timed out may still be running there. */
+function lostConnection(error: unknown): boolean {
+  for (let current = error, depth = 0; current && typeof current === 'object' && depth < 4; current = (current as any).cause, depth++) {
+    const { code, name } = current as { code?: unknown; name?: unknown };
+    if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'EAI_AGAIN'].includes(String(code))
+      || name === 'SandboxNotFoundError') return true;
+  }
+  return false;
+}
 
 const workDirectory = (world: World) => path.posix.join(world.handle.root, '.karmax-injection/work-env');
 
@@ -295,6 +304,7 @@ const SYSTEM_CODEX_CONFIG = 'KARMAX_SYSTEM_CODEX_CONFIG';
 const WORK_DIRECTORY_READY = 'KARMAX_WORK_DIRECTORY_READY';
 
 async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>): Promise<RemoteBootstrap> {
+  const issued = Date.now();
   const runtime = remoteNodeRuntime(world);
   const node = path.posix.join(runtime.bin, 'node');
   const command = [
@@ -305,7 +315,7 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
     // A single-repo world's root is itself a checkout. Keep injected auth out of
     // `git add -A` without modifying the user's tracked .gitignore.
     "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true",
-    ...(request.home && request.quiesce ? [`( ${quiesceCommand(request.home)} ) || exit ${BOOTSTRAP_QUIESCE}`] : []),
+    ...(request.home && request.quiesce ? [`( ${quiesceCommand(request.home, issued)} ) || exit ${BOOTSTRAP_QUIESCE}`] : []),
     // Credentials land only inside private directories: upload creates files
     // and directories with the sandbox's default modes.
     ...(request.home ? [`( mkdir -p ${quote(request.home)} && find ${quote(request.home)} -type d -exec chmod 700 {} + && find ${quote(request.home)} -type f -exec chmod 600 {} + ) || exit ${BOOTSTRAP_PROTECT}`,
@@ -843,8 +853,9 @@ export function spawnRemoteAgentProcess(opts: {
     `(umask 077; ${trace('shell-started')})`,
     `pidfile=${quote(pidFile)}`,
     trace('previous-process-check'),
-    `if [ -s "$pidfile" ]; then old=$(cat "$pidfile" 2>/dev/null); cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true); case "$cmd" in *${opts.provider}*) kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true;; esac; rm -f "$pidfile"; fi`,
-    'printf \'%s\\n\' "$$" > "$pidfile"',
+    `if [ -s "$pidfile" ]; then old=$(cut -d ' ' -f 1 < "$pidfile" 2>/dev/null); cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true); case "$cmd" in *${opts.provider}*) kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true;; esac; rm -f "$pidfile"; fi`,
+    // With the host's launch time: a bootstrap requested before it never stops it.
+    `printf '%s %s\\n' "$$" ${Date.now()} > "$pidfile"`,
     trace('previous-process-stopped'),
     // The seed uploads config and credentials with the sandbox's default modes
     // into a home the bootstrap made private: close them too before the agent runs.
@@ -1241,14 +1252,19 @@ export async function materializeRemoteSession(source: World, destination: World
 /** Reap an interrupted attempt before any history publication, not merely
  * before starting its replacement. The pid belongs to this account/task home. */
 async function quiesceRemoteCodexHome(world: World, absolute: string): Promise<void> {
-  const result = await world.exec('bash', ['-lc', quiesceCommand(absolute)]);
+  const result = await world.exec('bash', ['-lc', quiesceCommand(absolute, Date.now())]);
   if (result.code !== 0) throw new CodexHistoryError(`could not stop previous writer: ${result.stderr || result.stdout}`);
 }
 
-function quiesceCommand(absolute: string): string {
+/** Stop the home's previous writer, if the host launched it before it asked
+ * for this command (`issued`, host milliseconds, as the launcher records its
+ * own launch). A provider may run a command whose stream it already dropped
+ * long after: that late command must never stop a newer turn's agent. */
+function quiesceCommand(absolute: string, issued: number): string {
   return `pidfile=${quote(path.posix.join(absolute, 'karmax-agent.pid'))};
 if [ -s "$pidfile" ]; then
-  old=$(cat "$pidfile"); case "$old" in ''|*[!0-9]*) exit 1;; esac
+  read -r old launched < "$pidfile" || [ -n "$old" ]; case "$old" in ''|*[!0-9]*) exit 1;; esac
+  case "$launched" in ''|*[!0-9]*) ;; *) [ "$launched" -ge ${issued} ] && exit 0;; esac
   cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true)
   case "$cmd" in *codex*)
     kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true
@@ -1363,9 +1379,9 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   const entry = bootstraps.get(world.withoutProjectEnvironment?.() ?? world);
   const bin = runtimeBin ?? (await entry?.bootstrap.catch(() => undefined))?.runtimeBin;
   // A prewarmed repair that failed is this turn's failure; only a lost
-  // transport, or a bootstrap that never reached the browser, is tried again.
+  // connection, or a bootstrap that never reached the browser, is tried again.
   let tools = await entry?.browser?.catch((error) => {
-    if (browserFailures.has(error) && !isTransportError(error)) throw error;
+    if (browserFailures.has(error) && !lostConnection(error)) throw error;
     return undefined;
   });
   if (!tools) {
@@ -1403,8 +1419,11 @@ async function repairBrowser(world: World, runtimeBin: string | undefined, probe
   const pathEnv = runtimeBin ? `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
   const bakedRoot = '/opt/karmax/browser';
   const bakedCache = '/opt/karmax/browsers';
-  // One repair at a time per sandbox, including an abandoned turn's still-running one.
-  const locked = sandboxLock(path.posix.join(absolute, '.install.lock'), 540);
+  // One repair at a time per sandbox, including an abandoned turn's still-running
+  // one. A step waits only for what is left of the repair's nine minutes, so a
+  // late lock never runs its step into the ten-minute command timeout.
+  const started = Date.now();
+  const locked = () => sandboxLock(path.posix.join(absolute, '.install.lock'), Math.max(1, 540 - Math.floor((Date.now() - started) / 1000)));
   const busy = () => new Error('remote browser tools are still being installed by another turn in this sandbox; its lock stayed busy');
   const baked = probe ? { code: probe.baked ? 0 : 1 }
     : await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
@@ -1429,7 +1448,7 @@ async function repairBrowser(world: World, runtimeBin: string | undefined, probe
     ];
     const install = await timed('bootstrap.browser.install', () => world.exec('bash', ['-lc', [
       `mkdir -p ${quote(absolute)} ${quote(browserCache)} || exit 1`,
-      locked,
+      locked(),
       [...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
         `npm install --prefix ${quote(absolute)} --no-audit --no-fund --omit=dev ${packages.map(quote).join(' ')}`,
         `PLAYWRIGHT_BROWSERS_PATH=${quote(browserCache)} ${quote(path.posix.join(bin, 'playwright'))} install chromium`,
@@ -1454,7 +1473,7 @@ async function repairBrowser(world: World, runtimeBin: string | undefined, probe
       // template/image error instead of handing the agent a broken MCP.
       // Under the same lock: two install-deps would contend for dpkg's.
       const dependencyInstall = await world.exec('bash', ['-lc', [
-        locked,
+        locked(),
         ...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
         `installer=${quote(path.posix.join(bin, 'playwright'))}`,
         'if [ "$(id -u)" = 0 ]; then "$installer" install-deps chromium',
