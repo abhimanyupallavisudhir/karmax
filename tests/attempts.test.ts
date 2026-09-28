@@ -32,6 +32,12 @@ describe('multiple task attempts', () => {
     (await store.claimAttempt(first.id));
     await expect((async () => (await api.setPrincipalAttempt(token, first.id)))()).rejects.toThrow(/commitment/);
     expect((await store.attemptGroup(first.id))!.committedAttemptId).toBe(first.id);
+    // RT-14: the turn prompt's summary agrees with the hydrated group.
+    const group = (await store.attemptGroup(third.id))!;
+    expect(await store.attemptSummary(third.id)).toEqual({ attempts: group.attempts.length,
+      committedAttemptId: group.committedAttemptId, otherAttempts: group.otherAttempts });
+    const solo = (await store.createTask({ projectId: project.id, title: 'Y', workflow: 'script-exec', workflowVersion: '1.0.0', params: { prompt: 'test' } }));
+    expect(await store.attemptSummary(solo.id)).toEqual({ attempts: 1 });
     (await store.close());
   });
 

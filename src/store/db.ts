@@ -3474,8 +3474,8 @@ export class Store {
 
   /** Project default is read at Review time, including for already-running tasks. */
   async otherAttemptsDefault(taskId: string): Promise<'ask' | 'keep' | 'cancel'> {
-    const task = (await this.getTask(taskId));
-    const value = task && (await this.getSettings(task.projectId, '__common__'))?.otherAttempts;
+    const projectId = await this.taskProjectIdAsync(taskId);
+    const value = projectId && (await this.getSettings(projectId, '__common__'))?.otherAttempts;
     return value === 'keep' || value === 'cancel' ? value : 'ask';
   }
 
@@ -6425,8 +6425,8 @@ export class Store {
     const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
     const hostedCustomerWorld = remote && this.hosted && pool.mode === 'customer';
     const project = (await this.getProject(input.projectId));
-    const task = (await this.getTask(input.taskId));
-    if (!project || project.organizationId !== input.organizationId || !task || task.projectId !== project.id)
+    const taskProjectId = await this.taskProjectIdAsync(input.taskId);
+    if (!project || project.organizationId !== input.organizationId || taskProjectId !== project.id)
       throw new Error('runner admission attribution does not match the organization project and task');
     const resources = { cpu: Math.max(1, input.cpu ?? 2), memoryMb: Math.max(128, input.memoryMb ?? 2048), gpu: Math.max(0, input.gpu ?? 0) };
     if (!hostedCustomerWorld && (resources.cpu > pool.capacity.cpu || resources.memoryMb > pool.capacity.memoryMb || resources.gpu > pool.capacity.gpu
@@ -6631,6 +6631,22 @@ export class Store {
     return row?.projectId;
   }
 
+  /** World admission priority, likewise without the transcript (RT-14). */
+  async taskPriority(taskId: string): Promise<number> {
+    const [row] = await this.readRows<{ priority: unknown }>("SELECT json_extract(params, '$.priority') AS priority FROM tasks WHERE id=?", [taskId]);
+    return Number(row?.priority ?? 0);
+  }
+
+  /** An attempt group's size and commitment, without hydrating its attempts (RT-14). */
+  async attemptSummary(taskOrIntentId: string): Promise<{ attempts: number; committedAttemptId?: string; otherAttempts?: 'keep' | 'cancel' } | undefined> {
+    const [row] = await this.readRows<{ id: string; committedAttemptId: string | null; attempts: number }>(`SELECT i.id, i.committedAttemptId,
+      (SELECT COUNT(*) FROM tasks a WHERE a.intentId=i.id) AS attempts FROM task_intents i
+      WHERE i.id=COALESCE((SELECT intentId FROM tasks WHERE id=?), ?)`, [taskOrIntentId, taskOrIntentId]);
+    if (!row) return undefined;
+    return { attempts: Number(row.attempts), ...(row.committedAttemptId ? { committedAttemptId: row.committedAttemptId,
+      otherAttempts: (await this.kvGet(`attempt-policy:${row.id}`)) === 'keep' ? 'keep' as const : 'cancel' as const } : {}) };
+  }
+
   async projectOrganizationAsync(projectId: string): Promise<string | undefined> {
     const [row] = await this.readRows<{ organizationId: string | null }>('SELECT organizationId FROM projects WHERE id=?', [projectId]);
     return row ? row.organizationId ?? 'org_personal' : undefined;
@@ -6678,8 +6694,8 @@ export class Store {
 
     const now = input.now ?? Date.now();
     const project = (await this.getProject(input.projectId));
-    const task = (await this.getTask(input.taskId));
-    if (!project || project.organizationId !== input.organizationId || !task || task.projectId !== project.id)
+    const taskProjectId = await this.taskProjectIdAsync(input.taskId);
+    if (!project || project.organizationId !== input.organizationId || taskProjectId !== project.id)
       throw new Error('usage attribution does not match the organization project and task');
     const entitlements = (await this.organizationEntitlements(input.organizationId));
     if (!entitlements.agentRunAdmissionAllowed) {

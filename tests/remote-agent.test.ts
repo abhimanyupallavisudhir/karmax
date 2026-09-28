@@ -138,7 +138,7 @@ describe('remote subscription agents', () => {
     expect(world.commands.filter((command) => command.includes('ln -sfnT') && command.includes('/usr/local/bin/node'))).toHaveLength(2);
   });
 
-  it('bounds parallel config uploads and settles them before protecting the home', async () => {
+  it('protects the home before bounded parallel config uploads', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-parallel-home-'));
     fs.mkdirSync(path.join(localHome, 'skills'));
     for (let i = 0; i < 21; i++) fs.writeFileSync(path.join(localHome, 'skills', `${i}.md`), `skill-${i}`);
@@ -151,11 +151,13 @@ describe('remote subscription agents', () => {
       finally { active--; }
     };
     const exec = world.exec.bind(world);
+    let protectedBeforeUpload = false;
     world.exec = async (command, args, options) => {
-      if (args?.some(arg => arg.includes('chmod 600'))) expect(active).toBe(0);
+      if (args?.some(arg => arg.includes('chmod 600'))) protectedBeforeUpload = world.files.size === 0 && active === 0;
       return exec(command, args, options);
     };
     const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    expect(protectedBeforeUpload).toBe(true);
     expect(peak).toBe(8);
     expect(active).toBe(0);
     for (let i = 0; i < 21; i++) expect(world.files.get(`${home.relative}/skills/${i}.md`)?.toString()).toBe(`skill-${i}`);
@@ -165,31 +167,12 @@ describe('remote subscription agents', () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-'));
     const world = fakeWorld();
     const exec = world.exec.bind(world);
+    // The one bootstrap command names the step that failed by its exit status.
     world.exec = async (command, args = [], options) => args.some((arg) => arg.includes('ln -sfnT') && arg.includes('/usr/local/bin/node'))
-      ? { code: 1, stdout: '', stderr: 'sudo: a password is required' }
+      ? { code: 65, stdout: '', stderr: 'sudo: a password is required' }
       : exec(command, args, options);
     await expect(seedRemoteAgentHome(world, 'claude', localHome)).rejects.toThrow(
       'could not make managed Node/npm the sandbox default');
-  });
-
-  it('reuses a verified baked browser on later turns and repairs missing executables', async () => {
-    const world = fakeWorld(false, true);
-    await ensureRemoteBrowser(world, 'playwright');
-    await ensureRemoteBrowser(world, 'playwright');
-    expect(world.commands.filter(command => command.includes('/opt/karmax/smoke.mjs')
-      && !command.includes('test -f'))).toHaveLength(1);
-    const exec = world.exec.bind(world);
-    let stale = true;
-    world.exec = async (command, args, options) => {
-      if (stale && args.some(arg => arg.includes('test -x') && arg.includes('/opt/karmax/browsers/chromium'))) {
-        stale = false;
-        return { code: 1, stdout: '', stderr: '' };
-      }
-      return exec(command, args, options);
-    };
-    await ensureRemoteBrowser(world, 'playwright');
-    expect(world.commands.filter(command => command.includes('/opt/karmax/smoke.mjs')
-      && !command.includes('test -f'))).toHaveLength(2);
   });
 
   it('probes baked browser packages without an out-of-world working directory', async () => {

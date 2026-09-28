@@ -473,7 +473,7 @@ export class CodexAdapter implements AgentAdapter {
     const custody = remote ? undefined : createCustodyEnv(env);
     if (custody) env = custody.env;
 
-    const mcpFlags = await timed('bootstrap.mcp-config', () => selectedCodexMcpFlags(runtimeWorld, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(runtimeWorld) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal));
+    const mcpFlags = await timed('bootstrap.mcp-config', () => selectedCodexMcpFlags(runtimeWorld, cmd, cwd, env, [...(input.profile.mcpConnections !== undefined && !isRemoteAgentWorld(runtimeWorld) ? [{ name: 'karmax', ...platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505') }] : []), ...(input.agentMcp ?? [])], input.profile.mcpConnections !== undefined, ctx.signal, remoteHome?.configuredMcpServers));
 
     // Detached group is the fallback; the inherited custody marker crosses groups.
     const startupEnd = (await (await currentTiming())?.start('process.startup'));
@@ -804,46 +804,45 @@ export class CodexAdapter implements AgentAdapter {
       client.notify('initialized');
       if (remote) child.startupComplete();
       (await startupEnd?.());
-      try {
-        await timed('provider.account-health', () => withTimeout(client.request('account/rateLimits/read', {}), 5_000));
-        modelCredentialHealthy = true;
-      } catch {
-        // Older app-servers may not expose this endpoint. They retain the
-        // explicit MCP-name correlation above, but do not get the stronger
-        // generic-error correlation without positive account proof.
-      }
-      const requiredMcp = input.profile.mcpConnections !== undefined ? (input.agentMcp ?? []).map((s) => s.name) : remote ? Object.keys(remoteHome?.browserMcp ?? {}) : [];
-      if (requiredMcp.length) {
-        await timed('provider.mcp-readiness', async () => {
-          // Dynamic Karmax tools use this control channel and therefore need no
-          // sandbox startup probe. Browser MCPs really do launch remotely: ask
-          // app-server for its authoritative inventory and fail before the model
-          // turn when an explicitly provisioned browser did not load.
-          const required = requiredMcp;
-          let servers: any[] = [];
-          let missing = required;
-          const deadline = Date.now() + 30_000;
-          do {
-            const inventory = await client.request<any>('mcpServerStatus/list', {
-              cursor: null, limit: 100, detail: 'toolsAndAuthOnly', threadId: null,
-            });
-            servers = Array.isArray(inventory?.data) ? inventory.data : [];
-            missing = required.filter((name) => {
-              const server = servers.find((candidate) => candidate?.name === name);
-              if (!server) return true;
-              const tools = server.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [];
-              return name === 'chrome-devtools' || name === 'playwright' ? tools.length === 0 : false;
-            });
-            if (!missing.length || Date.now() >= deadline) break;
-            await new Promise((resolve) => setTimeout(resolve, 250));
-          } while (true);
-          if (missing.length) {
-            const observed = servers.map((server) => ({ name: server?.name,
-              tools: server?.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [] }));
-            throw new Error(`remote Codex MCP startup incomplete (missing ${missing.join(', ')}; observed ${JSON.stringify(observed)}; startup ${JSON.stringify(mcpStartup)})`);
-          }
+      // The account read and MCP startup are independent: wait for them together (LT-1).
+      const accountHealth = timed('provider.account-health', () => withTimeout(client.request('account/rateLimits/read', {}), 5_000))
+        .then(() => { modelCredentialHealthy = true; }, () => {
+          // Older app-servers may not expose this endpoint. They retain the
+          // explicit MCP-name correlation above, but do not get the stronger
+          // generic-error correlation without positive account proof.
         });
-      }
+      const requiredMcp = input.profile.mcpConnections !== undefined ? (input.agentMcp ?? []).map((s) => s.name) : remote ? Object.keys(remoteHome?.browserMcp ?? {}) : [];
+      const readiness = requiredMcp.length ? timed('provider.mcp-readiness', async () => {
+        // Dynamic Karmax tools use this control channel and therefore need no
+        // sandbox startup probe. Browser MCPs really do launch remotely: ask
+        // app-server for its authoritative inventory and fail before the model
+        // turn when an explicitly provisioned browser did not load.
+        const required = requiredMcp;
+        let servers: any[] = [];
+        let missing = required;
+        const deadline = Date.now() + 30_000;
+        do {
+          const inventory = await client.request<any>('mcpServerStatus/list', {
+            cursor: null, limit: 100, detail: 'toolsAndAuthOnly', threadId: null,
+          });
+          servers = Array.isArray(inventory?.data) ? inventory.data : [];
+          missing = required.filter((name) => {
+            const server = servers.find((candidate) => candidate?.name === name);
+            if (!server) return true;
+            const tools = server.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [];
+            return name === 'chrome-devtools' || name === 'playwright' ? tools.length === 0 : false;
+          });
+          if (!missing.length || Date.now() >= deadline) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        } while (true);
+        if (missing.length) {
+          const observed = servers.map((server) => ({ name: server?.name,
+            tools: server?.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [] }));
+          throw new Error(`remote Codex MCP startup incomplete (missing ${missing.join(', ')}; observed ${JSON.stringify(observed)}; startup ${JSON.stringify(mcpStartup)})`);
+        }
+      }) : undefined;
+      const [, ready] = await Promise.allSettled([accountHealth, readiness]);
+      if (ready.status === 'rejected') throw ready.reason;
 
       const sessionEnd = (await (await currentTiming())?.start('provider.session.prepare'));
       // ── Thread: resume the prior one, or start fresh (systemPrompt → developer
