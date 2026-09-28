@@ -53,14 +53,14 @@ The load-bearing constraint: **workflows are deterministic, activities do the si
 Layers around that core:
 
 - `src/temporal/` — dev-server boot (dynamic ports, one long-lived server **reused** across restarts — spawning a fresh one per reload against the same SQLite file wedges Temporal; spawned as a transient systemd user unit so closing the terminal that booted it can't kill it, health-watched and auto-respawned at the same address if it dies mid-run), worker, client, `worker-pool.ts` (managed worker that can be rolled to pick up newly installed workflow packages without a restart).
-- `src/coordinators/` — singleton lease coordinators (merge-queue, account/token, budget): the pattern for all resource contention; crash-safe via continue-as-new.
+- `src/coordinators/` — singleton lease coordinators (merge-queue, account/token, agent-queue, resource-publish): the pattern for queued resource contention; crash-safe via continue-as-new. Payments reserve spend atomically in the database instead; `budget.ts` is unused and stays exported only so a historical execution can still replay.
 - `src/agent/` — provider adapters (Claude Agent SDK + Messages API, Codex/OpenAI, mock) + the per-turn runtime with session resume + prompt assembly. With no credentials, karmax runs the mock agent (auto-detect order: `ANTHROPIC_API_KEY` → Claude Code login → `OPENAI_API_KEY`).
-- `src/world/` — world provider interface; worktree (isolated git worktree per task), container (Docker), memory backends. Merges land through `src/world/merge.ts` and the merge-queue coordinator.
+- `src/world/` — world provider interface; worktree (isolated git worktree per task), container (Docker), E2B and Daytona (remote sandboxes; the only kinds hosted allows), memory backends. Merges land through `src/world/merge.ts` and the merge-queue coordinator.
 - `src/platform/` — capability model, workflow-minted scoped tokens, the `KarmaxApi` service layer, and the permission-checked platform MCP server (the single API agents use to act on the system).
 - `src/packages/` — trusted self-hosted workflow packages: git repo → data-only `manifest.json` → code bundled into the worker; installed versions are pinned by commit SHA. Installation is global authority, not organization authority. Hosted install and restore are disabled; merging an edit never activates code automatically.
 - `src/autonomy/` — credential broker + AES-GCM vault (secrets move as handles, never plaintext), config homes per (account × profile), logins, payments.
 - `src/gateway/` — HTTP/WebSocket gateway translating requests into Temporal signal/query/update calls; the **only** thing the UI talks to.
-- `src/store/` — SQLite metadata index + safe-mode overlays.
+- `src/store/` — metadata store (SQLite; PostgreSQL when hosted). `overlays.ts` is the SPEC §9 overlay-resolution library; nothing reads it yet.
 - `web/` — single-page console with **no build step**; edit `app.js`/`index.html`/`styles.css` directly.
 
 ## Environment variables
@@ -71,7 +71,7 @@ Layers around that core:
 
 **Host admission control for agent turns** (memory-based backpressure, karmax#4 — prevents the OOM killer from SIGKILLing an agent under memory pressure; see `src/activities/agent-slots.ts`):
 
-- **Global settings → Host capacity → Concurrent agent turns** (default `3`) — max concurrent agent-turn model subprocesses, enforced by the durable/reorderable `agent-queue` coordinator. This is a dedicated cap *distinct* from the worker's `KARMAX_MAX_ACT` (which gates all activities together and scales with cores) and per-login concurrency. `KARMAX_MAX_AGENT_SLOTS` is retained only for replay-compatible admission of historical workflow executions that predate stable turn IDs.
+- **Installation → Host capacity → Concurrent agent turns** (default `3`, self-hosted; hosted organizations get plan-derived capacity on their own `agent-queue:<orgId>`) — max concurrent agent-turn model subprocesses, enforced by the durable/reorderable `agent-queue` coordinator. This is a dedicated cap *distinct* from the worker's `KARMAX_MAX_ACT` (which gates all activities together and scales with cores) and per-login concurrency. `KARMAX_MAX_AGENT_SLOTS` is retained only for replay-compatible admission of historical workflow executions that predate stable turn IDs.
 - `KARMAX_AGENT_MIN_FREE_MB` (default `512`) — admission backs off (a new turn waits, heartbeating) while free host memory is below this floor. `0` disables the check.
 - `KARMAX_AGENT_MAX_LOAD_FACTOR` (default `1.0`) — admission also backs off while the 1-minute load average exceeds `cores × factor`. `0` disables the check (and it is naturally inert on platforms that report loadavg `0`, e.g. Windows).
 

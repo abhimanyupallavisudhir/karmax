@@ -61,8 +61,8 @@ const maintainer = [
   'review:approve',
 ] satisfies Capability[];
 // A project grant can never turn into authority over unrelated projects or the
-// host. Global grants remain the explicit trust root for users, host processes,
-// safe mode, and installation settings. Organization grants can manage
+// host. Global grants remain the explicit trust root for users, host processes
+// and installation settings. Organization grants can manage
 // tenant-owned credentials and payments but cannot cross that boundary.
 const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*',
