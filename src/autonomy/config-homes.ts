@@ -226,7 +226,7 @@ export class ConfigHomeManager {
       : path.join(this.root, 'organizations', sanitize(organizationId));
   }
 
-  private allHomes(): Array<{ provider: string; path: string }> {
+  allHomes(): Array<{ provider: string; path: string }> {
     if (!fs.existsSync(this.root)) return [];
     const homes = this.list().map(({ provider, path: home }) => ({ provider, path: home }));
     const organizations = path.join(this.root, 'organizations');

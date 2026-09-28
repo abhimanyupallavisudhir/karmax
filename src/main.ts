@@ -400,6 +400,13 @@ async function main() {
     const serviceOrphans = await sweepOrphanedServiceContainers(async (taskId) => (await store.worldState(taskId))).catch(() => 0);
     if (serviceOrphans) console.log(`  • Reaped ${serviceOrphans} orphaned per-world service container(s)`);
   });
+  // Codex work profiles hold a turn's secrets; a turn that died with its
+  // process left one behind in a home that may never run another turn.
+  startupJobs.push(async () => {
+    const { sweepWorkProfiles } = await import('./agent/work-environment.js');
+    const profiles = sweepWorkProfiles(configHomes);
+    if (profiles) console.log(`  • Removed ${profiles} Codex work profile(s) left by ended turns`);
+  });
   // A concurrently running dogfooding instance can die after this app has
   // already booted. Sweep periodically so its detached agent/tool descendants
   // do not wait until the next host restart to be reaped.
