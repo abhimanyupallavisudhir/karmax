@@ -165,7 +165,9 @@ describe('agent permission approval requests', () => {
   });
 
   // PL-10: a finished task's pending request stayed in its recipients' inbox
-  // and approval lists (#400), although nothing could act on a decision.
+  // and approval lists (#400), although nothing could act on a decision. A
+  // failed task is not finished: reconcile fails every task whose execution died
+  // in a crash, and recovery resumes them with their requests still pending.
   describe('when the task settles', () => {
     async function asked() {
       const store = (await Store.create(':memory:'));
@@ -188,7 +190,7 @@ describe('agent permission approval requests', () => {
       return { store, organization, task, service, granted, pending, view };
     }
 
-    it.each(['done', 'failed', 'cancelled'] as const)('withdraws its pending requests when it is %s', async (status) => {
+    it.each(['done', 'cancelled'] as const)('withdraws its pending requests when it is %s', async (status) => {
       const f = (await asked());
       try {
         (await f.store.saveView(f.task.id, f.view('active')));
@@ -203,6 +205,21 @@ describe('agent permission approval requests', () => {
           .map((event) => event.payload)).toEqual([{ requestId: f.pending.id, action: 'withdraw', reason: `task ${status}` }]);
         expect((await f.store.listInbox('owner', f.organization.id)).map((item) => item.kind)).not.toContain('approval-requested');
         await expect(f.service.resolve(f.pending.id, { action: 'approve', by: 'user:owner' })).rejects.toThrow(/already withdrawn/);
+      } finally { (await f.store.close()); }
+    });
+
+    it('keeps a failed task\'s requests pending until it is cancelled or done', async () => {
+      const f = (await asked());
+      try {
+        (await f.store.saveView(f.task.id, f.view('active')));
+        (await f.store.saveView(f.task.id, f.view('failed')));
+        expect((await f.service.requests({ status: 'pending' })).map((request) => request.id)).toEqual([f.pending.id]);
+        expect((await f.store.listInbox('owner', f.organization.id)).map((item) => item.kind)).toContain('approval-requested');
+        (await f.store.retentionSweep());
+        expect((await f.service.requests({ status: 'pending' })).map((request) => request.id)).toEqual([f.pending.id]);
+        (await f.store.saveView(f.task.id, f.view('cancelled')));
+        expect((await f.service.requests({ taskId: f.task.id })).find((request) => request.id === f.pending.id))
+          .toMatchObject({ status: 'withdrawn', withdrawn: { reason: 'task cancelled' } });
       } finally { (await f.store.close()); }
     });
 

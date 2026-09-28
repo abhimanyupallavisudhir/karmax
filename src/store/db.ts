@@ -137,8 +137,12 @@ const AUTO_ARCHIVE_STATUS = new Set<string>(['done', 'cancelled']);
  */
 const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
 
-/** Statuses a task settles in: no further turn will run unless it is resumed. */
-const SETTLED_STATUS = new Set<string>(['done', 'cancelled', 'failed']);
+/**
+ * Statuses that withdraw a task's pending permission requests (PL-10). Not
+ * `failed`, for the reason above: reconcile fails every task a crash stopped, and
+ * recovery resumes them still waiting on their requests.
+ */
+const WITHDRAW_REQUESTS_STATUS = new Set<string>(['done', 'cancelled']);
 
 /**
  * Does an event type mean "a human is being asked to review this"? Such events
@@ -3816,7 +3820,7 @@ export class Store {
     return true;
   }
 
-  /** PL-10: a settled task's pending permission requests are withdrawn, and
+  /** PL-10: a finished task's pending permission requests are withdrawn, and
    * their withdrawal discharges the recipients' inbox like a decision would. */
   private async withdrawPermissionRequests(projectId: string, taskId: string, status: string): Promise<void> {
     const organizationId = (await this.getProject(projectId))?.organizationId ?? 'org_personal';
@@ -3895,7 +3899,7 @@ export class Store {
     // an already-finished task is not a repeated delete over the same rows.
     const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
     if (settledNow) (await this.pruneAgentOutput(taskId));
-    if (prev && SETTLED_STATUS.has(view.status) && !SETTLED_STATUS.has(prev.lastView?.status ?? ''))
+    if (prev && WITHDRAW_REQUESTS_STATUS.has(view.status) && !WITHDRAW_REQUESTS_STATUS.has(prev.lastView?.status ?? ''))
       (await this.withdrawPermissionRequests(prev.projectId, taskId, view.status));
     // `retentionSweep` measures its window from here: a workflow's `updatedAt`
     // is its history length, not a time. Resuming the task restarts the clock.
@@ -7676,10 +7680,10 @@ export class Store {
       (await this.db.prepare('DELETE FROM kv WHERE k=?').run(key));
       permissionRequests++;
     }
-    // Tasks that settled before settling withdrew their requests (#400).
+    // Tasks that finished before finishing withdrew their requests (#400).
     for (const [taskId, projectId] of pendingTasks) {
       const row = (await this.db.prepare("SELECT json_extract(lastView, '$.status') status FROM tasks WHERE id=?").get(taskId)) as { status?: string } | undefined;
-      if (SETTLED_STATUS.has(row?.status ?? '')) (await this.withdrawPermissionRequests(projectId, taskId, String(row!.status)));
+      if (WITHDRAW_REQUESTS_STATUS.has(row?.status ?? '')) (await this.withdrawPermissionRequests(projectId, taskId, String(row!.status)));
     }
 
     return {
