@@ -1,6 +1,7 @@
 // Request budgets for the console's hottest paths, measured in the full shell on
 // fake /api + WS (RQ-3, RQ-6, RQ-9, UI-6, UI-8): boot, task open, j/k walking,
-// organization switch, an organization-settings action, and a busy event stream.
+// organization switch, an organization-settings action, a busy event stream, and
+// the public pages (which read no session).
 // Every API response is delayed, so `depth` counts sequential round trips.
 // Run: node web/console-request-budget.browser.test.cjs  (REQUEST_BUDGET_REPORT=1 prints only)
 const assert = require('node:assert/strict');
@@ -155,8 +156,18 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       await deep.goto('http://console.test/second/other');
       await deep.locator('[data-id="t7"]').waitFor();
     }));
+    // Public pages need no session; reading one has side effects (it provisions a
+    // personal workspace and consumes the one-time onboarding flag).
+    const publicPage = await context.newPage();
+    record(await measure('public pages', async () => {
+      for (const route of ['/legal', '/pricing', '/reset-password?token=x']) {
+        await publicPage.goto(`http://console.test${route}`);
+        await publicPage.waitForLoadState('load');
+      }
+    }));
     assert.deepEqual(errors, []);
     if (!report) {
+      assert.equal(results['public pages'].counts['GET /api/session'], undefined, 'public pages never read the session');
       const budget = (name, requests, depth) => {
         assert.ok(results[name].requests <= requests, `${name}: ${results[name].requests} requests > ${requests}\n${JSON.stringify(results[name].counts)}`);
         if (depth != null) assert.ok(results[name].depth <= depth, `${name}: ${results[name].depth} round trips > ${depth}`);

@@ -2779,23 +2779,22 @@ function watchConsoleRevision() {
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
+  // Public pages need no session, and must not read one: that provisions a
+  // personal workspace and consumes the one-time git-onboarding flag. The
+  // emailed password-reset link lands signed out, so it is one of them.
+  const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
+  const publicPage = legalSlug ? () => renderLegalPage(legalSlug)
+    : { '/legal': renderLegalIndex, '/pricing': renderPricing,
+      '/reset-password': () => renderResetPassword(new URLSearchParams(location.search).get('token') || '') }[location.pathname];
   // Independent first reads go together; each used to wait for the one before (RQ-9).
-  const sessionRead = feedbackFetch('/api/session').then((response) => response.json());
-  sessionRead.catch(() => {}); // awaited below, after the public routes that need no session
+  const sessionRead = publicPage ? null : feedbackFetch('/api/session').then((response) => response.json());
+  sessionRead?.catch(() => {}); // awaited below
   [S.meta, S.launch] = await Promise.all([
     S.meta || api('/api/meta'),
     S.launch || feedbackFetch('/api/launch').then((response) => response.json()),
   ]);
   applyDocumentBrand();
-  const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
-  if (legalSlug) return renderLegalPage(legalSlug);
-  if (location.pathname === '/legal') return renderLegalIndex();
-  if (location.pathname === '/pricing') return renderPricing();
-  // The emailed password-reset link lands here unauthenticated; handle it before
-  // any session/setup gating so a signed-out user can actually reset.
-  if (location.pathname === '/reset-password') {
-    return renderResetPassword(new URLSearchParams(location.search).get('token') || '');
-  }
+  if (publicPage) return publicPage();
   // Better Auth redirects the confirmation link back here with ?verified=1 after
   // marking the address verified. Note it, strip it from the URL, and surface it
   // (a toast in-app, or a line on the sign-in card if the link was opened while
