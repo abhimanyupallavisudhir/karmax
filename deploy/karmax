@@ -316,8 +316,11 @@ cmd_restore() {
   # Check the control-plane manifest and every payload file using the candidate
   # app, while the live containers and all three databases are still untouched.
   dc build app
-  dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore -- --verify /restore \
-    || die 'control-plane backup verification failed'
+  # The backup is private to the operator who took it (0600) and the app image
+  # runs as its own uid, so the one-offs that read it run as root. Their stdin
+  # is closed so they cannot swallow the confirmation meant for the prompt.
+  dc run --rm --no-deps -T --user root -v "$source/control-plane:/restore:ro" app npm run restore -- --verify /restore \
+    < /dev/null || die 'control-plane backup verification failed'
   for dump in karmax temporal temporal-visibility; do
     [ -f "$source/$dump.dump" ] || { [ "$dump" = karmax ] && continue; die "backup is missing $dump.dump"; }
     dc run --rm --no-deps -T postgresql pg_restore -f /dev/null < "$source/$dump.dump" \
@@ -374,7 +377,8 @@ cmd_restore() {
     dc exec -T postgresql psql -U temporal -d postgres -v ON_ERROR_STOP=1 \
       -c "ALTER DATABASE ${database}_restore RENAME TO $database"
   done
-  dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore -- /restore
+  dc run --rm --no-deps -T --user root -v "$source/control-plane:/restore:ro" app \
+    sh -c 'npm run restore -- /restore && chown -R karmax:karmax /var/lib/karmax'
   dc up -d --remove-orphans
   wait_ready || die 'Karmax failed its readiness check after restore'
   note 'Restore complete.'

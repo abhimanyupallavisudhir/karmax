@@ -34,7 +34,8 @@ if (args.includes('cp')) {
 }
 if (args.includes('pg_dump')) process.stdout.write('dump-' + args.at(-1));
 if (args.join(' ').includes('pg_stat_activity')) process.stdout.write(process.env.FAKE_SESSIONS ?? '');
-if (args.includes('pg_restore')) fs.readFileSync(0);
+// Like Compose, a one-off without -T reads whatever stdin holds.
+if (args.includes('pg_restore') || (args.includes('run') && !args.includes('-T'))) fs.readFileSync(0);
 `, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   const run = (args: string[], fail = '', input = '', env: Record<string, string> = {}) => spawnSync('sh', [path.join(deploy, 'karmax'), ...args], {
@@ -108,8 +109,23 @@ it('verifies every restore input before stopping services, and waits for the res
   expect(calls.slice(0, stopped).filter(args => args.includes('pg_restore') && args.includes('/dev/null'))).toHaveLength(3);
   expect(calls.slice(0, stopped).some(args => args.includes('--verify'))).toBe(true);
   expect(calls.slice(stopped).filter(dropsLive)).toHaveLength(3);
-  expect(calls.slice(stopped).some(args => args.includes('restore') && !args.includes('--verify'))).toBe(true);
+  expect(calls.slice(stopped).some(args => args.join(' ').includes('npm run restore -- /restore'))).toBe(true);
   expect(result.stdout).toContain('Restore complete');
+});
+
+// A backup is private to the operator who took it, and the app image runs as
+// its own uid, so the one-offs that read it run as root; the restored data is
+// then handed back to the app's user.
+it('reads the backup as root and gives the restored data to the app user', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  h.clear();
+  expect(h.run(['restore', destination], '', 'RESTORE\n').status).toBe(0);
+  const readers = h.calls().filter(args => args.includes('run') && args.some(arg => arg.endsWith(':/restore:ro')));
+  expect(readers).toHaveLength(2);
+  for (const args of readers) expect(args.slice(args.indexOf('run'), args.indexOf('app'))).toEqual(expect.arrayContaining(['--user', 'root']));
+  expect(readers[1]!.at(-1)).toBe('npm run restore -- /restore && chown -R karmax:karmax /var/lib/karmax');
 });
 
 // A new dump names the karmax role as owner, which a fresh PostgreSQL volume
