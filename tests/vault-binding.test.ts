@@ -623,6 +623,17 @@ describe('the first boot, round 5', () => {
     return { dir, key };
   }
 
+  // The updater runs the preflight before the release has started: the app's
+  // database URL file does not exist yet on the first upgrade to a release
+  // with its own role, and the preflight needs only the vault key.
+  it('preflights with secrets it does not need still missing', () => {
+    const { dir } = masterVault({ kept: 'value' });
+    const run = spawnSync(process.execPath, ['--import', 'tsx', 'src/scripts/vault-preflight.ts', dir], { encoding: 'utf8',
+      env: { ...process.env, KARMAX_VAULT_KEY: '', KARMAX_DATABASE_URL_FILE: path.join(dir, 'missing', 'database_url') } });
+    expect(run.status, run.stderr).toBe(0);
+    expect(run.stdout).toMatch(/vault key accepted/);
+  });
+
   // Item 2: an unreadable entries/ is an error, never an empty vault.
   it('fails loudly, and preflights as fatal, when entries/ cannot be read', async () => {
     const { dir } = masterVault({ kept: 'value' });
