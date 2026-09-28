@@ -8,6 +8,8 @@ TypeScript.
 
 This is a faithful v1 implementation of the karmax spec, which lives in the project wiki as the `SPEC` page (open the **Wiki** tab in the console, or fetch it with `read_wiki`).
 
+**Names.** *tavya* is the hosted product at tavya.io; *karmax* is this repository and the internal identifier kept for compatibility (`KARMAX_*`, `~/.karmax`, `.karmax-injection/`); *krmax* is the console's legacy name.
+
 ## Quick start
 
 ```bash
@@ -88,7 +90,7 @@ remote target fails setup with an actionable error.
 |---|---|
 | Durable execution on **Temporal** (activity/workflow split, signals, queries, updates, child workflows, continue-as-new) | ✅ real dev server, dynamic ports |
 | Workflows: **software-dev ↔ goal** (switchable in-flight), **merge-only**; legacy just-do/script-exec replay | ✅ |
-| Coordinators (lease pattern, crash-safe, continue-as-new): **merge-queue, token/account, budget** | ✅ |
+| Coordinators (lease pattern, crash-safe, continue-as-new): **merge-queue, token/account, agent-queue, resource-publish** | ✅ |
 | Per-turn agent loop with session resume; provider adapters: **Claude (Agent SDK + Messages API), Codex (app-server/OpenAI), OpenCode (ACP), mock** | ✅ |
 | Worlds: **local git worktree**, **Docker**, **E2B**, and **Daytona**, with checkpoint/park/hibernate lifecycle | ✅ |
 | Capability model + attenuation + **workflow-minted scoped tokens**; **platform MCP server** (permission-checked) | ✅ |
@@ -98,9 +100,9 @@ remote target fails setup with an actionable error.
 | Contribution system: slots, declared event schemas, command/keymap registry; generic auto-render floor + sandboxed iframe | ✅ |
 | Core UI: task list, task drawer w/ stage pipeline, merge-queue, settings, insights, notifications, keyboard nav, command palette | ✅ |
 | Config homes per (account × profile) + scrubbed env | ✅ |
-| Virtual-card **budget lease** (hard cap + review-gate threshold) | ✅ |
+| Virtual-card **spend limits** (hard cap + review-gate threshold, reserved atomically in the database) | ✅ |
 | Cheap check-in: **PTY terminal** in the world (WebSocket) + transcript view | ✅ |
-| Immutable defaults + overlay resolution + per-workflow fallback | ✅ |
+| Immutable defaults + overlay resolution + per-workflow fallback | Library only; not wired (SPEC §9) |
 | Hosted control plane: organizations/teams/RBAC, GitHub App onboarding, runner pools, isolated previews, backup/restore, one-command VPS stack | ✅ |
 
 ## Architecture
@@ -109,14 +111,14 @@ remote target fails setup with an actionable error.
   are bundled into Temporal's deterministic sandbox.
 - `src/workflows/` — deterministic orchestration (the **definitions**). Only
   `await` engine primitives here; every side effect is an activity.
-- `src/coordinators/` — singleton lease coordinators (merge-queue, account, budget).
+- `src/coordinators/` — singleton lease coordinators (merge-queue, account, agent-queue, resource-publish).
 - `src/activities/` — the side-effecting work (worlds, agent turns, merges, …).
 - `src/agent/` — provider adapters + the per-turn runtime + prompt assembly.
-- `src/world/` — the world provider interface + worktree/container/memory backends.
+- `src/world/` — the world provider interface + worktree/container/E2B/Daytona/memory backends.
 - `src/platform/` — capabilities, scoped tokens, the `KarmaxApi` service layer, the MCP server.
 - `src/autonomy/` — credential broker + vault, config homes.
 - `src/gateway/` — HTTP/WebSocket gateway (the only thing the UI talks to).
-- `src/store/` — SQLite metadata index + safe-mode overlays.
+- `src/store/` — metadata store (SQLite; PostgreSQL when hosted). `overlays.ts` is the SPEC §9 overlay-resolution library; nothing reads it yet.
 - `web/` — the single-page console (no build step).
 
 ## Testing

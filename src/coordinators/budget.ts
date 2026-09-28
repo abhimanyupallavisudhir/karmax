@@ -24,6 +24,10 @@ import {
  * and a review-gate threshold (spend above it needs human approval). Because the
  * budget is a lease, the underlying rail can be swapped (Stripe Issuing → v2
  * payment protocols) without touching callers.
+ *
+ * Unused: nothing starts it. Payments reserve spend atomically in the database
+ * (`src/autonomy/payments.ts`, SPEC §6.3); it stays in the bundle so an
+ * execution started before that change can still replay.
  */
 export interface BudgetState {
   /** scope (profileId or taskId) → { cap, spent } */

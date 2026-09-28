@@ -45,6 +45,25 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  // Sub-tasks spawned in one agent turn are created within one millisecond,
+  // and task ids end in random bytes, so only the list position is a stable
+  // tie-break. SQLite's rowid is translated to id here.
+  it('lists children created in the same millisecond in creation order', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Same millisecond');
+      const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: 'p' } });
+      vi.spyOn(Date, 'now').mockReturnValue(1_790_000_000_000);
+      const children = [];
+      for (let i = 0; i < 8; i++)
+        children.push(await store.createTask({ projectId: project.id, title: `Child ${i}`, workflow: 'software-dev',
+          workflowVersion: '1.26.0', params: { prompt: `c${i}` }, parentTaskId: parent.id }));
+      vi.restoreAllMocks();
+      expect((await store.childTaskSummaries(parent.id)).map((summary) => summary.id)).toEqual(children.map((child) => child.id));
+    } finally { vi.restoreAllMocks(); await store.close(); }
+  });
+
   it('expires deduplicated GitHub PR observations', async () => {
     const store = await Store.create(url!);
     try {

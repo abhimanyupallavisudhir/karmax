@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .errors import AcquisitionError
+from .web import is_challenge_page
 
 
 CLAUDE_MESSAGE_SELECTOR = (
@@ -122,7 +123,7 @@ def fetch_share_browser(
                     html = page.content()
                     if "streamController.enqueue" in html or page.locator("[data-message-author-role]").count() >= 2:
                         return html
-                if mode == "headless" and not cdp_url and _is_challenge(page.url, page.content()):
+                if mode == "headless" and not cdp_url and is_challenge_page(page.content(), page.url):
                     raise AcquisitionError(
                         "Claude returned a challenge that cannot be completed in a headless browser. "
                         "Use --browser headed or --cdp-url with a user-controlled Chrome."
@@ -130,7 +131,7 @@ def fetch_share_browser(
                 page.wait_for_timeout(500)
 
             html = page.content()
-            if _is_challenge(page.url, html):
+            if is_challenge_page(html, page.url):
                 raise AcquisitionError(
                     "the browser challenge was not completed before the timeout. Complete it in the opened browser "
                     "and retry with a longer --browser-timeout, or use --cdp-url with that browser."
@@ -207,13 +208,3 @@ def _claude_dom_export(page: Any) -> dict[str, Any] | None:
     )
     return value if isinstance(value, dict) else None
 
-
-def _is_challenge(url: str, html: str) -> bool:
-    lowered = html.lower()
-    return (
-        "challenge_redirect" in url
-        or "challenge-platform" in lowered
-        or "cf-chl-" in lowered
-        or "verify you are human" in lowered
-        or "just a moment" in lowered and "cloudflare" in lowered
-    )

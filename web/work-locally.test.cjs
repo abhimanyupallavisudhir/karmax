@@ -50,5 +50,37 @@ ok(context.result.includes('@openai/codex@0.154.0-alpha.11 fork'), 'fork uses th
 ok(context.result.includes(snapshot.exportId) && !context.result.includes('old-session'), 'fork identity matches the downloaded snapshot');
 ok(require('child_process').spawnSync('bash', ['-n', '-c', context.result]).status === 0, 'commands safely quote paths containing shell metacharacters');
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+// PA-6: a download that panagent converted lossily says what changed.
+(async () => {
+  const toasts = [];
+  const warnings = encodeURIComponent(JSON.stringify([{ code: 'codex_system_role_mapped', message: 'System messages were mapped to Codex developer messages.' }]));
+  const button = { disabled: false, textContent: 'Download conversation', isConnected: true,
+    dataset: { url: '/api/tasks/t/conversation.jsonl?role=do', filename: 'x.jsonl' } };
+  const download = { S: {}, button, toasts, URL: { createObjectURL: () => 'blob:x', revokeObjectURL() {} }, setTimeout() {},
+    document: { createElement: () => ({ click() {}, remove() {} }), body: { appendChild() {} } },
+    toast: (message, error) => toasts.push({ message, error }),
+    feedbackFetch: async () => ({ ok: true, blob: async () => ({}),
+      headers: { get: (name) => name === 'x-karmax-conversation-warnings' ? warnings : null } }) };
+  vm.runInNewContext(slice('async function downloadNativeConversation', 'function localConversationHandoff')
+    + '\nresult = downloadNativeConversation(button);', download);
+  await download.result;
+  ok(button.textContent === '✓ Downloaded', 'the warned download still completes');
+  ok(toasts.length === 1 && !toasts[0].error && toasts[0].message.includes('System messages were mapped to Codex developer messages.'),
+    'conversion warnings are shown after the download');
+
+  // Several kinds of change stay one short line: the first, then a count.
+  const many = encodeURIComponent(JSON.stringify([
+    { code: 'a', message: 'System messages were mapped to Codex developer messages.' },
+    { code: 'b', message: 'Reasoning summaries were converted to labelled message text.', count: 12 },
+    { code: 'c', message: 'Image or attachment references were converted to labelled text.' },
+  ]));
+  toasts.length = 0;
+  download.feedbackFetch = async () => ({ ok: true, blob: async () => ({}),
+    headers: { get: (name) => name === 'x-karmax-conversation-warnings' ? many : null } });
+  vm.runInNewContext('result = downloadNativeConversation(button);', download);
+  await download.result;
+  ok(toasts.length === 1 && toasts[0].message === 'Converted with changes: System messages were mapped to Codex developer messages. (+2 more)',
+    'several conversion warnings collapse into one short toast');
+  console.log(`\n${pass} passed, ${fail} failed`);
+  process.exit(fail ? 1 : 0);
+})();

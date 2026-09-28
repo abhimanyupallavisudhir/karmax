@@ -225,7 +225,7 @@ function signalKillMessage(raw: string): string {
   const mem = `${h.freeMemMb}MB free of ${h.totalMemMb}MB (${h.usedMemPct}% used, load ${h.loadPerCore}/core)`;
   const diagnosis = hostMemoryTight()
     ? `host out of memory — the agent was likely killed by the OS OOM killer (${mem}). ` +
-      `Reduce Concurrent agent turns in Global settings (or raise KARMAX_AGENT_MIN_FREE_MB), or free RAM.`
+      `Reduce Concurrent agent turns under Installation → Host capacity (or raise KARMAX_AGENT_MIN_FREE_MB), or free RAM.`
     : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a krmax ` +
       `restart/reload/redeploy tearing down in-flight turns (orphan-sweep or shutdown escalation) or an external kill.`;
   return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
