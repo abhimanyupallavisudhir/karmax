@@ -40,3 +40,19 @@ export class WorldReferenceKeys {
     return JSON.parse(Buffer.concat([decipher.update(blob.subarray(28)), decipher.final()]).toString('utf8'));
   }
 }
+
+/** Boot warning for sealed references the current keys cannot open, naming the
+ * key each kind needs: KWR2 references use the vault's key, older ones the
+ * environment key (or provider API key) they were sealed under. */
+export function unreadableReferenceWarning(refs: readonly (string | undefined)[]): string | undefined {
+  if (!refs.length) return undefined;
+  const current = refs.filter(ref => ref?.startsWith('KWR2.')).length;
+  const unsealed = refs.filter(ref => !ref).length;
+  const legacy = refs.length - current - unsealed;
+  return [
+    `${refs.length} world reference(s) cannot be opened; their sandboxes will be preserved.`,
+    current ? `${current} sealed under the vault's world-reference:key:v2: restore the vault with the KARMAX_VAULT_KEY it was written under.` : '',
+    legacy ? `${legacy} legacy reference(s) sealed under KARMAX_WORLD_REF_KEY (or the provider API key when it was unset): restore the original value.` : '',
+    unsealed ? `${unsealed} carry no sealed reference and cannot be reopened.` : '',
+  ].filter(Boolean).join(' ');
+}

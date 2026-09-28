@@ -10,7 +10,7 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 
 from .detect import url_format
 from . import __version__
-from .errors import AcquisitionError, FormatError
+from .errors import AcquisitionError, BrowserRequired, FormatError
 from .model import message, new_conversation, normalize_timestamp, text_block, validate_conversation, warning
 
 USER_AGENT = f"panagent/{__version__} (+https://github.com/abhimanyupallavisudhir/panagent)"
@@ -31,9 +31,17 @@ class _ShareRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+_CHALLENGE_TITLES = ("just a moment", "attention required", "verify you are human", "one more step")
+_CHALLENGE_IDS = {"challenge-form", "challenge-running", "challenge-stage", "cf-challenge-running"}
+
+
 class _HTMLCollector(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
+        # Set by an interstitial's structure only (title, challenge form or
+        # script), never by message or body text.
+        self.challenge = False
+        self._title: list[str] | None = None
         self.scripts: list[tuple[dict[str, str | None], str]] = []
         self._script_attrs: dict[str, str | None] | None = None
         self._script_data: list[str] = []
@@ -45,6 +53,10 @@ class _HTMLCollector(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
+        if values.get("id") in _CHALLENGE_IDS or tag == "form" and "__cf_chl_" in (values.get("action") or ""):
+            self.challenge = True
+        if tag == "title":
+            self._title = []
         if tag == "script":
             self._script_attrs = values
             self._script_data = []
@@ -67,7 +79,11 @@ class _HTMLCollector(HTMLParser):
             self._message_data = []
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "title" and self._title is not None:
+            self.challenge |= " ".join("".join(self._title).split()).lower().startswith(_CHALLENGE_TITLES)
+            self._title = None
         if tag == "script" and self._script_attrs is not None:
+            self.challenge |= "_cf_chl_opt" in "".join(self._script_data)
             self.scripts.append((self._script_attrs, "".join(self._script_data)))
             self._script_attrs = None
             self._script_data = []
@@ -82,6 +98,8 @@ class _HTMLCollector(HTMLParser):
                 self._message_data = []
 
     def handle_data(self, data: str) -> None:
+        if self._title is not None:
+            self._title.append(data)
         if self._script_attrs is not None:
             self._script_data.append(data)
         if self._message_role is not None:
@@ -179,6 +197,18 @@ def read_chatgpt_share(text: str, *, source_uri: str | None = None, **_: Any) ->
         )
     _add_share_warnings(conv, provider="ChatGPT")
     return validate_conversation(conv)
+
+
+def is_challenge_page(html: str, url: str = "") -> bool:
+    """Whether a page is an anti-bot interstitial rather than content. Only its
+    structure counts: a conversation may quote challenge text, and ordinary
+    Cloudflare pages load /cdn-cgi/challenge-platform/ bot-management scripts."""
+    if "challenge_redirect" in url or "__cf_chl_" in url:
+        return True
+    try:
+        return _parse_html(html).challenge
+    except FormatError:
+        return False
 
 
 def _parse_html(text: str) -> _HTMLCollector:
@@ -331,12 +361,6 @@ def _chatgpt_content(value: Any, conv: dict[str, Any], index: int) -> list[dict[
 
 def read_claude_share(text: str, *, source_uri: str | None = None, **_: Any) -> dict[str, Any]:
     stripped = text.lstrip()
-    lowered = text.lower()
-    if stripped.startswith("<") and ("challenge-platform" in lowered or "cf-chl-" in lowered):
-        raise AcquisitionError(
-            "Claude returned an anti-bot challenge, not a conversation. Open the share URL in your browser, "
-            "complete the challenge, then use the browser/export fallback documented in docs/browser-export.md."
-        )
     data: Any = None
     if stripped.startswith(("{", "[")):
         try:
@@ -360,6 +384,16 @@ def read_claude_share(text: str, *, source_uri: str | None = None, **_: Any) -> 
             _add_share_warnings(conv, provider="Claude")
             warning(conv, "dom_fallback", "Structured Claude payload was unavailable; imported rendered browser DOM text.")
             return validate_conversation(conv)
+        if data is None and collector.challenge:
+            raise BrowserRequired(
+                "Claude returned an anti-bot challenge, not a conversation. Open the share URL in your browser, "
+                "complete the challenge, then use the browser/export fallback documented in docs/browser-export.md."
+            )
+        if data is None:
+            raise BrowserRequired(
+                "Claude share HTML contained no conversation; it renders only in a browser. Retry with "
+                "--browser headed or --cdp-url, or use the browser/export fallback documented in docs/browser-export.md."
+            )
     conversation = _select_claude_conversation(data)
     if conversation is None:
         raise FormatError(

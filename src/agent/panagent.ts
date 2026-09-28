@@ -32,7 +32,14 @@ export type PanagentImportResult =
   | { kind: 'native'; sessionId: string; warnings?: PanagentWarning[] }
   | { kind: 'context'; message: Message; warnings?: PanagentWarning[] };
 
-type PanagentWarning = { code: string; severity: string; message: string; path?: string };
+export type PanagentWarning = { code: string; severity: string; message: string; path?: string };
+
+/** The `x-karmax-conversation-warnings` value for a converted download: what
+ * the conversion changed, URI-encoded JSON. Info notes are not warnings. */
+export function conversionWarningsHeader(warnings: readonly PanagentWarning[] = []): string | undefined {
+  const notes = warnings.filter((warning) => warning.severity !== 'info').map(({ code, message }) => ({ code, message }));
+  return notes.length ? encodeURIComponent(JSON.stringify(notes)) : undefined;
+}
 
 /** Render Karmax's durable, provider-neutral transcript as a resumable native
  * CLI history. API-backed conversations have no file to copy, so this is the
@@ -43,7 +50,7 @@ export async function exportConversationWithPanagent(opts: {
   sessionId: string;
   title: string;
   cwd?: string;
-}): Promise<Buffer> {
+}): Promise<{ data: Buffer; warnings: PanagentWarning[] }> {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-panagent-export-'));
   try {
     const input = path.join(temporary, 'conversation.agent.json');
@@ -78,12 +85,12 @@ export async function exportConversationWithPanagent(opts: {
         message: 'Generated from Karmax durable messages because no native provider history was available.' }],
     };
     fs.writeFileSync(input, JSON.stringify(ir), { mode: 0o600 });
-    await runPanagent([
+    const warnings = await runPanagent([
       'convert', input, '--to', opts.provider === 'claude' ? 'claude-code' : 'codex',
       '--mode', 'transcript', '--session-id', opts.sessionId, '--cwd', opts.cwd ?? '.',
       '--browser', 'never', '--quiet', '-o', output,
     ], path.join(temporary, 'report.json'));
-    return fs.readFileSync(output);
+    return { data: fs.readFileSync(output), warnings };
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }
