@@ -7,6 +7,7 @@ const wf = vi.hoisted(() => ({
   patches: true,
   timeout: undefined as unknown,
   childSignal: vi.fn(async () => undefined),
+  startChild: undefined as undefined | ((...args: any[]) => any),
 }));
 vi.mock('@temporalio/workflow', async (importOriginal) => ({
   ...await importOriginal<typeof import('@temporalio/workflow')>(),
@@ -26,20 +27,20 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
     if (!predicate()) throw new Error('test: unexpected wait');
     return true;
   },
-  startChild: async () => ({ result: () => new Promise(() => {}) }),
+  startChild: async (...args: any[]) => wf.startChild?.(...args) ?? { result: () => new Promise(() => {}) },
   getExternalWorkflowHandle: () => ({ signal: wf.childSignal }),
   CancellationScope: class { async run(fn: () => any) { return fn(); } cancel() {} },
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
-import { softwareDevV1_26 } from '../src/workflows/software-dev.js';
+import { softwareDevV1_20, softwareDevV1_26 } from '../src/workflows/software-dev.js';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
 
 const input = { taskId: 'task', projectId: 'project', title: 'T', prompt: 'work',
   project: { repos: [] }, confirm: { layers: [] } } as any;
 beforeEach(() => {
-  wf.childSignal.mockClear(); wf.handlers.clear(); wf.wait = undefined; wf.patches = true;
+  wf.childSignal.mockClear(); wf.handlers.clear(); wf.wait = undefined; wf.patches = true; wf.startChild = undefined;
   wf.activities = {
     restoreChildTasks: vi.fn(async () => []),
     createWorld: vi.fn(async () => ({ id: 'task', kind: 'worktree', root: '/tmp/test', branch: 'b', base: 'main' })),
@@ -345,4 +346,51 @@ it('WF-3: plan-blocked admission waits for the queue grant, not a timer', async 
   expect(waits[0]).toBeUndefined();
   expect(wf.activities.runAgentTurn).toHaveBeenCalledOnce();
   (await store.close());
+});
+
+/** A landing whose unchanged CI failure repeats on the same head (duplicate
+ * repair fingerprint), recorded by tests/fixtures/history-landing-duplicate-prechange. */
+function repeatedLandingFailure() {
+  const prs = [{ slug: 'test/repo', number: 1, headSha: 'abc', url: 'https://github.com/test/repo/pull/1' }];
+  const failure = { status: 'needs-revision', prs, detail: 'CI failed on the same head.',
+    repair: { kind: 'ci', preserveAuthorization: true, fingerprint: 'test/repo#1:abc:ci' } };
+  Object.assign(wf.activities, {
+    accountPoolSize: vi.fn(async () => 0),
+    checkProposal: vi.fn(async () => ({ ready: true })), openPr: vi.fn(async () => prs),
+    settleResourceReview: vi.fn(async () => ({ settled: true })), closePrs: vi.fn(async () => prs),
+    mergeGithubPrs: vi.fn(async () => failure),
+    withdrawGithubPrs: vi.fn(async () => ({ withdrawn: [], reconciled: prs })),
+    enqueueMerge: vi.fn(async () => wf.handlers.get('mergeGranted')!()),
+    mergeQueuePosition: vi.fn(async () => ({ position: 0, total: 1 })),
+  });
+  return { failure, input: { ...input, project: { repos: ['/tmp/repo'], remote: 'pr' }, recovery: {
+    resumeStage: 'merge', messages: [], prs, world: { id: 'task', kind: 'worktree', root: '/tmp/test', branch: 'b', base: 'main' },
+    landing: { authorization: 'authorized', validation: 'pending', provider: 'admitting', authorizedHeads: { 'test/repo#1': 'abc' },
+      lastRepairFingerprint: 'test/repo#1:abc:ci', repairAttempts: 1 } } } };
+}
+
+it('LT-12: an unchanged landing failure waits in the watcher, not a parent poll', async () => {
+  const { failure, input: landingInput } = repeatedLandingFailure();
+  const watches: any[] = [];
+  wf.startChild = (_type: unknown, options: any) => {
+    watches.push(options.args[0]);
+    return { signal: vi.fn(), result: async () => { wf.handlers.get('cancel')!(); return failure; } };
+  };
+  wf.wait = () => { throw new Error('the parent must not poll'); };
+  expect(await softwareDevV1_26(landingInput)).toEqual({ stage: 'cancelled' });
+  expect(watches).toHaveLength(1);
+  expect(watches[0]).toMatchObject({ previous: { status: 'needs-revision', repair: failure.repair } });
+  // One read-only preflight observed the failure; the watcher owns every later poll.
+  expect(wf.activities.mergeGithubPrs).toHaveBeenCalledOnce();
+});
+
+it('LT-12: historical landing polls back off while GitHub is unchanged', async () => {
+  const { input: landingInput } = repeatedLandingFailure();
+  const polls: unknown[] = [];
+  wf.wait = () => {
+    polls.push(wf.timeout);
+    if (polls.length === 8) wf.handlers.get('cancel')!();
+  };
+  expect(await softwareDevV1_20(landingInput)).toEqual({ stage: 'cancelled' });
+  expect(polls).toEqual(['30s', 60_000, 120_000, 240_000, 480_000, 600_000, 600_000, 600_000]);
 });

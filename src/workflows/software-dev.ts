@@ -20,7 +20,7 @@ import {
   patched,
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
-import { ActivityCancellationType } from '@temporalio/common';
+import { ActivityCancellationType, msToNumber, type Duration } from '@temporalio/common';
 import type { childActivities } from '../activities/children.js';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
@@ -3353,13 +3353,32 @@ Inspect the complete current diff and specifically compare its delta from the re
   let githubErrorPolls = 0;
   let observedPreflight: GitHubMergeAuthorization | undefined;
   let priorPreflight: GitHubMergeAuthorization | undefined;
-  async function waitForGithubChange(pollMs: number) {
+  // A parent-side poll repeats the whole landing pass. While what it observes
+  // is unchanged, each wait doubles up to ten minutes, so executions the
+  // watcher cannot serve (before v1.21, or an unwatchable state) stop growing
+  // history at a fixed rate (LT-12). A v1.20 webhook still wakes it at once.
+  let githubPollStreak = 0;
+  let githubPollObservation: string | undefined;
+  function githubPollDelay(pollMs: number | string, observation: GitHubMergeAuthorization): number | string {
+    if (!patched('software-dev-github-poll-backoff-v1')) return pollMs;
+    const key = JSON.stringify(observation);
+    githubPollStreak = key === githubPollObservation ? githubPollStreak + 1 : 0;
+    githubPollObservation = key;
+    return githubPollStreak ? Math.min(msToNumber(pollMs as Duration) * 2 ** githubPollStreak, 600_000) : pollMs;
+  }
+  async function waitForGithubChange(pollMs: number, observation: GitHubMergeAuthorization, repeatedFailure = false) {
     // Keep leases and landing mutations in the parent. The watcher returns on
     // any readiness change, including checks or target movement under fallback.
+    // A repeated terminal failure the preflight itself reported is watched the
+    // same way: a new run, head or target changes that preflight.
     if (participantLanding && githubAuthoritativeMerge && priorPreflight
-      && (priorPreflight.status === 'waiting' || priorPreflight.status === 'queued'
-        || (priorPreflight.status === 'planned' && priorPreflight.observationKey !== undefined))
-      && patched('software-dev-cheap-github-wait-v1')) {
+      && (repeatedFailure
+        ? priorPreflight.status === 'needs-revision'
+          && priorPreflight.repair?.fingerprint === observation.repair?.fingerprint
+          && patched('software-dev-watch-repeated-landing-failure-v1')
+        : (priorPreflight.status === 'waiting' || priorPreflight.status === 'queued'
+          || (priorPreflight.status === 'planned' && priorPreflight.observationKey !== undefined))
+          && patched('software-dev-cheap-github-wait-v1'))) {
       const previous = priorPreflight;
       const providerSeen = providerChangeEpoch;
       await runCancellable(async () => {
@@ -3376,7 +3395,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       });
     } else {
       const providerSeen = providerChangeEpoch;
-      await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), pollMs);
+      await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), githubPollDelay(pollMs, observation));
     }
   }
   for (;;) {
@@ -3779,8 +3798,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         status = 'waiting';
         waitingFor = { kind: 'github', detail: `${landing.detail} The task is outside every admission queue while waiting for a new run, candidate head, or target state.` };
         await publish();
-        const providerSeen = providerChangeEpoch;
-        await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), input.githubPollMs ?? MERGE_POLL);
+        await waitForGithubChange((input.githubPollMs ?? MERGE_POLL) as number, decision, true);
         waitingFor = undefined;
         if (cancelled) return await abort();
         continue;
@@ -3879,7 +3897,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         status = 'waiting';
         waitingFor = { kind: 'github', detail: landing.detail };
         await publish();
-        await waitForGithubChange(input.githubPollMs ?? 30_000);
+        await waitForGithubChange(input.githubPollMs ?? 30_000, decision);
         waitingFor = undefined;
         if (cancelled) return await abort();
         continue;
@@ -3968,7 +3986,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       status = 'waiting';
       waitingFor = { kind: 'github', detail: decision.detail ?? 'Waiting for GitHub checks or merge queue.' };
       await publish();
-      await waitForGithubChange(classifiedGithubStates ? (input.githubPollMs ?? 30_000) : 30_000);
+      await waitForGithubChange(classifiedGithubStates ? (input.githubPollMs ?? 30_000) : 30_000, decision);
       waitingFor = undefined;
       if (cancelled) return await abort();
       continue;
