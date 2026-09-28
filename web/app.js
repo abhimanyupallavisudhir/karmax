@@ -10087,6 +10087,48 @@ function beginAsyncElementRender(element) {
   return () => element.isConnected && asyncElementRenderEpoch.get(element) === epoch;
 }
 
+// Start (or restart) a provider sign-in and walk the person through it in `out`:
+// the device URL, an authorization code when the provider asks for one, and the
+// result. Starting is an explicit re-authentication, so it is always forced —
+// otherwise an expired credential file reads as "Already signed in".
+async function runLoginFlow(out, { organizationId, provider, account, modelProvider, authMethod, onSignedIn }) {
+  const base = `/api/organizations/${encodeURIComponent(organizationId)}/accounts`;
+  const show = (html, color) => { out.innerHTML = html; out.style.color = color; };
+  show(`Launching ${esc(provider)}:${esc(account)} sign-in…`, 'var(--ink-2)');
+  let r;
+  try {
+    r = await api(`${base}/connect`, {
+      method: 'POST',
+      body: JSON.stringify({ provider, account, browserMcp: 'none', modelProvider, authMethod, force: true }),
+    });
+  } catch (e) { out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; return false; }
+  if (r.status === 'logged_in') { show('🟢 Already signed in.', 'var(--ok, green)'); onSignedIn?.(); return true; }
+  if (r.status !== 'awaiting_oauth' || !r.loginUrl) {
+    out.textContent = `Could not start login: ${r.detail || r.status}`;
+    out.style.color = 'var(--bad, crimson)';
+    return false;
+  }
+  const codeEntry = r.requiresCode
+    ? '<br><label class="form-row">Authorization code shown after sign-in<input class="login-authorization-code" autocomplete="off" /></label><button class="btn sm login-code-submit">Submit code</button>'
+    : '';
+  show(`Open this URL to finish signing in ${esc(provider)}:${esc(account)} (${siteNameMarkup()} won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}${codeEntry}`, 'var(--ink-1)');
+  out.querySelector('.login-code-submit')?.addEventListener('click', async () => {
+    const code = out.querySelector('.login-authorization-code')?.value.trim();
+    if (!code) return toast('authorization code required', true);
+    const submit = out.querySelector('.login-code-submit');
+    submit.disabled = true;
+    try {
+      const completed = await api(`${base}/connect/code`, { method: 'POST', body: JSON.stringify({ provider, account, code }) });
+      if (completed.status === 'logged_in') { show('🟢 Signed in.', 'var(--ok, green)'); onSignedIn?.(); }
+      else out.textContent = completed.detail || 'Authorization code submitted.';
+    } catch (e) {
+      submit.disabled = false;
+      toast(e.message, true);
+    }
+  });
+  return true;
+}
+
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
   const renderIsCurrent = beginAsyncElementRender(el);
@@ -10157,18 +10199,18 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
       // A login the provider signed out cannot run until someone signs in again;
-      // a Claude sign-in lapses about four weeks after it was made, so offer a
-      // renewal in its last three days rather than let tasks stall on it.
+      // a Claude sign-in lapses about four weeks after it was made, so flag it in
+      // its last three days rather than let tasks stall on it. Either way the `!`
+      // starts the sign-in.
       const renewInDays = !c.signedOut && c.signInExpiresAt && c.signInExpiresAt - Date.now() < 3 * 86_400_000
         ? Math.max(0, Math.ceil((c.signInExpiresAt - Date.now()) / 86_400_000)) : undefined;
-      const renew = renewInDays === undefined ? ''
-        : canManage
-          ? `<button class="cred-signin" title="Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — renew it to keep this login working">Renew</button>`
-          : `<span class="cred-signin" title="Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — renew it in Settings → Codex/Claude">renew</span>`;
-      const stateControl = c.signedOut
-        ? (canManage
-          ? '<button class="cred-signin" title="Signed out by the provider — sign in again to use it">Sign in</button>'
-          : '<span class="cred-signin" title="Signed out by the provider — sign in again in Settings → Codex/Claude">signed out</span>')
+      const signInAlert = c.signedOut
+        ? 'Signed out — click to sign in again'
+        : renewInDays === undefined ? ''
+          : `Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — click to renew`;
+      const alertButton = signInAlert
+        ? `<button class="cred-signin" title="${esc(signInAlert)}" aria-label="${esc(signInAlert)}">!</button>` : '';
+      const stateControl = c.signedOut ? ''
         : c.kind === 'key' && scope !== 'task'
         ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
             <option value="on"${mode === 'on' ? ' selected' : ''}>On</option>
@@ -10179,12 +10221,12 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       return `<div class="cred-row ${esc(c.signedOut ? 'signed-out' : mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
         ${stateControl}
-        <span class="cred-label mono">${icon}${esc(label)}</span>${renew}
+        <span class="cred-label mono">${icon}${esc(label)}</span>${alertButton}
         ${loginActions ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}
         ${keyActions ? '<span class="cred-key-edit" title="Edit API key">✎</span><span class="cred-key-del" title="Delete API key">✕</span>' : ''}
       </div>`;
     })
-    .join('')}</div>`;
+    .join('')}</div><div class="cred-login-flow" hidden></div>`;
   const save = async (policy) => {
     // Local mode: keep the change client-side (applied when the task is created); else
     // persist immediately, keyed by taskId/projectId scope.
@@ -10212,15 +10254,13 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     });
     const login = loginByKey[key];
     const credential = byKey[key];
-    // Reuse the Connect form below so the sign-in flow (URL, code entry) is one.
-    row.querySelector('button.cred-signin')?.addEventListener('click', () => {
-      const provider = $('#login-provider'), name = $('#login-name'), connect = $('#login-connect');
-      if (!provider || !name || !connect) return;
-      provider.value = credential.provider;
-      provider.dispatchEvent(new Event('change'));
-      name.value = credential.account;
-      connect.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      connect.click();
+    row.querySelector('.cred-signin')?.addEventListener('click', () => {
+      const out = el.querySelector('.cred-login-flow');
+      out.hidden = false;
+      runLoginFlow(out, {
+        organizationId, provider: credential.provider, account: credential.account,
+        onSignedIn: () => renderCredentialEditor(el, scope, opts),
+      });
     });
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
       const to = await promptText(`Rename login ${login.account} to:`, login.account);
@@ -12163,11 +12203,13 @@ function flashSaved(button) {
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
 const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
-// `confirm` (the Review route) stays a shared/common value on the wire, but it is
-// edited in the Agents card beside the task agents it gates — not here.
-const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
+// Review route and Responder stay shared/common values on the wire, but their
+// controls live in the Agent card.
+const agentRouteSettingsFields = (scope) => ['confirm', 'responder']
+  .map((name) => settingsFields('software-dev', scope).find((field) => field.name === name)).filter(Boolean);
+const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && !['confirm', 'responder'].includes(field.name));
 // The stored `__common__` row is shared by several forms (task defaults here; the
-// Review route and Git profile elsewhere) and a settings PUT replaces the whole
+// agent routes and Git profile elsewhere) and a settings PUT replaces the whole
 // row — so every save read-merge-writes: fetch the raw row, drop exactly the keys
 // this form owns, and lay the collected values on top.
 async function saveCommonSettings(scope, projectId, organizationId, ownNames, collected) {
@@ -12202,7 +12244,8 @@ function settingsForms(scope, projectId) {
       </details>`;
     })
     .join('');
-  return common + resourceDefaultsHtml(scope) + unique;
+  return common + profilesCard(scope) + quickSettingsForms(scope, projectId)
+    + resourceDefaultsHtml(scope) + explanationSettingsCard(scope) + unique;
 }
 
 function resourceDefaultsHtml(scope) {
@@ -12454,11 +12497,15 @@ async function openAvatarEditor(proj, avatar) {
   const overlay = document.createElement('div'); overlay.className = 'overlay avatar-editor-overlay';
   overlay.innerHTML = '<div class="modal-card avatar-editor"><div class="loading">Loading…</div></div>'; document.body.appendChild(overlay);
   const close = () => overlay.remove(); overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  try { await fillAvatarEditor(overlay, close, proj, avatar); } catch (error) { close(); toast(error.message, true); }
+}
+
+async function fillAvatarEditor(overlay, close, proj, avatar) {
   const [vaultItems, githubData] = await Promise.all([api(`/api/vault/items?organizationId=${encodeURIComponent(proj.organizationId)}`).catch(() => []), api('/api/user/github-accounts').catch(() => ({ accounts: [] }))]);
   const githubAccounts = githubData.accounts || [], activeGithub = githubAccounts.find((account) => account.active);
   const selectedCredentialIds = new Set((avatar?.authorization?.capabilities || []).filter((cap) => cap.startsWith('use-credential:item:')).map((cap) => cap.slice('use-credential:item:'.length)));
   let credentialPolicies = JSON.parse(JSON.stringify(avatar?.credentialPolicies || {}));
-  const callMode = avatar?.callableBy?.includes('@project') ? 'project' : avatar?.callableBy?.length === 1 && avatar.callableBy[0] === `user:${avatar.ownerUserId}` ? 'me' : 'specific';
+  const callMode = !avatar ? 'me' : avatar.callableBy?.includes('@project') ? 'project' : avatar.callableBy?.length === 1 && avatar.callableBy[0] === `user:${avatar.ownerUserId}` ? 'me' : 'specific';
   const roles = new Set(avatar?.roles || []), selectedAuth = avatar?.authorityMode === 'restricted' ? avatar.authorization : { level: 'developer', scope: 'projects', projectIds: [proj.id] };
   const runtime = avatar?.runtime || { provider: agentProviderChoice(), model: '', effort: '' };
   overlay.querySelector('.avatar-editor').innerHTML = `<div class="avatar-editor-head"><div><h2>${avatar ? 'Edit Avatar' : 'New Avatar'}</h2><p>Create a named autonomous principal. Only you can edit its instructions.</p></div><button class="icon-btn avatar-editor-close" type="button" aria-label="Close">✕</button></div><div class="avatar-editor-scroll">
@@ -12480,7 +12527,7 @@ async function openAvatarEditor(proj, avatar) {
   const anyRole = overlay.querySelector('#avatar-any-role'), roleGrid = overlay.querySelector('.avatar-role-grid'); anyRole.addEventListener('change', () => { roleGrid.hidden = anyRole.checked; });
   overlay.querySelector('.avatar-editor-save').addEventListener('click', async () => {
     const button = overlay.querySelector('.avatar-editor-save'); button.disabled = true; const authorityMode = authorityInputs.find((input) => input.checked)?.value || 'full';
-    const callableBy = callModeEl.value === 'me' ? [`user:${S.user.id}`] : callModeEl.value === 'project' ? ['@project'] : overlay.querySelector('#avatar-callers').value.split(',').map((value) => value.trim()).filter(Boolean);
+    const callableBy = callModeEl.value === 'me' ? [`user:${typeof S.user === 'string' ? S.user : S.user?.id}`] : callModeEl.value === 'project' ? ['@project'] : overlay.querySelector('#avatar-callers').value.split(',').map((value) => value.trim()).filter(Boolean);
     const requestedAuthorization = authorityMode === 'restricted'
       ? readAuthorizationEditor(overlay.querySelector('#avatar-authorization')) : null;
     const payload = { name: overlay.querySelector('#avatar-name').value, purpose: overlay.querySelector('#avatar-purpose').value,
@@ -13376,13 +13423,10 @@ function settingsView(proj) {
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
-    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
-    ${explanationSettingsCard('project')}
-    ${profilesCard('project')}
-    ${quickSettingsForms('project', proj.id)}
     <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
     <div class="settings-section-title" id="project-people"><div>People &amp; authorization<small>Who can work here, and what they may do</small></div></div>
     <div class="card"><div id="project-access">Loading…</div></div>
+    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
@@ -14258,9 +14302,6 @@ function globalSettingsView(embedded = false) {
   return `
     ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
-    ${explanationSettingsCard('global')}
-    ${profilesCard('global')}
-    ${quickSettingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps</div>
       <p class="task-sub">List of connected apps. To set defaults, go to <a href="#settings-defaults">Task defaults</a>.</p>
@@ -16404,15 +16445,14 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   }));
 }
 
-// The Review route — who checks the work at Review: human layers, agent layers,
-// or none (auto-confirm). Stored with the shared task defaults (__common__/
-// confirm) but edited here, beside the task agents it gates.
+// Review route and Responder share the task-defaults row (__common__) but are
+// edited beside the operational agent, with one save for both routes.
 async function hydrateReviewRoute(scope, projectId, organizationId) {
   const box = $(`#review-route-${scope}`);
   if (!box) return;
   const renderIsCurrent = beginAsyncElementRender(box);
-  const field = schemaFor('software-dev').find((f) => f.name === 'confirm');
-  if (!field) { box.innerHTML = ''; return; }
+  const fields = agentRouteSettingsFields(scope);
+  if (!fields.length) { box.innerHTML = ''; return; }
   let own = {};
   let inherited = {};
   try {
@@ -16422,16 +16462,16 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
     inherited = d[scope].inherited;
   } catch {}
   if (!renderIsCurrent()) return;
-  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
-    <button class="btn primary sm" data-save-review-route>Save review route</button>`;
+  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields(fields, own, inherited)}</div>
+    <button class="btn primary sm" data-save-review-route>Save routes</button>`;
   box.dataset.mcpScope = mcpScope(projectId || null, organizationId);
   wireAgentFields(box);
-  wireFieldResets(box, [field]);
+  wireFieldResets(box, fields);
   const saveButton = box.querySelector('[data-save-review-route]');
   saveButton.addEventListener('click', async () => {
-    const values = collectForm(box.querySelector('.wf-form'), [field]);
+    const values = collectForm(box.querySelector('.wf-form'), fields);
     try {
-      await saveCommonSettings(scope, projectId, organizationId, ['confirm'], values);
+      await saveCommonSettings(scope, projectId, organizationId, fields.map((field) => field.name), values);
       flashSaved(saveButton);
     } catch (err) { toast(err.message, true); }
   });
@@ -16505,58 +16545,16 @@ function wireGlobalSettings(organizationId) {
   $('#login-connect')?.addEventListener('click', async () => {
     const provider = $('#login-provider').value;
     const account = $('#login-name').value.trim();
-    const browserMcp = 'none';
     const [modelProvider, authMethod] = provider === 'opencode'
       ? $('#login-opencode-target').value.split('|', 2)
       : [];
-    const out = $('#login-result');
     if (!account) return toast('account name required', true);
-    out.textContent = 'Launching provider login…';
-    out.style.color = 'var(--ink-2)';
-    try {
-      const btn = $('#login-connect'); btn.disabled = true;
-      const r = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect`, {
-        method: 'POST',
-        // Clicking Connect is an explicit re-authentication request. Without
-        // force, an expired native credential file was mistaken for a healthy
-        // login and the UI misleadingly reported "Already signed in."
-        body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod, force: true }),
-      });
-      btn.disabled = false;
-      if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }
-      else if (r.status === 'awaiting_oauth' && r.loginUrl) {
-        const codeEntry = r.requiresCode
-          ? '<br><label class="form-row">Authorization code shown after sign-in<input id="login-authorization-code" autocomplete="off" /></label><button class="btn sm" id="login-code-submit">Submit code</button>'
-          : '';
-        out.innerHTML = `Open this URL to finish signing in (${siteNameMarkup()} won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}${codeEntry}`;
-        out.style.color = 'var(--ink-1)';
-        out.querySelector('#login-code-submit')?.addEventListener('click', async () => {
-          const code = out.querySelector('#login-authorization-code')?.value.trim();
-          if (!code) return toast('authorization code required', true);
-          const submit = out.querySelector('#login-code-submit');
-          submit.disabled = true;
-          try {
-            const completed = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect/code`, {
-              method: 'POST', body: JSON.stringify({ provider, account, code }),
-            });
-            if (completed.status === 'logged_in') {
-              out.innerHTML = '🟢 Signed in.';
-              out.style.color = 'var(--ok, green)';
-              hydrateAccounts(organizationId);
-              hydrateProfiles('global', undefined, organizationId);
-            } else {
-              out.textContent = completed.detail || 'Authorization code submitted.';
-            }
-          } catch (e) {
-            submit.disabled = false;
-            toast(e.message, true);
-          }
-        });
-      } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
-      $('#login-name').value = '';
-      hydrateAccounts(organizationId);
-      hydrateProfiles('global', undefined, organizationId);
-    } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
+    const btn = $('#login-connect');
+    btn.disabled = true;
+    const refresh = () => { hydrateAccounts(organizationId); hydrateProfiles('global', undefined, organizationId); };
+    const started = await runLoginFlow($('#login-result'), { organizationId, provider, account, modelProvider, authMethod, onSignedIn: refresh });
+    btn.disabled = false;
+    if (started) { $('#login-name').value = ''; refresh(); }
   });
   const syncLoginTarget = () => {
     const show = $('#login-provider')?.value === 'opencode';
@@ -16644,7 +16642,17 @@ function inboxTabs() {
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
+  if (item.subject?.kind === 'credential') {
+    if (item.subject.reason === 'signed-out') return 'Signed out — sign in again';
+    const days = Math.max(0, Math.ceil((item.subject.expiresAt - Date.now()) / 86_400_000));
+    return `Sign-in expires ${days ? `in ${days} day${days === 1 ? '' : 's'}` : 'today'} — renew it`;
+  }
   return item.kind === 'update' ? (item.task?.status || 'update') : item.kind.replaceAll('-', ' ');
+}
+// What a row is about, for rows that are not a task's (resource asks, logins).
+function inboxTitle(item, fallback = item.kind) {
+  if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
+  return item.task?.title || item.resource?.name || fallback;
 }
 // Every priority is explicit; color and bars make the urgent levels scannable.
 function urgencyChip(urgency) {
@@ -16685,7 +16693,7 @@ function inboxView() {
     <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.title || item.task?.title || 'Notification')}">
       <span class="status-dot ${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}" title="${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}"></span>
       <div class="task-main">
-        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(item.task?.title || item.resource?.name || item.kind)}</div>
+        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(inboxTitle(item))}</div>
         <div class="task-sub">${inboxProjectLabel(item) ? `<span class="inbox-project" title="${esc(inboxProjectLabel(item))}">${esc(inboxProjectLabel(item))}</span>` : ''}<span class="chip">${esc(inboxRowLabel(item))}</span></div>
       </div>
       <div class="task-right">${urgencyChip(item.urgency)}<time datetime="${new Date(item.createdAt).toISOString()}" title="${esc(new Date(item.createdAt).toLocaleString())}">${esc(inboxTimeLabel(item.createdAt))}</time><button class="icon-btn inbox-read" data-inbox-toggle="${esc(item.id)}" aria-label="${item.unread ? 'Mark as read' : 'Mark as unread'}" title="${item.unread ? 'Mark as read' : 'Mark as unread'}" aria-pressed="${!item.unread}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button></div></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
@@ -16816,7 +16824,7 @@ function showVisualNotification(item) {
   const alert = document.createElement('div');
   alert.className = 'notification-alert';
   alert.dataset.id = item.id;
-  alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || siteName())}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
+  alert.innerHTML = `<button class="notification-open"><strong>${esc(inboxTitle(item, '') || siteName())}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
   alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(liveInboxItem(item)); };
   alert.lastElementChild.onclick = () => alert.remove();
   region.prepend(alert);
@@ -16833,7 +16841,7 @@ function showSystemNotification(item) {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
   try {
     const number = item.task?.num != null ? `#${item.task.num} · ` : '';
-    const notification = new Notification(item.task?.title || item.resource?.name || siteName(), {
+    const notification = new Notification(inboxTitle(item, '') || siteName(), {
       body: `${URGENCY_LEVELS[urgencyRank(item.urgency)].toUpperCase()} · ${number}${inboxRowLabel(item)}`,
       silent: true, // Sound is controlled separately by this browser’s per-level preference.
       tag: item.id,                                    // a restated ask replaces its own popup
@@ -16893,6 +16901,9 @@ async function openInboxItem(item) {
     markInboxItemReadLocally(item);
     api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
       .catch(() => { item.unread = true; updateBell(); });
+  }
+  if (item.subject?.kind === 'credential') {
+    return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-agents`);
   }
   if (item.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId); if (!project) return;

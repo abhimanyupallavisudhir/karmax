@@ -420,7 +420,7 @@ export async function refreshClaudeAccessToken(
 
 function claudeSignedOut(configHome: string) {
   const account = path.basename(configHome).replace(/^claude-/, '');
-  const message = `Claude login claude:${account} was signed out by Anthropic (its sign-in expired or was revoked); sign in again in Credentials`;
+  const message = `Claude login claude:${account} was signed out by Anthropic (its sign-in expired or was revoked); sign in again in Settings → Codex/Claude`;
   return providerFailure(message, {
     kind: 'credential',
     permanence: 'hard',

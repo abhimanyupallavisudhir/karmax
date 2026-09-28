@@ -85,6 +85,11 @@ const long = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes',
   retry: { maximumAttempts: 1 },
 });
+// An agent turn has no wall-clock limit: long investigations and builds are
+// normal work. The 2-minute heartbeat timeout is what detects a dead worker or
+// a slept host. Temporal requires some start-to-close bound, so this one is
+// deliberately beyond any real turn.
+const AGENT_TURN_START_TO_CLOSE = '30 days';
 // Agent turns heartbeat every ~1s (runtime.ts), so a 2-minute gap means the
 // worker/host died or slept. Temporal then retries the turn, and the next
 // attempt RESUMES the interrupted session from heartbeat details (runAgentTurn)
@@ -93,7 +98,7 @@ const long = proxyActivities<coreActivities>({
 // tagged non-retryable by the activity and flow to account rotation / Resolve
 // exactly as before (see failures.ts).
 const turns = proxyActivities<coreActivities>({
-  startToCloseTimeout: '45 minutes',
+  startToCloseTimeout: AGENT_TURN_START_TO_CLOSE,
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
 });
@@ -102,7 +107,7 @@ const turns = proxyActivities<coreActivities>({
 // while the provider subprocess is still running — exactly the task-296 failure.
 // Keep the old proxy for replay-pinned histories; v1.6+ schedules turns with this one.
 const cancellationAwareTurns = proxyActivities<coreActivities>({
-  startToCloseTimeout: '45 minutes',
+  startToCloseTimeout: AGENT_TURN_START_TO_CLOSE,
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
@@ -1995,7 +2000,8 @@ async function softwareDevImpl(
     // BEFORE this turn's id; later ones resolve it after. Only the run's first
     // `agent-turn-run-identity-v1` marker is a command, so only it can tell them
     // apart: replay reports the marker unknown here exactly when the history
-    // recorded it after that resolution. Live executions take the current order.
+    // recorded it after that resolution, or not at all (both resolved first then).
+    // Live executions take the current order.
     const resolvedFirst = !compactStart && !patched('agent-turn-run-identity-v1');
     const firstAllowed = resolvedFirst ? await resolveAllowed() : undefined;
     const turnId = agentTurnId(taskId, turnSeq++);

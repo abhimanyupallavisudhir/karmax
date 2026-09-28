@@ -7,9 +7,26 @@ import { BRAND } from '../domain/brand.js';
 
 const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
 
-export interface QueuedDelegation {
+/** What a turn's tools recorded for the workflow to act on after the turn, plus
+ * how many workflow messages reached the agent mid-turn. Saved as each happens,
+ * so a retried activity attempt (worker restart, lost heartbeat) keeps every
+ * outcome of the attempt it replaces instead of silently dropping them. The
+ * tools told the agent these were done, and a resumed agent does not repeat
+ * them: task #367 lost two sub-tasks before spawns were kept here. */
+export interface TurnJournal {
+  completed?: boolean;
+  openPrRequested?: boolean;
+  reviewInfo?: ReviewInfo;
+  resolution?: Transition;
+  confirmDecision?: ConfirmDecision;
+  raise?: RaiseToParent;
+  waitForSubtasks?: boolean;
   subTasks?: SubTaskRequest[];
   subTaskResponses?: SubTaskResponse[];
+  skills?: { name: string; content: string }[];
+  worldHandle?: import('../world/types.js').WorldHandle;
+  /** Absolute `msgs` index delivered so far (initial snapshot + mid-turn follow-ups). */
+  delivered?: number;
 }
 
 export interface RunTurnDeps {
@@ -20,12 +37,6 @@ export interface RunTurnDeps {
   onReviewInfo?: (info: ReviewInfo, supplied: ReviewInfo) => void | Promise<void>;
   /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
   onActivity?: (activity: AgentActivity) => void | Promise<void>;
-  /** Sub-task spawns and answers this turn queued before a retry interrupted it.
-   *  The tool told the agent they were queued, and a resumed agent will not
-   *  queue them again, so they belong to this turn's result. */
-  queuedDelegation?: QueuedDelegation;
-  /** Persist queued spawns/answers before the tool acknowledges them. */
-  onDelegation?: (queued: QueuedDelegation) => void | Promise<void>;
   /** Validate and normalize create_sub_task `params` (PL-11). A refusal throws,
    *  so the agent gets a tool error and nothing is queued. */
   subTaskParams?: (params: unknown) => Promise<SubTaskRequest['params']>;
@@ -55,6 +66,9 @@ export interface RunTurnDeps {
   /** Pull follow-up messages queued in the workflow at/after `fromIndex` so a
    *  streaming adapter can inject them into the live session mid-turn (SPEC §5.6). */
   pullFollowUps?: (fromIndex: number) => Promise<import('../domain/types.js').Message[]>;
+  /** Durable per-turn journal: `restored` is what an interrupted earlier attempt of
+   *  this same turn recorded; `save` must persist before the tool call returns. */
+  journal?: { restored?: TurnJournal; save(journal: TurnJournal): Promise<void> };
   /** Resolve the project's work-command secrets as they stand now, so a secret
    *  added, rotated or disabled in project settings reaches the running turn. */
   pullSecretEnv?: () => Promise<Record<string, string>>;
@@ -162,26 +176,45 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   const opaqueEnd = (await trace?.start('adapter.to-first-output.opaque'));
   const observedTools = new Map<string, Awaited<ReturnType<NonNullable<typeof trace>['start']>>>();
   const outputObserved = async () => { await Promise.all([trace?.markOnce('first.output'), opaqueEnd?.()]); };
-  let completed = false;
-  let openPrRequested = false;
-  let reviewInfo: ReviewInfo | undefined;
+  const restored = deps.journal?.restored ?? {};
+  let completed = restored.completed ?? false;
+  let openPrRequested = restored.openPrRequested ?? false;
+  let reviewInfo: ReviewInfo | undefined = restored.reviewInfo;
   let reviewPublication = Promise.resolve();
-  let resolution: Transition | undefined;
-  let confirmDecision: ConfirmDecision | undefined;
-  let raise: RaiseToParent | undefined;
-  let waitForSubtasks = false;
-  const subTasks: SubTaskRequest[] = [...(deps.queuedDelegation?.subTasks ?? [])];
-  const subTaskResponses: SubTaskResponse[] = [...(deps.queuedDelegation?.subTaskResponses ?? [])];
-  // A resumed agent may queue the same request again; deliver it once.
-  const queueDelegation = async <T>(list: T[], item: T) => {
+  let resolution: Transition | undefined = restored.resolution;
+  let confirmDecision: ConfirmDecision | undefined = restored.confirmDecision;
+  let raise: RaiseToParent | undefined = restored.raise;
+  let waitForSubtasks = restored.waitForSubtasks ?? false;
+  const subTasks: SubTaskRequest[] = [...(restored.subTasks ?? [])];
+  const subTaskResponses: SubTaskResponse[] = [...(restored.subTaskResponses ?? [])];
+  const skills: { name: string; content: string }[] = [...(restored.skills ?? [])];
+  // A resumed agent may ask for the same spawn or answer again; deliver it once.
+  const addOnce = <T>(list: T[], item: T) => {
     const key = JSON.stringify(item);
-    if (list.some(existing => JSON.stringify(existing) === key)) return;
-    list.push(item);
-    await deps.onDelegation?.({ subTasks: [...subTasks], subTaskResponses: [...subTaskResponses] });
+    if (!list.some(existing => JSON.stringify(existing) === key)) list.push(item);
   };
-  const skills: { name: string; content: string }[] = [];
   // Set only if the agent partitioned its change across another branch this turn.
-  let worldHandle: import('../world/types.js').WorldHandle | undefined;
+  let worldHandle: import('../world/types.js').WorldHandle | undefined = restored.worldHandle;
+  let delivered = restored.delivered;
+  // Saves are serialized so a later snapshot can never be overwritten by an earlier one.
+  let journalSaves = Promise.resolve();
+  const journal = (): Promise<void> => {
+    if (!deps.journal) return Promise.resolve();
+    const snapshot: TurnJournal = {
+      ...(completed ? { completed } : {}), ...(openPrRequested ? { openPrRequested } : {}),
+      ...(reviewInfo ? { reviewInfo } : {}), ...(resolution ? { resolution } : {}),
+      ...(confirmDecision ? { confirmDecision } : {}), ...(raise ? { raise } : {}),
+      ...(waitForSubtasks ? { waitForSubtasks } : {}),
+      ...(subTasks.length ? { subTasks: [...subTasks] } : {}),
+      ...(subTaskResponses.length ? { subTaskResponses: [...subTaskResponses] } : {}),
+      ...(skills.length ? { skills: [...skills] } : {}),
+      ...(worldHandle ? { worldHandle } : {}), ...(delivered !== undefined ? { delivered } : {}),
+    };
+    // A failed save leaves this attempt's in-memory outcome intact; only a later
+    // retry would lose it, which is no worse than before the journal existed.
+    journalSaves = journalSaves.then(() => deps.journal!.save(snapshot)).catch(() => {});
+    return journalSaves;
+  };
   // Adapters copy `input` (e.g. to resume after a credential refresh), so live
   // secrets are one record shared by every copy and updated in place.
   const liveSecretEnv = deps.pullSecretEnv ? { ...input.secretEnv } : undefined;
@@ -216,6 +249,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       if (input.role !== 'do') throw new Error('open_pr is available only to the Do agent');
       openPrRequested = true;
       completed = true;
+      return journal();
     },
     // Optional, structured task-finish annotation. Provider completion is established
     // independently by the adapter's verified terminal event; this tool may add a summary
@@ -224,14 +258,17 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     signalCompletion(summary) {
       completed = true;
       if (summary && !reviewInfo?.summary) reviewInfo = { ...reviewInfo, summary };
+      return journal();
     },
     resolveDecision(t) {
       resolution = t;
       completed = true; // a decision ends the resolve turn
+      return journal();
     },
     confirmDecision(d) {
       confirmDecision = d;
       completed = true; // a verdict ends the confirm turn
+      return journal();
     },
     async createReviewInfo(info) {
       // Providers can dispatch tools concurrently. Serialize accumulation with
@@ -244,6 +281,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
         assertReviewInfoTotal(nextReviewInfo);
         await deps.onReviewInfo?.(nextReviewInfo, info);
         reviewInfo = nextReviewInfo;
+        await journal();
       });
       // A rejected attachment must not prevent the agent correcting it later.
       reviewPublication = publication.catch(() => {});
@@ -253,19 +291,29 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       // Unvalidated params never reach a child: without a validator, refuse them.
       if (t.params !== undefined && !deps.subTaskParams) throw new Error('sub-task params are unavailable in this turn');
       const params = t.params === undefined ? undefined : (await deps.subTaskParams!(t.params));
-      await queueDelegation(subTasks, { title: t.title, prompt: t.prompt, ...(params ? { params } : {}) });
+      addOnce(subTasks, { title: t.title, prompt: t.prompt, ...(params ? { params } : {}) });
+      return journal();
     },
-    async respondToSubTask(r) {
-      await queueDelegation(subTaskResponses, r);
+    respondToSubTask(r) {
+      addOnce(subTaskResponses, r);
+      return journal();
     },
     raiseToParent(r) {
       raise = r;
+      return journal();
     },
     waitForSubtasks() {
       waitForSubtasks = true;
+      return journal();
     },
     saveSkill(s) {
       skills.push(s);
+      return journal();
+    },
+    followUpsDelivered(index) {
+      if (delivered !== undefined && index <= delivered) return;
+      delivered = index;
+      void journal();
     },
     // Do the checkout NOW, so the agent can work in the new branch for the rest
     // of this turn, and hand the updated handle back for the workflow to adopt.
@@ -284,6 +332,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       worldHandle = await input.world.addCheckout(spec);
       const added = worldHandle.repos?.[worldHandle.repos.length - 1];
       if (!added) throw new Error('checkout was not recorded on the world handle');
+      await journal();
       return { name: added.name, root: added.root, branch: added.branch };
     },
     async requestSpend(args) {
@@ -310,6 +359,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
           : [];
         reviewInfo = { ...reviewInfo, summary: note,
           actions: [...(reviewInfo?.actions ?? []), ...actions] };
+        await journal();
       }
       return outcome;
     },

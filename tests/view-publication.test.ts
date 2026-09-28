@@ -95,8 +95,8 @@ describe('durable conversation publication', () => {
     const other = await store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
       workflowVersion: '1.20.0', params: { prompt: 'fixture', _workflowRunId: 'live-run' } });
     const day = 24 * 60 * 60 * 1000;
-    const stale = [`turnsession:${task.id}:run#1`, `turnresult:${task.id}:do:${task.id}:run#1`, `turnspawns:${task.id}#0`,
-      `task-create:${task.id}:run:child`, 'turnsession:legacy:last-run:activity', 'turnspawns:legacy:last-run:activity',
+    const stale = [`turnsession:${task.id}:run#1`, `turnsession:${task.id}:run#1:journal`, `turnresult:${task.id}:do:${task.id}:run#1`,
+      `task-create:${task.id}:run:child`, 'turnsession:legacy:last-run:activity',
       ...(history === 'unswept' ? ['turnsession:legacy:earlier-run:activity'] : [])];
     const kept = [`session:${task.id}:do`, `turnsession:${other.id}:run#1`, `turnresult:${other.id}:do:${other.id}:run#1`,
       'turnsession:legacy:live-run:activity'];

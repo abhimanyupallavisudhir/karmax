@@ -153,7 +153,7 @@ integration('PostgreSQL cutover', () => {
       for (const [avatarId, requestId] of [['avatar-a', 'Aa'], ['avatar-b', 'BB']] as const)
         await store.addAuthorizationInbox(org.id, ['owner'],
           { kind: 'avatar-authorization', avatarId, projectId: project.id, requestId }, 1000);
-      expect((await store.listInbox('owner', org.id)).map((row) => row.subject?.requestId).sort()).toEqual(['Aa', 'BB']);
+      expect((await store.listInbox('owner', org.id)).map((row) => row.subject?.kind === 'avatar-authorization' ? row.subject.requestId : undefined).sort()).toEqual(['Aa', 'BB']);
     } finally { await store.close(); }
   });
 
