@@ -72,8 +72,7 @@ loads `web/` into Chromium with a scripted `/api`, so a test renders a
 component with the console's own functions and then clicks, types and reads
 the DOM and the requests made. (Chromium comes from `npx playwright install
 chromium`, as in CI.) Do not assert on the text of `web/` or `src/` files:
-`tests/source-text-ratchet.test.ts` fails on a new such assertion and lists
-the files that still have them.
+`tests/source-text-ratchet.test.ts` fails on any such assertion.
 
 ## CI
 

@@ -3,25 +3,14 @@ import { sourceTextAssertions, testFiles } from './helpers/source-text-assertion
 
 /**
  * Tests that assert on the text of src/ or web/ pass while the behaviour is
- * broken and fail when the code is reworded (CI-15). These files still do,
- * with at most this many such assertions each. The list may only shrink: a
- * new file must test behaviour instead (render UI with
- * tests/helpers/console-page.ts, or run the extracted function), and a file
- * that converts leaves the list. Lower a number when you remove assertions.
+ * broken and fail when the code is reworded (CI-15). None does any more:
+ * render UI with tests/helpers/console-page.ts, or run the extracted
+ * function, and assert on what it does.
  */
-const REMAINING: Record<string, number> = {
-  'tests/provider-connections-ui.test.ts': 9,
-};
-
-it('adds no assertions on source text, and lists only files that still have them', () => {
-  const found = Object.fromEntries(testFiles().map((file) => [file, sourceTextAssertions(file)] as const)
-    .filter(([, count]) => count > 0));
-  const grown = Object.entries(found).filter(([file, count]) => count > (REMAINING[file] ?? 0))
-    .map(([file, count]) => `${file}: ${count} (allowed ${REMAINING[file] ?? 0})`);
-  expect(grown, 'these assert on source text; test the behaviour instead').toEqual([]);
-  const stale = Object.entries(REMAINING).filter(([file, count]) => (found[file] ?? 0) < count)
-    .map(([file, count]) => `${file}: ${found[file] ?? 0} (listed ${count})`);
-  expect(stale, 'lower these numbers (or drop the file) so the list keeps shrinking').toEqual([]);
+it('makes no assertions on source text', () => {
+  const found = testFiles().map((file) => [file, sourceTextAssertions(file)] as const).filter(([, count]) => count > 0)
+    .map(([file, count]) => `${file}: ${count}`);
+  expect(found, 'these assert on source text; test the behaviour instead').toEqual([]);
 });
 
 it('recognises an assertion on source text but not on behaviour', async () => {
