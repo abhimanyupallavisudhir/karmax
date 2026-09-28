@@ -5686,7 +5686,7 @@ export class Store {
     if (scopeKey === 'global' && workflow === 'timing') values = { ...values, revision: crypto.randomUUID() };
     if (workflow === 'payments') {
       if (values.budget !== undefined && values.budget !== null && (!Number.isSafeInteger(values.budget) || Number(values.budget) < 0))
-        throw new Error('Budget must be a non-negative amount in cents');
+        throw new Error('Budget must be a non-negative whole amount in the currency's smallest unit');
       if (values.cardIds !== undefined) {
         const project = (await this.getProject(scopeKey));
         const org = project?.organizationId ?? (scopeKey.startsWith('organization:') ? scopeKey.slice(13) : 'org_personal');

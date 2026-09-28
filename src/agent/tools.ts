@@ -203,11 +203,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_spend',
     description:
-      'Reserve authorization to pay with a permitted project/organization card. Amount in cents. Returns granted, needs_approval, needs_funding, or denied. If not granted, stop and report — the human will raise the card limit or approve, then you can retry.',
+      'Reserve authorization to pay with a permitted project/organization card. Amount in the smallest unit of the card\'s currency (cents for USD, whole yen for JPY; the task\'s payment context gives each scale). Returns granted, needs_approval, needs_funding, or denied. If not granted, stop and report — the human will raise the card limit or approve, then you can retry.',
     parameters: {
       type: 'object',
       properties: {
-        amount: { type: 'number', description: 'Amount in cents.' },
+        amount: { type: 'number', description: 'Amount in the smallest unit of the card\'s currency, e.g. 1250 for 12.50 USD or 1250 for 1,250 JPY.' },
         card_id: { type: 'string', description: 'Optional card id, as an alternative to card_name.' },
         card_name: { type: 'string', description: 'Name of the card to use (unique within the organization). Follow the user’s instructions about which card to use.' },
         merchant: { type: 'string' },

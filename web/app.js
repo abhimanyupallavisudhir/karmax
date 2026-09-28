@@ -14658,15 +14658,18 @@ function parseExpiry(raw) {
   return { expMonth: Number(m[1]), expYear: year < 100 ? 2000 + year : year };
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
-/** Digits in `currency`'s minor unit: amounts are stored in minor units (JPY 0, KWD 3). */
+/** Digits in `currency`'s minor unit, as amounts are stored: the payment rail's
+ *  convention (ISK has two), mirroring src/util/currency.ts. */
 function currencyDigits(currency = 'usd') {
-  try { return new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits; }
-  catch { return 2; }
+  const code = String(currency || 'usd').toLowerCase();
+  return ['bif', 'clp', 'djf', 'gnf', 'jpy', 'kmf', 'krw', 'mga', 'pyg', 'rwf', 'ugx', 'vnd', 'vuv', 'xaf', 'xof', 'xpf'].includes(code) ? 0
+    : ['bhd', 'jod', 'kwd', 'omr', 'tnd'].includes(code) ? 3 : 2;
 }
 function money(minor, currency = 'usd') {
   currency = String(currency || 'usd').toLowerCase();
   return currency === 'usd' ? usd(minor)
-    : new Intl.NumberFormat(undefined, { style: 'currency', currency }).format((minor || 0) / 10 ** currencyDigits(currency));
+    : new Intl.NumberFormat(undefined, { style: 'currency', currency, minimumFractionDigits: currencyDigits(currency),
+      maximumFractionDigits: currencyDigits(currency) }).format((minor || 0) / 10 ** currencyDigits(currency));
 }
 function toMinorUnits(value, currency = 'usd') { return Math.round(Number(value) * 10 ** currencyDigits(currency)); }
 function fromMinorUnits(minor, currency = 'usd') { const digits = currencyDigits(currency); return (minor / 10 ** digits).toFixed(digits); }

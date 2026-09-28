@@ -77,7 +77,7 @@ import {
 } from '../integrations/github-actions.js';
 import { isGithubWorkflowPermissionRejection, type GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
-import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
+import { PaymentProvider, PaymentRegistry, BudgetService, paymentPromptContext } from '../autonomy/payments.js';
 import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
@@ -2299,10 +2299,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const paymentService = deps.payments ? new BudgetService(store, deps.paymentRegistry ?? deps.payments) : undefined;
       const paymentCards = (await paymentService?.cards({ projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant })) ?? [];
       const paymentPolicy = (await paymentService?.policy(args.task.projectId, args.taskId));
-      const paymentContext = paymentCards.length ? `\n\nPayment cards available to this task: ${JSON.stringify(paymentCards.map(c => ({ name: c.label, id: c.id })))}. `
-        + `Task budget (${(paymentPolicy?.currency ?? 'usd').toUpperCase()}): ${paymentPolicy?.budget == null ? 'unlimited' : (paymentPolicy.budget / 100).toFixed(2)}. `
-        + `Spent/reserved (${(paymentPolicy?.currency ?? 'usd').toUpperCase()}): ${((await store.paymentSpent(args.taskId, false, paymentPolicy?.currency)) / 100).toFixed(2)}. `
-        + 'Use request_spend with card_name to choose a card. Follow the user’s restrictions on each card. Over-budget payments require approval.' : '';
+      const paymentContext = paymentPromptContext(paymentCards, paymentPolicy,
+        paymentCards.length ? (await store.paymentSpent(args.taskId, false, paymentPolicy?.currency)) : 0);
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,

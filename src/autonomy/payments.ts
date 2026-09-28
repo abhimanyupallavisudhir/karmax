@@ -7,6 +7,7 @@ import { newId } from '../util/id.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { formatMinorUnits, minorUnitDigits } from '../util/currency.js';
 import type { CredentialBroker } from './broker.js';
 
 /**
@@ -1267,6 +1268,25 @@ export interface PaymentPolicy { cardIds: string[]; budget: number | null; curre
 
 const cardCurrency = (card: { currency?: string | null }) => (card.currency ?? 'usd').toLowerCase();
 
+/**
+ * What an agent is told about its payments (#367 review item 14). Amounts are
+ * the minor units request_spend takes, shown with their scale: read as
+ * cents, a 1,000 JPY budget was "10.00" and the agent's amounts came out 100x
+ * too large.
+ */
+export function paymentPromptContext(cards: Array<{ label: string; id: string; currency?: string | null }>,
+  policy: PaymentPolicy | undefined, spent: number): string {
+  if (!cards.length) return '';
+  const currency = (policy?.currency ?? 'usd').toUpperCase();
+  const amount = (minor: number) => `${formatMinorUnits(minor, currency)} ${currency} (amount ${minor})`;
+  const scales = [...new Set([currency, ...cards.map(card => cardCurrency(card).toUpperCase())])]
+    .map(code => `1 ${code} = ${10 ** minorUnitDigits(code)}`).join('; ');
+  return `\n\nPayment cards available to this task: ${JSON.stringify(cards.map(c => ({ name: c.label, id: c.id, currency: cardCurrency(c).toUpperCase() })))}. `
+    + `Task budget: ${policy?.budget == null ? 'unlimited' : amount(policy.budget)}. Spent/reserved: ${amount(spent)}. `
+    + `request_spend amounts are in the card currency's smallest unit (${scales}). `
+    + 'Use request_spend with card_name to choose a card. Follow the user’s restrictions on each card. Over-budget payments require approval.';
+}
+
 /** Would this request keep the task inside a budget it can be counted against? */
 function withinBudget(policy: PaymentPolicy, request: { amount: number; currency?: string | null }, spent: number): boolean {
   if (policy.budget === null) return true;
@@ -1313,7 +1333,7 @@ export async function validatePaymentPolicy(store: Store, projectId: string | un
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid payment policy');
   const p = value as PaymentPolicy;
   if (p.budget !== null && (!Number.isSafeInteger(p.budget) || p.budget < 0))
-    throw new Error('Budget must be a non-negative amount in cents');
+    throw new Error('Budget must be a non-negative whole amount in the currency's smallest unit');
   if (p.currency !== undefined && (typeof p.currency !== 'string' || !/^[a-z]{3}$/.test(p.currency)))
     throw new Error('Budget currency must be a three-letter ISO 4217 code, e.g. "usd"');
   const cards = (await store.listCards(projectId, organizationId));

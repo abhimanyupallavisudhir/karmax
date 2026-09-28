@@ -5,7 +5,7 @@ import { Store } from '../src/store/db.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { MockPaymentProvider, VaultCardProvider, resolvePaymentPolicy } from '../src/autonomy/payments.js';
+import { MockPaymentProvider, VaultCardProvider, paymentPromptContext, resolvePaymentPolicy } from '../src/autonomy/payments.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 
@@ -61,5 +61,23 @@ describe('payment policy currency through the API', () => {
       expect((await resolvePaymentPolicy(store, project.id))).toMatchObject({ currency: 'eur' });
       expect(dollar.id).toBeTruthy();
     } finally { (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // #367 review item 12: the agent read budget / 100 with two decimals, so a
+  // 1,000 JPY budget read as "10.00" and its amounts came out 100x too large.
+  it('tells the agent amounts in the minor units request_spend takes', () => {
+    const yen = paymentPromptContext([{ label: 'Tokyo', id: 'c1', currency: 'JPY' }], { cardIds: ['c1'], budget: 1_000, currency: 'jpy' }, 250);
+    expect(yen).toContain('"currency":"JPY"');
+    expect(yen).toContain('Task budget: 1000 JPY (amount 1000)');
+    expect(yen).toContain('Spent/reserved: 250 JPY (amount 250)');
+    expect(yen).toContain('1 JPY = 1');
+    expect(yen).not.toContain('10.00');
+    const mixed = paymentPromptContext([{ label: 'Main', id: 'c1' }, { label: 'Euro', id: 'c2', currency: 'EUR' }],
+      { cardIds: ['c1', 'c2'], budget: 1_234, currency: 'usd' }, 0);
+    expect(mixed).toContain('Task budget: 12.34 USD (amount 1234)');
+    expect(mixed).toContain('1 USD = 100');
+    expect(mixed).toContain('1 EUR = 100');
+    expect(paymentPromptContext([{ label: 'Main', id: 'c1' }], { cardIds: ['c1'], budget: null, currency: 'usd' }, 0)).toContain('Task budget: unlimited');
+    expect(paymentPromptContext([], { cardIds: [], budget: 5, currency: 'usd' }, 0)).toBe('');
   });
 });
