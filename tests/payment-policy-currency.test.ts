@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { Store } from '../src/store/db.js';
-import { MockPaymentProvider, resolvePaymentPolicy } from '../src/autonomy/payments.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { MockPaymentProvider, VaultCardProvider, resolvePaymentPolicy } from '../src/autonomy/payments.js';
+import { CredentialBroker } from '../src/autonomy/broker.js';
+import { Vault } from '../src/autonomy/vault.js';
 
 // AU-36: a budget carries its currency. A policy sent without one (an older
 // console, an agent) takes the currency of the budget it replaces, so an
@@ -34,5 +39,27 @@ describe('payment policy currency through the API', () => {
       (await api.setTaskPaymentPolicy(writer, task.id, { cardIds: [card.id], budget: 700, currency: 'usd' }));
       expect((await resolvePaymentPolicy(store, project.id, task.id))).toMatchObject({ budget: 700, currency: 'usd' });
     } finally { (await store.close()); }
+  });
+
+  // #367 review item 14: before AU-36 a budget was a bare number counted
+  // against whatever cards the task used. Read as USD, a budget over euro
+  // cards would turn every auto-approved payment into an approval.
+  it('reads a budget saved before currencies in the currency its cards share', async () => {
+    const store = (await Store.create(':memory:'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-legacy-budget-'));
+    try {
+      const project = (await store.createProject('Legacy budget'));
+      const provider = new VaultCardProvider(store, new CredentialBroker(new Vault(dir)));
+      const details = { number: '4242424242424242', cvc: '123', expMonth: 12, expYear: 2031 };
+      const euro = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Euro', cap: 1000, currency: 'EUR', details } as any);
+      (await store.setSettings(project.id, 'payments', { budget: 500 }));
+      expect((await resolvePaymentPolicy(store, project.id))).toMatchObject({ budget: 500, currency: 'eur' });
+      const dollar = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Dollar', cap: 1000, details } as any);
+      expect((await resolvePaymentPolicy(store, project.id))).toMatchObject({ currency: 'usd' });
+      // The cards the policy selects decide, not every card in the project.
+      (await store.setSettings(project.id, 'payments', { budget: 500, cardIds: [euro.id] }));
+      expect((await resolvePaymentPolicy(store, project.id))).toMatchObject({ currency: 'eur' });
+      expect(dollar.id).toBeTruthy();
+    } finally { (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

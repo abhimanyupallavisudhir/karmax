@@ -1282,12 +1282,21 @@ export async function resolvePaymentPolicy(store: Store, projectId: string, task
   const p = ((await store.getSettings(projectId, 'payments')) ?? {}) as any;
   const t = taskId ? ((await store.getTask(taskId))?.params as any)?.paymentPolicy : undefined;
   const layer = t ?? p;
-  // The currency travels with whichever layer set the budget; budgets saved
-  // before AU-36 were entered as USD.
+  // The currency travels with whichever layer set the budget.
   const source = Object.hasOwn(layer, 'budget') || layer.allowance != null ? layer : g;
-  return { cardIds: layer.cardIds ?? g.cardIds ?? (await store.listCards(projectId, org)).filter(c => c.status !== 'canceled').map(c => c.id),
-    budget: Object.hasOwn(source, 'budget') ? source.budget : source.allowance ?? 0,
-    currency: typeof source.currency === 'string' ? source.currency.toLowerCase() : 'usd' };
+  const cards = (await store.listCards(projectId, org)).filter(c => c.status !== 'canceled');
+  const cardIds: string[] = layer.cardIds ?? g.cardIds ?? cards.map(c => c.id);
+  return { cardIds, budget: Object.hasOwn(source, 'budget') ? source.budget : source.allowance ?? 0,
+    currency: typeof source.currency === 'string' ? source.currency.toLowerCase()
+      : legacyBudgetCurrency(cards.filter(c => cardIds.includes(c.id))) };
+}
+
+/** A budget saved before AU-36 was a bare number, counted against whatever
+ * cards the task used. When they all share a currency it was that one;
+ * reading it as USD would turn their auto-approved spend into approvals. */
+function legacyBudgetCurrency(cards: Array<{ currency?: string | null }>): string {
+  const currencies = new Set(cards.map(cardCurrency));
+  return currencies.size === 1 ? [...currencies][0]! : 'usd';
 }
 
 /**

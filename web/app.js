@@ -14650,8 +14650,22 @@ function parseExpiry(raw) {
   return { expMonth: Number(m[1]), expYear: year < 100 ? 2000 + year : year };
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
-const money = (cents, currency = 'usd') => currency.toLowerCase() === 'usd' ? usd(cents)
-  : new Intl.NumberFormat(undefined, { style: 'currency', currency }).format((cents || 0) / 100);
+/** Digits in `currency`'s minor unit: amounts are stored in minor units (JPY 0, KWD 3). */
+function currencyDigits(currency = 'usd') {
+  try { return new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits; }
+  catch { return 2; }
+}
+function money(minor, currency = 'usd') {
+  currency = String(currency || 'usd').toLowerCase();
+  return currency === 'usd' ? usd(minor)
+    : new Intl.NumberFormat(undefined, { style: 'currency', currency }).format((minor || 0) / 10 ** currencyDigits(currency));
+}
+function toMinorUnits(value, currency = 'usd') { return Math.round(Number(value) * 10 ** currencyDigits(currency)); }
+function fromMinorUnits(minor, currency = 'usd') { const digits = currencyDigits(currency); return (minor / 10 ** digits).toFixed(digits); }
+function spendRequestRow(r) {
+  return `<div class="queue-item"><div style="flex:1"><b>${esc(money(r.amount, r.currency))}</b> ${r.merchant ? `at ${esc(r.merchant)}` : ''} <span class="chip">${esc(r.status)}</span><div class="task-sub">${esc(r.why || r.reason || '')}</div></div>
+          ${['pending_approval', 'needs_funding'].includes(r.status) ? `<button class="btn sm" data-payapprove="${r.id}">Approve / retry</button><button class="btn sm danger" data-paydeny="${r.id}">Deny</button>` : ''}</div>`;
+}
 async function wirePaymentProviders(box, organizationId, onChange) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
@@ -14780,15 +14794,16 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
-          <div class="task-sub">${usd(c.remaining ?? c.available)} of ${usd(c.cap)} left${c.merchantLock?.length ? ` · ${c.merchantLock.map(esc).join(', ')} only` : ''}</div></div>
-        ${c.provider === 'vault-card' && c.status !== 'canceled' ? `<button class="btn sm" data-fund="${c.id}" title="Match the limit you set with your bank">Raise limit</button>` : ''}
+          <div class="task-sub">${esc(money(c.remaining ?? c.available, c.currency))} of ${esc(money(c.cap, c.currency))} left${c.merchantLock?.length ? ` · ${c.merchantLock.map(esc).join(', ')} only` : ''}</div></div>
+        ${c.provider === 'vault-card' && c.status !== 'canceled' ? `<button class="btn sm" data-fund="${c.id}" data-currency="${esc(c.currency || 'usd')}" title="Match the limit you set with your bank">Raise limit</button>` : ''}
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = await promptText(`Raise this card’s limit by how much (USD)? Raise it with your bank first — ${siteName()} only mirrors the figure.`);
+      const currency = b.dataset.currency || 'usd';
+      const amt = await promptText(`Raise this card’s limit by how much (${currency.toUpperCase()})? Raise it with your bank first — ${siteName()} only mirrors the figure.`);
       if (amt == null) return;
       if (!Number(amt) || Number(amt) < 0) return toast('Enter an amount greater than zero.', true);
-      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
+      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: toMinorUnits(amt, currency) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
     }));
     list.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm('Revoke this card? This cannot be undone.')) return;
@@ -14852,12 +14867,10 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
         api(`${paymentsBase}/requests`), api(`${paymentsBase}/transactions`),
       ]); } catch {}
       const pending = requests.filter((r) => ['pending_approval', 'needs_funding', 'authorized', 'consumed'].includes(r.status));
-      box.querySelector('.pay-requests').innerHTML = pending.length ? pending.map((r) =>
-        `<div class="queue-item"><div style="flex:1"><b>${usd(r.amount)}</b> ${r.merchant ? `at ${esc(r.merchant)}` : ''} <span class="chip">${esc(r.status)}</span><div class="task-sub">${esc(r.why || r.reason || '')}</div></div>
-          ${['pending_approval', 'needs_funding'].includes(r.status) ? `<button class="btn sm" data-payapprove="${r.id}">Approve / retry</button><button class="btn sm danger" data-paydeny="${r.id}">Deny</button>` : ''}</div>`).join('')
+      box.querySelector('.pay-requests').innerHTML = pending.length ? pending.map(spendRequestRow).join('')
         : '<span style="color:var(--ink-3)">No pending requests.</span>';
       box.querySelector('.pay-transactions').innerHTML = transactions.length ? transactions.slice(0, 50).map((t) =>
-        `<div class="queue-item"><div style="flex:1"><b>${usd(t.amount)}</b> ${t.merchant ? `at ${esc(t.merchant)}` : ''} <span class="chip">${esc(t.status)}</span><div class="task-sub">${esc(t.provider)} · ${new Date(t.createdAt).toLocaleString()}</div></div></div>`).join('')
+        `<div class="queue-item"><div style="flex:1"><b>${esc(money(t.amount, t.currency))}</b> ${t.merchant ? `at ${esc(t.merchant)}` : ''} <span class="chip">${esc(t.status)}</span><div class="task-sub">${esc(t.provider)} · ${new Date(t.createdAt).toLocaleString()}</div></div></div>`).join('')
         : '<span style="color:var(--ink-3)">No payment activity.</span>';
       box.querySelectorAll('[data-payapprove],[data-paydeny]').forEach((b) => b.addEventListener('click', async () => {
         const id = b.dataset.payapprove || b.dataset.paydeny;
@@ -19767,9 +19780,10 @@ function readTaskPayments(box) {
   if (!box?.dataset.policy) return undefined;
   const budget = box.querySelector('.payment-budget');
   if (!budget.checkValidity()) throw new Error('Enter a non-negative budget');
-  const cents = budget.value === '' ? null : Math.round(Number(budget.value) * 100);
-  if (cents !== null && !Number.isSafeInteger(cents)) throw new Error('Enter a valid budget');
-  return { cardIds: JSON.parse(box.dataset.policy).cardIds, budget: cents, currency: box.querySelector('.payment-currency').value };
+  const currency = box.querySelector('.payment-currency').value;
+  const minor = budget.value === '' ? null : toMinorUnits(budget.value, currency);
+  if (minor !== null && !Number.isSafeInteger(minor)) throw new Error('Enter a valid budget');
+  return { cardIds: JSON.parse(box.dataset.policy).cardIds, budget: minor, currency };
 }
 async function wireTaskPayments(box, projectId, initial, taskId, organizationId) {
   if (!box) return;
@@ -19789,14 +19803,21 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
     let cards = (cards0.length ? cards0 : live?.cards || []).filter(c => c.status !== 'canceled' && c.status !== 'inactive');
     // A budget's currency comes from the layer that set it (see resolvePaymentPolicy).
     const layer = Object.hasOwn(project, 'budget') || project.allowance != null ? project : org;
-    const inherited = { cardIds: project.cardIds ?? org.cardIds,
-      budget: Object.hasOwn(layer, 'budget') ? layer.budget : layer.allowance ?? 0, currency: layer.currency };
+    const inheritedCards = project.cardIds ?? org.cardIds;
+    // A budget saved before budgets had a currency is in the one its cards share.
+    const shared = [...new Set(cards.filter(c => !inheritedCards || inheritedCards.includes(c.id)).map(c => (c.currency || 'usd').toLowerCase()))];
+    const inherited = { cardIds: inheritedCards, budget: Object.hasOwn(layer, 'budget') ? layer.budget : layer.allowance ?? 0,
+      currency: layer.currency || (shared.length === 1 ? shared[0] : 'usd') };
     const policy = (taskId && S.paymentEdits?.[taskId]) || live || initial || inherited;
     let selected = new Set(policy.cardIds ?? cards.map(c => c.id)), active = -1;
-    budget.value = policy.budget == null ? '' : (policy.budget / 100).toFixed(2);
-    const codes = [...new Set([policy.currency || 'usd', ...cards.map(c => c.currency || 'usd')].map(c => c.toLowerCase()))];
+    const codes = [...new Set([policy.currency || inherited.currency, ...cards.map(c => c.currency || 'usd')].map(c => c.toLowerCase()))];
+    budget.value = policy.budget == null ? '' : fromMinorUnits(policy.budget, codes[0]);
     currency.innerHTML = codes.map(c => `<option value="${esc(c)}">${esc(c.toUpperCase())}</option>`).join('');
     currency.value = codes[0];
+    // Whole yen, cents, or thousandths of a dinar.
+    const step = () => { const digits = currencyDigits(currency.value); budget.step = digits ? (1 / 10 ** digits).toFixed(digits) : '1'; };
+    step();
+    currency.addEventListener('change', step);
     currency.hidden = codes.length < 2;
     box.querySelector('.payment-currency-code').textContent = codes.length < 2 ? `(${codes[0].toUpperCase()})` : '';
     input.disabled = budget.disabled = currency.disabled = box.querySelector('.payment-caret').disabled = false;
