@@ -13038,10 +13038,10 @@ function settingsView(proj) {
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
-    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
     <div class="settings-section-title" id="project-people"><div>People &amp; authorization<small>Who can work here, and what they may do</small></div></div>
     <div class="card"><div id="project-access">Loading…</div></div>
+    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>

@@ -39,20 +39,26 @@ for (const scope of ['project', 'global']) {
         S.organizations = [{ id: 'org', name: 'Organization' }];
         S.projects = [{ id: 'project', name: 'Project', organizationId: 'org' }];
         S.projectId = 'project';
-        document.querySelector('#main').innerHTML = ${scope === 'project' ? "settingsView(S.projects[0])" : 'globalSettingsView(true)'};
+        document.querySelector('#main').innerHTML = ${scope === 'project' ? "settingsView(S.projects[0])" : 'organizationView()'};
         await hydrateSettingsForms('${scope}', ${scope === 'project' ? "'project'" : 'undefined'}, 'org');
         await hydrateReviewRoute('${scope}', ${scope === 'project' ? "'project'" : 'undefined'}, 'org');
         await hydrateQuickSettingsForms('${scope}', ${scope === 'project' ? "'project'" : 'undefined'}, 'org');
       })()`), { scope, schema: MANIFESTS });
 
-      const order = await page.locator('[data-wf="__common__"], .agent-profile-settings, [data-qwf], .resource-defaults, .explanation-settings, details[data-wf], #project-conversation-sharing').evaluateAll(elements =>
+      const order = await page.locator('[data-wf="__common__"], .agent-profile-settings, [data-qwf], .resource-defaults, .explanation-settings, details[data-wf]').evaluateAll(elements =>
         elements.map(el => el.matches('[data-wf="__common__"]') ? 'branches'
           : el.matches('.agent-profile-settings') ? 'agent'
           : el.matches('[data-qwf]') ? 'quick'
           : el.matches('.resource-defaults') ? 'resources'
           : el.matches('.explanation-settings') ? 'explanation'
-          : el.matches('details') ? 'workflow' : 'sharing'));
-      expect(order).toEqual(['branches', 'agent', 'quick', 'resources', 'explanation', 'workflow', ...(scope === 'project' ? ['sharing'] : [])]);
+          : 'workflow'));
+      expect(order).toEqual(['branches', 'agent', 'quick', 'resources', 'explanation', 'workflow']);
+      const sharingId = scope === 'project' ? 'project-conversation-sharing' : 'organization-conversation-sharing';
+      const peoplePane = scope === 'project' ? 'project-people' : 'settings-people';
+      await page.evaluate(() => (globalThis as any).eval('wireSettingsNavigation()'));
+      expect(await page.locator(`#${sharingId}`).evaluate(el => el.closest('.settings-pane')?.getAttribute('data-pane'))).toBe(peoplePane);
+      await page.locator(`.settings-nav a[href="#${peoplePane}"]`).click();
+      expect(await page.locator(`#${sharingId}`).evaluate(el => el.closest('.settings-pane')?.classList.contains('active'))).toBe(true);
       const branch = page.locator('[data-wf="__common__"]');
       expect(await branch.locator('[data-field="remote"]').count()).toBe(1);
       expect(await branch.locator('[data-field="landingAuthority"]').count()).toBe(1);
