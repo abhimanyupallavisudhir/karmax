@@ -1,4 +1,6 @@
+import fs from 'node:fs';
 import { paths } from '../config/paths.js';
+import { hydrateEnvFile, hydrateSecretFiles } from '../config/deployment.js';
 import { inspectVault } from '../autonomy/vault.js';
 
 // npm run vault-preflight -- [VAULT_DIR]
@@ -6,6 +8,10 @@ import { inspectVault } from '../autonomy/vault.js';
 // deploy/karmax update runs it with the candidate image before switching:
 // exit 3 (a refused key, an unreadable entry, an entry to quarantine) keeps
 // the previous app serving unless the operator passes --accept-vault-findings.
+// The key the app will use: $KARMAX_HOME/karmax.env, then NAME_FILE secrets
+// (the turnkey app has only KARMAX_VAULT_KEY_FILE), exactly as main.ts reads them.
+hydrateEnvFile(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
+hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
 const dir = process.argv[2] ?? paths().vault;
 const report = inspectVault(dir);
 const lines: string[] = [];

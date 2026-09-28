@@ -123,15 +123,6 @@ function foreignEntry(dir: string, handle: string) {
 }
 
 describe('a one-way migration that keeps its way back', () => {
-  it('copies the unbound entries aside before binding them', async () => {
-    const { dir } = legacyVault();
-    const original = fs.readFileSync(entryFile(dir, 'rotated'), 'utf8');
-    await new Vault(dir).migrate();
-    const aside = path.join(dir, 'entries.pre-v2', path.basename(entryFile(dir, 'rotated')));
-    expect(fs.readFileSync(aside, 'utf8')).toBe(original);
-    expect(fs.readFileSync(entryFile(dir, 'rotated'), 'utf8')).not.toBe(original);
-  });
-
   it('quarantines the entries that will not open and binds the rest', async () => {
     const { dir, key } = legacyVault();
     fs.writeFileSync(entryFile(dir, 'second'), JSON.stringify({ handle: 'second', blob: legacyBlob(key, 'two') }));
@@ -290,31 +281,6 @@ describe('the first boot of the binding release', () => {
     expect(new Vault(dir).reveal('rotated')).toBe('current');
   });
 
-  it('removes staging copies an earlier crash left behind', async () => {
-    const { dir } = legacyVault();
-    fs.mkdirSync(path.join(dir, 'entries.pre-v2.123.abc.tmp'));
-    await new Vault(dir).migrate();
-    expect(fs.readdirSync(dir).filter((name) => name.startsWith('entries.pre-v2'))).toEqual(['entries.pre-v2']);
-  });
-
-  // Item 7: the rollback copy would keep a full card for 14 days (and backups
-  // of it for another 14). It keeps the card without its CVC.
-  it('keeps no CVC in the rollback copy', async () => {
-    const { dir, key } = legacyVault();
-    const card = 'payment:card:card_1';
-    fs.writeFileSync(entryFile(dir, card), JSON.stringify({ handle: card,
-      blob: legacyBlob(key, JSON.stringify({ number: '4242424242424242', cvc: '123', expMonth: 1, expYear: 2031 })),
-      previous: [legacyBlob(key, JSON.stringify({ number: '4000000000000002', cvc: '999', expMonth: 1, expYear: 2030 }))] }));
-    await new Vault(dir).migrate();
-    const copy = JSON.parse(fs.readFileSync(path.join(dir, 'entries.pre-v2', path.basename(entryFile(dir, card))), 'utf8'));
-    expect(copy.previous).toBeUndefined();
-    const [iv, tag, data] = copy.blob.split('.').map((part: string) => Buffer.from(part, 'base64'));
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(tag);
-    const plain = JSON.parse(Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8'));
-    expect(plain).toEqual({ number: '4242424242424242', expMonth: 1, expYear: 2031 });
-  });
-
   // Item 5: a read error is not corruption.
   it('never quarantines an entry it merely failed to read', async () => {
     const { dir } = legacyVault();
@@ -328,44 +294,6 @@ describe('the first boot of the binding release', () => {
     spy.mockRestore();
     expect(fs.existsSync(entryFile(dir, 'rotated'))).toBe(true);
     expect(fs.existsSync(path.join(dir, 'entries', 'quarantine'))).toBe(false);
-  });
-});
-
-// Item 6: putting the pre-binding copy back is a rollback the next boot
-// recognises from the copy's own authenticated marker, swapped or copied over,
-// without the operator deleting the canary.
-describe('a manual rollback and forward again', () => {
-  async function rolledForward(copyOver: boolean) {
-    const { dir, key } = legacyVault();
-    await new Vault(dir).migrate();
-    await new Vault(dir).put('added-after-upgrade', 'v2-secret');
-    const entries = path.join(dir, 'entries');
-    if (copyOver) fs.cpSync(path.join(dir, 'entries.pre-v2'), entries, { recursive: true });
-    else { fs.renameSync(entries, `${entries}.v2`); fs.renameSync(path.join(dir, 'entries.pre-v2'), entries); }
-    // The previous release writes an unbound entry meanwhile.
-    fs.writeFileSync(entryFile(dir, 'written-by-old-release'), JSON.stringify({ handle: 'written-by-old-release', blob: legacyBlob(key, 'old') }));
-    const vault = new Vault(dir);
-    await vault.migrate();
-    return { dir, vault };
-  }
-
-  it.each([['swapped', false], ['copied over', true]] as const)('binds the returned entries again when they are %s', async (_name, copyOver) => {
-    const { dir, vault } = await rolledForward(copyOver);
-    expect(vault.reveal('rotated')).toBe('current');
-    expect(vault.reveal('written-by-old-release')).toBe('old');
-    if (copyOver) expect(vault.reveal('added-after-upgrade')).toBe('v2-secret');
-    expect(JSON.parse(fs.readFileSync(entryFile(dir, 'rotated'), 'utf8')).blob).toMatch(/^v2\./);
-    expect(new Vault(dir).reveal('written-by-old-release')).toBe('old');
-  });
-
-  it('does not take a forged marker for a rollback', async () => {
-    const { dir, key } = legacyVault();
-    await new Vault(dir).migrate();
-    fs.writeFileSync(path.join(dir, 'entries', '.generation'), JSON.stringify({ format: 'karmax-vault-generation', blob: 'v2.AAAA.BBBB.CCCC' }));
-    fs.writeFileSync(entryFile(dir, 'planted'), JSON.stringify({ handle: 'planted', blob: legacyBlob(key, 'planted') }));
-    const vault = new Vault(dir);
-    await vault.migrate();
-    expect(() => vault.reveal('planted')).toThrow(/not bound to its handle/);
   });
 });
 
@@ -405,5 +333,128 @@ describe('a read-only preflight of the migration', () => {
     const finding = run();
     expect(finding.status).toBe(3);
     expect(finding.stdout).toMatch(/would quarantine.*foreign/s);
+  });
+});
+
+/**
+ * #367 review, round 3: production's previous release (master, data epoch 2)
+ * keeps the whole vault in vault/secrets.json, with no entries/, history or
+ * canary. Its first boot of this release is the one that must not fail.
+ */
+describe('the first boot on the previous release’s vault', () => {
+  /** A vault as master writes it: one secrets.json map of unbound blobs. */
+  function masterVault(secrets: Record<string, string>, key = crypto.randomBytes(32), damaged: string[] = []) {
+    const dir = directory();
+    fs.writeFileSync(path.join(dir, 'vault.key'), key, { mode: 0o600 });
+    const map: Record<string, string> = {};
+    for (const [handle, plain] of Object.entries(secrets)) map[handle] = legacyBlob(key, plain);
+    for (const handle of damaged) map[handle] = legacyBlob(crypto.randomBytes(32), 'foreign');
+    fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify(map), { mode: 0o600 });
+    return { dir, key };
+  }
+  const card = JSON.stringify({ number: '4242424242424242', cvc: '123', expMonth: 1, expYear: 2031 });
+
+  it('binds every secret, keeps malformed card secrets as they are, and boots again', async () => {
+    const { dir } = masterVault({ 'world-reference:key:v2': 'world-key', 'payment:card:good': card,
+      'payment:card:text': 'not json', 'payment:card:null': 'null', 'github:app': 'pem' }, undefined, ['payment:card:broken']);
+    const report = inspectVault(dir);
+    expect(report).toMatchObject({ key: 'accepted', bound: false, rebind: 5, unreadable: [],
+      quarantine: [expect.objectContaining({ handle: 'payment:card:broken' })] });
+    expect(fs.existsSync(path.join(dir, 'entries'))).toBe(false); // the preflight wrote nothing
+    const { quarantined } = await new Vault(dir).migrate();
+    expect(quarantined.map((entry) => entry.handle)).toEqual(report.quarantine.map((entry) => entry.handle));
+    for (let boot = 0; boot < 2; boot++) {
+      const vault = new Vault(dir);
+      await vault.migrate();
+      expect(vault.reveal('world-reference:key:v2')).toBe('world-key');
+      expect(vault.reveal('payment:card:text')).toBe('not json');
+      expect(vault.reveal('payment:card:null')).toBe('null');
+      expect(JSON.parse(vault.reveal('payment:card:good')!)).toMatchObject({ cvc: '123' });
+    }
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8'))).toEqual({});
+    // No second copy of the vault is kept: the pre-update backup is the way back.
+    expect(fs.readdirSync(dir).filter((name) => name.includes('pre-v2'))).toEqual([]);
+  });
+
+  it('binds a few thousand secrets reading secrets.json once', async () => {
+    const secrets = Object.fromEntries(Array.from({ length: 3_000 }, (_, i) => [`handle-${i}`, `secret-${i}`]));
+    const { dir } = masterVault(secrets);
+    const reads = vi.spyOn(fs, 'readFileSync');
+    const started = Date.now();
+    const vault = new Vault(dir);
+    await vault.migrate();
+    const elapsed = Date.now() - started;
+    const mapReads = reads.mock.calls.filter(([file]) => String(file).endsWith('secrets.json')).length;
+    reads.mockRestore();
+    expect(mapReads).toBeLessThanOrEqual(4);
+    expect(elapsed).toBeLessThan(30_000);
+    expect(vault.reveal('handle-2999')).toBe('secret-2999');
+  }, 60_000);
+
+  it('refuses secrets a previous release wrote to secrets.json after the move', async () => {
+    const { dir, key } = masterVault({ kept: 'value' });
+    await new Vault(dir).migrate();
+    fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify({ 'world-reference:key:v2': legacyBlob(key, 'regenerated') }));
+    expect(() => new Vault(dir)).toThrow(/secrets\.json holds 1 secret.*pre-update backup/);
+    expect(inspectVault(dir)).toMatchObject({ key: 'refused', refusal: expect.stringMatching(/secrets\.json holds 1 secret/) });
+  });
+
+  // Item 4: a canary that says "bound" is final.
+  it('never unbinds a bound vault, whatever entries/ now holds', async () => {
+    const { dir, key } = masterVault({ victim: 'victim-secret', attacker: 'attacker-secret' });
+    await new Vault(dir).migrate();
+    fs.rmSync(path.join(dir, 'entries', '.generation'), { force: true });
+    fs.writeFileSync(entryFile(dir, 'victim'), JSON.stringify({ handle: 'victim', blob: legacyBlob(key, 'attacker-secret') }));
+    fs.rmSync(entryFile(dir, 'attacker'));
+    const vault = new Vault(dir);
+    await vault.migrate();
+    expect(() => vault.reveal('victim')).toThrow(/not bound to its handle/);
+  });
+
+  // Item 5: the override cannot bind the vault under a key that opens nothing.
+  it('refuses the override for a key that opens none of the entries', () => {
+    const { dir } = masterVault({ a: '1', b: '2' });
+    vi.stubEnv('KARMAX_VAULT_KEY', 'not-the-key-this-vault-was-created-with');
+    const refusal = (() => { try { new Vault(dir); } catch (error) { return String(error); } })()!;
+    expect(refusal).not.toContain('KARMAX_VAULT_ACCEPT_KEY');
+    vi.stubEnv('KARMAX_VAULT_ACCEPT_KEY', 'vk-anything');
+    expect(() => new Vault(dir)).toThrow(/opens none of the 2 entries/);
+    expect(fs.existsSync(path.join(dir, 'entries', 'quarantine'))).toBe(false);
+  });
+
+  // Item 7: temporaries a crash left in entries/ may hold a whole card.
+  it('sweeps temporaries a crash left in entries/', async () => {
+    const { dir } = masterVault({ kept: 'value' });
+    await new Vault(dir).migrate();
+    const stale = path.join(dir, 'entries', `${'a'.repeat(64)}.json.123.abc.tmp`);
+    fs.writeFileSync(stale, 'plaintext-looking leftovers');
+    await new Vault(dir).migrate();
+    expect(fs.existsSync(stale)).toBe(false);
+  });
+
+  it('prunes quarantined entries after the retention window', async () => {
+    const { dir } = masterVault({ kept: 'value' }, undefined, ['damaged']);
+    await new Vault(dir).migrate();
+    const quarantine = path.join(dir, 'entries', 'quarantine');
+    const [file] = fs.readdirSync(quarantine);
+    const old = new Date(Date.now() - 31 * 86_400_000);
+    fs.utimesSync(path.join(quarantine, file!), old, old);
+    await new Vault(dir).migrate();
+    expect(fs.readdirSync(quarantine)).toEqual([]);
+  });
+
+  // Item 2: the preflight runs in production with the key only in a file.
+  it('preflights with the key from KARMAX_VAULT_KEY_FILE and no entries/ yet', () => {
+    const material = 'turnkey-vault-key-material-0123456789abcdef';
+    const { dir } = masterVault({ 'world-reference:key:v2': 'world-key', 'payment:card:text': 'not json' },
+      crypto.createHash('sha256').update(material).digest());
+    fs.rmSync(path.join(dir, 'vault.key'));
+    const keyFile = path.join(directory(), 'vault_key');
+    fs.writeFileSync(keyFile, `${material}\n`);
+    const run = spawnSync(process.execPath, ['--import', 'tsx', 'src/scripts/vault-preflight.ts', dir], { encoding: 'utf8',
+      env: { ...process.env, KARMAX_VAULT_KEY: '', KARMAX_VAULT_KEY_FILE: keyFile, KARMAX_HOME: directory() } });
+    expect(run.stdout + run.stderr).toMatch(/key accepted.*2 entries to bind/s);
+    expect(run.status).toBe(0);
+    expect(fs.existsSync(path.join(dir, 'entries'))).toBe(false);
   });
 });

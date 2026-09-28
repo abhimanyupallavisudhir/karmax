@@ -42,7 +42,8 @@ describe('control-plane backup', () => {
         expect(restoredHandle).toBe(handle);
         expect(new Vault(path.join(recovered, 'vault')).reveal(restoredHandle!)).toBe(secret);
         expect(vault.reveal(handle)).toBe('changed-after-backup');
-        expect(fs.readFileSync(path.join(recovered, 'vault', 'secrets.json'), 'utf8')).not.toContain(secret);
+        for (const file of fs.readdirSync(path.join(recovered, 'vault'), { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile()))
+          expect(fs.readFileSync(path.join(file.parentPath, file.name), 'utf8')).not.toContain(secret);
       } finally { await restored.close(); }
     } finally { vi.unstubAllEnvs(); }
   });

@@ -284,41 +284,43 @@ release against the migrated database or restore only one database. Validate thi
 procedure on an isolated deployment before the production epoch transition.
 
 `update` checks the vault read-only with the new image after the pre-update
-backup and before switching (`npm run vault-preflight`): whether the key would
-be accepted, which entry files cannot be read, and which entries the first boot
-would quarantine. Any finding stops the update with the previous app still
-serving; `./deploy/karmax update --accept-vault-findings REVISION` proceeds
-anyway.
+backup and before switching (`npm run vault-preflight`, with the key the app
+itself reads): whether the key would be accepted, which files cannot be read,
+and which secrets the first boot would quarantine. Any finding stops the update
+with the previous app still serving; `./deploy/karmax update REVISION
+--accept-vault-findings` proceeds anyway.
 
-The epoch 3 vault migration reads every entry first; one it cannot read
-(permissions, an I/O error) stops boot with a list and changes nothing. It then
-copies the unbound entries to `vault/entries.pre-v2/` (removed at boot 14 days
-later), without card CVCs. Entries that do not parse or authenticate under the
-vault key are moved to `vault/entries/quarantine/` and recorded in the audit log
-(`vault.entry.quarantined`).
-
-To run the previous release against the vault alone, stop the app and put
-`vault/entries.pre-v2` in place of `vault/entries` (rename it, or copy its
-contents over). Secrets written since the upgrade are lost that way, so prefer
-the pre-update backup, and cards need their CVC entered again. Rolling forward
-needs nothing more: the copy carries an authenticated marker, so the next boot
-recognises it, binds it again (entries the previous release wrote included) and
-splits card CVCs again.
+The epoch 3 vault migration moves the previous release's `vault/secrets.json`
+into `vault/entries/`, one bound file per secret, and leaves `secrets.json`
+empty. It reads everything first; a file it cannot read (permissions, an I/O
+error) stops boot with a list and changes nothing. Secrets that do not parse or
+authenticate under the vault key are moved to `vault/entries/quarantine/` (kept
+30 days) and recorded in the audit log (`vault.entry.quarantined`). The previous
+release cannot read the result: **the only way back is the pre-update backup
+with its code.** There is no vault-only rollback. If a previous release runs
+against the migrated vault anyway, it sees an empty vault and writes new
+secrets to `secrets.json`; the next boot of this release then refuses to start
+("vault/secrets.json holds N secrets although the vault moved"), so restore the
+backup.
 
 "the vault key does not open this vault" says which check failed:
 - "vault/vault.canary fails to authenticate": `KARMAX_VAULT_KEY` (or
   `vault/vault.key`) is not the key the vault was created with. Restore it; do
   not delete the canary to get past it.
 - "vault/vault.canary is missing or damaged, and the key opens none of the N
-  entries" (or fewer than `vault/vault.key` opens): with no usable canary the
-  entries decide. Entries no known key opens are not counted.
-If you are certain the key is right, start once with the
-`KARMAX_VAULT_ACCEPT_KEY=vk-…` the message names; entries the key cannot open
-are then quarantined. A missing or damaged canary alone is not an error.
+  entries": no override applies; this key is not the vault's.
+- "... opens M of N entries while vault/vault.key opens K": with no usable
+  canary the secrets decide, and secrets no known key opens are not counted.
+When the message names `KARMAX_VAULT_ACCEPT_KEY=vk-…` and you are certain the
+key is right, set it once: on the turnkey stack, append it to the app's
+`/var/lib/karmax/karmax.env` (`./deploy/karmax` has no flag for it; the Compose
+environment does not pass it through), restart, then remove it. The vault
+preflight reads the same file. Secrets the key cannot open are then
+quarantined. A missing or damaged canary alone is not an error.
 
-"vault entry for H is not bound to its handle" means an entry in the pre-upgrade
-format sits in a bound vault: one file was copied back without the rest of
-`entries.pre-v2`. Restore it from a backup, or put the whole copy back as above.
+"vault entry for H is not bound to its handle" means a secret in the
+pre-upgrade format sits in a bound vault: a file was copied in from an older
+vault or backup. Restore that secret from the backup it belongs to.
 
 ## Cost and idle-world behavior
 

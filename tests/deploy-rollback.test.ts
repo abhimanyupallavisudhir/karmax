@@ -46,7 +46,8 @@ wait_ready() { ready_calls=$((ready_calls + 1)); [ "${ready ? '1' : '0'}" = 1 ] 
 cmd_update "$@"
 `;
   const file = path.join(root, 'deploy/fixture-updater'); fs.writeFileSync(file, script);
-  const result = spawnSync('sh', [file, ...flags, target], { cwd: root, encoding: 'utf8' });
+  const after = flags[0] === '--after';
+  const result = spawnSync('sh', [file, ...(after ? [target, ...flags.slice(1)] : [...flags, target])], { cwd: root, encoding: 'utf8' });
   const operations = fs.existsSync(path.join(root, 'operations')) ? fs.readFileSync(path.join(root, 'operations'), 'utf8') : '';
   return { ...result, operations, head: git('rev-parse', 'HEAD'), previous, target };
 }
@@ -137,7 +138,9 @@ it('puts the one-way vault migration behind its own data epoch', () => {
   expect(epoch).toBeGreaterThanOrEqual(3);
   const readme = fs.readFileSync(new URL('../deploy/README.md', import.meta.url), 'utf8');
   expect(readme).toMatch(/Epoch 3[^]*vault[^]*one-way/);
-  expect(readme).toContain('entries.pre-v2');
+  // The previous release reads only secrets.json: its way back is the backup.
+  expect(readme).toContain('the only way back is the pre-update backup');
+  expect(readme).not.toContain('entries.pre-v2');
 });
 
 // #367 review item 4: automatic rollback cannot cross epoch 3, so a first
@@ -153,6 +156,13 @@ it('keeps the previous app serving when the vault preflight finds anything', () 
   expect(preflight).toBeGreaterThan(operations.findIndex(line => line === 'build --pull app'));
   expect(result.operations).not.toContain('up -d');
   expect(result.head).toBe(result.previous);
+});
+
+it('reads the vault flag after the revision too', () => {
+  const result = update('2\n', '3\n', true, 'vault', ['--after', '--accept-vault-findings']);
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.head).toBe(result.target);
+  expect(update('2\n', '3\n', true, '', ['--after', '--no-such-flag']).stderr).toContain('unknown update option');
 });
 
 it('proceeds past the vault preflight only when told to', () => {

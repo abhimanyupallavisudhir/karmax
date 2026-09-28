@@ -478,10 +478,15 @@ data_epoch() {
 cmd_update() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured'
-  accept_vault=''
-  if [ "${1:-}" = --accept-vault-findings ]; then accept_vault=1; shift; fi
-  requested=${1:-origin/master}
-  case "$requested" in -*) die "invalid deployment revision: $requested" ;; esac
+  accept_vault='' requested=''
+  for argument in "$@"; do
+    case "$argument" in
+      --accept-vault-findings) accept_vault=1 ;;
+      -*) die "unknown update option: $argument" ;;
+      *) [ -z "$requested" ] || die "update takes one revision, not $requested and $argument"; requested=$argument ;;
+    esac
+  done
+  requested=${requested:-origin/master}
   git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die 'the deployment source is not a Git checkout'
   if [ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=no)" ]; then
