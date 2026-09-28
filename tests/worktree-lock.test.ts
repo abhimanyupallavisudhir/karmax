@@ -4,6 +4,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { withWorktreeLock } from '../src/world/worktree-lock.js';
+import { holdWorktreeLock } from './helpers/lock-waiters.js';
 
 /**
  * The lock that keeps concurrent world create/release out of each other's git
@@ -88,14 +89,14 @@ describe('worktree lock', () => {
 
   it('waits for a live holder rather than stealing its lock', async () => {
     const repo = makeRepo();
-    const dir = lockDir(repo);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'owner'), JSON.stringify({ pid: process.pid, ts: Date.now() }));
+    const holder = holdWorktreeLock(repo);
+    expect(holder.dir).toBe(lockDir(repo));
     let entered = false;
     const waiting = withWorktreeLock(repo, async () => { entered = true; });
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(entered).toBe(false);
-    fs.rmSync(dir, { recursive: true, force: true }); // holder releases
+    try {
+      await holder.waiting();
+      expect(entered).toBe(false);
+    } finally { holder.release(); }
     await waiting;
     expect(entered).toBe(true);
   });

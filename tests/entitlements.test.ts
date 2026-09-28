@@ -13,11 +13,12 @@ import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { Store } from '../src/store/db.js';
+import { storeBackends } from './helpers/store-backends.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { EntitlementQueueReconciler } from '../src/platform/entitlement-queue-reconciler.js';
 
-describe('hosted plan entitlements', () => {
-  it('keeps launch pricing and limits in one billing-safe catalog', () => {
+describe.each(storeBackends)('hosted plan entitlements ($name)', ({ name, open }) => {
+  it.skipIf(name !== 'SQLite')('keeps launch pricing and limits in one billing-safe catalog', () => {
     expect(HOSTED_PLANS.free).toMatchObject({
       monthlyBasePriceCents: 0, maxMembers: 1, maxActiveAgentRuns: 5,
       additionalActiveUserAgentRuns: 0, unlimitedProjects: true,
@@ -46,13 +47,13 @@ describe('hosted plan entitlements', () => {
       deployment: 'private', plan: null, maxMembers: null, maxActiveAgentRuns: null,
       unlimitedProjects: true,
     });
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const organization = (await store.createOrganization({ name: 'Private', ownerUserId: 'owner' }));
     for (let i = 0; i < 12; i++) (await store.setOrganizationMembership(organization.id, `user-${i}`, 'member'));
     expect((await store.listOrganizationMemberships(organization.id))).toHaveLength(13);
   });
 
-  it('migrates existing organizations onto Free without losing their identity', async () => {
+  it.skipIf(name !== 'SQLite')('migrates existing organizations onto Free without losing their identity', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-plan-migration-'));
     const file = path.join(home, 'state.db');
     const legacy = new DatabaseSync(file);
@@ -72,7 +73,7 @@ describe('hosted plan entitlements', () => {
   });
 
   it('enforces one-user plans at the persistence boundary and unlocks Team members', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Hosted', ownerUserId: 'owner' }));
 
     await expect((async () => (await store.setOrganizationMembership(organization.id, 'second', 'member')))()).rejects.toThrow('Free allows 1 organization user. Upgrade the plan');
@@ -91,7 +92,7 @@ describe('hosted plan entitlements', () => {
   });
 
   it('re-checks the member limit when an already-issued invitation is accepted', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Invites', ownerUserId: 'owner' }));
     (await store.setOrganizationPlan(organization.id, 'team'));
     const invite = (await store.createOrganizationInvitation({
@@ -105,7 +106,7 @@ describe('hosted plan entitlements', () => {
   it.each(['free', 'individual'] as const)(
     'makes a Team → %s downgrade non-destructive and recovers after extra members are removed',
     async (plan) => {
-      const store = (await Store.create(':memory:', { hosted: true }));
+      const store = (await open({ hosted: true }));
       const organization = (await store.createOrganization({ name: `Downgrade ${plan}`, ownerUserId: 'owner' }));
       (await store.setOrganizationPlan(organization.id, 'team'));
       (await store.setOrganizationMembership(organization.id, 'second', 'member'));
@@ -138,8 +139,8 @@ describe('hosted plan entitlements', () => {
   );
 
   it('requires hosted remote subscription turns to pass through admission', async () => {
-    const hostedStore = (await Store.create(':memory:', { hosted: true }));
-    const privateStore = (await Store.create(':memory:'));
+    const hostedStore = (await open({ hosted: true }));
+    const privateStore = (await open());
     const activity = (store: Store) => makeCoreActivities({
       store, worlds: new WorldRegistry(), adapters: new Map(), profiles: new ProfileResolver(store, 'mock'),
     });
@@ -154,13 +155,13 @@ describe('hosted plan entitlements', () => {
   });
 });
 
-describe('hosted agent-run admission integration', () => {
+describe.each(storeBackends)('hosted agent-run admission integration ($name)', ({ open }) => {
   it.each([
     ['free', 5],
     ['individual', 10],
     ['team', 20],
   ] as const)('uses the central %s plan limit of %i at model admission without a second default', async (plan, limit) => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: `Usage ${plan}`, ownerUserId: 'owner' }));
     (await store.setOrganizationPlan(organization.id, plan));
     const project = (await store.createProject('Product', {}, organization.id));
@@ -183,7 +184,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('allows only an optional owner cap tighter than the central plan entitlement', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Tighter cap', ownerUserId: 'owner' }));
     (await store.setOrganizationPlan(organization.id, 'team'));
     expect((await store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 3 }))).toMatchObject({
@@ -198,7 +199,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('does not retain a second hosted remote-world limit outside the plan', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'One capacity', ownerUserId: 'owner' }));
     expect((await store.setOrganizationUsagePolicy(organization.id, { maxActiveWorlds: 999 })).maxActiveWorlds).toBe(5);
     expect(JSON.parse((await store.kvGet(`organization-usage-policy:${organization.id}`)) ?? '{}'))
@@ -210,7 +211,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('blocks over-member organizations at the final model boundary before any provider spend', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Usage downgrade', ownerUserId: 'owner' }));
     (await store.setOrganizationPlan(organization.id, 'team'));
     (await store.setOrganizationMembership(organization.id, 'second', 'member'));
@@ -224,7 +225,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('reclaims stale queue and trusted-admission turns without evicting live owners', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Recovered capacity', ownerUserId: 'owner' }));
     const project = (await store.createProject('Product', {}, organization.id));
     const stale = (await store.createTask({ projectId: project.id, title: 'Interrupted', workflow: 'software-dev',
@@ -262,7 +263,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('preserves queue and usage leases when task ownership cannot be queried', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Conservative recovery', ownerUserId: 'owner' }));
     const project = (await store.createProject('Product', {}, organization.id));
     const task = (await store.createTask({ projectId: project.id, title: 'Temporarily unreachable', workflow: 'software-dev',
@@ -287,7 +288,7 @@ describe('hosted agent-run admission integration', () => {
   // WF-3: a plan-blocked turn waits for this reconciler to restore capacity;
   // one wedged task workflow must not hold up every organization after it.
   it('moves on to the next organization when a task view query hangs', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const wedged = (await store.createOrganization({ name: 'Wedged', ownerUserId: 'owner' }));
     const next = (await store.createOrganization({ name: 'Next', ownerUserId: 'owner' }));
     const project = (await store.createProject('Product', {}, wedged.id));
@@ -306,11 +307,10 @@ describe('hosted agent-run admission integration', () => {
     expect((await store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(`${task.id}#0`)))
       .toEqual({ state: 'active' });
     await reconciler.stop();
-    (await store.close());
   });
 
   it('preserves pre-durable usage admissions whose workflow view has no turn identity', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Historical workflow', ownerUserId: 'owner' }));
     const project = (await store.createProject('Product', {}, organization.id));
     const task = (await store.createTask({ projectId: project.id, title: 'Legacy', workflow: 'software-dev',
@@ -331,7 +331,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('reconciles the durable queue directly from member and billing-plan mutations', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Reconcile', ownerUserId: 'owner' }));
     (await store.setOrganizationPlan(organization.id, 'team'));
     (await store.setOrganizationMembership(organization.id, 'second', 'member'));
@@ -362,7 +362,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('does not finish stopping while an in-flight queue reconciliation still owns the Temporal client', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Orderly shutdown', ownerUserId: 'owner' }));
     let releaseSignal!: () => void;
     const signalBlocked = new Promise<void>((resolve) => { releaseSignal = resolve; });
@@ -390,7 +390,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('queues run admission at zero capacity while over the member limit and reopens after recovery', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Over limit', ownerUserId: 'owner' }));
     (await store.setOrganizationPlan(organization.id, 'team'));
     (await store.setOrganizationMembership(organization.id, 'second', 'member'));
@@ -435,7 +435,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('uses a durable organization queue and refreshes its capacity from plan changes', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
     (await store.setOrganizationPlan(organization.id, 'individual'));
     const project = (await store.createProject('Product', {}, organization.id));
@@ -482,7 +482,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('releases and cancels through the durable queue identity after task deletion', async () => {
-    const store = (await Store.create(':memory:', { hosted: true }));
+    const store = (await open({ hosted: true }));
     const organization = (await store.createOrganization({ name: 'Cleanup', ownerUserId: 'owner' }));
     (await store.setOrganizationPlan(organization.id, 'individual'));
     const project = (await store.createProject('Cleanup project', {}, organization.id));
@@ -519,7 +519,7 @@ describe('hosted agent-run admission integration', () => {
   });
 
   it('keeps the configurable host queue for private installations', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     (await store.setSettings('global', 'agent-queue', { capacity: 7 }));
     const executeUpdate = vi.fn(async () => ({ granted: true, position: 0, capacity: 7 }));
     const signalWithStart = vi.fn(async () => undefined);

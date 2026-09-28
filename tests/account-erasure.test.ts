@@ -234,3 +234,141 @@ it('protects HTTP inventory, closure and case export with unscoped installation 
   const cases = await (await request(admin, '/erasure-cases')).json() as any;
   expect(cases.cases).toHaveLength(1);
 });
+
+// CI-38i: the paths the suite above leaves out.
+
+it('refuses malformed ids and unknown users before reading anything', async () => {
+  const { service } = await fixture();
+  for (const id of ['../u_1', 'u 1', '', 'a:b'])
+    await expect(service.preview(id)).rejects.toMatchObject({ message: 'invalid user id', status: 400 });
+  await expect(service.preview('nobody')).rejects.toMatchObject({ message: 'user not found', status: 404 });
+});
+
+it('keeps a continuing installation administrator', async () => {
+  const { service, store, identity } = await fixture();
+  const closeAdmin = async () => service.close('admin', { fingerprint: (await service.preview('admin')).fingerprint,
+    confirmation: 'CLOSE admin', exportHandled: true }, 'user:admin');
+  await expect(closeAdmin()).rejects.toThrow('Create another installation administrator');
+  // A second administrator whose own account is already closed does not count.
+  const users = await identity.listUsers();
+  users.push({ id: 'admin2', name: 'Second', email: 'second@example.test', role: 'admin', createdAt: new Date() });
+  await store.kvSet(closedAccountKey('admin2'), '{}');
+  expect((await service.preview('admin')).blockers).toContain('Create another installation administrator before closing the last administrator.');
+  await store.kvDelete(closedAccountKey('admin2'));
+  expect((await closeAdmin()).state).toBe('closed');
+  expect(identity.removeUser).toHaveBeenCalledWith('admin');
+});
+
+it('blocks closure on live work linked only by subscription, a vote or a delegation', async () => {
+  const { store, service, close } = await fixture();
+  const org = await store.createOrganization({ name: 'Links', ownerUserId: 'admin' });
+  await store.setOrganizationMembership(org.id, 'u_1', 'member');
+  await store.setOrganizationMembership(org.id, 'uX1', 'member');
+  const project = await store.createProject('Linked', {}, org.id);
+  const task = (title: string) => store.createTask({ projectId: project.id, title, workflow: 'just-do', workflowVersion: '1',
+    params: { prompt: 'fixture' }, createdBy: { kind: 'user', userId: 'uX1' } });
+  const subscribed = await task('Subscribed');
+  const voted = await task('Voted');
+  const delegated = await task('Delegated');
+  const unrelated = await task('Unrelated');
+  await store.subscribeTask(subscribed.id, { kind: 'user', userId: 'u_1' });
+  await store.db.prepare('INSERT INTO confirmation_votes (taskId, cycle, userId, votedAt) VALUES (?,?,?,?)').run(voted.id, 1, 'u_1', Date.now());
+  const tokens = new TokenAuthority(store);
+  await tokens.delegateHuman((await tokens.mintPrincipal('user:u_1', ['*'])).token, { taskId: delegated.id, projectId: project.id });
+  const preview = await service.preview('u_1');
+  expect(preview.relatedTaskIds).toEqual([subscribed.id, voted.id, delegated.id].sort());
+  expect(preview.relatedTaskIds).not.toContain(unrelated.id);
+  expect(preview.organizations).toEqual([{ id: org.id, kind: 'team', role: 'member' }]);
+  await expect(close()).rejects.toThrow(`Resolve linked nonterminal tasks before closure: ${preview.activeTasks.join(', ')}`);
+  for (const { id } of [subscribed, voted, delegated])
+    await store.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify({ status: 'cancelled' }), id);
+  const record = await close();
+  // The linked organization still gets its own review item.
+  expect(record.items.map((item) => item.id)).toContain(`organization:${org.id}`);
+  expect(await store.getTask(unrelated.id)).toBeDefined();
+});
+
+it('fences the account but will not report it closed without the credential broker', async () => {
+  const { store, identity, broker, dir, tokens } = await fixture();
+  const human = await tokens.mintPrincipal('user:u_1', ['*']);
+  const brokerless = new AccountErasureService(store, identity, undefined, dir);
+  const preview = await brokerless.preview('u_1');
+  const error = await brokerless.close('u_1', { fingerprint: preview.fingerprint, confirmation: 'CLOSE u_1', exportHandled: true }, 'user:admin')
+    .catch((e) => e);
+  expect(error).toMatchObject({ status: 503, message: expect.stringContaining('cleanup is incomplete at personal-credentials') });
+  expect(await brokerless.get('u_1')).toMatchObject({ state: 'closing', retryRequired: true, failedStep: 'personal-credentials',
+    steps: ['access-and-preferences'] });
+  expect(await tokens.verify(human.token)).toBeUndefined();
+  expect(identity.removeUser).not.toHaveBeenCalled();
+  const record = await new AccountErasureService(store, identity, broker, dir).close('u_1', { confirmation: 'CLOSE u_1', exportHandled: true }, 'user:admin');
+  expect(record).toMatchObject({ state: 'closed', retryRequired: false });
+  expect(record.failedStep).toBeUndefined();
+});
+
+it('requires both confirmations', async () => {
+  const { service } = await fixture();
+  const { fingerprint } = await service.preview('u_1');
+  for (const input of [{ fingerprint, confirmation: 'CLOSE u_1' }, { fingerprint, confirmation: 'close u_1', exportHandled: true },
+    { fingerprint, confirmation: 'CLOSE u_1', exportHandled: 'yes' as any }])
+    await expect(service.close('u_1', input, 'user:admin')).rejects.toMatchObject({ status: 400 });
+  expect(await service.get('u_1')).toBeUndefined();
+});
+
+it('validates every review decision and reopens a completed review when one changes', async () => {
+  const { service, close } = await fixture();
+  await expect(service.decide('u_1', { revision: 1, itemId: 'response', outcome: 'erased', evidence: 'x'.repeat(20) }, 'user:admin'))
+    .rejects.toThrow('Close the account successfully');
+  let record = await close();
+  const decide = (patch: Record<string, unknown>) => service.decide('u_1', { revision: record.revision, itemId: 'response',
+    outcome: 'not-applicable', evidence: 'Response sent through the ticket system, ref 42.', ...patch } as any, 'user:admin');
+  for (const patch of [{ outcome: 'deleted' }, { evidence: '   short evidence   ' }, { evidence: 'x'.repeat(4001) }, { evidence: 42 }])
+    await expect(decide(patch)).rejects.toMatchObject({ status: 400, message: expect.stringContaining('20–4000 characters') });
+  await expect(decide({ itemId: 'backups', outcome: 'erased' })).rejects.toThrow('future review/expiry date');
+  await expect(decide({ reviewAt: Date.now() + 1.5 })).rejects.toThrow('reviewAt must be a future epoch-millisecond date');
+  await expect(decide({ itemId: 'no-such-item' })).rejects.toMatchObject({ status: 400, message: 'Unknown review item' });
+  record = await decide({ evidence: '  Response sent through the ticket system, ref 42.  ' });
+  expect(record.items.find((item) => item.id === 'response')!.decision).toMatchObject({ outcome: 'not-applicable',
+    evidence: 'Response sent through the ticket system, ref 42.', by: 'user:admin' });
+  expect(record.items.find((item) => item.id === 'response')!.decision!.reviewAt).toBeUndefined();
+
+  const complete = (confirmation = 'REVIEWED u_1', revision = record.revision) => service.complete('u_1', revision, confirmation, 'user:admin');
+  for (const item of record.items.filter((item) => !item.decision))
+    record = await service.decide('u_1', { revision: record.revision, itemId: item.id, outcome: 'erased',
+      evidence: `Removed per runbook step for ${item.id}.`, reviewAt: Date.now() + 86_400_000 }, 'user:admin');
+  await expect(complete('REVIEWED uX1')).rejects.toMatchObject({ status: 400 });
+  await expect(complete(undefined, record.revision - 1)).rejects.toThrow('Case changed');
+  record = await complete();
+  expect(record).toMatchObject({ state: 'review-complete', reviewedAt: expect.any(Number) });
+  // Revising a decision afterwards reopens the review rather than leaving a stale completion.
+  record = await decide({ outcome: 'redacted', evidence: 'Redacted the reply draft after re-review, ref 43.' });
+  expect(record.state).toBe('closed');
+  expect(record.reviewedAt).toBeUndefined();
+});
+
+it('does not let a slow concurrent retry undo a later review', async () => {
+  const { store, identity, broker, dir, close } = await fixture();
+  vi.spyOn(broker, 'deleteHandle').mockImplementationOnce(() => { throw new Error('outage'); });
+  await broker.registerHandle('github-app:user:u_1:authorization', 'fixture');
+  await expect(close()).rejects.toThrow('cleanup is incomplete');
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let entered!: () => void;
+  const inside = new Promise<void>((resolve) => { entered = resolve; });
+  identity.removeUser.mockImplementationOnce(async () => { entered(); await held; });
+  const retry = () => new AccountErasureService(store, identity, broker, dir).close('u_1', { confirmation: 'CLOSE u_1', exportHandled: true }, 'user:admin');
+  const slow = retry();
+  await inside;
+  const fast = await retry();
+  expect(fast.state).toBe('closed');
+  const service = new AccountErasureService(store, identity, broker, dir);
+  let reviewed = fast;
+  for (const item of fast.items)
+    reviewed = await service.decide('u_1', { revision: reviewed.revision, itemId: item.id, outcome: 'erased',
+      evidence: `Removed per runbook step for ${item.id}.`, reviewAt: Date.now() + 86_400_000 }, 'user:admin');
+  reviewed = await service.complete('u_1', reviewed.revision, 'REVIEWED u_1', 'user:admin');
+  release();
+  const late = await slow;
+  expect(late).toMatchObject({ state: 'review-complete', closedAt: fast.closedAt, reviewedAt: reviewed.reviewedAt });
+  expect(late.items).toEqual(reviewed.items);
+  expect((await service.get('u_1'))!.steps).toEqual(['access-and-preferences', 'personal-credentials', 'identity']);
+});

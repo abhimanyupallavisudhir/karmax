@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { Store } from '../src/store/db.js';
+import { storeBackends } from './helpers/store-backends.js';
 import { AuthorizationService, organizationScope } from '../src/platform/authorization.js';
 
-describe('organization-owned authorization roles', () => {
+describe.each(storeBackends)('organization-owned authorization roles ($name)', ({ open }) => {
   it('persists custom roles and uses them for people and tasks only in their organization', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     try {
       let auth = (await AuthorizationService.create(store));
       const org = (await store.createOrganization({ name: 'One' }));
@@ -40,7 +40,7 @@ describe('organization-owned authorization roles', () => {
   });
 
   it('rejects unknown, global-only and unheld permissions and duplicate names', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     try {
       const auth = (await AuthorizationService.create(store));
       const org = (await store.createOrganization({ name: 'One' }));

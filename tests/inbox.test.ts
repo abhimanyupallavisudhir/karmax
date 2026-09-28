@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { Store } from '../src/store/db.js';
+import { storeBackends, type StoreBackend } from './helpers/store-backends.js';
 
 /**
  * The inbox is a list of LIVE asks, not a copy of the event log. These tests pin
@@ -11,8 +12,8 @@ import { Store } from '../src/store/db.js';
  * as review requests, and nothing was ever removed once it had been answered.
  */
 
-async function fixture() {
-  const store = (await Store.create(':memory:'));
+async function fixture(open: StoreBackend['open']) {
+  const store = (await open());
   const organization = (await store.createOrganization({ name: 'Team', ownerUserId: 'owner' }));
   (await store.setOrganizationMembership(organization.id, 'reviewer', 'member'));
   const project = (await store.createProject('App', {}, organization.id));
@@ -49,9 +50,9 @@ async function fixture() {
 
 const humanWait = (stage: string) => ({ stage, status: 'waiting', waitingFor: { kind: 'human', audience: ['user:reviewer'] } });
 
-describe('inbox', () => {
+describe.each(storeBackends)('inbox ($name)', ({ name, open }) => {
   it('keeps dismissed approvals silent across waiting lifecycle ticks', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     (await f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-requested', ts: Date.now(),
       payload: { requestId: 'request', recipients: ['reviewer'] } }));
     expect((await f.inbox())).toHaveLength(1);
@@ -65,7 +66,7 @@ describe('inbox', () => {
   });
 
   it('keeps a connection ask visible while another approval is dismissed', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     try {
       (await f.store.appendEvent({ taskId: f.task.id, type: 'connection.requested', ts: Date.now(),
         payload: { requestId: 'connection' } }));
@@ -85,7 +86,7 @@ describe('inbox', () => {
   });
 
   it('keeps one row per ask instead of one per lifecycle event', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     (await f.view(humanWait('review')));
     const first = (await f.inbox());
     expect(first).toHaveLength(1);
@@ -101,7 +102,7 @@ describe('inbox', () => {
   });
 
   it('does not report machine waits or internal review events as an ask', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     (await f.view({ stage: 'do', status: 'waiting', waitingFor: { kind: 'account' } }));
     (await f.view({ stage: 'do', status: 'waiting', waitingFor: { kind: 'agentSlot' } }));
     (await f.view({ stage: 'merge', status: 'waiting', waitingFor: { kind: 'mergeSlot' } }));
@@ -111,7 +112,7 @@ describe('inbox', () => {
   });
 
   it('splits a human wait into review vs escalation by stage', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     (await f.view(humanWait('review')));
     expect((await f.inbox()).map((item) => item.kind)).toEqual(['review-requested']);
     (await f.view({ stage: 'do', status: 'active' }));
@@ -120,7 +121,7 @@ describe('inbox', () => {
   });
 
   it('removes an ask once the task stops waiting on a human', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     (await f.view(humanWait('review')));
     expect((await f.inbox())).toHaveLength(1);
     (await f.view({ stage: 'merge', status: 'waiting', waitingFor: { kind: 'mergeSlot' } }));
@@ -128,7 +129,7 @@ describe('inbox', () => {
   });
 
   it('clears every ask when the task finishes and leaves one update', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     (await f.store.subscribeTask(f.task.id, { kind: 'user', userId: 'reviewer' }));
     (await f.view(humanWait('review')));
     expect((await f.inbox())).toHaveLength(1);
@@ -144,7 +145,7 @@ describe('inbox', () => {
   });
 
   it('supersedes the previous ask on the same task rather than stacking asks', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     (await f.store.setTaskResponsibility(f.task.id, { assignee: { kind: 'user', userId: 'reviewer' } }));
     expect((await f.inbox()).map((item) => item.kind)).toEqual(['assigned']);
     (await f.view(humanWait('review')));
@@ -152,7 +153,7 @@ describe('inbox', () => {
   });
 
   it('drops an approval ask only once every request on the task is resolved', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     const request = async (requestId: string) => (await f.store.appendEvent({ taskId: f.task.id,
       type: 'credential.approval-requested', ts: Date.now(), payload: { requestId, status: 'approval-needed' } }));
     const resolve = async (requestId: string) => (await f.store.appendEvent({ taskId: f.task.id,
@@ -167,14 +168,14 @@ describe('inbox', () => {
   });
 
   it('leaves the approval ask in place while the task parks on a human for it', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     (await f.store.appendEvent({ taskId: f.task.id, type: 'permission.approval-requested', ts: Date.now(),
       payload: { requestId: 'preq_1', recipients: ['reviewer'] } }));
     (await f.view(humanWait('do')));
     expect((await f.inbox()).map((item) => item.kind)).toEqual(['approval-requested']);
   });
 
-  it('collapses and prunes a legacy event-per-row inbox on boot', async () => {
+  it.skipIf(name !== 'SQLite')('collapses and prunes a legacy event-per-row inbox on boot', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-inbox-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = (await Store.create(dbPath));
@@ -221,27 +222,27 @@ describe('inbox', () => {
  * orders by it before anything else, so the thing that most needs a person is
  * the thing they see first.
  */
-describe('inbox urgency', () => {
+describe.each(storeBackends)('inbox urgency ($name)', ({ name, open }) => {
   it('gives each kind of ask a sensible level when nobody said', async () => {
     // An approval blocks an agent on a person: it is the one ask that starts high.
-    const approval = (await fixture());
+    const approval = (await fixture(open));
     (await approval.store.appendEvent({ taskId: approval.task.id, type: 'credential.approval-requested',
       ts: Date.now(), payload: { requestId: 'vreq_1', status: 'approval-needed' } }));
     expect((await approval.inbox('owner'))[0]).toMatchObject({ kind: 'approval-requested', urgency: 'high' });
 
-    const review = (await fixture());
+    const review = (await fixture(open));
     (await review.view(humanWait('review')));
     expect((await review.inbox())[0]).toMatchObject({ kind: 'review-requested', urgency: 'normal' });
 
     // An outcome report asks nothing of anyone, so it sits at the bottom.
-    const outcome = (await fixture());
+    const outcome = (await fixture(open));
     (await outcome.store.subscribeTask(outcome.task.id, { kind: 'user', userId: 'reviewer' }));
     (await outcome.view({ stage: 'done', status: 'done' }));
     expect((await outcome.inbox())).toEqual([expect.objectContaining({ kind: 'update', urgency: 'low' })]);
   });
 
   it('takes the urgency the agent stated, and keeps it while the ask is restated', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     (await f.store.appendEvent({ taskId: f.task.id, type: 'task.escalated', ts: Date.now(),
       payload: { audience: ['user:reviewer'], detail: 'the disk is filling up', urgency: 'critical' } }));
     expect((await f.inbox())[0]).toMatchObject({ kind: 'escalated', urgency: 'critical' });
@@ -255,14 +256,14 @@ describe('inbox urgency', () => {
 
     // Nonsense is not an error — urgency is advisory metadata and must never be
     // the reason an escalation fails to reach anyone.
-    const g = (await fixture());
+    const g = (await fixture(open));
     (await g.store.appendEvent({ taskId: g.task.id, type: 'task.escalated', ts: Date.now(),
       payload: { audience: ['user:reviewer'], detail: 'hi', urgency: 'EXTREMELY' } }));
     expect((await g.inbox())[0]).toMatchObject({ urgency: 'normal' });
   });
 
   it('puts the most urgent ask first, whatever its age', async () => {
-    const f = (await fixture());
+    const f = (await fixture(open));
     const wait = { status: 'waiting', waitingFor: { kind: 'human', audience: ['user:reviewer'] } };
     const raise = async (title: string, urgency: string | undefined, ts: number) => {
       const { task } = (await f.other(title, { stage: 'do', ...wait }));
@@ -283,7 +284,7 @@ describe('inbox urgency', () => {
       .toMatchObject({ urgency: 'critical', createdAt: 1_000 });
   });
 
-  it('adds the column to an inbox that predates it, reading old asks as normal', async () => {
+  it.skipIf(name !== 'SQLite')('adds the column to an inbox that predates it, reading old asks as normal', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-urgency-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const before = (await Store.create(dbPath));
@@ -309,9 +310,9 @@ describe('inbox urgency', () => {
   });
 });
 
-describe('bulk inbox reads (UI-18)', () => {
+describe.each(storeBackends)('bulk inbox reads (UI-18) ($name)', ({ open }) => {
   it('updates only requested rows owned by the caller in the specified organization', async () => {
-    const f = await fixture();
+    const f = await fixture(open);
     try {
       await f.view(humanWait('review'));
       const [item] = await f.inbox();

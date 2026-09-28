@@ -57,8 +57,11 @@ describe('durable background collaboration requests', () => {
     const getTask = vi.spyOn(f.store, 'getTask');
     f.bus.emit({ taskId: f.target.id, type: 'view.updated', ts: Date.now(),
       payload: { stage: 'do', status: 'active' }, seq: 1 });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(getTask).not.toHaveBeenCalled();
+    // A payload without its stage must hydrate. Routed after the ordinary one,
+    // it marks the point by which the ordinary update would have hydrated too.
+    f.bus.emit({ taskId: f.requester.id, type: 'view.updated', ts: Date.now(), payload: {}, seq: 2 });
+    await vi.waitFor(() => expect(getTask).toHaveBeenCalled());
+    expect(getTask.mock.calls).toEqual([[f.requester.id]]);
   });
 
   it('returns immediately after registering the requester and nudging the target', async () => {
