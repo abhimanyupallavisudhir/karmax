@@ -37,6 +37,20 @@ describe('Store', () => {
     expect(await store.childTaskSummaries(first.id)).toEqual([]);
   });
 
+  // Ids only carry millisecond time plus random bytes, so children created in
+  // the same millisecond must keep their insertion order rather than id order.
+  it('lists children created in the same millisecond in creation order', async () => {
+    const project = await store.createProject('Same millisecond');
+    const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'p' } });
+    vi.spyOn(Date, 'now').mockReturnValue(1_790_000_000_000);
+    const children = [];
+    for (let i = 0; i < 8; i++)
+      children.push(await store.createTask({ projectId: project.id, title: `Child ${i}`, workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: `c${i}` }, parentTaskId: parent.id }));
+    vi.restoreAllMocks();
+    expect((await store.childTaskSummaries(parent.id)).map((summary) => summary.id)).toEqual(children.map((child) => child.id));
+  });
+
   it('finds a merged result without loading the task event history', async () => {
     const project = await store.createProject('Merge');
     const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });

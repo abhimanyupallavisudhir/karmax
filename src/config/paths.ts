@@ -21,7 +21,7 @@ export interface KarmaxPaths {
   state: string; // local sqlite + json state
   vault: string; // credential broker storage
   temporal: string; // temporal dev-server db
-  overlays: string; // user/project overlays (safe-mode resolution)
+  overlays: string; // user/project overlays (SPEC §9; not wired yet)
   attachments: string; // content-addressed user prompt attachments (images + files)
   objects: string; // encrypted checkpoints and promoted artifacts
   backups: string; // operator-created, integrity-checked control-plane snapshots
