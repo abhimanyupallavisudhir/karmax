@@ -56,8 +56,8 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     expect(beFile.code).toBe(0);
     expect(beFile.stdout).toContain('serve');
     // and a real merge commit exists in each repo (point of no return, per repo)
-    expect((await git(fe, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge karmax/${taskId} into main`));
-    expect((await git(be, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge karmax/${taskId} into main`));
+    expect((await git(fe, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge tavya/${taskId} into main`));
+    expect((await git(be, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge tavya/${taskId} into main`));
   });
 
   it('multi-PR: the agent adds a second branch, and BOTH land as their own merges', async () => {
@@ -115,8 +115,8 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     expect((await git(repo, ['show', 'main:core.js'])).code).toBe(0);
     expect((await git(repo, ['show', 'main:README.md'])).code).toBe(0);
     const log = (await git(repo, ['log', '--oneline', 'main'])).stdout;
-    expect(log).toMatch(new RegExp(`merge karmax/${taskId} into main`));
-    expect(log).toMatch(new RegExp(`merge karmax/${taskId}-docs into main`));
+    expect(log).toMatch(new RegExp(`merge tavya/${taskId} into main`));
+    expect(log).toMatch(new RegExp(`merge tavya/${taskId}-docs into main`));
   });
 
   it('returns to Do on a follow-up, then merges after confirm', async () => {
@@ -679,7 +679,7 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     await accounts.terminate('test complete').catch(() => {});
   });
 
-  it('semantically classifies novel provider quota wording and marks the credential needs-attention', async () => {
+  it('semantically classifies novel provider quota wording, marks the credential needs-attention, and waits for a credential', async () => {
     const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
     const coord = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
     await coord.registerAccounts([
@@ -703,8 +703,11 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
       ],
     });
 
-    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('escalated');
+    // A credential needing a person is a wait, never an escalation with an error.
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 20_000 })
+      .toBe('Every allowed credential needs attention — sign in again or add one');
     const v = await view(handle);
+    expect(v).toMatchObject({ stage: 'do', status: 'waiting', waitingFor: { kind: 'account' } });
     expect((v.transcripts ?? []).find((t: any) => t.role === 'resolve')?.messages?.length ?? 0).toBe(0);
     const auto = (await h.store.eventsSince(taskId, 0)).filter((e) => e.type === 'resolve.auto');
     expect(auto).toHaveLength(1);

@@ -1376,6 +1376,8 @@ export interface FieldSpec {
   help?: string;
   required?: boolean;
   options?: string[];
+  /** Display text for select options whose stored value is not what people should read. */
+  optionLabels?: Record<string, string>;
   default?: unknown;
   placeholder?: string;
   scopes: FieldScope[];

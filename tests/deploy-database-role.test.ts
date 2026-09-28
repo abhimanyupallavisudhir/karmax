@@ -107,6 +107,60 @@ describe('deploy/postgres/karmax-role.sh', () => {
   });
 });
 
+// Temporal and the setup jobs use the superuser password, and releases before
+// the karmax role handed it to the app too, so it is rotated after the switch.
+describe('deploy/karmax rotate-postgres-password', () => {
+  const operator = read('karmax');
+  const roots: string[] = [];
+  afterAll(() => { for (const root of roots) fs.rmSync(root, { recursive: true, force: true }); });
+  const before = 'KARMAX_DOMAIN=example.test\nPOSTGRES_PASSWORD=old\nSMTP_URL=smtp://kept.example.test\n';
+
+  function rotate(refuse: boolean) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-rotate-')); roots.push(root);
+    const deploy = path.join(root, 'deploy');
+    fs.mkdirSync(deploy);
+    const envFile = path.join(deploy, '.turnkey.env');
+    fs.writeFileSync(envFile, before, { mode: 0o600 });
+    // The real command with only its infrastructure stubbed: psql's stdin is
+    // kept, since that is where the password must travel.
+    const script = operator.slice(0, operator.indexOf('\nusage() {')) + `
+need_docker() { :; }
+dc() {
+  printf '%s\\n' "$*" >> "$ROOT_DIR/operations"
+  case "$*" in *psql*) cat > "$ROOT_DIR/psql-stdin"; [ ${refuse ? 1 : 0} = 0 ] ;; esac
+}
+wait_ready() { :; }
+report_app_role() { echo reported >> "$ROOT_DIR/operations"; }
+cmd_rotate_postgres_password
+`;
+    fs.writeFileSync(path.join(deploy, 'fixture-rotate'), script);
+    const result = spawnSync('sh', [path.join(deploy, 'fixture-rotate')], { cwd: root, encoding: 'utf8' });
+    const readIf = (file: string) => fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    return { ...result, envFile, deploy, operations: readIf(path.join(root, 'operations')),
+      stdin: readIf(path.join(root, 'psql-stdin')), env: fs.readFileSync(envFile, 'utf8') };
+  }
+
+  it('changes the password through psql\'s stdin, then the env file, then the services', () => {
+    const result = rotate(false);
+    expect(result.status, result.stderr).toBe(0);
+    const [, password] = /^ALTER ROLE temporal PASSWORD '([0-9a-f]{64})';\n$/.exec(result.stdin) ?? [];
+    expect(password).toBeDefined();
+    expect(result.env).toBe(`KARMAX_DOMAIN=example.test\nSMTP_URL=smtp://kept.example.test\nPOSTGRES_PASSWORD=${password}\n`);
+    expect(fs.statSync(result.envFile).mode & 0o777).toBe(0o600);
+    expect(result.operations).not.toContain(password);
+    expect(result.operations).toMatch(/psql[^\n]*\nup -d --no-build --remove-orphans\nreported\n$/);
+    expect(fs.readdirSync(result.deploy).sort()).toEqual(['.turnkey.env', 'fixture-rotate']);
+  });
+
+  it('changes nothing when PostgreSQL refuses the new password', () => {
+    const result = rotate(true);
+    expect(result.status).not.toBe(0);
+    expect(result.env).toBe(before);
+    expect(result.operations).not.toContain('up -d');
+    expect(fs.readdirSync(result.deploy).sort()).toEqual(['.turnkey.env', 'fixture-rotate']);
+  });
+});
+
 const postgres = process.env.KARMAX_TEST_POSTGRES_URL;
 
 describe.skipIf(!postgres)('karmax-role.sql against PostgreSQL', () => {

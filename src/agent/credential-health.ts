@@ -28,12 +28,14 @@ const usageProbes = new Map<string, Promise<UsageResult>>();
  * A usage probe cannot be the gate: setup tokens and API keys have no usage API,
  * and an expired access-only probe cannot refresh the login it is checking.
  * Only enabled credentials in this task's policy are eligible. The coordinator's
- * atomic guard preserves manual disables and known quota-reset waits.
+ * atomic guard preserves manual disables and, unless the person retrying a
+ * quota wait asks for it (`includeExhausted`), known quota-reset waits.
  */
 export async function retryCredentials(
   deps: CredentialHealthDeps,
   task: { id: string; projectId: string },
   provider: string,
+  options: { includeExhausted?: boolean } = {},
 ): Promise<void> {
   const organizationId = (await deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
   const all = enumerateCredentials(gatherCredentialSources({ ...deps, organizationId }));
@@ -45,9 +47,10 @@ export async function retryCredentials(
     aliases.includes(credential.provider)
     || (credential.provider === 'opencode' && !!credential.modelProvider && aliases.includes(credential.modelProvider)));
   const coordinator = makeCoordinatorActivities(deps);
+  const statuses = options.includeExhausted ? ['needs-attention', 'exhausted'] as const : ['needs-attention'] as const;
   for (const credential of eligible) {
-    await coordinator.setAccountAvailability({
-      accountId: credential.key, status: 'available', onlyIfStatus: 'needs-attention',
+    for (const onlyIfStatus of statuses) await coordinator.setAccountAvailability({
+      accountId: credential.key, status: 'available', onlyIfStatus,
     });
   }
 }

@@ -226,7 +226,7 @@ export class ConfigHomeManager {
       : path.join(this.root, 'organizations', sanitize(organizationId));
   }
 
-  private allHomes(): Array<{ provider: string; path: string }> {
+  allHomes(): Array<{ provider: string; path: string }> {
     if (!fs.existsSync(this.root)) return [];
     const homes = this.list().map(({ provider, path: home }) => ({ provider, path: home }));
     const organizations = path.join(this.root, 'organizations');
@@ -431,6 +431,22 @@ export function claudeAccessTokenExpiresAt(home: string): number | undefined {
     try {
       const value = Number(JSON.parse(fs.readFileSync(path.join(home, rel), 'utf8'))?.claudeAiOauth?.expiresAt);
       if (Number.isFinite(value) && value > 0) return value;
+    } catch {
+      /* try the other native credential location */
+    }
+  }
+  return undefined;
+}
+
+/** When a Claude login's sign-in itself expires. The refresh token has a fixed
+ * lifetime (about four weeks from sign-in, not extended by refreshes); after it
+ * Anthropic signs the login out and only signing in again restores it. */
+export function claudeSignInExpiresAt(home: string): number | undefined {
+  for (const rel of ['.credentials.json', '.claude/.credentials.json']) {
+    try {
+      const oauth = JSON.parse(fs.readFileSync(path.join(home, rel), 'utf8'))?.claudeAiOauth;
+      const value = Number(oauth?.refreshTokenExpiresAt);
+      if (typeof oauth?.refreshToken === 'string' && oauth.refreshToken && Number.isFinite(value) && value > 0) return value;
     } catch {
       /* try the other native credential location */
     }

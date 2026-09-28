@@ -47,6 +47,19 @@ eval(extractFn('hydrateTaskFilePage'));
   ok(requests[1][0] === '/api/tasks/task-cloud/file-checkout', 'a hosted install asks for portable checkout-and-open instructions');
   ok(S.taskFileLoad.result.openScript === 'git clone …', 'the portable script becomes the page result');
 
+  // Links minted before the view knew its wiki folder still land in the wiki.
+  const navigations = [];
+  global.go = (to, options) => { navigations.push([to, options]); };
+  global.taskRecord = () => ({ projectId: 'project-1' });
+  global.wikiRoute = (pid, view, entry) => `/${pid}/wiki?${view}#${entry}`;
+  global.api = async () => ({ wiki: { path: 'reviews/2026-09-26' } });
+  S.taskFileLoad = null;
+  const wikiView = { taskId: 'task-cloud', num: 367 };
+  const wikiTarget = { path: 'app-wiki/reviews/2026-09-26/SKILL.md' };
+  await hydrateTaskFilePage(wikiView, wikiTarget, taskFileKey(wikiView, wikiTarget));
+  ok(navigations.length === 1 && navigations[0][0] === '/project-1/wiki?task:367#reviews/2026-09-26' && navigations[0][1].replace,
+    'a wiki file opens its entry in the wiki view, replacing the handoff page');
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((error) => { console.error(error); process.exit(1); });

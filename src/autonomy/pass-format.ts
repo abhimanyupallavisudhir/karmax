@@ -1,5 +1,6 @@
 import { isMap, parseDocument } from 'yaml';
 import { ITEM_FIELDS, type VaultItemType, type VaultFieldName } from './vault-items.js';
+import { BRAND } from '../domain/brand.js';
 
 type Secrets = Partial<Record<VaultFieldName, string>>;
 const isTotp = (value: string) => /^otpauth:\/\/totp\//.test(value.trim());
@@ -53,7 +54,7 @@ function totpUri(value: string): string {
       if (new URL(trimmed).searchParams.get('secret')) return trimmed;
     } catch { /* report without echoing the secret */ }
   } else if (/^[A-Z2-7]+=*$/i.test(trimmed)) {
-    return `otpauth://totp/karmax?secret=${encodeURIComponent(trimmed)}`;
+    return `otpauth://totp/${BRAND}?secret=${encodeURIComponent(trimmed)}`;
   }
   throw new Error('TOTP must be a base32 seed or an otpauth://totp URI with a secret');
 }

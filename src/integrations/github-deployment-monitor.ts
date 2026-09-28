@@ -2,6 +2,7 @@ import type { Repository } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import type { GithubActionsApi } from './github-actions.js';
 import type { GithubProjectWebhookEvent, GitHubRepositoryFileStatus } from './github-app.js';
+import { BRAND } from '../domain/brand.js';
 
 export const DEPLOYMENT_SOURCE_WORKFLOW = 'CI';
 export const DEPLOYMENT_WORKFLOW = 'Deploy';
@@ -204,7 +205,7 @@ export class GitHubDeploymentMonitor {
           ? 'The deployment workflow file exists, but GitHub exposed no run for the validated revision after the grace period. Invalid workflow schema or trigger/configuration rejection is likely; a delayed webhook is ruled out by the direct Actions API query.'
           : file.status === 'missing'
             ? 'This repository previously exposed the deployment workflow, but its workflow file is now missing and GitHub exposed no run for the validated revision.'
-            : 'Karmax could not read the expected deployment workflow file. Repository/App permissions or GitHub API availability may be preventing both workflow registration and monitoring.',
+            : `${BRAND} could not read the expected deployment workflow file. Repository/App permissions or GitHub API availability may be preventing both workflow registration and monitoring.`,
       };
       const incidentKey = `missing:${expectation.headSha}:${expectation.expectedWorkflowFile}`;
       const base = {

@@ -66,6 +66,8 @@ eval(extractFn('syncOrganizationSwitcher'));
 eval(extractFn('orgBase'));
 eval(extractFn('fileRouteTarget'));
 eval(extractFn('parseRoute'));
+eval(extractFn('wikiViewFromQuery'));
+eval(extractFn('wikiRoute'));
 eval(extractFn('projectBase'));
 eval(extractFn('projectRoute'));
 eval(extractFn('encodeQuery'));
@@ -143,6 +145,14 @@ eq(parseRoute('/acme/website-redesign/tasks/42/checkin'),
 eq(globalRoute('orgwiki'), '/acme/wiki', 'internal tab "orgwiki" → URL segment "wiki"');
 eq(parseRoute('/acme/wiki'), { name: 'global', org: 'acme', tab: 'orgwiki' }, 'parse /<org>/wiki as the organization wiki');
 eq(projectRoute('P1', 'wiki'), '/acme/website-redesign/wiki', 'project wiki route');
+// The wiki's branch view is part of its URL (task 367: it had none).
+eq(wikiRoute('P1', 'task:367', 'reviews/2026-09-26'), '/acme/website-redesign/wiki?task=367#reviews%2F2026-09-26', 'a task view with an open entry');
+eq(wikiRoute('P1', 'branch:feature/x'), '/acme/website-redesign/wiki?branch=feature%2Fx', 'a branch view');
+eq(wikiRoute('P1', ''), '/acme/website-redesign/wiki', 'the default branch has the plain wiki URL');
+eq(parseRoute('/acme/website-redesign/wiki?task=367').wikiView, 'task:367', 'a task view parses back');
+eq(parseRoute('/acme/website-redesign/wiki?branch=feature%2Fx').wikiView, 'branch:feature/x', 'a branch view parses back');
+eq(parseRoute('/acme/website-redesign/wiki').wikiView, undefined, 'the default view carries no selector');
+eq(parseRoute('/acme/website-redesign/queue?task=367').wikiView, undefined, 'only the wiki reads a view');
 eq(parseRoute('/acme/website-redesign/wiki'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'wiki', taskKey: null, taskTab: null, q: '' },
   'parse a project wiki tab');

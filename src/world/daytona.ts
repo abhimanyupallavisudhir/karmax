@@ -10,6 +10,7 @@ import { boundedResponseBody } from './http.js';
 import { serviceHomeLabel } from './services.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
+import { taskBranch } from '../domain/brand.js';
 
 const DEFAULT_IDLE_MS = 10 * 60_000;
 
@@ -159,7 +160,7 @@ export class DaytonaWorldProvider implements WorldProvider {
       spec.signal?.throwIfAborted();
       const handle: WorldHandle = {
         version: 2, kind: this.kind, provider: this.kind, id: spec.taskId, root, workspaceRoot: root,
-        branch: spec.branch ?? `karmax/${spec.taskId}`, base: provisioned.repos[0]?.base ?? spec.base,
+        branch: spec.branch ?? taskBranch(spec.taskId), base: provisioned.repos[0]?.base ?? spec.base,
         target: provisioned.repos[0]?.target ?? spec.target,
         repo: provisioned.repos[0]?.repo, repos: provisioned.repos,
         ...(provisioned.workdir ? { workdir: provisioned.workdir } : {}),

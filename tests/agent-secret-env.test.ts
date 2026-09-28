@@ -13,6 +13,7 @@ import { SecretScrubber } from '../src/agent/activity.js';
 import { LocalObjectStore } from '../src/store/objects.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
+import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
 
 describe('agent project-secret delivery', () => {
   it('resolves attachment and service handles JIT into the dedicated turn channel', async () => {
@@ -31,9 +32,9 @@ describe('agent project-secret delivery', () => {
     const worlds = new WorldRegistry();
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
-    const credential = 'resource:test:agent-token';
+    const credential = resourceSecretHandle('resource_agent_token');
     (await broker.registerHandle(credential, 'secret-project-token'));
-    const initial = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const initial = (await store.createResourceAttachment({ id: 'resource_agent_token', organizationId: project.organizationId!, projectId: project.id,
       name: 'Agent token', driver: 'secret@1', target: { kind: 'environment', name: 'PROJECT_TOKEN' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [credential], publish: 'discard' }));
 
@@ -84,9 +85,9 @@ describe('agent project-secret delivery', () => {
 
       } finally { vaultEnvironment.mockRestore(); }
       // A resumed turn opens the same world, without materializing its files again.
-      const lateHandle = 'resource:test:late-token';
+      const lateHandle = resourceSecretHandle('resource_late_token');
       (await broker.registerHandle(lateHandle, 'late-project-token'));
-      const late = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      const late = (await store.createResourceAttachment({ id: 'resource_late_token', organizationId: project.organizationId!, projectId: project.id,
         name: 'Late token', driver: 'secret@1', target: { kind: 'environment', name: 'LATE_TOKEN' },
         access: 'read', isolation: 'fork', source: {}, credentialHandles: [lateHandle], publish: 'discard' }));
       const resume = () => core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: handle,
@@ -106,17 +107,19 @@ describe('agent project-secret delivery', () => {
       await resume();
       expect(received?.secretEnv).toEqual({ DATABASE_URL: 'postgres://task-service' });
       // A secret added while the agent is already running reaches that same turn.
-      const midHandle = 'resource:test:mid-turn-token';
-      (await broker.registerHandle(midHandle, 'mid-turn-token'));
       let midTurn: Record<string, string> | undefined;
       let midTurnWorld: TurnInput['world'] | undefined;
       adapter.runTurn = async (input: TurnInput, ctx?: any) => {
         received = input;
         const changed = new Promise<void>((resolve) => ctx.onSecretEnvChange(resolve));
-        for (const target of [{ kind: 'environment', name: 'MID_TURN_TOKEN' }, { kind: 'path', path: '.mid-turn-key' }] as const)
-          (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+        for (const target of [{ kind: 'environment', name: 'MID_TURN_TOKEN' }, { kind: 'path', path: '.mid-turn-key' }] as const) {
+          // Each resource owns its own copy of the value.
+          const id = `resource_mid_${target.kind}`;
+          (await broker.registerHandle(resourceSecretHandle(id), 'mid-turn-token'));
+          (await store.createResourceAttachment({ id, organizationId: project.organizationId!, projectId: project.id,
             name: target.kind, driver: 'secret@1', target, access: 'read', isolation: 'fork', source: {},
-            credentialHandles: [midHandle], publish: 'discard' }));
+            credentialHandles: [resourceSecretHandle(id)], publish: 'discard' }));
+        }
         await changed;
         midTurn = { ...input.secretEnv };
         midTurnWorld = input.world;
@@ -162,10 +165,10 @@ describe('agent output archiving', () => {
     const worlds = new WorldRegistry();
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
-    (await broker.registerHandle('resource:test:db', 'postgres://admin:hunter2-db-pass@db.internal/app'));
-    (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    (await broker.registerHandle(resourceSecretHandle('resource_db'), 'postgres://admin:hunter2-db-pass@db.internal/app'));
+    (await store.createResourceAttachment({ id: 'resource_db', organizationId: project.organizationId!, projectId: project.id,
       name: 'Database', driver: 'secret@1', target: { kind: 'environment', name: 'DATABASE_URL' },
-      access: 'read', isolation: 'fork', source: {}, credentialHandles: ['resource:test:db'], publish: 'discard' }));
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: [resourceSecretHandle('resource_db')], publish: 'discard' }));
     const { TokenAuthority } = await import('../src/platform/tokens.js');
     const tokens = new TokenAuthority(store);
     let karmaxToken = '';
@@ -243,10 +246,10 @@ describe('streamed partial text', () => {
     const worlds = new WorldRegistry();
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
-    (await broker.registerHandle('resource:test:key', secret));
-    (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    (await broker.registerHandle(resourceSecretHandle('resource_key'), secret));
+    (await store.createResourceAttachment({ id: 'resource_key', organizationId: project.organizationId!, projectId: project.id,
       name: 'Key', driver: 'secret@1', target: { kind: 'environment', name: 'API_KEY' },
-      access: 'read', isolation: 'fork', source: {}, credentialHandles: ['resource:test:key'], publish: 'discard' }));
+      access: 'read', isolation: 'fork', source: {}, credentialHandles: [resourceSecretHandle('resource_key')], publish: 'discard' }));
     const { KarmaxBus } = await import('../src/contrib/bus.js');
     const bus = new KarmaxBus();
     const published: string[] = [];

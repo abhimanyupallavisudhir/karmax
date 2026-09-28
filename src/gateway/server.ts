@@ -28,7 +28,7 @@ import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { EvalResult } from '../domain/search.js';
 import type { KarmaxEvent, TaskView } from '../domain/types.js';
-import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf } from '../domain/brand.js';
+import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
 import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
@@ -80,11 +80,11 @@ import type { RemoteAccessController } from '../remote/access.js';
 import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent,
   type GithubVaultPushEvent } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
-import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
+import { credentialResource, resourceDriverCatalog, resourceSecretHandle, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/repository.js';
-import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
+import { worldRepos, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
@@ -532,6 +532,10 @@ export function toPublicPayload(value: unknown): unknown {
         ? handle.meta as Record<string, unknown>
         : undefined;
       if (handleMeta?.environmentFlavor === 'desktop') out.worldDesktop = true;
+      // The wiki checkout's folder name (never its location), so citations of
+      // wiki files link to the wiki view rather than to a file handoff.
+      const wiki = worldRepos(handle as unknown as WorldHandle).find((repo) => repo.role === 'project-wiki');
+      if (wiki?.root) out.worldWiki = wiki.root.replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop();
     }
   }
   return out;
@@ -2320,7 +2324,7 @@ export class Gateway {
         };
         const label = String(identityData.profile.email ?? identityData.profile.name ?? 'user')
           .split('@')[0]!.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'user';
-        return this.downloadJson(res, `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
+        return this.downloadJson(res, `${BRAND}-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (p === '/api/settings/access' && method === 'GET') {
         if (!requestedScope.projectId && !requestedScope.organizationId)
@@ -2657,7 +2661,7 @@ export class Gateway {
         const label = String(organization?.slug || organizationId).toLowerCase()
           .replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'organization';
         return this.downloadJson(res,
-          `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
+          `${BRAND}-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (organizationMatch && method === 'DELETE') {
         const organizationId = organizationMatch[1]!;
@@ -3920,11 +3924,15 @@ export class Gateway {
               const existing = resources.find((resource) =>
                 resource.name === entry.name || (resource.target.kind === 'environment' && resource.target.name === entry.name));
               if (existing) {
-                const handle = existing.credentialHandles[0] ?? `resource:${existing.id}:credential`;
+                // A new value becomes the resource's own secret; a stored
+                // handle may name someone else's (AU-40).
+                const handle = entry.value ? resourceSecretHandle(existing.id)
+                  : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
                 if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value));
                 saved.push((await store.updateResourceAttachment(existing.id, {
                   target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
                   credentialHandles: [handle], enabled: true,
+                  ...(entry.value ? { source: withoutVaultProjection(existing.source) } : {}),
                 })));
               } else {
                 if (!entry.value) continue;
@@ -4094,7 +4102,7 @@ export class Gateway {
           if (credentialResource(driver)) {
             if (!secret) return this.json(res, 400, { error: 'secret value is required for this resource driver' });
             if (!this.deps.broker) return this.json(res, 503, { error: 'credential broker is unavailable' });
-            const handle = `resource:${id}:credential`;
+            const handle = resourceSecretHandle(id);
             (await this.deps.broker.registerHandle(handle, secret));
             credentialHandles.push(handle);
           }
@@ -4191,12 +4199,20 @@ export class Gateway {
           revisions: (await store.listResourceRevisions(resource.id)).map(redactResourceRevision) });
         if (method === 'PATCH') {
           const b = await this.body(req);
+          // The server alone decides which vault handles a resource uses, since
+          // the resource grants itself their use (AU-40).
+          if (b.credentialHandles !== undefined)
+            return this.json(res, 400, { error: 'a resource\'s credential is set by sending its secret, not a vault handle' });
           try {
             let secretUpdate: { handle: string; value: string } | undefined;
+            let source = b.source && typeof b.source === 'object' ? withReservedSource(b.source, resource.source) : undefined;
             if (typeof b.secret === 'string') {
               if (!this.deps.broker) throw new Error('credential broker is unavailable');
-              const handle = resource.credentialHandles[0] ?? `resource:${resource.id}:credential`;
+              // A new value becomes the resource's own secret, never the handle
+              // it names: that may be a vault item's or someone else's.
+              const handle = resourceSecretHandle(resource.id);
               b.credentialHandles = [handle];
+              source = withoutVaultProjection(source ?? resource.source);
               secretUpdate = { handle, value: b.secret };
             }
             const next = (await store.updateResourceAttachment(resource.id, {
@@ -4204,7 +4220,7 @@ export class Gateway {
               ...(b.target !== undefined ? { target: normalizeResourceTarget(b.target, resource.driver, resource.name) } : {}),
               ...(b.access !== undefined ? { access: b.access } : {}), ...(b.isolation !== undefined ? { isolation: b.isolation } : {}),
               ...(b.publish !== undefined ? { publish: b.publish } : {}), ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
-              ...(b.source && typeof b.source === 'object' ? { source: b.source } : {}),
+              ...(source ? { source } : {}),
               ...(b.storageLocationId !== undefined && isSnapshotResourceDriver(resource.driver)
                 ? { storageLocationId: (await this.deps.resources?.storageLocationFor(resource.organizationId, String(b.storageLocationId))) }
                 : {}),
@@ -4217,7 +4233,8 @@ export class Gateway {
         if (method === 'DELETE') {
           await this.deps.resources?.deleteAttachment(resource.id);
           if (!this.deps.resources) {
-            for (const handle of resource.credentialHandles) (await this.deps.broker?.deleteHandle(handle));
+            if (resource.credentialHandles.includes(resourceSecretHandle(resource.id)))
+              (await this.deps.broker?.deleteHandle(resourceSecretHandle(resource.id)));
             (await store.deleteResourceAttachment(resource.id));
           }
           return this.json(res, 200, { deleted: true, resourceId: resource.id });
@@ -5013,7 +5030,7 @@ export class Gateway {
         this.terminalTickets.set(ticket, { taskId, session, expiresAt });
         setTimeout(() => this.terminalTickets.delete(ticket), ttlMs).unref();
         // A path into this install's checkout only means something to the machine it lives on.
-        const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))] : ['karmax'];
+        const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/tavya.js', import.meta.url))] : [BRAND];
         return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
       }
       const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
@@ -5048,6 +5065,8 @@ export class Gateway {
         const line = body.line == null ? undefined : Number(body.line);
         if (line !== undefined && (!Number.isInteger(line) || line < 1))
           return this.json(res, 400, { error: 'line must be a positive integer' });
+        const wiki = await this.deps.handoffs.wikiCitation(taskId, String(body.path ?? ''));
+        if (wiki) return this.json(res, 200, wiki);
         try { return this.json(res, 200, await this.deps.handoffs.openFile(taskId, view, String(body.path ?? ''), line)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
@@ -5061,6 +5080,8 @@ export class Gateway {
         const line = body.line == null ? undefined : Number(body.line);
         if (line !== undefined && (!Number.isInteger(line) || line < 1))
           return this.json(res, 400, { error: 'line must be a positive integer' });
+        const wiki = await this.deps.handoffs.wikiCitation(taskId, String(body.path ?? ''));
+        if (wiki) return this.json(res, 200, wiki);
         try { return this.json(res, 200,
           (await this.deps.handoffs.fileCheckout(taskId, view, String(body.path ?? ''), line))); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
@@ -7445,8 +7466,25 @@ export class Gateway {
         const global = resolved({ global: g });
         const project = projectId ? resolved({ global: g, project: pr }) : undefined;
         const task = taskId ? resolved({ global: g, project: pr, task: tk }) : undefined;
+        const { claudeSignInExpiresAt } = await import('../autonomy/config-homes.js');
+        // Logins the provider signed out cannot run, but must stay visible so a
+        // person can sign in again; hiding them made a login silently vanish.
+        const loginKey = (provider: string, account: string) => scopedOrganizationId === 'org_personal'
+          ? `login:${provider}:${account}` : `login:${scopedOrganizationId}:${provider}:${account}`;
+        const signedOut = (this.deps.configHomes?.list(scopedOrganizationId) ?? [])
+          .filter((login) => !login.loggedIn && isLoginProvider(login.provider) && login.account)
+          .map((login) => ({ key: loginKey(login.provider, login.account), label: `${login.provider}:${login.account}`,
+            provider: login.provider, kind: 'login' as const, account: login.account, signedOut: true }));
         return this.json(res, 200, {
-          credentials: creds.map((c) => ({ key: c.key, label: c.label, provider: c.provider, kind: c.kind, account: c.account })),
+          credentials: [
+            ...creds.map((c) => {
+              const signInExpiresAt = c.kind === 'login' && c.provider === 'claude' && c.configHome
+                ? claudeSignInExpiresAt(c.configHome) : undefined;
+              return { key: c.key, label: c.label, provider: c.provider, kind: c.kind, account: c.account,
+                ...(signInExpiresAt ? { signInExpiresAt } : {}) };
+            }),
+            ...signedOut,
+          ],
           global: { own: g ?? {}, ...global },
           ...(projectId && project ? { project: { own: pr ?? {}, ...project } } : {}),
           ...(taskId && task ? { task: { own: tk ?? {}, ...task } } : {}),
@@ -7473,6 +7511,11 @@ export class Gateway {
           return this.json(res, 400, { error: 'scope must be organization, global, project, or task' });
         }
         (await store.kvSet(key, JSON.stringify(b.policy ?? {})));
+        // Parked turns resolved their allow-lists under the old policy.
+        if (this.deps.client) {
+          const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
+          await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).relistAccountLeases();
+        }
         return this.json(res, 200, { ok: true });
       }
 
@@ -8124,10 +8167,10 @@ export class Gateway {
       const siteName = (await this.siteName);
       const origin = req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '';
       return Buffer.from(data.toString('utf8')
-        .replace(/^# krmax$/m, `# ${siteName}`)
-        .replace(/^> krmax is /m, `> ${siteName} is `)
-        .replace(/^krmax gives /m, `${siteName} gives `)
-        .replace(/https:\/\/krmax\.io/g, origin || 'https://krmax.io'));
+        .replace(/^# tavya$/m, `# ${siteName}`)
+        .replace(/^> tavya is /m, `> ${siteName} is `)
+        .replace(/^tavya gives /m, `${siteName} gives `)
+        .replace(/https:\/\/tavya\.io/g, origin || 'https://tavya.io'));
     };
     try {
       await serveStaticAsset(req, res, file, name === 'index.html' ? brandShell : name === 'llms.txt' ? brandLlms : undefined);
@@ -9049,7 +9092,7 @@ function scimList(Resources: unknown[]) {
 }
 
 function prometheusMetrics(snapshot: Record<string, unknown>): string {
-  const lines = ['# HELP karmax_info Krmax control-plane information.', '# TYPE karmax_info gauge', 'karmax_info 1'];
+  const lines = [`# HELP karmax_info ${BRAND} control-plane information.`, '# TYPE karmax_info gauge', 'karmax_info 1'];
   const scalar = (name: string, help: string, value: unknown) => {
     lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${Number(value ?? 0)}`);
   };
@@ -9211,6 +9254,23 @@ function parseEnvironmentValues(text: string): Array<{ name: string; value: stri
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
   const { credentialHandles, ...safe } = resource;
   return { ...safe, credentialConfigured: credentialHandles.length > 0 };
+}
+
+/** Source keys that carry a resource's provenance and authority: which vault
+ * item it projects, and whether it is a task's staged candidate. Only the
+ * server sets them; a request keeps whatever is stored. */
+const RESERVED_SOURCE_KEYS = ['vaultItemId', 'vaultField', 'vaultItemLabel', 'vaultItemType', 'candidate', 'createdByTaskId'];
+
+function withReservedSource(requested: Record<string, unknown>, stored: Record<string, unknown>): Record<string, unknown> {
+  const source = Object.fromEntries(Object.entries(requested).filter(([key]) => !RESERVED_SOURCE_KEYS.includes(key)));
+  for (const key of RESERVED_SOURCE_KEYS) if (key in stored) source[key] = stored[key];
+  return source;
+}
+
+/** A resource that now holds its own secret no longer projects a vault item. */
+function withoutVaultProjection(source: Record<string, unknown>): Record<string, unknown> {
+  const { vaultItemId: _item, vaultField: _field, vaultItemLabel: _label, vaultItemType: _type, ...rest } = source;
+  return rest;
 }
 
 function stagedResourceCandidate(resource: ResourceAttachment): boolean {

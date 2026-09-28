@@ -4,8 +4,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import type { TurnInput } from './types.js';
-import { isRemoteAgentWorld } from './remote-process.js';
+import { isRemoteAgentWorld, preparedRemoteWorkDirectory } from './remote-process.js';
 import { ensureWorldExcluded } from '../world/secret-exclude.js';
+import type { ConfigHomeManager } from '../autonomy/config-homes.js';
+import { processStartTick } from '../util/processes.js';
 
 /** Application credentials belong to work commands, never to the model client.
  * Tavya-owned turn values still win collisions (notably its scoped MCP token). */
@@ -64,11 +66,14 @@ export async function claudeWorkEnvironment(input: TurnInput, live = false) {
     } else fs.rmSync(directory, { recursive: true, force: true });
   };
   try {
-    if (typeof world.exec === 'function') await ensureWorldExcluded(world, '.karmax-injection');
-    if (remote) {
+    // A remote world's bootstrap, when it already ran beside prompt preparation,
+    // git-excluded and privatized the parent: nothing is asked of the sandbox.
+    const prepared = remote && await preparedRemoteWorkDirectory(world);
+    if (!prepared && typeof world.exec === 'function') await ensureWorldExcluded(world, '.karmax-injection');
+    if (remote && !prepared) {
       const created = await world.exec('mkdir', ['-p', '-m', '700', directory]);
       if (created.code !== 0) throw new Error('Could not prepare private work environment');
-    } else fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    } else if (!remote) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     await write();
   } catch (error) { await cleanup(); throw error; }
   // A source statement avoids copying secret values into Claude's persistent
@@ -86,21 +91,57 @@ export async function claudeWorkEnvironment(input: TurnInput, live = false) {
 export function codexWorkProfile(input: TurnInput) {
   const env = workEnvironment(input);
   if (!Object.keys(env).length) return { args: [] as string[], cleanup() {} };
-  const home = input.resolvedAuth?.configHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+  const home = input.resolvedAuth?.configHome ?? defaultCodexHome();
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-  for (const entry of fs.readdirSync(home)) {
-    const owner = entry.match(/^karmax-work-(\d+)-[a-f0-9-]{36}\.config\.toml$/)?.[1];
-    if (!owner) continue;
-    try { process.kill(Number(owner), 0); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') fs.rmSync(path.join(home, entry), { force: true });
-    }
-  }
-  const name = `karmax-work-${process.pid}-${crypto.randomUUID()}`;
+  sweepCodexWorkProfiles(home);
+  const owner = ownerTag(process.pid);
+  const name = `karmax-work-${process.pid}-${owner ? `${owner}-` : ''}${crypto.randomUUID()}`;
   const file = path.join(home, `${name}.config.toml`);
   fs.writeFileSync(file, '[shell_environment_policy.set]\n' + Object.entries(env)
     .map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}\n`).join(''), { mode: 0o600, flag: 'wx' });
   return { args: ['--profile', name], cleanup() { fs.rmSync(file, { force: true }); } };
+}
+
+const defaultCodexHome = () => process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+
+/** A pid names a process only until it is reused, so a profile also records a
+ * digest of its owner's start time (safe in a file name on every platform). */
+function ownerTag(pid: number): string | undefined {
+  const tick = processStartTick(pid);
+  return tick ? crypto.createHash('sha256').update(tick).digest('hex').slice(0, 12) : undefined;
+}
+
+/** Profiles hold a turn's work secrets. Remove those whose owner process is
+ * gone (or whose pid now belongs to another process), and unowned ones from
+ * older releases once no turn could still be using them. */
+export function sweepCodexWorkProfiles(home: string, now = Date.now()): number {
+  let removed = 0;
+  let entries: string[];
+  try { entries = fs.readdirSync(home); } catch { return 0; }
+  for (const entry of entries) {
+    const file = path.join(home, entry);
+    const owned = entry.match(/^karmax-work-(\d+)-(?:([a-f0-9]{12})-)?[a-f0-9-]{36}\.config\.toml$/);
+    let stale: boolean;
+    if (owned) {
+      const pid = Number(owned[1]);
+      try { process.kill(pid, 0); stale = Boolean(owned[2]) && ownerTag(pid) !== owned[2]; }
+      catch (error) { stale = (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+    } else if (/^karmax-work-[a-f0-9-]{36}\.config\.toml$/.test(entry)) {
+      try { stale = now - fs.statSync(file).mtimeMs > 86_400_000; } catch { stale = false; }
+    } else continue;
+    if (stale) { fs.rmSync(file, { force: true }); removed++; }
+  }
+  return removed;
+}
+
+/** Boot's sweep: a home no turn uses again would otherwise keep a crashed
+ * turn's secrets indefinitely. */
+export function sweepWorkProfiles(homes: Pick<ConfigHomeManager, 'allHomes'>): number {
+  const codexHomes = new Set(homes.allHomes().filter(({ provider }) => provider === 'codex').map(({ path: home }) => home));
+  codexHomes.add(defaultCodexHome());
+  let removed = 0;
+  for (const home of codexHomes) removed += sweepCodexWorkProfiles(home);
+  return removed;
 }
 
 /** OpenCode can run its Bash tool inside the server instead of calling ACP

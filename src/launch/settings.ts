@@ -43,7 +43,7 @@ export const FOUNDER_TASKS = [
   { id: 'tax-registration', group: 'Business', title: 'Review tax and sales-tax obligations',
     instructions: 'A merchant of record handles customer sales taxes for its covered transactions, not your own income tax or all business obligations. Check registration, bookkeeping, and tax duties for your circumstances.' },
   { id: 'name-ip', group: 'Business', title: 'Clear the product and company name',
-    instructions: 'Check company registries, domains, and relevant trademarks for krmax/Karmax in launch markets; document ownership of the domain, code, brand assets, and contractor IP assignments.' },
+    instructions: 'Check company registries, domains, and relevant trademarks for tavya in launch markets; document ownership of the domain, code, brand assets, and contractor IP assignments.' },
   { id: 'stripe-account', group: 'Stripe Billing', title: 'Create and activate the Stripe account',
     instructions: 'Create the account in the legal entity’s name, complete owner/business verification, add the payout bank account and statement descriptor, enable live mode, and require MFA for administrators.',
     href: 'https://dashboard.stripe.com/register' },

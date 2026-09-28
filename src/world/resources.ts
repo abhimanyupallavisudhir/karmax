@@ -20,7 +20,8 @@ import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL
   SIG_ENQUEUE_RESOURCE_PUBLISH, SIG_RELEASE_RESOURCE_PUBLISH,
   resourcePublishCoordinatorId } from '../coordinators/names.js';
 import type { ResourcePublishView } from '../coordinators/resource-publish.js';
-import { credentialResource, snapshotResource } from '../domain/resource-drivers.js';
+import { credentialResource, resourceSecretHandle, snapshotResource } from '../domain/resource-drivers.js';
+import { VaultItems, itemHandle, type VaultFieldName } from '../autonomy/vault-items.js';
 import { ensureWorldExcluded } from './secret-exclude.js';
 import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
@@ -403,7 +404,7 @@ export class ProjectResourceService {
       try {
         if (isSecretLike(attachment)) {
           if (!attachment.credentialHandles[0]) throw new Error(`resource "${attachment.name}" has no configured credential`);
-          const value = this.resolveSecret(attachment, taskId);
+          const value = await this.resolveSecret(attachment, taskId);
           if (attachment.target.kind === 'path') {
             const target = worldWorkingRelativePath(world.handle, attachment.target.path);
             await world.writeFile(target, value);
@@ -475,7 +476,7 @@ export class ProjectResourceService {
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (!attachment?.enabled || !isSecretLike(attachment)) continue;
       if (attachment.target.kind === 'environment' || attachment.target.kind === 'service')
-        env[attachment.target.name] = this.resolveSecret(attachment, lease.taskId);
+        env[attachment.target.name] = await this.resolveSecret(attachment, lease.taskId);
     }
     return env;
   }
@@ -520,7 +521,7 @@ export class ProjectResourceService {
       attachment.organizationId === project.organizationId && isSecretLike(attachment) && !existing.has(attachment.id));
     // Resolve before recording anything: a transient broker failure must fail
     // this open, but remain retryable on the next one.
-    for (const attachment of late) this.resolveSecret(attachment, task.id);
+    for (const attachment of late) await this.resolveSecret(attachment, task.id);
     const projections = Object.fromEntries(late.flatMap((attachment) => attachment.target.kind === 'path'
       ? [[attachment.id, { target: worldWorkingRelativePath(handle, attachment.target.path), access: attachment.access }]] : []));
     if (Object.keys(projections).length)
@@ -545,7 +546,7 @@ export class ProjectResourceService {
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (!attachment?.enabled || !isSecretLike(attachment) || attachment.target.kind !== 'path') continue;
       const target = resourcePath(world.handle, attachment);
-      const value = this.resolveSecret(attachment, lease.taskId);
+      const value = await this.resolveSecret(attachment, lease.taskId);
       const key = `${writtenPrefix(world.handle)}${attachment.id}`;
       const digest = sha256(Buffer.from(`${target}\0${value}`));
       if (changedOnly && this.writtenSecrets.get(key) === digest) continue;
@@ -730,11 +731,11 @@ export class ProjectResourceService {
     const attachment = (await this.store.getResourceAttachment(attachmentId));
     if (!attachment) return;
     for (const revision of (await this.store.listResourceRevisions(attachmentId))) await this.engine.delete?.(revision);
-    // An attachment may project a first-class vault item. Removing the
-    // projection must not destroy the underlying credential, which may already
-    // control a live external account or be used by another project.
-    if (typeof attachment.source.vaultItemId !== 'string')
-      for (const handle of attachment.credentialHandles) (await this.broker.deleteHandle(handle));
+    // Only the resource's own secret is its to delete. A vault item it projects
+    // may control a live external account or serve another project, and any
+    // other handle belongs to someone else (AU-40).
+    const own = resourceSecretHandle(attachment.id);
+    if (attachment.credentialHandles.includes(own)) (await this.broker.deleteHandle(own));
     (await this.store.deleteResourceAttachment(attachmentId));
   }
 
@@ -1085,9 +1086,26 @@ export class ProjectResourceService {
     return value;
   }
 
-  private resolveSecret(attachment: ResourceAttachment, taskId: string): string {
-    const handle = attachment.credentialHandles[0]!;
+  private async resolveSecret(attachment: ResourceAttachment, taskId: string): Promise<string> {
+    const handle = await this.ownedCredentialHandle(attachment);
     return this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] });
+  }
+
+  /** A resource grants itself the use of one credential, so it may name only
+   * its own secret or a field of a vault item of its own organization. The
+   * vault also holds other tenants' credentials and the installation's own
+   * keys (the GitHub App's under a fixed name); a stored handle naming any of
+   * those is refused, never resolved (AU-40). */
+  private async ownedCredentialHandle(attachment: ResourceAttachment): Promise<string> {
+    const handle = attachment.credentialHandles[0];
+    if (handle && handle === resourceSecretHandle(attachment.id)) return handle;
+    const { vaultItemId, vaultField } = attachment.source;
+    if (handle && typeof vaultItemId === 'string' && typeof vaultField === 'string'
+      && handle === itemHandle(vaultItemId, vaultField as VaultFieldName)) {
+      const item = await new VaultItems(this.store, this.broker, undefined, attachment.organizationId).get(vaultItemId);
+      if (item?.fields.includes(vaultField as VaultFieldName)) return handle;
+    }
+    throw new Error(`resource "${attachment.name}" names a credential it does not own`);
   }
 
   private async serializePublish<T>(key: string, taskId: string, action: () => Promise<T>): Promise<T> {

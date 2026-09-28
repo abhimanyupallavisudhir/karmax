@@ -42,3 +42,8 @@ Resource-heavy setup (LegiBench3 probes, 12 revisions, 708 MB in 498 files), 202
 - `resource-bulk-upload-2026-09-23.jsonl` — bulk multipart vs concurrent single-file upload experiment.
 - `resource-deployment-2026-09-23.json` — hashes of the live validation overrides (not a release image).
 - `resource-integrity-2026-09-23.json` — binary/text transfer integrity probe (`benchmarks/e2b-resource-integrity.ts`).
+
+Remote start-up in a directory sandbox (`benchmarks/remote-bootstrap.ts`: fake Codex, no sandbox, model or credit), 2026-09-28:
+
+- `remote-bootstrap-2026-09-28.json` — LT-1, AD-12, AD-13: one bootstrap command, history moved by its new part only.
+- `remote-bootstrap-lt22-2026-09-28.json` — LT-22: browser readiness folded into that bootstrap, first-turn smoke test beside prompt preparation.

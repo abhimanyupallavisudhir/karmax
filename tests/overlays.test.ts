@@ -30,12 +30,12 @@ describe('manifest dependency resolution (SPEC §4.6)', () => {
     expect(manifest('software-dev')?.onActivate?.spawnTask?.workflow).toBe('software-dev');
   });
 
-  it('tailors the initial krmax-readiness task to the deployment', () => {
+  it('tailors the initial tavya-readiness task to the deployment', () => {
     const prep = manifest('software-dev')!.onActivate!.spawnTask!;
     const local = activationTaskPrompt(prep, false);
     const hosted = activationTaskPrompt(prep, true);
-    const expectedHosted = `## Initial set-up task for krmax-readiness
-1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to krmax's project wiki.
+    const expectedHosted = `## Initial set-up task for tavya-readiness
+1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to tavya's project wiki.
 2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.
 It is important to use the "default" tag on wiki articles that must appear in the context of every new agent.
 Report what you changed.

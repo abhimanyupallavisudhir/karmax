@@ -84,7 +84,7 @@ import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
-import { isRemoteAgentWorld, materializeRemoteSession } from '../agent/remote-process.js';
+import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -120,6 +120,7 @@ import {
   agentQueueId,
 } from '../coordinators/names.js';
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
+import { BRAND } from '../domain/brand.js';
 
 // Old executions without a recorded grant retain the normal developer workflow
 // surface (but no administration). New tasks always carry a creator-attenuated
@@ -225,7 +226,7 @@ function signalKillMessage(raw: string): string {
   const diagnosis = hostMemoryTight()
     ? `host out of memory — the agent was likely killed by the OS OOM killer (${mem}). ` +
       `Reduce Concurrent agent turns under Installation → Host capacity (or raise KARMAX_AGENT_MIN_FREE_MB), or free RAM.`
-    : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a krmax ` +
+    : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a ${BRAND} ` +
       `restart/reload/redeploy tearing down in-flight turns (orphan-sweep or shutdown escalation) or an external kill.`;
   return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
 }
@@ -270,7 +271,7 @@ export interface OpenPrDetails {
  *  dispatcher's branch matching relies on being true). */
 function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoName?: string): string {
   const summary = details.summary?.trim() || '_No review summary was recorded for this task._';
-  const task = num != null ? `karmax task #${num} (\`${handle.id}\`)` : `karmax task \`${handle.id}\``;
+  const task = num != null ? `${BRAND} task #${num} (\`${handle.id}\`)` : `${BRAND} task \`${handle.id}\``;
   const provenance = `\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
   const suffix = '\n… (summary truncated)';
   const budget = Math.max(0, 65_536 - Buffer.byteLength(provenance + suffix));
@@ -515,7 +516,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
     const projectId = typeof handle.meta?.projectId === 'string'
       ? handle.meta.projectId
-      : taskId ? (await store.getTask(taskId))?.projectId : undefined;
+      : taskId ? (await store.taskProjectIdAsync(taskId)) : undefined;
     return (await developmentGitBinding(taskId ?? handle.id, projectId,
       typeof profileName === 'string' ? profileName : undefined));
   };
@@ -710,7 +711,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           coherent: false,
           target,
           checkout: authority,
-          detail: `GitHub merged the project-wiki pull request, but Karmax could not reconcile concurrent canonical and task edits: ${error instanceof Error ? error.message : String(error)}`,
+          detail: `GitHub merged the project-wiki pull request, but ${BRAND} could not reconcile concurrent canonical and task edits: ${error instanceof Error ? error.message : String(error)}`,
         };
       }
       return finish(result, 'the reconciled project wiki');
@@ -724,7 +725,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         coherent: false,
         retryable: true,
         target,
-        detail: `GitHub merged the pull request, but Karmax could not fetch origin/${target} into the enrolled local checkout: ${fetched.stderr || fetched.stdout}`,
+        detail: `GitHub merged the pull request, but ${BRAND} could not fetch origin/${target} into the enrolled local checkout: ${fetched.stderr || fetched.stdout}`,
       };
     }
 
@@ -973,12 +974,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     if (!isRemote(handle.kind) || !deps.runners) return handle;
     const existing = typeof handle.meta?.worldLeaseId === 'string' ? (await store.worldLease(handle.meta.worldLeaseId)) : undefined;
     if (existing?.state === 'active') return handle;
-    const projectId = String(handle.meta?.projectId ?? (await store.getTask(taskId))?.projectId ?? '');
+    const projectId = String(handle.meta?.projectId ?? (await store.taskProjectIdAsync(taskId)) ?? '');
     const project = (await store.getProject(projectId));
     if (!project) throw new Error('cloud world has no owning project');
     const ctx = activityContext.current();
     const acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId, worldId: handle.id, provider: handle.kind,
-      priority: Number((await store.getTask(taskId))?.params.priority ?? 0), signal: ctx.cancellationSignal,
+      priority: (await store.taskPriority(taskId)), signal: ctx.cancellationSignal,
       heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) }));
     const next = (await store.updateWorldMeta(handle, { worldLeaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId }));
     (await store.setWorldState(next, 'ready'));
@@ -1305,10 +1306,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         gitIdentity = profile
           ? (await gitProfiles.identity(profile, { taskId: args.taskId }))
           : gitBinding.userId
-            ? { name: 'karmax', email: `karmax+${gitBinding.userId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` }
+            ? { name: BRAND, email: `${BRAND}+${gitBinding.userId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` }
             : organizationId === 'org_personal'
               ? undefined
-              : { name: 'karmax', email: `karmax+${organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` };
+              : { name: BRAND, email: `${BRAND}+${organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` };
       } catch (e) {
         (await record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}": ${e instanceof Error ? e.message : e}` }));
       }
@@ -2101,7 +2102,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (spec.resumeFrom.sessionId && !share && !allowProviderId) {
           throw ApplicationFailure.create({
-            message: 'Provider conversation IDs are available only on a host-local Karmax. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.',
+            message: `Provider conversation IDs are available only on a host-local ${BRAND}. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.`,
             type: 'agent-error',
             nonRetryable: true,
           });
@@ -2143,7 +2144,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (!materialized) {
             (await record(args.taskId, 'session.resume-failed', { session, provider: profile.provider }));
             throw ApplicationFailure.create({
-              message: `Cannot find conversation "${session}" in this Karmax installation's Codex or Claude history. Check the provider conversation ID and try again.`,
+              message: `Cannot find conversation "${session}" in this ${BRAND} installation's Codex or Claude history. Check the provider conversation ID and try again.`,
               type: 'agent-error',
               nonRetryable: true,
             });
@@ -2253,6 +2254,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
 
+      // The sandbox bootstrap, and a native agent's home and browser tools, are
+      // prepared while the prompt is (LT-1, LT-22).
+      prewarmRemoteAgentHome(world, profile.provider, remoteSubscriptionRail && (profile.provider === 'codex' || profile.provider === 'claude')
+        ? resolvedAuth?.configHome : undefined, session, profile.mcpConnections);
+
       // Self-healing loop (SPEC §3.4): show the Resolve agent the INDEX of prior saved
       // resolutions (`{{skills}}`) so it reuses a known fix rather than rediscovering
       // one. Read here (an activity) since the workflow can't touch the filesystem.
@@ -2320,9 +2326,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : forkOrigin.unpublished
             ? 'This independent world includes the source checkpoint’s unpublished work. Shared external services retain their configured sharing behavior.'
             : 'The source task landed. This world starts from its merge destination with the normal promoted project resources, rather than its old unpublished state.') : '';
-      const attemptGroup = (await store.attemptGroup(args.taskId));
-      const attemptContext = attemptGroup && attemptGroup.attempts.length > 1
-        ? `\n\nThis task has ${attemptGroup.attempts.length} attempts. Other attempts: ${attemptGroup.otherAttempts ?? (await store.otherAttemptsDefault(args.taskId))}. `
+      const attemptGroup = (await store.attemptSummary(args.taskId));
+      const attemptContext = attemptGroup && attemptGroup.attempts > 1
+        ? `\n\nThis task has ${attemptGroup.attempts} attempts. Other attempts: ${attemptGroup.otherAttempts ?? (await store.otherAttemptsDefault(args.taskId))}. `
           + (args.role === 'confirm' && !attemptGroup.committedAttemptId
             ? 'When accepting, set otherAttempts in confirm_decision to keep or cancel. Keep allows complementary proposals to continue and merge; cancel stops the alternatives. Follow an explicit project default; otherwise decide based on the value of the alternatives.'
             : 'If other attempts are kept, integrate against the latest target and assess combined behavior, redundant changes, and incompatible assumptions, as well as textual conflicts. Validate the combined result.')
@@ -3495,8 +3501,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const repository = await enrolledRepositoryForCheckout(handle, repo);
             const guidance = repository && deps.githubApp
               ? await deps.githubApp.workflowPermissionGuidance(repository).catch(() =>
-                'Grant the krmax GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.')
-              : 'Grant the krmax GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.';
+                `Grant the ${BRAND} GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.`)
+              : `Grant the ${BRAND} GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.`;
             throw ApplicationFailure.create({
               message: `GitHub App workflow permission required for ${slug}. ${guidance}`,
               type: 'github-workflows-permission',
@@ -3522,8 +3528,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // With several branches in flight the task title alone names none of
             // them; say which pull request this one is.
             title: changed.length > 1
-              ? `${details.title?.trim() || 'karmax'} (${repo.name})`
-              : details.title?.trim() || `karmax: ${repo.branch}`,
+              ? `${details.title?.trim() || BRAND} (${repo.name})`
+              : details.title?.trim() || `${BRAND}: ${repo.branch}`,
             body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
           });
         } catch (error) {
@@ -3717,7 +3723,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (error instanceof GithubApiError && [404, 410, 422].includes(error.status)) {
           return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `${detail} The pull request or branch needs human attention on GitHub before krmax can continue.`,
+            detail: `${detail} The pull request or branch needs human attention on GitHub before ${BRAND} can continue.`,
           };
         }
         return {
@@ -3933,7 +3939,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
           if (reconciling.length) return {
             status: 'waiting', prs: current, actorUserId,
-            detail: 'A current GitHub Actions run was cancelled with no replacement yet visible. Karmax is performing bounded exact-head reconciliation before classification or rerun.',
+            detail: `A current GitHub Actions run was cancelled with no replacement yet visible. ${BRAND} is performing bounded exact-head reconciliation before classification or rerun.`,
           };
           const providerFailure = classifyGithubCheckStates((readiness.failedChecks ?? []).map(check => check.state));
           if (providerFailure?.disposition === 'human') return {
@@ -4066,6 +4072,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
         };
       };
+      // GitHub reports BEHIND only under strict required checks, which a
+      // parent's task branch cannot carry: they would also reject its agents'
+      // own pushes. A sub-task landing there is karmax's own integration, so
+      // karmax enforces freshness itself (GH-26); every other target keeps its
+      // repository's policy.
+      const parentBranch = task.parentTaskId
+        ? ((await store.currentWorld(task.parentTaskId)) as WorldHandle | undefined)?.branch
+        : undefined;
       for (let ref of prs) {
         let live;
         try {
@@ -4138,7 +4152,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }));
             return {
               status: 'needs-revision', prs: current, actorUserId,
-              detail: `Pull request ${ref.slug}#${ref.number} changed outside krmax's authorized repair cycle. Inspect the new head and send the proposal through human Review before landing.`,
+              detail: `Pull request ${ref.slug}#${ref.number} changed outside ${BRAND}'s authorized repair cycle. Inspect the new head and send the proposal through human Review before landing.`,
               repair: { kind: 'head-changed', preserveAuthorization: false },
             };
           }
@@ -4155,11 +4169,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         let readinessError: unknown;
         const inspection = (await inspectionFor(ref.slug));
         const inspectionApi = inspection.api;
+        const freshnessTarget = parentBranch && live.base === parentBranch ? parentBranch : undefined;
+        // A head without the parent branch's tip passed CI on an older base:
+        // read it as BEHIND, so the paths below update it and wait for new CI.
+        const readinessOf = async (): Promise<GithubPullRequestReadiness> => {
+          const observed = await inspectionApi.readiness(ref.slug, ref.number);
+          if (!freshnessTarget || !['CLEAN', 'UNSTABLE'].includes(observed.mergeStateStatus)) return observed;
+          const comparison = await inspectionApi.compare(ref.slug, freshnessTarget, observed.headSha);
+          return comparison.behindBy > 0 ? { ...observed, mergeStateStatus: 'BEHIND',
+            ...(comparison.baseSha ? { baseSha: comparison.baseSha } : {}) } : observed;
+        };
         const repairFingerprint = (kind: 'conflict' | 'base-moved', suffix?: string) =>
           readiness?.baseSha ? `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha ?? 'unknown'}:${readiness.baseSha}:${kind}${suffix ? `:${suffix}` : ''}` : undefined;
         if (live.nodeId) {
           try {
-            readiness = await inspectionApi.readiness(ref.slug, ref.number);
+            readiness = await readinessOf();
           } catch (error) {
             // Readiness enriches the decision, but a head-bound REST landing
             // may still succeed when GraphQL is degraded or incomplete.
@@ -4172,7 +4196,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               actorUserId,
               detail: intentAuthorizedLanding
                 ? fairLanding
-                  ? `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or landing candidate. It has no Karmax admission slot; resolve it against the newest target, verify it, and request landing again.`
+                  ? `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or landing candidate. It has no ${BRAND} admission slot; resolve it against the newest target, verify it, and request landing again.`
                   : `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or merge group. GitHub has ejected this entry; resolve it against the newest target and reopen it for automated integration review.`
                 : `Pull request ${ref.slug}#${ref.number} conflicts with its target. Resolve it in the task branch, reopen the proposal, and review the new head.`,
               ...(intentAuthorizedLanding ? { repair: { kind: 'conflict' as const, preserveAuthorization: true,
@@ -4295,7 +4319,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (frontHeldExact && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
           return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `Pull request ${ref.slug}#${ref.number} is already controlled by GitHub's merge queue or auto-merge. Remove it there before retrying: this workflow keeps one authoritative karmax queue position through exact-candidate review and repair.`,
+            detail: `Pull request ${ref.slug}#${ref.number} is already controlled by GitHub's merge queue or auto-merge. Remove it there before retrying: this workflow keeps one authoritative ${BRAND} queue position through exact-candidate review and repair.`,
             eligibleUserIds: [actorUserId],
           };
         }
@@ -4307,7 +4331,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : undefined;
           return {
             status: 'waiting', prs: current, actorUserId,
-            detail: `GitHub has not granted krmax read access to CI for ${ref.slug}#${ref.number}. `
+            detail: `GitHub has not granted ${BRAND} read access to CI for ${ref.slug}#${ref.number}. `
               + 'Grant the GitHub App read-only Checks and Commit statuses permissions, then approve the updated installation permissions; '
               + `this task will retain the front landing slot and retry automatically.${appSlug
                 ? ` App settings: https://github.com/settings/apps/${appSlug}/permissions`
@@ -4363,7 +4387,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           || (intentAuthorizedLanding && mirroredReviews.length === 0 && voters.includes(actorUserId));
         if (mayMirrorApproval && !alreadyMirrored) {
           await api.approve(ref.slug, ref.number, ref.headSha,
-            'Approved in krmax after reviewing this exact pull-request head.')
+            `Approved in ${BRAND} after reviewing this exact pull-request head.`)
             .then(async () => (await record(handle.id, 'github.pr.review-approved', { ...ref, actorUserId })))
             .catch(async (error) => (await record(handle.id, 'github.pr.review-skipped', {
               ...ref, actorUserId, detail: error instanceof Error ? error.message : String(error),
@@ -4374,7 +4398,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // is, this is a real external-human wait rather than an opaque merge poll.
         if (readiness?.reviewDecision === 'REVIEW_REQUIRED') {
           try {
-            readiness = await inspectionApi.readiness(ref.slug, ref.number);
+            readiness = await readinessOf();
           } catch (error) {
             return errorDecision(error, current);
           }
@@ -4431,7 +4455,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (readinessError) return errorDecision(readinessError, current);
             return {
               status: 'retryable-error', prs: current, actorUserId,
-              detail: `GitHub did not expose policy and check state for ${ref.slug}#${ref.number}; karmax cannot certify the exact candidate yet.`,
+              detail: `GitHub did not expose policy and check state for ${ref.slug}#${ref.number}; ${BRAND} cannot certify the exact candidate yet.`,
             };
           }
           if (readiness.mergeStateStatus === 'BEHIND') {
@@ -4499,7 +4523,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (/fast.?forward|behind|reference update failed|not a valid head/i.test(advanced.message)) {
             return {
               status: 'needs-revision', prs: current, actorUserId,
-              detail: `The target moved outside karmax's landing coordinator before exact head ${ref.headSha} could land for ${ref.slug}#${ref.number}: ${advanced.message}. Repair against that live target while retaining the front slot.`,
+              detail: `The target moved outside ${BRAND}'s landing coordinator before exact head ${ref.headSha} could land for ${ref.slug}#${ref.number}: ${advanced.message}. Repair against that live target while retaining the front slot.`,
               repair: { kind: 'base-moved', preserveAuthorization: true,
                 ...(repairFingerprint('base-moved', advanced.message) ? { fingerprint: repairFingerprint('base-moved', advanced.message) } : {}) },
             };
@@ -4536,7 +4560,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (landingAuthority === 'external') {
             queued = true;
             queuedOwner = 'external';
-            pendingDetail = 'The configured external landing authority owns landing; Karmax is observing the PRs and will act only on a terminal failure or merge.';
+            pendingDetail = `The configured external landing authority owns landing; ${BRAND} is observing the PRs and will act only on a terminal failure or merge.`;
             const externalParticipant = participant('external', 'queued');
             if (externalParticipant) participants.push(externalParticipant);
             settled.push(next);
@@ -4750,7 +4774,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (mergeMethod !== 'merge') {
             return {
               status: 'needs-human', prs: current, actorUserId,
-              detail: `Repository policy requests ${mergeMethod} landing, but GitHub did not accept this PR into a merge queue. Enable the native queue for ${mergeMethod} landing; krmax will not substitute an unvalidated direct merge.`,
+              detail: `Repository policy requests ${mergeMethod} landing, but GitHub did not accept this PR into a merge queue. Enable the native queue for ${mergeMethod} landing; ${BRAND} will not substitute an unvalidated direct merge.`,
               eligibleUserIds: [actorUserId],
             };
           }
@@ -4896,7 +4920,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           participants,
           landingOwner: fallback ? 'karmax' : external ? 'external' : 'provider',
           detail: fallback
-            ? 'No repository landing scheduler accepted this participant; it requires guarded Karmax fallback admission.'
+            ? `No repository landing scheduler accepted this participant; it requires guarded ${BRAND} fallback admission.`
             : pendingDetail ?? 'The repository landing authority accepted this participant.',
           ...(!fallback ? { providerQueue: { state: 'queued' as const } } : {}),
         };
@@ -5001,9 +5025,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
           const after = await api.get(ref.slug, ref.number);
           await worlds.withOperation(handle.id, () => api.commentOnce(ref.slug, ref.number,
-            after.merged ? `Merged into \`${outcome.target}\` by karmax${as}.`
-            : landed ? `karmax merged this branch into \`${outcome.target}\`${as} and pushed it. Closing.`
-            : `karmax merged this branch into \`${outcome.target}\` locally${as}, but could not push`
+            after.merged ? `Merged into \`${outcome.target}\` by ${BRAND}${as}.`
+            : landed ? `${BRAND} merged this branch into \`${outcome.target}\`${as} and pushed it. Closing.`
+            : `${BRAND} merged this branch into \`${outcome.target}\` locally${as}, but could not push`
               + ` \`${outcome.target}\` to origin. This pull request stays open until that target lands.`,
             JSON.stringify([handle.id, 'finalize', outcome.target, outcome.sha, landed])));
           const next = { ...ref, state: after.state, merged: after.merged };

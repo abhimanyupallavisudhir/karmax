@@ -23,7 +23,7 @@ describe('task branch policy persistence', () => {
     const source = (await store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
       workflowVersion: '1.26.0', params: { prompt: 'source' } }));
     (await store.kvSet(`session:${source.id}:do`, 'preserved-session'));
-    const parent = 'karmax/task_parent';
+    const parent = 'tavya/task_parent';
 
     const fork = await api.forkTaskAgent(token, {
       taskId: source.id,
@@ -61,7 +61,7 @@ describe('task branch policy persistence', () => {
       workflowVersion: '1.26.0', params: { prompt: 'source' } }));
     (await store.kvSet(`session:${source.id}:do`, 'preserved-session'));
     const fork = await api.forkTaskAgent(token, { taskId: source.id, message: 'recover independently' });
-    const parent = 'karmax/task_parent';
+    const parent = 'tavya/task_parent';
 
     await expect(api.updateParams(token, fork.id, { target: parent })).resolves.toEqual({ applied: ['target'] });
 
@@ -78,12 +78,12 @@ describe('task branch policy persistence', () => {
         _repositoryBranchesResolved: true } }));
     const baseSha = 'a'.repeat(40);
     const handle = (await store.registerWorld({
-      kind: 'e2b', id: task.id, root: '/workspace', branch: `karmax/${task.id}`,
+      kind: 'e2b', id: task.id, root: '/workspace', branch: `tavya/${task.id}`,
       base: 'master', target: 'master',
       repos: [{ name: 'app', repo: 'git@github.com:acme/app.git', root: '/workspace',
-        branch: `karmax/${task.id}`, base: 'master', target: 'master', targetPinned: false, baseSha }],
+        branch: `tavya/${task.id}`, base: 'master', target: 'master', targetPinned: false, baseSha }],
     }, project.id));
-    const parent = 'karmax/task_parent';
+    const parent = 'tavya/task_parent';
 
     await expect(api.updateParams(token, task.id, { target: parent })).resolves.toEqual({ applied: ['target'] });
 

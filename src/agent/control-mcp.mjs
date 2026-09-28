@@ -91,7 +91,7 @@ function connect() {
     socket.on('error', (error) => { fail(error); reject(error); });
     // The activity closes the socket when the turn ends; any in-flight call is
     // then answered with a real error instead of hanging the harness forever.
-    socket.on('close', () => fail(new Error('karmax control bridge closed (the turn ended)')));
+    socket.on('close', () => fail(new Error('tavya control bridge closed (the turn ended)')));
     socket.on('connect', () => resolve(client));
   });
 }
@@ -136,7 +136,7 @@ async function main() {
     try {
       const reply = await (await client()).request({ op: 'call', name, args: request.params?.arguments ?? {} });
       if (reply?.ok) return { content: [{ type: 'text', text: String(reply.text ?? '') }] };
-      return { content: [{ type: 'text', text: `error: ${String(reply?.error ?? 'karmax control call failed')}` }], isError: true };
+      return { content: [{ type: 'text', text: `error: ${String(reply?.error ?? 'tavya control call failed')}` }], isError: true };
     } catch (error) {
       return { content: [{ type: 'text', text: `error: ${String(error?.message ?? error)}` }], isError: true };
     }
