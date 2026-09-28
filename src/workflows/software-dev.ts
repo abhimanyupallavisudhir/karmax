@@ -45,6 +45,7 @@ import {
   WorldHandleLike,
   ChildRaise,
   ParentResponse,
+  SubTaskRequest,
   SubTaskResponse,
   TaskPullRequest,
   GithubLandingParticipant,
@@ -2446,7 +2447,7 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  off — and merges back into — THIS task's world branch, so `main` sees one merge at
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
-  async function spawnSubTasks(list: { title: string; prompt: string }[]) {
+  async function spawnSubTasks(list: SubTaskRequest[]) {
     await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
     for (const s of list) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
@@ -2473,6 +2474,9 @@ Inspect the complete current diff and specifically compare its delta from the re
         // Branch-scoped, least-privilege grant for the child (SPEC §8.2).
         parentBranch: world!.branch,
         parentGrant: input.grant,
+        // The child's own agent choice (PL-11). Only the activity's argument
+        // changes, never a command, so recorded histories replay unchanged.
+        ...(s.params ? { params: s.params } : {}),
       });
       subTaskIds.push(childInput.taskId);
       outstanding.add(childInput.taskId);

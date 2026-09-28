@@ -25,6 +25,7 @@ export type {
   ProjectConfig,
   ChildRaise,
   ParentResponse,
+  SubTaskRequest,
   SubTaskResponse,
   RaiseToParent,
   RaiseType,

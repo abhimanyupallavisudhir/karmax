@@ -2,15 +2,13 @@
 // Full console shell, trusted Chromium, deterministic local API/WS fakes.
 // Run: node web/live-stream.browser.test.cjs
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const { chromium } = require('playwright');
+const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
 
 (async () => {
-  const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--no-sandbox'] });
+  const browser = await launch();
   try {
     const context = await browser.newContext({ serviceWorkers: 'block' });
-    const requests = [], errors = [], sockets = [];
+    const errors = [];
     const project = { id: 'p', organizationId: 'o', name: 'Workspace', config: {} };
     const task = { id: 't', projectId: 'p', num: 1, title: 'Stream the reply', workflow: 'software-dev', params: {}, tags: [], lastView: { stage: 'do', status: 'active' } };
     const schema = [{ name: 'software-dev', params: [{ name: 'prompt', type: 'text', label: 'Prompt', scopes: ['task'], bind: 'prompt' }], stages: [{ key: 'do', label: 'Working' }] }];
@@ -18,35 +16,12 @@ const { chromium } = require('playwright');
       messages: [{ id: 'm1', role: 'user', text: 'Fix the parser', ts: 1 }], agentTurn: { turnId: 'turn-1', role: 'do', state: 'running' } };
     const turn = { role: 'do', turnId: 'turn-1', attempt: 1 };
     const events = [{ seq: 1, type: 'agent.activity', taskId: 't', ts: 2, payload: { ...turn, id: 'msg-0', kind: 'message', phase: 'completed', title: 'Reading the parser first.' } }];
-    await context.routeWebSocket('**/ws*', ws => { sockets.push(ws); });
-    await context.route('http://console.test/**', async route => {
-      const req = route.request(), url = new URL(req.url()), p = url.pathname;
-      if (!p.startsWith('/api/')) {
-        const file = ['/app.js', '/styles.css', '/markdown.js', '/totp-qr.js', '/register-service-worker.js'].includes(p) ? p.slice(1) : 'index.html';
-        return route.fulfill({ contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html', body: fs.readFileSync(path.join(__dirname, file), 'utf8') });
-      }
-      requests.push(`${req.method()} ${p}`);
-      let data = [];
-      if (p === '/api/meta') data = { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [] };
-      else if (p === '/api/launch') data = {};
-      else if (p === '/api/session') data = { authenticated: true, user: { id: 'u', name: 'Tester' } };
-      else if (p === '/api/settings/installation') data = { canManage: false };
-      else if (p === '/api/organizations') data = [{ id: 'o', name: 'Organization', slug: 'org' }];
-      else if (p === '/api/user/default-organization') data = { organizationId: 'o' };
-      else if (p === '/api/projects') data = [project];
-      else if (p === '/api/projects/p') data = project;
-      else if (p === '/api/schema') data = schema;
-      else if (p === '/api/contributions') data = { slots: [], commands: [], events: [] };
-      else if (p === '/api/models') data = { providers: [] };
-      else if (p.endsWith('/defaults')) data = { effective: {}, inherited: {} };
-      else if (p === '/api/projects/p/tasks') data = [task];
-      else if (p === '/api/projects/p/search' || p === '/api/search') data = p === '/api/search' ? [{ projectId: 'p', tasks: [task], total: 1 }] : { tasks: [task], total: 1 };
-      else if (p === '/api/tasks/t') data = view;
-      else if (p.endsWith('/sessions')) data = {};
-      else if (p.endsWith('/attempts')) data = { principalAttemptId: 't', attempts: [task] };
-      else if (p.endsWith('/events')) data = events;
-      return route.fulfill({ json: data });
-    });
+    // The view and the event history change as the test goes, so answer them live.
+    const { requests, sockets } = await fakeConsole(context, { project, tasks: [task], schema, api(p) {
+      if (p === '/api/tasks/t') return view;
+      if (p.endsWith('/events')) return events;
+      return undefined;
+    } });
     context.setDefaultTimeout(8000);
     const page = await context.newPage();
     page.on('pageerror', error => { errors.push(error.message); console.error('page:', error.message); });

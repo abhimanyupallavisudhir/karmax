@@ -107,10 +107,15 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_sub_task',
     description:
-      'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends. You manage your children to completion before you finish.',
+      'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends. You manage your children to completion before you finish. '
+      + 'It runs your agent unless `params` choose another: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}} or {"agent:do": {"avatarId": "…"}}. Only the agent fields can be set; the branch, project and authorization stay yours. An invalid or unavailable choice is refused and nothing is created.',
     parameters: {
       type: 'object',
-      properties: { title: { type: 'string' }, prompt: { type: 'string' } },
+      properties: {
+        title: { type: 'string' },
+        prompt: { type: 'string' },
+        params: { type: 'object', description: 'Task-form agent fields for the child (e.g. "agent:do"), as in create_task; omit to run your agent.' },
+      },
       required: ['title', 'prompt'],
     },
   },
@@ -925,7 +930,8 @@ export function platformToolHandlers(
       return 'review info recorded';
     },
     async create_sub_task(args) {
-      await ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
+      await ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? ''),
+        ...(args?.params !== undefined ? { params: args.params } : {}) });
       return 'sub-task queued: it starts when this turn ends (branches off your work; you are its confirmer)';
     },
     async respond_to_sub_task(args) {

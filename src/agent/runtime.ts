@@ -2,7 +2,7 @@ import { currentTiming } from '../timing/index.js';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
-import { AgentActivity, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
 import { formatMinorUnits } from '../util/currency.js';
 
@@ -21,7 +21,7 @@ export function spendReviewSummary(outcome: { status: string; reason?: string; s
 }
 
 export interface QueuedDelegation {
-  subTasks?: { title: string; prompt: string }[];
+  subTasks?: SubTaskRequest[];
   subTaskResponses?: SubTaskResponse[];
 }
 
@@ -39,6 +39,9 @@ export interface RunTurnDeps {
   queuedDelegation?: QueuedDelegation;
   /** Persist queued spawns/answers before the tool acknowledges them. */
   onDelegation?: (queued: QueuedDelegation) => void | Promise<void>;
+  /** Validate and normalize create_sub_task `params` (PL-11). A refusal throws,
+   *  so the agent gets a tool error and nothing is queued. */
+  subTaskParams?: (params: unknown) => Promise<SubTaskRequest['params']>;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
   budget?: {
     request(ctx: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -179,7 +182,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let confirmDecision: ConfirmDecision | undefined;
   let raise: RaiseToParent | undefined;
   let waitForSubtasks = false;
-  const subTasks: { title: string; prompt: string }[] = [...(deps.queuedDelegation?.subTasks ?? [])];
+  const subTasks: SubTaskRequest[] = [...(deps.queuedDelegation?.subTasks ?? [])];
   const subTaskResponses: SubTaskResponse[] = [...(deps.queuedDelegation?.subTaskResponses ?? [])];
   // A resumed agent may queue the same request again; deliver it once.
   const queueDelegation = async <T>(list: T[], item: T) => {
@@ -259,7 +262,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       await publication;
     },
     async createSubTask(t) {
-      await queueDelegation(subTasks, t);
+      // Unvalidated params never reach a child: without a validator, refuse them.
+      if (t.params !== undefined && !deps.subTaskParams) throw new Error('sub-task params are unavailable in this turn');
+      const params = t.params === undefined ? undefined : (await deps.subTaskParams!(t.params));
+      await queueDelegation(subTasks, { title: t.title, prompt: t.prompt, ...(params ? { params } : {}) });
     },
     async respondToSubTask(r) {
       await queueDelegation(subTaskResponses, r);
