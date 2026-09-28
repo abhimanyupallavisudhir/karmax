@@ -11,7 +11,6 @@ const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci
 const ciSource = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
 const workflow = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'deploy.yml'), 'utf8'));
 const installAction = parse(fs.readFileSync(path.join(repoRoot, '.github', 'actions', 'install', 'action.yml'), 'utf8'));
-const backupWorkflowPath = path.join(repoRoot, '.github', 'workflows', 'backup.yml');
 const deploy = workflow.jobs.deploy;
 const script: string = JSON.stringify(deploy.steps);
 const operator = fs.readFileSync(path.join(repoRoot, 'deploy', 'karmax'), 'utf8');
@@ -135,20 +134,18 @@ describe('post-push deployment to the public instance', () => {
   // Every push snapshots the vault and Temporal history before rebuilding.
   // Unpruned, that grows without bound until the disk fills and the instance
   // stops taking writes.
-  // The operator script owns retention (tests/deploy-lifecycle.test.ts pins
-  // the policy), so an update and the daily snapshot prune the same way.
+  // The operator script owns retention (tests/deploy-lifecycle.test.ts pins the
+  // policy). A daily copy is the provider's job: tavya.io's one.com image is
+  // daily and off-host, where a nightly snapshot on the same disk was neither.
   it('retains manual backups while pruning only automatic snapshots', () => {
     const update = operator.split('cmd_update() {')[1]?.split('\n}')[0] ?? '';
     const reclaim = operator.split('reclaim_space() {')[1]?.split('\n}')[0] ?? '';
     expect(update).toContain('reclaim_space');
     expect(reclaim).toContain('prune_backups');
     expect(script).not.toContain('rm -rf');
-    const backup = parse(fs.readFileSync(backupWorkflowPath, 'utf8'));
-    expect(backup.on.schedule).toBeDefined();
-    const steps = JSON.stringify(backup.jobs.backup.steps);
-    expect(steps).toContain('scheduled-');
-    expect(steps).toContain('./deploy/karmax prune-backups');
-    expect(steps).not.toContain('rm -rf');
+    const workflows = fs.readdirSync(path.join(repoRoot, '.github', 'workflows'))
+      .map((file) => fs.readFileSync(path.join(repoRoot, '.github', 'workflows', file), 'utf8'));
+    expect(workflows.filter((text) => text.includes('deploy/karmax backup'))).toEqual([]);
   });
 
   // `cmd_backup` runs inside the live app container. The backup API rejects a

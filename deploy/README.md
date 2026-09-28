@@ -233,11 +233,14 @@ directories as immutable; copy files out before editing them. The live data
 volume is never linked to a backup.
 
 Automatic snapshots are pruned: `update` keeps the newest 10 `predeploy-*`
-snapshots, and the daily `scheduled-*` snapshots are kept for 14 days, as are
-the bare `<UTC timestamp>` snapshots earlier updaters took. A successful update
-also prunes dangling images and caps the Docker build cache at 8 GB. Snapshots
-with any other name (`manual-*` from `backup`, or a directory you choose) are
-never deleted automatically.
+snapshots, and the bare `<UTC timestamp>` snapshots earlier updaters took are
+kept for 14 days. A successful update also prunes dangling images and caps the
+Docker build cache at 8 GB. Snapshots with any other name (`manual-*` from
+`backup`, or a directory you choose) are never deleted automatically.
+
+These snapshots live on the disk they protect: they undo a bad deploy, not a
+lost server. For that, keep an off-host copy, such as your provider's daily
+server backup or these directories copied elsewhere.
 
 `restore` verifies the control-plane payload, PostgreSQL dumps, and deployment
 secrets, then restores every dump into a staging database (`karmax_restore`,

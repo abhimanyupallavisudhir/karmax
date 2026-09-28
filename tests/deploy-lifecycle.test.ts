@@ -76,7 +76,7 @@ it('publishes a complete backup atomically and verifies its checksums (CI-37)', 
 
 // Every deploy snapshots fresh database dumps and agent transcripts. Kept
 // forever they filled tavya.io's disk: 84 snapshots, 144 GB of 193 GB, in 15 days.
-it('keeps the newest predeploy snapshots and two weeks of scheduled ones, never an operator\'s', () => {
+it('keeps the newest predeploy snapshots and two weeks of the old updater\'s, never an operator\'s', () => {
   const h = deployment();
   const backups = path.join(h.deploy, 'backups');
   const make = (name: string, daysOld = 0) => {
@@ -91,9 +91,9 @@ it('keeps the newest predeploy snapshots and two weeks of scheduled ones, never 
   // Unprefixed stamps are the previous updater's automatic snapshots: they age
   // out like scheduled ones. Operator backups are named and kept.
   const kept = ['20260927T073452Z', 'manual-20260901T000000Z', 'incident-20260919-page-latency',
-    'predeploy-20260901T000000Z.partial.7', 'scheduled-20260925T021700Z'];
-  make(kept[0]!, 3); make(kept[1]!, 30); make(kept[2]!, 30); make(kept[3]!, 30); make(kept[4]!, 3);
-  make('scheduled-20260901T021700Z', 20); make('20260913T132143Z', 15);
+    'predeploy-20260901T000000Z.partial.7'];
+  make(kept[0]!, 3); make(kept[1]!, 30); make(kept[2]!, 30); make(kept[3]!, 30);
+  make('20260913T132143Z', 15);
   const result = h.run(['prune-backups']);
   expect(result.status, result.stderr).toBe(0);
   expect(fs.readdirSync(backups).sort()).toEqual([...kept, ...predeploy.slice(2)].sort());
