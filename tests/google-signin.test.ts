@@ -9,8 +9,6 @@
 //
 // A cheap file by design: no Temporal server, no worker — an in-memory identity
 // plus a directly constructed Gateway (see tests/fixtures/identity-smoke.ts).
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { describe, it, expect, afterAll, vi } from 'vitest';
 import { IdentityService } from '../src/auth/identity.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
@@ -23,6 +21,7 @@ import { Overlays } from '../src/store/overlays.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { GitProfiles, userGitScope } from '../src/autonomy/git-profiles.js';
+import { closeConsoleBrowser, consolePage, type ApiCall } from './helpers/console-page.js';
 
 const GOOGLE = { clientId: 'test-google-client-id.apps.googleusercontent.com', clientSecret: 'test-google-client-secret' };
 const GITHUB = { clientId: 'test-github-client-id', clientSecret: 'test-github-client-secret' };
@@ -33,7 +32,7 @@ const OIDC = {
 };
 
 const closers: Array<() => Promise<void>> = [];
-afterAll(async () => { for (const close of closers) await close().catch(() => {}); });
+afterAll(async () => { for (const close of closers) await close().catch(() => {}); await closeConsoleBrowser(); });
 
 /** An identity + a minimally wired gateway on a free loopback port. */
 async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
@@ -339,11 +338,27 @@ describe('Google sign-in when configured', () => {
   // own sign-in card. Better Auth's default is its bare `/api/auth/error` page
   // ("CODE: account_not_linked", plus an "Ask AI" button) — a dead end that
   // tells the user nothing about what to do next.
-  it('sends Google failures back to the sign-in card instead of Better Auth error page', () => {
-    const app = readFileSync(fileURLToPath(new URL('../web/app.js', import.meta.url)), 'utf8');
-    expect(app).toMatch(/errorCallbackURL/);
-    // …and the card actually says what happened, naming the recoverable case.
-    expect(app).toMatch(/account_not_linked/);
+  it('sends Google failures back to the sign-in card instead of Better Auth error page', async () => {
+    const signedOut = (call: ApiCall) => call.path === '/api/meta' ? { siteName: 'tavya' } : call.path === '/api/launch' ? {}
+      : call.path === '/api/session' ? { authRequired: true, authenticated: false, google: true }
+      : call.path === '/api/auth/sign-in/social' ? { status: 400, json: { message: 'provider unavailable' } } : undefined;
+    const login = await consolePage({ path: '/login?next=%2Ftasks', api: signedOut });
+    try {
+      await login.run('boot()');
+      await login.page.locator('#google-btn').click();
+      await expect.poll(() => login.calls.find((call) => call.path === '/api/auth/sign-in/social')?.body).toEqual({
+        provider: 'google', callbackURL: 'http://console.test/login?next=%2Ftasks',
+        errorCallbackURL: 'http://console.test/login?next=%2Ftasks&auth_provider=google' });
+    } finally { await login.close(); }
+
+    // Better Auth appends `?error=<code>` to that URL; the card says what happened and the URL is cleaned.
+    const back = await consolePage({ path: '/login?next=%2Ftasks&auth_provider=google&error=account_not_linked', api: signedOut });
+    try {
+      await back.run('boot()');
+      await expect.poll(() => back.page.locator('#login-err').textContent())
+        .toBe('An account already exists for that email address with a password. Sign in with that password instead — social sign-in requires confirming the address first.');
+      expect(await back.run<string>('location.pathname + location.search')).toBe('/login?next=%2Ftasks');
+    } finally { await back.close(); }
   });
 });
 

@@ -74,6 +74,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
 import type { GithubActionsStatus, GithubActionsInspectOptions } from '../integrations/github-actions.js';
+import { withPullRequestStates } from '../integrations/github-pr.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -3109,10 +3110,16 @@ export class KarmaxApi {
         // just declared done (task #395). No successor run follows.
         await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
         (await this.deps.store.kvDelete(lifecycleReplacementKey(task.id)));
+        // No successor run will supersede the stopped one's late publications.
+        const runId = task.params._workflowRunId;
+        if (typeof runId === 'string' && runId) (await this.deps.store.retireViewRun(task.id, runId));
       }
       if (task.params.draft) (await this.deps.store.clearDraft(taskId));
+      // WF-32: `view` predates the stop. The stored view is newer for its PRs:
+      // the stopped run's last publication, or what GitHub's webhook recorded.
+      const stored = (await this.deps.store.getTask(taskId))?.lastView;
       const done: TaskView = {
-        ...view,
+        ...withPullRequestStates(view, stored),
         stage: 'done',
         status: 'done',
         waitingFor: undefined,

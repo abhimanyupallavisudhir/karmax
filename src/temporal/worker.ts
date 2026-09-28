@@ -35,6 +35,17 @@ export function activityTaskConcurrency(env: NodeJS.ProcessEnv = process.env): n
     : env.KARMAX_DEPLOYMENT === 'hosted' ? 1_000 : 8;
 }
 
+/** Sticky workflow cache. Every open task's workflow is queried by the console
+ * and by its own running turn, and a query or task for an evicted workflow
+ * replays its whole history. The private default suits one person's handful
+ * of tasks; a hosted cell keeps hundreds open. karmax workflows hold their
+ * conversation, so this stays well under the SDK's heap-derived default
+ * (about 600 per GiB of heap), which assumes much smaller workflow state. */
+export function workflowCacheSize(env: NodeJS.ProcessEnv = process.env): number {
+  return env.KARMAX_MAX_CACHED_WORKFLOWS ? Number(env.KARMAX_MAX_CACHED_WORKFLOWS)
+    : env.KARMAX_DEPLOYMENT === 'hosted' ? 250 : 20;
+}
+
 export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, opts: WorkerOpts = {}): Promise<WorkerHandle> {
   ensureQuietRuntime();
   const connection = await NativeConnection.connect({ address: conn.address, apiKey: conn.apiKey, tls: conn.tls });
@@ -54,7 +65,7 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     taskQueue: TASK_QUEUE,
     ...source,
     activities: buildActivities(deps),
-    maxCachedWorkflows: num(process.env.KARMAX_MAX_CACHED_WORKFLOWS, 20),
+    maxCachedWorkflows: workflowCacheSize(),
     maxConcurrentWorkflowTaskExecutions: num(process.env.KARMAX_MAX_WFT, 8),
     maxConcurrentActivityTaskExecutions: activityTaskConcurrency(),
     // Agent activities heartbeat once a second so Temporal can deliver a pending
@@ -63,7 +74,7 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     // leaving a cancelled provider subprocess alive long after its task closed.
     maxHeartbeatThrottleInterval: '1 second',
     // Share ONE V8 context across all cached workflows instead of one isolate per
-    // workflow. With up to `maxCachedWorkflows` (20) sticky executions, per-isolate
+    // workflow. With up to `maxCachedWorkflows` sticky executions, per-isolate
     // heap dominates the worker's RAM; a shared context is the single biggest memory
     // lever here. All bundled code must be trusted: Temporal determinism and
     // VM reuse do not provide a security boundary for tenant-supplied code.

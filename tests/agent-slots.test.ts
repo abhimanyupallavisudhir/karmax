@@ -145,7 +145,8 @@ describe('agent-slot admission semaphore', () => {
         overflowGranted = true;
         return release;
       });
-      await new Promise((r) => setTimeout(r, 150));
+      // Parked, not merely not yet scheduled: only a release can grant it now.
+      await expect.poll(() => slots.agentSlotStats().waiting).toBe(1);
       expect(overflowGranted).toBe(false);
       expect(slots.agentSlotStats()).toMatchObject({ inUse: 2, waiting: 1 });
 
@@ -171,9 +172,8 @@ describe('agent-slot admission semaphore', () => {
       thirdGranted = true;
       return rel;
     });
-    await new Promise((r) => setTimeout(r, 50));
+    await expect.poll(() => slots.agentSlotStats().waiting).toBe(1);
     expect(thirdGranted).toBe(false);
-    expect(slots.agentSlotStats().waiting).toBe(1);
 
     // Releasing one transfers its slot straight to the parked waiter (never a
     // momentary over-admit): inUse stays at capacity, waiting drops to 0.

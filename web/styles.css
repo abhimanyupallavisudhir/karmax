@@ -3,6 +3,11 @@
    for the board details (ids, stages, branches, SHAs). One confident accent
    (electric indigo). The signature is the stage pipeline. */
 
+/* `hidden` always hides. Component display rules (.btn, .card, .inline-form…)
+   otherwise override the browser's own [hidden] rule, so a control hidden for
+   lack of permission stayed on screen. */
+[hidden] { display: none !important; }
+
 @font-face {
   font-family: "Inter";
   src: url("/fonts/inter/InterVariable.woff2") format("woff2");

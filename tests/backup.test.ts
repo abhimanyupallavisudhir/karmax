@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -198,8 +199,18 @@ describe('control-plane backup', () => {
     await expect(createBackup({ home, destination: path.join(root, 's'), externalTemporal: true }))
       .rejects.toThrow(/npm run backup -- --allow-running/);
 
-    const cli = fs.readFileSync(new URL('../src/scripts/backup.ts', import.meta.url), 'utf8');
-    expect(cli).toContain("'--allow-running'");
+    // Run that command: it takes the backup and says what it traded away.
+    const cli = (...args: string[]) => spawnSync(process.execPath, ['--import', 'tsx', 'src/scripts/backup.ts', ...args],
+      { encoding: 'utf8', env: { ...process.env, KARMAX_HOME: home, KARMAX_TEMPORAL_ADDRESS: 'temporal.invalid:7233' } });
+    const taken = cli('--allow-running', path.join(root, 'cli'));
+    expect(taken.status, taken.stderr).toBe(0);
+    expect(taken.stdout).toContain(`backup complete: ${path.join(root, 'cli')}`);
+    expect(taken.stdout).toMatch(/not point-in-time consistent/);
+    expect(JSON.parse(fs.readFileSync(path.join(root, 'cli', 'manifest.json'), 'utf8'))).toMatchObject({ temporal: 'external', secretsIncluded: true });
+    const refused = cli('--allow-runing', path.join(root, 'typo'));
+    expect(refused.status).not.toBe(0);
+    expect(refused.stderr).toContain('unknown option --allow-runing');
+    expect(fs.existsSync(path.join(root, 'typo'))).toBe(false);
   });
 
   it('rejects a backup whose payload changed', async () => {
@@ -355,6 +366,141 @@ describe('control-plane backup', () => {
     const made = await createBackup({ home, externalTemporal: true });
     expect(made.directory.startsWith(path.join(home, 'backups'))).toBe(true);
     expect(fs.existsSync(path.join(made.directory, 'manifest.json'))).toBe(true);
+  });
+
+  it('also withholds the plaintext secrets that live outside the vault', async () => {
+    const { root, home } = makeHome('karmax-backup-plaintext-');
+    write(home, 'state/git-profiles/work/id_ed25519', 'PRIVATE KEY');
+    write(home, 'state/vault-items/items.json', '{"token":"plain"}');
+    write(home, 'config-homes/claude-personal/.credentials.json', '{"oauth":"token"}');
+    write(home, 'state/settings.json', '{"theme":"dark"}');
+    const { manifest } = await createBackup({ home, destination: path.join(root, 'b'), externalTemporal: true, excludeSecrets: true });
+    expect(manifest.files.map((file) => file.path)).toEqual(['state/settings.json']);
+  });
+
+  it('embeds Temporal and local objects unless they are external', async () => {
+    const { root, home } = makeHome('karmax-backup-components-');
+    const temporal = await Store.create(path.join(home, 'temporal', 'temporal.db'));
+    await temporal.kvSet('history', 'embedded');
+    await temporal.close();
+    write(home, 'objects/checkpoints/a.bin', 'checkpoint');
+
+    const embedded = await createBackup({ home, destination: path.join(root, 'embedded') });
+    expect(embedded.manifest).toMatchObject({ temporal: 'embedded', objectStore: 'local' });
+    expect(embedded.manifest.files.map((file) => file.path)).toEqual(expect.arrayContaining(['objects/checkpoints/a.bin', 'temporal/temporal.db']));
+    const copy = await Store.create(path.join(root, 'embedded', 'payload', 'temporal', 'temporal.db'));
+    expect(await copy.kvGet('history')).toBe('embedded');
+    await copy.close();
+
+    const external = await createBackup({ home, destination: path.join(root, 'external'), externalTemporal: true, externalObjectStore: true });
+    expect(external.manifest).toMatchObject({ temporal: 'external', objectStore: 'external' });
+    expect(fs.existsSync(path.join(root, 'external', 'payload', 'temporal'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'external', 'payload', 'objects'))).toBe(false);
+    // Restoring it leaves this home's own Temporal and objects in place.
+    write(home, 'objects/checkpoints/b.bin', 'newer');
+    await restoreBackup(path.join(root, 'external'), { home });
+    expect(fs.readFileSync(path.join(home, 'objects', 'checkpoints', 'b.bin'), 'utf8')).toBe('newer');
+    expect(fs.existsSync(path.join(home, 'temporal', 'temporal.db'))).toBe(true);
+  });
+
+  it('refuses a destination that would replace the home or sit in a task world', async () => {
+    const { home } = makeHome('karmax-backup-destination-');
+    fs.mkdirSync(path.join(home, 'worlds', 'task-1'), { recursive: true });
+    for (const destination of [home, `${home}/`, path.join(home, 'worlds', 'task-1', 'backup')])
+      await expect(createBackup({ home, destination, externalTemporal: true })).rejects.toThrow(/must not replace KARMAX_HOME or live inside a task world/);
+    expect(fs.readdirSync(path.join(home, 'worlds', 'task-1'))).toEqual([]);
+    // An existing directory is never reused: two backups would interleave.
+    fs.mkdirSync(path.join(home, 'taken'));
+    await expect(createBackup({ home, destination: path.join(home, 'taken'), externalTemporal: true })).rejects.toThrow(/EEXIST/);
+  });
+
+  it.each([
+    ['another format', (m: any) => { m.format = 'tarball'; }, 'unsupported or invalid Krmax backup manifest'],
+    ['a newer version', (m: any) => { m.version = 2; }, 'unsupported or invalid Krmax backup manifest'],
+    ['no file list', (m: any) => { delete m.files; }, 'unsupported or invalid Krmax backup manifest'],
+    ['a path escaping the payload', (m: any) => { m.files[0].path = '../manifest.json'; }, 'backup path escapes payload: ../manifest.json'],
+    ['an absolute path', (m: any) => { m.files[0].path = '/etc/passwd'; }, 'invalid backup path: /etc/passwd'],
+    ['a backslash path', (m: any) => { m.files[0].path = 'vault\\\\value'; }, 'invalid backup path'],
+    ['a wrong size', (m: any) => { m.files[0].bytes += 1; }, 'backup integrity check failed: vault/value'],
+    ['a file that is missing', (m: any) => { m.files.push({ path: 'vault/gone', bytes: 0, sha256: '' }); }, 'backup integrity check failed: vault/gone'],
+  ])('will not restore a manifest with %s', async (_name, edit, error) => {
+    const { root, home } = makeHome('karmax-backup-manifest-');
+    write(home, 'vault/value', 'original');
+    const destination = path.join(root, 'snapshot');
+    await createBackup({ home, destination, externalTemporal: true });
+    const manifestFile = path.join(destination, 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    edit(manifest);
+    fs.writeFileSync(manifestFile, JSON.stringify(manifest));
+    // An edited manifest no longer matches its signature; accepted unsigned,
+    // it is still checked for everything below.
+    fs.rmSync(path.join(destination, 'manifest.sig'));
+    write(home, 'vault/value', 'live');
+    expect(() => verifyBackup(destination, { home, acceptUnsignedV1: true })).toThrow(error);
+    await expect(restoreBackup(destination, { home, acceptUnsignedV1: true })).rejects.toThrow(error);
+    expect(fs.readFileSync(path.join(home, 'vault', 'value'), 'utf8')).toBe('live');
+  });
+
+  it('refuses to restore under a live app, and offers no way to force it', async () => {
+    const { root, home } = makeHome('karmax-restore-live-');
+    write(home, 'vault/value', 'backed-up');
+    await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    write(home, 'vault/value', 'live');
+    write(home, `state/instances/${process.ppid}.pid`, JSON.stringify({ pid: process.ppid, home }));
+    const error = await restoreBackup(path.join(root, 'snapshot'), { home }).catch((e: Error) => e);
+    expect((error as Error).message).toBe(`stop Krmax before restore (live app pids: ${process.ppid})`);
+    expect(fs.readFileSync(path.join(home, 'vault', 'value'), 'utf8')).toBe('live');
+  });
+
+  it('puts every component back when the swap fails partway', async () => {
+    const { root, home } = makeHome('karmax-restore-rollback-');
+    write(home, 'vault/value', 'backed-up vault');
+    write(home, 'content/page.md', 'backed-up content');
+    write(home, 'objects/blob', 'backed-up object');
+    await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    write(home, 'vault/value', 'live vault');
+    write(home, 'content/page.md', 'live content');
+    write(home, 'objects/blob', 'live object');
+    const rename = fs.renameSync;
+    // vault and content have been swapped in by the time objects fails.
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(to) === path.join(home, 'objects') && String(from).includes('.restore-stage-')) throw new Error('EXDEV: simulated');
+      return rename(from, to);
+    });
+    try {
+      await expect(restoreBackup(path.join(root, 'snapshot'), { home })).rejects.toThrow('EXDEV: simulated');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readFileSync(path.join(home, 'vault', 'value'), 'utf8')).toBe('live vault');
+    expect(fs.readFileSync(path.join(home, 'content', 'page.md'), 'utf8')).toBe('live content');
+    expect(fs.readFileSync(path.join(home, 'objects', 'blob'), 'utf8')).toBe('live object');
+    expect(fs.readdirSync(home).filter((name) => name.startsWith('.restore-'))).toEqual([]);
+  });
+
+  it.runIf(fs.existsSync('/proc/self/cmdline'))('stops the embedded Temporal server first, but never a stranger with its recycled pid', async () => {
+    const { root, home } = makeHome('karmax-restore-temporal-');
+    write(home, 'vault/value', 'backed-up');
+    await createBackup({ home, destination: path.join(root, 'snapshot') });
+    const idle = (...argv: string[]) => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', ...argv], { stdio: 'ignore' });
+    const exited = (child: ChildProcess) => new Promise<NodeJS.Signals | null>((resolve) => child.once('exit', (_code, signal) => resolve(signal)));
+    const temporal = idle('temporal', 'server', 'start-dev');
+    const stranger = idle('an-unrelated-process');
+    try {
+      const temporalExit = exited(temporal);
+      write(home, 'temporal/dev-server.json', JSON.stringify({ pid: temporal.pid }));
+      await restoreBackup(path.join(root, 'snapshot'), { home });
+      expect(await temporalExit).toBe('SIGTERM');
+
+      write(home, 'temporal/dev-server.json', JSON.stringify({ pid: stranger.pid }));
+      await restoreBackup(path.join(root, 'snapshot'), { home });
+      expect(stranger.exitCode).toBeNull();
+      expect(stranger.signalCode).toBeNull();
+      expect(() => process.kill(stranger.pid!, 0)).not.toThrow();
+    } finally {
+      temporal.kill('SIGKILL');
+      stranger.kill('SIGKILL');
+    }
   });
 });
 
@@ -562,3 +708,16 @@ describe('signed deployment backups (DB-10)', () => {
     expect(verifyDeploymentBackup(b.directory, { home: b.home, acceptUnsignedV1: true }).signedBy).toBeUndefined();
   });
 });
+
+function makeHome(prefix: string): { root: string; home: string } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  roots.push(root);
+  const home = path.join(root, 'home');
+  fs.mkdirSync(home, { recursive: true });
+  return { root, home };
+}
+
+function write(home: string, relative: string, contents: string): void {
+  fs.mkdirSync(path.dirname(path.join(home, relative)), { recursive: true });
+  fs.writeFileSync(path.join(home, relative), contents);
+}

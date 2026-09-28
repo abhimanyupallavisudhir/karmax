@@ -303,7 +303,7 @@ export class GithubPrApi {
     const marker = `<!-- karmax-comment:${createHash('sha256').update(key).digest('hex')} -->`;
     for (let page = 1; page <= 100; page++) {
       const comments = await this.request<Array<{ body?: string }>>(
-        `/repos/${slug}/issues/${number}/comments?per_page=100&page=${page}`);
+        `/repos/${repositorySlug(slug)}/issues/${number}/comments?per_page=100&page=${page}`);
       if (comments.some(comment => comment.body?.includes(marker))) return;
       if (comments.length < 100) {
         await this.comment(slug, number, `${body}\n\n${marker}`);
@@ -585,7 +585,8 @@ export class GithubPrApi {
           .map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean).join(' — ');
         return `${location ? `${location}: ` : ''}${message || annotation.annotation_level || 'check annotation'}`;
       }).join('\n');
-      check.detail = [check.detail, output, rendered].filter(Boolean).join('\n').slice(0, 24_000);
+      const detail = [check.detail, output, rendered].filter(Boolean).join('\n').slice(0, 24_000);
+      if (detail) check.detail = detail;
     }
     return candidates.map(({ databaseId: _databaseId, ...check }) => check);
   }
@@ -717,6 +718,18 @@ export function reconcilePullRequestView(
     return next === checkout.pr ? checkout : { ...checkout, pr: next };
   });
   return changed ? { ...view, pr, prs, checkouts } : view;
+}
+
+/**
+ * Apply the PR states `source` records to the same PRs in `view` (WF-32).
+ * `mergedOnly` carries just merges, which are immutable, for when `source`
+ * may be older than `view`: a workflow never sees a webhook's reconciliation,
+ * so its next publication would otherwise report a merged PR open again.
+ */
+export function withPullRequestStates(view: TaskView, source: TaskView | undefined, options: { mergedOnly?: boolean } = {}): TaskView {
+  const known = source ? [source.pr, ...(source.prs ?? []), ...(source.checkouts ?? []).map((checkout) => checkout.pr)] : [];
+  return known.reduce((next, pr) => !pr || (options.mergedOnly && !pr.merged) ? next
+    : reconcilePullRequestView(next, { repo: pr.slug, number: pr.number, state: pr.state, merged: pr.merged === true }), view);
 }
 
 /**

@@ -979,8 +979,7 @@ export class BudgetService {
    * or charged on it. The cap is CUMULATIVE, so this has to be recounted at every
    * point that can commit spend — a per-request check passes independently for
    * each of several queued requests, and letting them all through is exactly the
-   * breach the cap exists to prevent (the budget coordinator has guarded its own
-   * approval path this way from the start; see src/coordinators/budget.ts).
+   * breach the cap exists to prevent.
    *
    * A rail without its own ceiling can only run out of funds, never breach a cap,
    * so an oversized request there asks for a top-up rather than being denied.

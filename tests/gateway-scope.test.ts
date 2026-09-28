@@ -406,6 +406,52 @@ describe('gateway request scope for bare-id routes', () => {
     expect((await send(acmeTask.id, signaller)).status).toBe(403);
   });
 
+  // `?projectId=` used to outrank the addressed task's own project, so a token
+  // for one project could read, and run review actions in, any tenant's task
+  // just by naming its own project. The record decides; a contradiction is refused.
+  it('refuses a projectId or organizationId that contradicts the addressed task', async () => {
+    const foreign = (await store.createTask({ projectId: theirs, title: 'Theirs', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    const own = (await store.createTask({ projectId: mine, title: 'Mine', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    for (const t of [foreign, own]) (await store.saveView(t.id, {
+      taskId: t.id, title: t.title, workflow: t.workflow, stage: 'review', status: 'waiting', messages: [], actions: [], state: {}, updatedAt: 1,
+      reviewInfo: { summary: 'Check it', actions: [{ kind: 'open', label: 'Report', path: 'report.md' }] },
+    } as any));
+    const request = (taskId: string, route: string, query: string, init: RequestInit = {}) =>
+      fetch(`${base}/api/tasks/${taskId}/${route}${route.includes('?') ? '&' : '?'}${query}`, { headers: auth(), ...init });
+    const routes: Array<[string, RequestInit]> = [
+      ['responsibility', {}], ['subscribers', {}], ['widgets', {}], ['artifact?path=.env', {}],
+      ['review-action', { method: 'POST', body: JSON.stringify({ index: 0 }) }],
+      ['checkout', { method: 'POST', body: '{}' }], ['desktop', { method: 'POST', body: '{}' }],
+    ];
+    for (const [route, init] of routes) {
+      expect((await request(foreign.id, route, `projectId=${mine}`, init)).status, `${route} with a spoofed project`).toBe(403);
+      expect((await request(foreign.id, route, `organizationId=${acmeId}`, init)).status, `${route} with a spoofed organization`).toBe(403);
+    }
+    // The task's own project may still be named, and a contradiction is refused
+    // even for the caller's own task.
+    expect((await request(own.id, 'subscribers', `projectId=${mine}`)).status).toBe(200);
+    expect((await request(own.id, 'subscribers', `projectId=${theirs}`)).status).toBe(403);
+    // Bare-id records resolve the same way.
+    const foreignTag = (await store.createTag({ projectId: theirs, name: 'internal' }));
+    expect((await fetch(`${base}/api/tags/${foreignTag.id}?projectId=${mine}`, {
+      method: 'PATCH', headers: auth(), body: JSON.stringify({ name: 'pwned' }) })).status).toBe(403);
+    expect((await store.getTag(foreignTag.id))?.name).toBe('internal');
+  });
+
+  // Routes that fall back to the stored view when the live one is unavailable
+  // must not take that path when the live read was refused.
+  it('never serves a stored view to a caller refused the live one', async () => {
+    const task = (await store.createTask({ projectId: mine, title: 'Actions', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    (await store.saveView(task.id, {
+      taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting', messages: [], actions: [], state: {}, updatedAt: 1,
+      reviewInfo: { summary: 'Check it', actions: [{ kind: 'open', label: 'Report', path: 'report.md' }] },
+    } as any));
+    const executor = (await tokens.mintPrincipal('user:a', ['task:review:execute'], mine, 60_000, acmeId)).token;
+    const response = await fetch(`${base}/api/tasks/${task.id}/review-action`, { method: 'POST',
+      headers: { authorization: `Bearer ${executor}`, 'content-type': 'application/json' }, body: JSON.stringify({ index: 0 }) });
+    expect(response.status).toBe(403);
+  });
+
   it('answers a missing identifier with 404 rather than 500', async () => {
     const missing = await fetch(`${base}/api/tasks/task_missing/tag`, {
       method: 'POST', headers: auth(), body: JSON.stringify({ add: ['bug'] }),

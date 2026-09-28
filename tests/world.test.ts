@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { World } from '../src/world/types.js';
 import { git, gitOrThrow, currentBranch, ensureIdentity } from '../src/world/git.js';
-import { withWorktreeLock } from '../src/world/worktree-lock.js';
+import { holdWorktreeLock } from './helpers/lock-waiters.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { Store } from '../src/store/db.js';
 import { makeCoreActivities } from '../src/activities/core.js';
@@ -490,13 +490,13 @@ describe('WorktreeProvider (real git)', () => {
   it('creates a world only while holding the repo\'s worktree lock', async () => {
     const provider = new WorktreeProvider(home);
     let created = false;
-    let creating!: Promise<World>;
-    await withWorktreeLock(repo, async () => {
-      creating = provider.create({ taskId: 'arriving', repo, base: 'main', target: 'main' })
-        .then((world) => { created = true; return world; });
-      await new Promise((resolve) => setTimeout(resolve, 250));
+    const holder = holdWorktreeLock(repo);
+    const creating = provider.create({ taskId: 'arriving', repo, base: 'main', target: 'main' })
+      .then((world) => { created = true; return world; });
+    try {
+      await holder.waiting();
       expect(created, 'world creation ran its `worktree add` while another holder had the lock').toBe(false);
-    });
+    } finally { holder.release(); }
     await (await creating).destroy();
   });
 
@@ -504,11 +504,12 @@ describe('WorktreeProvider (real git)', () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'leaving', repo, base: 'main', target: 'main' });
     let released = false;
-    await withWorktreeLock(repo, async () => {
-      void world.destroy().then(() => { released = true; });
-      await new Promise((resolve) => setTimeout(resolve, 250));
+    const holder = holdWorktreeLock(repo);
+    void world.destroy().then(() => { released = true; });
+    try {
+      await holder.waiting();
       expect(released, 'world release ran its `worktree remove` while another holder had the lock').toBe(false);
-    });
+    } finally { holder.release(); }
     await vi.waitFor(() => expect(released).toBe(true));
   });
 });
