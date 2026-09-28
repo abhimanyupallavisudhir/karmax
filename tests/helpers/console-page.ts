@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { chromium, type Browser, type Page } from 'playwright';
+import { chromium, type Browser } from 'playwright';
 
 /**
  * The real console scripts in a real browser, with a scripted `/api`. For UI

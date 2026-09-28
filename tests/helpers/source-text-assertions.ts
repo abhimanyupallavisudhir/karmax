@@ -45,7 +45,7 @@ export function sourceTextAssertions(file: string): number {
 
 export function testFiles(root = 'tests'): string[] {
   return fs.readdirSync(root, { recursive: true, encoding: 'utf8' })
-    .filter((file) => /\.test\.ts$/.test(file))
+    .filter((file) => file.endsWith('.test.ts'))
     .map((file) => path.posix.join(root, file.split(path.sep).join('/')))
     .sort();
 }
