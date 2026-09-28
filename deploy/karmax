@@ -25,6 +25,39 @@ compact_backups() {
   sh "$DEPLOY_DIR/compact-backups.sh" "$DEPLOY_DIR/backups" || note 'Backup compaction failed; snapshots are retained.'
 }
 
+# Automatic snapshots are restore points for the last few deploys and days, not
+# an archive: each carries fresh database dumps, and kept forever they filled
+# tavya.io's disk (84 snapshots, 144 GB of 193 GB, in 15 days). The daily
+# scheduled snapshots cover the two weeks; a predeploy snapshot only matters for
+# undoing a recent deploy. Any other name is an operator's backup, never pruned.
+PREDEPLOY_KEEP=10
+prune_backups() {
+  backups="$DEPLOY_DIR/backups"
+  [ -d "$backups" ] || return 0
+  # Fixed-width UTC stamps: name order is age order.
+  for name in $(ls -1 "$backups" | grep -E '^predeploy-[0-9]{8}T[0-9]{6}Z$' | sort -r | tail -n "+$((PREDEPLOY_KEEP + 1))"); do
+    rm -rf "${backups:?}/$name"
+  done
+  find "$backups" -mindepth 1 -maxdepth 1 -type d -name 'scheduled-*' ! -name '*.partial.*' -mtime +14 -exec rm -rf {} +
+}
+
+# Housekeeping once the new revision serves; none of it may fail an update.
+reclaim_space() {
+  prune_backups || note 'Could not prune old snapshots; they are retained.'
+  compact_backups
+  prune_build_cache
+}
+
+# Each build leaves superseded layers behind, and the replaced image dangles;
+# unbounded, build cache alone reached 15.6 GB on tavya.io. A rollback rebuilds
+# the previous revision from source, so neither is needed once the update is up.
+prune_build_cache() {
+  docker image prune -f >/dev/null || true
+  docker builder prune -f --max-used-space 8gb >/dev/null 2>&1 \
+    || docker builder prune -f --keep-storage 8gb >/dev/null 2>&1 \
+    || docker builder prune -f --filter until=72h >/dev/null || true
+}
+
 need_docker() {
   command -v docker >/dev/null 2>&1 || die 'Docker is required: https://docs.docker.com/engine/install/'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required (the `docker compose` command)'
@@ -318,7 +351,6 @@ cmd_backup_candidate() {
   if ! chmod -R go-rwx "$destination"; then rm -rf "$destination"; return 1; fi
   note "Backup complete: $destination"
   note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
-  compact_backups
 }
 
 cmd_restore() {
@@ -535,6 +567,7 @@ cmd_update() {
     cleanup_migration
     migration_backup=''
     report_app_role || true
+    reclaim_space
     note "Update complete at $target."
     return 0
   fi
@@ -593,6 +626,7 @@ Usage: ./deploy/karmax COMMAND
   status                       Show service health
   logs [SERVICE]               Follow logs (app by default)
   backup [DIRECTORY]           Snapshot Karmax, object data, Temporal, and keys
+  prune-backups                Drop automatic snapshots past their retention
   restore DIRECTORY            Verify and restore a complete snapshot
   update [REVISION]             Backup, deploy an exact master revision, and restart
   rotate-postgres-password      Replace PostgreSQL's superuser password
@@ -608,6 +642,7 @@ case "$command" in
   status) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc ps ;;
   logs) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc logs -f --tail=200 "${1:-app}" ;;
   backup) cmd_backup "$@" ;;
+  prune-backups) prune_backups ;;
   restore) cmd_restore "$@" ;;
   update) cmd_update "$@" ;;
   rotate-postgres-password) cmd_rotate_postgres_password "$@" ;;

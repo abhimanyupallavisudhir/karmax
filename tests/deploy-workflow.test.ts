@@ -135,13 +135,20 @@ describe('post-push deployment to the public instance', () => {
   // Every push snapshots the vault and Temporal history before rebuilding.
   // Unpruned, that grows without bound until the disk fills and the instance
   // stops taking writes.
+  // The operator script owns retention (tests/deploy-lifecycle.test.ts pins
+  // the policy), so an update and the daily snapshot prune the same way.
   it('retains manual backups while pruning only automatic snapshots', () => {
-    expect(script).toContain("-name 'predeploy-*'");
+    const update = operator.split('cmd_update() {')[1]?.split('\n}')[0] ?? '';
+    const reclaim = operator.split('reclaim_space() {')[1]?.split('\n}')[0] ?? '';
+    expect(update).toContain('reclaim_space');
+    expect(reclaim).toContain('prune_backups');
+    expect(script).not.toContain('rm -rf');
     const backup = parse(fs.readFileSync(backupWorkflowPath, 'utf8'));
     expect(backup.on.schedule).toBeDefined();
     const steps = JSON.stringify(backup.jobs.backup.steps);
     expect(steps).toContain('scheduled-');
-    expect(steps).toMatch(/-name.*scheduled-\*/);
+    expect(steps).toContain('./deploy/karmax prune-backups');
+    expect(steps).not.toContain('rm -rf');
   });
 
   // `cmd_backup` runs inside the live app container. The backup API rejects a
@@ -229,6 +236,9 @@ it('updates a configured instance through the detached copy of the updater', () 
     git(host, 'add', '.'); git(host, 'commit', '-qm', 'candidate'); git(host, 'push', '-q', 'origin', 'master');
     const candidate = git(host, 'rev-parse', 'HEAD');
     git(host, 'checkout', '-q', '--detach', live);
+    // Ten earlier restore points: the update's own snapshot retires the oldest.
+    const earlier = Array.from({ length: 10 }, (_, i) => `predeploy-202609${String(10 + i)}T000000Z`);
+    for (const name of earlier) fs.mkdirSync(path.join(host, 'deploy/backups', name, 'control-plane'), { recursive: true });
     // The instance configuration lives beside the operator, outside Git.
     fs.writeFileSync(path.join(host, 'deploy/.turnkey.env'), 'KARMAX_DOMAIN=example.com\nPOSTGRES_PASSWORD=fixture\n');
     fs.mkdirSync(path.join(host, 'deploy/.secrets'));
@@ -262,6 +272,13 @@ ssh() { (cd ${JSON.stringify(root)} && bash -c "\${@: -1}"); }
     const calls = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]);
     // The copy drove the instance's own Compose project and environment.
     expect(calls.some(args => args.includes('up') && args.includes(path.join(host, 'deploy/.turnkey.env')))).toBe(true);
-    expect(fs.readdirSync(path.join(host, 'deploy/backups')).some(name => name.startsWith('predeploy-'))).toBe(true);
+    const snapshots = fs.readdirSync(path.join(host, 'deploy/backups')).filter(name => name.startsWith('predeploy-')).sort();
+    expect(snapshots).toHaveLength(10);
+    expect(snapshots.slice(0, 9)).toEqual(earlier.slice(1));
+    expect(snapshots[9]).not.toBe(earlier[9]);
+    // Superseded layers and the replaced image are cleaned up once the new app is ready.
+    const up = calls.findIndex(args => args.includes('up'));
+    expect(calls.findIndex(args => args.join(' ').startsWith('builder prune -f'))).toBeGreaterThan(up);
+    expect(calls.findIndex(args => args.join(' ') === 'image prune -f')).toBeGreaterThan(up);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
