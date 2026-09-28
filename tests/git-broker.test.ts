@@ -7,6 +7,7 @@ import { WorktreeProvider } from '../src/world/worktree.js';
 import { brokerEnrollRepository, brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerPushBranches, brokerRefreshUpstream } from '../src/world/git-broker.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { acquireFileLock } from '../src/util/file-lock.js';
+import { mirroredClone } from '../src/world/git-mirror.js';
 
 describe('cloud Git broker', () => {
   const cleanups: string[] = [];
@@ -783,6 +784,42 @@ describe('cloud Git broker', () => {
       expect((await git(f.remote, ['show', 'main:portable.txt'])).stdout).toBe('portable.txt\n');
       expect(mirrors()).toEqual([]);
       await f.destroy(world);
+    });
+
+    it('drops mirrored branches whose names conflict with a branch origin now has', async () => {
+      const f = await cloudFixture('renamed');
+      const seed = path.join(f.root, 'seed');
+      await gitOrThrow(f.root, ['clone', '-q', f.remote, seed]);
+      await ensureIdentity(seed);
+      const publish = async (to: string, file: string) => {
+        await gitOrThrow(seed, ['checkout', '-q', '-B', to, 'main']);
+        fs.writeFileSync(path.join(seed, file), `${file}\n`);
+        await gitOrThrow(seed, ['add', '-A']);
+        await gitOrThrow(seed, ['commit', '-q', '-m', file]);
+        await gitOrThrow(seed, ['push', '-q', 'origin', to]);
+        return (await git(seed, ['rev-parse', 'HEAD'])).stdout.trim();
+      };
+      const checkout = async (branch: string) => {
+        const dir = fs.mkdtempSync(path.join(f.root, 'scratch-'));
+        const cloned = await mirroredClone(f.sshRemote, path.join(dir, 'repo'), f.env, { branch, scratch: dir });
+        const head = (await git(cloned.clone, ['rev-parse', `refs/heads/${branch}`])).stdout.trim();
+        await cloned.release();
+        return head;
+      };
+      await publish('feature', 'feature.txt');
+      await publish('topic/x', 'topic.txt');
+      await checkout('feature');
+      await checkout('topic/x');
+      // Origin replaced `feature` with `feature/x` and `topic/x` with `topic`;
+      // the mirror still holds the old names.
+      await gitOrThrow(seed, ['checkout', '-q', 'main']);
+      await gitOrThrow(seed, ['push', '-q', 'origin', ':feature', ':topic/x']);
+      await gitOrThrow(seed, ['branch', '-q', '-D', 'feature', 'topic/x']);
+      const nested = await publish('feature/x', 'nested.txt');
+      const flat = await publish('topic', 'flat.txt');
+      expect(await checkout('feature/x')).toBe(nested);
+      expect(await checkout('topic')).toBe(flat);
+      expect(mirrors().filter((name) => name.endsWith('.git'))).toHaveLength(1);
     });
   });
 });

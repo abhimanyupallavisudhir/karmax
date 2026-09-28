@@ -81,6 +81,7 @@ export async function mirroredClone(source: string, clone: string, env: Record<s
       if (local.code !== 0 || local.stdout.trim() !== advertised.tips[name]) stale.push(name);
     }
     if (stale.length) {
+      await dropConflictingRefs(mirror, stale);
       const fetched = await git(mirror, [...QUIET_REPOSITORY, 'fetch', '--no-tags', '--no-write-fetch-head', source,
         ...stale.map((name) => `+refs/heads/${name}:refs/heads/${name}`)], { env, timeoutMs: 10 * 60_000 });
       if (fetched.code !== 0) throw new Error(fetched.stderr || fetched.stdout || 'git fetch failed');
@@ -136,6 +137,23 @@ function parseAdvertisement(output: string): { head?: string; tips: Record<strin
   }
   if (head && headTip) tips[head] ??= headTip;
   return { head, tips };
+}
+
+/** Origin cannot hold both `a` and `a/b`, so a mirrored branch that conflicts
+ * with a wanted name that way was deleted on origin, and would make the fetch
+ * fail for as long as the mirror lives. Deleting a ref removes no objects, so
+ * clones still borrowing the mirror are unaffected. */
+async function dropConflictingRefs(mirror: string, wanted: string[]): Promise<void> {
+  const listed = await git(mirror, ['for-each-ref', '--format=%(refname)', 'refs/heads/']);
+  if (listed.code !== 0) throw new Error(listed.stderr || listed.stdout);
+  const conflicting = listed.stdout.split('\n').filter(Boolean).filter((ref) => wanted.some((name) => {
+    const branch = ref.slice('refs/heads/'.length);
+    return branch.startsWith(`${name}/`) || name.startsWith(`${branch}/`);
+  }));
+  for (const ref of conflicting) {
+    const deleted = await git(mirror, ['update-ref', '-d', ref]);
+    if (deleted.code !== 0) throw new Error(deleted.stderr || deleted.stdout);
+  }
 }
 
 async function ensureMirror(mirror: string): Promise<void> {
