@@ -25,7 +25,19 @@ for (const provider of ['claude', 'codex'] as const) describe(`${provider} API t
     { headers: {}, detail: 'Rate limit reached on requests per min. Please try again in 120ms.', resetHint: 'in 1s' },
     { headers: {}, detail: 'Rate limit reached on requests per day. Please try again in 6m0s.', resetHint: 'in 360s' },
     { headers: {}, detail: 'rate limit exceeded, try again at 5:55 PM', resetHint: 'in 60s' },
-    { headers: { 'x-ratelimit-reset-requests': '6m0s', 'x-ratelimit-reset-tokens': '1s' }, detail: 'rate limit exceeded', resetHint: 'in 360s' },
+    // x-ratelimit-reset-* is the time to a FULL refill, so only the bucket
+    // that is empty says when a request can go again (#367 review item 11).
+    { headers: { 'x-ratelimit-remaining-requests': '0', 'x-ratelimit-reset-requests': '6m0s',
+      'x-ratelimit-remaining-tokens': '5000', 'x-ratelimit-reset-tokens': '1s' }, detail: 'rate limit exceeded', resetHint: 'in 360s' },
+    { headers: { 'x-ratelimit-remaining-tokens': '0', 'x-ratelimit-reset-tokens': '20ms' }, detail: 'rate limit exceeded', resetHint: 'in 1s' },
+    { headers: { 'x-ratelimit-reset-requests': '6m0s' }, detail: 'rate limit exceeded', resetHint: 'in 60s' },
+    // The message's own wait beats a refill time; the probe that parked a key 1,213 minutes.
+    { headers: { 'x-ratelimit-remaining-requests': '150', 'x-ratelimit-reset-requests': '20h13m0s',
+      'x-ratelimit-remaining-tokens': '0', 'x-ratelimit-reset-tokens': '59s' },
+      detail: 'Rate limit reached for gpt-5 on tokens per min. Please try again in 1.5s.', resetHint: 'in 2s' },
+    // Header waits are capped at a day, as message waits are.
+    { headers: { 'retry-after': String(3 * 86_400) }, detail: 'rate limit exceeded', resetHint: 'in 86400s' },
+    { headers: { 'x-ratelimit-remaining-requests': '0', 'x-ratelimit-reset-requests': '40h0m0s' }, detail: 'rate limit exceeded', resetHint: 'in 86400s' },
   ])('waits out an API throttle as the provider asks ($resetHint)', async ({ headers, detail, resetHint }) => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(detail, { status: 429, headers })));
     const failure: any = await adapter().runTurn(input, { emit() {} } as any).catch((error) => error);
