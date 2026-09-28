@@ -44,6 +44,15 @@ export interface GithubRefUpdateResult {
   message: string;
 }
 
+export interface GithubComparison {
+  /** Commits `head` has that `base` lacks. */
+  aheadBy: number;
+  /** Commits `base` has that `head` lacks: above zero, `head` never saw base's tip. */
+  behindBy: number;
+  /** The commit GitHub resolved `base` to for this comparison. */
+  baseSha?: string;
+}
+
 export interface GithubBranchUpdateResult {
   requested: boolean;
   headSha?: string;
@@ -309,6 +318,18 @@ export class GithubPrApi {
       }
     }
     throw new Error('cannot verify comment receipt within the pull request comment limit');
+  }
+
+  /** How `head` relates to `base`. A branch `base` is compared at its live
+   * tip, which the PR's own base commit may not yet reflect. */
+  async compare(slug: string, base: string, head: string): Promise<GithubComparison> {
+    const value = await this.request<any>(
+      `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`);
+    const aheadBy = Number(value?.ahead_by);
+    const behindBy = Number(value?.behind_by);
+    if (!Number.isSafeInteger(aheadBy) || aheadBy < 0 || !Number.isSafeInteger(behindBy) || behindBy < 0)
+      throw new Error(`GitHub did not report how ${head} relates to ${base}`);
+    return { aheadBy, behindBy, ...(value?.base_commit?.sha ? { baseSha: String(value.base_commit.sha) } : {}) };
   }
 
   /** Mirror an explicit krmax Human-confirm decision into GitHub's native PR

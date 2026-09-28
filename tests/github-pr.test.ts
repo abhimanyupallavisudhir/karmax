@@ -1663,6 +1663,163 @@ describe('GitHub-authoritative merge activity', () => {
   });
 });
 
+/** A repository where freshness is observable: every commit knows its
+ *  ancestors, and merges and branch updates create real descendants. No branch
+ *  has strict protection, so GitHub never reports BEHIND (GH-26). */
+function freshnessGithub(branches: Record<string, string>) {
+  const ancestry = new Map<string, Set<string>>(Object.values(branches).map((sha) => [sha, new Set([sha])]));
+  const prs = new Map<number, { head: string; ref: string; base: string; merged?: string }>();
+  const checks = new Map<string, string>();
+  const calls: string[] = [];
+  const commit = (sha: string, ...parents: string[]) => {
+    ancestry.set(sha, new Set([sha, ...parents.flatMap((parent) => [...ancestry.get(parent)!])]));
+    return sha;
+  };
+  const contains = (head: string, sha: string) => ancestry.get(head)!.has(sha);
+  const behindBy = (head: string, base: string) => [...ancestry.get(base)!].filter((sha) => !contains(head, sha)).length;
+  const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+    const url = new URL(String(input));
+    const method = init.method ?? 'GET';
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    calls.push(`${method} ${decodeURIComponent(url.pathname)}`);
+    const compare = decodeURIComponent(url.pathname).match(/\/compare\/(.+)\.\.\.(.+)$/);
+    if (compare) {
+      const base = branches[compare[1]!] ?? compare[1]!;
+      return Response.json({ status: 'diverged', base_commit: { sha: base },
+        ahead_by: behindBy(base, compare[2]!), behind_by: behindBy(compare[2]!, base) });
+    }
+    const number = Number(url.pathname.match(/\/pulls\/(\d+)/)?.[1] ?? body.variables?.number);
+    const pr = prs.get(number)!;
+    const view = () => ({ number, node_id: `PR_${number}`, html_url: `https://github.test/${SLUG}/pull/${number}`,
+      state: pr.merged ? 'closed' : 'open', merged: Boolean(pr.merged), ...(pr.merged ? { merge_commit_sha: pr.merged } : {}),
+      head: { ref: pr.ref, sha: pr.head }, base: { ref: pr.base } });
+    if (method === 'GET' && url.pathname.endsWith(`/pulls/${number}`)) return Response.json(view());
+    if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness')) {
+      const state = checks.get(pr.head) ?? 'PENDING';
+      return Response.json({ data: { repository: { pullRequest: {
+        id: `PR_${number}`, url: view().html_url, state: pr.merged ? 'MERGED' : 'OPEN', isDraft: false,
+        merged: Boolean(pr.merged), headRefOid: pr.head, baseRefOid: branches[pr.base], mergeable: 'MERGEABLE',
+        mergeStateStatus: state === 'SUCCESS' ? 'CLEAN' : 'UNSTABLE',
+        statusCheckRollup: { state, contexts: { nodes: [] } },
+        viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+    }
+    if (method === 'PUT' && url.pathname.endsWith('/update-branch')) {
+      expect(body).toEqual({ expected_head_sha: pr.head });
+      pr.head = commit(`${pr.head}+${branches[pr.base]}`, pr.head, branches[pr.base]!);
+      return Response.json({ message: 'Updating pull request branch.' }, { status: 202 });
+    }
+    if (method === 'PUT' && url.pathname.endsWith('/merge')) {
+      expect(body.sha).toBe(pr.head);
+      pr.merged = branches[pr.base] = commit(`merge-${number}`, branches[pr.base]!, pr.head);
+      return Response.json({ merged: true, sha: pr.merged, message: 'Pull Request successfully merged' });
+    }
+    return Response.json({ message: `unrouted ${method} ${url.pathname}` }, { status: 404 });
+  }) as typeof fetch;
+  return { fetcher, branches, prs, checks, calls, commit,
+    options: { apiBase: 'https://api.github.test', fetch: fetcher } };
+}
+
+async function freshnessCore(github: ReturnType<typeof freshnessGithub>) {
+  const core = await coreFor(github, {
+    activeUserAccountId: () => 'reviewer-account',
+    repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+    userAccessToken: async () => 'reviewer-token',
+  });
+  (await core.store.claimPersonalOrganization('owner'));
+  const project = (await core.store.createProject('Sub-task landing', { landingAuthority: 'auto' }));
+  (await core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member'));
+  (await core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer'));
+  const parent = (await core.store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev',
+    workflowVersion: '1.24.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
+  (await core.store.registerWorld({ id: parent.id, kind: 'worktree', branch: 'karmax/task_parent',
+    base: 'main', repo: tmp, root: tmp } as any, project.id));
+  /** A confirmed task with one open PR, landed the way fallback admission does. */
+  const confirmed = async (number: number, head: string, base: string, parentTaskId?: string) => {
+    const task = (await core.store.createTask({ projectId: project.id, title: `PR ${number}`, workflow: 'software-dev',
+      workflowVersion: '1.24.0', params: { prompt: 'x', base, target: base },
+      createdBy: { kind: 'user', userId: 'owner' }, ...(parentTaskId ? { parentTaskId } : {}) }));
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+      userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number, headSha: head }],
+    } }));
+    github.prs.set(number, { head, ref: `karmax/${task.id}`, base });
+    const handle = { id: task.id, kind: 'worktree', branch: `karmax/${task.id}`, base, repo: tmp, root: tmp } as any;
+    let prs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number, nodeId: `PR_${number}`,
+      url: `https://github.test/${SLUG}/pull/${number}`, state: 'open', headSha: head }];
+    return {
+      task,
+      land: async () => {
+        const result = await core.mergeGithubPrs(handle, prs, { mode: 'submit-fallback', authority: 'karmax' });
+        prs = result.prs;
+        return result;
+      },
+    };
+  };
+  return { core, parent, confirmed };
+}
+
+describe('Sub-task landing freshness (GH-26)', () => {
+  it('updates a green sibling that lacks the parent branch head and waits for its fresh checks', async () => {
+    const github = freshnessGithub({ 'karmax/task_parent': 'parent-0' });
+    github.checks.set(github.commit('first-head', 'parent-0'), 'SUCCESS');
+    github.checks.set(github.commit('second-head', 'parent-0'), 'SUCCESS');
+    const { core, parent, confirmed } = await freshnessCore(github);
+    const first = await confirmed(1, 'first-head', 'karmax/task_parent', parent.id);
+    const second = await confirmed(2, 'second-head', 'karmax/task_parent', parent.id);
+
+    await expect(first.land()).resolves.toMatchObject({ status: 'merged' });
+    expect(github.branches['karmax/task_parent']).toBe('merge-1');
+
+    // GitHub still calls the second PR CLEAN: its green CI never saw merge-1.
+    await expect(second.land()).resolves.toMatchObject({
+      status: 'waiting', landingOwner: 'karmax',
+      prs: [expect.objectContaining({ headSha: 'second-head+merge-1' })],
+      detail: expect.stringMatching(/mechanically updated/),
+    });
+    expect(github.calls).not.toContain('PUT /repos/acme/widgets/pulls/2/merge');
+    await expect(second.land()).resolves.toMatchObject({
+      status: 'waiting', detail: expect.stringMatching(/waiting for required checks/),
+    });
+    expect(github.prs.get(2)?.merged).toBeUndefined();
+
+    github.checks.set('second-head+merge-1', 'SUCCESS');
+    await expect(second.land()).resolves.toMatchObject({ status: 'merged' });
+    expect(github.calls.filter((call) => call.endsWith('/update-branch'))).toEqual(['PUT /repos/acme/widgets/pulls/2/update-branch']);
+    expect((await core.store.eventsOfTypes(second.task.id, ['github.pr.merged'])).map((event) => event.payload))
+      .toEqual([expect.objectContaining({ number: 2, sha: 'merge-2', strategy: 'provider-policy' })]);
+    expect(github.branches['karmax/task_parent']).toBe('merge-2');
+  });
+
+  it('merges a sibling whose head already contains the parent branch head without updating it', async () => {
+    const github = freshnessGithub({ 'karmax/task_parent': 'parent-0' });
+    github.branches['karmax/task_parent'] = github.commit('parent-1', 'parent-0');
+    github.checks.set(github.commit('fresh-head', 'parent-1'), 'SUCCESS');
+    const { parent, confirmed } = await freshnessCore(github);
+    const sibling = await confirmed(1, 'fresh-head', 'karmax/task_parent', parent.id);
+
+    await expect(sibling.land()).resolves.toMatchObject({ status: 'merged' });
+    expect(github.calls).toContain('GET /repos/acme/widgets/compare/karmax/task_parent...fresh-head');
+    expect(github.calls.some((call) => call.endsWith('/update-branch'))).toBe(false);
+    expect(github.branches['karmax/task_parent']).toBe('merge-1');
+  });
+
+  it("keeps GitHub's policy authoritative for a target that is not the parent's task branch", async () => {
+    const github = freshnessGithub({ main: 'main-0', 'karmax/task_parent': 'parent-0' });
+    github.branches.main = github.commit('main-1', 'main-0');
+    github.checks.set(github.commit('stale-head', 'main-0'), 'SUCCESS');
+    github.checks.set(github.commit('stale-child-head', 'main-0'), 'SUCCESS');
+    const { parent, confirmed } = await freshnessCore(github);
+    // A top-level task, and a sub-task whose PR targets another branch than its parent's.
+    const topLevel = await confirmed(1, 'stale-head', 'main');
+    const elsewhere = await confirmed(2, 'stale-child-head', 'main', parent.id);
+
+    await expect(topLevel.land()).resolves.toMatchObject({ status: 'merged' });
+    await expect(elsewhere.land()).resolves.toMatchObject({ status: 'merged' });
+    expect(github.calls.some((call) => call.includes('/compare/') || call.endsWith('/update-branch'))).toBe(false);
+  });
+});
+
 describe('PR stage (remote policy "pr")', () => {
   it('pushes the task branch and opens a PR carrying the task summary', async () => {
     const gh = fakeGithub();
