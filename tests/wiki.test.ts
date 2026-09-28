@@ -964,6 +964,93 @@ describe('remote task wiki views', () => {
   });
 });
 
+describe('browsing a remote task wiki', () => {
+  const setup = async () => {
+    const contentDir = tmp();
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Remote org' }));
+    const project = (await store.createProject('Remote project', {}, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Cloud task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    const done = (await store.createTask({ projectId: project.id, title: 'Finished task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    const remoteHandle = (id: string): any => ({ kind: 'fake-remote', id, root: '/remote/world', branch: `karmax/${id}`, base: 'main',
+      repos: [{ name: 'project-wiki', role: 'project-wiki', repo: 'git@github.com:acme/wiki.git',
+        root: '/remote/world/project-wiki', branch: `karmax/${id}`, base: 'main', target: 'main' }] });
+    const handle = remoteHandle(task.id);
+    (await store.registerWorld(handle, project.id));
+    const doneHandle = remoteHandle(done.id);
+    (await store.registerWorld(doneHandle, project.id));
+    (await store.setWorldState(doneHandle, 'released'));
+    const files = new Map<string, Buffer>([
+      ['project-wiki/notes/a/SKILL.md', Buffer.from('Page A.')],
+      ['project-wiki/notes/b/SKILL.md', Buffer.from('Page B.')],
+      ['project-wiki/reviews/2026-09-26/SKILL.md', Buffer.from('Review.')],
+    ]);
+    const counts = { open: 0, read: 0 };
+    const world: any = {
+      handle,
+      listFiles: async () => [...files.keys()],
+      readFileBuffer: async (file: string) => { counts.read++; return files.get(file)!; },
+      writeFileBuffer: async (file: string, value: Buffer) => { files.set(file, Buffer.from(value)); },
+      writeFile: async (file: string, value: string) => { files.set(file, Buffer.from(value)); },
+      exec: async () => ({ code: 0, stdout: '', stderr: '' }),
+      destroy: async () => {},
+    };
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'fake-remote', parkable: false, capabilities: { remote: true },
+      create: async () => world, open: async () => { counts.open++; return world; } } as any);
+    const tokens = new TokenAuthority();
+    const token = (await tokens.mint({ taskId: 't', profileId: 'do', principal: 'user:a',
+      projectId: project.id, organizationId: organization.id,
+      ceiling: ['project:read', 'skill:write'], grantorCaps: ['project:read', 'skill:write'] })).token;
+    const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens, contentDir, worlds } as any);
+    const cleanup = async () => { (await store.close()); fs.rmSync(contentDir, { recursive: true, force: true }); };
+    const agentToken = (await tokens.mint({ taskId: task.id, profileId: 'do', principal: `task-agent:${task.id}:do`,
+      projectId: project.id, organizationId: organization.id, ceiling: ['project:read'], grantorCaps: ['project:read'] })).token;
+    return { api, token, agentToken, project, task, done, files, counts, cleanup };
+  };
+
+  it('serves the index and every page after it from one copy of the sandbox', async () => {
+    const { api, token, project, task, files, counts, cleanup } = await setup();
+    try {
+      const view = { taskId: task.id };
+      const index = await api.readWikiResolved(token, 'project', project.id, '', view) as any;
+      expect(index.toc.children.map((entry: any) => entry.name)).toEqual(expect.arrayContaining(['notes', 'reviews']));
+      expect((await api.readWikiResolved(token, 'project', project.id, 'notes/a', view) as any).page.content).toBe('Page A.');
+      expect((await api.readWikiResolved(token, 'project', project.id, 'notes/b', view) as any).page.content).toBe('Page B.');
+      expect(counts).toEqual({ open: 1, read: 3 });
+
+      // An edit made through karmax is visible on the very next read.
+      await api.saveWikiPageResolved(token, 'project', project.id, { path: 'notes/a', content: 'Edited.' }, view);
+      expect(files.get('project-wiki/notes/a/SKILL.md')!.toString()).toBe('Edited.');
+      expect((await api.readWikiResolved(token, 'project', project.id, 'notes/a', view) as any).page.content).toBe('Edited.');
+    } finally { await cleanup(); }
+  });
+
+  it("keeps the task's own agent reading its live checkout", async () => {
+    const { api, token, agentToken, project, task, files, cleanup } = await setup();
+    try {
+      const view = { taskId: task.id };
+      await api.readWikiResolved(token, 'project', project.id, 'notes/a', view);
+      // The agent edits the page with its shell inside the sandbox.
+      files.set('project-wiki/notes/a/SKILL.md', Buffer.from('Written by the agent.'));
+      expect((await api.readWikiResolved(agentToken, 'project', project.id, 'notes/a') as any).page.content)
+        .toBe('Written by the agent.');
+      // A person browsing moments later still gets the shared copy.
+      expect((await api.readWikiResolved(token, 'project', project.id, 'notes/a', view) as any).page.content).toBe('Page A.');
+    } finally { await cleanup(); }
+  });
+
+  it('offers only task views that can still be opened', async () => {
+    const { api, token, project, task, cleanup } = await setup();
+    try {
+      const refs = await api.wikiViews(token, project.id);
+      expect(refs.tasks.map((entry: any) => entry.id)).toEqual([task.id]);
+    } finally { await cleanup(); }
+  });
+});
+
 describe('wiki symlink confinement', () => {
   /**
    * A container world's root is bind-mounted from the host, and the project wiki's

@@ -77,7 +77,7 @@ import { credentialResource, resourceDriverCatalog, snapshotResource } from '../
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
-import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
+import { worldRepos, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
@@ -522,6 +522,10 @@ export function toPublicPayload(value: unknown): unknown {
         ? handle.meta as Record<string, unknown>
         : undefined;
       if (handleMeta?.environmentFlavor === 'desktop') out.worldDesktop = true;
+      // The wiki checkout's folder name (never its location), so citations of
+      // wiki files link to the wiki view rather than to a file handoff.
+      const wiki = worldRepos(handle as unknown as WorldHandle).find((repo) => repo.role === 'project-wiki');
+      if (wiki?.root) out.worldWiki = wiki.root.replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop();
     }
   }
   return out;
@@ -4824,6 +4828,8 @@ export class Gateway {
         const line = body.line == null ? undefined : Number(body.line);
         if (line !== undefined && (!Number.isInteger(line) || line < 1))
           return this.json(res, 400, { error: 'line must be a positive integer' });
+        const wiki = await this.deps.handoffs.wikiCitation(taskId, String(body.path ?? ''));
+        if (wiki) return this.json(res, 200, wiki);
         try { return this.json(res, 200, await this.deps.handoffs.openFile(taskId, view, String(body.path ?? ''), line)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
@@ -4837,6 +4843,8 @@ export class Gateway {
         const line = body.line == null ? undefined : Number(body.line);
         if (line !== undefined && (!Number.isInteger(line) || line < 1))
           return this.json(res, 400, { error: 'line must be a positive integer' });
+        const wiki = await this.deps.handoffs.wikiCitation(taskId, String(body.path ?? ''));
+        if (wiki) return this.json(res, 200, wiki);
         try { return this.json(res, 200,
           (await this.deps.handoffs.fileCheckout(taskId, view, String(body.path ?? ''), line))); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
