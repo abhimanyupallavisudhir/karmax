@@ -450,10 +450,12 @@ describe('zero-exposure CDP fill (§5B)', () => {
         const msg = JSON.parse(String(raw));
         received.push(msg);
         let result: any = {};
+        if (msg.method === 'Page.getFrameTree') result = { frameTree: { frame: { id: 'main' } } };
+        if (msg.method === 'Page.createIsolatedWorld') result = { executionContextId: 7 };
         if (msg.method === 'Runtime.evaluate') {
           result = msg.params.expression === 'location.origin'
             ? { result: { value: origin } }
-            : { result: { value: true } }; // selector focus succeeds
+            : { result: { value: { origin } } }; // the in-page check or write succeeds
         }
         socket.send(JSON.stringify({ id: msg.id, result }));
       });
@@ -474,8 +476,10 @@ describe('zero-exposure CDP fill (§5B)', () => {
     try {
       const out = await fillViaCdp({ cdpUrl: `http://127.0.0.1:${b.port}`, selector: '#password', text: 's3cret', expectDomains: ['github.com'] });
       expect(out.origin).toBe('https://github.com');
-      const insert = b.received.find((m) => m.method === 'Input.insertText');
-      expect(insert?.params?.text).toBe('s3cret');
+      // Checked, then written, in the page's isolated world; the check never carries the secret.
+      const inPage = b.received.filter((m) => m.method === 'Runtime.evaluate' && m.params?.contextId === 7);
+      expect(inPage.map((m) => m.params.expression.includes('"s3cret"'))).toEqual([false, true]);
+      expect(b.received.some((m) => m.method === 'Input.insertText')).toBe(false);
       expect(JSON.stringify(out)).not.toContain('s3cret');
     } finally {
       await b.close();
