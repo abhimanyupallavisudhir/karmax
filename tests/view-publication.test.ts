@@ -82,6 +82,37 @@ describe('durable conversation publication', () => {
     } finally { await store.close(); }
   });
 
+  // RT-30a: tasks that settled before terminal publications pruned turn
+  // checkpoints kept their run-scoped and legacy rows forever, including tasks
+  // an earlier sweep had already marked as swept.
+  it.each(['unswept', 'swept by the earlier sweep'])('prunes a settled task\'s pre-fix turn checkpoints (%s)', async (history) => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Retention');
+    const task = await store.createTask({ projectId: project.id, title: 'Old', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'fixture', _workflowRunId: 'last-run' } });
+    const other = await store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'fixture', _workflowRunId: 'live-run' } });
+    const day = 24 * 60 * 60 * 1000;
+    const stale = [`turnsession:${task.id}:run#1`, `turnresult:${task.id}:do:${task.id}:run#1`, `turnspawns:${task.id}#0`,
+      `task-create:${task.id}:run:child`, 'turnsession:legacy:last-run:activity', 'turnspawns:legacy:last-run:activity',
+      ...(history === 'unswept' ? ['turnsession:legacy:earlier-run:activity'] : [])];
+    const kept = [`session:${task.id}:do`, `turnsession:${other.id}:run#1`, `turnresult:${other.id}:do:${other.id}:run#1`,
+      'turnsession:legacy:live-run:activity'];
+    try {
+      if (history === 'unswept') await store.kvSet(`view-publication-fence:${task.id}:earlier-run:publish`, '1');
+      await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
+      const settledAt = Date.now();
+      if (history !== 'unswept') await store.kvSet(`retention:view:${task.id}`, '1');
+      for (const key of [...stale, ...kept]) await store.kvSet(key, 'saved');
+      const swept = await store.retentionSweep(settledAt + 9 * day);
+      expect(swept.turnSessions).toBe(stale.length);
+      for (const key of stale) expect(await store.kvGet(key)).toBeUndefined();
+      for (const key of kept) expect(await store.kvGet(key)).toBe('saved');
+      expect((await store.retentionSweep(settledAt + 10 * day)).turnSessions).toBe(0);
+    } finally { await store.close(); }
+  });
+
   it('restarts the retention window when a settled task is resumed', async () => {
     const store = await Store.create(':memory:');
     const project = await store.createProject('Retention');

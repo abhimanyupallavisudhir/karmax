@@ -7609,23 +7609,34 @@ export class Store {
     (await this.db.prepare(`INSERT OR IGNORE INTO kv(k,v) SELECT 'retention:settled:' || id, ? FROM tasks
       WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`).run(String(now)));
-    const settled = await this.db.prepare(`SELECT tasks.id, tasks.conversationRef FROM tasks
+    // Marker '2' also covers turn checkpoints in every key form (RT-30a), so
+    // tasks the earlier sweep marked '1' are swept once more.
+    const settled = await this.db.prepare(`SELECT tasks.id, tasks.conversationRef,
+        json_extract(tasks.params, '$._workflowRunId') runId FROM tasks
       JOIN kv settle ON settle.k='retention:settled:' || tasks.id
       WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
         AND CAST(settle.v AS BIGINT) < ?
-        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`)
-      .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null }>;
+        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id AND v='2')`)
+      .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null; runId: string | null }>;
     for (const task of settled) {
       const snapshotPrefix = `view-conversation:${task.id}:`;
       viewSnapshots += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<? AND k<>?`)
         .run(snapshotPrefix, `view-conversation:${task.id};`, `${snapshotPrefix}${task.conversationRef ?? ''}`)).changes);
       const fencePrefix = `view-publication-fence:${task.id}:`;
+      // Legacy turn ids are keyed by run, not task: the runs this task published
+      // from are named in its fences, and its last run in its params.
+      const runs = new Set((await this.kvEntries(fencePrefix)).map(({ key }) => key.slice(fencePrefix.length).split(':')[0]!));
+      if (typeof task.runId === 'string' && task.runId) runs.add(task.runId);
       publicationFences += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
         .run(fencePrefix, `view-publication-fence:${task.id};`)).changes);
-      const sessionPrefix = `turnsession:${task.id}#`;
-      turnSessions += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
-        .run(sessionPrefix, `turnsession:${task.id}$`)).changes);
-      (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:view:${task.id}`, '1'));
+      // The same checkpoints a terminal publication clears (`clearTurnCheckpoints`),
+      // for tasks that settled before it did.
+      for (const prefix of [`turnsession:${task.id}#`, `turnsession:${task.id}:`, `turnresult:${task.id}:`,
+        `turnspawns:${task.id}#`, `task-create:${task.id}:`,
+        ...[...runs].filter(Boolean).flatMap((run) => [`turnsession:legacy:${run}:`, `turnspawns:legacy:${run}:`])])
+        turnSessions += (await this.kvDeletePrefix(prefix));
+      (await this.db.prepare('INSERT INTO kv(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v = excluded.v')
+        .run(`retention:view:${task.id}`, '2'));
     }
 
     return {
@@ -7727,11 +7738,12 @@ export class Store {
 
   /** Delete every key starting with `prefix` through the primary-key range; the
    * literal prefix check keeps exact semantics under any collation (PS-8). */
-  private async kvDeletePrefix(prefix: string): Promise<void> {
+  private async kvDeletePrefix(prefix: string): Promise<number> {
     const key = this.kvRangeKey();
     const end = this.kvPrefixEnd(prefix);
-    if (end) await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND ${key} < ? AND substr(k, 1, length(?))=?`).run(prefix, end, prefix, prefix);
-    else await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND substr(k, 1, length(?))=?`).run(prefix, prefix, prefix);
+    return Number((end
+      ? await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND ${key} < ? AND substr(k, 1, length(?))=?`).run(prefix, end, prefix, prefix)
+      : await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND substr(k, 1, length(?))=?`).run(prefix, prefix, prefix)).changes);
   }
 
   async kvEntries(prefix: string): Promise<Array<{ key: string; value: string }>> {
