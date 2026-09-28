@@ -245,8 +245,11 @@ jobs:
             JOIN pg_roles r ON r.rolname = a.usename WHERE a.datname = 'karmax'")
           echo "karmax database sessions: $sessions"
           [ "$sessions" = 'karmax superuser=false' ]
+          # The operator's own check reports the same.
+          ./deploy/karmax doctor | tee "$RUNNER_TEMP/doctor.log"
+          grep -F 'The app connects to PostgreSQL as karmax, not a superuser.' "$RUNNER_TEMP/doctor.log"
           [ "$(query karmax "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner <> 'karmax'")" = 0 ]
-          url=$(cat deploy/.secrets/database_url)
+          url=$(docker compose exec -T app cat /run/karmax-database/database_url)
           docker compose exec -T postgresql psql "${url%@*}@127.0.0.1:5432/karmax" -Atc 'SELECT 1'
           if docker compose exec -T postgresql psql "${url%@*}@127.0.0.1:5432/temporal" -Atc 'SELECT 1' 2>/dev/null; then
             echo "the app's role can connect to Temporal's database" >&2
@@ -254,7 +257,7 @@ jobs:
           fi
           password=$(sed -n 's/^POSTGRES_PASSWORD=//p' deploy/.turnkey.env)
           [ -n "$password" ]
-          if docker compose exec -T app sh -c 'env; cat /run/secrets/*' | grep -qF "$password"; then
+          if docker compose exec -T app sh -c 'env; cat /run/secrets/* /run/karmax-database/*' | grep -qF "$password"; then
             echo 'the PostgreSQL superuser password reached the app container' >&2
             exit 1
           fi

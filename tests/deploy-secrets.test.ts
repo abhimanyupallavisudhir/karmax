@@ -169,24 +169,18 @@ describe('turnkey backup publication', () => {
 
 describe('turnkey deployment secrets', () => {
   const secretsDir = generateSecrets();
-  const secrets = ['auth_secret', 'vault_key', 'world_ref_key', 'database_url'];
+  const secrets = ['auth_secret', 'vault_key', 'world_ref_key'];
 
-  it('generates every secret the compose profile mounts', () => {
+  // An update runs the installed release's script, which cannot generate a
+  // host secret a newer release adds; Compose would refuse to mount it. So
+  // new credentials come from a job instead (postgres/karmax-role.sh).
+  it('generates every secret the compose profile mounts, and mounts no new one', () => {
     const compose = fs.readFileSync(path.join(deployDir, 'compose.turnkey.yml'), 'utf8');
     const mounted = Object.keys(parse(compose).secrets as Record<string, unknown>);
     expect(mounted.sort()).toEqual([...secrets].sort());
     for (const name of secrets) {
       expect(fs.existsSync(path.join(secretsDir, name)), `${name} was not generated`).toBe(true);
     }
-  });
-
-  // The app's own login (deploy/postgres/karmax-role.sh), not the superuser's.
-  it('generates the app database login once and keeps it across re-runs', () => {
-    const file = path.join(secretsDir, 'database_url');
-    const url = fs.readFileSync(file, 'utf8');
-    expect(url).toMatch(/^postgres:\/\/karmax:[0-9a-f]{64}@postgresql:5432\/karmax\n$/);
-    rerunUp(path.dirname(secretsDir));
-    expect(fs.readFileSync(file, 'utf8')).toBe(url);
   });
 
   // The app container runs as its own uid and compose bind-mounts these files

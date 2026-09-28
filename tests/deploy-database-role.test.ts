@@ -14,7 +14,8 @@ const roleSql = read('postgres/karmax-role.sql');
 
 type Service = { environment?: Record<string, string>; secrets?: string[]; depends_on?: Record<string, { condition: string }>;
   entrypoint?: string[]; volumes?: string[]; image?: string };
-const turnkey = parse(read('compose.turnkey.yml')) as { services: Record<string, Service>; secrets: Record<string, { file: string }> };
+const turnkey = parse(read('compose.turnkey.yml')) as { services: Record<string, Service>; secrets: Record<string, { file: string }>;
+  volumes: Record<string, unknown> };
 
 // The turnkey app used to connect as `temporal`, the cluster's bootstrap
 // superuser: a compromised app could read every Temporal history, create
@@ -23,11 +24,16 @@ describe('turnkey PostgreSQL credentials', () => {
   const app = turnkey.services.app!;
   const job = turnkey.services['karmax-database']!;
 
-  it('gives the app its own database URL as a secret file, never the superuser password', () => {
+  // An update runs the installed release's deploy/karmax, which cannot know
+  // a host secret file this release adds, and Compose refuses to mount a
+  // missing one. So the role job generates the app's URL into a volume.
+  it('gives the app its own database URL from the role job, never the superuser password', () => {
     expect(app.environment?.KARMAX_DATABASE_URL).toBeUndefined();
-    expect(app.environment?.KARMAX_DATABASE_URL_FILE).toBe('/run/secrets/database_url');
-    expect(app.secrets).toContain('database_url');
-    expect(turnkey.secrets.database_url).toEqual({ file: './.secrets/database_url' });
+    expect(app.environment?.KARMAX_DATABASE_URL_FILE).toBe('/run/karmax-database/database_url');
+    expect(app.volumes).toContain('karmax_database:/run/karmax-database:ro');
+    expect(app.secrets).not.toContain('database_url');
+    expect(Object.keys(turnkey.secrets).sort()).toEqual(['auth_secret', 'vault_key', 'world_ref_key']);
+    expect(Object.keys(turnkey.volumes)).toContain('karmax_database');
     expect(JSON.stringify(app)).not.toContain('POSTGRES_PASSWORD');
   });
 
@@ -36,36 +42,55 @@ describe('turnkey PostgreSQL credentials', () => {
     expect(job.depends_on?.['temporal-schema']?.condition).toBe('service_completed_successfully');
     expect(app.depends_on?.['karmax-database']?.condition).toBe('service_completed_successfully');
     expect(job.environment?.PGUSER).toBe('temporal');
-    expect(job.secrets).toEqual(['database_url']);
+    expect(job.secrets).toBeUndefined();
+    expect(job.volumes).toContain('karmax_database:/run/karmax-database');
     expect(job.entrypoint).toEqual(['/bin/sh', '/scripts/karmax-role.sh']);
   });
 });
 
 describe('deploy/postgres/karmax-role.sh', () => {
-  /** Run the script with a `psql` stub that records what it was given. */
-  function run(url: string) {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-role-script-'));
-    try {
-      const bin = path.join(home, 'bin');
-      fs.mkdirSync(bin);
-      fs.writeFileSync(path.join(bin, 'psql'), `#!/bin/sh\nprintf '%s\\n' "$PGOPTIONS" "$*" > "${home}/psql"\n`, { mode: 0o755 });
-      fs.writeFileSync(path.join(home, 'database_url'), `${url}\n`);
-      const result = spawnSync('sh', [path.join(deployDir, 'postgres', 'karmax-role.sh')], {
-        encoding: 'utf8',
-        env: { PATH: `${bin}:${process.env.PATH}`, KARMAX_DATABASE_URL_FILE: path.join(home, 'database_url') },
-      });
-      const psql = fs.existsSync(path.join(home, 'psql')) ? fs.readFileSync(path.join(home, 'psql'), 'utf8').split('\n') : undefined;
-      return { status: result.status, stderr: result.stderr, psql };
-    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  /** Run the script with a `psql` stub that records what it was given, in a
+   *  credentials directory holding `url` (none when undefined). */
+  function run(url: string | undefined, home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-role-script-'))) {
+    const bin = path.join(home, 'bin');
+    const file = path.join(home, 'credentials', 'database_url');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(path.join(bin, 'psql'), `#!/bin/sh\nprintf '%s\\n' "$PGOPTIONS" "$*" > "${home}/psql"\n`, { mode: 0o755 });
+    fs.rmSync(path.join(home, 'psql'), { force: true });
+    if (url !== undefined) fs.writeFileSync(file, `${url}\n`);
+    const result = spawnSync('sh', [path.join(deployDir, 'postgres', 'karmax-role.sh')], {
+      encoding: 'utf8',
+      env: { PATH: `${bin}:${process.env.PATH}`, KARMAX_DATABASE_URL_FILE: file },
+    });
+    const psql = fs.existsSync(path.join(home, 'psql')) ? fs.readFileSync(path.join(home, 'psql'), 'utf8').split('\n') : undefined;
+    return { status: result.status, stderr: result.stderr, psql, file, home };
   }
+  const homes: string[] = [];
+  afterAll(() => { for (const home of homes) fs.rmSync(home, { recursive: true, force: true }); });
+  const tracked = (url: string | undefined) => { const result = run(url); homes.push(result.home); return result; };
 
   it('applies the role SQL to the karmax database with the password from the app URL', () => {
     const password = 'ab'.repeat(32);
-    const { status, psql } = run(`postgres://karmax:${password}@postgresql:5432/karmax`);
+    const { status, psql } = tracked(`postgres://karmax:${password}@postgresql:5432/karmax`);
     expect(status).toBe(0);
     expect(psql![0]).toBe(`-c karmax.app_role=karmax -c karmax.app_password=${password} `
       + '-c karmax.private_databases=temporal,temporal_visibility');
     expect(psql![1]).toBe(`-v ON_ERROR_STOP=1 -d karmax -f ${path.join(deployDir, 'postgres', 'karmax-role.sql')}`);
+  });
+
+  it('generates the URL once, readable by the app, when the volume has none', () => {
+    const first = tracked(undefined);
+    expect(first.status, first.stderr).toBe(0);
+    const url = fs.readFileSync(first.file, 'utf8');
+    const [, password] = /^postgres:\/\/karmax:([0-9a-f]{64})@postgresql:5432\/karmax\n$/.exec(url) ?? [];
+    expect(password).toBeDefined();
+    expect(first.psql![0]).toContain(`-c karmax.app_password=${password} `);
+    expect(fs.statSync(first.file).mode & 0o777).toBe(0o644);
+    const again = run(undefined, first.home);
+    expect(again.status, again.stderr).toBe(0);
+    expect(fs.readFileSync(first.file, 'utf8')).toBe(url);
+    expect(fs.readdirSync(path.dirname(first.file))).toEqual(['database_url']);
   });
 
   // The password travels inside a connection option, so it must be exactly
@@ -74,9 +99,8 @@ describe('deploy/postgres/karmax-role.sh', () => {
     'postgres://temporal:abc@postgresql:5432/karmax',
     `postgres://karmax:${'ab'.repeat(32)} -c x=y@postgresql:5432/karmax`,
     'postgres://karmax:short@postgresql:5432/karmax',
-    '',
-  ])('refuses a URL deploy/karmax did not generate: %s', (url) => {
-    const { status, stderr, psql } = run(url);
+  ])('refuses a URL it did not generate: %s', (url) => {
+    const { status, stderr, psql } = tracked(url);
     expect(status).not.toBe(0);
     expect(stderr).toContain('database_url');
     expect(psql).toBeUndefined();

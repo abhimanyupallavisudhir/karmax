@@ -207,7 +207,7 @@ release their execution lease when finished.
 ## Operations
 
 ```bash
-./deploy/karmax doctor              # Compose, secrets, containers, DNS/HTTPS
+./deploy/karmax doctor              # Compose, secrets, containers, database role, DNS/HTTPS
 ./deploy/karmax status
 ./deploy/karmax logs                # or: logs temporal
 ./deploy/karmax backup              # deploy/backups/<UTC timestamp>
@@ -270,9 +270,35 @@ durable local object storage and an embedded PostgreSQL-backed data/Temporal clu
 It is the clean choice for one VPS and can serve many users, but its availability
 is that VPS plus your backup/restore policy. The app connects as its own `karmax`
 role, which owns the `karmax` database and nothing else; Temporal and the
-backup commands keep the `temporal` superuser. `deploy/karmax` generates the
-app's URL in `.secrets/database_url`, and `postgres/karmax-role.sql` re-applies
-the role on every start.
+backup commands keep the `temporal` superuser. On every start the one-shot
+`karmax-database` job (`postgres/karmax-role.sh`) re-applies the role, taking
+over anything an older release or a restore created as the superuser. It
+generates the app's URL once into the `karmax_database` Docker volume, which
+only it and the app mount; deleting that volume rotates the app's password at
+the next `up`. `./deploy/karmax doctor` reports which role the app is
+connected as, and warns if it is the superuser: a `KARMAX_DATABASE_URL` in
+the app's `/var/lib/karmax/karmax.env` overrides the role's URL.
+
+Releases before the `karmax` role gave the app the `temporal` superuser
+password. After the first update to a release with the role, confirm it with
+`./deploy/karmax doctor`, then rotate that password, since the old app
+process held it:
+
+```bash
+password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+./deploy/karmax backup
+docker compose --project-directory deploy --env-file deploy/.turnkey.env -f deploy/compose.turnkey.yml \
+  exec -T postgresql psql -U temporal -d postgres -v ON_ERROR_STOP=1 \
+  -c "ALTER ROLE temporal PASSWORD '$password'"
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$password/" deploy/.turnkey.env
+./deploy/karmax up
+./deploy/karmax doctor
+```
+
+The `postgresql` service reads `POSTGRES_PASSWORD` only when it initializes an
+empty volume, so the `ALTER ROLE` is what changes the password; `up` restarts
+Temporal and the jobs with the new value. Temporal is briefly unavailable
+between the two steps, and in-flight workflows resume once it reconnects.
 
 Larger installations can use `compose.hosted.yml` with managed PostgreSQL,
 managed Temporal, S3, and one active Karmax cell. Copy `.env.example`, provide

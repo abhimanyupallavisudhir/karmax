@@ -58,24 +58,20 @@ secret_mode() { chmod 644 "$@"; }
 
 write_secret() {
   file="$SECRETS_DIR/$1"
-  [ -s "$file" ] || random_hex 48 > "$file"
-  secret_mode "$file"
+  { [ -s "$file" ] || random_hex 48 > "$file"; } && secret_mode "$file"
 }
 
 # Every secret compose.turnkey.yml mounts; existing ones are kept. Updates and
 # restores call this too, so a release that mounts a new secret can start.
-# A subshell, so the umask cannot reach files a later checkout writes.
+# A subshell, so the umask cannot reach files a later checkout writes. Every
+# step checks its status because callers test it with `if`, where `set -e`
+# does not apply.
 ensure_secrets() (
   umask 077
-  mkdir -p "$SECRETS_DIR"
-  chmod 700 "$SECRETS_DIR"
-  write_secret auth_secret
-  write_secret vault_key
-  write_secret world_ref_key
-  # The app's own PostgreSQL login, not the superuser (postgres/karmax-role.sh).
-  file="$SECRETS_DIR/database_url"
-  [ -s "$file" ] || printf 'postgres://karmax:%s@postgresql:5432/karmax\n' "$(random_hex 32)" > "$file"
-  secret_mode "$file"
+  mkdir -p "$SECRETS_DIR" && chmod 700 "$SECRETS_DIR" || exit 1
+  for secret in auth_secret vault_key world_ref_key; do
+    write_secret "$secret" || exit 1
+  done
 )
 
 configure() {
@@ -194,11 +190,25 @@ cmd_doctor() {
   [ -f "$ENV_FILE" ] || die 'this instance is not configured; run `./deploy/karmax up your-domain`'
   dc config --quiet
   note 'Compose configuration is valid.'
-  for secret in auth_secret vault_key world_ref_key database_url; do
+  for secret in auth_secret vault_key world_ref_key; do
     [ -s "$SECRETS_DIR/$secret" ] || die "missing secret: $secret"
   done
   note 'Durable secrets are present.'
   dc ps
+  # A KARMAX_DATABASE_URL left in the app's karmax.env wins over the role's
+  # URL, so check what the app actually connected as.
+  sessions=$(dc exec -T postgresql psql -U temporal -d postgres -Atc "SELECT DISTINCT a.usename, r.rolsuper
+    FROM pg_stat_activity a JOIN pg_roles r ON r.rolname = a.usename WHERE a.datname = 'karmax'") \
+    || die 'could not query PostgreSQL'
+  [ -n "$sessions" ] || note 'The app has no connection to the karmax database right now.'
+  printf '%s\n' "$sessions" | while IFS='|' read -r role superuser; do
+    [ -n "$role" ] || continue
+    if [ "$superuser" = t ]; then
+      echo "karmax: warning: the app connects to PostgreSQL as the superuser $role. Remove KARMAX_DATABASE_URL from /var/lib/karmax/karmax.env and restart the app." >&2
+    else
+      note "The app connects to PostgreSQL as $role, not a superuser."
+    fi
+  done
   domain=$(env_value KARMAX_DOMAIN)
   if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 "https://$domain/api/health/ready" >/dev/null 2>&1; then
     note "Public HTTPS health check passed for $domain."
@@ -432,7 +442,13 @@ cmd_update() {
   note "Checking out validated revision $target…"
   git -C "$ROOT_DIR" checkout --detach "$target"
   # This file is the target's own, so it knows every secret the target mounts.
-  ensure_secrets
+  if ! ensure_secrets; then
+    git -C "$ROOT_DIR" checkout --detach "$previous"
+    restore_migration
+    cleanup_migration
+    migration_backup=''
+    die "deployment $target could not write its secrets; production remains at $previous"
+  fi
 
   # Building does not replace the running container. It gives the one-off
   # snapshot process the candidate's backup implementation while production

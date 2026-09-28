@@ -74,6 +74,8 @@ describe('deploy artifacts', () => {
 
   it('proves the booted app uses its own database role and never sees the superuser password (CI-7)', () => {
     expect(runs).toContain("[ \"$sessions\" = 'karmax superuser=false' ]");
+    expect(runs).toContain("grep -F 'The app connects to PostgreSQL as karmax, not a superuser.'");
+    expect(runs).toContain('/run/karmax-database/*');
     expect(runs).toContain("tableowner <> 'karmax'");
     expect(runs).toContain('grep -qF "$password"');
   });
