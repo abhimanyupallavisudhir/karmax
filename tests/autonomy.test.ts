@@ -285,6 +285,24 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('captures a device URL still in the pipe when the login process exits', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-late-'));
+    const homes = new ConfigHomeManager(dir);
+    // 'exit' can precede the child's last output (a busy event loop, or a helper
+    // that still holds the pipe); only 'close' means the output is complete.
+    const login = new LoginManager(homes, () => ({
+      cmd: 'bash',
+      args: ['-c', '(sleep 0.3; echo "Visit https://example.com/late?code=LATE") & exit 0'],
+      env: {} as Record<string, string>,
+    }));
+    try {
+      const r = await login.connect('claude', 'work', { urlTimeoutMs: 4000 });
+      expect(r).toMatchObject({ status: 'awaiting_oauth', loginUrl: 'https://example.com/late?code=LATE' });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('uses OpenCode auth selectors and preserves a device verification code', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-oc-'));
     const homes = new ConfigHomeManager(dir);
