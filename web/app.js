@@ -9855,11 +9855,11 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       const renew = renewInDays === undefined ? ''
         : canManage
           ? `<button class="cred-signin" title="Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — renew it to keep this login working">Renew</button>`
-          : `<span class="cred-signin" title="Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — renew it in Settings → Credentials">renew</span>`;
+          : `<span class="cred-signin" title="Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — renew it in Settings → Codex/Claude">renew</span>`;
       const stateControl = c.signedOut
         ? (canManage
           ? '<button class="cred-signin" title="Signed out by the provider — sign in again to use it">Sign in</button>'
-          : '<span class="cred-signin" title="Signed out by the provider — sign in again in Settings → Credentials">signed out</span>')
+          : '<span class="cred-signin" title="Signed out by the provider — sign in again in Settings → Codex/Claude">signed out</span>')
         : c.kind === 'key' && scope !== 'task'
         ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
             <option value="on"${mode === 'on' ? ' selected' : ''}>On</option>
