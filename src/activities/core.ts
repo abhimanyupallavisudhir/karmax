@@ -5197,9 +5197,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await store.kvSet(key, json));
           if (stale) return;
         }
-        if (!(await store.kvHas(key))) {
+        if (!(await store.kvHas(key)) && !(await store.conversationSupersedesReference(taskId, conversationReference))) {
           // A concurrent, newer publication of this run may have replaced and
-          // dropped the snapshot since the order check above (DB-2).
+          // dropped the snapshot since the order check above (DB-2). A stored
+          // newer revision of the run makes the snapshot unnecessary: saveView
+          // then keeps that conversation and applies this frame's status.
           if (order && (await store.viewPublicationStale(taskId, order))) return;
           throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
         }
