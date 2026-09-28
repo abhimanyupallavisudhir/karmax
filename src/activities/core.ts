@@ -5382,12 +5382,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (parentHandle && isRemote(parentHandle.kind)) {
         const parentWorld = await openWorld(parentHandle);
         await enrollLiveProjectRepositories(parentWorld, args.parentTaskId);
-        const persisted = await publishTaskBranch(parentWorld, args.parentTaskId);
-        if (!persisted.pushed.length || persisted.skipped.length)
-          throw new Error(`could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`);
-        (await record(args.parentTaskId, 'push.branch', {
-          branch: parentWorld.handle.branch, repos: persisted.pushed, reason: 'subtask-bootstrap',
-        }));
+        // A project without repositories has no branch to seed: its child starts
+        // from an empty world like its parent (upgrade rehearsal, #421).
+        if (worldRepos(parentWorld.handle).length) {
+          const persisted = await publishTaskBranch(parentWorld, args.parentTaskId);
+          if (!persisted.pushed.length || persisted.skipped.length)
+            throw new Error(`could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`);
+          (await record(args.parentTaskId, 'push.branch', {
+            branch: parentWorld.handle.branch, repos: persisted.pushed, reason: 'subtask-bootstrap',
+          }));
+        }
       }
       let idempotencyKey: string | undefined;
       try {
