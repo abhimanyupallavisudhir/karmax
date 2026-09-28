@@ -85,6 +85,12 @@ describe('repository guidance', () => {
     expect(read('README.md')).toMatch(/\*\*Names\.\*\* \*tavya\*[^\n]*\*karmax\*[^\n]*\*krmax\*/);
   });
 
+  it('describes the file vault as the backend in use (WK-2p)', () => {
+    const vault = read('src/autonomy/vault.ts');
+    expect(vault).not.toMatch(/in production it would be/);
+    expect(vault).toMatch(/KARMAX_VAULT_KEY/);
+  });
+
   it('links every tracked benchmark result from a repository doc', () => {
     const ls = (...args: string[]) => execFileSync('git', ['ls-files', ...args], {
       cwd: new URL('..', import.meta.url), encoding: 'utf8',
