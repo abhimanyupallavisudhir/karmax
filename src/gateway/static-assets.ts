@@ -23,6 +23,34 @@ const MIN_COMPRESS_BYTES = 1024;
 /** The console's own test suites live beside it (`web/*.test.cjs`) but are not part of it. */
 const UNPUBLISHED = /\.test\.cjs$/;
 
+/** The one third-party script source: the pinned MathJax release, whose every
+ *  file web/markdown.js also integrity-checks. */
+export const MATHJAX_SCRIPT_SOURCE = 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/';
+
+/** The console shell's policy. Script runs only from this origin and the pinned
+ *  MathJax path: no inline script, no eval. Agent-authored documents (review
+ *  HTML, HTML artifacts) are separate responses with their own sandbox policy,
+ *  because a srcdoc or blob: document would inherit this one. */
+export const CONSOLE_CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  `script-src 'self' ${MATHJAX_SCRIPT_SOURCE}`,
+  // The console and MathJax style elements directly; styles cannot run script.
+  "style-src 'self' 'unsafe-inline'",
+  // Profile pictures come from the sign-in provider; previews are blob: URLs.
+  "img-src 'self' data: blob: https:",
+  "media-src 'self' blob:",
+  // A PDF artifact opens as a blob: document, which inherits this policy.
+  'object-src blob:',
+  // qr-scanner decodes in a worker built from a blob.
+  "worker-src 'self' blob:",
+  "base-uri 'none'",
+  // Creating the shared GitHub App posts its manifest to GitHub.
+  "form-action 'self' https://github.com",
+  // The console is a surface of one-click approvals (Review, spending,
+  // credential grants): another site must never frame it (clickjacking).
+  "frame-ancestors 'self'",
+].join('; ');
+
 export function staticAssetHeaders(file: string): Record<string, string> {
   const headers: Record<string, string> = {
     'content-type': MIME[path.extname(file)] ?? 'application/octet-stream',
@@ -35,11 +63,9 @@ export function staticAssetHeaders(file: string): Record<string, string> {
     'x-content-type-options': 'nosniff',
   };
   if (path.extname(file) === '.html') {
-    // The console is a surface of one-click approvals (Review, spending,
-    // credential grants): another site must never frame it (clickjacking).
     headers['content-security-policy'] = path.basename(file) === 'paddle-checkout.html'
       ? "default-src 'none'; script-src 'self' https://cdn.paddle.com; connect-src 'self' https://*.paddle.com; frame-src https://*.paddle.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.paddle.com; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
-      : "frame-ancestors 'self'";
+      : CONSOLE_CONTENT_SECURITY_POLICY;
     headers['x-frame-options'] = 'SAMEORIGIN';
   }
   return headers;

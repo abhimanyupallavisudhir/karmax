@@ -8286,26 +8286,12 @@ function showArtifactReader(text, kind, name, blob) {
 }
 
 // Types a browser renders without running anything: opened straight from a
-// `blob:` URL. Active documents (HTML, SVG) are opened too — inside a sandboxed
-// iframe, because a `blob:` URL carries THIS page's origin and an agent-authored
-// page opened bare would execute with the console's session. Everything else
-// is downloaded.
+// `blob:` URL. Active documents (HTML, SVG) open by their own URL instead: the
+// gateway serves them under a `sandbox` policy that gives them an opaque origin,
+// while a `blob:` URL would carry THIS page's origin and policy. Everything
+// else is downloaded.
 const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
 const ACTIVE_ARTIFACT = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i;
-function openSandboxedDocument(blobUrl, title) {
-  const w = window.open('', '_blank', 'noopener=no');
-  if (!w) return false;
-  w.document.title = title;
-  const frame = w.document.createElement('iframe');
-  // No allow-same-origin: the document gets an opaque origin, so its scripts
-  // cannot read this console's storage or cookies or call its API as the user.
-  frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
-  frame.src = blobUrl;
-  frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0';
-  w.document.body.style.margin = '0';
-  w.document.body.appendChild(frame);
-  return true;
-}
 function safeHref(href) {
   return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
 }
@@ -8324,9 +8310,14 @@ async function openArtifact(url, external, target = '') {
       showArtifactReader(await blob.text(), kind, name, blob);
       return;
     }
+    if (ACTIVE_ARTIFACT.test(blob.type)) {
+      // `noopener` would hide whether a popup blocker stopped the window.
+      const opened = window.open(url, '_blank');
+      if (opened) { opened.opener = null; return; }
+    }
     const obj = URL.createObjectURL(blob);
     if (RENDERABLE_ARTIFACT.test(blob.type)) window.open(obj, '_blank', 'noopener');
-    else if (!(ACTIVE_ARTIFACT.test(blob.type) && openSandboxedDocument(obj, name))) {
+    else {
       const a = document.createElement('a');
       a.href = obj; a.download = name; a.rel = 'noopener';
       document.body.appendChild(a); a.click(); a.remove();
@@ -8779,7 +8770,7 @@ function overviewTab(v) {
          ${v.reviewInfo?.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
          ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
-         ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
+         ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" src="/api/tasks/${encodeURIComponent(v.taskId)}/review-info.html" title="Review details"></iframe>` : ''}
          ${v.stage === 'review' ? `${resourceReviewPlaceholder()}<div id="review-resource-inventory"><div class="task-sub" role="status">Inspecting ignored output…</div></div>` : ''}
        </div>`
     : '';

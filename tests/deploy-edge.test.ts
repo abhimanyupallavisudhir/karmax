@@ -260,3 +260,14 @@ describe('deploy/karmax preserves operator settings across a re-run', () => {
     expect(result).toMatch(/^POSTGRES_PASSWORD=.+$/m);
   });
 });
+
+it('gives app responses without a policy a locked-down default on the console origin only', () => {
+  const caddyfile = read('Caddyfile');
+  const site = (name: string) => caddyfile.slice(caddyfile.indexOf(`${name} {`), caddyfile.indexOf('\n}\n', caddyfile.indexOf(`${name} {`)));
+  // `?` sets the header only when the upstream response has none, so the
+  // console's, public pages' and agent content's own policies stay in force.
+  expect(site('{$KARMAX_DOMAIN}')).toContain(`header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"`);
+  const security = caddyfile.slice(caddyfile.indexOf('(karmax_security) {'), caddyfile.indexOf('\n}\n', caddyfile.indexOf('(karmax_security) {')));
+  expect(security).not.toMatch(/Content-Security-Policy/i);
+  expect(site('https://')).not.toMatch(/Content-Security-Policy/i);
+});

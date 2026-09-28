@@ -5,7 +5,7 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { checkpointEncodingStats } from '../world/checkpoint-executor.js';
 import { GatewayMetrics } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
-import { assetExists, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
+import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
@@ -1499,7 +1499,7 @@ export class Gateway {
       const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));
       res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
-        'content-security-policy': "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+        'content-security-policy': `default-src 'none'; script-src 'self' ${MATHJAX_SCRIPT_SOURCE}; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` });
       return void res.end(publicConversationHtml(share, { siteName: await this.siteName, signedIn }));
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
@@ -4753,6 +4753,16 @@ export class Gateway {
         // knows the opaque id) so the drawer can show `#num` + a permalink.
         const projected = (await this.withApprovalRequests(view, viewMatch[1]!))!;
         return this.json(res, 200, rec?.num != null ? { ...projected, num: rec.num } : projected);
+      }
+      // Agent-authored review HTML is its own document under the untrusted-content
+      // sandbox; as a srcdoc it would inherit the console's policy and lose its script.
+      const reviewHtmlMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-info\.html$/);
+      if (reviewHtmlMatch && method === 'GET') {
+        const html = (await api.getTaskView(token, reviewHtmlMatch[1]!))?.reviewInfo?.html;
+        if (!html) return this.json(res, 404, { error: 'no review HTML' });
+        res.writeHead(200, { ...untrustedContentHeaders('text/html; charset=utf-8', 'review.html'),
+          'content-length': String(Buffer.byteLength(html)), 'cache-control': 'private, no-store' });
+        return void res.end(html);
       }
       if (viewMatch && method === 'DELETE') {
         // Hard-delete is for drafts only (they never started a workflow). Running
@@ -8873,7 +8883,7 @@ export class Gateway {
     if (!String(req.headers.accept ?? '').includes('text/html')) return this.json(res, status, { error });
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
       'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
-      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+      'content-security-policy': SERVER_PAGE_CSP });
     res.end(PREVIEW_STOPPED_HTML);
   }
 
@@ -8899,14 +8909,14 @@ export class Gateway {
     const name = escapeHtml((await this.siteName));
     const body = `<!doctype html><meta charset="utf-8"><title>${name} · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to ${name}</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
-      'x-karmax-cell': this.deps.cellId ?? 'local' });
+      'content-security-policy': SERVER_PAGE_CSP, 'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private async paymentCallbackPage(res: http.ServerResponse, status: number, message: string) {
     const name = escapeHtml((await this.siteName));
     const body = `<!doctype html><meta charset="utf-8"><title>${name} · Stripe</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>Stripe connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to ${name}</a></p></main>`;
-    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8',
-      'content-length': String(Buffer.byteLength(body)), 'x-karmax-cell': this.deps.cellId ?? 'local' });
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
+      'content-security-policy': SERVER_PAGE_CSP, 'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private async body(req: http.IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<any> {
@@ -9061,6 +9071,10 @@ export function untrustedContentHeaders(mediaType: string, filename: string): Re
     'x-content-type-options': 'nosniff',
   };
 }
+
+/** For the gateway's own static pages (callbacks, a stopped preview): markup and
+ *  inline styles only, never framed, nothing to submit. */
+const SERVER_PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
 const PREVIEW_STOPPED_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">
