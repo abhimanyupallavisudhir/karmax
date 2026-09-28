@@ -1197,8 +1197,10 @@ async function readSmallFile(file: string, maximumBytes: number): Promise<Buffer
 async function* filesFromWorld(world: World, target: string, attachment?: ResourceAttachment, checkContinue?: () => Promise<void>): AsyncGenerator<SnapshotInputFile> {
   await checkContinue?.();
   const single = Boolean(attachment && fileShaped(attachment));
+  // -H follows a symlinked target the way `test -f` did, so a linked
+  // single-file resource is captured rather than recorded as empty.
   const prefix = target === '.' ? '' : `${target}/`;
-  const listed = await world.exec('bash', ['-lc', `date +%s.%N && { test ! -e ${quote(target)} || find ${quote(target)} ${single ? '-maxdepth 0 ' : ''}-type f -not -path '*/.git/*' -not -path '*/.karmax-injection/*' -printf '%s %T@ %C@ %i %p\\0'; }`],
+  const listed = await world.exec('bash', ['-lc', `date +%s.%N && { test ! -e ${quote(target)} || find -H ${quote(target)} ${single ? '-maxdepth 0 ' : ''}-type f -not -path '*/.git/*' -not -path '*/.karmax-injection/*' -printf '%s %T@ %C@ %i %p\\0'; }`],
     { timeoutMs: 30 * 60_000 });
   const newline = listed.stdout.indexOf('\n');
   const listedAt = Number(listed.stdout.slice(0, newline));

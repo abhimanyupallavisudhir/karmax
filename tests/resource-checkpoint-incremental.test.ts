@@ -110,3 +110,22 @@ it('re-reads a same-size rewrite and a file deleted then recreated (LT-11)', asy
   expect(manifest.files.find((entry: any) => entry.path === 'run-1.json').sha256).toBe(digest('RESULT 1\n'));
   expect(manifest.files).toHaveLength(3);
 });
+
+it('captures a single-file resource whose path is a symlink (LT-11)', async () => {
+  const f = await fixture(1);
+  const ledger = await f.store.createResourceAttachment({ organizationId: f.project.organizationId!, projectId: f.project.id,
+    name: 'Ledger', driver: 'object-tree@1', target: { kind: 'path', path: 'ledger.json' }, access: 'write',
+    isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' });
+  await f.resources.importFiles(ledger.id, [{ path: 'ledger.json', data: Buffer.from('original\n') }]);
+  await f.store.createResourceLease({ attachmentId: ledger.id, revisionId: (await f.store.getResourceAttachment(ledger.id))!.currentRevisionId,
+    taskId: f.handle.id, worldId: f.handle.id, worldGeneration: f.handle.generation ?? 1, access: 'write', state: 'active' });
+  // The agent replaced the file with a link to the real ledger.
+  fs.writeFileSync(path.join(f.world.handle.root, 'real-ledger.json'), 'linked ledger\n');
+  fs.rmSync(path.join(f.world.handle.root, 'ledger.json'), { force: true });
+  fs.symlinkSync('real-ledger.json', path.join(f.world.handle.root, 'ledger.json'));
+  const refs = await f.resources.checkpoint(f.handle);
+  const ref = refs.find((entry) => entry.attachmentId === ledger.id)!;
+  const manifest = await (f.resources as any).engine.manifest(await f.store.getResourceRevision(ref.revisionId));
+  expect(manifest.files).toEqual([expect.objectContaining({ path: 'ledger.json',
+    sha256: crypto.createHash('sha256').update('linked ledger\n').digest('hex') })]);
+});
