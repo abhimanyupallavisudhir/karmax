@@ -3,6 +3,7 @@
 ```bash
 npm test            # full suite (sequential, resource-capped)
 npm run typecheck
+npm run lint        # oxlint + warning and `as any` budgets that fail when exceeded (scripts/lint.ts)
 npm run test:coverage   # same suite, instrumented; coverage dependency is installed by npm ci
 ```
 
@@ -78,8 +79,9 @@ chromium`, as in CI.) Do not assert on the text of `web/` or `src/` files:
 
 CI (`.github/workflows/ci.yml`) splits the suite across parallel runners with
 Vitest's `--shard`; each runner still runs its files one at a time. The
-required `typecheck + tests` check passes only when the typecheck and every
-shard pass. To reproduce a failing shard, run the same slice locally:
+required `typecheck + tests` check passes only when the typecheck, every
+shard and `deploy artifacts` pass. To reproduce a failing shard, run the same
+slice locally:
 
 ```bash
 npx vitest run --shard=2/5
@@ -95,9 +97,22 @@ measurements from a green CI run:
 gh run view <run-id> --log | npm run test:durations
 ```
 
-No shard can finish faster than the slowest single file (`pipeline.test.ts`,
-about 6.5 minutes in CI). Adding a number to the `test` job's `shard` list helps
+No shard can finish faster than the slowest single file
+(`github-pr-pipeline.test.ts`, about 3.5 minutes). Adding a number to the `test` job's `shard` list helps
 only while the shards are well above that; past it, split the slowest file.
+
+Jobs install through `.github/actions/install`, which restores `node_modules`
+from the Actions cache when the lockfile, platform and Node release match an
+earlier run, and runs `npm ci` only on a miss; the shards also cache the
+locked Playwright release's Chromium.
+
+`deploy artifacts` installs the turnkey stack exactly as an operator does
+(`./deploy/karmax up karmax.localhost`), then checks the booted hosted cell:
+the edge routes to it, and the app reaches PostgreSQL only as its own role.
+Pull requests that change only tests, docs or other workflows skip it.
+`tests/hosted-main.test.ts` boots `src/main.ts` as a hosted cell on the
+shards' PostgreSQL and a Temporal dev server; it needs
+`KARMAX_TEST_POSTGRES_URL`, like every PostgreSQL test.
 
 ## The live-agent test
 
@@ -108,6 +123,35 @@ provider credit or write to a GitHub fixture, so ordinary `npm test` never runs 
 ```bash
 KARMAX_RUN_LIVE=1 OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
 ```
+
+### Live tests in GitHub Actions
+
+`.github/workflows/live.yml` runs every suite behind the live gate on demand
+(Actions → Live → Run workflow, optionally one suite), and every Monday once
+the repository variable `KARMAX_LIVE_SCHEDULE` is `true`; until then the
+schedule does nothing. A suite whose secret is missing is skipped, and the
+`choose suites` log says why.
+
+The `LIVE_*` secrets must be secrets of the `live` environment, restricted to
+the `master` branch and with a required reviewer, never repository secrets.
+A dispatch runs the chosen branch's workflow file and test code, so a
+repository secret would reach any branch someone can push. Every job also
+refuses to run off master, but a branch can edit that guard away; the
+environment's branch rule is the control.
+
+
+
+| Suite | Secret | Runs |
+| --- | --- | --- |
+| `models` | `LIVE_ANTHROPIC_API_KEY`, `LIVE_OPENAI_API_KEY` (either) | `live-providers` |
+| `agent` | `LIVE_OPENAI_API_KEY` | `live-agent` |
+| `claude` | `LIVE_CLAUDE_CODE_OAUTH_TOKEN` | `claude-permission` |
+| `e2b` | `LIVE_E2B_API_KEY` | `cloud-live` |
+| `daytona` | `LIVE_DAYTONA_API_KEY` | `daytona-live`, `daytona-environment-live` |
+| `github` | `LIVE_GITHUB_TOKEN` (a fixture account; creates `karmax-e2e-tests`) | `github-live` |
+
+`daytona-workflow-live` and the Daytona snapshot build keep their own
+switches and do not run there.
 
 ## Docker test
 

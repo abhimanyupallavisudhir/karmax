@@ -5,7 +5,7 @@ const path = require('path');
 
 const src = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 const viewStart = src.indexOf('function organizationView()');
-const viewEnd = src.indexOf('async function hydrateOrganizationView()', viewStart);
+const viewEnd = src.indexOf('async function hydrateOrganizationView(', viewStart);
 if (viewStart < 0 || viewEnd < 0) throw new Error('organizationView not found');
 
 const view = src.slice(viewStart, viewEnd);

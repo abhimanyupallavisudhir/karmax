@@ -5,7 +5,7 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { checkpointEncodingStats } from '../world/checkpoint-executor.js';
 import { GatewayMetrics } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
-import { assetExists, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
+import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
@@ -357,6 +357,8 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
 }
 
 type DownloadableProvider = 'claude' | 'codex';
+/** Pending decisions per task: those that still notify, and all of them. */
+type ApprovalCounts = Map<string, { notify: number; pending: number }>;
 
 function downloadableProvider(value: unknown): DownloadableProvider | undefined {
   return value === 'claude' || value === 'codex' ? value : undefined;
@@ -548,6 +550,10 @@ const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
 const SOCKET_DECISION_TTL_MS = 5_000;
 /** Past this much unsent data a socket gets only the latest streamed text. */
 const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
+/** A watching socket gets these only for the task it shows (RQ-16)… */
+const WATCHED_TASK_EVENTS = new Set(['agent.output', 'timing']);
+/** …and these only from its own project; lifecycle events still reach inbox and insights. */
+const TASK_DETAIL_EVENTS = new Set([...WATCHED_TASK_EVENTS, 'agent.activity', 'conversation.message', 'conversation.explanation']);
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -703,10 +709,23 @@ export class Gateway {
     const offTiming = (await this.watchTiming(syncTiming));
     lifetime.add(offTiming);
     if (lifetime.closed) return;
+    // What this tab shows (RQ-16). Until it says, it gets every readable event.
+    let watch: { projectId: string | null; taskId: string | null } | undefined;
     ws.on('message', async data => {
       if (data.toString().length > 1024) return;
-      try { (await delivery.acknowledge(JSON.parse(data.toString()))); } catch { /* invalid observation */ }
+      try {
+        const message = JSON.parse(data.toString());
+        if (message?.type === 'watch') {
+          const id = (value: unknown) => value == null ? null : typeof value === 'string' ? value : undefined;
+          const projectId = id(message.projectId), taskId = id(message.taskId);
+          if (projectId !== undefined && taskId !== undefined) watch = { projectId, taskId };
+          return;
+        }
+        (await delivery.acknowledge(message));
+      } catch { /* invalid observation */ }
     });
+    const watched = (ev: KarmaxEvent, projectId?: string) => !watch || ev.taskId === watch.taskId
+      || (projectId === watch.projectId ? !WATCHED_TASK_EVENTS.has(ev.type) : !TASK_DETAIL_EVENTS.has(ev.type));
     // Decide each task's visibility once and reuse it (LT-15): re-verifying the
     // token cost several store reads per event per socket, and a streaming agent
     // publishes several events a second. A decision lasts until this process
@@ -740,7 +759,7 @@ export class Gateway {
     // Streamed text supersedes itself, so a client that has fallen behind gets
     // only each agent's latest text once its buffer drains, never every window
     // (#396 review item 2). Everything else keeps its order and the hard bound.
-    const heldOutput = new Map<string, { ev: KarmaxEvent & { seq?: number }; projectId?: string }>();
+    const heldOutput = new Map<string, { ev: KarmaxEvent & { seq?: number }; projectId?: string; siblingAttempt?: boolean }>();
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
     const releaseHeld = () => {
       drainTimer ??= setTimeout(() => {
@@ -749,19 +768,20 @@ export class Gateway {
         if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { releaseHeld(); return; }
         const held = [...heldOutput.values()];
         heldOutput.clear();
-        for (const { ev, projectId } of held) void deliver(ev, projectId);
+        for (const { ev, projectId, siblingAttempt } of held) void deliver(ev, projectId, siblingAttempt);
       }, 100);
       drainTimer.unref?.();
     };
     lifetime.add(() => { if (drainTimer) clearTimeout(drainTimer); });
-    const deliver = async (ev: KarmaxEvent & { seq?: number }, projectId?: string) => {
+    const deliver = async (ev: KarmaxEvent & { seq?: number }, projectId?: string, siblingAttempt?: boolean) => {
       // Reconnect/backfill from durable state rather than allowing a slow
       // browser's send queue to grow without bound.
       if (ws.readyState !== WebSocketClient.OPEN) return;
+      if (!watched(ev, projectId)) return;
       if (ev.type === 'agent.output' && (ev.payload as { source?: unknown }).source === 'assistant') {
         const key = `${ev.taskId}\0${String((ev.payload as { role?: unknown }).role ?? '')}`;
         heldOutput.delete(key);
-        if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { heldOutput.set(key, { ev, projectId }); releaseHeld(); return; }
+        if (ws.bufferedAmount > LIVE_OUTPUT_BUFFER_BYTES) { heldOutput.set(key, { ev, projectId, siblingAttempt }); releaseHeld(); return; }
       }
       if (ws.bufferedAmount > 2 * 1024 * 1024) {
         ws.close(1013, 'Client fell behind; reconnect to refresh');
@@ -778,7 +798,8 @@ export class Gateway {
             workflowRunId: typeof payload.workflowRunId === 'string' ? payload.workflowRunId : undefined,
             attempt: typeof payload.attempt === 'number' ? payload.attempt : undefined })) : undefined;
         if (ws.readyState !== WebSocketClient.OPEN) return;
-        ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), projectId, ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
+        ws.send(JSON.stringify({ ...(toPublicPayload(ev) as Record<string, unknown>), projectId,
+          ...(siblingAttempt ? { siblingAttempt } : {}), ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
     };
     const off = this.fanout.on(deliver, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
@@ -823,32 +844,38 @@ export class Gateway {
   }
 
   /** Read each organization request ledger once per response, not once per row.
-   * Task list projections must never hydrate every task's transcript again. */
-  private async approvalCounts(organizationId: string): Promise<Map<string, number>> {
-    const counts = new Map<string, number>();
-    const add = (taskId: string | undefined) => {
-      if (taskId) counts.set(taskId, (counts.get(taskId) ?? 0) + 1);
+   * Task list projections must never hydrate every task's transcript again.
+   * `notify` leaves out decisions dismissed from the inbox; `pending` keeps them,
+   * because a dismissed decision still blocks its agent. */
+  private async approvalCounts(organizationId: string): Promise<ApprovalCounts> {
+    const counts: ApprovalCounts = new Map();
+    const add = (taskId: string | undefined, dismissed = false) => {
+      if (!taskId) return;
+      const count = counts.get(taskId) ?? { notify: 0, pending: 0 };
+      count.pending += 1;
+      if (!dismissed) count.notify += 1;
+      counts.set(taskId, count);
     };
     for (const request of (await new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
       .requests({ status: 'pending' }))) add(request.taskId);
     for (const request of (await new PermissionRequests(this.deps.store, organizationId).requests({ status: 'pending' })))
-      if (!request.dismissed) add(request.taskId);
+      add(request.taskId, !!request.dismissed);
     for (const request of (await new AuthorizationRequests(this.deps.store, organizationId).requests({ status: 'pending' })))
-      if (!request.dismissed && request.target.kind === 'task') add(request.target.taskId);
+      if (request.target.kind === 'task') add(request.target.taskId, !!request.dismissed);
     for (const connection of (await this.connections()?.all()) ?? [])
       if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId);
     return counts;
   }
 
   private async withApprovalRequests(view: TaskView | undefined, taskId: string,
-    counts?: Map<string, number>): Promise<TaskView | undefined> {
+    counts?: ApprovalCounts): Promise<TaskView | undefined> {
     if (!view) return view;
     if (!counts) {
       const organizationId = (await this.deps.store.taskAttribution(taskId))?.organizationId;
       counts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
     }
-    const count = counts.get(taskId) ?? 0;
-    return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
+    const count = counts.get(taskId);
+    return { ...view, approvalRequests: count?.notify || undefined, pendingDecisions: count?.pending || undefined };
   }
 
   private async credentialRequestView(request: CredentialAccessRequest, organizationId: string): Promise<CredentialAccessRequest> {
@@ -1502,7 +1529,7 @@ export class Gateway {
       const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));
       res.writeHead(share ? 200 : 404, { 'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
-        'content-security-policy': "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+        'content-security-policy': `default-src 'none'; script-src 'self' ${MATHJAX_SCRIPT_SOURCE}; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` });
       return void res.end(publicConversationHtml(share, { siteName: await this.siteName, signedIn }));
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
@@ -4560,7 +4587,7 @@ export class Gateway {
               includeArchived: url.searchParams.get('includeArchived') === '1', limit, offset,
             });
             const organizationId = (await store.getProject(projectId))?.organizationId;
-            const counts = organizationId ? (await this.approvalCounts(organizationId)) : new Map<string, number>();
+            const counts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
             return this.json(res, 200, { ...result, tasks: (await __asyncCollections.map(result.tasks, async task => ({ ...task,
               lastView: (await this.withApprovalRequests(task.lastView, task.id, counts)) }))) });
           }
@@ -4590,7 +4617,7 @@ export class Gateway {
           // request into thousands of synchronous SQLite reads. Drawer-only fields
           // (including stageTransitions) are resolved by the single-task endpoint.
           const organizationId = (await store.getProject(projectId))?.organizationId;
-          const approvalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map<string, number>();
+          const approvalCounts: ApprovalCounts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
           const listed = (await __asyncCollections.map(page, async (t) => ({
             ...t,
             lastView: trimListView((await this.withApprovalRequests(t.lastView, t.id, approvalCounts))),
@@ -4759,6 +4786,16 @@ export class Gateway {
         // knows the opaque id) so the drawer can show `#num` + a permalink.
         const projected = (await this.withApprovalRequests(view, viewMatch[1]!))!;
         return this.json(res, 200, rec?.num != null ? { ...projected, num: rec.num } : projected);
+      }
+      // Agent-authored review HTML is its own document under the untrusted-content
+      // sandbox; as a srcdoc it would inherit the console's policy and lose its script.
+      const reviewHtmlMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-info\.html$/);
+      if (reviewHtmlMatch && method === 'GET') {
+        const html = (await api.getTaskView(token, reviewHtmlMatch[1]!))?.reviewInfo?.html;
+        if (!html) return this.json(res, 404, { error: 'no review HTML' });
+        res.writeHead(200, { ...untrustedContentHeaders('text/html; charset=utf-8', 'review.html'),
+          'content-length': String(Buffer.byteLength(html)), 'cache-control': 'private, no-store' });
+        return void res.end(html);
       }
       if (viewMatch && method === 'DELETE') {
         // Hard-delete is for drafts only (they never started a workflow). Running
@@ -8991,7 +9028,7 @@ export class Gateway {
     if (!String(req.headers.accept ?? '').includes('text/html')) return this.json(res, status, { error });
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
       'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
-      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" });
+      'content-security-policy': SERVER_PAGE_CSP });
     res.end(PREVIEW_STOPPED_HTML);
   }
 
@@ -9017,14 +9054,14 @@ export class Gateway {
     const name = escapeHtml((await this.siteName));
     const body = `<!doctype html><meta charset="utf-8"><title>${name} · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to ${name}</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
-      'x-karmax-cell': this.deps.cellId ?? 'local' });
+      'content-security-policy': SERVER_PAGE_CSP, 'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private async paymentCallbackPage(res: http.ServerResponse, status: number, message: string) {
     const name = escapeHtml((await this.siteName));
     const body = `<!doctype html><meta charset="utf-8"><title>${name} · Stripe</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>Stripe connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to ${name}</a></p></main>`;
-    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8',
-      'content-length': String(Buffer.byteLength(body)), 'x-karmax-cell': this.deps.cellId ?? 'local' });
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
+      'content-security-policy': SERVER_PAGE_CSP, 'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private async body(req: http.IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<any> {
@@ -9182,11 +9219,15 @@ export function untrustedContentHeaders(mediaType: string, filename: string): Re
     'content-type': inert || active ? mediaType : 'application/octet-stream',
     'content-disposition': `${inert || active ? 'inline' : 'attachment'}; filename="${name}"`,
     'content-security-policy': active
-      ? 'sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads'
+      ? "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads; form-action 'none'"
       : "sandbox; default-src 'none'",
     'x-content-type-options': 'nosniff',
   };
 }
+
+/** For the gateway's own static pages (callbacks, a stopped preview): markup and
+ *  inline styles only, never framed, nothing to submit. */
+const SERVER_PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
 const PREVIEW_STOPPED_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">

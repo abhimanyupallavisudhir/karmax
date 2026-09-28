@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { Gateway } from '../src/gateway/server.js';
-import { preferredEncoding } from '../src/gateway/static-assets.js';
+import { consoleContentSecurityPolicy, preferredEncoding } from '../src/gateway/static-assets.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxBus } from '../src/contrib/bus.js';
@@ -59,6 +59,8 @@ describe('console static assets over HTTP', () => {
       staticDir: dir,
       agentInfo: { provider: 'mock', reason: 'static serving test' },
       worlds: new WorldRegistry(),
+      githubApp: {} as any,
+      identity: { session: async () => null, connectOrganizationNames: () => {} } as any,
     } as any);
     const running = await gateway.listen(await findFreePortFrom(48_600));
     base = running.url;
@@ -127,6 +129,8 @@ describe('console static assets over HTTP', () => {
   it('does not let another site frame the console', async () => {
     const shell = await raw('/', { 'accept-encoding': 'gzip' });
     expect(shell.status).toBe(200);
+    expect(shell.headers['content-security-policy']).toBe(consoleContentSecurityPolicy(new URL(base).host));
+    expect(shell.headers['content-security-policy']).toContain(`connect-src 'self' wss://${new URL(base).host} ws://${new URL(base).host}`);
     expect(shell.headers['content-security-policy']).toMatch(/frame-ancestors 'self'/);
     expect(shell.headers['x-frame-options']).toBe('SAMEORIGIN');
     expect(shell.headers['x-content-type-options']).toBe('nosniff');
@@ -157,5 +161,12 @@ describe('console static assets over HTTP', () => {
     expect(preferredEncoding('*, br;q=0')).toBe('gzip');
     expect(preferredEncoding('identity')).toBeUndefined();
     expect(preferredEncoding('GZIP')).toBe('gzip');
+  });
+
+  it('serves its own HTML pages under a locked-down policy', async () => {
+    const page = await raw('/api/github/oauth/callback');
+    expect(page.status).toBe(400);
+    expect(String(page.headers['content-type'])).toMatch(/^text\/html/);
+    expect(page.headers['content-security-policy']).toBe("default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
   });
 });

@@ -98,7 +98,15 @@ export async function bootHarness(
   // the harness so API-created tasks honor the requested hermetic provider and
   // never auto-detect a developer's real Claude/Codex login.
   (await seedProfiles(store, provider));
-  const worldsHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-worlds-'));
+  // Everything below lives in temp dirs that stop() removes; one integration
+  // file boots this harness, so a leak repeats per file on every run.
+  const tempDirs: string[] = [];
+  const tempDir = (prefix: string) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    tempDirs.push(dir);
+    return dir;
+  };
+  const worldsHome = tempDir('karmax-worlds-');
   const worlds = new WorldRegistry();
   // Point the worktree provider at a temp worlds home.
   const { WorktreeProvider } = await import('../../src/world/worktree.js');
@@ -107,9 +115,9 @@ export async function bootHarness(
   if (adapterOverride) adapters.set(provider, adapterOverride);
   const profiles = new ProfileResolver(store, provider);
   const bus = new KarmaxBus();
-  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
-  const vaultHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-'));
-  const objectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-objects-'));
+  const contentDir = tempDir('karmax-content-');
+  const vaultHome = tempDir('karmax-vault-');
+  const objectHome = tempDir('karmax-objects-');
   const broker = new CredentialBroker(new Vault(vaultHome));
   const objects = new LocalObjectStore(objectHome);
   const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker,
@@ -172,7 +180,7 @@ export async function bootHarness(
       runPromise = worker.run();
     },
     async startGateway(opts) {
-      const configHomes = overrides.configHomes ?? new ConfigHomeManager(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-homes-')));
+      const configHomes = overrides.configHomes ?? new ConfigHomeManager(tempDir('karmax-homes-'));
       // fake login command (no real CLI / OAuth): print a device URL then exit
       const login = new LoginManager(configHomes, opts?.loginCommand ?? (() => ({
         cmd: 'bash',
@@ -265,14 +273,11 @@ export async function bootHarness(
         serverStopped = true;
       });
       await stopPhase('rmTempDirs', async () => {
-        fs.rmSync(worldsHome, { recursive: true, force: true });
-        fs.rmSync(vaultHome, { recursive: true, force: true });
-        fs.rmSync(objectHome, { recursive: true, force: true });
-        fs.rmSync(contentDir, { recursive: true, force: true });
+        for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
       });
     },
     async makeRepo(name: string) {
-      const repo = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-repo-${name}-`));
+      const repo = tempDir(`karmax-repo-${name}-`);
       await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
       await ensureIdentity(repo);
       fs.writeFileSync(path.join(repo, 'README.md'), `# ${name}\n`);

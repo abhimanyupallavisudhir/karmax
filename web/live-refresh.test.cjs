@@ -83,8 +83,8 @@ ok(open.indexOf('renderTaskPage();') < open.indexOf('await details'), 'the compa
 const series = extractFn('renderSeriesPage');
 ok(series.includes('await Promise.all(['), 'repeatable-task defaults and runs load in parallel');
 
-const localCheckout = extractFn('openLocalCheckout');
-ok(localCheckout.indexOf('host.innerHTML =') < localCheckout.indexOf('await api('),
+const localCheckout = src.slice(src.indexOf('async function localHandoffDialog('), src.indexOf('async function openLocalCheckout('));
+ok(localCheckout.indexOf("show('Work locally'") < localCheckout.indexOf('await load()'),
   'the local-checkout handoff opens a loading modal before its request');
 
 const refresh = extractFn('refreshTasks');

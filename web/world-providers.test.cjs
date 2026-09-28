@@ -12,9 +12,11 @@ function ok(condition, message) {
 }
 
 const start = src.indexOf('const providerInfo = {');
-const end = src.indexOf('\n  };', start);
+// The object closes at the indentation it opened with.
+const indent = start >= 0 ? src.slice(src.lastIndexOf('\n', start) + 1, start) : '';
+const end = src.indexOf(`\n${indent}};`, start);
 ok(start >= 0 && end > start, 'Organization settings declare providerInfo');
-const providerInfo = start >= 0 && end > start ? new Function(`${src.slice(start, end + 5)} return providerInfo;`)() : {};
+const providerInfo = start >= 0 && end > start ? new Function(`${src.slice(start, end + indent.length + 3)} return providerInfo;`)() : {};
 
 const note = providerInfo.daytona?.note || '';
 ok(/Tiers? 1.2/.test(note), 'Daytona note names Tiers 1–2');

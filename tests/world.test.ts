@@ -3,7 +3,6 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { WorktreeProvider } from '../src/world/worktree.js';
-import { World } from '../src/world/types.js';
 import { git, gitOrThrow, currentBranch, ensureIdentity } from '../src/world/git.js';
 import { holdWorktreeLock } from './helpers/lock-waiters.js';
 import { WorldRegistry } from '../src/world/registry.js';

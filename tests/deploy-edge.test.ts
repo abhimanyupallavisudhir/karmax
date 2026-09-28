@@ -195,7 +195,7 @@ it('forwards optional Stripe Issuing settings in both deployment profiles', () =
 describe('compose provisions the PostgreSQL application database', () => {
   it('turnkey creates and connects the separate karmax database', () => {
     expect(read('temporal/setup-postgres.sh')).toContain('--db karmax create');
-    expect(read('compose.turnkey.yml')).toMatch(/KARMAX_DATABASE_URL:\s+postgres:\/\/[^\n]+\/karmax/);
+    expect(read('compose.turnkey.yml')).toContain('KARMAX_DATABASE_URL_FILE: /run/karmax-database/database_url');
   });
 
   it('managed hosting mounts the database URL as a secret', () => {
@@ -259,4 +259,15 @@ describe('deploy/karmax preserves operator settings across a re-run', () => {
     expect(result).toContain('KARMAX_PREVIEW_DOMAIN=preview.krmax.example.com');
     expect(result).toMatch(/^POSTGRES_PASSWORD=.+$/m);
   });
+});
+
+it('gives app responses without a policy a locked-down default on the console origin only', () => {
+  const caddyfile = read('Caddyfile');
+  const site = (name: string) => caddyfile.slice(caddyfile.indexOf(`${name} {`), caddyfile.indexOf('\n}\n', caddyfile.indexOf(`${name} {`)));
+  // `?` sets the header only when the upstream response has none, so the
+  // console's, public pages' and agent content's own policies stay in force.
+  expect(site('{$KARMAX_DOMAIN}')).toContain(`header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"`);
+  const security = caddyfile.slice(caddyfile.indexOf('(karmax_security) {'), caddyfile.indexOf('\n}\n', caddyfile.indexOf('(karmax_security) {')));
+  expect(security).not.toMatch(/Content-Security-Policy/i);
+  expect(site('https://')).not.toMatch(/Content-Security-Policy/i);
 });
