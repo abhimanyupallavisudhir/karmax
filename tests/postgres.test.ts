@@ -221,6 +221,28 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  // The upgrade rehearsal (#421): PostgreSQL may cast every kv value before the
+  // join narrows them to settle times, and one non-numeric value ("developer",
+  // "seen") aborted the whole hourly sweep, so nothing was ever purged.
+  it('sweeps settled tasks while other kv values are not numbers', async () => {
+    // Make PostgreSQL scan kv and filter it before the join, as production's planner did.
+    const planned = new URL(url!);
+    planned.searchParams.set('options', '-c enable_nestloop=off -c enable_indexscan=off -c enable_bitmapscan=off');
+    const store = await Store.create(planned.toString());
+    try {
+      const project = await store.createProject('Retention with settings');
+      const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture', _workflowRunId: 'run' } });
+      await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
+      for (const [key, value] of [['authz:default:global', 'developer'], ['git:onboarding:x', 'seen'], ['session:x', 'mock-1']])
+        await store.kvSet(key, value);
+      await store.kvSet(`turnsession:${task.id}:run#1`, 'x');
+      await store.kvSet(`retention:settled:${task.id}`, String(Date.now() - 8 * 86_400_000));
+      expect((await store.retentionSweep(Date.now())).turnSessions).toBe(1);
+    } finally { await store.close(); }
+  });
+
   it('skips completed PostgreSQL row migrations on repeated initialization', async () => {
     const store = await Store.create(url!);
     try {
