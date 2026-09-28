@@ -296,11 +296,29 @@ export class OnePasswordConnector implements CredentialConnector {
    * token (AU-29). `op item edit` accepts a new value only as an argv
    * assignment, readable by every local process from /proc, and its JSON
    * template form replaces the whole item, losing what the CLI's export cannot
-   * round-trip (notably passkeys). The CLI names the vault holding the item. */
+   * round-trip (notably passkeys). The CLI names the vault holding the item.
+   *
+   * The SDK models no passkeys either, and its edit is a get-then-put of the
+   * whole item. An item that may hold one keeps the CLI's in-place assignment:
+   * the value is briefly visible in argv, which is better than losing a passkey. */
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
     const item = JSON.parse(await this.exec('op', ['item', 'get', externalId, '--format=json'], { env: this.env() }));
     if (typeof item?.vault?.id !== 'string') throw new Error(`1Password item "${externalId}" has no vault`);
-    await this.writer.updateSecretIn(item.vault.id, externalId, field, value);
+    const inPlace = () => this.assign(externalId, field, value);
+    if (mentionsPasskey(item)) return inPlace();
+    await this.writer.updateSecretIn(item.vault.id, externalId, field, value, inPlace);
+  }
+
+  private async assign(externalId: string, field: VaultFieldName, value: string): Promise<void> {
+    const assignment =
+      field === 'password' ? `password=${value}`
+        : field === 'secret' ? `credential=${value}`
+          : field === 'totp' ? `one-time password[otp]=${value}`
+            : field === 'note' ? `notesPlain=${value}`
+              : field === 'privateKey' ? `private_key=${value}`
+                : undefined;
+    if (!assignment) throw new Error(`1Password write-back does not support the "${field}" field`);
+    await this.exec('op', ['item', 'edit', externalId, assignment], { env: this.env() });
   }
 }
 
@@ -427,15 +445,32 @@ export class OnePasswordSdkConnector implements CredentialConnector {
     await this.updateSecretIn(vaultId, itemId, field, value);
   }
 
-  async updateSecretIn(vaultId: string, itemId: string, field: VaultFieldName, value: string): Promise<void> {
+  /** `unmodelled` edits an item holding data the SDK cannot represent (a
+   * passkey comes back `Unsupported`), which a put could drop; without it
+   * such an item is refused and its write goes to review. */
+  async updateSecretIn(vaultId: string, itemId: string, field: VaultFieldName, value: string,
+    unmodelled?: () => Promise<void>): Promise<void> {
     const client = await this.client();
     const item = await client.items.get(vaultId, itemId);
+    if (item.category === 'Unsupported' || (item.fields ?? []).some((candidate: any) => candidate.fieldType === 'Unsupported')) {
+      if (unmodelled) return unmodelled();
+      throw new Error('1Password item holds data the SDK cannot rewrite safely (such as a passkey); update it in 1Password');
+    }
     if (field === 'note') {
       item.notes = value;
       await client.items.put(item);
       return;
     }
     const target = (item.fields ?? []).find((candidate: any) => onePasswordField(candidate, field));
+    if (!target && field === 'totp') {
+      // As `op item edit … 'one-time password[otp]=…'` did: add the field.
+      const sectionId = 'totpsection';
+      if (!(item.sections ?? []).some((section: any) => section.id === sectionId))
+        item.sections = [...(item.sections ?? []), { id: sectionId, title: '' }];
+      item.fields = [...(item.fields ?? []), { id: 'onetimepassword', title: 'one-time password', sectionId, fieldType: 'Totp', value }];
+      await client.items.put(item);
+      return;
+    }
     if (!target) throw new Error(`1Password item does not contain a writable "${field}" field`);
     item.fields = item.fields.map((candidate: any) =>
       candidate === target ? { ...candidate, value } : candidate);
@@ -480,6 +515,11 @@ function onePasswordSdkSecret(item: any, externalId: string): ExternalSecretItem
     fields: Object.keys(secrets) as VaultFieldName[],
     secrets,
   };
+}
+
+/** Does the CLI's view of an item show a passkey anywhere? */
+function mentionsPasskey(item: unknown): boolean {
+  return /passkey/i.test(JSON.stringify(item, (key, value) => key === 'value' ? undefined : value));
 }
 
 function onePasswordField(field: any, target: VaultFieldName): boolean {

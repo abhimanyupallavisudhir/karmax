@@ -146,6 +146,55 @@ describe('1Password connector', () => {
     expect(puts[0].fields).toEqual([{ id: 'username', value: 'octo', fieldType: 'Text' }, { id: 'password', value: 'rotated-s3cret', fieldType: 'Concealed' }]);
   });
 
+  // The CLI's `one-time password[otp]=` assignment created the field when an
+  // item had none; the SDK path adds it the same way.
+  it('adds a one-time password field to an item without one', async () => {
+    const puts: any[] = [];
+    const client: any = { vaults: { list: async () => [] }, items: {
+      list: async () => [],
+      get: async (vaultId: string, id: string) => ({ id, vaultId, category: 'Login', sections: [],
+        fields: [{ id: 'password', title: 'password', value: 'sw0rd', fieldType: 'Concealed' }] }),
+      put: async (item: any) => { puts.push(item); return item; } } };
+    const c = new OnePasswordConnector(() => 'tok', async () => JSON.stringify({ id: 'op1', vault: { id: 'v' } }),
+      new OnePasswordSdkConnector(() => 'tok', async () => client));
+    await c.updateSecret('op1', 'totp', 'JBSWY3DPEHPK3PXP');
+    expect(puts[0].fields).toContainEqual(expect.objectContaining({ fieldType: 'Totp', value: 'JBSWY3DPEHPK3PXP', sectionId: expect.any(String) }));
+    expect(puts[0].sections.map((section: any) => section.id)).toContain(puts[0].fields.at(-1).sectionId);
+    expect(puts[0].fields[0]).toEqual({ id: 'password', title: 'password', value: 'sw0rd', fieldType: 'Concealed' });
+  });
+
+  // The SDK models no passkeys, so its get-then-put could drop one. Items that
+  // may hold one keep the CLI's in-place assignment (the pre-AU-29 path).
+  it.each([
+    ['the CLI shows a passkey', { fields: [{ id: 'passkey', type: 'PASSKEY', label: 'passkey' }] }, []],
+    ['the SDK cannot model a field', {}, [{ id: 'x', title: 'passkey', value: '', fieldType: 'Unsupported' }]],
+  ])('keeps the in-place CLI edit when %s', async (_case, cliExtra, sdkExtra) => {
+    const commands: string[][] = [];
+    const puts: any[] = [];
+    const client: any = { vaults: { list: async () => [] }, items: {
+      list: async () => [],
+      get: async (vaultId: string, id: string) => ({ id, vaultId, category: 'Login', sections: [],
+        fields: [{ id: 'password', title: 'password', value: 'old', fieldType: 'Concealed' }, ...sdkExtra] }),
+      put: async (item: any) => { puts.push(item); return item; } } };
+    const c = new OnePasswordConnector(() => 'tok', async (_cmd, args) => {
+      commands.push(args);
+      return args[1] === 'get' ? JSON.stringify({ id: 'op1', vault: { id: 'v' }, ...cliExtra }) : '{}';
+    }, new OnePasswordSdkConnector(() => 'tok', async () => client));
+    await c.updateSecret('op1', 'password', 'rotated');
+    expect(puts).toHaveLength(0);
+    expect(commands.at(-1)).toEqual(['item', 'edit', 'op1', 'password=rotated']);
+  });
+
+  it('refuses a hosted write-back that could drop a passkey', async () => {
+    const client: any = { vaults: { list: async () => [] }, items: {
+      list: async () => [],
+      get: async (vaultId: string, id: string) => ({ id, vaultId, category: 'Login', sections: [],
+        fields: [{ id: 'x', title: 'passkey', value: '', fieldType: 'Unsupported' }, { id: 'password', value: 'old', fieldType: 'Concealed' }] }),
+      put: async () => { throw new Error('must not put'); } } };
+    const c = new OnePasswordSdkConnector(() => 'tok', async () => client);
+    await expect(c.updateSecretIn('v', 'op1', 'password', 'rotated')).rejects.toThrow(/cannot rewrite.*passkey/);
+  });
+
   it('does not connect without a service-account token', async () => {
     const { items, broker, store } = makeVault();
     const connectors = new Connectors(store, items, broker);
