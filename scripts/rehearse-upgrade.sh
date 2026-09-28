@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Rehearses a release upgrade on a production-shaped turnkey stack:
 #
-#   scripts/rehearse-upgrade.sh [--from REV] [--to REV] [--work DIR] [--keep] [--no-runner]
+#   scripts/rehearse-upgrade.sh [--from REV] [--to REV] [--work DIR] [--keep]
+#                               [--no-runner] [--before-update CMD]
 #
 # FROM (default origin/master, the deployed revision) is installed from a
 # scratch clone with its own `deploy/karmax up`, seeded with production-shaped
@@ -10,7 +11,8 @@
 # Deploy workflow upgrades production: TO's own `deploy/karmax update <sha>`,
 # through TO's update-runner.sh when it has one (--no-runner skips the runner,
 # as deploy.yml did before it, to tell the runner's failures from the
-# release's). Everything is verified through TO's API; then the pre-update
+# release's; --before-update runs an operator's workaround in the install
+# first). Everything is verified through TO's API; then the pre-update
 # backup is restored onto a fresh TO stack and verified again. Timings are
 # printed; any failure exits non-zero.
 #
@@ -29,6 +31,7 @@ TO=HEAD
 WORK=''
 KEEP=0
 RUNNER=1
+BEFORE_UPDATE=''
 DOMAIN=rehearse.localhost
 # A project of its own, so the rehearsal never touches an installation's
 # `karmax` containers or volumes on the same host. deploy/karmax runs every
@@ -52,6 +55,7 @@ while [ "$#" -gt 0 ]; do
     --work) WORK=$2; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --no-runner) RUNNER=0; shift ;;
+    --before-update) BEFORE_UPDATE=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; echo "rehearse: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -300,6 +304,10 @@ deploy_like_production() {
   [ "$status" = success ]
 }
 git -C "$WORK/origin.git" update-ref refs/heads/master "$DEPLOY_SHA"
+if [ -n "$BEFORE_UPDATE" ]; then
+  export REHEARSAL_TO_SHA=$DEPLOY_SHA
+  step '   Before the update (--before-update)' before-update.log sh -c "$BEFORE_UPDATE" || true
+fi
 previous_app=$(app_container)
 watch_app & WATCHER=$!
 update_started=$(date +%s)
@@ -352,7 +360,8 @@ wipe_project
 git clone -q "$WORK/origin.git" "$WORK/restore"
 git -C "$WORK/restore" checkout -q --detach "$DEPLOY_SHA"
 cd "$WORK/restore"
-restore() { printf 'RESTORE\n' | ./deploy/karmax restore "$@"; }
+# Answers the confirmation the restore asks for, whatever its wording.
+restore() { printf '%s\n' "${CONFIRM:-RESTORE}" | ./deploy/karmax restore "$@"; }
 # Releases before CI-37 wrote no SHA256SUMS, and a restore that requires one
 # refuses their backups; one that also verifies signatures refuses unsigned
 # checksums unless told --accept-unsigned-v1. The refusal is recorded as a
@@ -362,7 +371,8 @@ with_checksums() {
   local accept=()
   cp -a "$BACKUP" "$BACKUP-checksummed"
   (cd "$BACKUP-checksummed" && sha256sum *.dump deployment-secrets/* control-plane/manifest.json > SHA256SUMS)
-  ! grep -q -- '--accept-unsigned-v1' ./deploy/karmax || accept=(--accept-unsigned-v1)
+  local CONFIRM=RESTORE
+  if grep -q -- '--accept-unsigned-v1' ./deploy/karmax; then accept=(--accept-unsigned-v1); CONFIRM='RESTORE UNSIGNED'; fi
   restore "${accept[@]}" "$BACKUP-checksummed"
 }
 restored=0
