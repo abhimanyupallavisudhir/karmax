@@ -91,6 +91,15 @@ describe('repository guidance', () => {
     expect(vault).toMatch(/KARMAX_VAULT_KEY/);
   });
 
+  it('says which key seals new sandbox references (WD-30a)', () => {
+    for (const file of ['src/world/e2b.ts', 'src/world/daytona.ts', 'src/runtime/execution-services.ts', 'HOSTING.md']) {
+      const text = read(file);
+      expect(text, file).not.toContain('Hosted deployments must set KARMAX_WORLD_REF_KEY');
+      expect(text, file).not.toContain('Restore the original KARMAX_WORLD_REF_KEY;');
+      expect(text, file).toMatch(/world-reference:key:v2|WorldReferenceKeys/);
+    }
+  });
+
   it('links every tracked benchmark result from a repository doc', () => {
     const ls = (...args: string[]) => execFileSync('git', ['ls-files', ...args], {
       cwd: new URL('..', import.meta.url), encoding: 'utf8',
