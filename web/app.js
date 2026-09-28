@@ -11885,11 +11885,13 @@ function flashSaved(button) {
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
 const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
-// `confirm` (the Review route) stays a shared/common value on the wire, but it is
-// edited in the Agents card beside the task agents it gates — not here.
-const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
+// Review route and Responder stay shared/common values on the wire, but their
+// controls live in the Agent card.
+const agentRouteSettingsFields = (scope) => ['confirm', 'responder']
+  .map((name) => settingsFields('software-dev', scope).find((field) => field.name === name)).filter(Boolean);
+const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && !['confirm', 'responder'].includes(field.name));
 // The stored `__common__` row is shared by several forms (task defaults here; the
-// Review route and Git profile elsewhere) and a settings PUT replaces the whole
+// agent routes and Git profile elsewhere) and a settings PUT replaces the whole
 // row — so every save read-merge-writes: fetch the raw row, drop exactly the keys
 // this form owns, and lay the collected values on top.
 async function saveCommonSettings(scope, projectId, organizationId, ownNames, collected) {
@@ -11924,7 +11926,8 @@ function settingsForms(scope, projectId) {
       </details>`;
     })
     .join('');
-  return common + resourceDefaultsHtml(scope) + unique;
+  return common + profilesCard(scope) + quickSettingsForms(scope, projectId)
+    + resourceDefaultsHtml(scope) + explanationSettingsCard(scope) + unique;
 }
 
 function resourceDefaultsHtml(scope) {
@@ -13102,13 +13105,10 @@ function settingsView(proj) {
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
-    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
-    ${explanationSettingsCard('project')}
-    ${profilesCard('project')}
-    ${quickSettingsForms('project', proj.id)}
     <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
     <div class="settings-section-title" id="project-people"><div>People &amp; authorization<small>Who can work here, and what they may do</small></div></div>
     <div class="card"><div id="project-access">Loading…</div></div>
+    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
@@ -14069,9 +14069,6 @@ function globalSettingsView(embedded = false) {
   return `
     ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
-    ${explanationSettingsCard('global')}
-    ${profilesCard('global')}
-    ${quickSettingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps</div>
       <p class="task-sub">List of connected apps. To set defaults, go to <a href="#settings-defaults">Task defaults</a>.</p>
@@ -16226,15 +16223,14 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   }));
 }
 
-// The Review route — who checks the work at Review: human layers, agent layers,
-// or none (auto-confirm). Stored with the shared task defaults (__common__/
-// confirm) but edited here, beside the task agents it gates.
+// Review route and Responder share the task-defaults row (__common__) but are
+// edited beside the operational agent, with one save for both routes.
 async function hydrateReviewRoute(scope, projectId, organizationId) {
   const box = $(`#review-route-${scope}`);
   if (!box) return;
   const renderIsCurrent = beginAsyncElementRender(box);
-  const field = schemaFor('software-dev').find((f) => f.name === 'confirm');
-  if (!field) { box.innerHTML = ''; return; }
+  const fields = agentRouteSettingsFields(scope);
+  if (!fields.length) { box.innerHTML = ''; return; }
   let own = {};
   let inherited = {};
   try {
@@ -16244,16 +16240,16 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
     inherited = d[scope].inherited;
   } catch {}
   if (!renderIsCurrent()) return;
-  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
-    <button class="btn primary sm" data-save-review-route>Save review route</button>`;
+  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields(fields, own, inherited)}</div>
+    <button class="btn primary sm" data-save-review-route>Save routes</button>`;
   box.dataset.mcpScope = mcpScope(projectId || null, organizationId);
   wireAgentFields(box);
-  wireFieldResets(box, [field]);
+  wireFieldResets(box, fields);
   const saveButton = box.querySelector('[data-save-review-route]');
   saveButton.addEventListener('click', async () => {
-    const values = collectForm(box.querySelector('.wf-form'), [field]);
+    const values = collectForm(box.querySelector('.wf-form'), fields);
     try {
-      await saveCommonSettings(scope, projectId, organizationId, ['confirm'], values);
+      await saveCommonSettings(scope, projectId, organizationId, fields.map((field) => field.name), values);
       flashSaved(saveButton);
     } catch (err) { toast(err.message, true); }
   });
