@@ -26,8 +26,9 @@ import type { Organization } from '../../src/domain/types.js';
 // own the parts every journey otherwise re-implemented inline: the browser,
 // page-error capture, a signed-in context, a hosted gateway, and email.
 
-export const launchChromium = (options: { args?: string[] } = {}): Promise<Browser> => chromium.launch({ headless: true,
-  args: ['--no-sandbox', ...(options.args ?? [])], executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined });
+export const launchChromium = (options: { args?: string[]; env?: Record<string, string | undefined> } = {}): Promise<Browser> => chromium.launch({ headless: true,
+  args: ['--no-sandbox', ...(options.args ?? [])], executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
+  ...(options.env ? { env: options.env } : {}) });
 
 export interface ConsolePage {
   context: BrowserContext;
