@@ -382,7 +382,25 @@ function parseRoute(url) {
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
-  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}) };
+  const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
+  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
+    ...(wikiView ? { wikiView } : {}) };
+}
+
+// Which branch the project wiki shows is part of the page, so it lives in the
+// URL: `?task=<num>` (a task's live checkout) or `?branch=<name>`; the open
+// entry rides in the hash.
+function wikiViewFromQuery(query) {
+  const task = query.get('task'), branch = query.get('branch');
+  return task ? `task:${task}` : branch ? `branch:${branch}` : '';
+}
+
+function wikiRoute(pid, view = '', entry = '') {
+  const [kind, ...rest] = String(view).split(':');
+  const value = rest.join(':');
+  const query = kind === 'task' && value ? `?task=${encodeURIComponent(value)}`
+    : kind === 'branch' && value ? `?branch=${encodeURIComponent(value)}` : '';
+  return `${projectRoute(pid, 'wiki')}${query}${entry ? `#${encodeURIComponent(entry)}` : ''}`;
 }
 
 function fileRouteTarget(query) {
@@ -609,6 +627,7 @@ async function applyRoute() {
   await loadOrganizationRuntimeCatalog();
   if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
+  S.wikiView = r.wikiView || '';
   if (!sameProject) {
     // Switching projects: drop the previous project's per-project view state so
     // its query/roving-cursor/search-result can't bleed into the new project
@@ -7069,6 +7088,12 @@ async function hydrateTaskFilePage(v, target, key) {
       method: 'POST', body: JSON.stringify(target),
     });
     if (taskFileKey(v, target) !== key || S.taskFileLoad?.key !== key) return;
+    // A wiki file is shown in the wiki itself, on this task's branch.
+    if (result.wiki) {
+      S.taskFileLoad = null;
+      if (S.selected !== v.taskId || !S.taskFile) return;
+      return go(wikiRoute(taskRecord(v.taskId)?.projectId || S.projectId, `task:${v.num ?? v.taskId}`, result.wiki.path), { replace: true });
+    }
     S.taskFileLoad = { key, status: 'ready', result };
   } catch (error) {
     if (taskFileKey(v, target) !== key || S.taskFileLoad?.key !== key) return;
@@ -8922,7 +8947,7 @@ function renderConversationText(text, role, v = S.view) {
     const href = match[2].startsWith('<') ? match[2].slice(1, -1) : match[2];
     const fileUrl = worldFileHref(href, v);
     html += fileUrl
-      ? `<a href="${esc(fileUrl)}" class="world-file-link" target="_blank" rel="noopener" title="Open this file from its task workspace">${esc(match[1])}</a>`
+      ? `${worldFileAnchor(fileUrl)}${esc(match[1])}</a>`
       : `<a href="${esc(safeHref(href))}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
     at = match.index + match[0].length;
   }
@@ -8974,7 +8999,28 @@ function worldFileHref(raw, v = S.view) {
   // confinement check; a transient `worldAvailable` hint must not decide
   // whether an agent-authored filesystem path becomes a handoff permalink.
   const target = worldFileTarget(raw, v?.worldPath, !!v?.taskId && !v?.worldPath);
-  return target && v?.taskId ? `${taskUrl(v.taskId)}/file?${fileTargetQuery(target)}` : null;
+  if (!target || !v?.taskId) return null;
+  return worldWikiHref(target, v) || `${taskUrl(v.taskId)}/file?${fileTargetQuery(target)}`;
+}
+
+// A file in the task's wiki checkout is a wiki entry (its SKILL.md/MEMORY.md,
+// or an attachment): link to that entry in the wiki view, on this task's live
+// branch. The gateway also resolves these, for links minted before this.
+function worldWikiHref(target, v) {
+  if (!v?.worldWiki) return null;
+  const parts = String(target.path).replace(/\\/g, '/').split('/');
+  const at = parts.indexOf(v.worldWiki);
+  const relative = !String(target.path).startsWith('/');
+  if (at < 0 || (relative && parts.slice(0, at).some((part) => part && part !== '.' && part !== '..'))) return null;
+  const entry = parts.slice(at + 1).filter((part) => part && part !== '.');
+  if (entry.length && /\.[A-Za-z0-9]+$/.test(entry[entry.length - 1])) entry.pop();
+  const projectId = taskRecord(v.taskId)?.projectId || S.projectId;
+  return wikiRoute(projectId, `task:${v.num ?? v.taskId}`, entry.join('/'));
+}
+
+function worldFileAnchor(href) {
+  const wiki = !/\/tasks\/[^/]+\/file\?/.test(href);
+  return `<a href="${esc(href)}" class="world-file-link" target="_blank" rel="noopener" title="${wiki ? 'Open in the wiki' : 'Open this file from its task workspace'}">`;
 }
 
 function decodeMarkdownAttribute(value) {
@@ -8990,7 +9036,7 @@ function annotateWorldFileLinks(html, v = S.view) {
     const local = attrs.match(/\sdata-md-local="([^"]*)"/);
     const fileUrl = worldFileHref(decodeMarkdownAttribute(local ? local[1] : href), v);
     return fileUrl
-      ? `<a href="${esc(fileUrl)}" class="world-file-link" target="_blank" rel="noopener" title="Open this file from its task workspace">`
+      ? worldFileAnchor(fileUrl)
       : anchor;
   });
 }
@@ -12158,10 +12204,10 @@ function wireAvatarsView(proj) {
 // the URL hash so wiki pages deep-link like settings panes.
 function wikiScopeInfo(proj) {
   if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki`,
-    selector: S.wikiViews?.[proj.id] || '' };
+    view: S.wikiView || '' };
   const org = currentOrg();
   if (!org) return null;
-  return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki` };
+  return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki`, view: '' };
 }
 
 function wikiView(proj) {
@@ -12169,19 +12215,110 @@ function wikiView(proj) {
   if (!info) return `<div class="empty">No organization yet.</div>`;
   return `<div class="organization-settings wiki-page"><div class="settings-header"><div>
       <h1 class="page-title">${esc(info.title)} — wiki</h1>
-    </div>${proj ? `<div class="wiki-view-picker"><label for="wiki-view-input">Viewing</label>
-      <input id="wiki-view-input" list="wiki-view-options" placeholder="Default branch" autocomplete="off">
-      <datalist id="wiki-view-options"></datalist></div>` : ''}</div>
+    </div>${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout">
+      <span>Viewing</span><select id="wiki-view-select">${wikiViewOptionsHtml(proj)}</select></label>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
 }
 
+// The default branch, every task whose checkout can still be opened, and the
+// other branches. The current view is always an option, even before (or
+// without) the server's list, so the control never misstates what is shown.
+function wikiViewOptionsHtml(proj) {
+  const refs = S.wikiRefs?.[proj.id]?.data;
+  const view = S.wikiView || '';
+  const tasks = (refs?.tasks || []).map((task) => ({ value: `task:${task.num ?? task.id}`,
+    label: `#${task.num ?? '–'} ${task.title}`, title: task.branch }));
+  const branches = (refs?.branches || []).filter((branch) => branch !== refs.defaultBranch)
+    .map((branch) => ({ value: `branch:${branch}`, label: branch }));
+  if (view && ![...tasks, ...branches].some((option) => option.value === view)) {
+    const key = view.slice(view.indexOf(':') + 1);
+    if (view.startsWith('task:')) {
+      const task = (S.tasks || []).find((t) => String(t.num) === key || t.id === key);
+      tasks.unshift({ value: view, label: `#${task?.num ?? key} ${task?.title || ''}`.trim() });
+    } else branches.unshift({ value: view, label: key });
+  }
+  const option = (o) => `<option value="${esc(o.value)}"${o.value === view ? ' selected' : ''}${o.title ? ` title="${esc(o.title)}"` : ''}>${esc(o.label)}</option>`;
+  return option({ value: '', label: refs?.defaultBranch || 'main' })
+    + (tasks.length ? `<optgroup label="Tasks">${tasks.map(option).join('')}</optgroup>` : '')
+    + (branches.length ? `<optgroup label="Branches">${branches.map(option).join('')}</optgroup>` : '');
+}
+
+// The picker's list changes only as tasks start and finish: fetch it at most
+// every half minute, in the background, and never rebuild an open dropdown.
+function loadWikiRefs(proj) {
+  S.wikiRefs ||= {};
+  const entry = S.wikiRefs[proj.id];
+  if (entry?.pending || (entry?.at && Date.now() - entry.at < 30_000)) return;
+  const pending = api(`/api/projects/${encodeURIComponent(proj.id)}/wiki/refs`).then((data) => {
+    S.wikiRefs[proj.id] = { data, at: Date.now() };
+    const select = $('#wiki-view-select');
+    if (!select || S.projectId !== proj.id || S.tab !== 'wiki') return;
+    const refresh = () => { select.innerHTML = wikiViewOptionsHtml(proj); };
+    if (document.activeElement === select) select.addEventListener('blur', refresh, { once: true });
+    else refresh();
+  }).catch(() => { S.wikiRefs[proj.id] = { ...entry, pending: null }; });
+  S.wikiRefs[proj.id] = { ...entry, pending };
+}
+
 function wikiUrl(info, suffix = '', params = {}) {
   const url = new URL(`${info.base}${suffix}`, location.origin);
-  if (info.selector?.startsWith('task:')) url.searchParams.set('taskId', info.selector.slice(5));
-  else if (info.selector?.startsWith('branch:')) url.searchParams.set('branch', info.selector.slice(7));
+  if (info.taskId) url.searchParams.set('taskId', info.taskId);
+  else if (info.view?.startsWith('branch:')) url.searchParams.set('branch', info.view.slice(7));
   for (const [key, value] of Object.entries(params)) if (value != null && value !== '') url.searchParams.set(key, value);
   return `${url.pathname}${url.search}`;
+}
+
+// Wiki reads are cached by URL: a repaint, an entry switch or Back paints the
+// last copy at once and then revalidates (unless it is only seconds old), and
+// concurrent callers share one request. A task view can be slow to read (its
+// checkout may live in a cloud sandbox), so navigation never waits on it.
+const wikiReadCache = new Map(); // url → { data, at }
+const wikiReadsInFlight = new Map();
+function wikiRead(url) {
+  const cached = wikiReadCache.get(url);
+  let fresh = wikiReadsInFlight.get(url);
+  if (!fresh && cached && Date.now() - cached.at < 5_000) fresh = Promise.resolve(cached.data);
+  if (!fresh) {
+    const request = api(url).then((data) => {
+      if (wikiReadsInFlight.get(url) === request) {
+        wikiReadCache.delete(url);
+        wikiReadCache.set(url, { data, at: Date.now() });
+        if (wikiReadCache.size > 200) wikiReadCache.delete(wikiReadCache.keys().next().value);
+      }
+      return data;
+    }).finally(() => { if (wikiReadsInFlight.get(url) === request) wikiReadsInFlight.delete(url); });
+    wikiReadsInFlight.set(url, fresh = request);
+  }
+  return { cached: cached?.data, fresh };
+}
+// After a write nothing cached may be shown again.
+function forgetWikiReads() { wikiReadCache.clear(); wikiReadsInFlight.clear(); }
+// Paint the cached copy synchronously, then the fresh one if it differs.
+function paintWikiRead(read, paint, fail) {
+  const seen = read.cached === undefined ? undefined : JSON.stringify(read.cached);
+  if (read.cached !== undefined) paint(read.cached);
+  read.fresh.then((data) => { if (JSON.stringify(data) !== seen) paint(data); },
+    (error) => { if (read.cached === undefined) fail(error); });
+}
+
+// Move to another entry (or the Index, path ''), keeping the branch view.
+// Entries are history entries, so Back returns to the previous one.
+function openWikiEntry(proj, path, { replace = false } = {}) {
+  S.wikiEditing = null;
+  history[replace ? 'replaceState' : 'pushState']({ kx: 1 }, '',
+    `${location.pathname}${location.search}${path ? `#${encodeURIComponent(path)}` : ''}`);
+  wireWikiView(proj);
+}
+
+// The entry that encloses `path` (an attachment or a sub-folder of one), if any.
+function wikiEnclosingEntry(toc, path) {
+  const entries = new Set();
+  const walk = (list) => (list || []).forEach((e) => (e.kind === 'section' ? walk(e.children) : entries.add(e.path)));
+  walk(toc?.children);
+  for (let cut = path; cut; cut = cut.includes('/') ? cut.slice(0, cut.lastIndexOf('/')) : '')
+    if (entries.has(cut)) return cut;
+  return '';
 }
 
 const wikiIsDefault = (e) => (e.labels || []).includes('default');
@@ -12195,75 +12332,88 @@ function wikiTreeHtml(entries, sel, depth = 0) {
   ).join('');
 }
 
+const wikiTaskIds = new Map(); // `${projectId}:${num}` → task id, for ?task= views
+let wikiGeneration = 0;
+
 async function wireWikiView(proj) {
   const info = wikiScopeInfo(proj);
   const nav = $('#wiki-nav');
   const pane = $('#wiki-pane');
   if (!info || !nav || !pane) return;
-  if (proj) {
-    try {
-      const refs = await api(`${info.base}/refs`);
-      const input = $('#wiki-view-input');
-      const options = $('#wiki-view-options');
-      const entries = [
-        { value: '', label: `Default branch · ${refs.defaultBranch}` },
-        ...(refs.tasks || []).map((task) => ({ value: `task:${task.id}`, label: `#${task.num || '–'} ${task.title} · ${task.branch}` })),
-        ...(refs.branches || []).filter((branch) => branch !== refs.defaultBranch)
-          .map((branch) => ({ value: `branch:${branch}`, label: `Branch · ${branch}` })),
-      ];
-      const selected = entries.find((entry) => entry.value === info.selector) || entries[0];
-      input.value = selected.label;
-      options.innerHTML = entries.map((entry) => `<option value="${esc(entry.label)}"></option>`).join('');
-      input.onchange = () => {
-        const chosen = entries.find((entry) => entry.label === input.value.trim());
-        if (!chosen) return;
-        S.wikiViews ||= {};
-        S.wikiViews[proj.id] = chosen.value;
-        S.wikiEditing = null;
-        wireWikiView(proj);
-      };
-    } catch { /* the canonical wiki remains usable without the selector metadata */ }
-  }
-  const key = `${info.scope}:${info.id}`;
-  let data;
-  try { data = await api(wikiUrl(info)); }
-  catch (e) { pane.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; nav.textContent = ''; return; }
+  // Only the latest call may paint: a slow answer for an entry the user has
+  // already left must not replace the one they moved to.
+  const generation = ++wikiGeneration;
+  const current = () => generation === wikiGeneration && pane.isConnected;
   const sel = decodeURIComponent((location.hash || '').slice(1));
+  const key = `${info.scope}:${info.id}`;
+  if (proj) {
+    const select = $('#wiki-view-select');
+    if (select) select.onchange = () => { S.wikiEditing = null; go(wikiRoute(proj.id, select.value, sel)); };
+    loadWikiRefs(proj);
+    if (info.view.startsWith('task:')) {
+      const taskKey = info.view.slice(5);
+      info.taskId = wikiTaskIds.get(`${proj.id}:${taskKey}`)
+        || (S.wikiRefs?.[proj.id]?.data?.tasks || []).find((task) => String(task.num) === taskKey)?.id
+        || await resolveProjectTaskKey(proj.id, taskKey);
+      if (!current()) return;
+      if (!info.taskId) { nav.textContent = ''; pane.innerHTML = '<span class="task-sub">Task not found.</span>'; return; }
+      wikiTaskIds.set(`${proj.id}:${taskKey}`, info.taskId);
+    }
+  }
 
-  nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
-    <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
-    ${wikiTreeHtml(data.toc?.children, sel)}
-    ${data.view?.writable !== false ? '<button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>' : ''}`;
-  const open = (path) => {
-    S.wikiEditing = null;
-    history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
-    wireWikiView(proj);
+  let indexData;
+  const paintNav = (data) => {
+    nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
+      <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
+      ${wikiTreeHtml(data?.toc?.children, sel)}
+      ${data && data.view?.writable !== false ? '<button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>' : ''}`;
+    nav.querySelectorAll('[data-wiki-home], [data-wiki-path]').forEach((a) => a.addEventListener('click', (ev) => {
+      if (isNewTabClick(ev)) return;
+      ev.preventDefault();
+      openWikiEntry(proj, a.dataset.wikiPath || '');
+    }));
+    $('#wiki-new')?.addEventListener('click', () => renderWikiEditor(info, proj, pane, null));
   };
-  nav.querySelector('[data-wiki-home]')?.addEventListener('click', (ev) => { ev.preventDefault(); open(''); });
-  nav.querySelectorAll('[data-wiki-path]').forEach((a) => a.addEventListener('click', (ev) => { ev.preventDefault(); open(a.dataset.wikiPath); }));
-  $('#wiki-new')?.addEventListener('click', () => renderWikiEditor(info, proj, pane, null));
+  paintNav(undefined);
 
-  // A page fetch goes through the base route so built-ins resolve (a virtual
-  // built-in has no on-disk page for /page to find).
-  const fetchPage = async (p) => {
-    const read = await api(wikiUrl(info, '', { path: p }));
-    return read.page ? { ...read.page, _wikiWritable: read.view?.writable !== false } : null;
-  };
   // A background re-render (WS task event) must not blow away an in-progress
   // editor: restore it for the same scope before painting the read view.
   if (S.wikiEditing?.wikiKey === key) {
     if (!S.wikiEditing.path) return renderWikiEditor(info, proj, pane, null);
     try {
-      const editing = await fetchPage(S.wikiEditing.path);
-      if (editing) return renderWikiEditor(info, proj, pane, editing);
+      const read = await wikiRead(wikiUrl(info, '', { path: S.wikiEditing.path })).fresh;
+      if (!current()) return;
+      if (read.page) return renderWikiEditor(info, proj, pane, { ...read.page, _wikiWritable: read.view?.writable !== false });
     } catch { /* fall through */ }
     S.wikiEditing = null;
   }
-  if (!sel) return renderWikiHome(info, proj, pane, data);
-  let page;
-  try { page = await fetchPage(sel); } catch { page = null; }
-  if (!page) return renderWikiHome(info, proj, pane, data); // stale hash → fall back
-  renderWikiPage(info, proj, pane, page);
+
+  const index = wikiRead(wikiUrl(info));
+  const page = sel ? wikiRead(wikiUrl(info, '', { path: sel })) : null;
+  if ((page || index).cached === undefined) pane.innerHTML = '<span class="task-sub" role="status">Loading…</span>';
+  paintWikiRead(index, (data) => {
+    if (!current()) return;
+    indexData = data;
+    paintNav(data);
+    if (!sel) renderWikiHome(info, proj, pane, data);
+  }, (error) => {
+    if (current() && !sel) pane.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
+  });
+  if (!page) return;
+  // Not an entry on this view (a stale link, or a cited attachment inside an
+  // entry): open the enclosing entry, else the Index.
+  const fallback = async (error) => {
+    const data = indexData || await index.fresh.catch(() => null);
+    if (!current()) return;
+    if (!data) { pane.innerHTML = `<span class="task-sub">${esc(error?.message || 'This wiki is unavailable.')}</span>`; return; }
+    const enclosing = wikiEnclosingEntry(data.toc, sel);
+    openWikiEntry(proj, enclosing !== sel ? enclosing : '', { replace: true });
+  };
+  paintWikiRead(page, (read) => {
+    if (!current()) return;
+    if (read.page) renderWikiPage(info, proj, pane, { ...read.page, _wikiWritable: read.view?.writable !== false });
+    else fallback();
+  }, (error) => { if (current()) fallback(error); });
 }
 
 // Everything above the frontmatter fence is metadata; render only the body.
@@ -12681,10 +12831,7 @@ function wireWikiPathEditor(el, warnEl, kindOf) {
 function wireWikiLocalLinks(root, proj) {
   root?.querySelectorAll('a[data-md-local]').forEach((a) => a.addEventListener('click', (ev) => {
     ev.preventDefault();
-    const path = (a.dataset.mdLocal || '').replace(/^\.?\//, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
-    S.wikiEditing = null;
-    history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
-    wireWikiView(proj);
+    openWikiEntry(proj, (a.dataset.mdLocal || '').replace(/^\.?\//, '').replace(/[?#].*$/, '').replace(/\/+$/, ''));
   }));
 }
 
@@ -12708,7 +12855,7 @@ function renderWikiHome(info, proj, pane, data) {
     try {
       const read = await api(wikiUrl(info, '', { path: b.dataset.path }));
       if (!read.page) return toast('Entry not found', true);
-      history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(read.page.path)}`);
+      history.replaceState({ kx: 1 }, '', `${location.pathname}${location.search}#${encodeURIComponent(read.page.path)}`);
       renderWikiEditor(info, proj, pane, read.page);
     } catch (e) { toast(e.message, true); }
   }));
@@ -12741,7 +12888,8 @@ function renderWikiPage(info, proj, pane, page) {
     if (!confirm(q)) return;
     try {
       await api(wikiUrl(info, '/page', { path: page.path }), { method: 'DELETE' });
-      if (!page.builtin) history.replaceState({ kx: 1 }, '', location.pathname);
+      forgetWikiReads();
+      if (!page.builtin) history.replaceState({ kx: 1 }, '', `${location.pathname}${location.search}`);
       wireWikiView(proj);
     } catch (e) { toast(e.message, true); }
   });
@@ -12853,8 +13001,9 @@ function renderWikiEditor(info, proj, pane, page) {
     else if (path !== page.path) body.prevPath = page.path;
     try {
       await api(wikiUrl(info, '/page'), { method: 'PUT', body: JSON.stringify(body) });
+      forgetWikiReads();
       S.wikiEditing = null;
-      history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(path)}`);
+      history.replaceState({ kx: 1 }, '', `${location.pathname}${location.search}#${encodeURIComponent(path)}`);
       wireWikiView(proj);
     } catch (e) { toast(e.message, true); }
   });

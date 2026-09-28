@@ -32,6 +32,39 @@ describe('hosted/local Git handoff', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // The project wiki is never part of a development checkout, so a wiki
+  // citation used to fail with "local checkout does not contain the requested
+  // repository" (task 367). It names a wiki entry and opens in the wiki view.
+  it('resolves a citation inside the project-wiki checkout to its wiki entry', async () => {
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Platform', { worldProvider: 'e2b' }, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Review', workflow: 'software-dev', workflowVersion: '1.0.0',
+      params: { prompt: 'review' } as any }));
+    const branch = `karmax/${task.id}`;
+    // The agent works inside the development checkout; its prompt lists the
+    // wiki beside it, at the world root.
+    (await store.registerWorld({ kind: 'e2b', id: task.id, root: '/home/user/acme', workdir: '/home/user/acme/app', branch, base: 'main',
+      repos: [
+        { name: 'app', repo: 'git@github.com:acme/app.git', root: '/home/user/acme/app', branch, base: 'main', target: 'main' },
+        { name: 'acme-wiki', role: 'project-wiki', repo: 'git@github.com:acme/acme-wiki.git', root: '/home/user/acme/acme-wiki',
+          branch, base: 'main', target: 'main' },
+      ] }, project.id));
+    const handoff = new WorldHandoffService(store, new WorldRegistry(), {} as any);
+    expect(await handoff.wikiCitation(task.id, 'acme-wiki/reviews/2026-09-26/SKILL.md'))
+      .toEqual({ wiki: { path: 'reviews/2026-09-26' } });
+    expect(await handoff.wikiCitation(task.id, '/home/user/acme/acme-wiki/notes/MEMORY.md'))
+      .toEqual({ wiki: { path: 'notes' } });
+    expect(await handoff.wikiCitation(task.id, 'acme-wiki/reviews/2026-09-26/diagram.png'))
+      .toEqual({ wiki: { path: 'reviews/2026-09-26' } });
+    expect(await handoff.wikiCitation(task.id, 'acme-wiki/reviews')).toEqual({ wiki: { path: 'reviews' } });
+    expect(await handoff.wikiCitation(task.id, '../acme-wiki/notes/SKILL.md')).toEqual({ wiki: { path: 'notes' } });
+    expect(await handoff.wikiCitation(task.id, 'src/index.ts')).toBeUndefined();
+    expect(await handoff.wikiCitation(task.id, '/home/user/acme/app/src/index.ts')).toBeUndefined();
+    expect(await handoff.wikiCitation(task.id, '/etc/passwd')).toBeUndefined();
+    (await store.close());
+  });
+
   it('produces a secret-free SSH checkout plan for every attached repository', async () => {
     const store = (await Store.create(':memory:'));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));

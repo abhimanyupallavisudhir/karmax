@@ -80,6 +80,30 @@ export class WorldHandoffService {
     private localRoot = paths().localCheckouts,
     private resources?: import('./resources.js').ProjectResourceService) {}
 
+  /** The wiki entry an agent-cited path names, when it lies in the task's
+   * project-wiki checkout. The wiki view renders every live task branch, so a
+   * wiki citation opens there: the wiki is never part of a development
+   * checkout, and there is nothing to hand off. */
+  async wikiCitation(taskId: string, requestedPath: string): Promise<WikiFileTarget | undefined> {
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
+    if (!handle) return undefined;
+    const wiki = worldRepos(handle).find((repo) => repo.role === 'project-wiki');
+    if (!wiki) return undefined;
+    // Agents also cite the wiki relative to the world root (where their prompt
+    // lists it) while working in a nested development checkout.
+    const requested = requestedPath.trim();
+    const fromRoot = !path.isAbsolute(requested) && requested.split(/[\\/]/)[0] === path.basename(wiki.root)
+      ? path.join(handle.root, requested) : undefined;
+    for (const candidate of [requested, fromRoot]) {
+      if (!candidate) continue;
+      let resolved;
+      try { resolved = resolveWorldFile(handle, candidate); } catch { continue; }
+      if (worldRepos(handle)[resolved.repoIndex]?.role === 'project-wiki')
+        return { wiki: { path: wikiPageOfFile(resolved.relative) } };
+    }
+    return undefined;
+  }
+
   /** Resolve an agent-authored path into the corresponding host checkout and
    * return a pasteable editor command. Remote worlds cross the normal Git
    * handoff boundary first; local worktrees already are the host checkout. */
@@ -427,6 +451,16 @@ function safeName(value: string): string { return value.replace(/[^A-Za-z0-9._-]
 function pathInside(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+export interface WikiFileTarget { wiki: { path: string } }
+
+/** The entry a file in a wiki checkout belongs to: an entry is a folder whose
+ * SKILL.md/MEMORY.md is its text, and any other file in it is an attachment. */
+export function wikiPageOfFile(relative: string): string {
+  const parts = relative.split(/[\\/]+/).filter((part) => part && part !== '.');
+  if (parts.length && /\.[A-Za-z0-9]+$/.test(parts[parts.length - 1]!)) parts.pop();
+  return parts.join('/');
 }
 
 function resolveWorldFile(handle: WorldHandle, requestedPath: string): {

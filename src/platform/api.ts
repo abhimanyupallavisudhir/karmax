@@ -45,6 +45,7 @@ import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, sanitizeAttachmentName } from '../store/attachments.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES, BUILTIN_WIKI_PREFIX } from '../wiki/wiki.js';
+import { copyRemoteWiki, RemoteWikiSnapshots } from '../wiki/remote-snapshot.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
 import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
@@ -350,6 +351,11 @@ export interface KarmaxApiDeps {
  */
 export class KarmaxApi {
   private resolvingPermissions = new Set<string>();
+  private remoteWikiReadCache?: RemoteWikiSnapshots;
+  private get remoteWikiReads(): RemoteWikiSnapshots {
+    return this.remoteWikiReadCache ??= new RemoteWikiSnapshots(
+      path.join(this.deps.contentDir ?? paths().content, '.wiki-snapshots'));
+  }
   /** A workflow id can have several unrelated runs after a lifecycle recovery.
    * Temporal's id-only handle may resolve an earlier closed run; replacements
    * persist their exact run id so every later query/signal targets the live run. */
@@ -5255,12 +5261,20 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async wikiViews(token: string, projectId: string) {
     const view = (await this.wikiScope(token, 'project', projectId, false));
     const branches = projectWikiBranches(view.root);
+    // Only views that can actually open: a task whose world has been released
+    // (every finished task) has no checkout left to read, and listing hundreds
+    // of those buried the few live ones.
     const tasks = (await __asyncCollections.flatMap((await this.deps.store.listTasks(projectId)), async (task) => {
       const handle = ((await this.deps.store.currentWorld(task.id)) ?? task.lastView?.world) as WorldHandle | undefined;
-      if (!handle || !worldRepos(handle).some((repo) => repo.role === 'project-wiki') && !branches.includes(handle.branch)) return [];
+      if (!handle) return [];
+      const repo = worldRepos(handle).find((candidate) => candidate.role === 'project-wiki');
+      const state = repo && !fs.existsSync(repo.root) ? await this.deps.store.worldState(handle.id) : undefined;
+      const live = repo && (fs.existsSync(repo.root) || (state !== undefined && state !== 'released'));
+      if (!live && !branches.includes(handle.branch)) return [];
       return [{ id: task.id, num: task.num, title: task.title, branch: handle.branch,
         status: task.lastView?.status ?? (task.params.draft ? 'draft' : 'queued') }];
     }));
+    tasks.sort((a, b) => (b.num ?? 0) - (a.num ?? 0));
     return { defaultBranch: PROJECT_WIKI_BRANCH, branches, tasks };
   }
 
@@ -5392,27 +5406,38 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const handle = ((await this.deps.store.currentWorld(taskId)) ?? task.lastView?.world) as WorldHandle | undefined;
     const repo = handle ? worldRepos(handle).find((candidate) => candidate.role === 'project-wiki') : undefined;
     if (!handle || !repo || fs.existsSync(repo.root)) return undefined;
-    const access = await this.openCollaborationWorld(taskId, handle);
     const prefix = path.posix.relative(handle.root.replace(/\\/g, '/'), repo.root.replace(/\\/g, '/'));
-    if (prefix.startsWith('..')) {
-      await access.release();
-      throw new Error('project wiki is outside the task world');
+    if (prefix.startsWith('..')) throw new Error('project wiki is outside the task world');
+    const copy = async (root: string) => {
+      const access = await this.openCollaborationWorld(taskId, handle);
+      try { await copyRemoteWiki(access.world, prefix, root); }
+      finally { await access.release(); }
+    };
+    const readOnly = { flush: async () => { throw new Error('read-only wiki snapshot'); } };
+    // The task's own agent edits this checkout with its shell and must read
+    // back exactly what it wrote, so its reads stay live; everyone else
+    // browsing the branch shares the cached copy.
+    if (!write && caller.taskId !== taskId) {
+      const root = await this.remoteWikiReads.read(taskId, `${handle.id}:${handle.generation ?? 1}`, copy);
+      return { root, repo, taskId, ...readOnly, release: async () => {} };
     }
+    if (!write) {
+      const contentDir = this.deps.contentDir ?? paths().content;
+      fs.mkdirSync(contentDir, { recursive: true });
+      const root = fs.mkdtempSync(path.join(contentDir, '.wiki-snapshot-'));
+      try { await copy(root); }
+      catch (error) { fs.rmSync(root, { recursive: true, force: true }); throw error; }
+      return { root, repo, taskId, ...readOnly, release: async () => { fs.rmSync(root, { recursive: true, force: true }); } };
+    }
+    // A write edits the live checkout, so it works on a fresh copy of its own
+    // and holds the world open until the edit is committed there.
+    this.remoteWikiReads.invalidate(taskId);
+    const access = await this.openCollaborationWorld(taskId, handle);
     const contentDir = this.deps.contentDir ?? paths().content;
     fs.mkdirSync(contentDir, { recursive: true });
     const root = fs.mkdtempSync(path.join(contentDir, '.wiki-snapshot-'));
     try {
-      const all = await access.world.listFiles();
-      const inside = all.filter((file) => !prefix || file === prefix || file.startsWith(`${prefix}/`));
-      const relative = (file: string) => prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
-      for (const file of inside) {
-        const rel = relative(file);
-        if (!rel || rel.startsWith('.git/')) continue;
-        const target = path.join(root, rel);
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        fs.writeFileSync(target, await access.world.readFileBuffer(file));
-      }
-      const before = new Set(inside.map(relative).filter(Boolean));
+      const before = new Set(await copyRemoteWiki(access.world, prefix, root));
       return {
         root, repo, taskId,
         flush: async (message: string) => {
@@ -5432,6 +5457,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
             throw new Error(committed.stderr || committed.stdout);
         },
         release: async () => {
+          this.remoteWikiReads.invalidate(taskId);
           fs.rmSync(root, { recursive: true, force: true });
           await access.release();
         },
