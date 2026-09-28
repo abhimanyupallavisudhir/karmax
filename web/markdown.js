@@ -320,26 +320,82 @@
   // MathJax is loaded lazily from a CDN the first time a rendered message actually
   // contains math, and only while the flag is on. If it can't load (offline), the
   // raw $…$ simply stays visible — a graceful, non-fatal degradation.
+  //
+  // Every file comes from one pinned release and is integrity-checked: the entry
+  // bundle here, and whatever MathJax's own loader fetches later (ui/safe, TeX
+  // extensions pulled in by autoload or \require) through `loader.require`, which
+  // refuses any file this table does not pin. Regenerate the table with
+  // `node scripts/mathjax-integrity.mjs` when the release changes.
+  const MATHJAX_ROOT = 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/';
+  const MATHJAX_INTEGRITY = {
+    'tex-svg': 'sha384-KKWa9jJ1MZvssLeOoXG6FiOAZfAgmzsIIfw8BXwI9+kYm0lPCbC6yTQPBC00F1/L',
+    'a11y/assistive-mml': 'sha384-qSxBwhwvtvRyFQg5tIdeWHfceQdw8SyGOF6mQJlXrR2xIkv0MhdNVoQ47EjFLHK7',
+    'input/tex/extensions/action': 'sha384-PY+ttyB5xUWU3vWZAgp/O8oPFVbYUe02ASBZxCu2RQ4EAccyrmJCHmUjy+LwhLbT',
+    'input/tex/extensions/all-packages': 'sha384-5jv4tuho7ZYU9LpjRU7iBQHU8semS1AWEA+8xD86BZiJGK2aqVlvfCIm8LsCjb/d',
+    'input/tex/extensions/ams': 'sha384-VkLIFB4IrvgzmtOf8Q13gM/lTJnF91FOfAZXcfUkDY94FnbBPbVU3cyhESqBzNa/',
+    'input/tex/extensions/amscd': 'sha384-es5T1F+CeXLEJNCY8oyWXCMMF3OG3XZkjm9NaKsH0VsvKJ5KIv0+UzLsXVT8SuAw',
+    'input/tex/extensions/autoload': 'sha384-byPhdtsMhI2d4TAdqfk01YEcjXqT5v/xk5fEHEmvhpqGsa5nVzMGQnlqQeq9R4G0',
+    'input/tex/extensions/bbox': 'sha384-I4gnUmwoHTR+/u+XafWkn/T0em8dkv0APufIvx99glfdWavSFpndWwIogE63diS+',
+    'input/tex/extensions/boldsymbol': 'sha384-m7IgUOndpCawN1qQw/yHbl8Owz0gCZWtO23dTNqPARGk/v54JLqLIG88NbzJkdZf',
+    'input/tex/extensions/braket': 'sha384-zKoj5hkO1udEwbNQwB8VS5s52sy4MPkoJrB2OtKfnEVG+4BwxBG+LXwTI06Tb4i8',
+    'input/tex/extensions/bussproofs': 'sha384-hjII5qg0Sq5FqXnLGU2bOf5jXtd3mM3U1rsI7U7w+Ucu2bj0ozjL8qhXEmExgQgY',
+    'input/tex/extensions/cancel': 'sha384-Q0WkNOaovkeett90kCzEDj+iNtwY1YZYn/P699lTwaoBPpTY7XiKaI3yR1fABEwj',
+    'input/tex/extensions/cases': 'sha384-6hfnPmtF/EiP1F+zmLYzdL/RbDZQcTOSCDs4XWxCu7tztnZoYVBOI6xMnDDlR6Oa',
+    'input/tex/extensions/centernot': 'sha384-DlyRewLqhFjdD7tLijMVfpR3ec14hrbhCKTQoThNfkTgj0Z7dywCXCFnZap5eUVB',
+    'input/tex/extensions/color': 'sha384-MD7Q10XmadwswyGCjioiT030pwt0JMbzlEIabTz6FO4GftpOoasSzgtCBYbJxtYR',
+    'input/tex/extensions/colortbl': 'sha384-KLcatUDnqHArbThLcgchTAaCZZB5CRBnuBRPUyJJC1UFGkNxj6qQn2iBEx9Q/zgP',
+    'input/tex/extensions/colorv2': 'sha384-NuDgXFnc8AMwP+8oXxBfGPPLZYJTErMmMjczXIlgZcubC/rr+cjmIlfLJu3BJBTg',
+    'input/tex/extensions/configmacros': 'sha384-iaA8KoDHshQ6w/z5EZV2GQIzWEDHoqVowLcxdjDXRSNwf+cPE8vfkOnX5vNm0iqA',
+    'input/tex/extensions/empheq': 'sha384-NDrQ3nLXyj+QXfkFtCHcUO7Ne9OwBVa54sjftuKLJDS+QAT0Bdu9F2Trmx47+GEJ',
+    'input/tex/extensions/enclose': 'sha384-sDDHCXb1Na2LxKaRYrhPgSMx4b8u3t6XGCE3pmB940s7+9FFlJgalFLz4NxED4GZ',
+    'input/tex/extensions/extpfeil': 'sha384-BCtWPkWwg6JjzCIJal0gDonYJQ6xBBkzK3iULG4IndlDrsHPXh6qureIkRc4LlOH',
+    'input/tex/extensions/gensymb': 'sha384-KGbCyKPF+J6LFt+3DGxPWqI1A2a5tmYoNnOsj8LRoYOaAfjaPmj+BC4S+52Z0aPJ',
+    'input/tex/extensions/html': 'sha384-6wlucvU0GPBpKSp7j0ux0wi8lDnvzWQuPXpYBwhTqRaTHm0rdCcM6brLKy7yqZhD',
+    'input/tex/extensions/mathtools': 'sha384-TdOgJf69C0d2sJoYGwsmRvexBSVd6kK1t4cOCTC3DshuqrWxyfqdqNuIGKP9/YkI',
+    'input/tex/extensions/mhchem': 'sha384-G2viS3iW7b46EkElgsoYinFdp3u+p9pP3W5m7mrWQiv3KOeHpFj+AiA292ibBTq9',
+    'input/tex/extensions/newcommand': 'sha384-IRsdg68rX3FWNm27QOx+SVJYsE5hP9wdIPe4WeWGJ0n++1VQeaL26iPyLKreQkw8',
+    'input/tex/extensions/noerrors': 'sha384-yoLuYEI/Q9pBmUdE7vvg82dPBdtzAFR+u1109LTxSoH5kQZbFk9kzBUu+cVu02pd',
+    'input/tex/extensions/noundefined': 'sha384-fch4rg47Pu3x/HF2Yj5k2XlcVGLnxFRkDKiLFPlfUCLuFiW0PRPPZCtI0ZcJuKdN',
+    'input/tex/extensions/physics': 'sha384-uDmrF1tLROBL+9qI8qJ3eWmAve6NlSOMnIdeZ6WXI6IELq0WIwifITCkeb+MrTfM',
+    'input/tex/extensions/require': 'sha384-2olh1gVZV9hKPmVyYBifQM29Og2sCHIWhiNfIHcLftlqdQXncV8R/VMbHQVPqceS',
+    'input/tex/extensions/setoptions': 'sha384-HHd0JDin1nf0pZ4gNNMMEVjsshbCcFxQ0e9RquiKyxS9gtMKG7qSNU7c9w4BN3pF',
+    'input/tex/extensions/tagformat': 'sha384-wklnj9jcwLTCQnPCOM0m1GuMJ45jUAi89j4010BwJR7NDCQ9elSCS93J3Ht+0xCg',
+    'input/tex/extensions/textcomp': 'sha384-/k0pbTRYKP1boPXI456tWN87qaf7ua6c1bmCxYVD2sGW4WuFy/AM9bYzDv78Y77U',
+    'input/tex/extensions/textmacros': 'sha384-5n28pmVjAtqrt7IAgwK3xBYAq4EaEWF/b8u6NSDI1+Pa/A0C9Or+Y0lxaPDEd7bZ',
+    'input/tex/extensions/unicode': 'sha384-0lGBc3eOwLh9yc8/zACEPaZx3B+EwFAYTOHk6r/Bu9A3DuoudomuHbHdhPI3FDaG',
+    'input/tex/extensions/upgreek': 'sha384-z1OOiA8tK1fI419+erxWaYBkugaJ2XnN5jNbZJMuUiFS5mdrgb3bz06xoHEQbvSw',
+    'input/tex/extensions/verb': 'sha384-+G9ZvDcejeTyTqze0Uz6l4UmagCECucAn4WpmW07v38mTstLfF9vRX2m6LaaxRpY',
+    'ui/safe': 'sha384-BAIqbtawDyB5QXh8BrGd4h2FmhlZB70FJqMpHt2LxKkPSRa29VXhrB/DV3xLP+/B',
+  };
+  function loadPinnedScript(url) {
+    const file = url.startsWith(MATHJAX_ROOT) ? url.slice(MATHJAX_ROOT.length).replace(/\.js$/, '') : '';
+    const integrity = Object.hasOwn(MATHJAX_INTEGRITY, file) ? MATHJAX_INTEGRITY[file] : '';
+    if (!integrity) return Promise.reject(new Error(`${url} is not a pinned MathJax file`));
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = url;
+      script.integrity = integrity;
+      script.crossOrigin = 'anonymous';
+      script.async = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error(`could not load ${url}`));
+      document.head.appendChild(script);
+    });
+  }
   let mathjaxLoad = null;
   function ensureMathJax() {
     if (mathjaxLoad) return mathjaxLoad;
     mathjaxLoad = new Promise((resolve) => {
       window.MathJax = {
-        loader: { load: ['ui/safe'] },
+        loader: { load: ['ui/safe'], require: loadPinnedScript },
         tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
         options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
           safeOptions: { allow: { URLs: 'none', classes: 'safe', cssIDs: 'safe', styles: 'safe' } } },
         startup: { typeset: false, ready: () => { window.MathJax.startup.defaultReady(); resolve(true); } },
       };
-      const script = document.createElement('script');
-      script.src = 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg.js';
-      script.integrity = 'sha384-KKWa9jJ1MZvssLeOoXG6FiOAZfAgmzsIIfw8BXwI9+kYm0lPCbC6yTQPBC00F1/L';
-      script.crossOrigin = 'anonymous';
-      script.async = true;
-      script.onerror = () => resolve(false);
-      document.head.appendChild(script);
+      loadPinnedScript(`${MATHJAX_ROOT}tex-svg.js`).catch(() => resolve(false));
     });
     return mathjaxLoad;
   }
-  globalThis.TavyaMarkdown = { renderMarkdown, ensureMathJax };
+  globalThis.KarmaxMarkdown = { renderMarkdown, ensureMathJax };
 })();

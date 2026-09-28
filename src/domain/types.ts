@@ -1533,6 +1533,9 @@ export interface TaskView {
   /** Pending credential decisions projected by the gateway. The vault remains
    * the source of truth; workflows do not persist or replay this host state. */
   approvalRequests?: number;
+  /** Every pending decision, including those dismissed from the inbox: dismissal
+   * silences the notification, but the agent still waits on the decision. */
+  pendingDecisions?: number;
   /**
    * Free-form human notes (cosmetic, UI-only — never sent to any agent). Mirrored
    * onto the view from the task record so the UI can show/edit them at any stage,

@@ -8,10 +8,12 @@ import { createRequire } from 'node:module';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
-import type { World, WorldPty, WorldPtyTermination } from '../world/types.js';
+import { worldWorkingDirectory, type World, type WorldPty, type WorldPtyTermination } from '../world/types.js';
 import { fileURLToPath } from 'node:url';
-import { CODEX_PACKAGE as PINNED_CODEX_PACKAGE, CodexHistoryError, prepareCodexHistory, selectCodexHistoryCopy } from './codex-history.js';
-import { atomicPrivateWrite, publishLocalCodexHistory } from './codex-history-files.js';
+import { CODEX_PACKAGE as PINNED_CODEX_PACKAGE, CodexHistoryError, codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory,
+  selectCodexHistoryCopy, validCodexSessionId, type CodexHistoryFile } from './codex-history.js';
+import { codexConfigMcpServers } from './codex-config.js';
+import { atomicPrivateWrite, localCodexCopies, publishLocalCodexHistory } from './codex-history-files.js';
 import { publishRemoteCodexHistory } from './codex-history-remote.js';
 import { codexHistoryBase, codexSessionFiles } from './fork.js';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION, KARMAX_TOKEN_FILE } from '../autonomy/config-homes.js';
@@ -52,68 +54,397 @@ export interface RemoteAgentHome {
   runtimeBin?: string;
   /** Browser entries rewritten to sandbox-local, pinned executables. */
   browserMcp?: Record<string, { command: string; args: string[]; env?: Record<string, string> }>;
+  /** Codex lineage the sandbox holds byte for byte, by identity (host bytes, sandbox paths). */
+  syncedHistory?: ReadonlyMap<string, CodexHistoryFile>;
+  /** Every MCP server the seeded Codex config defines, when karmax can tell without asking Codex. */
+  configuredMcpServers?: string[];
 }
 
 /** Seed the leased subscription credentials/config into this task's persistent
  * sandbox. Provider session/cache directories are deliberately left sandbox-
  * local. OAuth remains control-plane-owned: every turn replaces the sandbox
  * projection and withholds rotating refresh tokens, so parallel task worlds
- * cannot fork and revoke one shared login's token family. */
+ * cannot fork and revoke one shared login's token family.
+ *
+ * One sandbox command prepares the runtime, stops a previous writer and
+ * measures the native history already there (LT-1, AD-12), while the host's
+ * config files upload beside it. History the sandbox already holds byte for
+ * byte is not sent again (AD-13). */
 export async function seedRemoteAgentHome(world: World, provider: Provider, localHome: string,
   session?: string, browserOverride?: 'none', onStartupStep?: (step: string) => Promise<void>): Promise<RemoteAgentHome> {
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
   const relative = remoteAgentHomeRelative(provider, localHome);
   const absolute = path.posix.join(world.handle.root, relative);
   await onStartupStep?.('prepare-runtime');
-  const runtimeBin = await timed('bootstrap.node', () => ensureRemoteNode(world));
-  if (provider === 'codex') await timed('bootstrap.quiesce', () => quiesceRemoteCodexHome(world, absolute));
-  // A single-repo world's root is itself a checkout. Keep injected auth out of
-  // `git add -A` without modifying the user's tracked .gitignore.
-  await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
-  await onStartupStep?.('prepare-config');
-  const files = configFiles(localHome, provider, session);
-  const rollouts = files.filter(file => provider === 'codex' && codexRolloutIdentity(file.relative.split(path.sep).join('/')));
+  const history = hostHistoryFiles(localHome, provider, session);
+  const browser = browserOverride === 'none' ? undefined : configuredBrowser(localHome, provider);
+  // Without a browser the Codex config is known now and uploads with the rest.
+  const codexConfig = provider === 'codex' && !browser ? remoteCodexConfig(localHome) : undefined;
+  const files = [...configFiles(localHome, provider).filter(file => provider !== 'codex' || file.relative !== 'config.toml'),
+    ...(codexConfig === undefined ? [] : [{ relative: 'config.toml', content: Buffer.from(codexConfig) }])];
   async function seed(file: { relative: string; content: Buffer }) {
     const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
     if (!world.writeFileBuffer) throw new Error('remote world cannot receive subscription config files');
-    // Codex resolves rollout identity across the entire home, not by directory.
-    // A cloud fork may already have a newer copy under sessions/forked while the
-    // host cache still has an older dated copy. Never seed a second identity.
-    const rollout = provider === 'codex' ? codexRolloutIdentity(file.relative.split(path.sep).join('/')) : undefined;
-    if (rollout) {
-      const id = path.posix.basename(file.relative).replace(/\.jsonl$/, '').match(/([0-9a-f-]{36})$/i)?.[1]
-        ?? path.posix.basename(file.relative).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
-      await publishRemoteCodexHistory(world, { absolute, relative, runtimeBin }, { file: file.relative, content: file.content }, id);
-      return;
-    }
     const controlledAuth = isControlPlaneAuth(provider, file.relative);
     const content = controlledAuth ? remoteAuthProjection(provider, file.relative, file.content) : file.content;
     await world.writeFileBuffer(target, content);
   }
-  // Ordinary files have distinct paths and no live reader until startup. Rollout
-  // publication reconciles shared session identity, so keep it serialized.
-  const rolloutSet = new Set(rollouts);
+  const request = bootstrapRequest(world, provider, absolute, session, history);
+  // The bootstrap also stops a previous writer and protects the home, so
+  // nothing below lands before either. One prewarmed for this very home,
+  // session and history is used once; a failed one is rerun at once, and one
+  // prewarmed for something else is not waited for: the runtime installation
+  // it may still be running is locked in the sandbox, and it stops only a
+  // writer launched before it was requested, never the agent this seed starts.
+  const early = bootstraps.get(world);
+  const reused = early?.key === request.key ? early!.bootstrap.catch(() => undefined) : undefined;
+  const own = (async () => (await reused) ?? runBootstrap(world, request))();
+  bootstraps.set(world, { bootstrap: own, ...(early?.browser ? { browser: early.browser } : {}) });
+  const bootstrap = await timed('bootstrap.prepare', () => own);
+  const home: RemoteAgentHome = { absolute, relative, runtimeBin: bootstrap.runtimeBin };
+  const inventory = trustedInventory(world, provider, session, bootstrap.history);
+  const synced = provider === 'codex' ? syncedCodexHistory(relative, history, inventory) : undefined;
+  if (synced) home.syncedHistory = synced;
+  await onStartupStep?.('prepare-config');
   await Promise.all([
-    timed('bootstrap.seed-files', () => mapBatches(files.filter(file => !rolloutSet.has(file)), seed)),
+    // Ordinary files have distinct paths and no live reader until startup.
+    timed('bootstrap.seed-files', () => mapBatches(files, seed)),
     // A safety net, not a requirement: never fail a turn over it.
     installMemoryGuard(world).catch(() => undefined),
+    provider !== 'codex'
+      // A transcript the sandbox holds already, or has extended, stays as it is.
+      ? timed('bootstrap.history', () => mapBatches(history.filter(file => {
+        const copy = inventory?.find(candidate => candidate.file === file.relative.split(path.sep).join('/'));
+        return !(copy && copy.size >= file.content.length && copy.prefix === sha256(file.content));
+      }), seed))
+      // Codex resolves rollout identity across the entire home, not by directory.
+      // A cloud fork may already have a newer copy under sessions/forked while the
+      // host cache still has an older dated copy. Never seed a second identity.
+      // Rollout publication reconciles shared session identity: keep it serialized.
+      : synced ? undefined : timed('bootstrap.history', async () => {
+        for (const file of history)
+          await publishRemoteCodexHistory(world, home, { file: file.relative, content: file.content }, codexFileIdentity(file.relative));
+        // Retries may restore exclusively from the host after the source world has
+        // been deleted. Repair prior duplicate copies here too, before Codex opens its
+        // persistent index; live-world transfer is not guaranteed to run.
+        if (session) await reconcileRemoteCodexSessionCopies(world, home, session);
+      }),
   ]);
-  for (const file of rollouts) await seed(file);
-  // Retries may restore exclusively from the host after the source world has
-  // been deleted. Repair prior duplicate copies here too, before Codex opens its
-  // persistent index; live-world transfer is not guaranteed to run.
-  if (provider === 'codex' && session)
-    await timed('bootstrap.reconcile-session', () => reconcileRemoteCodexSessionCopies(world, { absolute, relative, runtimeBin }, session));
-  const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
-  const browser = browserOverride === 'none' ? undefined : configuredBrowser(localHome, provider);
   await onStartupStep?.('prepare-browser');
-  const browserMcp = browser ? await timed('bootstrap.browser', () => ensureRemoteBrowser(world, browser, runtimeBin)) : undefined;
-  if (provider === 'codex') await timed('bootstrap.config', () => seedRemoteCodexConfig(world, localHome, home, browserMcp));
-  await onStartupStep?.('protect-config');
-  const permissions = await world.exec('bash', ['-lc',
-    `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type d -exec chmod 700 {} + && find ${quote(absolute)} -type f -exec chmod 600 {} +; fi`]);
-  if (permissions.code !== 0) throw new Error(`could not protect remote subscription files: ${permissions.stderr || permissions.stdout}`);
-  return { ...home, ...(browserMcp ? { browserMcp } : {}) };
+  const browserMcp = browser ? await timed('bootstrap.browser', () => ensureRemoteBrowser(world, browser, bootstrap.runtimeBin)) : undefined;
+  const seededConfig = codexConfig ?? (provider === 'codex' ? remoteCodexConfig(localHome, browserMcp) : undefined);
+  if (provider === 'codex' && codexConfig === undefined)
+    await timed('bootstrap.config', () => world.writeFile(`${relative}/config.toml`, seededConfig!));
+  // Codex reads MCP servers from this config and, when present, a system layer
+  // karmax did not write; only then must Codex be asked for their names.
+  const configuredMcpServers = seededConfig !== undefined && !bootstrap.systemCodexConfig ? codexConfigMcpServers(seededConfig) : undefined;
+  return { ...home, ...(browserMcp ? { browserMcp } : {}), ...(configuredMcpServers ? { configuredMcpServers } : {}) };
+}
+
+/** Start the sandbox half of this turn's start-up while the caller prepares
+ * its prompt (LT-1, LT-22): the runtime, the agent home when the turn runs on
+ * a subscription (`localHome`), and the browser tools its MCP connections (or,
+ * without a selection, the account's own config) name, including a first
+ * turn's browser smoke test. The seed reuses the home half when provider,
+ * home and session match; connection preparation reuses the rest. */
+export function prewarmRemoteAgentHome(world: World, provider: Provider, localHome: string | undefined, session?: string,
+  mcpConnections?: readonly string[]): void {
+  const runtimeWorld = world.withoutProjectEnvironment?.() ?? world;
+  if (!isRemoteAgentWorld(runtimeWorld) || bootstraps.has(runtimeWorld)) return;
+  const browser = mcpConnections ? mcpConnections.some((id) => id.startsWith('browser:')) : !!localHome && !!configuredBrowser(localHome, provider);
+  if (!localHome && !browser) return;
+  try {
+    const request: BootstrapRequest = localHome
+      ? bootstrapRequest(runtimeWorld, provider, path.posix.join(runtimeWorld.handle.root, remoteAgentHomeRelative(provider, localHome)),
+        session, hostHistoryFiles(localHome, provider, session))
+      : { key: '' };
+    const bootstrap = runBootstrap(runtimeWorld, { ...request, browser });
+    bootstrap.catch(() => undefined);
+    const entry: WorldBootstrap = { ...(localHome ? { key: request.key } : {}), bootstrap };
+    if (browser) {
+      entry.browser = bootstrap.then((prepared) => readyBrowser(runtimeWorld, prepared.runtimeBin, prepared.browser).catch((error) => {
+        if (error && typeof error === 'object') browserFailures.add(error);
+        throw error;
+      }));
+      entry.browser.catch(() => undefined);
+    }
+    bootstraps.set(runtimeWorld, entry);
+  } catch { /* the seed and connection preparation report whatever made this fail */ }
+}
+
+/** This turn's bootstrap of a world. World objects live for one activity, so
+ * nothing here outlives the turn that measured it. */
+interface WorldBootstrap {
+  /** The home, session and history a prewarmed bootstrap measured, until a seed uses it. */
+  key?: string;
+  bootstrap: Promise<RemoteBootstrap>;
+  browser?: Promise<BrowserTools>;
+}
+const bootstraps = new WeakMap<World, WorldBootstrap>();
+/** Browser readiness a prewarm tried and failed: reported, not repeated. */
+const browserFailures = new WeakSet<object>();
+
+/** The connection to the sandbox broke, by the error's structure alone: a
+ * repair's message quotes the sandbox's output, which may name any error, and
+ * a command that timed out may still be running there. */
+function lostConnection(error: unknown): boolean {
+  for (let current = error, depth = 0; current && typeof current === 'object' && depth < 4; current = (current as any).cause, depth++) {
+    const { code, name } = current as { code?: unknown; name?: unknown };
+    if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'EAI_AGAIN'].includes(String(code))
+      || name === 'SandboxNotFoundError') return true;
+  }
+  return false;
+}
+
+const workDirectory = (world: World) => path.posix.join(world.handle.root, '.karmax-injection/work-env');
+
+/** The world's private work-environment directory, when this turn's
+ * bootstrap (which also git-excludes it) has already made it (AD-12). */
+export async function preparedRemoteWorkDirectory(world: World): Promise<string | undefined> {
+  const runtimeWorld = world.withoutProjectEnvironment?.() ?? world;
+  const prepared = await bootstraps.get(runtimeWorld)?.bootstrap.catch(() => undefined);
+  return prepared?.workDirectory ? workDirectory(runtimeWorld) : undefined;
+}
+
+/** Every copy of a native history the sandbox holds, measured in place. */
+export interface RemoteHistoryCopy {
+  /** Relative to the agent home. */
+  file: string;
+  /** Codex rollout identity. */
+  id?: string;
+  size: number;
+  sha256: string;
+  /** Digest of the first bytes the host already holds of it, when this copy is at least that long. */
+  prefix?: string;
+}
+
+interface RemoteBootstrap {
+  runtimeBin: string;
+  /** Undefined when the inventory did not run; callers then read whole files. */
+  history?: RemoteHistoryCopy[];
+  /** Codex also loads /etc/codex, which karmax did not write. */
+  systemCodexConfig: boolean;
+  /** The world's private work-environment directory exists (AD-12). */
+  workDirectory: boolean;
+  /** Undefined when the probe did not run; readyBrowser then probes step by step. */
+  browser?: BrowserProbe;
+}
+
+interface BootstrapRequest {
+  key: string;
+  /** The agent home: its previous writer is stopped (Codex) and it is made private. */
+  home?: string;
+  quiesce?: boolean;
+  inventory?: HistoryInventoryRequest;
+  systemCodexConfig?: boolean;
+  /** Probe the browser tools' readiness (LT-22). */
+  browser?: boolean;
+}
+
+interface HistoryInventoryRequest { home: string; provider: Provider; session: string; known: Record<string, number> }
+
+function bootstrapRequest(world: World, provider: Provider, absolute: string, session: string | undefined,
+  history: Array<{ relative: string; content: Buffer }>): BootstrapRequest {
+  const known: Record<string, number> = {};
+  for (const file of history) known[historyKey(provider, file.relative)] = file.content.length;
+  return {
+    key: JSON.stringify([world.handle.root, provider, absolute, session ?? null, known]),
+    home: absolute,
+    ...(provider === 'codex' ? { quiesce: true, systemCodexConfig: true } : {}),
+    ...(session ? { inventory: { home: absolute, provider, session, known } } : {}),
+  };
+}
+
+const historyKey = (provider: Provider, relative: string) =>
+  provider === 'codex' ? codexFileIdentity(relative) : relative.split(path.sep).join('/');
+
+const codexFileIdentity = (file: string) => path.posix.basename(file.split(path.sep).join('/')).replace(/\.jsonl$/, '').match(/([0-9a-f-]{36})$/i)?.[1]
+  ?? path.posix.basename(file.split(path.sep).join('/')).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
+
+const sha256 = (content: Buffer) => crypto.createHash('sha256').update(content).digest('hex');
+
+/** The host lineage, when the sandbox holds exactly one identical copy of each
+ * rollout in it and nothing else of that lineage: nothing needs publishing, and
+ * the host bytes stand in for the sandbox's own. */
+function syncedCodexHistory(relative: string, history: Array<{ relative: string; content: Buffer }>,
+  copies?: RemoteHistoryCopy[]): Map<string, CodexHistoryFile> | undefined {
+  if (!copies || !history.length) return undefined;
+  const synced = new Map<string, CodexHistoryFile>();
+  for (const file of history) {
+    const id = codexFileIdentity(file.relative);
+    const remote = copies.filter(copy => copy.id === id);
+    if (remote.length !== 1 || remote[0]!.size !== file.content.length || remote[0]!.prefix !== sha256(file.content)) return undefined;
+    synced.set(id, { file: `${relative}/${remote[0]!.file}`, content: file.content });
+  }
+  return copies.every(copy => copy.id && synced.has(copy.id)) ? synced : undefined;
+}
+
+// Exit statuses by which the bootstrap command names the step that failed.
+const BOOTSTRAP_NODE = 64, BOOTSTRAP_EXPOSE = 65, BOOTSTRAP_QUIESCE = 66, BOOTSTRAP_PROTECT = 67, BOOTSTRAP_LOCKED = 68;
+/** sandboxLock's status when another holder kept the lock past its wait. */
+const LOCK_BUSY = 75;
+
+/** Shell that holds an exclusive sandbox lock on descriptor 9 until the
+ * enclosing (sub)shell ends: one installer at a time, including an abandoned
+ * turn's still-running one. The kernel releases it with its holder, however
+ * that ends. BusyBox flock has no -w, so `timeout` bounds the wait; without
+ * flock the step runs unlocked, as before. */
+function sandboxLock(file: string, seconds: number): string {
+  const wait = Number(process.env.KARMAX_REMOTE_INSTALL_LOCK_SECONDS) || seconds;
+  return [
+    `exec 9>>${quote(file)} || exit 1`,
+    'if command -v flock >/dev/null 2>&1; then',
+    `  if command -v timeout >/dev/null 2>&1; then timeout ${wait} flock 9; else flock 9; fi`,
+    `  case $? in 0) ;; 124|143) exit ${LOCK_BUSY};; *) exit 1;; esac`,
+    'fi',
+  ].join('\n');
+}
+const HISTORY_MARKER = 'KARMAX_HISTORY_INVENTORY ';
+const BROWSER_MARKER = 'KARMAX_BROWSER_PROBE ';
+const SYSTEM_CODEX_CONFIG = 'KARMAX_SYSTEM_CODEX_CONFIG';
+const WORK_DIRECTORY_READY = 'KARMAX_WORK_DIRECTORY_READY';
+
+async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>): Promise<RemoteBootstrap> {
+  const issued = Date.now();
+  const runtime = remoteNodeRuntime(world);
+  const node = path.posix.join(runtime.bin, 'node');
+  const command = [
+    `( ${runtime.install} ) || { [ $? = ${LOCK_BUSY} ] && exit ${BOOTSTRAP_LOCKED}; exit ${BOOTSTRAP_NODE}; }`,
+    // Login shells reset PATH in /etc/profile. Publish the whole paired toolchain
+    // at the standard sandbox location, including on resumed worlds.
+    `( ${runtime.expose} ) || exit ${BOOTSTRAP_EXPOSE}`,
+    // A single-repo world's root is itself a checkout. Keep injected auth out of
+    // `git add -A` without modifying the user's tracked .gitignore.
+    "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true",
+    ...(request.home && request.quiesce ? [`( ${quiesceCommand(request.home, issued)} ) || exit ${BOOTSTRAP_QUIESCE}`] : []),
+    // Credentials land only inside private directories: upload creates files
+    // and directories with the sandbox's default modes.
+    ...(request.home ? [`( mkdir -p ${quote(request.home)} && find ${quote(request.home)} -type d -exec chmod 700 {} + && find ${quote(request.home)} -type f -exec chmod 600 {} + ) || exit ${BOOTSTRAP_PROTECT}`,
+      // So do Claude's work environments. Only Claude uses them, and it makes
+      // the directory itself when this could not: never fail a turn over it.
+      `( mkdir -p ${quote(workDirectory(world))} && chmod 700 ${quote(workDirectory(world))} ) 2>/dev/null && printf '\\n%s\\n' ${WORK_DIRECTORY_READY}`] : []),
+    ...(request.inventory ? [`${historyInventoryCommand(node, request.inventory)} || true`] : []),
+    ...(request.browser ? [`${browserProbeCommand(world, node)} || true`] : []),
+    ...(request.systemCodexConfig ? [`if [ -e '/etc/codex' ]; then printf '\\n%s\\n' ${SYSTEM_CODEX_CONFIG}; fi`] : []),
+    'exit 0',
+  ].join('\n');
+  const result = await world.exec('bash', ['-lc', command], { timeoutMs: 5 * 60_000 });
+  const detail = result.stderr || result.stdout;
+  if (result.code === BOOTSTRAP_NODE) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${detail}`);
+  if (result.code === BOOTSTRAP_LOCKED)
+    throw new Error('the managed runtime is still being installed by another turn in this sandbox; its lock stayed busy');
+  if (result.code === BOOTSTRAP_EXPOSE)
+    throw new Error(`could not make managed Node/npm the sandbox default (requires writable /usr/local/bin or passwordless sudo): ${detail}`);
+  if (result.code === BOOTSTRAP_QUIESCE) throw new CodexHistoryError(`could not stop previous writer: ${detail}`);
+  if (result.code === BOOTSTRAP_PROTECT) throw new Error(`could not protect remote subscription files: ${detail}`);
+  // A killed command (137, 143) or a failing login profile is not a Node problem.
+  if (result.code !== 0) throw new Error(`remote runtime bootstrap failed (status ${result.code}): ${detail}`);
+  const lines = result.stdout.split('\n').map((line) => line.trim());
+  return { runtimeBin: runtime.bin, systemCodexConfig: lines.includes(SYSTEM_CODEX_CONFIG), workDirectory: lines.includes(WORK_DIRECTORY_READY),
+    ...(request.inventory ? { history: parseHistoryInventory(result.stdout) } : {}),
+    ...(request.browser ? { browser: parseBrowserProbe(result.stdout) } : {}) };
+}
+
+// Runs in the sandbox with the paired Node: find every copy of the session's
+// history (and, for Codex, its lineage), and hash each where it lies.
+const REMOTE_HISTORY_INVENTORY = String.raw`
+const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+const [home, provider, session, knownJson] = process.argv.slice(1);
+const known = JSON.parse(knownJson);
+const found = [];
+function walk(dir, depth) {
+  let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory() && depth < 8) walk(file, depth + 1);
+    else if (entry.isFile() && entry.name.endsWith('.jsonl')) found.push(file);
+    if (found.length > 4096) throw new Error('too many history files');
+  }
+}
+function measure(file, key) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size, whole = crypto.createHash('sha256');
+    const limit = Number.isSafeInteger(known[key]) && known[key] <= size ? known[key] : -1;
+    const prefix = limit >= 0 ? crypto.createHash('sha256') : undefined;
+    const buffer = Buffer.alloc(1 << 20);
+    let first = [], firstDone = false;
+    for (let offset = 0; offset < size;) {
+      const bytes = fs.readSync(fd, buffer, 0, Math.min(buffer.length, size - offset), offset);
+      if (!bytes) break;
+      const chunk = buffer.subarray(0, bytes);
+      if (prefix && offset < limit) prefix.update(chunk.subarray(0, Math.min(bytes, limit - offset)));
+      if (!firstDone) { const end = chunk.indexOf(10); first.push(Buffer.from(end < 0 ? chunk : chunk.subarray(0, end))); firstDone = end >= 0 || offset + bytes > 2097152; }
+      whole.update(chunk);
+      offset += bytes;
+    }
+    let base;
+    try { base = JSON.parse(Buffer.concat(first).toString('utf8'))?.payload?.history_base?.thread_id; } catch {}
+    return { file: path.relative(home, file).split(path.sep).join('/'), size, sha256: whole.digest('hex'),
+      ...(prefix ? { prefix: prefix.digest('hex') } : {}), ...(typeof base === 'string' ? { base } : {}) };
+  } finally { fs.closeSync(fd); }
+}
+const copies = [];
+if (provider === 'codex') {
+  walk(path.join(home, 'sessions'), 0); walk(path.join(home, 'archived_sessions'), 0);
+  const pending = [session], seen = new Set();
+  while (pending.length) {
+    const id = pending.pop();
+    if (seen.has(id) || !/^[a-zA-Z0-9_-]{8,160}$/.test(id)) continue;
+    seen.add(id);
+    const mine = found.filter(file => path.basename(file).endsWith(id + '.jsonl')).map(file => ({ id, ...measure(file, id) }));
+    copies.push(...mine);
+    const largest = mine.sort((a, b) => b.size - a.size)[0];
+    if (largest?.base) pending.push(largest.base);
+  }
+} else {
+  walk(path.join(home, 'projects'), 0);
+  for (const file of found) if (path.basename(file) === session + '.jsonl') copies.push(measure(file, path.relative(home, file).split(path.sep).join('/')));
+}
+process.stdout.write('\n${HISTORY_MARKER}' + JSON.stringify(copies.map(({ base, ...copy }) => copy)) + '\n');
+`;
+
+function historyInventoryCommand(node: string, request: HistoryInventoryRequest): string {
+  return [node, '-e', REMOTE_HISTORY_INVENTORY, request.home, request.provider, request.session, JSON.stringify(request.known)]
+    .map(quote).join(' ');
+}
+
+function parseHistoryInventory(stdout: string): RemoteHistoryCopy[] | undefined {
+  const line = stdout.split('\n').reverse().find(candidate => candidate.startsWith(HISTORY_MARKER));
+  if (!line) return undefined;
+  let copies: unknown;
+  try { copies = JSON.parse(line.slice(HISTORY_MARKER.length)); } catch { return undefined; }
+  const hex = (value: unknown) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+  if (!Array.isArray(copies) || !copies.every((copy: any) => copy && typeof copy.file === 'string'
+    && !copy.file.split('/').some((segment: string) => !segment || segment === '.' || segment === '..')
+    && Number.isSafeInteger(copy.size) && copy.size >= 0 && hex(copy.sha256) && (copy.prefix === undefined || hex(copy.prefix))
+    && (copy.id === undefined || typeof copy.id === 'string'))) return undefined;
+  return copies as RemoteHistoryCopy[];
+}
+
+/** The inventory, when every entry is one the host would have looked for
+ * itself: this session's transcript in this working directory's project
+ * (Claude), or a rollout whose file name carries the identity it claims
+ * (Codex). The sandbox's own Node prints it, and the agent can replace that,
+ * so an entry must never choose a host path; any other entry means the
+ * sandbox cannot be measured and whole files are read instead. */
+function trustedInventory(world: World, provider: Provider, session: string | undefined,
+  copies?: RemoteHistoryCopy[]): RemoteHistoryCopy[] | undefined {
+  if (!copies || !session) return undefined;
+  const transcript = `projects/${claudeCwdSlug(worldWorkingDirectory(world.handle))}/${session}.jsonl`;
+  return copies.every((copy) => provider === 'codex'
+    ? typeof copy.id === 'string' && validCodexSessionId(copy.id) && codexRolloutIdentity(copy.file) === copy.id
+    : copy.id === undefined && copy.file === transcript) ? copies : undefined;
+}
+
+/** Measure the sandbox's copies of a session's history against the host's. */
+async function remoteHistoryInventory(world: World, home: RemoteAgentHome, provider: Provider, session: string,
+  known: Record<string, number>): Promise<RemoteHistoryCopy[] | undefined> {
+  try {
+    const node = home.runtimeBin ? path.posix.join(home.runtimeBin, 'node') : 'node';
+    const result = await world.exec('bash', ['-c', historyInventoryCommand(node, { home: home.absolute, provider, session, known })]);
+    return result.code === 0 ? trustedInventory(world, provider, session, parseHistoryInventory(result.stdout)) : undefined;
+  } catch { return undefined; }
 }
 
 /** A world can rotate between several subscription accounts. Keep each native
@@ -183,6 +514,13 @@ async function readRemoteHistory(world: World, file: string, budget: HistoryBudg
 export async function syncRemoteAgentHome(world: World, provider: Provider, remoteHome: RemoteAgentHome,
   localHome: string, session?: string): Promise<void> {
   if (!localHome || !session) return;
+  try {
+    if (await exportHistoryTails(world, provider, remoteHome, localHome, session, { bytes: 0, files: 0 })) return;
+  } catch (error) {
+    // A refused history publishes nothing either way; anything else (a lost
+    // read, a shell that printed too much) is retried by whole verified reads.
+    if (error instanceof CodexHistoryError) throw error;
+  }
   const budget: HistoryBudget = { bytes: 0, files: 0 };
   const homePrefix = `${remoteHome.relative}/`;
   const files = [...await remoteHomeFiles(world, remoteHome.absolute)].filter(file => {
@@ -227,6 +565,106 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
       }
     }
   }
+}
+
+/** Export only what the sandbox appended to the host's copy (AD-12, AD-13).
+ * One command measures every copy of the session's history in place; bytes
+ * past a prefix the host already holds, proven by digest, are all that cross.
+ * False when the sandbox could not be measured: the caller reads whole files. */
+async function exportHistoryTails(world: World, provider: Provider, remoteHome: RemoteAgentHome,
+  localHome: string, session: string, budget: HistoryBudget): Promise<boolean> {
+  const local = new Map<string, Buffer | undefined>();
+  if (provider !== 'codex')
+    for (const file of hostHistoryFiles(localHome, provider, session)) local.set(file.relative.split(path.sep).join('/'), file.content);
+  const hostCopy = (key: string) => {
+    if (!local.has(key)) local.set(key, provider === 'codex' ? localCodexHistory(localHome, key) : undefined);
+    return local.get(key);
+  };
+  const measure = (keys: string[]) => Object.fromEntries(keys.flatMap((key) => {
+    const content = hostCopy(key);
+    return content ? [[key, content.length]] : [];
+  }));
+  let known = measure(provider === 'codex' ? hostCodexLineage(localHome, session) : [...local.keys()]);
+  let copies = await remoteHistoryInventory(world, remoteHome, provider, session, known);
+  if (!copies) return false;
+  // A new thread's ancestors are usually on the host already; measure them too.
+  const unmeasured = provider === 'codex' ? [...new Set(copies.map((copy) => copy.id!))].filter((id) => !(id in known)) : [];
+  if (Object.keys(measure(unmeasured)).length) {
+    known = { ...known, ...measure(unmeasured) };
+    copies = await remoteHistoryInventory(world, remoteHome, provider, session, known);
+    if (!copies) return false;
+  }
+  const fetch = async (copy: RemoteHistoryCopy, host?: Buffer): Promise<Buffer> => {
+    if (++budget.files > HISTORY_FILE_COUNT) throw new Error('remote history file count limit exceeded');
+    budget.bytes += copy.size;
+    if (copy.size > HISTORY_FILE_BYTES || budget.bytes > HISTORY_TOTAL_BYTES) throw new Error('remote history byte limit exceeded');
+    const file = `${remoteHome.relative}/${copy.file}`;
+    const offset = host && copy.size > host.length && copy.prefix === sha256(host) ? host.length : 0;
+    const tail = await readRemoteHistoryRange(world, file, offset, copy.size - offset);
+    const content = offset ? Buffer.concat([host!, tail]) : tail;
+    if (sha256(content) !== copy.sha256) throw new Error('could not read remote history: the sandbox copy changed while it was read');
+    return content;
+  };
+  if (provider !== 'codex') {
+    for (const copy of copies) {
+      const destination = path.resolve(localHome, copy.file);
+      if (!destination.startsWith(path.resolve(localHome) + path.sep)) continue;
+      const host = hostCopy(copy.file);
+      if (host && copy.size <= host.length && sha256(host.subarray(0, copy.size)) === copy.sha256) continue;
+      if (host && !(copy.size > host.length && copy.prefix === sha256(host))) throw new Error(`divergent Claude history for ${session}`);
+      atomicPrivateWrite(destination, await fetch(copy, host));
+    }
+    return true;
+  }
+  const pending = [session];
+  const seen = new Set<string>();
+  while (pending.length) {
+    const id = pending.pop()!;
+    if (seen.has(id)) throw new CodexHistoryError(`cyclic lineage for ${session}`);
+    seen.add(id);
+    const matches = copies.filter((copy) => copy.id === id);
+    if (!matches.length) {
+      if (id !== session) throw new CodexHistoryError(`missing ancestor ${id}`);
+      continue;
+    }
+    const host = hostCopy(id);
+    let content = host;
+    if (matches.length !== 1 || !host || matches[0]!.size !== host.length || matches[0]!.sha256 !== sha256(host)) {
+      const candidates = [];
+      for (const copy of matches) candidates.push({ file: copy.file, content: await fetch(copy, host) });
+      const kept = selectCodexHistoryCopy(candidates, id);
+      // A new host copy is named after its identity, never after the sandbox's path.
+      let name: string;
+      try { name = codexRolloutFilename(codexHistoryMetadata(kept.content).timestamp, id); }
+      catch { name = codexRolloutFilename(undefined, id); }
+      publishLocalCodexHistory(localHome, { file: path.posix.join('sessions/forked', name), content: kept.content }, id);
+      content = kept.content;
+    }
+    const base = codexHistoryBase(content!);
+    if (base) pending.push(base);
+  }
+  return true;
+}
+
+async function readRemoteHistoryRange(world: World, file: string, offset: number, length: number): Promise<Buffer> {
+  // The capture allows a whole file's worth, like readRemoteHistory: whatever a
+  // login shell prints before the output must not fail a short read.
+  const encoded = await verifiedRemoteOutput(world,
+    `tail -c +${offset + 1} -- ${quote(path.posix.join(world.handle.root, file))} | head -c ${length} | base64 -w 0`,
+    Math.ceil((HISTORY_FILE_BYTES + 1) / 3) * 4, 'read remote history');
+  const data = Buffer.from(encoded.toString('latin1'), 'base64');
+  if (data.length !== length) throw new Error('could not read remote history: the sandbox copy changed while it was read');
+  return data;
+}
+
+function localCodexHistory(localHome: string, id: string): Buffer | undefined {
+  if (!validCodexSessionId(id)) return undefined;
+  const copies = localCodexCopies(localHome, id);
+  return copies.length ? selectCodexHistoryCopy(copies, id).content : undefined;
+}
+
+function hostCodexLineage(localHome: string, session: string): string[] {
+  try { return (codexSessionFiles({ session, forkHome: localHome }) ?? []).map(codexFileIdentity); } catch { return []; }
 }
 
 function isControlPlaneAuth(provider: Provider, relative: string): boolean {
@@ -416,9 +854,13 @@ export function spawnRemoteAgentProcess(opts: {
     `(umask 077; ${trace('shell-started')})`,
     `pidfile=${quote(pidFile)}`,
     trace('previous-process-check'),
-    `if [ -s "$pidfile" ]; then old=$(cat "$pidfile" 2>/dev/null); cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true); case "$cmd" in *${opts.provider}*) kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true;; esac; rm -f "$pidfile"; fi`,
-    'printf \'%s\\n\' "$$" > "$pidfile"',
+    `if [ -s "$pidfile" ]; then old=$(cut -d ' ' -f 1 < "$pidfile" 2>/dev/null); cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true); case "$cmd" in *${opts.provider}*) kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true;; esac; rm -f "$pidfile"; fi`,
+    // With the host's launch time: a bootstrap requested before it never stops it.
+    `printf '%s %s\\n' "$$" ${Date.now()} > "$pidfile"`,
     trace('previous-process-stopped'),
+    // The seed uploads config and credentials with the sandbox's default modes
+    // into a home the bootstrap made private: close them too before the agent runs.
+    `chmod -R go= -- ${quote(home)} 2>/dev/null`,
     `guard=${quote(path.posix.join(opts.world.handle.root, MEMORY_GUARD))}; [ -f "$guard" ] && sh "$guard" start >/dev/null 2>&1`,
     // Assemble the sentinel at runtime so no echo of the launcher can open the
     // protocol gate before `exec agent` and let the shell consume the JSON
@@ -606,7 +1048,7 @@ export class RemoteSpawnedProcess extends EventEmitter {
   }
 }
 
-function configFiles(root: string, provider: Provider, session?: string): Array<{ relative: string; content: Buffer }> {
+function configFiles(root: string, provider: Provider): Array<{ relative: string; content: Buffer }> {
   const files: Array<{ relative: string; content: Buffer }> = [];
   const walk = (dir: string, relative = '') => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -631,6 +1073,12 @@ function configFiles(root: string, provider: Provider, session?: string): Array<
     }
   };
   walk(root);
+  return files;
+}
+
+/** The one requested session: Codex's physical lineage or Claude's transcript copies. */
+function hostHistoryFiles(root: string, provider: Provider, session?: string): Array<{ relative: string; content: Buffer }> {
+  const files: Array<{ relative: string; content: Buffer }> = [];
   if (session && provider === 'codex') {
     const lineage = codexSessionFiles({ session, forkHome: root });
     if (lineage) for (const file of lineage)
@@ -713,9 +1161,13 @@ export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAg
   session: string, dynamicTools: unknown[]): Promise<string | undefined> {
   if (!world.writeFileBuffer) return undefined;
   const budget: HistoryBudget = { bytes: 0, files: 0 };
-  const files = [...await remoteHomeFiles(world, home.absolute)]
-    .filter((file) => file.startsWith(`${home.relative}/sessions/`) || file.startsWith(`${home.relative}/archived_sessions/`));
+  let files: string[] | undefined;
   const snapshot = await prepareCodexHistory(session, async (id) => {
+    // A rollout the seed proved identical is read from the host (AD-13).
+    const synced = home.syncedHistory?.get(id);
+    if (synced) return synced;
+    files ??= [...await remoteHomeFiles(world, home.absolute)]
+      .filter((file) => file.startsWith(`${home.relative}/sessions/`) || file.startsWith(`${home.relative}/archived_sessions/`));
     const candidates = [];
     for (const file of files.filter((candidate) => path.posix.basename(candidate).endsWith(`${id}.jsonl`)))
       candidates.push({ file, content: await readRemoteHistory(world, file, budget) });
@@ -801,9 +1253,19 @@ export async function materializeRemoteSession(source: World, destination: World
 /** Reap an interrupted attempt before any history publication, not merely
  * before starting its replacement. The pid belongs to this account/task home. */
 async function quiesceRemoteCodexHome(world: World, absolute: string): Promise<void> {
-  const result = await world.exec('bash', ['-lc', `pidfile=${quote(path.posix.join(absolute, 'karmax-agent.pid'))};
+  const result = await world.exec('bash', ['-lc', quiesceCommand(absolute, Date.now())]);
+  if (result.code !== 0) throw new CodexHistoryError(`could not stop previous writer: ${result.stderr || result.stdout}`);
+}
+
+/** Stop the home's previous writer, if the host launched it before it asked
+ * for this command (`issued`, host milliseconds, as the launcher records its
+ * own launch). A provider may run a command whose stream it already dropped
+ * long after: that late command must never stop a newer turn's agent. */
+function quiesceCommand(absolute: string, issued: number): string {
+  return `pidfile=${quote(path.posix.join(absolute, 'karmax-agent.pid'))};
 if [ -s "$pidfile" ]; then
-  old=$(cat "$pidfile"); case "$old" in ''|*[!0-9]*) exit 1;; esac
+  read -r old launched < "$pidfile" || [ -n "$old" ]; case "$old" in ''|*[!0-9]*) exit 1;; esac
+  case "$launched" in ''|*[!0-9]*) ;; *) [ "$launched" -ge ${issued} ] && exit 0;; esac
   cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true)
   case "$cmd" in *codex*)
     kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true
@@ -813,8 +1275,7 @@ if [ -s "$pidfile" ]; then
     if kill -0 "$old" 2>/dev/null; then echo 'previous Codex writer did not stop' >&2; exit 1; fi;;
   esac
   rm -f "$pidfile"
-fi`]);
-  if (result.code !== 0) throw new CodexHistoryError(`could not stop previous writer: ${result.stderr || result.stdout}`);
+fi`;
 }
 
 function claudeCwdSlug(worldPath: string): string { return worldPath.replace(/[^a-zA-Z0-9]/g, '-'); }
@@ -822,8 +1283,7 @@ function claudeCwdSlug(worldPath: string): string { return worldPath.replace(/[^
 /** Browser MCPs execute in the sandbox, while Karmax platform tools cross the
  * existing app-server stdio channel and execute on the trusted host. Remove the
  * old host-specific Karmax MCP table and preserve every other user entry. */
-async function seedRemoteCodexConfig(world: World, localHome: string, home: RemoteAgentHome,
-  browserMcp?: RemoteAgentHome['browserMcp']): Promise<void> {
+function remoteCodexConfig(localHome: string, browserMcp?: RemoteAgentHome['browserMcp']): string {
   let config = '';
   // Host settings are authoritative on every turn, like the skills seeded above.
   try { config = fs.readFileSync(path.join(localHome, 'config.toml'), 'utf8'); } catch { /* new home */ }
@@ -835,7 +1295,7 @@ async function seedRemoteCodexConfig(world: World, localHome: string, home: Remo
       config += `\n[mcp_servers.${name}.env]\n${Object.entries(server.env).map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join('\n')}\n`;
     }
   }
-  await world.writeFile(`${home.relative}/config.toml`, config);
+  return config;
 }
 
 type BrowserKind = 'chrome-devtools' | 'playwright';
@@ -855,16 +1315,104 @@ function configuredBrowser(home: string, provider: Provider): BrowserKind | unde
   return undefined;
 }
 
+/** Browser tools ready in a world: what the readiness marker records. */
+interface BrowserTools { chromium: string; bin: string; cache: string }
+
+/** What the bootstrap found of the browser tools, in one pass (LT-22). */
+interface BrowserProbe {
+  /** The marker, when its versions are current and every executable it names is there. */
+  ready?: BrowserTools;
+  /** A template's baked browser tools are present. */
+  baked: boolean;
+  /** Digest of the CDP launcher the world holds, if any. */
+  launcher?: string;
+}
+
+const BROWSER_ROOT = `${REMOTE_ROOT}/tools/browser-${PLAYWRIGHT_VERSION}`;
+const BROWSER_MARKER_FILE = `${BROWSER_ROOT}/ready.json`;
+const CDP_LAUNCHER = `${REMOTE_ROOT}/chrome-cdp-launcher.mjs`;
+const BROWSER_VERSIONS = { playwright: PLAYWRIGHT_VERSION, chromeMcp: CHROME_DEVTOOLS_MCP_VERSION, playwrightMcp: PLAYWRIGHT_MCP_VERSION };
+const cdpLauncherSource = () => fs.readFileSync(fileURLToPath(new URL('../autonomy/chrome-cdp-launcher.mjs', import.meta.url)), 'utf8');
+
+// Runs in the sandbox with the paired Node: the readiness marker, the
+// executables it names, the baked alternative and the launcher's digest.
+const REMOTE_BROWSER_PROBE = String.raw`
+const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+const [marker, launcher, versionsJson] = process.argv.slice(1);
+const versions = JSON.parse(versionsJson);
+const executable = (file) => { try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; } };
+let ready;
+try {
+  const cached = JSON.parse(fs.readFileSync(marker, 'utf8'));
+  if (Object.entries(versions).every(([key, value]) => cached[key] === value)
+    && ['chromium', 'bin', 'cache'].every((key) => typeof cached[key] === 'string')
+    && [cached.chromium, path.join(cached.bin, 'playwright-mcp'), path.join(cached.bin, 'chrome-devtools-mcp')].every(executable))
+    ready = { chromium: cached.chromium, bin: cached.bin, cache: cached.cache };
+} catch {}
+const baked = !ready && executable('/opt/karmax/bin/playwright-mcp') && executable('/opt/karmax/bin/chrome-devtools-mcp')
+  && fs.existsSync('/opt/karmax/smoke.mjs');
+let digest;
+try { digest = crypto.createHash('sha256').update(fs.readFileSync(launcher)).digest('hex'); } catch {}
+process.stdout.write('\n${BROWSER_MARKER}' + JSON.stringify({ ...(ready ? { ready } : {}), baked, ...(digest ? { launcher: digest } : {}) }) + '\n');
+`;
+
+function browserProbeCommand(world: World, node: string): string {
+  return [node, '-e', REMOTE_BROWSER_PROBE, path.posix.join(world.handle.root, BROWSER_MARKER_FILE),
+    path.posix.join(world.handle.root, CDP_LAUNCHER), JSON.stringify(BROWSER_VERSIONS)].map(quote).join(' ');
+}
+
+function parseBrowserProbe(stdout: string): BrowserProbe | undefined {
+  const line = stdout.split('\n').reverse().find((candidate) => candidate.startsWith(BROWSER_MARKER));
+  let probe: any;
+  try { probe = JSON.parse(line!.slice(BROWSER_MARKER.length)); } catch { return undefined; }
+  const ready = probe?.ready;
+  if (typeof probe?.baked !== 'boolean' || (probe.launcher !== undefined && typeof probe.launcher !== 'string')
+    || (ready !== undefined && !['chromium', 'bin', 'cache'].every((key) => typeof ready?.[key] === 'string'))) return undefined;
+  return { baked: probe.baked, ...(ready ? { ready: { chromium: ready.chromium, bin: ready.bin, cache: ready.cache } } : {}),
+    ...(probe.launcher ? { launcher: probe.launcher } : {}) };
+}
+
+/** The browser MCP servers for this world, rewritten to sandbox-local, pinned
+ * executables. Readiness is established once per turn (LT-22): by the
+ * bootstrap prewarmed beside prompt preparation when there is one, including
+ * a first turn's smoke test, otherwise by one probe here. */
+export async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBin?: string): Promise<NonNullable<RemoteAgentHome['browserMcp']>> {
+  const entry = bootstraps.get(world.withoutProjectEnvironment?.() ?? world);
+  const bin = runtimeBin ?? (await entry?.bootstrap.catch(() => undefined))?.runtimeBin;
+  // A prewarmed repair that failed is this turn's failure; only a lost
+  // connection, or a bootstrap that never reached the browser, is tried again.
+  let tools = await entry?.browser?.catch((error) => {
+    if (browserFailures.has(error) && !lostConnection(error)) throw error;
+    return undefined;
+  });
+  if (!tools) {
+    const ready = timed('bootstrap.browser.ready', async () => readyBrowser(world, bin,
+      parseBrowserProbe((await world.exec('bash', ['-c', browserProbeCommand(world, bin ? path.posix.join(bin, 'node') : 'node')])).stdout)));
+    if (entry) entry.browser = ready;
+    tools = await ready;
+  }
+  return browserServers(world, browser, tools, bin);
+}
+
 /** Provider templates are the fast path; this sandbox-local installation is the
  * compatibility path for stock/custom environments. The launch smoke test is
  * the actual guarantee: a world is never handed to an agent with a configured
- * browser MCP that cannot start its browser. */
-export async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBin?: string): Promise<NonNullable<RemoteAgentHome['browserMcp']>> {
-  const relative = `${REMOTE_ROOT}/tools/browser-${PLAYWRIGHT_VERSION}`;
-  const absolute = path.posix.join(world.handle.root, relative);
+ * browser MCP that cannot start its browser. The marker and the CDP launcher
+ * are written only when the probe found them missing or different. */
+async function readyBrowser(world: World, runtimeBin: string | undefined, probe?: BrowserProbe): Promise<BrowserTools> {
+  const launcher = cdpLauncherSource();
+  const launcherWrite = probe?.launcher === sha256(Buffer.from(launcher)) ? undefined : world.writeFile(CDP_LAUNCHER, launcher);
+  launcherWrite?.catch(() => undefined);
+  const tools = probe?.ready ?? await repairBrowser(world, runtimeBin, probe);
+  if (!probe?.ready) await world.writeFile(BROWSER_MARKER_FILE, JSON.stringify({ ...tools, ...BROWSER_VERSIONS }));
+  await launcherWrite;
+  return tools;
+}
+
+async function repairBrowser(world: World, runtimeBin: string | undefined, probe?: BrowserProbe): Promise<BrowserTools> {
+  const absolute = path.posix.join(world.handle.root, BROWSER_ROOT);
   const bin = path.posix.join(absolute, 'node_modules/.bin');
   const browserCache = path.posix.join(absolute, 'browsers');
-  const marker = `${relative}/ready.json`;
   let chromium = '';
   let resolvedBin = bin;
   let resolvedCache = browserCache;
@@ -872,20 +1420,14 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   const pathEnv = runtimeBin ? `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
   const bakedRoot = '/opt/karmax/browser';
   const bakedCache = '/opt/karmax/browsers';
-  try {
-    const cached = JSON.parse((await readRemoteHistory(world, marker, { bytes: 0, files: 0 }, 8192)).toString('utf8'));
-    if (cached.playwright === PLAYWRIGHT_VERSION && cached.chromeMcp === CHROME_DEVTOOLS_MCP_VERSION
-      && cached.playwrightMcp === PLAYWRIGHT_MCP_VERSION && typeof cached.chromium === 'string'
-      && typeof cached.bin === 'string' && typeof cached.cache === 'string') {
-      const probe = await world.exec('bash', ['-lc', [cached.chromium,
-        path.posix.join(cached.bin, 'playwright-mcp'), path.posix.join(cached.bin, 'chrome-devtools-mcp')]
-        .map(file => `test -x ${quote(file)}`).join(' && ')]);
-      if (probe.code === 0) {
-        chromium = cached.chromium; resolvedBin = cached.bin; resolvedCache = cached.cache;
-      }
-    }
-  } catch { /* missing or stale readiness marker: probe and repair below */ }
-  const baked = chromium ? { code: 1 } : await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
+  // One repair at a time per sandbox, including an abandoned turn's still-running
+  // one. A step waits only for what is left of the repair's nine minutes, so a
+  // late lock never runs its step into the ten-minute command timeout.
+  const started = Date.now();
+  const locked = () => sandboxLock(path.posix.join(absolute, '.install.lock'), Math.max(1, 540 - Math.floor((Date.now() - started) / 1000)));
+  const busy = () => new Error('remote browser tools are still being installed by another turn in this sandbox; its lock stayed busy');
+  const baked = probe ? { code: probe.baked ? 0 : 1 }
+    : await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
   if (baked.code === 0) {
     const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
       env: { NODE_PATH: path.posix.join(bakedRoot, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: bakedCache,
@@ -906,11 +1448,14 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
       `chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}`,
     ];
     const install = await timed('bootstrap.browser.install', () => world.exec('bash', ['-lc', [
-      ...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
-      `mkdir -p ${quote(absolute)} ${quote(browserCache)}`,
-      `npm install --prefix ${quote(absolute)} --no-audit --no-fund --omit=dev ${packages.map(quote).join(' ')}`,
-      `PLAYWRIGHT_BROWSERS_PATH=${quote(browserCache)} ${quote(path.posix.join(bin, 'playwright'))} install chromium`,
-    ].join(' && ')], { timeoutMs: 10 * 60_000 }));
+      `mkdir -p ${quote(absolute)} ${quote(browserCache)} || exit 1`,
+      locked(),
+      [...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
+        `npm install --prefix ${quote(absolute)} --no-audit --no-fund --omit=dev ${packages.map(quote).join(' ')}`,
+        `PLAYWRIGHT_BROWSERS_PATH=${quote(browserCache)} ${quote(path.posix.join(bin, 'playwright'))} install chromium`,
+      ].join(' && '),
+    ].join('\n')], { timeoutMs: 10 * 60_000 }));
+    if (install.code === LOCK_BUSY) throw busy();
     if (install.code !== 0) throw new Error(`remote browser installation failed: ${install.stderr || install.stdout}`);
     const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
       cwd: absolute, env: { NODE_PATH: path.posix.join(absolute, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: browserCache,
@@ -927,15 +1472,18 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
       // passwordless sudo even when browser libraries are absent. Repair that
       // case once; custom locked-down images still fail with an actionable
       // template/image error instead of handing the agent a broken MCP.
+      // Under the same lock: two install-deps would contend for dpkg's.
       const dependencyInstall = await world.exec('bash', ['-lc', [
+        locked(),
         ...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
         `installer=${quote(path.posix.join(bin, 'playwright'))}`,
         'if [ "$(id -u)" = 0 ]; then "$installer" install-deps chromium',
         'elif command -v sudo >/dev/null 2>&1; then sudo -n "$installer" install-deps chromium',
         'else exit 126',
         'fi',
-      ].join('; ')], { env: { PLAYWRIGHT_BROWSERS_PATH: browserCache,
+      ].join('\n')], { env: { PLAYWRIGHT_BROWSERS_PATH: browserCache,
         ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 10 * 60_000 });
+      if (dependencyInstall.code === LOCK_BUSY) throw busy();
       const repaired = dependencyInstall.code === 0
         ? await world.exec(nodeCommand, ['-e', "require('playwright').chromium.launch({headless:true,args:['--no-sandbox']}).then(async b=>{await b.close()}).catch(e=>{console.error(e);process.exit(1)})"], {
             cwd: absolute, env: { NODE_PATH: path.posix.join(absolute, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: browserCache,
@@ -945,11 +1493,16 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
       if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a ${BRAND} browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
     }
   }
-  await world.writeFile(marker, JSON.stringify({ chromium, bin: resolvedBin, cache: resolvedCache,
-    playwright: PLAYWRIGHT_VERSION, chromeMcp: CHROME_DEVTOOLS_MCP_VERSION, playwrightMcp: PLAYWRIGHT_MCP_VERSION }));
-  const env = { PLAYWRIGHT_BROWSERS_PATH: resolvedCache, ...(pathEnv ? { PATH: pathEnv } : {}) };
+  return { chromium, bin: resolvedBin, cache: resolvedCache };
+}
+
+function browserServers(world: World, browser: BrowserKind, tools: BrowserTools,
+  runtimeBin?: string): NonNullable<RemoteAgentHome['browserMcp']> {
+  const nodeCommand = runtimeBin ? path.posix.join(runtimeBin, 'node') : 'node';
+  const pathEnv = runtimeBin ? `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
+  const env = { PLAYWRIGHT_BROWSERS_PATH: tools.cache, ...(pathEnv ? { PATH: pathEnv } : {}) };
   if (browser === 'playwright')
-    return { playwright: { command: path.posix.join(resolvedBin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } };
+    return { playwright: { command: path.posix.join(tools.bin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } };
   // Run chrome-devtools-mcp through karmax's launcher so the sandbox browser
   // exposes a loopback DevTools port (wiki plans/PLAN-passwords §5B, cloud path): the
   // launcher opens Chromium with --remote-debugging-port and attaches the baked
@@ -960,18 +1513,15 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
   // renderer cannot reserve its virtual CodeRange and dies, hanging all
   // page-level CDP (see findings/e2b-headless-chrome-overcommit.md). It
   // self-falls-back to pipe mode if the browser can't open, so tools never
-  // regress. The dep-free launcher is shipped into the world here.
-  const launcherRel = `${REMOTE_ROOT}/chrome-cdp-launcher.mjs`;
-  const launcherSource = fs.readFileSync(fileURLToPath(new URL('../autonomy/chrome-cdp-launcher.mjs', import.meta.url)), 'utf8');
-  await world.writeFile(launcherRel, launcherSource);
+  // regress. readyBrowser ships the dep-free launcher into the world.
   return { 'chrome-devtools': {
     command: nodeCommand,
-    args: [path.posix.join(world.handle.root, launcherRel)],
+    args: [path.posix.join(world.handle.root, CDP_LAUNCHER)],
     env: {
       ...env,
-      KARMAX_CDP_MCP_BIN: path.posix.join(resolvedBin, 'chrome-devtools-mcp'),
+      KARMAX_CDP_MCP_BIN: path.posix.join(tools.bin, 'chrome-devtools-mcp'),
       KARMAX_CDP_MCP_VERSION: CHROME_DEVTOOLS_MCP_VERSION,
-      KARMAX_CDP_CHROME: chromium,
+      KARMAX_CDP_CHROME: tools.chromium,
       KARMAX_CDP_PORT: String(DEFAULT_CDP_PORT),
       KARMAX_CDP_NO_SANDBOX: '1',
       KARMAX_CDP_SET_OVERCOMMIT: '1',
@@ -989,6 +1539,12 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
  * E2B template merely because its system Node is stale. Reuse the paired runtime
  * on later turns even if task commands replace system Node/npm. */
 export async function ensureRemoteNode(world: World): Promise<string> {
+  // This turn's bootstrap, prewarmed or seeded, already installed it.
+  const prepared = await bootstraps.get(world.withoutProjectEnvironment?.() ?? world)?.bootstrap.catch(() => undefined);
+  return prepared?.runtimeBin ?? (await timed('bootstrap.node', () => runBootstrap(world, {}))).runtimeBin;
+}
+
+function remoteNodeRuntime(world: World): { bin: string; install: string; expose: string } {
   const acceptable = "const [a,b]=process.versions.node.split('.').map(Number);process.exit(a>22||(a===22&&b>=12)?0:1)";
   // Task commands can replace system Node with an npx-cache symlink. Its
   // version still passes while npm's inferred prefix is unusable (task 201).
@@ -996,20 +1552,17 @@ export async function ensureRemoteNode(world: World): Promise<string> {
   const root = path.posix.join(world.handle.root, `${REMOTE_ROOT}/tools/node-${REMOTE_NODE_VERSION}`);
   const bin = path.posix.join(root, 'bin');
   const node = path.posix.join(bin, 'node');
-  const install = await timed('bootstrap.node.install-or-check', () => world.exec('bash', ['-lc', [
-    `mkdir -p ${quote(bin)}`,
-    installRemoteNodeCommand(root, REMOTE_NODE_VERSION, REMOTE_NPM_VERSION),
+  return { bin, expose: exposeRemoteNodeCommand(bin), install: [
+    `mkdir -p ${quote(bin)} || exit 1`,
+    // Two npm installs into one prefix corrupt it. The bootstrap's own
+    // timeout is five minutes; leave the installation one of them.
+    sandboxLock(path.posix.join(root, '.install.lock'), 240),
+    [installRemoteNodeCommand(root, REMOTE_NODE_VERSION, REMOTE_NPM_VERSION),
     `ln -sfn ../node_modules/node/bin/node ${quote(node)}`,
     `ln -sfn ../node_modules/npm/bin/npm-cli.js ${quote(path.posix.join(bin, 'npm'))}`,
     `ln -sfn ../node_modules/npm/bin/npx-cli.js ${quote(path.posix.join(bin, 'npx'))}`,
-    `${quote(node)} -e ${quote(acceptable)}`,
-  ].join(' && ')], { timeoutMs: 5 * 60_000 }));
-  if (install.code !== 0) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${install.stderr || install.stdout}`);
-  // Login shells reset PATH in /etc/profile. Publish the whole paired toolchain
-  // at the standard sandbox location, including on resumed worlds.
-  const expose = await world.exec('bash', ['-lc', exposeRemoteNodeCommand(bin)]);
-  if (expose.code !== 0) throw new Error(`could not make managed Node/npm the sandbox default (requires writable /usr/local/bin or passwordless sudo): ${expose.stderr || expose.stdout}`);
-  return bin;
+    `${quote(node)} -e ${quote(acceptable)}`].join(' && '),
+  ].join('\n') };
 }
 
 function removeTomlTable(source: string, owned: string): string {

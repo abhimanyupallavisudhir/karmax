@@ -209,8 +209,8 @@ describe('public conversation sharing over HTTP', async () => {
         await page.route('**/markdown.js', async route => {
           const response = await route.fetch();
           const source = await response.text();
-          expect(source).toMatch(/script\.integrity = 'sha384-[A-Za-z0-9+/=]+'/);
-          await route.fulfill({ response, body: source.replace(/script\.integrity = 'sha384-[A-Za-z0-9+/=]+'/, `script.integrity = '${integrity}'`) });
+          expect(source).toMatch(/'tex-svg': 'sha384-[A-Za-z0-9+/=]+'/);
+          await route.fulfill({ response, body: source.replace(/'tex-svg': 'sha384-[A-Za-z0-9+/=]+'/, `'tex-svg': '${integrity}'`) });
         });
         await page.route('https://cdn.jsdelivr.net/**', route => route.fulfill({
           contentType: 'text/javascript', headers: { 'access-control-allow-origin': '*' }, body: mathjax,

@@ -1,0 +1,20 @@
+name: Install the Temporal CLI
+description: >-
+  The pinned Temporal CLI at ~/.temporalio/bin/temporal, where
+  src/temporal/dev-server.ts looks for it; integration tests boot its dev
+  server. Pinned so a CLI release cannot break the build.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TEMPORAL_CLI_VERSION: '1.7.2'
+        TEMPORAL_CLI_LINUX_AMD64_SHA256: 'e2f548af84e820b7d71f25fc6461a4e6a1ab7cdb6a80fde3c375641b0772375b'
+      run: |
+        mkdir -p ~/.temporalio/bin
+        archive="$RUNNER_TEMP/temporal-cli.tar.gz"
+        curl -fsSL "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/temporal_cli_${TEMPORAL_CLI_VERSION}_linux_amd64.tar.gz" -o "$archive"
+        echo "${TEMPORAL_CLI_LINUX_AMD64_SHA256}  $archive" | sha256sum -c -
+        tar -xzf "$archive" -C ~/.temporalio/bin temporal
+        ~/.temporalio/bin/temporal --version

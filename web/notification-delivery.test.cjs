@@ -36,7 +36,7 @@ function browser() {
     api: async () => { if (response instanceof Error) throw response; return response; },
     announceInbox: (items) => alerts.push(...items),
     updateBell() {}, bgRenderMain() {}, patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false,
-    LIST_RELOAD_EVENTS: new Set(), setWsOnline() {}, checkConsoleRevision() {},
+    LIST_RELOAD_EVENTS: new Set(), setWsOnline() {}, checkConsoleRevision() {}, syncLiveWatch() {},
     refreshTasks: async () => {},
     setTimeout: (fn) => { timers.push(fn); return timers.length; },
   });

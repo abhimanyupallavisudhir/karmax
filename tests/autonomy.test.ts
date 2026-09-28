@@ -4,8 +4,6 @@ import path from 'node:path';
 import fs from 'node:fs';
 import WebSocket from 'ws';
 import { bootHarness, Harness } from './helpers/harness.js';
-import { TASK_QUEUE } from '../src/temporal/config.js';
-import { newId } from '../src/util/id.js';
 import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, isFullyAuthed, capturedToken, tokenToInject } from '../src/autonomy/config-homes.js';
 import { LoginManager, defaultLoginCommand, parseLoginPrompt } from '../src/autonomy/login.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';

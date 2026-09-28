@@ -112,6 +112,18 @@ export interface ViewPublicationOrder {
   revision?: number;
 }
 
+/** Conversation references are `${runId}:${revision}` (conversationPublisher):
+ * does `stored` hold the same run's conversation at `reference`'s revision or later? */
+function conversationSupersedes(stored: string, reference: string): boolean {
+  const revision = (value: string) => {
+    const at = value.lastIndexOf(':');
+    const n = Number(value.slice(at + 1));
+    return at > 0 && /^\d+$/.test(value.slice(at + 1)) && Number.isSafeInteger(n) ? { run: value.slice(0, at), n } : undefined;
+  };
+  const a = revision(stored), b = revision(reference);
+  return Boolean(a && b && a.run === b.run && a.n >= b.n);
+}
+
 /** A task's accepted publication position plus the runs it has moved past. */
 interface ViewOrderState { runId: string; seq: number; revision: number; retired: string[] }
 /** Runs a task replaces are few; remember enough to outlast a straggler. */
@@ -3461,8 +3473,8 @@ export class Store {
 
   /** Project default is read at Review time, including for already-running tasks. */
   async otherAttemptsDefault(taskId: string): Promise<'ask' | 'keep' | 'cancel'> {
-    const task = (await this.getTask(taskId));
-    const value = task && (await this.getSettings(task.projectId, '__common__'))?.otherAttempts;
+    const projectId = await this.taskProjectIdAsync(taskId);
+    const value = projectId && (await this.getSettings(projectId, '__common__'))?.otherAttempts;
     return value === 'keep' || value === 'cancel' ? value : 'ask';
   }
 
@@ -3832,6 +3844,13 @@ export class Store {
         payload: { requestId: request.id, action: 'withdraw', reason } }));
   }
 
+  /** Does the task's stored conversation make `reference`'s snapshot unnecessary
+   * (the same run, at the same or a later revision)? */
+  async conversationSupersedesReference(taskId: string, reference: string): Promise<boolean> {
+    const current = (await this.db.prepare('SELECT conversationRef FROM tasks WHERE id=?').get(taskId)) as { conversationRef?: string | null } | undefined;
+    return Boolean(current?.conversationRef && conversationSupersedes(current.conversationRef, reference));
+  }
+
   /** Returns false, and changes nothing, for a publication `order` shows is stale. */
   async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder): Promise<boolean> {
     return this.db.transaction(async () => {
@@ -3857,9 +3876,17 @@ export class Store {
     const { messages, transcripts, ...status } = view;
     if (conversationReference) {
       const key = `view-conversation:${taskId}:${conversationReference}`;
-      if (!(await this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(key))) throw new Error('Conversation publication snapshot is missing');
       const current = (await this.db.prepare('SELECT conversationRef FROM tasks WHERE id=?').get(taskId)) as any;
-      if (current?.conversationRef === conversationReference) {
+      // Within one run the conversation follows revisions while the status
+      // follows the workflow's order: two publishers of a run (an update handler
+      // and the main loop) can keep referring to an older revision after a newer
+      // one replaced it. Such a frame updates the status and keeps the newer
+      // conversation, and never needs the snapshot it names (DB-2 dropped it).
+      if (current?.conversationRef && conversationSupersedes(current.conversationRef, conversationReference)) {
+        (await this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId));
+      } else if (!(await this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(key))) {
+        throw new Error('Conversation publication snapshot is missing');
+      } else if (current?.conversationRef === conversationReference) {
         (await this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId));
       } else {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
@@ -5603,13 +5630,20 @@ export class Store {
 
   /** Event routing needs ownership, never a conversation or reviewer expansion. */
   async taskProjectIds(taskIds: readonly string[]): Promise<Map<string, string>> {
-    const result = new Map<string, string>();
+    return new Map([...(await this.taskEventRoutes(taskIds))].map(([id, route]) => [id, route.projectId]));
+  }
+
+  /** Each task's project, and whether it is an attempt other than its intent's
+   *  principal: task lists show only principals, so live events say so (RQ-3). */
+  async taskEventRoutes(taskIds: readonly string[]): Promise<Map<string, { projectId: string; siblingAttempt: boolean }>> {
+    const result = new Map<string, { projectId: string; siblingAttempt: boolean }>();
     const ids = [...new Set(taskIds)];
     for (let offset = 0; offset < ids.length; offset += 500) {
       const batch = ids.slice(offset, offset + 500);
-      const rows = await this.readRows<{ id: string; projectId: string }>(
-        `SELECT id, projectId FROM tasks WHERE id IN (${batch.map(() => '?').join(',')})`, batch);
-      for (const row of rows) result.set(row.id, row.projectId);
+      const rows = await this.readRows<{ id: string; projectId: string; principalAttemptId: string | null }>(
+        `SELECT t.id, t.projectId, i.principalAttemptId FROM tasks t LEFT JOIN task_intents i ON i.id=t.intentId
+         WHERE t.id IN (${batch.map(() => '?').join(',')})`, batch);
+      for (const row of rows) result.set(row.id, { projectId: row.projectId, siblingAttempt: !!row.principalAttemptId && row.principalAttemptId !== row.id });
     }
     return result;
   }
@@ -6389,8 +6423,8 @@ export class Store {
     const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
     const hostedCustomerWorld = remote && this.hosted && pool.mode === 'customer';
     const project = (await this.getProject(input.projectId));
-    const task = (await this.getTask(input.taskId));
-    if (!project || project.organizationId !== input.organizationId || !task || task.projectId !== project.id)
+    const taskProjectId = await this.taskProjectIdAsync(input.taskId);
+    if (!project || project.organizationId !== input.organizationId || taskProjectId !== project.id)
       throw new Error('runner admission attribution does not match the organization project and task');
     const resources = { cpu: Math.max(1, input.cpu ?? 2), memoryMb: Math.max(128, input.memoryMb ?? 2048), gpu: Math.max(0, input.gpu ?? 0) };
     if (!hostedCustomerWorld && (resources.cpu > pool.capacity.cpu || resources.memoryMb > pool.capacity.memoryMb || resources.gpu > pool.capacity.gpu
@@ -6595,6 +6629,22 @@ export class Store {
     return row?.projectId;
   }
 
+  /** World admission priority, likewise without the transcript (RT-14). */
+  async taskPriority(taskId: string): Promise<number> {
+    const [row] = await this.readRows<{ priority: unknown }>("SELECT json_extract(params, '$.priority') AS priority FROM tasks WHERE id=?", [taskId]);
+    return Number(row?.priority ?? 0);
+  }
+
+  /** An attempt group's size and commitment, without hydrating its attempts (RT-14). */
+  async attemptSummary(taskOrIntentId: string): Promise<{ attempts: number; committedAttemptId?: string; otherAttempts?: 'keep' | 'cancel' } | undefined> {
+    const [row] = await this.readRows<{ id: string; committedAttemptId: string | null; attempts: number }>(`SELECT i.id, i.committedAttemptId,
+      (SELECT COUNT(*) FROM tasks a WHERE a.intentId=i.id) AS attempts FROM task_intents i
+      WHERE i.id=COALESCE((SELECT intentId FROM tasks WHERE id=?), ?)`, [taskOrIntentId, taskOrIntentId]);
+    if (!row) return undefined;
+    return { attempts: Number(row.attempts), ...(row.committedAttemptId ? { committedAttemptId: row.committedAttemptId,
+      otherAttempts: (await this.kvGet(`attempt-policy:${row.id}`)) === 'keep' ? 'keep' as const : 'cancel' as const } : {}) };
+  }
+
   async projectOrganizationAsync(projectId: string): Promise<string | undefined> {
     const [row] = await this.readRows<{ organizationId: string | null }>('SELECT organizationId FROM projects WHERE id=?', [projectId]);
     return row ? row.organizationId ?? 'org_personal' : undefined;
@@ -6642,8 +6692,8 @@ export class Store {
 
     const now = input.now ?? Date.now();
     const project = (await this.getProject(input.projectId));
-    const task = (await this.getTask(input.taskId));
-    if (!project || project.organizationId !== input.organizationId || !task || task.projectId !== project.id)
+    const taskProjectId = await this.taskProjectIdAsync(input.taskId);
+    if (!project || project.organizationId !== input.organizationId || taskProjectId !== project.id)
       throw new Error('usage attribution does not match the organization project and task');
     const entitlements = (await this.organizationEntitlements(input.organizationId));
     if (!entitlements.agentRunAdmissionAllowed) {

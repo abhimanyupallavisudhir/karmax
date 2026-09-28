@@ -18,7 +18,7 @@ const slice = (from, to) => {
 };
 
 const installation = slice('function installationView()', 'function organizationView()');
-const organization = slice('function organizationView()', 'async function hydrateOrganizationView()');
+const organization = slice('function organizationView()', 'async function hydrateOrganizationView(');
 const project = slice('function settingsView(proj)', 'function cloudEnvironmentCard(proj)');
 
 for (const marker of [

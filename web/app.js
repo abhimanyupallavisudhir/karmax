@@ -342,6 +342,10 @@ function syncOrganizationSwitcher() {
 // `/<org>` prefix for the current (or a given) organization; '' when none is known.
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 
+/** Tabs that belong to the selected project (the router reads them from URLs,
+ *  the rail highlights the project, the main pane shows its tab bar). One list
+ *  so they never drift apart again. */
+const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
 // Second-segment words that name an organization-level view rather than a project.
 const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
 
@@ -369,7 +373,7 @@ function parseRoute(url) {
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
   if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', sub: seg[1] || null, legacy: true };
   if (seg[0] === 'projects' && seg[1]) {
-    const tab = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+    const tab = PROJECT_SCOPED_TABS.includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
     const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
@@ -386,7 +390,7 @@ function parseRoute(url) {
   // The inbox is the one org view with a sub-view (which kind of notification).
   if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', org, tab: 'inbox', sub: seg[2] || null };
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
-  const tab = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+  const tab = PROJECT_SCOPED_TABS.includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
@@ -556,6 +560,7 @@ async function applyRoute() {
       if (organizationChanged) {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+        syncLiveWatch();
         renderOnboarding();
         refreshOnboarding();
         renderRouteLoadingPage(org.name, 'Switching organization…');
@@ -642,28 +647,36 @@ async function applyRoute() {
     // view/cursor that doesn't exist here). The incoming URL's own ?q= is applied
     // below, so a link into another project's search still lands filtered.
     S.projectId = pid;
+    syncLiveWatch();
     S.avatarSelected = null;
     S.search = '';
     S.searchResult = null;
     S.searchPending = false;
     S.cursorId = null;
-    await loadTasks().catch(() => {});
-    await loadAvatars().catch(() => {});
-    if (!routeIsCurrent()) return;
   }
-  else if (!S.tasks?.length) {
-    await loadTasks().catch(() => {});
-    if (!routeIsCurrent()) return;
+  const incomingListQuery = r.q || '';
+  const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
+  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
+  // A project with nothing in memory to paint reads everything its page needs
+  // together: tasks, avatars, tags/views and the list's search (RQ-9).
+  const reads = [];
+  if (!sameProject || !S.tasks?.length) reads.push(loadTasks().catch(() => {}));
+  if (!sameProject || !S.avatarAvailability || S.avatarProjectId !== pid) reads.push(loadAvatars().catch(() => {}));
+  let organizationRead = null, listSearch = null;
+  if (!projectOrganizationLoaded) {
+    organizationRead = loadOrg().catch(() => false);
+    if (!r.taskKey && tab === 'tasks') {
+      S.search = incomingListQuery;
+      listSearch = runSearch().catch(() => {});
+    }
   }
-  if (sameProject && (!S.avatarAvailability || S.avatarProjectId !== pid)) await loadAvatars().catch(() => {});
+  await Promise.all(reads);
+  if (!routeIsCurrent()) return;
   // Same-project tabs are local navigation. Their complete last-painted inputs
   // are already in memory, so reveal the destination before refreshing tags,
   // views, fields, and (for the task list) the authoritative search result.
   // A changed task-list query clears the previous server result and paints a
   // labelled local preview instead of flashing unrelated rows.
-  const incomingListQuery = r.q || '';
-  const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
-  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
   if (canPaintCachedProject) {
     S.tab = tab;
     closeTaskDom();
@@ -678,12 +691,11 @@ async function applyRoute() {
     if (tab === 'activity') seedActivity();
     if (tab === 'queue') seedQueue();
   }
-  const organizationRefresh = loadOrg().catch(() => false); // tags / saved views / field registry
-  // A task page can open entirely from the loaded task record and paints its own
-  // loading state below. Do not put the metadata refresh back in front of it.
-  // First visits/cross-project routes still wait so they never render foreign tags.
-  if (!r.taskKey || !projectOrganizationLoaded) await organizationRefresh;
-  else organizationRefresh.then(() => { if (routeIsCurrent()) renderRail(); });
+  // Tags / saved views / field registry. A task page in a project whose metadata
+  // is loaded re-reads none of it, so opening or j/k-walking tasks costs only the
+  // task's own reads (UI-6); the list refreshes it when shown again. First visits
+  // and cross-project routes wait so they never render foreign tags.
+  if (!r.taskKey || !projectOrganizationLoaded) await (organizationRead || loadOrg().catch(() => false));
   if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
@@ -699,7 +711,7 @@ async function applyRoute() {
     // The list is query-driven and the URL owns the query: a pasted, bookmarked,
     // reloaded or Back-navigated link paints the same filtered/grouped/sorted view.
     S.search = incomingListQuery;
-    await runSearch().catch(() => {});
+    await (listSearch || runSearch().catch(() => {}));
     if (!routeIsCurrent()) return;
   }
   renderRail();
@@ -2372,12 +2384,16 @@ function api(path, opts = {}) {
   }
   if (opts.signal) return fetchApi(path, opts);
   const key = JSON.stringify([S.token, typeof S.user === 'object' ? S.user?.id : S.user, path, opts]);
+  // `stable` reads (settings that change only by a write) are kept until this
+  // tab's next write; `maxAge` reads (and resolved defaults) for that many ms,
+  // so one navigation's panes share a read instead of each repeating it.
+  const maxAge = opts.stable ? Infinity : opts.maxAge ?? (path.startsWith('/api/defaults/') ? 10_000 : 0);
   const cached = defaults.get(key);
-  if (cached && Date.now() - cached.at < 10_000) return Promise.resolve(JSON.parse(cached.json));
+  if (cached && Date.now() - cached.at < maxAge) return Promise.resolve(JSON.parse(cached.json));
   defaults.delete(key);
   if (pending.has(key)) return pending.get(key);
   const request = fetchApi(path, opts).then(value => {
-    if (path.startsWith('/api/defaults/') && pending.get(key) === request) {
+    if (maxAge && pending.get(key) === request) {
       if (defaults.size >= 64) defaults.delete(defaults.keys().next().value);
       defaults.set(key, { at: Date.now(), json: JSON.stringify(value) });
     }
@@ -2646,7 +2662,7 @@ function renderMarkdown(src, opts = {}) {
   const cache = renderMarkdown.cache ||= new Map();
   const key = JSON.stringify([src, opts]);
   if (cache.has(key)) return cache.get(key);
-  const html = globalThis.TavyaMarkdown.renderMarkdown(src, opts);
+  const html = globalThis.KarmaxMarkdown.renderMarkdown(src, opts);
   if (key.length + html.length <= 64_000) {
     if (cache.size >= 128) cache.delete(cache.keys().next().value);
     cache.set(key, html);
@@ -2654,7 +2670,7 @@ function renderMarkdown(src, opts = {}) {
   return html;
 }
 function ensureMathJax() {
-  return globalThis.TavyaMarkdown.ensureMathJax();
+  return globalThis.KarmaxMarkdown.ensureMathJax();
 }
 function typesetMath(root) {
   const scope = root || document.getElementById('ck-thread');
@@ -2782,18 +2798,22 @@ function watchConsoleRevision() {
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
-  S.meta = S.meta || await api('/api/meta');
-  applyDocumentBrand();
-  S.launch = S.launch || await (await feedbackFetch('/api/launch')).json();
+  // Public pages need no session, and must not read one: that provisions a
+  // personal workspace and consumes the one-time git-onboarding flag. The
+  // emailed password-reset link lands signed out, so it is one of them.
   const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
-  if (legalSlug) return renderLegalPage(legalSlug);
-  if (location.pathname === '/legal') return renderLegalIndex();
-  if (location.pathname === '/pricing') return renderPricing();
-  // The emailed password-reset link lands here unauthenticated; handle it before
-  // any session/setup gating so a signed-out user can actually reset.
-  if (location.pathname === '/reset-password') {
-    return renderResetPassword(new URLSearchParams(location.search).get('token') || '');
-  }
+  const publicPage = legalSlug ? () => renderLegalPage(legalSlug)
+    : { '/legal': renderLegalIndex, '/pricing': renderPricing,
+      '/reset-password': () => renderResetPassword(new URLSearchParams(location.search).get('token') || '') }[location.pathname];
+  // Independent first reads go together; each used to wait for the one before (RQ-9).
+  const sessionRead = publicPage ? null : feedbackFetch('/api/session').then((response) => response.json());
+  sessionRead?.catch(() => {}); // awaited below
+  [S.meta, S.launch] = await Promise.all([
+    S.meta || api('/api/meta'),
+    S.launch || feedbackFetch('/api/launch').then((response) => response.json()),
+  ]);
+  applyDocumentBrand();
+  if (publicPage) return publicPage();
   // Better Auth redirects the confirmation link back here with ?verified=1 after
   // marking the address verified. Note it, strip it from the URL, and surface it
   // (a toast in-app, or a line on the sign-in card if the link was opened while
@@ -2812,7 +2832,7 @@ async function boot() {
     clean.searchParams.delete('auth_provider');
     history.replaceState({ kx: 1 }, '', `${clean.pathname}${clean.search}${clean.hash}`);
   }
-  const session = await (await feedbackFetch('/api/session')).json();
+  const session = await sessionRead;
   // Account email (confirmation, password reset) only when the installation can send it.
   S.emailDelivery = session.emailDelivery === true;
   S.sso = session.sso || null;
@@ -2875,6 +2895,15 @@ async function boot() {
     throw e;
   }
   if (!S.organizationId) S.organizationId = S.defaultOrganizationId;
+  // Load for the organization and project the URL names, not the defaults the
+  // first route would switch away from at once (RQ-9, UI-8).
+  const initialRoute = parseRoute(currentPath());
+  const routeOrganization = initialRoute.org && organizationBySlug(initialRoute.org);
+  if (routeOrganization) {
+    S.organizationId = routeOrganization.id;
+    S.projectId = (initialRoute.slug && projectBySlug(initialRoute.slug, routeOrganization.id)?.id)
+      || firstProjectForOrganization(routeOrganization.id)?.id || null;
+  }
   // Account creation marks exactly one session response for Git onboarding. Only
   // replace the neutral home route (never an invitation or another deep link).
   if (session.gitOnboarding && parseRoute(currentPath()).name === 'home')
@@ -2885,6 +2914,7 @@ async function boot() {
   loadModelCatalog(projectScope, S.organizationId);
   await Promise.all([
     loadCollaboration().catch(() => {}),
+    loadInbox().catch(() => {}),
     api(`/api/contributions${projectScope}`).then((contributions) => { S.contributions = contributions; }).catch(() => {}),
     api(`/api/schema${projectScope}`).then((schema) => {
       S.schema = schema;
@@ -2975,24 +3005,33 @@ async function loadOrganizations() {
   if (!S.organizationId) S.organizationId = S.defaultOrganizationId;
 }
 
+// The organization's people, teams and roles. A route that switches organization
+// and the settings page it paints share one read (any write drops it); the inbox
+// spans organizations and is loaded by its own callers. A failed read keeps what
+// was known about this organization and rejects, so no page reads it as empty.
 async function loadCollaboration() {
-  const inbox = loadInbox().catch(() => {});
   const organizationId = S.organizationId;
-  if (!organizationId) return inbox;
+  if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
-  const [members, teams, users, catalog] = await Promise.all([
-    api(`/api/organizations/${organizationId}/members`).catch(() => []),
-    api(`/api/organizations/${organizationId}/teams`).catch(() => []),
-    api('/api/users').catch(() => []),
-    api(`/api/organizations/${organizationId}/roles`).catch(() => null),
-    inbox,
+  const read = path => api(path, { maxAge: 10_000 });
+  const [members, teams, users, catalog] = await Promise.allSettled([
+    read(`/api/organizations/${organizationId}/members`),
+    read(`/api/organizations/${organizationId}/teams`),
+    read('/api/users'),
+    read(`/api/organizations/${organizationId}/roles`),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
-  S.authorizationCatalog = catalog;
+  const known = S.authorizationCatalogOrganization === organizationId;
+  const value = (result, previous, empty) => result.status === 'fulfilled' ? result.value ?? empty : known ? previous : empty;
+  S.authorizationCatalog = value(catalog, S.authorizationCatalog, null);
+  S.organizationMembers = value(members, S.organizationMembers, []);
+  S.teams = value(teams, S.teams, []);
+  S.users = users.status === 'fulfilled' ? users.value || [] : S.users || [];
   S.authorizationCatalogOrganization = organizationId;
-  S.organizationMembers = members || [];
-  S.teams = teams || [];
-  S.users = users || [];
+  // The installation's user directory only fills in names the members already
+  // carry, and an organization owner may not read it (hosted): not a failure.
+  const failed = [members, teams, catalog].find((result) => result.status === 'rejected');
+  if (failed) throw failed.reason;
 }
 
 async function loadInbox() {
@@ -3400,10 +3439,6 @@ function patchTaskListFromEvent(ev) {
     || turnKey(previous.agentTurn) !== turnKey(next.agentTurn);
 }
 
-/** Tabs that belong to the selected project (the rail highlights it, the main
- *  pane shows its tab bar). One list so the two never drift apart again. */
-const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
-
 function scheduleTaskListReload() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
@@ -3435,7 +3470,7 @@ function connectWs() {
     if (S.tab === 'insights' && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleInsightsRefresh();
     const eventProject = ev.projectId || ev.payload?.projectId;
     const currentProject = !eventProject || eventProject === S.projectId;
-    const siblingAttempt = S.attemptGroup?.attempts?.some(a => a.id === ev.taskId)
+    const siblingAttempt = ev.siblingAttempt || S.attemptGroup?.attempts?.some(a => a.id === ev.taskId)
       && S.attemptGroup.principalAttemptId !== ev.taskId;
     const patchedList = currentProject && patchTaskListFromEvent(ev);
     if (ev.type === 'review.updated' || ev.type.startsWith('resource.')) {
@@ -3501,6 +3536,7 @@ function connectWs() {
   ws.onopen = () => {
     wsRetryMs = 1500;
     setWsOnline(true);
+    syncLiveWatch();
     if (wsHadDropped) checkConsoleRevision();
     if (wsHadDropped && document.hidden) S.liveUpdatesStale = true;
     else if (wsHadDropped) {
@@ -3518,6 +3554,17 @@ function connectWs() {
     connectWs.retryTimer = setTimeout(connectWs, wsRetryMs);
     wsRetryMs = Math.min(wsRetryMs * 2, 30_000);
   };
+}
+
+// Tell the gateway what this tab shows, so it streams agent output only for the
+// open task and only lifecycle events from other projects (RQ-16).
+function syncLiveWatch() {
+  const ws = S.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const watch = JSON.stringify({ type: 'watch', projectId: S.projectId || null, taskId: S.selected || null });
+  if (ws.sentWatch === watch) return;
+  ws.sentWatch = watch;
+  ws.send(watch);
 }
 
 let wsHadDropped = false;
@@ -6940,6 +6987,43 @@ async function refreshTaskHistory(taskId) {
   }
 }
 
+// j/k walking (see openAdjacentTask) keeps the task it is heading to in
+// S.taskWalkTarget until that page opens. Opens during a walk wait this long
+// before fetching, so a further key press supersedes them.
+const TASK_WALK_SETTLE_MS = 150;
+
+// Approval decisions load for the pages that show them: a task with pending
+// decisions (dismissed ones too: the conversation keeps them, because the agent
+// still waits), or its Approvals tab (UI-6). Vault item names only label
+// credential requests, so they load only when there are some.
+function showsTaskApprovals(view) {
+  return !!(view.approvalRequests || view.pendingDecisions || S.taskTab === 'approvals');
+}
+function ensureTaskApprovals(taskId) {
+  if (S.taskApprovalsFor === taskId) return Promise.resolve();
+  const epoch = S.taskOpenEpoch;
+  const inFlight = ensureTaskApprovals.pending;
+  if (inFlight?.taskId === taskId && inFlight.epoch === epoch) return inFlight.promise;
+  const rec = taskRecord(taskId);
+  const draft = !!rec?.params?.draft;
+  const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+  const query = `taskId=${encodeURIComponent(taskId)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+  const promise = (async () => {
+    const [approvalRequests, permissionRequests, authorizationRequests] = await Promise.all([
+      draft ? [] : api(`/api/vault/requests?${query}`).catch(() => []),
+      draft ? [] : api(`/api/permission-requests?${query}`).catch(() => []),
+      api(`/api/authorization-requests?${query}`).catch(() => []),
+    ]);
+    const approvalItems = approvalRequests.length
+      ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
+    if (S.selected !== taskId || S.taskOpenEpoch !== epoch) return;
+    Object.assign(S, { approvalRequests, permissionRequests, authorizationRequests, approvalItems, taskApprovalsFor: taskId });
+    scheduleTaskPageRender();
+  })().finally(() => { if (ensureTaskApprovals.pending?.promise === promise) ensureTaskApprovals.pending = null; });
+  ensureTaskApprovals.pending = { taskId, epoch, promise };
+  return promise;
+}
+
 async function openTask(taskId, wantTab, explicitAttempt = false) {
   const openEpoch = S.taskOpenEpoch = (S.taskOpenEpoch || 0) + 1;
   S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
@@ -6956,9 +7040,19 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // (edit its parameters + triggers, see its runs, run again).
   const rec = taskRecord(taskId);
   S.selected = taskId;
+  syncLiveWatch();
   S.viewingAttempt = explicitAttempt ? taskId : null;
   S.view = null;
   renderTaskLoadingPage(rec);
+  // j/k outpaces loading: each step paints its title at once, and only the task
+  // the walk settles on is fetched (UI-6).
+  // Any other open (a click, Back, a superseded route) ends the walk.
+  const walking = S.taskWalkTarget === taskId;
+  S.taskWalkTarget = null;
+  if (walking) {
+    await new Promise((resolve) => setTimeout(resolve, TASK_WALK_SETTLE_MS));
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
+  }
   if (rec?.params?.repeatable) {
     await renderSeriesPage(rec);
     return;
@@ -6992,6 +7086,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.permissionRequests = [];
   S.authorizationRequests = [];
   S.approvalItems = [];
+  S.taskApprovalsFor = null;
   try {
     // Start secondary resources in parallel, but let the compact task projection
     // paint as soon as it arrives. A large event history or a slow session lookup
@@ -7007,11 +7102,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions?metadata=1`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
-      draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
-      draft ? Promise.resolve([]) : api(`/api/permission-requests?${approvalQuery}`).catch(() => []),
-      api(`/api/authorization-requests?${approvalQuery}`).catch(() => []),
-      draft ? Promise.resolve([]) : api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []),
-      taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
+      taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`, { stable: true }).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
         : Promise.resolve({ effective: DEFAULT_EXPLANATION_SETTINGS }),
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
       api(`/api/connections?${approvalQuery}`).catch(() => []),
@@ -7024,17 +7115,14 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(S.view);
     renderTaskPage();
+    if (showsTaskApprovals(S.view)) ensureTaskApprovals(taskId);
 
-    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents, connections] = await details;
+    const [events, widgets, sessions, attempts, explanationSettings, explanationEvents, connections] = await details;
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     mergeTaskHistory([...explanationEvents, ...events]);
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    S.approvalRequests = approvalRequests;
-    S.permissionRequests = permissionRequests;
-    S.authorizationRequests = authorizationRequests;
-    S.approvalItems = approvalItems;
     S.connections = connections;
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
   } catch (e) {
@@ -7079,18 +7167,22 @@ async function refreshTask(reason = 'all') {
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+    const approvals = S.taskApprovalsFor === id;
+    // Only what this refresh fetched is written back; the rest (undefined) keeps
+    // whatever landed meanwhile, e.g. the approvals ensureTaskApprovals loaded.
+    const load = (wanted, url) => wanted ? api(url).catch(() => undefined) : undefined;
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       // Widgets are resolved against the view (the Overview's stage and changed
       // files), so every lifecycle publication re-resolves them.
-      has(/view\.updated|review|stage|turn\.result/) ? api(`/api/tasks/${id}/widgets`).catch(() => S.widgets) : S.widgets,
-      has(/session|turn.result|stage/) ? api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions) : S.sessions,
-      has(/attempt|turn.result|merge.result/) ? api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup) : S.attemptGroup,
-      has(/credential\.approval/) ? api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests) : S.approvalRequests,
-      has(/permission\.approval/) ? api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests) : S.permissionRequests,
-      has(/authorization\.approval/) ? api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests) : S.authorizationRequests,
-      has(/credential\.approval/) ? api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems) : S.approvalItems,
-      has(/^connection\./) ? api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []) : S.connections,
+      load(has(/view\.updated|review|stage|turn\.result/), `/api/tasks/${id}/widgets`),
+      load(has(/session|turn.result|stage/), `/api/tasks/${id}/sessions?metadata=1`),
+      load(has(/attempt|turn.result|merge.result/), `/api/tasks/${id}/attempts`),
+      load(approvals && has(/credential\.approval/), `/api/vault/requests?${approvalQuery}`),
+      load(approvals && has(/permission\.approval/), `/api/permission-requests?${approvalQuery}`),
+      load(approvals && has(/authorization\.approval/), `/api/authorization-requests?${approvalQuery}`),
+      load(approvals && has(/credential\.approval/), `/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`),
+      load(has(/^connection\./), `/api/connections?${approvalQuery}`),
     ]);
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
@@ -7100,14 +7192,9 @@ async function refreshTask(reason = 'all') {
       return;
     }
     S.view = pendingCancellationView(view, id);
-    S.widgets = widgets;
-    S.sessions = sessions;
-    S.attemptGroup = attempts;
-    S.approvalRequests = approvalRequests;
-    S.permissionRequests = permissionRequests;
-    S.authorizationRequests = authorizationRequests;
-    S.approvalItems = approvalItems;
-    S.connections = connections;
+    Object.assign(S, Object.fromEntries(Object.entries({ widgets, sessions, attemptGroup: attempts, approvalRequests,
+      permissionRequests, authorizationRequests, approvalItems, connections }).filter(([, value]) => value !== undefined)));
+    if (!approvals && showsTaskApprovals(S.view)) ensureTaskApprovals(id);
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -7143,8 +7230,10 @@ function closeTask() {
 }
 // Drop the open task's page state without navigating (called by applyRoute()).
 function closeTaskDom() {
+  S.taskWalkTarget = null;
   if (!S.selected && !S.view) return;
   S.selected = null;
+  syncLiveWatch();
   S.viewingAttempt = null;
   S.view = null;
   S.attemptGroup = null;
@@ -7779,6 +7868,10 @@ function taskTabBody(v, tab) {
 }
 
 function approvalRequestsTab(v) {
+  if (S.taskApprovalsFor !== v.taskId) {
+    ensureTaskApprovals(v.taskId);
+    return '<div class="task-approvals" id="task-approval-requests"><span class="global-search-loading">Loading…</span></div>';
+  }
   const pending = [...S.approvalRequests, ...S.permissionRequests, ...(S.authorizationRequests || [])]
     .filter((request) => request.status === 'pending' && !request.dismissed).length + (S.connections || []).filter(c => ['requested', 'connecting'].includes(c.status)).length;
   return `<div class="task-approvals" id="task-approval-requests">
@@ -7817,13 +7910,13 @@ function wireTaskApprovalRequests(v) {
   const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
   wireConnectionActions(document.getElementById('task-approval-requests'), organizationId, refreshTask);
   wireCredentialRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
-    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
   });
   wirePermissionRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
-    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
   });
   wireAuthorizationRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
-    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
   });
 }
 
@@ -8232,26 +8325,12 @@ function showArtifactReader(text, kind, name, blob) {
 }
 
 // Types a browser renders without running anything: opened straight from a
-// `blob:` URL. Active documents (HTML, SVG) are opened too — inside a sandboxed
-// iframe, because a `blob:` URL carries THIS page's origin and an agent-authored
-// page opened bare would execute with the console's session. Everything else
-// is downloaded.
+// `blob:` URL. Active documents (HTML, SVG) open by their own URL instead: the
+// gateway serves them under a `sandbox` policy that gives them an opaque origin,
+// while a `blob:` URL would carry THIS page's origin and policy. Everything
+// else is downloaded.
 const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
 const ACTIVE_ARTIFACT = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i;
-function openSandboxedDocument(blobUrl, title) {
-  const w = window.open('', '_blank', 'noopener=no');
-  if (!w) return false;
-  w.document.title = title;
-  const frame = w.document.createElement('iframe');
-  // No allow-same-origin: the document gets an opaque origin, so its scripts
-  // cannot read this console's storage or cookies or call its API as the user.
-  frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
-  frame.src = blobUrl;
-  frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0';
-  w.document.body.style.margin = '0';
-  w.document.body.appendChild(frame);
-  return true;
-}
 function safeHref(href) {
   return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
 }
@@ -8270,9 +8349,14 @@ async function openArtifact(url, external, target = '') {
       showArtifactReader(await blob.text(), kind, name, blob);
       return;
     }
+    if (ACTIVE_ARTIFACT.test(blob.type)) {
+      // `noopener` would hide whether a popup blocker stopped the window.
+      const opened = window.open(url, '_blank');
+      if (opened) { opened.opener = null; return; }
+    }
     const obj = URL.createObjectURL(blob);
     if (RENDERABLE_ARTIFACT.test(blob.type)) window.open(obj, '_blank', 'noopener');
-    else if (!(ACTIVE_ARTIFACT.test(blob.type) && openSandboxedDocument(obj, name))) {
+    else {
       const a = document.createElement('a');
       a.href = obj; a.download = name; a.rel = 'noopener';
       document.body.appendChild(a); a.click(); a.remove();
@@ -8725,7 +8809,7 @@ function overviewTab(v) {
          ${v.reviewInfo?.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
          ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
-         ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
+         ${v.reviewInfo?.html ? `<iframe id="review-info-frame" data-live-key="${esc(v.taskId)}:${contentKey(v.reviewInfo.html)}" sandbox="allow-scripts" src="/api/tasks/${encodeURIComponent(v.taskId)}/review-info.html" title="Review details"></iframe>` : ''}
          ${v.stage === 'review' ? `${resourceReviewPlaceholder()}<div id="review-resource-inventory"><div class="task-sub" role="status">Inspecting ignored output…</div></div>` : ''}
        </div>`
     : '';
@@ -9616,45 +9700,55 @@ function localConversationHandoff(v, cwd, portable = false, preparedSessions = S
     }).join('')}</div>`;
 }
 
-async function openLocalCheckout(v) {
-  if (hostLocal()) return materializeLocalCheckout(v);
+// The Work-locally dialogs share one frame: a loading state while `load()` runs,
+// then `render(data)`'s body, with close, copy and conversation downloads wired.
+// Resolves to { host, data }, or null when the load failed or the dialog closed.
+async function localHandoffDialog({ loading, load, title = () => 'Work locally', render }) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
+  const show = (heading, body) => {
+    host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">${heading} <span class="q-spacer"></span><button class="icon-btn local-handoff-close" aria-label="Close">✕</button></div>
+    ${body}
   </div></div>`;
-  const wireClose = () => {
     host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
     host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
   };
-  wireClose();
-  let plan, preparedSessions;
-  try {
-    [plan, preparedSessions] = await Promise.all([
+  show('Work locally', `<div class="tf-loading modal-loading" role="status"><span class="global-search-loading">${loading}</span></div>`);
+  let data;
+  try { data = await load(); }
+  catch (error) { host.remove(); toast(error.message, true); return null; }
+  if (!host.isConnected) return null;
+  show(title(data), render(data));
+  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
+  })));
+  host.querySelectorAll('.native-conversation-download').forEach((button) =>
+    button.addEventListener('click', () => downloadNativeConversation(button)));
+  return { host, data };
+}
+
+async function openLocalCheckout(v) {
+  if (hostLocal()) return materializeLocalCheckout(v);
+  const opened = await localHandoffDialog({
+    loading: 'Preparing checkout instructions…',
+    load: () => Promise.all([
       api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`),
       api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`),
-    ]);
-  }
-  catch (error) { host.remove(); return toast(error.message, true); }
-  if (!host.isConnected) return;
-  const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
+    ]),
+    render: ([plan, preparedSessions]) => {
+      const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
+      return `<p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
     ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true, preparedSessions)}
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
     <p class="task-sub">${siteNameMarkup()} accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
-    <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
-  </div></div>`;
-  wireClose();
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
-  host.querySelectorAll('.native-conversation-download').forEach((button) =>
-    button.addEventListener('click', () => downloadNativeConversation(button)));
+    <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>`;
+    },
+  });
+  if (!opened) return;
+  const { host } = opened;
   $('#local-refresh', host)?.addEventListener('click', async (event) => {
     const button = event.currentTarget; const result = $('#local-refresh-result', host); button.disabled = true; result.textContent = 'Importing the pushed branch…';
     try {
@@ -9667,63 +9761,31 @@ async function openLocalCheckout(v) {
 
 async function openProjectCheckout(project) {
   if (!project?.id) return;
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
-  </div></div>`;
-  const wireClose = () => {
-    host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
-    host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  };
-  wireClose();
-  let plan;
-  try { plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`); }
-  catch (error) { host.remove(); return toast(error.message, true); }
-  if (!host.isConnected) return;
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to ${siteNameMarkup()}.</p>
+  await localHandoffDialog({
+    loading: 'Preparing checkout instructions…',
+    load: () => api(`/api/projects/${encodeURIComponent(project.id)}/checkout`),
+    render: (plan) => `<p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to ${siteNameMarkup()}.</p>
     <div class="section-h">First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
-    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
-  </div></div>`;
-  wireClose();
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
+    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>`,
+  });
 }
 
 async function materializeLocalCheckout(v) {
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Materializing a local checkout…</span></div>
-  </div></div>`;
-  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
-  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  let checkout, preparedSessions;
-  try {
-    checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
-    preparedSessions = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`);
-  } catch (error) { host.remove(); toast(error.message, true); return null; }
-  if (!host.isConnected) return null;
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
+  const opened = await localHandoffDialog({
+    loading: 'Materializing a local checkout…',
+    load: async () => {
+      const checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
+      return [checkout, await api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`)];
+    },
+    title: () => 'Ready locally',
+    render: ([checkout, preparedSessions]) => `<p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
     ${localConversationHandoff(v, checkout.cwd, false, preparedSessions)}
     <div class="section-h" style="margin-top:14px">Repositories</div>
-    <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
-  </div></div>`;
-  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
-  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
-  host.querySelectorAll('.native-conversation-download').forEach((button) =>
-    button.addEventListener('click', () => downloadNativeConversation(button)));
-  return checkout;
+    <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>`,
+  });
+  return opened?.data[0] ?? null;
 }
 
 async function forkCloudSessionLocally(v, button) {
@@ -9963,6 +10025,14 @@ function agentTurnStateText(v) {
 function humanWaitDetail(v) {
   if (v?.status !== 'waiting' || v.waitingFor?.kind !== 'human') return '';
   return typeof v.waitingFor.detail === 'string' ? v.waitingFor.detail.trim() : '';
+}
+
+// A short fingerprint (FNV-1a) of content a live section was built from: a
+// retained review frame reloads only when its document changed.
+function contentKey(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return `${text.length.toString(36)}-${(hash >>> 0).toString(36)}`;
 }
 
 // Provider streams and workflow snapshots may normalize line endings
@@ -11018,7 +11088,7 @@ function mergeQueuePanel() {
           const pos = v.mergeQueue?.position;
           const merging = !!v.state?.mergeGranted;
           const canMove = !merging && !!domain;
-          return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
+          return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel(t, merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued', merging ? null : pos))}" ${canMove ? 'draggable="true"' : ''}>
         ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
         <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued'}</span></div>
@@ -11039,7 +11109,7 @@ function mergeQueuePanel() {
         const route = participant
           ? `<span class="branch">${esc(participant.slug)}</span> → <span class="branch">${esc(participant.target)}</span>`
           : `<span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span>`;
-        return `<div class="queue-item" data-id="${t.id}" tabindex="0">
+        return `<div class="queue-item" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(queueRowLabel(t, `${authority} ${state}`))}">
           <span class="drag-handle placeholder"></span><span class="pos">⇱</span>
           <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${esc(authority)} ${esc(state)}</span></div>
             <div class="task-sub">${route}${v.landing?.detail ? ` · ${esc(v.landing.detail)}` : ''}</div></div>
@@ -11047,6 +11117,11 @@ function mergeQueuePanel() {
       }).join('')}</div>`
     : '';
   return `${internal}${provider}`;
+}
+
+// A queue row's accessible name: the task, and where it stands in the queue.
+function queueRowLabel(task, state, position) {
+  return [`${task.num != null ? `#${task.num} ` : ''}${task.title}`, state, position > 0 ? `position ${position}` : ''].filter(Boolean).join(' · ');
 }
 
 function agentQueuePanel() {
@@ -11058,7 +11133,7 @@ function agentQueuePanel() {
       const task = taskRecord(x.taskId);
       const title = x.title || task?.title || `Task ${String(x.taskId || '').slice(0, 8)}`;
       const num = task?.num != null ? `<span class="task-num">#${task.num}</span> ` : '';
-      return `<div class="queue-item ${x.active ? 'current' : ''}" data-agent-turn="${esc(x.turnId)}" data-id="${esc(x.taskId)}" tabindex="0" ${x.active ? '' : 'draggable="true"'}>
+      return `<div class="queue-item ${x.active ? 'current' : ''}" data-agent-turn="${esc(x.turnId)}" data-id="${esc(x.taskId)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel({ num: task?.num, title }, x.active ? 'active lease' : 'queued', x.active ? null : i - active.length + 1))}" ${x.active ? '' : 'draggable="true"'}>
         ${x.active ? '<span class="drag-handle placeholder"></span>' : '<span class="drag-handle" title="Drag to reorder">⠿</span>'}
         <span class="pos">${x.active ? '▶' : `#${i - active.length + 1}`}</span>
         <div style="flex:1"><div class="task-title">${num}${esc(title)} <span class="chip">${x.active ? 'active lease' : 'queued'}</span></div>
@@ -12457,7 +12532,7 @@ function wireAvatarsView(proj) {
   document.querySelector('.avatar-remove')?.addEventListener('click', async () => { if (!confirm(`Remove ${avatar.name}? Its audit history will be retained.`)) return; try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'DELETE' }); S.avatarSelected = null; await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
   document.querySelector('.avatar-project-enable')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatar-settings`, { method: 'PUT', body: JSON.stringify({ value: 'enabled' }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
   wireAuthorizationRequestActions(document.querySelector('.avatar-authorization-requests'), proj.organizationId, async () => {
-    await Promise.all([loadAvatars(), loadAvatarAuthorizationRequests(S.avatarSelected), loadCollaboration().catch(() => {})]);
+    await Promise.all([loadAvatars(), loadAvatarAuthorizationRequests(S.avatarSelected), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
     renderMain();
   });
 }
@@ -13345,15 +13420,18 @@ async function hydrateConversationSharing(scope, id) {
       <label class="form-row"><span>${scope === 'organization' ? 'Organization policy' : `Project policy · organization ${policy.organization ? 'allows' : 'disallows'} sharing`}</span><select ${policy.canManage ? '' : 'disabled'}>
         ${scope === 'organization' ? `<option value="disabled" ${!policy.enabled ? 'selected' : ''}>Disabled</option><option value="enabled" ${policy.enabled ? 'selected' : ''}>Allow developers to share</option>` : `<option value="inherit" ${policy.value === 'inherit' ? 'selected' : ''}>Use organization policy</option><option value="disabled" ${policy.value === 'disabled' ? 'selected' : ''}>Disable for this project</option>`}
       </select></label><button class="btn sm" data-save ${policy.canManage ? '' : 'disabled'}>Save</button>`;
+    const select = box.querySelector('select');
+    let saved = select.value;
     box.querySelector('[data-save]').onclick = async (event) => {
       const button = event.currentTarget;
-      button.disabled = true;
+      button.disabled = select.disabled = true;
       try {
-        const value = box.querySelector('select').value;
+        const value = select.value;
         await api(url, { method: 'PUT', body: JSON.stringify(scope === 'organization' ? { enabled: value === 'enabled' } : { value }) });
+        saved = value;
         toast('Public sharing policy saved');
-      } catch (error) { toast(error.message, true); }
-      finally { button.disabled = false; }
+      } catch (error) { select.value = saved; toast(error.message, true); }
+      finally { button.disabled = select.disabled = false; }
     };
   } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
 }
@@ -13767,11 +13845,14 @@ async function hydrateProjectAccess(proj) {
   const repositoriesAreCurrent = beginAsyncElementRender(repositoryBox);
   const renderIsCurrent = () => accessIsCurrent() && repositoriesAreCurrent();
   try {
+    // Unreadable GitHub state offers Retry; read as "not connected" it would send
+    // an organization that is connected into setup.
+    let githubLoadError = null;
     const [repositories, members, gitConnections, githubApp] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
       api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch(() => []),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch(() => ({ configured: false })),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch((error) => { githubLoadError = error; return []; }),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch((error) => { githubLoadError = error; return { configured: false }; }),
     ]);
     if (!renderIsCurrent()) return;
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
@@ -13786,7 +13867,7 @@ async function hydrateProjectAccess(proj) {
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
       <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button>${githubApp.configured && gitConnections.length && githubApp.userAuthorized ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository...</button>' : ''}</div>
-      ${!githubApp.configured ? `<div class="inline-form">${S.installationAccess
+      ${githubLoadError ? '<div id="project-github-error"></div>' : !githubApp.configured ? `<div class="inline-form">${S.installationAccess
         ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
         : '<span class="task-sub">The installation operator must set up the shared GitHub App before repositories can be connected.</span>'}</div>`
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
@@ -13796,6 +13877,7 @@ async function hydrateProjectAccess(proj) {
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
       catch (error) { toast(error.message, true); }
     }));
+    if (githubLoadError) paneError($('#project-github-error'), githubLoadError, () => hydrateProjectAccess(projectById(proj.id) || proj));
     const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
     wireRepositoryRemoves();
     $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
@@ -17907,8 +17989,7 @@ function renderOrganizationRoles() {
     try {
       await api(`/api/organizations/${S.organizationId}/roles`, { method: 'POST',
         body: JSON.stringify({ name: data.get('name'), description: data.get('description'), capabilities }) });
-      await loadCollaboration();
-      await hydrateOrganizationView();
+      await hydrateOrganizationView(['people']);
       toast('Role created');
     } catch (e) { error.textContent = e.message; button.disabled = false; }
   });
@@ -17918,328 +17999,373 @@ function setEventHandler(element, type, handler) {
   if (element) element['on' + type] = handler;
 }
 
-async function hydrateOrganizationView() {
+// Organization settings, pane by pane: opening the page paints every pane, each
+// as soon as its own reads arrive; an action refreshes only the panes it changed,
+// so adding a team re-reads people and teams, not GitHub, compute and usage too.
+const ORGANIZATION_PANES = ['people', 'github', 'compute', 'storage', 'usage', 'identity'];
+async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
   if (!$('#org-members') || !S.organizationId) return;
   const organizationId = S.organizationId;
-  const epoch = S.organizationViewEpoch = (S.organizationViewEpoch || 0) + 1;
-  const renderIsCurrent = () => S.organizationViewEpoch === epoch
-    && S.organizationId === organizationId
-    && !!$('#org-members');
-  wireSettingsNavigation();
-  hydrateSettingsAccess({ organizationId });
-  hydrateConversationSharing('organization', organizationId);
-  hydrateAvatarAvailability('organization', organizationId);
-  hydrateOrganizationSubscription(organizationId);
-  await loadCollaboration().catch(() => {});
-  if (!renderIsCurrent()) return;
+  const epochs = S.organizationPaneEpochs ||= {};
+  const mine = Object.fromEntries(panes.map((pane) => [pane, epochs[pane] = (epochs[pane] || 0) + 1]));
+  // A newer refresh of the same pane, or leaving the page, retires this one.
+  const live = (pane) => epochs[pane] === mine[pane] && S.organizationId === organizationId && !!$('#org-members');
+  const refresh = (...only) => hydrateOrganizationView(only);
+  const reads = new Map();
+  const read = (suffix) => reads.get(suffix) || reads.set(suffix, api(`/api/organizations/${organizationId}/${suffix}`)).get(suffix);
+  if (panes === ORGANIZATION_PANES) {
+    wireSettingsNavigation();
+    hydrateSettingsAccess({ organizationId });
+    hydrateConversationSharing('organization', organizationId);
+    hydrateAvatarAvailability('organization', organizationId);
+    hydrateOrganizationSubscription(organizationId);
+    setEventHandler($('#create-organization'), 'click', createOrganization);
+    setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
+    const renameOrganization = async () => {
+      const name = $('#organization-name')?.value.trim();
+      if (!name) return toast('Organization name is required', true);
+      try {
+        await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+        await loadOrganizations();
+        toast('Organization renamed');
+        renderShell();
+        renderMain();
+      } catch (e) { toast(e.message, true); }
+    };
+    setEventHandler($('#rename-organization'), 'click', renameOrganization);
+    setEventHandler($('#organization-name'), 'keydown', (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); renameOrganization(); }
+    });
+    setEventHandler($('#delete-organization'), 'click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = await promptText(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
+  }
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
   const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name">${S.installationAccess ? `<a data-spa href="${profileRoute(id)}"><b>${esc(userName(id, embedded))}</b></a>` : `<b>${esc(userName(id, embedded))}</b>`}${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
-  const visibility = $('#organization-name-visibility');
-  if (visibility) {
-    visibility.disabled = !S.authorizationCatalog?.canCreate;
-    visibility.onchange = async () => {
-      visibility.disabled = true;
-      try {
-        const updated = await api(`/api/organizations/${organizationId}`, {
-          method: 'PATCH', body: JSON.stringify({ nameVisibility: visibility.value }),
-        });
-        const organization = organizationById(organizationId);
-        if (organization) organization.nameVisibility = updated.nameVisibility;
-        toast('Organization name visibility updated');
-      } catch (error) {
-        visibility.value = organizationById(organizationId)?.nameVisibility || 'members';
-        toast(error.message, true);
-      } finally { visibility.disabled = !S.authorizationCatalog?.canCreate; }
-    };
-  }
-  renderOrganizationRoles();
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
-  $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
-    const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
-    return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
-  }).join('') : '<span class="task-sub">No members.</span>';
-  let githubLoadError = null;
-  const [entitlements, gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, usagePolicy, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
-    api(`/api/organizations/${organizationId}/entitlements`).catch(() => null),
-    api(`/api/organizations/${organizationId}/git-connections`).catch(error => { githubLoadError = error; return []; }),
-    api(`/api/organizations/${organizationId}/github/app`).catch(error => { githubLoadError = error; return { configured: false }; }),
-    api(`/api/organizations/${organizationId}/github/identity`).catch(() => ({ profile: null })),
-    api(`/api/organizations/${organizationId}/runner-pools`).catch(() => []),
-    api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
-    api(`/api/organizations/${organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
-    api(`/api/organizations/${organizationId}/usage`).catch(() => null),
-    api(`/api/organizations/${organizationId}/usage-policy`).catch(() => null),
-    api(`/api/organizations/${organizationId}/identity-policy`).catch(() => null),
-    api(`/api/organizations/${organizationId}/invitations`).catch(() => []),
-    Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
-    api(`/api/organizations/${organizationId}/storage`).catch(() => []),
-  ]);
-  if (!renderIsCurrent()) return;
-  $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
-  const pendingInvitations = invitations.filter((invitation) => !invitation.acceptedAt);
-  $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
-  $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
-  $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
-  const githubManageUrl = (connection) => connection.accountType === 'Organization'
-    ? `https://github.com/organizations/${encodeURIComponent(connection.accountLogin)}/settings/installations/${encodeURIComponent(connection.installationId)}`
-    : `https://github.com/settings/installations/${encodeURIComponent(connection.installationId)}`;
-  const githubSetup = !githubApp.configured
-    ? (S.installationAccess
-      ? `<a class="btn primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
-      : '<span class="task-sub">The installation operator must set up the shared GitHub App before this organization can connect repositories.</span>')
-    : `<button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${githubMark()}${gitConnections.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>${gitConnections.length ? '<button class="btn" id="org-github-custom" type="button">Custom automation identity</button>' : ''}`;
-  $('#org-github').innerHTML = `<div class="github-account-list">${gitConnections.map((connection) => {
-    const permission = connection.permissionStatus;
-    const permissionAction = permission?.ready ? '' : permission?.unavailable
-      ? '<span class="chip" style="color:var(--warn)">access unknown</span>'
-      : permission?.missingApp?.length
-        ? `<a class="btn sm primary" href="${esc(permission?.appSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Update App permissions</a>`
-        : `<a class="btn sm primary" href="${esc(permission?.installationSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Approve permissions</a>`;
-    return `<div class="github-account-row" data-connection="${esc(connection.id)}">
-    <span class="github-account-label">${githubMark()}<b>${esc(connection.accountLogin)}</b>${permission?.ready ? '' : '<span class="chip" style="color:var(--warn)">GitHub access update required</span>'}</span>
-    <span class="github-account-actions">${permissionAction}<a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
-  </div>`; }).join('')}</div>
-  <div class="github-org-actions">${githubSetup}</div>`;
-  if (githubLoadError) paneError($('#org-github'), githubLoadError, hydrateOrganizationView);
-  const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
-  S.worldProviderConnections = providerConnections;
-  // The default Agent environment moved to Task defaults (below) and can be
-  // overridden per project/task. Compute keeps the runner pool + budget; the pool
-  // list is scoped to the effective environment, shown read-only here.
-  const orgEnvironment = executionPolicy.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
-  $('#org-execution').innerHTML = `<div class="settings-grid">
-    <label class="form-row">Agent environment<input value="${esc(orgEnvironment)}" disabled title="Set the default in Task defaults; override it per project or task" /></label>
-    <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
-    <label class="form-row">World experience<select id="org-execution-flavor"><option value="headless" ${(executionPolicy.environment?.flavor || 'headless') === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${executionPolicy.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
-    <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
-    <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
-    <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
-    <label class="form-row">Hibernate parked worlds after (days)<input id="org-execution-hibernate" type="number" min="1" value="${esc(Math.round((executionPolicy.hibernateAfterMs || 604800000) / 86400000))}" /></label>
-    <label class="form-row"><span>Outbound network ${policyTip('Coding agents normally need arbitrary package registries, documentation, web search and APIs. Restricted mode is for organizations with a maintained egress policy.')}</span><select id="org-execution-network"><option value="unrestricted" ${executionPolicy.network?.unrestricted !== false ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${executionPolicy.network?.unrestricted === false ? 'selected' : ''}>Restricted allowlist</option></select></label>
-  </div>
-  <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
-  <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
-  const providerInfo = {
-    e2b: { name: 'E2B', site: 'https://e2b.dev', keys: 'https://e2b.dev/dashboard?tab=keys' },
-    daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io',
-      note: 'Note: <a href="https://www.daytona.io/docs/en/network-limits/" target="_blank" rel="noopener noreferrer">Daytona Tiers 1–2</a> only reach package registries, Git hosts and AI APIs, not the open internet. Use E2B or Daytona Tier 3+ instead.' },
-  };
-  $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
-    const connection = connectionFor(provider); const config = connection?.config || {};
-    const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
-    const info = providerInfo[provider];
-    return `<div class="team-block provider-connection" data-provider="${provider}">
-      <div class="member-row"><b>${info.name}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
-      <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
-      ${info.note ? `<p class="provider-note">${info.note}</p>` : ''}
-      ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
-      <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
-      ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
-        : `<details class="settings-disclosure compact"><summary><b>Advanced (optional)</b></summary><p class="task-sub">An API key is enough to use Daytona’s default environment. Snapshots set their own CPU and memory; choose an image to apply task resource settings.</p><div class="settings-grid"><label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="Daytona default" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label></div></details>`}
-      </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
-  }).join('');
-  $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
-    <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select>${hostLocal() ? '<input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds">' : ''}<button class="btn sm" id="runner-create">Add pool</button></div>`;
-  $('#org-storage').innerHTML = `
-    ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
-    <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
-      <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
-      <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-tavya"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
-      <label class="form-row">Restricted prefix<input id="storage-prefix" value="tavya/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
-      <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
-      <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the ${siteNameMarkup()} vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
-  const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
-  const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
-    : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
-      : usageSync.length ? ` · synced ${fmtAgo(Math.max(...usageSync.map((item) => Number(item.at || 0))))}` : '';
-  const coverageFrom = usageSync.length ? Math.max(...usageSync.map((item) => Number(item.coverageFrom || 0))) : 0;
-  const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
-    : coverageFrom > Number(usage?.from || 0)
-      ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
-  const usageFunding = usage?.byFundingSource || {};
-  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Metered + estimated usage · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
-    <p class="task-sub">Incurred $${((usage.incurredCostMicros || 0) / 1e6).toFixed(2)} · estimated $${((usage.estimatedCostMicros || 0) / 1e6).toFixed(2)} · active managed reservations $${((usage.activeReservationsMicros || 0) / 1e6).toFixed(2)}</p>
-    <p class="task-sub">Managed $${((usageFunding.managed || 0) / 1e6).toFixed(2)} (${usage.requests?.managed || 0} model requests) · BYOK $${((usageFunding.byok || 0) / 1e6).toFixed(2)} (${usage.requests?.byok || 0} model requests) · active: ${usage.active?.agentTurns || 0} model turns, ${usage.active?.worlds || 0} worlds, ${usage.active?.executions || 0} commands</p>
-    ${usagePolicy ? `<details class="settings-disclosure compact"><summary><b>Usage guardrails</b> ${policyTip(`The plan admits ${entitlements?.maxActiveAgentRuns || usagePolicy.effectiveMaxActiveAgentTurns} shared active agent runs; an owner can only set a tighter cap here. Managed model use stays off until an owner sets a spend cap and enables a provider. BYOK usage is attributed separately, and remote sandboxes use the organization's own provider account.`)}</summary><div class="settings-grid">
-      <label class="form-row">Managed spend cap (USD/month)<input id="usage-managed-cap" type="number" min="0.01" step="0.01" value="${usagePolicy.managedSpendCapMicros == null ? '' : esc(usagePolicy.managedSpendCapMicros / 1e6)}" placeholder="Disabled" /></label>
-      <label class="form-row">Managed model providers<input id="usage-managed-providers" value="${esc((usagePolicy.managedModelProviders || []).join(', '))}" placeholder="Disabled" /></label>
-      <label class="form-row">Allowed model providers<input id="usage-allowed-providers" value="${esc((usagePolicy.allowedModelProviders || []).join(', '))}" placeholder="All connected BYOK providers" /></label>
-      <label class="form-row">Allowed models<input id="usage-allowed-models" value="${esc((usagePolicy.allowedModels || []).join(', '))}" placeholder="All models" /></label>
-      <label class="form-row">Model starts / minute<input id="usage-agent-rate" type="number" min="1" value="${esc(usagePolicy.maxAgentStartsPerMinute)}" /></label>
-      <label class="form-row">Sandbox starts / minute<input id="usage-world-rate" type="number" min="1" value="${esc(usagePolicy.maxRemoteStartsPerMinute)}" /></label>
-      <label class="form-row">Optional tighter model concurrency<input id="usage-agent-active" type="number" min="1" max="${esc(entitlements?.maxActiveAgentRuns || 1000000)}" value="${usagePolicy.maxActiveAgentTurns == null ? '' : esc(usagePolicy.maxActiveAgentTurns)}" placeholder="Plan limit: ${esc(usagePolicy.effectiveMaxActiveAgentTurns)}" /></label>
-      ${hostLocal() ? `<label class="form-row">Concurrent remote worlds<input id="usage-world-active" type="number" min="1" value="${esc(usagePolicy.maxActiveWorlds)}" /></label>`
-        : `<div class="form-row"><span>Concurrent remote worlds</span><b>Same as agent concurrency: ${esc(usagePolicy.maxActiveWorlds)}</b></div>`}
-    </div><button class="btn sm primary" id="usage-policy-save">Save usage guardrails</button></details>` : ''}` : 'Usage unavailable.';
-  if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
-    <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
-    <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
-    <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
-    <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
-  wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
-  setEventHandler($('#invite-member'), 'click', async () => {
-    try {
-      const email = $('#invite-email').value;
-      const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) });
-      const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`;
-      $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`;
-      appendPendingInvitation(result.invitation, authorizationProjects);
-      $('#invite-email').value = '';
-    } catch (e) { toast(e.message, true); }
-  });
-  setEventHandler($('#create-team'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  setEventHandler($('#connect-github'), 'click', async () => {
-    try {
-      await connectOrganizationGithub(organizationId, hydrateOrganizationView);
-    } catch (error) { toast(error.message, true); }
-  });
-  if (new URL(location.href).searchParams.get('github') === 'choose-installation') {
-    const returned = new URL(location.href);
-    returned.searchParams.delete('github');
-    history.replaceState(history.state, '', returned);
-    connectOrganizationGithub(organizationId, hydrateOrganizationView).catch(error => toast(error.message, true));
-  }
-  setEventHandler($('#org-github-custom'), 'click', () => openGitIdentityDialog({
-    title: 'Custom automation identity', profile: githubIdentity.profile,
-    endpoint: `/api/organizations/${S.organizationId}/github/identity`, onSaved: hydrateOrganizationView,
-  }));
-  $('#org-github').querySelectorAll('.github-account-row').forEach((row) => {
-    row.querySelector('.github-remove')?.addEventListener('click', async () => {
-      if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return;
-      try { await api(`/api/organizations/${S.organizationId}/git-connections/${encodeURIComponent(row.dataset.connection)}`, { method: 'DELETE' }); await hydrateOrganizationView(); }
-      catch (error) { toast(error.message, true); }
-    });
-  });
-  $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
-    const provider = row.dataset.provider;
-    row.querySelector('.provider-save')?.addEventListener('click', async () => {
-      const body = { apiKey: row.querySelector('.provider-key').value || undefined, config: provider === 'e2b'
-        ? { template: row.querySelector('.provider-template').value, desktopTemplate: row.querySelector('.provider-desktop-template').value }
-        : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
-            desktopSnapshot: row.querySelector('.provider-desktop-snapshot').value, desktopImage: row.querySelector('.provider-desktop-image').value,
-            apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
-      try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await hydrateOrganizationView(); }
-      catch (e) { toast(e.message, true); await hydrateOrganizationView(); }
-    });
-    row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); await hydrateOrganizationView(); } });
-    row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  });
-  setEventHandler($('#storage-connect'), 'click', async () => {
-    try {
-      const created = await api(`/api/organizations/${organizationId}/storage`, { method: 'POST', body: JSON.stringify({
-        name: $('#storage-name').value, endpoint: $('#storage-endpoint').value, bucket: $('#storage-bucket').value,
-        region: $('#storage-region').value, prefix: $('#storage-prefix').value,
-        accessKeyId: $('#storage-access-key').value, secretAccessKey: $('#storage-secret-key').value,
-      }) });
-      await api(`/api/organizations/${organizationId}/storage/${encodeURIComponent(created.id)}/test`, { method: 'POST', body: '{}' });
-      toast('Customer storage connected'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); }
-  });
-  $('#org-storage')?.querySelectorAll('[data-storage]').forEach((row) => {
-    const id = encodeURIComponent(row.dataset.storage);
-    row.querySelector('.storage-test')?.addEventListener('click', async () => { try {
-      await api(`/api/organizations/${organizationId}/storage/${id}/test`, { method: 'POST', body: '{}' }); toast('Storage connection verified'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); await hydrateOrganizationView(); } });
-    row.querySelector('.storage-default')?.addEventListener('click', async () => { try {
-      await api(`/api/organizations/${organizationId}/storage/${id}/default`, { method: 'PUT', body: '{}' }); toast('Default storage updated'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); } });
-    row.querySelector('.storage-delete')?.addEventListener('click', async () => {
-      if (!confirm('Remove this storage connection? It is allowed only when no resource or revision uses it.')) return;
-      try { await api(`/api/organizations/${organizationId}/storage/${id}`, { method: 'DELETE' }); await hydrateOrganizationView(); }
-      catch (error) { toast(error.message, true); }
-    });
-  });
-  setEventHandler($('#runner-create'), 'click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
-  $('#org-execution-pool').innerHTML = `<option value="">Organization BYOK default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-  setEventHandler($('#org-execution-network'), 'change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
-  setEventHandler($('#org-execution-save'), 'click', async () => {
-    const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
-    const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
-    try {
-      await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
-        runnerPoolId: $('#org-execution-pool').value || undefined,
-        environment: { flavor: $('#org-execution-flavor').value },
-        resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
-        network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
-        monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
-        hibernateAfterMs: Math.round(Number($('#org-execution-hibernate').value) * 86400000),
-      } }) }); toast('Organization execution policy saved'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); }
-  });
-  setEventHandler($('#usage-policy-save'), 'click', async () => {
-    const list = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
-    const cap = $('#usage-managed-cap').value.trim();
-    const agentCap = $('#usage-agent-active').value.trim();
-    try {
-      const policy = {
-        managedSpendCapMicros: cap === '' ? null : Math.round(Number(cap) * 1e6),
-        managedModelProviders: list('#usage-managed-providers'), allowedModelProviders: list('#usage-allowed-providers'),
-        allowedModels: list('#usage-allowed-models'), maxAgentStartsPerMinute: Number($('#usage-agent-rate').value),
-        maxRemoteStartsPerMinute: Number($('#usage-world-rate').value),
-        maxActiveAgentTurns: agentCap === '' ? null : Number(agentCap),
-        ...(hostLocal() ? { maxActiveWorlds: Number($('#usage-world-active').value) } : {}),
+  const paint = {
+    async people() {
+      // The invite and new-team forms are static markup: they work while the
+      // pane's reads are still in flight, or after they failed.
+      wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
+      setEventHandler($('#invite-member'), 'click', async () => {
+        try {
+          const email = $('#invite-email').value;
+          const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) });
+          const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`;
+          $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`;
+          // Sent before the pane painted: its invitation read may predate this one.
+          if ($('#pending-invitations')) appendPendingInvitation(result.invitation, authorizationProjects);
+          else refresh('people');
+          $('#invite-email').value = '';
+        } catch (e) { toast(e.message, true); }
+      });
+      setEventHandler($('#create-team'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await refresh('people'); } catch (e) { toast(e.message, true); } });
+      const invitations = read('invitations').catch(() => []);
+      const collaborationError = await loadCollaboration().then(() => null, (error) => error);
+      if (!live('people')) return;
+      if (collaborationError) {
+        paneError($('#org-members'), collaborationError, () => refresh('people'));
+        paneError($('#org-teams'), collaborationError, () => refresh('people'));
+        return;
+      }
+      const visibility = $('#organization-name-visibility');
+      if (visibility) {
+        visibility.disabled = !S.authorizationCatalog?.canCreate;
+        visibility.onchange = async () => {
+          visibility.disabled = true;
+          try {
+            const updated = await api(`/api/organizations/${organizationId}`, {
+              method: 'PATCH', body: JSON.stringify({ nameVisibility: visibility.value }),
+            });
+            const organization = organizationById(organizationId);
+            if (organization) organization.nameVisibility = updated.nameVisibility;
+            toast('Organization name visibility updated');
+          } catch (error) {
+            visibility.value = organizationById(organizationId)?.nameVisibility || 'members';
+            toast(error.message, true);
+          } finally { visibility.disabled = !S.authorizationCatalog?.canCreate; }
+        };
+      }
+      renderOrganizationRoles();
+      $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
+        const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
+        return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
+      }).join('') : '<span class="task-sub">No members.</span>';
+      const [teamMembers, invitationList] = await Promise.all([
+        Promise.all(S.teams.map((team) => read(`teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
+        invitations,
+      ]);
+      if (!live('people')) return;
+      const pendingInvitations = invitationList.filter((invitation) => !invitation.acceptedAt);
+      $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
+      $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
+      $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
+      $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
+        const editor = row.querySelector('.authz-editor');
+        wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {
+          if (authorization.scope === 'projects' && !authorization.projectIds?.length) return;
+          try { await api(`/api/organizations/${S.organizationId}/members`, { method: 'POST', body: JSON.stringify({ userId: row.dataset.orgMember, authorization }) }); }
+          catch (e) { toast(e.message, true); await refresh('people'); }
+        });
+        row.querySelector('.org-member-remove')?.addEventListener('click', async () => { if (!confirm('Remove this member from the organization?')) return; try { await api(`/api/organizations/${S.organizationId}/members/${encodeURIComponent(row.dataset.orgMember)}`, { method: 'DELETE' }); await refresh('people'); } catch (e) { toast(e.message, true); } });
+      });
+      $('#org-teams')?.querySelectorAll('[data-team]').forEach((block) => {
+        block.querySelector('.team-member-add')?.addEventListener('click', async () => {
+          const entered = block.querySelector('.team-user')?.value.trim();
+          const member = S.organizationMembers.find((candidate) => personChoice(candidate).toLowerCase() === entered?.toLowerCase()
+            || userName(candidate.userId, candidate.user).toLowerCase() === entered?.toLowerCase()
+            || userRecord(candidate.userId, candidate.user)?.email?.toLowerCase() === entered?.toLowerCase());
+          if (!member) return toast('Choose a person in this organization', true);
+          try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members`, { method: 'POST', body: JSON.stringify({ userId: member.userId }) }); await refresh('people'); } catch (e) { toast(e.message, true); }
+        });
+        block.querySelector('.team-rename')?.addEventListener('click', () => { const form = block.querySelector('.team-rename-form'); form.hidden = false; form.querySelector('.team-name-edit').focus(); form.querySelector('.team-name-edit').select(); });
+        block.querySelector('.team-rename-cancel')?.addEventListener('click', () => { block.querySelector('.team-rename-form').hidden = true; });
+        block.querySelector('.team-rename-save')?.addEventListener('click', async () => {
+          const name = block.querySelector('.team-name-edit')?.value.trim(); if (!name) return toast('Team name is required', true);
+          try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await refresh('people'); } catch (e) { toast(e.message, true); }
+        });
+        block.querySelector('.team-name-edit')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); block.querySelector('.team-rename-save').click(); } if (event.key === 'Escape') block.querySelector('.team-rename-cancel').click(); });
+        block.querySelector('.team-delete')?.addEventListener('click', async () => {
+          const team = S.teams.find((candidate) => candidate.id === block.dataset.team);
+          if (!confirm(`Delete “${team?.name || 'this team'}”? This is only allowed when no project or workflow still uses it.`)) return;
+          try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'DELETE' }); await refresh('people'); } catch (e) { toast(e.message, true); }
+        });
+        block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await refresh('people'); } catch (e) { toast(e.message, true); } }));
+      });
+    },
+    async github() {
+      let githubLoadError = null;
+      const [gitConnections, githubApp, githubIdentity] = await Promise.all([
+        read('git-connections').catch(error => { githubLoadError = error; return []; }),
+        read('github/app').catch(error => { githubLoadError = error; return { configured: false }; }),
+        read('github/identity').catch(() => ({ profile: null })),
+      ]);
+      if (!live('github')) return;
+      const githubManageUrl = (connection) => connection.accountType === 'Organization'
+        ? `https://github.com/organizations/${encodeURIComponent(connection.accountLogin)}/settings/installations/${encodeURIComponent(connection.installationId)}`
+        : `https://github.com/settings/installations/${encodeURIComponent(connection.installationId)}`;
+      const githubSetup = !githubApp.configured
+        ? (S.installationAccess
+          ? `<a class="btn primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
+          : '<span class="task-sub">The installation operator must set up the shared GitHub App before this organization can connect repositories.</span>')
+        : `<button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${githubMark()}${gitConnections.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>${gitConnections.length ? '<button class="btn" id="org-github-custom" type="button">Custom automation identity</button>' : ''}`;
+      $('#org-github').innerHTML = `<div class="github-account-list">${gitConnections.map((connection) => {
+        const permission = connection.permissionStatus;
+        const permissionAction = permission?.ready ? '' : permission?.unavailable
+          ? '<span class="chip" style="color:var(--warn)">access unknown</span>'
+          : permission?.missingApp?.length
+            ? `<a class="btn sm primary" href="${esc(permission?.appSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Update App permissions</a>`
+            : `<a class="btn sm primary" href="${esc(permission?.installationSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Approve permissions</a>`;
+        return `<div class="github-account-row" data-connection="${esc(connection.id)}">
+        <span class="github-account-label">${githubMark()}<b>${esc(connection.accountLogin)}</b>${permission?.ready ? '' : '<span class="chip" style="color:var(--warn)">GitHub access update required</span>'}</span>
+        <span class="github-account-actions">${permissionAction}<a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
+      </div>`; }).join('')}</div>
+      <div class="github-org-actions">${githubSetup}</div>`;
+      if (githubLoadError) paneError($('#org-github'), githubLoadError, () => refresh('github'));
+      setEventHandler($('#connect-github'), 'click', async () => {
+        try {
+          await connectOrganizationGithub(organizationId, () => refresh('github'));
+        } catch (error) { toast(error.message, true); }
+      });
+      if (new URL(location.href).searchParams.get('github') === 'choose-installation') {
+        const returned = new URL(location.href);
+        returned.searchParams.delete('github');
+        history.replaceState(history.state, '', returned);
+        connectOrganizationGithub(organizationId, () => refresh('github')).catch(error => toast(error.message, true));
+      }
+      setEventHandler($('#org-github-custom'), 'click', () => openGitIdentityDialog({
+        title: 'Custom automation identity', profile: githubIdentity.profile,
+        endpoint: `/api/organizations/${S.organizationId}/github/identity`, onSaved: () => refresh('github'),
+      }));
+      $('#org-github').querySelectorAll('.github-account-row').forEach((row) => {
+        row.querySelector('.github-remove')?.addEventListener('click', async () => {
+          if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return;
+          try { await api(`/api/organizations/${S.organizationId}/git-connections/${encodeURIComponent(row.dataset.connection)}`, { method: 'DELETE' }); await refresh('github'); }
+          catch (error) { toast(error.message, true); }
+        });
+      });
+    },
+    async compute() {
+      const [runners, providerConnections, executionPolicy, usagePolicy] = await Promise.all([
+        read('runner-pools').catch(() => []),
+        read('world-providers').catch(() => []),
+        read('execution-policy').catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
+        read('usage-policy').catch(() => null),
+      ]);
+      if (!live('compute')) return;
+      const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
+      S.worldProviderConnections = providerConnections;
+      // The default Agent environment moved to Task defaults (below) and can be
+      // overridden per project/task. Compute keeps the runner pool + budget; the pool
+      // list is scoped to the effective environment, shown read-only here.
+      const orgEnvironment = executionPolicy.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
+      $('#org-execution').innerHTML = `<div class="settings-grid">
+        <label class="form-row">Agent environment<input value="${esc(orgEnvironment)}" disabled title="Set the default in Task defaults; override it per project or task" /></label>
+        <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
+        <label class="form-row">World experience<select id="org-execution-flavor"><option value="headless" ${(executionPolicy.environment?.flavor || 'headless') === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${executionPolicy.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
+        <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
+        <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
+        <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
+        <label class="form-row">Hibernate parked worlds after (days)<input id="org-execution-hibernate" type="number" min="1" value="${esc(Math.round((executionPolicy.hibernateAfterMs || 604800000) / 86400000))}" /></label>
+        <label class="form-row"><span>Outbound network ${policyTip('Coding agents normally need arbitrary package registries, documentation, web search and APIs. Restricted mode is for organizations with a maintained egress policy.')}</span><select id="org-execution-network"><option value="unrestricted" ${executionPolicy.network?.unrestricted !== false ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${executionPolicy.network?.unrestricted === false ? 'selected' : ''}>Restricted allowlist</option></select></label>
+      </div>
+      <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
+      <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
+      const providerInfo = {
+        e2b: { name: 'E2B', site: 'https://e2b.dev', keys: 'https://e2b.dev/dashboard?tab=keys' },
+        daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io',
+          note: 'Note: <a href="https://www.daytona.io/docs/en/network-limits/" target="_blank" rel="noopener noreferrer">Daytona Tiers 1–2</a> only reach package registries, Git hosts and AI APIs, not the open internet. Use E2B or Daytona Tier 3+ instead.' },
       };
-      await api(`/api/organizations/${S.organizationId}/usage-policy`, { method: 'PUT', body: JSON.stringify({ policy }) }); toast('Usage guardrails saved'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); }
-  });
-  $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
-  setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
-  setEventHandler($('#rotate-scim'), 'click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
-  setEventHandler($('#create-organization'), 'click', createOrganization);
-  $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
-    const editor = row.querySelector('.authz-editor');
-    wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {
-      if (authorization.scope === 'projects' && !authorization.projectIds?.length) return;
-      try { await api(`/api/organizations/${S.organizationId}/members`, { method: 'POST', body: JSON.stringify({ userId: row.dataset.orgMember, authorization }) }); }
-      catch (e) { toast(e.message, true); await hydrateOrganizationView(); }
-    });
-    row.querySelector('.org-member-remove')?.addEventListener('click', async () => { if (!confirm('Remove this member from the organization?')) return; try { await api(`/api/organizations/${S.organizationId}/members/${encodeURIComponent(row.dataset.orgMember)}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  });
-  $('#org-teams')?.querySelectorAll('[data-team]').forEach((block) => {
-    block.querySelector('.team-member-add')?.addEventListener('click', async () => {
-      const entered = block.querySelector('.team-user')?.value.trim();
-      const member = S.organizationMembers.find((candidate) => personChoice(candidate).toLowerCase() === entered?.toLowerCase()
-        || userName(candidate.userId, candidate.user).toLowerCase() === entered?.toLowerCase()
-        || userRecord(candidate.userId, candidate.user)?.email?.toLowerCase() === entered?.toLowerCase());
-      if (!member) return toast('Choose a person in this organization', true);
-      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members`, { method: 'POST', body: JSON.stringify({ userId: member.userId }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
-    });
-    block.querySelector('.team-rename')?.addEventListener('click', () => { const form = block.querySelector('.team-rename-form'); form.hidden = false; form.querySelector('.team-name-edit').focus(); form.querySelector('.team-name-edit').select(); });
-    block.querySelector('.team-rename-cancel')?.addEventListener('click', () => { block.querySelector('.team-rename-form').hidden = true; });
-    block.querySelector('.team-rename-save')?.addEventListener('click', async () => {
-      const name = block.querySelector('.team-name-edit')?.value.trim(); if (!name) return toast('Team name is required', true);
-      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
-    });
-    block.querySelector('.team-name-edit')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); block.querySelector('.team-rename-save').click(); } if (event.key === 'Escape') block.querySelector('.team-rename-cancel').click(); });
-    block.querySelector('.team-delete')?.addEventListener('click', async () => {
-      const team = S.teams.find((candidate) => candidate.id === block.dataset.team);
-      if (!confirm(`Delete “${team?.name || 'this team'}”? This is only allowed when no project or workflow still uses it.`)) return;
-      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
-    });
-    block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
-  });
-  setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
-  const renameOrganization = async () => {
-    const name = $('#organization-name')?.value.trim();
-    if (!name) return toast('Organization name is required', true);
-    try {
-      await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
-      await loadOrganizations();
-      toast('Organization renamed');
-      renderShell();
-      renderMain();
-    } catch (e) { toast(e.message, true); }
+      $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
+        const connection = connectionFor(provider); const config = connection?.config || {};
+        const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
+        const info = providerInfo[provider];
+        return `<div class="team-block provider-connection" data-provider="${provider}">
+          <div class="member-row"><b>${info.name}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
+          <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
+          ${info.note ? `<p class="provider-note">${info.note}</p>` : ''}
+          ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
+          <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
+          ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
+            : `<details class="settings-disclosure compact"><summary><b>Advanced (optional)</b></summary><p class="task-sub">An API key is enough to use Daytona’s default environment. Snapshots set their own CPU and memory; choose an image to apply task resource settings.</p><div class="settings-grid"><label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="Daytona default" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label></div></details>`}
+          </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
+      }).join('');
+      $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
+        <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select>${hostLocal() ? '<input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds">' : ''}<button class="btn sm" id="runner-create">Add pool</button></div>`;
+      $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
+        const provider = row.dataset.provider;
+        row.querySelector('.provider-save')?.addEventListener('click', async () => {
+          const body = { apiKey: row.querySelector('.provider-key').value || undefined, config: provider === 'e2b'
+            ? { template: row.querySelector('.provider-template').value, desktopTemplate: row.querySelector('.provider-desktop-template').value }
+            : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
+                desktopSnapshot: row.querySelector('.provider-desktop-snapshot').value, desktopImage: row.querySelector('.provider-desktop-image').value,
+                apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
+          try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await refresh('compute'); }
+          catch (e) { toast(e.message, true); await refresh('compute'); }
+        });
+        row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await refresh('compute'); } catch (e) { toast(e.message, true); await refresh('compute'); } });
+        row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await refresh('compute'); } catch (e) { toast(e.message, true); } });
+      });
+      setEventHandler($('#runner-create'), 'click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await refresh('compute'); } catch (e) { toast(e.message, true); } });
+      const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
+      $('#org-execution-pool').innerHTML = `<option value="">Organization BYOK default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+      setEventHandler($('#org-execution-network'), 'change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
+      setEventHandler($('#org-execution-save'), 'click', async () => {
+        const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+        const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
+        try {
+          await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
+            runnerPoolId: $('#org-execution-pool').value || undefined,
+            environment: { flavor: $('#org-execution-flavor').value },
+            resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
+            network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
+            monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
+            hibernateAfterMs: Math.round(Number($('#org-execution-hibernate').value) * 86400000),
+          } }) }); toast('Organization execution policy saved'); await refresh('compute');
+        } catch (error) { toast(error.message, true); }
+      });
+      $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await refresh('compute'); } catch (e) { toast(e.message, true); } }));
+    },
+    async storage() {
+      const storageLocations = await read('storage').catch(() => []);
+      if (!live('storage')) return;
+      $('#org-storage').innerHTML = `
+        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+        <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
+          <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
+          <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-tavya"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
+          <label class="form-row">Restricted prefix<input id="storage-prefix" value="tavya/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
+          <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
+          <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the ${siteNameMarkup()} vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
+      setEventHandler($('#storage-connect'), 'click', async () => {
+        try {
+          const created = await api(`/api/organizations/${organizationId}/storage`, { method: 'POST', body: JSON.stringify({
+            name: $('#storage-name').value, endpoint: $('#storage-endpoint').value, bucket: $('#storage-bucket').value,
+            region: $('#storage-region').value, prefix: $('#storage-prefix').value,
+            accessKeyId: $('#storage-access-key').value, secretAccessKey: $('#storage-secret-key').value,
+          }) });
+          await api(`/api/organizations/${organizationId}/storage/${encodeURIComponent(created.id)}/test`, { method: 'POST', body: '{}' });
+          toast('Customer storage connected'); await refresh('storage');
+        } catch (error) { toast(error.message, true); }
+      });
+      $('#org-storage')?.querySelectorAll('[data-storage]').forEach((row) => {
+        const id = encodeURIComponent(row.dataset.storage);
+        row.querySelector('.storage-test')?.addEventListener('click', async () => { try {
+          await api(`/api/organizations/${organizationId}/storage/${id}/test`, { method: 'POST', body: '{}' }); toast('Storage connection verified'); await refresh('storage');
+        } catch (error) { toast(error.message, true); await refresh('storage'); } });
+        row.querySelector('.storage-default')?.addEventListener('click', async () => { try {
+          await api(`/api/organizations/${organizationId}/storage/${id}/default`, { method: 'PUT', body: '{}' }); toast('Default storage updated'); await refresh('storage');
+        } catch (error) { toast(error.message, true); } });
+        row.querySelector('.storage-delete')?.addEventListener('click', async () => {
+          if (!confirm('Remove this storage connection? It is allowed only when no resource or revision uses it.')) return;
+          try { await api(`/api/organizations/${organizationId}/storage/${id}`, { method: 'DELETE' }); await refresh('storage'); }
+          catch (error) { toast(error.message, true); }
+        });
+      });
+    },
+    async usage() {
+      const [entitlements, usage, usagePolicy] = await Promise.all([
+        read('entitlements').catch(() => null),
+        read('usage').catch(() => null),
+        read('usage-policy').catch(() => null),
+      ]);
+      if (!live('usage')) return;
+      $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
+      const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
+      const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
+        : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
+          : usageSync.length ? ` · synced ${fmtAgo(Math.max(...usageSync.map((item) => Number(item.at || 0))))}` : '';
+      const coverageFrom = usageSync.length ? Math.max(...usageSync.map((item) => Number(item.coverageFrom || 0))) : 0;
+      const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
+        : coverageFrom > Number(usage?.from || 0)
+          ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
+      const usageFunding = usage?.byFundingSource || {};
+      $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Metered + estimated usage · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
+        <p class="task-sub">Incurred $${((usage.incurredCostMicros || 0) / 1e6).toFixed(2)} · estimated $${((usage.estimatedCostMicros || 0) / 1e6).toFixed(2)} · active managed reservations $${((usage.activeReservationsMicros || 0) / 1e6).toFixed(2)}</p>
+        <p class="task-sub">Managed $${((usageFunding.managed || 0) / 1e6).toFixed(2)} (${usage.requests?.managed || 0} model requests) · BYOK $${((usageFunding.byok || 0) / 1e6).toFixed(2)} (${usage.requests?.byok || 0} model requests) · active: ${usage.active?.agentTurns || 0} model turns, ${usage.active?.worlds || 0} worlds, ${usage.active?.executions || 0} commands</p>
+        ${usagePolicy ? `<details class="settings-disclosure compact"><summary><b>Usage guardrails</b> ${policyTip(`The plan admits ${entitlements?.maxActiveAgentRuns || usagePolicy.effectiveMaxActiveAgentTurns} shared active agent runs; an owner can only set a tighter cap here. Managed model use stays off until an owner sets a spend cap and enables a provider. BYOK usage is attributed separately, and remote sandboxes use the organization's own provider account.`)}</summary><div class="settings-grid">
+          <label class="form-row">Managed spend cap (USD/month)<input id="usage-managed-cap" type="number" min="0.01" step="0.01" value="${usagePolicy.managedSpendCapMicros == null ? '' : esc(usagePolicy.managedSpendCapMicros / 1e6)}" placeholder="Disabled" /></label>
+          <label class="form-row">Managed model providers<input id="usage-managed-providers" value="${esc((usagePolicy.managedModelProviders || []).join(', '))}" placeholder="Disabled" /></label>
+          <label class="form-row">Allowed model providers<input id="usage-allowed-providers" value="${esc((usagePolicy.allowedModelProviders || []).join(', '))}" placeholder="All connected BYOK providers" /></label>
+          <label class="form-row">Allowed models<input id="usage-allowed-models" value="${esc((usagePolicy.allowedModels || []).join(', '))}" placeholder="All models" /></label>
+          <label class="form-row">Model starts / minute<input id="usage-agent-rate" type="number" min="1" value="${esc(usagePolicy.maxAgentStartsPerMinute)}" /></label>
+          <label class="form-row">Sandbox starts / minute<input id="usage-world-rate" type="number" min="1" value="${esc(usagePolicy.maxRemoteStartsPerMinute)}" /></label>
+          <label class="form-row">Optional tighter model concurrency<input id="usage-agent-active" type="number" min="1" max="${esc(entitlements?.maxActiveAgentRuns || 1000000)}" value="${usagePolicy.maxActiveAgentTurns == null ? '' : esc(usagePolicy.maxActiveAgentTurns)}" placeholder="Plan limit: ${esc(usagePolicy.effectiveMaxActiveAgentTurns)}" /></label>
+          ${hostLocal() ? `<label class="form-row">Concurrent remote worlds<input id="usage-world-active" type="number" min="1" value="${esc(usagePolicy.maxActiveWorlds)}" /></label>`
+            : `<div class="form-row"><span>Concurrent remote worlds</span><b>Same as agent concurrency: ${esc(usagePolicy.maxActiveWorlds)}</b></div>`}
+        </div><button class="btn sm primary" id="usage-policy-save">Save usage guardrails</button></details>` : ''}` : 'Usage unavailable.';
+      setEventHandler($('#usage-policy-save'), 'click', async () => {
+        const list = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+        const cap = $('#usage-managed-cap').value.trim();
+        const agentCap = $('#usage-agent-active').value.trim();
+        try {
+          const policy = {
+            managedSpendCapMicros: cap === '' ? null : Math.round(Number(cap) * 1e6),
+            managedModelProviders: list('#usage-managed-providers'), allowedModelProviders: list('#usage-allowed-providers'),
+            allowedModels: list('#usage-allowed-models'), maxAgentStartsPerMinute: Number($('#usage-agent-rate').value),
+            maxRemoteStartsPerMinute: Number($('#usage-world-rate').value),
+            maxActiveAgentTurns: agentCap === '' ? null : Number(agentCap),
+            ...(hostLocal() ? { maxActiveWorlds: Number($('#usage-world-active').value) } : {}),
+          };
+          await api(`/api/organizations/${S.organizationId}/usage-policy`, { method: 'PUT', body: JSON.stringify({ policy }) }); toast('Usage guardrails saved'); await refresh('usage', 'compute');
+        } catch (error) { toast(error.message, true); }
+      });
+    },
+    async identity() {
+      const identityPolicy = await read('identity-policy').catch(() => null);
+      if (!live('identity')) return;
+      if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
+        <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
+        <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
+        <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
+        <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
+      setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
+      setEventHandler($('#rotate-scim'), 'click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
+    },
   };
-  setEventHandler($('#rename-organization'), 'click', renameOrganization);
-  setEventHandler($('#organization-name'), 'keydown', (event) => {
-    if (event.key === 'Enter') { event.preventDefault(); renameOrganization(); }
-  });
-  setEventHandler($('#delete-organization'), 'click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = await promptText(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
+  await Promise.all(panes.map((pane) => paint[pane]()));
 }
-
 async function createOrganization() {
   const name = await promptText('Organization name');
   if (!name) { syncOrganizationSwitcher(); return; }
@@ -18248,7 +18374,7 @@ async function createOrganization() {
     await loadOrganizations();
     S.organizationId = organization.id;
     S.projectId = null;
-    await loadCollaboration().catch(() => {});
+    await Promise.all([loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
     await refreshOnboarding();
     renderShell();
     await go(globalRoute('organization'));
@@ -18620,9 +18746,12 @@ function taskOrder() {
 }
 function openAdjacentTask(delta) {
   const order = taskOrder();
-  const i = order.indexOf(S.selected);
+  // A key pressed before the previous step's page opened continues from its target.
+  const i = order.indexOf(S.taskWalkTarget || S.selected);
   const next = order[i < 0 ? 0 : i + delta];
-  if (next) { S.cursorId = next; goToTask(next); }
+  if (!next) return;
+  S.cursorId = S.taskWalkTarget = next;
+  goToTask(next);
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----

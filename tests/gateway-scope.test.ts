@@ -336,14 +336,17 @@ describe('gateway request scope for bare-id routes', () => {
 
     const viewUrl = `${base}/api/tasks/${task.id}`;
     const headers = { authorization: `Bearer ${approver}`, 'content-type': 'application/json' };
-    expect(await (await fetch(viewUrl, { headers })).json()).toMatchObject({ approvalRequests: 1 });
+    expect(await (await fetch(viewUrl, { headers })).json()).toMatchObject({ approvalRequests: 1, pendingDecisions: 1 });
     const dismissed = await fetch(
       `${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${(await store.getProject(mine))!.organizationId}`,
       { method: 'POST', headers, body: JSON.stringify({ action: 'dismiss' }) },
     );
     expect(dismissed.status).toBe(200);
     expect(await dismissed.json()).toMatchObject({ status: 'pending', dismissed: { by: 'user:a' } });
-    expect(await (await fetch(viewUrl, { headers })).json()).not.toHaveProperty('approvalRequests');
+    // Dismissal silences the notification; the agent still waits on the decision.
+    const afterDismissal = await (await fetch(viewUrl, { headers })).json();
+    expect(afterDismissal).not.toHaveProperty('approvalRequests');
+    expect(afterDismissal).toMatchObject({ pendingDecisions: 1 });
     expect((await new PermissionRequests(store, (await store.getProject(mine))!.organizationId!).requests({ taskId: task.id })))
       .toEqual([expect.objectContaining({ status: 'pending', dismissed: expect.any(Object) })]);
 

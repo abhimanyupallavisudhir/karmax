@@ -8,3 +8,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # Base images are pinned by digest, which never moves on its own; these
+  # updates are how the images keep receiving the distributions' fixes.
+  - package-ecosystem: docker
+    directories: [/deploy, /environments/browser]
+    schedule:
+      interval: weekly

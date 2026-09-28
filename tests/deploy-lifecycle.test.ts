@@ -33,12 +33,14 @@ if (args.includes('cp')) {
   fs.writeFileSync(path.join(destination, 'manifest.hmac'), 'fixture');
 }
 if (args.includes('pg_dump')) process.stdout.write('dump-' + args.at(-1));
-if (args.includes('pg_restore')) fs.readFileSync(0);
+if (args.join(' ').includes('pg_stat_activity')) process.stdout.write(process.env.FAKE_SESSIONS ?? '');
+// Like Compose, a one-off without -T reads whatever stdin holds.
+if (args.includes('pg_restore') || (args.includes('run') && !args.includes('-T'))) fs.readFileSync(0);
 `, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  const run = (args: string[], fail = '', input = '') => spawnSync('sh', [path.join(deploy, 'karmax'), ...args], {
+  const run = (args: string[], fail = '', input = '', env: Record<string, string> = {}) => spawnSync('sh', [path.join(deploy, 'karmax'), ...args], {
     encoding: 'utf8', input, timeout: 30_000,
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, FAKE_FAIL: fail },
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, FAKE_FAIL: fail, ...env },
   });
   const calls = () => fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]) : [];
   return { root, deploy, run, calls, clear: () => fs.writeFileSync(log, '') };
@@ -90,6 +92,10 @@ it.each(['cp app:', 'pg_dump -U temporal -Fc temporal'])('removes partial backup
   expect(h.calls().some(args => args.includes('down'))).toBe(false);
 });
 
+const LIVE = ['karmax', 'temporal', 'temporal_visibility'];
+const into = (args: string[]) => args.includes('pg_restore') && args.includes('-d') ? args[args.indexOf('-d') + 1] : undefined;
+const dropsLive = (args: string[]) => args.includes('dropdb') && LIVE.includes(args.at(-1)!);
+
 it('verifies every restore input before stopping services, and waits for the restored app', () => {
   const h = deployment();
   const destination = path.join(h.root, 'snapshot with spaces');
@@ -100,12 +106,68 @@ it('verifies every restore input before stopping services, and waits for the res
   const calls = h.calls();
   const stopped = calls.findIndex(args => args.includes('down'));
   expect(stopped).toBeGreaterThan(0);
-  expect(calls.slice(0, stopped).filter(args => args.includes('pg_restore'))).toHaveLength(3);
+  expect(calls.slice(0, stopped).filter(args => args.includes('pg_restore') && args.includes('/dev/null'))).toHaveLength(3);
   expect(calls.slice(0, stopped).some(args => args.includes('--verify'))).toBe(true);
-  expect(calls.slice(stopped).filter(args => args.includes('dropdb'))).toHaveLength(3);
-  expect(calls.slice(stopped).some(args => args.includes('restore') && !args.includes('--verify'))).toBe(true);
+  expect(calls.slice(stopped).filter(dropsLive)).toHaveLength(3);
+  expect(calls.slice(stopped).some(args => args.join(' ').includes('npm run restore -- /restore'))).toBe(true);
   expect(result.stdout).toContain('Restore complete');
 });
+
+// A backup is private to the operator who took it, and the app image runs as
+// its own uid, so the one-offs that read it run as root; the restored data is
+// then handed back to the app's user.
+it('reads the backup as root and gives the restored data to the app user', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  h.clear();
+  expect(h.run(['restore', destination], '', 'RESTORE\n').status).toBe(0);
+  const readers = h.calls().filter(args => args.includes('run') && args.some(arg => arg.endsWith(':/restore:ro')));
+  expect(readers).toHaveLength(2);
+  for (const args of readers) expect(args.slice(args.indexOf('run'), args.indexOf('app'))).toEqual(expect.arrayContaining(['--user', 'root']));
+  expect(readers[1]!.at(-1)).toBe('npm run restore -- /restore && chown -R karmax:karmax /var/lib/karmax');
+});
+
+// A new dump names the karmax role as owner, which a fresh PostgreSQL volume
+// does not have: pg_restore failed after all three databases were dropped, and
+// the stack stayed down with Temporal's databases empty.
+it('restores every dump into a staging database before stopping or dropping anything', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  h.clear();
+  const result = h.run(['restore', destination], '', 'RESTORE\n');
+  expect(result.status, result.stderr).toBe(0);
+  const calls = h.calls();
+  const staged = calls.filter(into);
+  expect(staged.map(into)).toEqual(['karmax_restore', 'temporal_restore', 'temporal_visibility_restore']);
+  // Owners and grants are the role job's to apply on the next start.
+  for (const args of staged) expect(args, into(args)).toEqual(expect.arrayContaining(['--no-owner', '--no-privileges']));
+  const lastStaged = calls.lastIndexOf(staged.at(-1)!);
+  expect(calls.findIndex(args => args.includes('down'))).toBeGreaterThan(lastStaged);
+  expect(calls.findIndex(dropsLive)).toBeGreaterThan(lastStaged);
+  const renames = calls.map(args => args.join(' ')).filter(call => call.includes('RENAME TO'));
+  expect(renames.map(call => /ALTER DATABASE (\w+) RENAME TO (\w+)/.exec(call)?.slice(1))).toEqual(LIVE.map(db => [`${db}_restore`, db]));
+});
+
+it.each(['-d karmax_restore', '-d temporal_visibility_restore', 'createdb -U temporal temporal_restore'])(
+  'keeps the live databases, services and secrets when staging fails: %s', fail => {
+    const h = deployment();
+    const destination = path.join(h.root, 'snapshot');
+    expect(h.run(['backup', destination]).status).toBe(0);
+    fs.writeFileSync(path.join(destination, 'deployment-secrets', 'vault_key'), 'restored-vault_key');
+    spawnSync('sh', ['-c', 'sha256sum *.dump deployment-secrets/* > SHA256SUMS'], { cwd: destination });
+    h.clear();
+    const result = h.run(['restore', destination], fail, 'RESTORE\n');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/nothing on this instance was changed/);
+    const calls = h.calls();
+    expect(calls.some(args => args.includes('down') || dropsLive(args))).toBe(false);
+    expect(calls.filter(args => args.includes('dropdb')).map(args => args.at(-1)).slice(-3))
+      .toEqual(LIVE.map(db => `${db}_restore`));
+    expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
+    expect(fs.readdirSync(h.deploy).filter(name => name.startsWith('.secrets'))).toEqual(['.secrets']);
+  });
 
 it.each(['npm run restore -- --verify', 'pg_restore -f /dev/null'])('leaves services and secrets untouched when restore validation fails: %s', fail => {
   const h = deployment();
@@ -128,4 +190,61 @@ it('rejects changed dump bytes and cancelled confirmation before stopping servic
   fs.appendFileSync(path.join(destination, 'temporal.dump'), 'tampered');
   expect(h.run(['restore', destination], '', 'RESTORE\n').status).not.toBe(0);
   expect(h.calls().some(args => args.includes('build') || args.includes('down'))).toBe(false);
+});
+
+// Compose no longer sets KARMAX_DATABASE_URL, so one left in the app's
+// karmax.env would silently keep it on the superuser (CI-7).
+it('doctor reports the role the app connects to PostgreSQL as, and warns on the superuser', () => {
+  const h = deployment();
+  const own = h.run(['doctor'], '', '', { FAKE_SESSIONS: 'karmax|f\n' });
+  expect(own.status, own.stderr).toBe(0);
+  expect(own.stdout).toContain('The app connects to PostgreSQL as karmax, not a superuser.');
+  expect(own.stderr).not.toContain('superuser');
+  const superuser = h.run(['doctor'], '', '', { FAKE_SESSIONS: 'temporal|t\n' });
+  expect(superuser.stderr).toMatch(/warning: the app connects to PostgreSQL as the superuser temporal/);
+  expect(superuser.stderr).toContain('KARMAX_DATABASE_URL');
+  const idle = h.run(['doctor'], '', '', { FAKE_SESSIONS: '' });
+  expect(idle.stdout).toContain('The app has no connection to the karmax database');
+});
+
+/** A deployment whose source is a Git checkout at `previous`, with `target`
+ *  one commit ahead on origin/master. */
+function checkout() {
+  const h = deployment();
+  const git = (...args: string[]) => spawnSync('git', args, { cwd: h.root, encoding: 'utf8' }).stdout.trim();
+  const origin = path.join(h.root, 'origin.git');
+  spawnSync('git', ['init', '-q', '--bare', origin]);
+  git('init', '-q', '-b', 'master');
+  git('config', 'user.email', 'test@example.com'); git('config', 'user.name', 'Test');
+  fs.writeFileSync(path.join(h.root, '.gitignore'), 'deploy/.secrets/\ndeploy/.turnkey.env\ndocker.jsonl\nbin/\norigin.git/\n');
+  git('add', '.'); git('commit', '-q', '-m', 'previous');
+  const previous = git('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(h.root, 'release'), 'target\n');
+  git('add', '.'); git('commit', '-q', '-m', 'target');
+  const target = git('rev-parse', 'HEAD');
+  git('remote', 'add', 'origin', origin); git('push', '-q', 'origin', 'master');
+  git('checkout', '-q', '--detach', previous);
+  return { ...h, git, previous, target };
+}
+
+it('updates an exact master revision', () => {
+  const h = checkout();
+  const result = h.run(['update', h.target]);
+  expect(result.status, result.stderr).toBe(0);
+  expect(h.git('rev-parse', 'HEAD')).toBe(h.target);
+  expect(result.stdout).toContain(`Update complete at ${h.target}`);
+});
+
+// HEAD is the running revision: a failure before the new release starts must
+// leave the checkout at the one still serving.
+it('returns the checkout to the running revision when the target secrets cannot be written', () => {
+  const h = checkout();
+  // The first secret, so a later one cannot mask the failure.
+  fs.rmSync(path.join(h.deploy, '.secrets', 'auth_secret'));
+  fs.symlinkSync(path.join(h.root, 'missing', 'auth_secret'), path.join(h.deploy, '.secrets', 'auth_secret'));
+  const result = h.run(['update', h.target]);
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain(`production remains at ${h.previous}`);
+  expect(h.git('rev-parse', 'HEAD')).toBe(h.previous);
+  expect(h.calls().some(args => args.includes('build') || args.includes('up'))).toBe(false);
 });

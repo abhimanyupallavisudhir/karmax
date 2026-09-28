@@ -50,6 +50,13 @@ ok(context.result.includes('@openai/codex@0.154.0-alpha.11 fork'), 'fork uses th
 ok(context.result.includes(snapshot.exportId) && !context.result.includes('old-session'), 'fork identity matches the downloaded snapshot');
 ok(require('child_process').spawnSync('bash', ['-n', '-c', context.result]).status === 0, 'commands safely quote paths containing shell metacharacters');
 
+// UI-33c: the three Work-locally dialogs share one frame, loading state and wiring.
+const dialog = slice('async function localHandoffDialog(', 'async function openLocalCheckout(v)');
+ok((src.match(/class="palette-scrim local-handoff-scrim"/g) || []).length === 1 && dialog.includes('class="palette-scrim local-handoff-scrim"'), 'one Work-locally frame');
+ok(dialog.includes('aria-label="Close"'), 'the close button is named');
+ok(!/copyToClipboard/.test(taskModal.slice(taskModal.indexOf('async function openLocalCheckout'))) && !/copyToClipboard/.test(projectModal) && !/copyToClipboard/.test(localModal),
+  'copy buttons are wired once, by the shared dialog');
+
 // PA-6: a download that panagent converted lossily says what changed.
 (async () => {
   const toasts = [];

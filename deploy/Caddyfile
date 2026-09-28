@@ -60,6 +60,11 @@
 {$KARMAX_DOMAIN} {
 	import karmax_security
 	import karmax_ratelimit
+	# The app sends each document its own policy (console, public pages, agent
+	# content). Anything it answers without one gets this locked-down default,
+	# so a page added later is not left unprotected. Previews are exempt: they
+	# serve people's own apps on their own origins.
+	header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 	reverse_proxy app:4505
 }
 

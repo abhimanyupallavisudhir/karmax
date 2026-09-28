@@ -13,6 +13,9 @@ import { findFreePortFrom } from '../../src/util/ports.js';
 import { encryptIdentity } from '../helpers/age-encrypted-identity.js';
 import { totpCode } from '../../src/autonomy/vault-items.js';
 
+// Bodies passed to page.evaluate run in the page; this file has no DOM lib.
+declare const document: any;
+
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pass-browser-'));
 process.env.KARMAX_HOME = path.join(root, 'karmax');
 process.env.KARMAX_SKIP_LIVE = '1';
@@ -189,7 +192,7 @@ try {
   const signedIn = page.waitForResponse((r) => r.url().endsWith('/api/login') && r.request().method() === 'POST');
   await page.locator('#login-btn').click();
   assert.equal((await signedIn).status(), 200);
-  await page.waitForFunction("!document.querySelector('#login-btn')");
+  await page.waitForFunction(() => !document.querySelector('#login-btn'));
   // All requests below go through the real gateway, identity and authorization.
   const api = (url: string, body?: unknown) =>
     page.evaluate(
@@ -255,7 +258,7 @@ try {
   assert.equal(checkedResponse.status(), 200);
   assert.deepEqual((await checkedResponse.json()).checks, checks);
   await row.locator('[data-conn-import]').click();
-  await page.waitForFunction("document.querySelectorAll('.imp-pick').length === 2");
+  await page.waitForFunction(() => document.querySelectorAll('.imp-pick').length === 2);
   await page.locator('.imp-all').check();
   await page.locator('.imp-wb').check();
   await page.locator('.imp-reveal').selectOption('auto');
@@ -405,7 +408,7 @@ try {
   assert.equal((await failed).status(), 400);
   await page.locator('.toast.err').last().waitFor({ state: 'visible' });
   await page.locator('.toast.err .toast-dismiss').last().click();
-  await page.waitForFunction("!document.querySelector('[data-git-pass-save]')?.disabled");
+  await page.waitForFunction(() => !document.querySelector('[data-git-pass-save]')?.disabled);
   await page.locator('[data-git-pass-cancel]').click();
   assert.equal((await api('/api/vault/connectors/pass-git/list' + oq, {})).body.length, 4);
   assert.deepEqual(errors, []);

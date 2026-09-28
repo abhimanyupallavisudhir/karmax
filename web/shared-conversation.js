@@ -16,11 +16,11 @@
     window.MathJax?.typesetClear?.([thread]);
     for (const { node, source } of messages) {
       node.classList.add('md');
-      node.innerHTML = TavyaMarkdown.renderMarkdown(source, { math });
+      node.innerHTML = KarmaxMarkdown.renderMarkdown(source, { math });
     }
     toggle.setAttribute('aria-pressed', String(math));
     if (!math || !thread.querySelector('.md-math')) return;
-    const loaded = await TavyaMarkdown.ensureMathJax();
+    const loaded = await KarmaxMarkdown.ensureMathJax();
     if (!loaded || !math || current !== revision || !thread.isConnected) return;
     try { await window.MathJax.typesetPromise([...thread.querySelectorAll('.md-math')]); }
     catch { /* Keep readable TeX if typesetting is unavailable. */ }
