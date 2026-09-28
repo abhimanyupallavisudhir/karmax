@@ -12,13 +12,17 @@ import { historyFromJson } from './helpers/stub-task-worker.js';
 // running, so replay ends inside the wait the fixes changed. The long task
 // recorded at bc2ea4db (tests/history-bounds.test.ts, 68 turns) passes the
 // continue-as-new threshold at its last Do turns, so replay reaches that
-// check with no marker recorded and must not continue.
+// check with no marker recorded and must not continue. Recorded at 689f1c51
+// on older pins (tests/helpers/record-task-history.ts): a v1.20 landing that
+// polls a repeated failure without backing off, and a v1.23 task past the
+// threshold. Recorded at a14b89e4: a merge-queue wait polling its position.
 it('replays task histories recorded before history bounding', async () => {
   const workflowBundle = await bundleWorkflowCode({
     workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)),
   });
   for (const name of ['history-long-prechange', 'history-landing-duplicate-prechange',
-    'history-admission-prechange', 'history-admission-justdo-prechange', 'history-long-past-threshold-prechange']) {
+    'history-admission-prechange', 'history-admission-justdo-prechange', 'history-long-past-threshold-prechange',
+    'history-landing-duplicate-v1_20-prechange', 'history-long-v1_23-prechange', 'history-merge-queue-prechange']) {
     const file = new URL(`./fixtures/${name}.json`, import.meta.url);
     const json = JSON.parse(fs.existsSync(file) ? fs.readFileSync(file, 'utf8')
       : zlib.gunzipSync(fs.readFileSync(new URL(`${file.href}.gz`))).toString('utf8'));
