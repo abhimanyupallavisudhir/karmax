@@ -14,7 +14,9 @@ import { replayRunningWorkflows } from '../ops/replay-check.js';
 // names the workflows it cannot replay; exit 2 means it could not check.
 
 hydrateEnvFile(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
-hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
+// Only what reaching Temporal needs: the check runs before the release has
+// started, when secrets it never reads (the app's database URL) may not exist.
+hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'), ['KARMAX_TEMPORAL_API_KEY']);
 const conn = temporalConnectionFromEnv();
 if (!conn) {
   console.error('replay-check: KARMAX_TEMPORAL_ADDRESS is not set, so there is no shared Temporal to check against.');
