@@ -146,13 +146,23 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
     record(await measure('organization action (create team)', async () => {
       await page.evaluate(() => { document.querySelector('#team-name').value = 'Team'; document.querySelector('#create-team').click(); });
     }));
+    // A deep link into another organization boots straight into it.
+    const deep = await context.newPage();
+    deep.on('pageerror', error => { errors.push(error.message); console.error('page:', error.stack); });
+    record(await measure('boot (other organization)', async () => {
+      await deep.goto('http://console.test/second/other');
+      await deep.locator('[data-id="t7"]').waitFor();
+    }));
     assert.deepEqual(errors, []);
     if (!report) {
       const budget = (name, requests, depth) => {
         assert.ok(results[name].requests <= requests, `${name}: ${results[name].requests} requests > ${requests}\n${JSON.stringify(results[name].counts)}`);
         if (depth != null) assert.ok(results[name].depth <= depth, `${name}: ${results[name].depth} round trips > ${depth}`);
       };
-      budget('boot', Infinity, Infinity);
+      budget('boot', 24, 5);
+      budget('boot (other organization)', 24, 5);
+      assert.ok(!Object.keys(results['boot (other organization)'].counts).some(key => key.includes('/organizations/o/')),
+        'a deep link loads only its own organization');
       budget('busy event stream (list)', 0);
       budget('task open', 8, 1);
       assert.equal(walkedTo, '/org/workspace/tasks/5', 'every j/k press counts, even before the last task loaded');

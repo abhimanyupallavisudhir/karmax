@@ -631,23 +631,30 @@ async function applyRoute() {
     S.searchResult = null;
     S.searchPending = false;
     S.cursorId = null;
-    await loadTasks().catch(() => {});
-    await loadAvatars().catch(() => {});
-    if (!routeIsCurrent()) return;
   }
-  else if (!S.tasks?.length) {
-    await loadTasks().catch(() => {});
-    if (!routeIsCurrent()) return;
+  const incomingListQuery = r.q || '';
+  const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
+  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
+  // A project with nothing in memory to paint reads everything its page needs
+  // together: tasks, avatars, tags/views and the list's search (RQ-9).
+  const reads = [];
+  if (!sameProject || !S.tasks?.length) reads.push(loadTasks().catch(() => {}));
+  if (!sameProject || !S.avatarAvailability || S.avatarProjectId !== pid) reads.push(loadAvatars().catch(() => {}));
+  let organizationRead = null, listSearch = null;
+  if (!projectOrganizationLoaded) {
+    organizationRead = loadOrg().catch(() => false);
+    if (!r.taskKey && tab === 'tasks') {
+      S.search = incomingListQuery;
+      listSearch = runSearch().catch(() => {});
+    }
   }
-  if (sameProject && (!S.avatarAvailability || S.avatarProjectId !== pid)) await loadAvatars().catch(() => {});
+  await Promise.all(reads);
+  if (!routeIsCurrent()) return;
   // Same-project tabs are local navigation. Their complete last-painted inputs
   // are already in memory, so reveal the destination before refreshing tags,
   // views, fields, and (for the task list) the authoritative search result.
   // A changed task-list query clears the previous server result and paints a
   // labelled local preview instead of flashing unrelated rows.
-  const incomingListQuery = r.q || '';
-  const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
-  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
   if (canPaintCachedProject) {
     S.tab = tab;
     closeTaskDom();
@@ -666,7 +673,7 @@ async function applyRoute() {
   // is loaded re-reads none of it, so opening or j/k-walking tasks costs only the
   // task's own reads (UI-6); the list refreshes it when shown again. First visits
   // and cross-project routes wait so they never render foreign tags.
-  if (!r.taskKey || !projectOrganizationLoaded) await loadOrg().catch(() => false);
+  if (!r.taskKey || !projectOrganizationLoaded) await (organizationRead || loadOrg().catch(() => false));
   if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
@@ -682,7 +689,7 @@ async function applyRoute() {
     // The list is query-driven and the URL owns the query: a pasted, bookmarked,
     // reloaded or Back-navigated link paints the same filtered/grouped/sorted view.
     S.search = incomingListQuery;
-    await runSearch().catch(() => {});
+    await (listSearch || runSearch().catch(() => {}));
     if (!routeIsCurrent()) return;
   }
   renderRail();
@@ -2767,9 +2774,14 @@ function watchConsoleRevision() {
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
-  S.meta = S.meta || await api('/api/meta');
+  // Independent first reads go together; each used to wait for the one before (RQ-9).
+  const sessionRead = feedbackFetch('/api/session').then((response) => response.json());
+  sessionRead.catch(() => {}); // awaited below, after the public routes that need no session
+  [S.meta, S.launch] = await Promise.all([
+    S.meta || api('/api/meta'),
+    S.launch || feedbackFetch('/api/launch').then((response) => response.json()),
+  ]);
   applyDocumentBrand();
-  S.launch = S.launch || await (await feedbackFetch('/api/launch')).json();
   const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
   if (legalSlug) return renderLegalPage(legalSlug);
   if (location.pathname === '/legal') return renderLegalIndex();
@@ -2797,7 +2809,7 @@ async function boot() {
     clean.searchParams.delete('auth_provider');
     history.replaceState({ kx: 1 }, '', `${clean.pathname}${clean.search}${clean.hash}`);
   }
-  const session = await (await feedbackFetch('/api/session')).json();
+  const session = await sessionRead;
   // Account email (confirmation, password reset) only when the installation can send it.
   S.emailDelivery = session.emailDelivery === true;
   S.sso = session.sso || null;
@@ -2860,6 +2872,15 @@ async function boot() {
     throw e;
   }
   if (!S.organizationId) S.organizationId = S.defaultOrganizationId;
+  // Load for the organization and project the URL names, not the defaults the
+  // first route would switch away from at once (RQ-9, UI-8).
+  const initialRoute = parseRoute(currentPath());
+  const routeOrganization = initialRoute.org && organizationBySlug(initialRoute.org);
+  if (routeOrganization) {
+    S.organizationId = routeOrganization.id;
+    S.projectId = (initialRoute.slug && projectBySlug(initialRoute.slug, routeOrganization.id)?.id)
+      || firstProjectForOrganization(routeOrganization.id)?.id || null;
+  }
   // Account creation marks exactly one session response for Git onboarding. Only
   // replace the neutral home route (never an invitation or another deep link).
   if (session.gitOnboarding && parseRoute(currentPath()).name === 'home')
