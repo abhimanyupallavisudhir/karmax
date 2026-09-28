@@ -21,7 +21,7 @@ import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
-import { Store } from '../store/db.js';
+import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
 import { World, WorldHandle, WorldKind, WorldSpec, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
@@ -5094,6 +5094,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
+      // WF-27: an attempt that timed out still completes, and a stopped run's
+      // last publication can land after its successor's. Drop what the task has
+      // already moved past, before it can rewrite a snapshot or the view.
+      let order: ViewPublicationOrder | undefined;
+      try {
+        const runId = activityContext.current().info.workflowExecution?.runId;
+        const revision = runId && conversationReference?.startsWith(`${runId}:`)
+          ? Number(conversationReference.slice(runId.length + 1)) : undefined;
+        if (runId && typeof publication.updatedAt === 'number')
+          order = { runId, seq: publication.updatedAt, ...(Number.isSafeInteger(revision) ? { revision } : {}) };
+      } catch { /* direct invocation has no run to order by */ }
+      if (order && (await store.viewPublicationStale(taskId, order))) return;
       let view: TaskView;
       if (conversationReference) {
         // Immutable, task-scoped snapshots survive worker restarts and activity
@@ -5161,7 +5173,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await trace.mark(`queue.observed.${after?.state ?? 'released'}`));
         }
       }
-      (await store.saveView(taskId, view, conversationReference));
+      if (!(await store.saveView(taskId, view, conversationReference, order))) return;
       await notifyChildSettlement(store, deps.client, view);
       if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
         let runId: string | undefined;

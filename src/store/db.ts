@@ -100,6 +100,22 @@ export interface CollaborationRequest {
 }
 
 /**
+ * Where a workflow publication sits in its task's history (WF-27): the
+ * publishing run, the view's `updatedAt` (that run's history length, so
+ * monotonic within the run) and the conversation revision it references.
+ */
+export interface ViewPublicationOrder {
+  runId: string;
+  seq: number;
+  revision?: number;
+}
+
+/** A task's accepted publication position plus the runs it has moved past. */
+interface ViewOrderState { runId: string; seq: number; revision: number; retired: string[] }
+/** Runs a task replaces are few; remember enough to outlast a straggler. */
+const RETIRED_VIEW_RUNS = 16;
+
+/**
  * Terminal statuses that auto-archive a task when it first reaches one (see
  * `Store.saveView`). Only fully-resolved outcomes — a failed task stays visible
  * because it usually needs attention.
@@ -3755,8 +3771,50 @@ export class Store {
     return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
   }
 
-  async saveView(taskId: string, view: TaskView, conversationReference?: string) {
+  /**
+   * Would this publication be older than one the task has already saved? A
+   * run's later publication supersedes its earlier ones, and a run's successor
+   * supersedes all of it: once a new run has published, only a straggler of the
+   * old run can still arrive. Equal positions are the same publication retried,
+   * or siblings of one workflow task, and are admitted.
+   */
+  async viewPublicationStale(taskId: string, order: ViewPublicationOrder): Promise<boolean> {
+    const raw = (await this.kvGet(`view-order:${taskId}`));
+    const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
+    if (!state) return false;
+    if (state.retired.includes(order.runId)) return true;
+    return state.runId === order.runId
+      && (order.seq < state.seq || (order.seq === state.seq && (order.revision ?? -1) < state.revision));
+  }
+
+  /** Stop admitting publications from a run the platform stopped itself (a
+   * manual Done): no successor run will publish to retire it. */
+  async retireViewRun(taskId: string, runId: string): Promise<void> {
     return this.db.transaction(async () => {
+      const raw = (await this.kvGet(`view-order:${taskId}`));
+      const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
+      if (state?.retired.includes(runId)) return;
+      const retired = [...(state?.retired ?? []), runId].slice(-RETIRED_VIEW_RUNS);
+      (await this.kvSet(`view-order:${taskId}`, JSON.stringify({ runId: state?.runId ?? '', seq: state?.seq ?? 0,
+        revision: state?.revision ?? -1, retired })));
+    });
+  }
+
+  private async admitViewPublication(taskId: string, order: ViewPublicationOrder): Promise<boolean> {
+    if ((await this.viewPublicationStale(taskId, order))) return false;
+    const raw = (await this.kvGet(`view-order:${taskId}`));
+    const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
+    const retired = state && state.runId && state.runId !== order.runId && !state.retired.includes(state.runId)
+      ? [...state.retired, state.runId].slice(-RETIRED_VIEW_RUNS) : state?.retired ?? [];
+    (await this.kvSet(`view-order:${taskId}`, JSON.stringify({ runId: order.runId, seq: order.seq,
+      revision: order.revision ?? -1, retired } satisfies ViewOrderState)));
+    return true;
+  }
+
+  /** Returns false, and changes nothing, for a publication `order` shows is stale. */
+  async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder): Promise<boolean> {
+    return this.db.transaction(async () => {
+    if (order && !(await this.admitViewPublication(taskId, order))) return false;
 
     const pending = (await this.kvGet(`pending-review:${taskId}`));
     if (pending && Object.entries(JSON.parse(pending)).every(([key, value]) =>
@@ -3820,6 +3878,7 @@ export class Store {
     if (['done', 'cancelled', 'failed'].includes(view.status))
       (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:settled:${taskId}`, String(Date.now())));
     else (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:settled:${taskId}`));
+    return true;
 
     });
   }
@@ -5161,7 +5220,7 @@ export class Store {
       await this.kvDeletePrefix(sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`,
-        `retention:settled:${taskId}`, `retention:view:${taskId}`]) (await exact.run(key));
+        `retention:settled:${taskId}`, `retention:view:${taskId}`, `view-order:${taskId}`]) (await exact.run(key));
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
         `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) await this.kvDeletePrefix(value);
     }

@@ -586,6 +586,17 @@ describe('task stage transitions', () => {
     expect(restored).toMatchObject({ stage: 'do', status: 'active' });
   });
 
+  // WF-27: the run a Done stops has no successor to supersede it, so a
+  // publication of it that lands late must not reopen the task.
+  it('ignores a late publication from the run a manual Done stopped', async () => {
+    const f = (await fixture());
+    (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'stopped-run' }));
+    (await f.store.saveView(f.task.id, f.view, undefined, { runId: 'stopped-run', seq: 40 }));
+    await f.api.moveTaskStage(f.token, f.task.id, 'done');
+    expect((await f.store.saveView(f.task.id, { ...f.view, updatedAt: 90 }, undefined, { runId: 'stopped-run', seq: 90 }))).toBe(false);
+    expect((await f.store.getTask(f.task.id))?.lastView).toMatchObject({ stage: 'done', status: 'done' });
+  });
+
   it('tells the parent when a person marks its sub-task done', async () => {
     const f = (await fixture());
     const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',

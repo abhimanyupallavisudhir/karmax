@@ -199,6 +199,59 @@ describe('durable conversation publication', () => {
     } finally { (await store.close()); }
   });
 
+  // WF-27: publications of one task can land out of order — an activity attempt
+  // that timed out still completes, or a stopped run's last publication lands
+  // after its successor's. The store keeps the newest, not the last to arrive.
+  describe('publication order', () => {
+    async function publisher() {
+      const store = await Store.create(':memory:');
+      const project = await store.createProject('Order');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: 'x' } });
+      const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+        profiles: new ProfileResolver(store, 'mock') });
+      let runId = 'run-one';
+      const ctx = vi.spyOn(Context, 'current').mockImplementation(() =>
+        ({ info: { workflowExecution: { runId }, activityId: `publish-${Math.random()}`, attempt: 1 } }) as any);
+      const view = (stage: TaskView['stage'], updatedAt: number, text = stage): TaskView => ({ taskId: task.id, title: 'T',
+        workflow: 'software-dev', stage, status: 'active', messages: [{ id: 'm', role: 'agent', text, ts: 0 }],
+        actions: [], state: {}, updatedAt });
+      const stored = async () => (await store.getTask(task.id))?.lastView;
+      const updates = async () => (await store.eventsSince(task.id, 0)).filter((event) => event.type === 'view.updated').length;
+      return { store, task, core, view, stored, updates, useRun: (id: string) => { runId = id; },
+        close: async () => { ctx.mockRestore(); await store.close(); } };
+    }
+
+    it('ignores a late publication that the same run has already superseded', async () => {
+      const f = await publisher();
+      try {
+        await f.core.publishView(f.task.id, f.view('review', 40));
+        expect(await f.core.publishView(f.task.id, f.view('do', 30))).toBeUndefined();
+        expect(await f.stored()).toMatchObject({ stage: 'review', messages: [{ text: 'review' }] });
+        expect(await f.updates()).toBe(1);
+        // The same publication retried, or a sibling from the same workflow task, still lands.
+        await f.core.publishView(f.task.id, { ...f.view('review', 40), status: 'waiting' });
+        expect(await f.stored()).toMatchObject({ status: 'waiting' });
+      } finally { await f.close(); }
+    });
+
+    it('ignores a replaced run once its successor has published', async () => {
+      const f = await publisher();
+      try {
+        await f.core.publishView(f.task.id, f.view('review', 400));
+        f.useRun('run-two');
+        await f.core.publishView(f.task.id, f.view('do', 3));
+        expect(await f.stored()).toMatchObject({ stage: 'do' });
+        f.useRun('run-one');
+        await f.core.publishView(f.task.id, f.view('done', 500));
+        expect(await f.stored()).toMatchObject({ stage: 'do' });
+        f.useRun('run-two');
+        await f.core.publishView(f.task.id, f.view('review', 9));
+        expect(await f.stored()).toMatchObject({ stage: 'review' });
+      } finally { await f.close(); }
+    });
+  });
+
   it('does not reference an unacknowledged write', async () => {
     let fail = true;
     const publications: PublishedView[] = [];

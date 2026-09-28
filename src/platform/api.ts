@@ -3105,6 +3105,9 @@ export class KarmaxApi {
         // just declared done (task #395). No successor run follows.
         await this.stopTaskActivity(task, view, 'Task marked done manually', 'replace');
         (await this.deps.store.kvDelete(lifecycleReplacementKey(task.id)));
+        // No successor run will supersede the stopped one's late publications.
+        const runId = task.params._workflowRunId;
+        if (typeof runId === 'string' && runId) (await this.deps.store.retireViewRun(task.id, runId));
       }
       if (task.params.draft) (await this.deps.store.clearDraft(taskId));
       const done: TaskView = {
