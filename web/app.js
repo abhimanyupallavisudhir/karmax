@@ -9511,6 +9511,9 @@ async function downloadNativeConversation(button) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.error || `download failed (HTTP ${response.status})`);
     }
+    let notes = [];
+    try { notes = JSON.parse(decodeURIComponent(response.headers.get('x-karmax-conversation-warnings') || '[]')).map((note) => note.message); }
+    catch { /* A malformed header must not fail the download. */ }
     const href = URL.createObjectURL(await response.blob());
     const anchor = document.createElement('a');
     anchor.href = href;
@@ -9520,6 +9523,7 @@ async function downloadNativeConversation(button) {
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(href), 60_000);
     button.textContent = '✓ Downloaded';
+    if (notes.length) toast(`Converted with changes: ${notes.join(' ')}`);
     setTimeout(() => { if (button.isConnected) button.textContent = label; }, 1200);
   } catch (error) {
     button.textContent = label;
