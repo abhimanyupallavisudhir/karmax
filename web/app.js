@@ -342,6 +342,10 @@ function syncOrganizationSwitcher() {
 // `/<org>` prefix for the current (or a given) organization; '' when none is known.
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 
+/** Tabs that belong to the selected project (the router reads them from URLs,
+ *  the rail highlights the project, the main pane shows its tab bar). One list
+ *  so they never drift apart again. */
+const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
 // Second-segment words that name an organization-level view rather than a project.
 const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
 
@@ -369,7 +373,7 @@ function parseRoute(url) {
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
   if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', sub: seg[1] || null, legacy: true };
   if (seg[0] === 'projects' && seg[1]) {
-    const tab = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+    const tab = PROJECT_SCOPED_TABS.includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
     const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
@@ -386,7 +390,7 @@ function parseRoute(url) {
   // The inbox is the one org view with a sub-view (which kind of notification).
   if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', org, tab: 'inbox', sub: seg[2] || null };
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
-  const tab = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+  const tab = PROJECT_SCOPED_TABS.includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
@@ -3415,10 +3419,6 @@ function patchTaskListFromEvent(ev) {
     || waitKey(previous.waitingFor) !== waitKey(next.waitingFor)
     || turnKey(previous.agentTurn) !== turnKey(next.agentTurn);
 }
-
-/** Tabs that belong to the selected project (the rail highlights it, the main
- *  pane shows its tab bar). One list so the two never drift apart again. */
-const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
 
 function scheduleTaskListReload() {
   clearTimeout(refreshTimer);
