@@ -4039,6 +4039,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
         };
       };
+      // GitHub reports BEHIND only under strict required checks, which a
+      // parent's task branch cannot carry: they would also reject its agents'
+      // own pushes. A sub-task landing there is karmax's own integration, so
+      // karmax enforces freshness itself (GH-26); every other target keeps its
+      // repository's policy.
+      const parentBranch = task.parentTaskId
+        ? ((await store.currentWorld(task.parentTaskId)) as WorldHandle | undefined)?.branch
+        : undefined;
       for (let ref of prs) {
         let live;
         try {
@@ -4128,11 +4136,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         let readinessError: unknown;
         const inspection = (await inspectionFor(ref.slug));
         const inspectionApi = inspection.api;
+        const freshnessTarget = parentBranch && live.base === parentBranch ? parentBranch : undefined;
+        // A head without the parent branch's tip passed CI on an older base:
+        // read it as BEHIND, so the paths below update it and wait for new CI.
+        const readinessOf = async (): Promise<GithubPullRequestReadiness> => {
+          const observed = await inspectionApi.readiness(ref.slug, ref.number);
+          if (!freshnessTarget || !['CLEAN', 'UNSTABLE'].includes(observed.mergeStateStatus)) return observed;
+          const comparison = await inspectionApi.compare(ref.slug, freshnessTarget, observed.headSha);
+          return comparison.behindBy > 0 ? { ...observed, mergeStateStatus: 'BEHIND',
+            ...(comparison.baseSha ? { baseSha: comparison.baseSha } : {}) } : observed;
+        };
         const repairFingerprint = (kind: 'conflict' | 'base-moved', suffix?: string) =>
           readiness?.baseSha ? `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha ?? 'unknown'}:${readiness.baseSha}:${kind}${suffix ? `:${suffix}` : ''}` : undefined;
         if (live.nodeId) {
           try {
-            readiness = await inspectionApi.readiness(ref.slug, ref.number);
+            readiness = await readinessOf();
           } catch (error) {
             // Readiness enriches the decision, but a head-bound REST landing
             // may still succeed when GraphQL is degraded or incomplete.
@@ -4347,7 +4365,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // is, this is a real external-human wait rather than an opaque merge poll.
         if (readiness?.reviewDecision === 'REVIEW_REQUIRED') {
           try {
-            readiness = await inspectionApi.readiness(ref.slug, ref.number);
+            readiness = await readinessOf();
           } catch (error) {
             return errorDecision(error, current);
           }
