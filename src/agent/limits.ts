@@ -384,17 +384,48 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
  * how long the provider asked the client to wait, in whole seconds. */
 export interface ApiThrottle { retryAfterSeconds?: number }
 
+const MAX_THROTTLE_SECONDS = 14 * 24 * 3600;
+/** A throttle message names a wait of at most a day (a per-day request limit). */
+const MAX_THROTTLE_HINT_SECONDS = 24 * 3600;
+const DURATION_UNIT_SECONDS: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 0.001 };
+
+/** A Go-style relative duration as OpenAI writes it ("1.5s", "120ms", "6m0s"),
+ * in seconds; undefined for anything else. */
+function goDurationSeconds(text: string): number | undefined {
+  if (!/^(?:\d+(?:\.\d+)?(?:ms|h|m|s))+$/.test(text)) return undefined;
+  let seconds = 0;
+  for (const [, amount, unit] of text.matchAll(/(\d+(?:\.\d+)?)(ms|h|m|s)/g)) seconds += Number(amount) * DURATION_UNIT_SECONDS[unit!]!;
+  return seconds;
+}
+
 /** Read the wait an API response asks for (AD-3), the way the providers' own
  * SDKs do: OpenAI's `retry-after-ms`, then `Retry-After` as delta-seconds or an
- * HTTP date. Undefined for anything but a 429. */
+ * HTTP date, then OpenAI's `x-ratelimit-reset-*` (the later of the two).
+ * Undefined for anything but a 429. */
 export function apiThrottle(res: { status: number; headers: Headers }, nowMs = Date.now()): ApiThrottle | undefined {
   if (res.status !== 429) return undefined;
-  const ms = Number(res.headers.get('retry-after-ms'));
+  const usable = (seconds: number) => seconds > 0 && seconds <= MAX_THROTTLE_SECONDS;
   const raw = res.headers.get('retry-after')?.trim();
-  const seconds = res.headers.has('retry-after-ms') && Number.isFinite(ms) ? ms / 1000
-    : raw && /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw)
-      : raw ? (Date.parse(raw) - nowMs) / 1000 : NaN;
-  return seconds > 0 && seconds <= 14 * 24 * 3600 ? { retryAfterSeconds: Math.ceil(seconds) } : {};
+  const resets = ['x-ratelimit-reset-requests', 'x-ratelimit-reset-tokens']
+    .map((name) => goDurationSeconds(res.headers.get(name)?.trim() ?? '') ?? NaN).filter(usable);
+  const seconds = [
+    Number(res.headers.get('retry-after-ms') ?? NaN) / 1000,
+    raw && /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : raw ? (Date.parse(raw) - nowMs) / 1000 : NaN,
+    resets.length ? Math.max(...resets) : NaN,
+  ].find(usable);
+  return seconds === undefined ? {} : { retryAfterSeconds: Math.ceil(seconds) };
+}
+
+/** The wait a throttle's own message names, read strictly as a relative
+ * duration ("Please try again in 1.5s."). Never a clock time: the general
+ * reset parse reads "in 1.5s" as one o'clock, parking a key for half a day. */
+function throttleMessageSeconds(message: string): number | undefined {
+  const match = /\btry again in\s+(\d+(?:\.\d+)?(?:ms|h|m|s)(?:\d+(?:\.\d+)?(?:ms|h|m|s))*)(?![a-z])/i.exec(message)
+    ?? /\btry again in\s+(\d+(?:\.\d+)?)\s*(milliseconds?|seconds?|minutes?|hours?)\b/i.exec(message);
+  if (!match) return undefined;
+  const seconds = match[2] === undefined ? goDurationSeconds(match[1]!.toLowerCase())
+    : Number(match[1]) * ({ millisecond: 0.001, second: 1, minute: 60, hour: 3600 } as Record<string, number>)[match[2].toLowerCase().replace(/s$/, '')]!;
+  return seconds !== undefined && seconds > 0 ? Math.ceil(Math.min(seconds, MAX_THROTTLE_HINT_SECONDS)) : undefined;
 }
 
 /** Convert a provider message into a typed failure when it is recognizable, while
@@ -402,9 +433,10 @@ export function apiThrottle(res: { status: number; headers: Headers }, nowMs = D
  * structured provider signal should call `providerFailure` directly.
  *
  * `throttle` marks an API-key rate limit. Those windows are seconds to a minute,
- * so the reset comes from the provider's Retry-After, else any reset the message
- * names, else one minute — never the five-hour subscription fallback, which
- * parked a merely throttled key's login for the rest of the afternoon. */
+ * so the reset comes from the provider's headers, else a relative wait the
+ * message names, else one minute — never the five-hour subscription fallback,
+ * which parked a merely throttled key's login for the rest of the afternoon,
+ * nor the general reset parse, which reads subscription clock times. */
 export function providerErrorFromMessage(
   provider: ProviderFailureMetadata['provider'],
   message: string,
@@ -414,9 +446,8 @@ export function providerErrorFromMessage(
   if (isProviderPolicyRejection(message, { providerOrigin: true })) return new ProviderPolicyFailure(message, provider);
   const cls = classifyLimitError(message, { providerOrigin: true });
   if (!cls.limited) return new Error(message);
-  if (throttle && !cls.hard) {
-    cls.resetHint = throttle.retryAfterSeconds ? `in ${throttle.retryAfterSeconds}s` : cls.resetHint ?? 'in 60s';
-  }
+  if (throttle && !cls.hard)
+    cls.resetHint = `in ${throttle.retryAfterSeconds ?? throttleMessageSeconds(message) ?? 60}s`;
   const diagnostic = nativeProviderDiagnostic(message);
   return new ProviderFailure(message, {
     kind: cls.kind ?? 'quota',

@@ -17,6 +17,15 @@ for (const provider of ['claude', 'codex'] as const) describe(`${provider} API t
     { headers: { 'retry-after': new Date(Date.now() + 90_000).toUTCString() }, detail: 'too many requests', resetHint: /^in (8[89]|9[01])s$/ },
     { headers: {}, detail: 'too many requests', resetHint: 'in 60s' },
     { headers: { 'retry-after': 'soon' }, detail: 'rate limit exceeded', resetHint: 'in 60s' },
+    // A zero `retry-after-ms` does not hide a usable Retry-After.
+    { headers: { 'retry-after-ms': '0', 'retry-after': '7' }, detail: 'rate limit exceeded', resetHint: 'in 7s' },
+    // OpenAI's wording is a relative duration, never a clock time: read at
+    // 14:00, "in 1.5s" must not become 1 o'clock (#367 review item 10).
+    { headers: {}, detail: 'Rate limit reached for gpt-5 in organization org-x on tokens per min. Please try again in 1.5s.', resetHint: 'in 2s' },
+    { headers: {}, detail: 'Rate limit reached on requests per min. Please try again in 120ms.', resetHint: 'in 1s' },
+    { headers: {}, detail: 'Rate limit reached on requests per day. Please try again in 6m0s.', resetHint: 'in 360s' },
+    { headers: {}, detail: 'rate limit exceeded, try again at 5:55 PM', resetHint: 'in 60s' },
+    { headers: { 'x-ratelimit-reset-requests': '6m0s', 'x-ratelimit-reset-tokens': '1s' }, detail: 'rate limit exceeded', resetHint: 'in 360s' },
   ])('waits out an API throttle as the provider asks ($resetHint)', async ({ headers, detail, resetHint }) => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(detail, { status: 429, headers })));
     const failure: any = await adapter().runTurn(input, { emit() {} } as any).catch((error) => error);
