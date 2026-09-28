@@ -12,6 +12,11 @@ import { acquireFileLock } from '../util/file-lock.js';
  * Stored values are SECRETS resolved only by the broker; everything else in the
  * system holds opaque handles (pointers), never raw keys.
  */
+const CANARY = 'karmax-vault-canary';
+/** Not a storable handle, so the canary's ciphertext cannot stand in for an entry. */
+const CANARY_HANDLE = '\0canary';
+const boundTo = (handle: string) => Buffer.from(`karmax-vault:v2\0${handle}`, 'utf8');
+
 export class Vault {
   private keyPath: string;
   private dbPath: string;
@@ -27,6 +32,34 @@ export class Vault {
     this.key = this.loadOrCreateKey();
     this.entriesPath = path.join(dir, 'entries');
     fs.mkdirSync(this.entriesPath, { recursive: true, mode: 0o700 });
+    this.checkCanary(path.join(dir, 'vault.canary'));
+  }
+
+  /**
+   * A known ciphertext under the vault key (AU-27). A wrong `KARMAX_VAULT_KEY`
+   * otherwise surfaces only as per-entry authentication failures, while every
+   * new secret is quietly written under the wrong key, splitting the vault in
+   * two. A vault from before the canary is checked against one of its own
+   * entries before one is recorded.
+   */
+  private checkCanary(file: string): void {
+    const mismatch = () => new Error('the vault key does not open this vault: KARMAX_VAULT_KEY (or vault.key) '
+      + 'differs from the key it was created with; restore the original key');
+    if (fs.existsSync(file)) {
+      try { if (this.decrypt(fs.readFileSync(file, 'utf8'), CANARY_HANDLE) === CANARY) return; } catch {}
+      throw mismatch();
+    }
+    // One entry that opens proves the key; one damaged entry must not refuse the rest.
+    const handles = this.list();
+    if (handles.length && !handles.some(handle => {
+      try { this.decrypt(this.readEntry(handle)!, handle); return true; } catch { return false; }
+    })) throw mismatch();
+    const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(temporary, this.encrypt(CANARY, CANARY_HANDLE), { mode: 0o600, flag: 'wx' });
+    try {
+      try { fs.linkSync(temporary, file); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    } finally { fs.unlinkSync(temporary); }
   }
 
   /**
@@ -87,21 +120,35 @@ export class Vault {
     fs.renameSync(tmp, this.dbPath);
   }
 
-  private encrypt(plain: string): string {
+  /** `v2.` ciphertext authenticates its handle as additional data (AU-27), so
+   * a blob copied onto another handle's entry fails to open instead of
+   * handing that handle's reader a different secret. */
+  private encrypt(plain: string, handle: string): string {
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
+    cipher.setAAD(boundTo(handle));
     const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
-    return `${iv.toString('base64')}.${tag.toString('base64')}.${enc.toString('base64')}`;
+    return `v2.${iv.toString('base64')}.${tag.toString('base64')}.${enc.toString('base64')}`;
   }
-  private decrypt(blob: string): string {
+  /** Unbound (pre-v2) ciphertext opens only until `migrate` has bound the vault. */
+  private decrypt(blob: string, handle: string): string {
     const parts = typeof blob === 'string' ? blob.split('.') : [];
+    const bound = parts[0] === 'v2';
+    if (bound) parts.shift();
+    else if (fs.existsSync(path.join(this.entriesPath, '.bound')))
+      throw new Error(`vault entry for ${handle} is not bound to its handle; restore it from a backup`);
     const iv = parts.length === 3 ? Buffer.from(parts[0]!, 'base64') : Buffer.alloc(0);
     const tag = parts.length === 3 ? Buffer.from(parts[1]!, 'base64') : Buffer.alloc(0);
     if (iv.length !== 12 || tag.length !== 16) throw new Error('vault entry is corrupt (malformed ciphertext)');
     const decipher = crypto.createDecipheriv('aes-256-gcm', this.key, iv);
     decipher.setAuthTag(tag);
-    return Buffer.concat([decipher.update(Buffer.from(parts[2]!, 'base64')), decipher.final()]).toString('utf8');
+    if (bound) decipher.setAAD(boundTo(handle));
+    try {
+      return Buffer.concat([decipher.update(Buffer.from(parts[2]!, 'base64')), decipher.final()]).toString('utf8');
+    } catch {
+      throw new Error(`vault entry for ${handle} failed authentication (altered, moved from another handle, or a different key)`);
+    }
   }
 
   private entryPath(handle: string): string {
@@ -148,29 +195,45 @@ export class Vault {
         // Publish all entries before retiring the legacy map. A crash retries
         // this migration while readers can still use the original ciphertext.
         for (const [handle, blob] of Object.entries(this.readDb())) {
-          this.decrypt(blob);
+          this.decrypt(blob, handle);
           this.writeEntry(handle, blob);
         }
         this.writeDb({});
         fs.writeFileSync(marker, '', { mode: 0o600 });
       }
+      const bound = path.join(this.entriesPath, '.bound');
+      if (!fs.existsSync(bound)) {
+        // Re-encrypt every entry and its history under its handle, then stop
+        // accepting unbound ciphertext. Rewriting a bound blob is harmless, so
+        // a crash midway simply redoes the rest.
+        for (const handle of this.list()) {
+          const rebind = (blob: string) => blob.startsWith('v2.') ? blob : this.encrypt(this.decrypt(blob, handle), handle);
+          this.writeEntry(handle, rebind(this.readEntry(handle)!), this.history(handle).map(rebind));
+        }
+        fs.writeFileSync(bound, '', { mode: 0o600 });
+      }
       return operation();
     } finally { release?.(); }
+  }
+
+  /** Bind an existing vault (AU-27) without waiting for its next write. */
+  async migrate(): Promise<void> {
+    await this.mutate(() => {});
   }
 
   async put(handle: string, secret: string): Promise<void> {
     this.validateSecret(secret);
     await this.mutate(() => {
       const prior = this.readEntry(handle);
-      if (prior !== undefined && this.decrypt(prior) === secret) return;
+      if (prior !== undefined && this.decrypt(prior, handle) === secret) return;
       const previous = prior === undefined ? [] : [prior, ...this.history(handle)].slice(0, 5);
-      this.writeEntry(handle, this.encrypt(secret), previous);
+      this.writeEntry(handle, this.encrypt(secret, handle), previous);
     });
   }
 
   async putIfAbsent(handle: string, secret: string): Promise<void> {
     this.validateSecret(secret);
-    await this.mutate(() => { if (!this.has(handle)) this.writeEntry(handle, this.encrypt(secret)); });
+    await this.mutate(() => { if (!this.has(handle)) this.writeEntry(handle, this.encrypt(secret, handle)); });
   }
 
   async move(handle: string, nextHandle: string, replacement?: string): Promise<void> {
@@ -179,9 +242,11 @@ export class Vault {
       const secret = replacement ?? this.reveal(handle);
       if (secret === undefined) throw new Error(`credential broker: no secret for handle ${handle}`);
       const prior = this.readEntry(handle);
-      const previous = prior !== undefined && this.decrypt(prior) !== secret
+      const previous = prior !== undefined && this.decrypt(prior, handle) !== secret
         ? [prior, ...this.history(handle)].slice(0, 5) : this.history(handle);
-      this.writeEntry(nextHandle, this.encrypt(secret), previous);
+      // History is bound to the old handle; carry it across re-encrypted.
+      this.writeEntry(nextHandle, this.encrypt(secret, nextHandle),
+        previous.map(blob => nextHandle === handle ? blob : this.encrypt(this.decrypt(blob, handle), nextHandle)));
       if (nextHandle !== handle) fs.rmSync(this.entryPath(handle), { force: true });
     });
   }
@@ -192,7 +257,7 @@ export class Vault {
   reveal(handle: string, revision = 0): string | undefined {
     if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('invalid vault revision');
     const blob = revision === 0 ? this.readEntry(handle) : this.history(handle)[revision - 1];
-    return blob === undefined ? undefined : this.decrypt(blob);
+    return blob === undefined ? undefined : this.decrypt(blob, handle);
   }
   list(): string[] {
     const handles = fs.readdirSync(this.entriesPath).filter(file => /^[a-f0-9]{64}\.json$/.test(file))

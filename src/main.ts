@@ -172,7 +172,9 @@ async function main() {
         .map((value) => value?.trim()).find(Boolean)! }
       : {}),
   }));
-  const broker = new CredentialBroker(new Vault(p.vault));
+  const vault = new Vault(p.vault);
+  await vault.migrate(); // binds ciphertext written before AU-27 to its handle
+  const broker = new CredentialBroker(vault);
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');
   const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
   if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
