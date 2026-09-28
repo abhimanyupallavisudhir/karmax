@@ -1832,6 +1832,14 @@ export interface ParentResponse {
   text?: string;
 }
 
+/** A child the Do agent asked for in a turn (`create_sub_task`, SPEC §5.3). `params`
+ *  are the child's own task-form values (PL-11), validated when the tool ran. */
+export interface SubTaskRequest {
+  title: string;
+  prompt: string;
+  params?: Record<string, AgentSpec>;
+}
+
 /** A parent-agent response emitted in a turn. `childTaskId` omitted ⇒ all children
  *  currently awaiting a response (the common "confirm my sub-tasks" case). */
 export interface SubTaskResponse {

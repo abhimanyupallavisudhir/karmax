@@ -7,6 +7,10 @@
 export const MERGE_QUEUE_WORKFLOW = 'mergeQueue';
 export const AGENT_QUEUE_WORKFLOW = 'agentQueue';
 export const ACCOUNT_COORDINATOR_WORKFLOW = 'accountCoordinator';
+/** The allow-list of a turn whose credential policy could not be read: it
+ * matches no credential, so the turn waits instead of borrowing another
+ * organization's login. */
+export const CREDENTIAL_POLICY_UNAVAILABLE = 'missing:policy-unavailable';
 export const RESOURCE_PUBLISH_COORDINATOR_WORKFLOW = 'resourcePublishCoordinator';
 
 export const SIG_ENQUEUE = 'enqueue';

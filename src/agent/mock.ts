@@ -13,6 +13,8 @@ import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/
  *   @write <path> :: <content>      write a file (\n decoded to newlines)
  *   @run <command...>               run a shell command in the world
  *   @subtask <title> :: <prompt>    spawn a child task
+ *   @subtaskwith <json> :: <title> :: <prompt>
+ *                                   spawn a child task with create_sub_task `params`
  *   @branch <name> [:: <base>]      add another branch/PR to this task (multi-PR)
  *   @respond <action> [:: text]     parent answers a raising child (open_pr/confirm/comment/retry/cancel)
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
@@ -125,10 +127,18 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`ran: ${rest} (exit ${r.code})`);
           break;
         }
-        case 'subtask': {
-          const [title, prompt = ''] = splitOn(rest, '::');
-          await ctx.createSubTask({ title: title.trim(), prompt: prompt.trim() });
-          outputs.push(`subtask: ${title.trim()}`);
+        case 'subtask':
+        case 'subtaskwith': {
+          const [json, spec] = directive === 'subtaskwith' ? splitOn(rest, '::') : ['', rest];
+          const [title, prompt = ''] = splitOn(spec, '::');
+          try {
+            await ctx.createSubTask({ title: title.trim(), prompt: prompt.trim(), ...(json ? { params: JSON.parse(json) } : {}) });
+            outputs.push(`subtask: ${title.trim()}`);
+          } catch (e: any) {
+            // A refused create_sub_task is a tool error the agent reads, not a failed turn.
+            if (directive !== 'subtaskwith') throw e;
+            outputs.push(`subtask refused: ${e?.message ?? e}`);
+          }
           break;
         }
         case 'branch': {

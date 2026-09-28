@@ -27,6 +27,7 @@ import {
   QRY_ACCOUNTS,
   QRY_ACCOUNT_LEASE,
   QRY_ACCOUNT_TASK_LEASES,
+  CREDENTIAL_POLICY_UNAVAILABLE,
 } from './names.js';
 
 /**
@@ -478,6 +479,9 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     if (continuingAsNew) return { waiting: false, continuingAsNew: true as const };
     const req = queue.find((r) => r.taskId === taskId && (turnId === undefined || r.turnId === turnId));
     if (!req) return { waiting: false };
+    // A query records nothing in history, so this wording can change freely.
+    if (req.allowed?.length && req.allowed.every((id) => id === CREDENTIAL_POLICY_UNAVAILABLE))
+      return { waiting: true, detail: 'Couldn\'t read this task\'s credential policy — Retry reads it again' };
     const compatible = accounts.filter((a) => req.allowed !== undefined
       ? req.allowed.includes(a.id) : a.provider === req.provider);
     if (compatible.some((a) => a.status === 'available'))

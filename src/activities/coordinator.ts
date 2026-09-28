@@ -6,6 +6,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
   ACCOUNT_COORDINATOR_WORKFLOW,
+  CREDENTIAL_POLICY_UNAVAILABLE,
   SIG_ENQUEUE,
   SIG_RELEASE,
   SIG_PRIORITIZE,
@@ -320,7 +321,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       // the coordinator grants any account of the provider, so a real provider
       // whose policy could not be resolved (the workflow's `.catch(() =>
       // undefined)`) must fail closed. Only the mock keeps the provider fallback.
-      if (provider && provider !== 'mock' && allowed === undefined) allowed = ['missing:policy-unavailable'];
+      if (provider && provider !== 'mock' && allowed === undefined) allowed = [CREDENTIAL_POLICY_UNAVAILABLE];
       (await timing(taskId, turnId, 'queue.account.requested'));
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
