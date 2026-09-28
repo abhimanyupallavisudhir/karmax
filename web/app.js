@@ -2644,7 +2644,7 @@ function renderMarkdown(src, opts = {}) {
   const cache = renderMarkdown.cache ||= new Map();
   const key = JSON.stringify([src, opts]);
   if (cache.has(key)) return cache.get(key);
-  const html = globalThis.TavyaMarkdown.renderMarkdown(src, opts);
+  const html = globalThis.KarmaxMarkdown.renderMarkdown(src, opts);
   if (key.length + html.length <= 64_000) {
     if (cache.size >= 128) cache.delete(cache.keys().next().value);
     cache.set(key, html);
@@ -2652,7 +2652,7 @@ function renderMarkdown(src, opts = {}) {
   return html;
 }
 function ensureMathJax() {
-  return globalThis.TavyaMarkdown.ensureMathJax();
+  return globalThis.KarmaxMarkdown.ensureMathJax();
 }
 function typesetMath(root) {
   const scope = root || document.getElementById('ck-thread');

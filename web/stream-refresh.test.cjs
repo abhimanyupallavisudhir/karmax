@@ -52,7 +52,7 @@ test('LT-5: each agent keeps its own live text; another agent\'s events never cl
 });
 test('RQ-1: markdown renders are cached with bounded text size and option-sensitive keys', () => {
   let renders = 0;
-  const ctx = vm.createContext({ globalThis: { TavyaMarkdown: { renderMarkdown: (text, opts) => { renders++; return text + opts.math; } } }, Map });
+  const ctx = vm.createContext({ globalThis: { KarmaxMarkdown: { renderMarkdown: (text, opts) => { renders++; return text + opts.math; } } }, Map });
   vm.runInContext(fn('renderMarkdown'), ctx);
   assert.equal(ctx.renderMarkdown('hello', { math: true }), 'hellotrue');
   ctx.renderMarkdown('hello', { math: true }); assert.equal(renders, 1);

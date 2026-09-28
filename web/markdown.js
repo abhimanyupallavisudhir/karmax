@@ -341,5 +341,5 @@
     });
     return mathjaxLoad;
   }
-  globalThis.TavyaMarkdown = { renderMarkdown, ensureMathJax };
+  globalThis.KarmaxMarkdown = { renderMarkdown, ensureMathJax };
 })();
