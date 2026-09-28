@@ -11,11 +11,7 @@ import { sourceTextAssertions, testFiles } from './helpers/source-text-assertion
  */
 const REMAINING: Record<string, number> = {
   'tests/account-diagnostics-ui.test.ts': 5,
-  'tests/gateway-safe-mode.test.ts': 1,
-  'tests/google-signin.test.ts': 2,
-  'tests/memory-guard.test.ts': 1,
   'tests/provider-connections-ui.test.ts': 9,
-  'tests/task-picker-ui.test.ts': 1,
   'tests/ui-agent-settings.test.ts': 5,
   'tests/ui-deverbosification.test.ts': 9,
   'tests/web-confirmer.test.ts': 10,
@@ -44,10 +40,15 @@ it('recognises an assertion on source text but not on behaviour', async () => {
     const app = fs.readFileSync(path.resolve('${web}/app.js'), 'utf8');
     const section = app.slice(app.indexOf('function a('), app.indexOf('function b('));
     const run = new Function('esc', section + '; return a;');
+    const script = fileURLToPath(new URL('../${src}/agent/memory-guard.sh', import.meta.url));
+    const log = fs.readFileSync(path.join(dir, 'script.log'), 'utf8');
+    const pick = () => spawnSync('sh', [script, 'pick'], { encoding: 'utf8' });
     expect(section).toContain('literal');
     expect(app).not.toMatch(/old/);
     expect(fs.readFileSync('${src}/main.ts', 'utf8')).toContain('x');
     expect(run(String)('input')).toContain('rendered');
+    expect(pick().stdout).toMatch(/killed/);
+    expect(log).toMatch(/killed/);
     expect(await page.locator('main').innerText()).toContain('visible');
   `);
   try { expect(sourceTextAssertions(file)).toBe(3); } finally { fs.rmSync(dir, { recursive: true, force: true }); }

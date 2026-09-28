@@ -7,9 +7,9 @@ import path from 'node:path';
  * under src/ or web/). Such a test passes while the behaviour is broken and
  * fails when the code is merely reworded (CI-15). A value is source text if
  * it is read from src/ or web/, or derived from such a value, by any
- * `const`/`let` declaration or assignment in the file. Source compiled and
- * run (`Function(...)`, `vm`) is not text: asserting on what it returns tests
- * behaviour.
+ * `const`/`let` declaration or assignment in the file. Source compiled or
+ * run (`Function(...)`, `vm`, a spawned script) is not text: asserting on
+ * what it returns tests behaviour.
  */
 export function sourceTextAssertions(file: string): number {
   const text = fs.readFileSync(file, 'utf8');
@@ -21,9 +21,11 @@ export function sourceTextAssertions(file: string): number {
     grew = false;
     for (const { name, value } of bindings) {
       if (tainted.has(name)) continue;
-      // Compiling the source into something callable executes it: its results are behaviour.
-      if (/\bFunction\(|\bvm\.|runInContext|runInNewContext|\beval\(/.test(value)) continue;
-      if (reads.test(value) || [...tainted].some((source) => new RegExp(`\\b${escape(source)}\\b`).test(value))) {
+      // Compiling or running the source executes it: its results are behaviour.
+      if (/\bFunction\(|\bvm\.|runInContext|runInNewContext|\beval\(|\b(?:spawn|exec|execFile)(?:Sync)?\(/.test(value)) continue;
+      // A name inside a quoted string ('memory-guard.log') is not a use of that binding.
+      const code = value.replace(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"/g, "''");
+      if (reads.test(value) || [...tainted].some((source) => new RegExp(`\\b${escape(source)}\\b`).test(code))) {
         tainted.add(name);
         grew = true;
       }
