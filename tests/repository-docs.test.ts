@@ -21,8 +21,12 @@ describe('repository guidance', () => {
     // Deployment code runs on production with its secrets: an owner reviews it.
     const owners = read('.github/CODEOWNERS').split('\n').filter(line => line.trim() && !line.startsWith('#'))
       .map(line => line.trim().split(/\s+/));
-    for (const pattern of ['/.github/workflows/', '/.github/actions/', '/deploy/', '/.github/CODEOWNERS'])
+    for (const pattern of ['/.github/workflows/', '/.github/actions/', '/deploy/', '/.github/CODEOWNERS',
+      '/package.json', '/package-lock.json', '/src/autonomy/vault.ts', '/src/world/reference-keys.ts', '/src/config/deployment.ts'])
       expect(owners.find(([path]) => path === pattern)?.slice(1), pattern).toContain('@abhimanyupallavisudhir');
+    // Pull requests are opened as the owner, who cannot approve their own.
+    expect(read('.github/CODEOWNERS')).toMatch(/second\s+reviewer/);
+    expect(read('CONTRIBUTING.md')).toMatch(/second\s+reviewer/);
   });
 
   it('requires the first Node release with the SQLite APIs the app uses', () => {

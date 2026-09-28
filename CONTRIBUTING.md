@@ -18,7 +18,11 @@ issue tracker.
    pins), with a replay test from a history recorded before the change.
 4. One change per commit, with an imperative subject; the body says why.
 
-A pull request needs the **typecheck + tests** check to pass. Changes to
-`.github/workflows/` or `deploy/` also need a code owner's review
-([.github/CODEOWNERS](.github/CODEOWNERS)): that code runs on production with
-its secrets.
+A pull request needs the **typecheck + tests** check to pass.
+[.github/CODEOWNERS](.github/CODEOWNERS) names an owner for the code that runs
+with production's secrets or handles its keys (workflows, `deploy/`, the
+dependency manifests, the vault and key handling). Enforcing it needs a second
+reviewer identity (a team or a reviewer account) in that file first: pull
+requests are opened as the owner account, and GitHub does not let an author
+approve their own, so requiring code owner review with the owner alone would
+block every such change.
