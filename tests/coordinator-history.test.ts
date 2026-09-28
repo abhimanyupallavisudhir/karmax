@@ -1,6 +1,7 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({ handlers: new Map<string, (...args: any[]) => any>(),
-  signal: vi.fn(async () => undefined), rotate: vi.fn(), sleep: vi.fn(), condition: vi.fn(), patches: true }));
+  signal: vi.fn(async () => undefined), rotate: vi.fn(), sleep: vi.fn(), condition: vi.fn(), patches: true,
+  info: { historyLength: 1, continueAsNewSuggested: false } }));
 vi.mock('@temporalio/workflow', async (original) => ({
   ...await original<typeof import('@temporalio/workflow')>(),
   defineSignal: (name: string) => name, defineQuery: (name: string) => name, defineUpdate: (name: string) => name,
@@ -13,13 +14,14 @@ vi.mock('@temporalio/workflow', async (original) => ({
   patched: () => state.patches,
   allHandlersFinished: () => true,
   log: { warn: vi.fn() },
-  workflowInfo: () => ({ historyLength: 1, continueAsNewSuggested: false }),
+  workflowInfo: () => state.info,
 }));
 import { accountCoordinator } from '../src/coordinators/account.js';
 import { mergeQueue } from '../src/coordinators/merge-queue.js';
 const stop = new Error('continue-as-new');
 beforeEach(() => {
   state.handlers.clear(); state.signal.mockClear(); state.patches = true;
+  state.info = { historyLength: 1, continueAsNewSuggested: false };
   state.rotate.mockReset().mockImplementation(async () => { throw stop; });
   state.condition.mockReset().mockImplementation(async (predicate: () => boolean) => {
     if (state.condition.mock.calls.length > 10) throw new Error('spin');
@@ -63,6 +65,24 @@ it('parks a bounded-history credential wall instead of spinning on a request it 
   await expect(accountCoordinator({ state: { accounts: [{ id: 'login', provider: 'mock', configHome: '/test',
     status: 'needs-attention', inUse: 0, maxConcurrent: 1 }], queue: [{ taskId: 'waiting', turnId: 'turn', allowed: ['login'] }],
     processed: 0, historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.signal).not.toHaveBeenCalled();
+});
+
+it('carries an owed credential re-list across a history rotation', async () => {
+  const account = { id: 'login', provider: 'mock', configHome: '/test', status: 'exhausted', resetAt: Date.now() + 3_600_000,
+    inUse: 0, maxConcurrent: 1 };
+  const queue = [{ taskId: 'waiting', turnId: 'turn', allowed: ['login'] }];
+  state.condition.mockImplementation(async (predicate: () => boolean, timeout?: number) => {
+    if (timeout === undefined) return true;
+    // A credential sync arrives while the request is parked, and the history
+    // fills before the loop gets to hand the request back.
+    state.handlers.get('registerAccounts')!({ accounts: [{ id: 'login', configHome: '/test', provider: 'mock' }] });
+    state.info = { historyLength: 1, continueAsNewSuggested: true };
+    return predicate();
+  });
+  await expect(accountCoordinator({ state: { accounts: [account], queue, processed: 0,
+    historyPolicyVersion: 2 } } as any)).rejects.toBe(stop);
+  expect(state.rotate).toHaveBeenCalledWith({ state: expect.objectContaining({ queue, relistRequested: true }) });
   expect(state.signal).not.toHaveBeenCalled();
 });
 

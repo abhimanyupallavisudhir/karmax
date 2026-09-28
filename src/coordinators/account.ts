@@ -140,6 +140,8 @@ export interface AccountCoordinatorState {
   granted?: GrantedAccountLease[];
   processed: number;
   historyPolicyVersion?: 2;
+  /** A credential change the parked requests have not yet been asked to re-list. */
+  relistRequested?: true;
 }
 
 export interface AccountView {
@@ -229,7 +231,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   let waitForCredentials = patched('account-coordinator-credential-wait-v1');
   // Set when credentials changed under parked requests (a credential sync or a
   // policy edit); the loop then asks each parked owner to request again.
-  let relistRequested = false;
+  let relistRequested = input.state?.relistRequested === true;
   /**
    * Parked allow-lists were resolved against the credentials of their day. A
    * sync is the only notice the coordinator gets that they changed, and only
@@ -504,7 +506,10 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     // Migrate at a command boundary; the new loop policy lives in the next run's input.
     if ((!boundedHistory && patched('account-history-policy-v2')) || (boundedHistory && historyFull())) {
       continuingAsNew = true;
-      await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, granted, processed: 0, historyPolicyVersion: 2 } });
+      // A credential change still owed to parked requests must survive the
+      // rotation, or they would keep waiting on their stale allow-lists.
+      await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, granted, processed: 0, historyPolicyVersion: 2,
+        ...(relistRequested && queue.length ? { relistRequested: true as const } : {}) } });
     }
   }
 
