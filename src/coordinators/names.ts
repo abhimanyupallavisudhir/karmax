@@ -7,7 +7,6 @@
 export const MERGE_QUEUE_WORKFLOW = 'mergeQueue';
 export const AGENT_QUEUE_WORKFLOW = 'agentQueue';
 export const ACCOUNT_COORDINATOR_WORKFLOW = 'accountCoordinator';
-export const BUDGET_COORDINATOR_WORKFLOW = 'budgetCoordinator';
 export const RESOURCE_PUBLISH_COORDINATOR_WORKFLOW = 'resourcePublishCoordinator';
 
 export const SIG_ENQUEUE = 'enqueue';
@@ -59,12 +58,6 @@ export const QRY_ACCOUNTS = 'accounts';
 export const QRY_ACCOUNT_LEASE = 'accountLease';
 /** Finds every parked credential request owned by a task for out-of-band stop/drain. */
 export const QRY_ACCOUNT_TASK_LEASES = 'accountTaskLeases';
-
-export const SIG_REQUEST_SPEND = 'requestSpend';
-export const SIG_APPROVE_SPEND = 'approveSpend';
-export const SIG_DENY_SPEND = 'denySpend';
-export const SIG_SPEND_RESULT = 'spendResult';
-export const QRY_BUDGET = 'budget';
 
 export function mergeQueueId(domain: string): string {
   return `merge-queue:${domain}`;

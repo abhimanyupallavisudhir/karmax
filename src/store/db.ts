@@ -78,6 +78,8 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
+import { PermissionRequests } from '../platform/permission-requests.js';
+import { withPullRequestStates } from '../integrations/github-pr.js';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -100,6 +102,22 @@ export interface CollaborationRequest {
 }
 
 /**
+ * Where a workflow publication sits in its task's history (WF-27): the
+ * publishing run, the view's `updatedAt` (that run's history length, so
+ * monotonic within the run) and the conversation revision it references.
+ */
+export interface ViewPublicationOrder {
+  runId: string;
+  seq: number;
+  revision?: number;
+}
+
+/** A task's accepted publication position plus the runs it has moved past. */
+interface ViewOrderState { runId: string; seq: number; revision: number; retired: string[] }
+/** Runs a task replaces are few; remember enough to outlast a straggler. */
+const RETIRED_VIEW_RUNS = 16;
+
+/**
  * Terminal statuses that auto-archive a task when it first reaches one (see
  * `Store.saveView`). Only fully-resolved outcomes — a failed task stays visible
  * because it usually needs attention.
@@ -118,6 +136,13 @@ const AUTO_ARCHIVE_STATUS = new Set<string>(['done', 'cancelled']);
  * mid-flight, destroying the only record of what the agent was doing when it broke.
  */
 const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
+
+/**
+ * Statuses that withdraw a task's pending permission requests (PL-10). Not
+ * `failed`, for the reason above: reconcile fails every task a crash stopped, and
+ * recovery resumes them still waiting on their requests.
+ */
+const WITHDRAW_REQUESTS_STATUS = new Set<string>(['done', 'cancelled']);
 
 /**
  * Does an event type mean "a human is being asked to review this"? Such events
@@ -3757,8 +3782,60 @@ export class Store {
     return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
   }
 
-  async saveView(taskId: string, view: TaskView, conversationReference?: string) {
+  /**
+   * Would this publication be older than one the task has already saved? A
+   * run's later publication supersedes its earlier ones, and a run's successor
+   * supersedes all of it: once a new run has published, only a straggler of the
+   * old run can still arrive. Equal positions are the same publication retried,
+   * or siblings of one workflow task, and are admitted.
+   */
+  async viewPublicationStale(taskId: string, order: ViewPublicationOrder): Promise<boolean> {
+    const raw = (await this.kvGet(`view-order:${taskId}`));
+    const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
+    if (!state) return false;
+    if (state.retired.includes(order.runId)) return true;
+    return state.runId === order.runId
+      && (order.seq < state.seq || (order.seq === state.seq && (order.revision ?? -1) < state.revision));
+  }
+
+  /** Stop admitting publications from a run the platform stopped itself (a
+   * manual Done): no successor run will publish to retire it. */
+  async retireViewRun(taskId: string, runId: string): Promise<void> {
     return this.db.transaction(async () => {
+      const raw = (await this.kvGet(`view-order:${taskId}`));
+      const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
+      if (state?.retired.includes(runId)) return;
+      const retired = [...(state?.retired ?? []), runId].slice(-RETIRED_VIEW_RUNS);
+      (await this.kvSet(`view-order:${taskId}`, JSON.stringify({ runId: state?.runId ?? '', seq: state?.seq ?? 0,
+        revision: state?.revision ?? -1, retired })));
+    });
+  }
+
+  private async admitViewPublication(taskId: string, order: ViewPublicationOrder): Promise<boolean> {
+    if ((await this.viewPublicationStale(taskId, order))) return false;
+    const raw = (await this.kvGet(`view-order:${taskId}`));
+    const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
+    const retired = state && state.runId && state.runId !== order.runId && !state.retired.includes(state.runId)
+      ? [...state.retired, state.runId].slice(-RETIRED_VIEW_RUNS) : state?.retired ?? [];
+    (await this.kvSet(`view-order:${taskId}`, JSON.stringify({ runId: order.runId, seq: order.seq,
+      revision: order.revision ?? -1, retired } satisfies ViewOrderState)));
+    return true;
+  }
+
+  /** PL-10: a finished task's pending permission requests are withdrawn, and
+   * their withdrawal discharges the recipients' inbox like a decision would. */
+  private async withdrawPermissionRequests(projectId: string, taskId: string, status: string): Promise<void> {
+    const organizationId = (await this.getProject(projectId))?.organizationId ?? 'org_personal';
+    const reason = `task ${status}`;
+    for (const request of (await new PermissionRequests(this, organizationId).withdrawForTask(taskId, reason)))
+      (await this.appendEvent({ taskId, type: 'permission.approval-resolved', ts: Date.now(),
+        payload: { requestId: request.id, action: 'withdraw', reason } }));
+  }
+
+  /** Returns false, and changes nothing, for a publication `order` shows is stale. */
+  async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder): Promise<boolean> {
+    return this.db.transaction(async () => {
+    if (order && !(await this.admitViewPublication(taskId, order))) return false;
 
     const pending = (await this.kvGet(`pending-review:${taskId}`));
     if (pending && Object.entries(JSON.parse(pending)).every(([key, value]) =>
@@ -3776,6 +3853,7 @@ export class Store {
     // already done/cancelled) so a later view re-save can't override a user who
     // deliberately un-archived a finished task.
     const prev = (await this.taskMetadata(taskId));
+    view = withPullRequestStates(view, prev?.lastView, { mergedOnly: true });
     const { messages, transcripts, ...status } = view;
     if (conversationReference) {
       const key = `view-conversation:${taskId}:${conversationReference}`;
@@ -3787,6 +3865,12 @@ export class Store {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
           .run(JSON.stringify(status), key, conversationReference, taskId));
         (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
+        // DB-2: the task row now holds this conversation, and a publication that
+        // still refers to the one it replaces is stale (`viewPublicationStale`).
+        // Keeping each superseded full copy until the task settled grew kv with
+        // the square of a long conversation's length.
+        if (current?.conversationRef)
+          (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`view-conversation:${taskId}:${current.conversationRef}`));
       }
     } else if (messages === undefined && transcripts === undefined) {
       // A status-only view (reconcile and lifecycle repairs read `lastView`
@@ -3817,11 +3901,14 @@ export class Store {
     // an already-finished task is not a repeated delete over the same rows.
     const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
     if (settledNow) (await this.pruneAgentOutput(taskId));
+    if (prev && WITHDRAW_REQUESTS_STATUS.has(view.status) && !WITHDRAW_REQUESTS_STATUS.has(prev.lastView?.status ?? ''))
+      (await this.withdrawPermissionRequests(prev.projectId, taskId, view.status));
     // `retentionSweep` measures its window from here: a workflow's `updatedAt`
     // is its history length, not a time. Resuming the task restarts the clock.
     if (['done', 'cancelled', 'failed'].includes(view.status))
       (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:settled:${taskId}`, String(Date.now())));
     else (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:settled:${taskId}`));
+    return true;
 
     });
   }
@@ -5163,9 +5250,9 @@ export class Store {
       await this.kvDeletePrefix(sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`,
-        `retention:settled:${taskId}`, `retention:view:${taskId}`]) (await exact.run(key));
+        `retention:settled:${taskId}`, `retention:view:${taskId}`, `view-order:${taskId}`]) (await exact.run(key));
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `turnspawns:${taskId}#`, `task-create:${taskId}:`,
-        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) await this.kvDeletePrefix(value);
+        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`, `resource-checkpoint:${taskId}:`]) await this.kvDeletePrefix(value);
     }
   
     });
@@ -5179,6 +5266,12 @@ export class Store {
     const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
     for (const taskId of taskIds) (await exact.run(`permission:grant:${taskId}`));
     if (!organizationId) return;
+    for (const taskId of taskIds) {
+      const prefix = `permission:request:${organizationId}:${taskId}:`;
+      for (const { key } of (await this.kvEntries(prefix))) (await exact.run(`permission:deciding:${key.slice(prefix.length)}`));
+      (await this.kvDeletePrefix(prefix));
+    }
+    // An organization whose requests predate per-request rows (PL-8).
     const key = `permission:requests:${organizationId}`;
     const raw = (await this.kvGet(key));
     if (!raw) return;
@@ -7535,7 +7628,7 @@ export class Store {
    */
   async retentionSweep(now = Date.now()): Promise<{ scopedTokens: number; humanDelegations: number; githubDeliveries: number;
     githubPrObservations: number; subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number;
-    events: number; auditEntries: number }> {
+    permissionRequests: number; events: number; auditEntries: number }> {
     return this.db.transaction(async () => {
 
     // Keep immutable snapshots through a retry window. A late activity retry can
@@ -7546,23 +7639,53 @@ export class Store {
     (await this.db.prepare(`INSERT OR IGNORE INTO kv(k,v) SELECT 'retention:settled:' || id, ? FROM tasks
       WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`).run(String(now)));
-    const settled = await this.db.prepare(`SELECT tasks.id, tasks.conversationRef FROM tasks
+    // Marker '2' also covers turn checkpoints in every key form (RT-30a), so
+    // tasks the earlier sweep marked '1' are swept once more.
+    const settled = await this.db.prepare(`SELECT tasks.id, tasks.conversationRef,
+        json_extract(tasks.params, '$._workflowRunId') runId FROM tasks
       JOIN kv settle ON settle.k='retention:settled:' || tasks.id
       WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
         AND CAST(settle.v AS BIGINT) < ?
-        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`)
-      .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null }>;
+        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id AND v='2')`)
+      .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null; runId: string | null }>;
     for (const task of settled) {
       const snapshotPrefix = `view-conversation:${task.id}:`;
       viewSnapshots += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<? AND k<>?`)
         .run(snapshotPrefix, `view-conversation:${task.id};`, `${snapshotPrefix}${task.conversationRef ?? ''}`)).changes);
       const fencePrefix = `view-publication-fence:${task.id}:`;
+      // Legacy turn ids are keyed by run, not task: the runs this task published
+      // from are named in its fences, and its last run in its params.
+      const runs = new Set((await this.kvEntries(fencePrefix)).map(({ key }) => key.slice(fencePrefix.length).split(':')[0]!));
+      if (typeof task.runId === 'string' && task.runId) runs.add(task.runId);
       publicationFences += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
         .run(fencePrefix, `view-publication-fence:${task.id};`)).changes);
-      const sessionPrefix = `turnsession:${task.id}#`;
-      turnSessions += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
-        .run(sessionPrefix, `turnsession:${task.id}$`)).changes);
-      (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:view:${task.id}`, '1'));
+      // The same checkpoints a terminal publication clears (`clearTurnCheckpoints`),
+      // for tasks that settled before it did.
+      for (const prefix of [`turnsession:${task.id}#`, `turnsession:${task.id}:`, `turnresult:${task.id}:`,
+        `turnspawns:${task.id}#`, `task-create:${task.id}:`,
+        ...[...runs].filter(Boolean).flatMap((run) => [`turnsession:legacy:${run}:`, `turnspawns:legacy:${run}:`])])
+        turnSessions += (await this.kvDeletePrefix(prefix));
+      (await this.db.prepare('INSERT INTO kv(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v = excluded.v')
+        .run(`retention:view:${task.id}`, '2'));
+    }
+
+    // Decided permission requests outlive their decision events by nothing: both
+    // go after the event window. Pending ones stay until decided or withdrawn.
+    let permissionRequests = 0;
+    const pendingTasks = new Map<string, string>();
+    for (const { key, value } of (await this.kvEntries('permission:request:'))) {
+      let request: { status?: string; taskId?: string; projectId?: string; createdAt?: number; resolution?: { at?: number }; withdrawn?: { at?: number } };
+      try { request = JSON.parse(value); } catch { continue; }
+      if (request.status === 'pending' && request.taskId && request.projectId) pendingTasks.set(request.taskId, request.projectId);
+      const decidedAt = request.resolution?.at ?? request.withdrawn?.at ?? request.createdAt;
+      if (request.status === 'pending' || !(Number(decidedAt) < now - 90 * 86400_000)) continue;
+      (await this.db.prepare('DELETE FROM kv WHERE k=?').run(key));
+      permissionRequests++;
+    }
+    // Tasks that finished before finishing withdrew their requests (#400).
+    for (const [taskId, projectId] of pendingTasks) {
+      const row = (await this.db.prepare("SELECT json_extract(lastView, '$.status') status FROM tasks WHERE id=?").get(taskId)) as { status?: string } | undefined;
+      if (WITHDRAW_REQUESTS_STATUS.has(row?.status ?? '')) (await this.withdrawPermissionRequests(projectId, taskId, String(row!.status)));
     }
 
     return {
@@ -7574,7 +7697,7 @@ export class Store {
         .run(now - 30 * 86400_000)).changes),
       subscriptionRequests: Number((await this.db.prepare(`DELETE FROM subscription_billing_requests
         WHERE createdAt<? AND responseJson IS NOT NULL`).run(now - 30 * 24 * 60 * 60 * 1000)).changes),
-      viewSnapshots, publicationFences, turnSessions,
+      viewSnapshots, publicationFences, turnSessions, permissionRequests,
       events: Number((await this.db.prepare(`DELETE FROM events WHERE seq IN
         (SELECT e.seq FROM events e WHERE e.ts<?
           AND (e.type NOT IN ('credential.approval-requested', 'permission.approval-requested',
@@ -7664,11 +7787,12 @@ export class Store {
 
   /** Delete every key starting with `prefix` through the primary-key range; the
    * literal prefix check keeps exact semantics under any collation (PS-8). */
-  private async kvDeletePrefix(prefix: string): Promise<void> {
+  private async kvDeletePrefix(prefix: string): Promise<number> {
     const key = this.kvRangeKey();
     const end = this.kvPrefixEnd(prefix);
-    if (end) await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND ${key} < ? AND substr(k, 1, length(?))=?`).run(prefix, end, prefix, prefix);
-    else await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND substr(k, 1, length(?))=?`).run(prefix, prefix, prefix);
+    return Number((end
+      ? await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND ${key} < ? AND substr(k, 1, length(?))=?`).run(prefix, end, prefix, prefix)
+      : await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND substr(k, 1, length(?))=?`).run(prefix, prefix, prefix)).changes);
   }
 
   async kvEntries(prefix: string): Promise<Array<{ key: string; value: string }>> {

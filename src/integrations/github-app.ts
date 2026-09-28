@@ -1233,12 +1233,14 @@ export class GitHubAppService {
     return true;
   }
 
-  async brokerCredentials(repository: Repository): Promise<{ httpsToken: string; env: Record<string, string> }> {
+  /** The organization's enrollment of the repository scopes the broker's host
+   * mirror: tenants that enrolled the same repository never share objects. */
+  async brokerCredentials(repository: Repository): Promise<{ httpsToken: string; env: Record<string, string>; mirrorScope: string }> {
     if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
     const connection = (await this.store.getGitConnection(repository.gitConnectionId));
     if (!connection || connection.organizationId !== repository.organizationId) throw new Error('repository GitHub App connection is missing');
     const token = await this.installationToken(connection, [repository.providerId ?? '']);
-    return { httpsToken: token, env: { GH_TOKEN: token } };
+    return { httpsToken: token, env: { GH_TOKEN: token }, mirrorScope: repository.id };
   }
 
   /** Repository-bound Actions client. Tokens remain inside this service and a

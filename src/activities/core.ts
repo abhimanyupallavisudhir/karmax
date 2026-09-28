@@ -21,7 +21,7 @@ import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
-import { Store } from '../store/db.js';
+import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
 import { World, WorldHandle, WorldKind, WorldSpec, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
@@ -105,7 +105,7 @@ import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
-import type { ForkWorldSource } from '../world/fork.js';
+import { forkDevelopmentSources, forkRecordedAuthority, type ForkWorldSource } from '../world/fork.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
 import { syncLocalTarget, type LocalTargetSyncResult } from '../world/target-sync.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
@@ -1293,8 +1293,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (e) {
         (await record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" clone credentials: ${e instanceof Error ? e.message : e}` }));
       }
-      const developmentSources = (args.repos?.length ? args.repos : args.repo ? [args.repo] : [])
-        .map((source) => source.trim()).filter(Boolean);
       // The project wiki is a platform-owned companion repository for source
       // work. A zero-repo task reads and mutates project state through the
       // platform API, so attaching the wiki there would secretly reintroduce a
@@ -1304,6 +1302,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : undefined;
       if (project && !(await store.projectWiki(project.id))) (await store.setProjectWikiRepository(project.id));
       const wikiRepository = project ? (await store.projectWiki(project.id))?.repository : undefined;
+      const developmentSources = forkDevelopmentSources((args.repos?.length ? args.repos : args.repo ? [args.repo] : [])
+        .map((source) => source.trim()).filter(Boolean), forkCheckpoint, [wikiRoot, wikiRepository?.sshUrl]);
       if (remote && developmentSources.length > 0 && project && (!wikiRepository || !wikiRepository.private))
         throw new Error('the project wiki needs a private GitHub remote before a cloud world can be created');
       const requestedSources = [
@@ -1364,8 +1364,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ?? (candidate.baseBranch ? base : commonBranchesResolved ? args.target ?? base : candidate.repository.defaultBranch);
         return [[source, { base, target }]];
       }));
-      const repositoryAuthorities: Record<string, 'origin'> = Object.fromEntries(worldSources.flatMap((source, index) =>
+      const repositoryAuthorities: Record<string, 'project' | 'origin'> = Object.fromEntries(worldSources.flatMap((source, index) =>
         githubIsAuthority && githubSlug(transportSources[index]!) ? [[source, 'origin' as const]] : []));
+      forkRecordedAuthority(forkCheckpoint, requestedSources).forEach((authority, index) => {
+        if (authority) repositoryAuthorities[worldSources[index]!] = authority;
+      });
       const repositoryOrigins = Object.fromEntries(worldSources.flatMap((source, index) =>
         !remote && sourceResolutions[index]?.localPath && transportSources[index] !== source
           ? [[source, transportSources[index]!]]
@@ -2939,8 +2942,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // `<base>...HEAD` would drop along with every uncommitted change.
         const forkPoint = await world.exec('git', ['merge-base', repoBase, 'HEAD'], { cwd: repo.root });
         const since = forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : repoBase;
-        const tracked = await world.exec('git', ['diff', '--name-only', since], { cwd: repo.root });
-        const untracked = await world.exec('git', ['ls-files', '--others', '--exclude-standard'], { cwd: repo.root });
+        // NUL-separated output is never C-quoted, whatever the world's Git config
+        // (non-ASCII, quotes and newlines in names survive verbatim; WD-27).
+        const tracked = await world.exec('git', ['diff', '-z', '--name-only', since], { cwd: repo.root });
+        const untracked = await world.exec('git', ['ls-files', '-z', '--others', '--exclude-standard'], { cwd: repo.root });
         // A companion wiki must not make the sole development checkout appear
         // artificially nested. Keep a stable prefix for wiki changes, while
         // genuine multi-development-repo worlds retain repository prefixes.
@@ -2950,8 +2955,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? `${repo.name}/`
             : '';
         changedFiles.push(
-          ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file}`),
-          ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file} (new)`),
+          ...tracked.stdout.split('\0').filter(Boolean).map((file) => `${prefix}${file}`),
+          ...untracked.stdout.split('\0').filter(Boolean).map((file) => `${prefix}${file} (new)`),
         );
       }
       const bounded = reviewFiles(changedFiles);
@@ -2973,11 +2978,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const dirty: string[] = [];
       const conflicts: string[] = [];
       for (const repo of worldRepos(world.handle)) {
-        const unresolved = await world.exec('git', ['diff', '--name-only', '--diff-filter=U'], { cwd: repo.root });
+        const unresolved = await world.exec('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '--diff-filter=U'], { cwd: repo.root });
         if (unresolved.stdout.trim()) {
           conflicts.push(...unresolved.stdout.trim().split('\n').filter(Boolean).map((file) => `${repo.name}/${file}`));
         }
-        const status = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+        const status = await world.exec('git', ['-c', 'core.quotePath=false', 'status', '--porcelain'], { cwd: repo.root });
         if (status.code !== 0) {
           return { ready: false, note: `could not inspect checkout "${repo.name}": ${status.stderr || status.stdout || 'git status failed'}` };
         }
@@ -5095,6 +5100,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
+      // WF-27: an attempt that timed out still completes, and a stopped run's
+      // last publication can land after its successor's. Drop what the task has
+      // already moved past, before it can rewrite the view. A full publication
+      // still records its snapshot first: the run's next frames may refer to it.
+      let order: ViewPublicationOrder | undefined;
+      try {
+        const runId = activityContext.current().info.workflowExecution?.runId;
+        const revision = runId && conversationReference?.startsWith(`${runId}:`)
+          ? Number(conversationReference.slice(runId.length + 1)) : undefined;
+        if (runId && typeof publication.updatedAt === 'number')
+          order = { runId, seq: publication.updatedAt, ...(Number.isSafeInteger(revision) ? { revision } : {}) };
+      } catch { /* direct invocation has no run to order by */ }
+      const stale = order !== undefined && (await store.viewPublicationStale(taskId, order));
+      if (stale && !(conversationReference && publication.messages !== undefined)) return;
       let view: TaskView;
       if (conversationReference) {
         // Immutable, task-scoped snapshots survive worker restarts and activity
@@ -5106,9 +5125,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (existing !== undefined && existing !== json)
             throw ApplicationFailure.nonRetryable('Conversation publication reference was reused', 'view-publication');
           (await store.kvSet(key, json));
+          if (stale) return;
         }
-        if (!(await store.kvHas(key)))
+        if (!(await store.kvHas(key))) {
+          // A concurrent, newer publication of this run may have replaced and
+          // dropped the snapshot since the order check above (DB-2).
+          if (order && (await store.viewPublicationStale(taskId, order))) return;
           throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+        }
         // The store can reuse the immutable conversation directly in SQL. A
         // status publication must never parse/rewrite the historical transcript.
         view = { ...publication, messages: publication.messages ?? [] };
@@ -5162,7 +5186,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await trace.mark(`queue.observed.${after?.state ?? 'released'}`));
         }
       }
-      (await store.saveView(taskId, view, conversationReference));
+      if (!(await store.saveView(taskId, view, conversationReference, order))) return;
       await notifyChildSettlement(store, deps.client, view);
       if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
         let runId: string | undefined;

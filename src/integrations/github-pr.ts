@@ -718,6 +718,18 @@ export function reconcilePullRequestView(
 }
 
 /**
+ * Apply the PR states `source` records to the same PRs in `view` (WF-32).
+ * `mergedOnly` carries just merges, which are immutable, for when `source`
+ * may be older than `view`: a workflow never sees a webhook's reconciliation,
+ * so its next publication would otherwise report a merged PR open again.
+ */
+export function withPullRequestStates(view: TaskView, source: TaskView | undefined, options: { mergedOnly?: boolean } = {}): TaskView {
+  const known = source ? [source.pr, ...(source.prs ?? []), ...(source.checkouts ?? []).map((checkout) => checkout.pr)] : [];
+  return known.reduce((next, pr) => !pr || (options.mergedOnly && !pr.merged) ? next
+    : reconcilePullRequestView(next, { repo: pr.slug, number: pr.number, state: pr.state, merged: pr.merged === true }), view);
+}
+
+/**
  * Normalize a `pull_request` / `pull_request_review` delivery into the karmax
  * event a trigger can match (`github.pr.merged`, `github.pr.closed`,
  * `github.pr.review`, …). Only PRs whose head is a karmax task branch produce

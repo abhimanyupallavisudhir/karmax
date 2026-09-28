@@ -4,12 +4,10 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
   ACCOUNT_COORDINATOR_WORKFLOW,
-  BUDGET_COORDINATOR_WORKFLOW,
   RESOURCE_PUBLISH_COORDINATOR_WORKFLOW,
   QRY_QUEUE,
   QRY_AGENT_QUEUE,
   QRY_ACCOUNTS,
-  QRY_BUDGET,
   QRY_RESOURCE_PUBLISH,
 } from '../coordinators/names.js';
 import { BRAND } from '../domain/brand.js';
@@ -60,13 +58,6 @@ const SPECS: Record<string, CoordinatorSpec> = {
     query: QRY_ACCOUNTS,
     rebuild: null,
     reason: 'in-flight account leases would be lost while their holders keep using them',
-  },
-  // Its `spent` counters exist nowhere else; resetting them re-authorizes money
-  // that has already been spent.
-  [BUDGET_COORDINATOR_WORKFLOW]: {
-    query: QRY_BUDGET,
-    rebuild: null,
-    reason: 'spend counters exist nowhere else; a reset would re-authorize money already spent',
   },
   [RESOURCE_PUBLISH_COORDINATOR_WORKFLOW]: {
     query: QRY_RESOURCE_PUBLISH,

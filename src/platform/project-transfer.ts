@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { Store, deleteRows, slugify } from '../store/db.js';
 import { ProjectEnvironment } from '../store/project-environment.js';
 import type { Project } from '../domain/types.js';
+import { PermissionRequests } from './permission-requests.js';
 
 export class ProjectTransferError extends Error {
   constructor(message: string, public status = 409) { super(message); }
@@ -240,12 +241,15 @@ export class ProjectTransfers {
     // Cancel outstanding grants and remove app sharing; keeping these keyed by
     // stable task/project IDs would resurrect source authority on a later move.
     const movedTasks = new Set(taskIds);
-    for (const prefix of ['vault:requests:', 'permission:requests:', 'authorization:requests:']) {
+    for (const prefix of ['vault:requests:', 'authorization:requests:']) {
       const key = prefix + plan.project.organizationId;
       const requests = JSON.parse((await s.kvGet(key)) ?? '[]');
       (await s.kvSet(key, JSON.stringify(requests.filter((r: any) => !movedTasks.has(r.taskId)
         && !movedTasks.has(r.target?.taskId) && r.projectId !== id))));
     }
+    const permissions = new PermissionRequests(s, plan.project.organizationId ?? 'org_personal');
+    for (const request of (await permissions.requests()))
+      if (movedTasks.has(request.taskId) || request.projectId === id) (await permissions.remove(request));
     for (const entry of (await s.kvEntries('service-connection:'))) {
       const connection = JSON.parse(entry.value);
       if (connection.organizationId !== plan.project.organizationId) continue;
