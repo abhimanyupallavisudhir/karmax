@@ -276,7 +276,8 @@ export class ClaudeAdapter implements AgentAdapter {
         ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'failed',
           title: 'Could not refresh Claude access token',
           detail: activityDetail(refreshError instanceof Error ? refreshError.message : refreshError) });
-        throw error;
+        // A signed-out login is the more precise diagnosis than the expiry.
+        throw refreshError instanceof ProviderFailure ? refreshError : error;
       }
       if (ctx.signal?.aborted) throw error;
       ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'completed',

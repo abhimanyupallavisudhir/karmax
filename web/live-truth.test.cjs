@@ -51,7 +51,7 @@ function extractConst(name) {
   const concise = {
     mergeSlot: 'Waiting to merge',
     agentSlot: 'Waiting for agent',
-    account: 'Waiting for account',
+    account: 'Waiting for credential',
     subtask: 'Waiting for sub-tasks',
     collaboration: 'Waiting for collaborator',
     confirm: 'Waiting for review',

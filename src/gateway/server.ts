@@ -7197,8 +7197,25 @@ export class Gateway {
         const global = resolved({ global: g });
         const project = projectId ? resolved({ global: g, project: pr }) : undefined;
         const task = taskId ? resolved({ global: g, project: pr, task: tk }) : undefined;
+        const { claudeSignInExpiresAt } = await import('../autonomy/config-homes.js');
+        // Logins the provider signed out cannot run, but must stay visible so a
+        // person can sign in again; hiding them made a login silently vanish.
+        const loginKey = (provider: string, account: string) => scopedOrganizationId === 'org_personal'
+          ? `login:${provider}:${account}` : `login:${scopedOrganizationId}:${provider}:${account}`;
+        const signedOut = (this.deps.configHomes?.list(scopedOrganizationId) ?? [])
+          .filter((login) => !login.loggedIn && isLoginProvider(login.provider) && login.account)
+          .map((login) => ({ key: loginKey(login.provider, login.account), label: `${login.provider}:${login.account}`,
+            provider: login.provider, kind: 'login' as const, account: login.account, signedOut: true }));
         return this.json(res, 200, {
-          credentials: creds.map((c) => ({ key: c.key, label: c.label, provider: c.provider, kind: c.kind, account: c.account })),
+          credentials: [
+            ...creds.map((c) => {
+              const signInExpiresAt = c.kind === 'login' && c.provider === 'claude' && c.configHome
+                ? claudeSignInExpiresAt(c.configHome) : undefined;
+              return { key: c.key, label: c.label, provider: c.provider, kind: c.kind, account: c.account,
+                ...(signInExpiresAt ? { signInExpiresAt } : {}) };
+            }),
+            ...signedOut,
+          ],
           global: { own: g ?? {}, ...global },
           ...(projectId && project ? { project: { own: pr ?? {}, ...project } } : {}),
           ...(taskId && task ? { task: { own: tk ?? {}, ...task } } : {}),
@@ -7225,6 +7242,11 @@ export class Gateway {
           return this.json(res, 400, { error: 'scope must be organization, global, project, or task' });
         }
         (await store.kvSet(key, JSON.stringify(b.policy ?? {})));
+        // Parked turns resolved their allow-lists under the old policy.
+        if (this.deps.client) {
+          const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
+          await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).relistAccountLeases();
+        }
         return this.json(res, 200, { ok: true });
       }
 
