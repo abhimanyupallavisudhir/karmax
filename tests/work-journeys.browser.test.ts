@@ -6,13 +6,21 @@ import { git } from '../src/world/git.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
 import { findFreePortFrom } from '../src/util/ports.js';
+import { spawn } from 'node:child_process';
+import { createCustodyEnv, registerAgent } from '../src/agent/custody.js';
 
 const LOGIN_SITE = 'login.example.test';
+/** The sign-in agent's custody marker. A CLI agent's process carries one, and
+ *  the Chrome its chrome-devtools MCP launches inherits it; fills type only into
+ *  the browser that marks as the calling task's own (AU-14/AU-32). */
+const agentCustody = createCustodyEnv({} as Record<string, string>);
 
 /** The mock agent, plus the one thing its directives cannot script: signing in
  *  through the vault the way a real agent does — request_credential, then, once
  *  the human's decision resumes the task, fill_credential for each field — over
- *  the turn's own scoped token. The secret never passes through the agent. */
+ *  the turn's own scoped token. The secret never passes through the agent. The
+ *  mock runs in this process, so for the filling turn it stands up the agent
+ *  process a CLI adapter would spawn and register, carrying its marker. */
 function signInAgent(agentBrowser: () => string): AgentAdapter {
   const mock = new MockAdapter();
   return {
@@ -22,8 +30,15 @@ function signInAgent(agentBrowser: () => string): AgentAdapter {
       if (latest.includes(`@signin ${LOGIN_SITE}`))
         await ctx.platformRequest!('POST', '/api/vault/requests', { domain: LOGIN_SITE, mode: 'use', why: 'sign in to the staging site' });
       else if (latest.includes('credential decision') && latest.includes('approved')) {
-        for (const [field, selector] of [['username', '#username'], ['password', '#password']])
-          await ctx.platformRequest!('POST', '/api/vault/fill', { domain: LOGIN_SITE, field, selector, cdpUrl: agentBrowser() });
+        const agent = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore',
+          env: { PATH: process.env.PATH ?? '', ...agentCustody.env } });
+        registerAgent({ pid: agent.pid!, cmd: 'node', provider: 'mock', taskId: input.world.handle.id, role: input.role,
+          owner: process.pid, custodyId: agentCustody.custodyId, startedAt: Date.now() });
+        try {
+          // `cdpUrl` is ignored: the gateway finds the task's own browser.
+          for (const [field, selector] of [['username', '#username'], ['password', '#password']])
+            await ctx.platformRequest!('POST', '/api/vault/fill', { domain: LOGIN_SITE, field, selector, cdpUrl: agentBrowser() });
+        } finally { agent.kill('SIGKILL'); }
       }
       return mock.runTurn(input, ctx);
     },
@@ -81,7 +96,7 @@ describe('self-hosted console journeys (real gateway, mock agent)', () => {
   it('parks an agent’s credential request, lets the human add and grant it, then fills the login without the agent seeing it (CI-38w)', async () => {
     // The agent's own browser, which fill_credential types into over loopback CDP.
     const port = await findFreePortFrom(49400);
-    const agentBrowser = await launchChromium({ args: [`--remote-debugging-port=${port}`] });
+    const agentBrowser = await launchChromium({ args: [`--remote-debugging-port=${port}`], env: { ...process.env, ...agentCustody.env } });
     cdpUrl = `http://127.0.0.1:${port}`;
     const { page, errors, step, context } = await openConsole(browser);
     try {

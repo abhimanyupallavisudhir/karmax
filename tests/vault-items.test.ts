@@ -16,6 +16,10 @@ import {
   itemCaps,
   domainMatches,
   itemHandle,
+  removeTurnKeys,
+  removeLegacyKeyCopies,
+  turnKeyDirectory,
+  sweepTurnKeys,
 } from '../src/autonomy/vault-items.js';
 import { fillViaCdp } from '../src/autonomy/fill.js';
 
@@ -133,6 +137,30 @@ describe('vault usage frequency', () => {
     (await broker.deleteHandle(itemHandle(item.id, 'password')));
     await expect((async () => (await items.resolveField(item, 'password', { mode: 'use' })))()).rejects.toThrow();
     expect((await items.get(item.id))?.useCount).toBe(1);
+  });
+});
+
+describe('vault usage writes (AU-25)', () => {
+  it('records an access without rewriting the organization item index', async () => {
+    const store = (await Store.create(':memory:'));
+    try {
+      const { broker, dir } = makeService();
+      const items = new VaultItems(store, broker, dir, 'org_usage');
+      for (let i = 0; i < 200; i++) (await items.save({ type: 'login', label: `Login ${i}`, username: `user${i}@example.com`,
+        domains: [`site-${i}.example.com`], tags: ['team'], secrets: { password: `secret-${i}` } }));
+      const target = (await items.list())[123]!;
+      const writes: Array<{ key: string; bytes: number }> = [];
+      const kvSet = store.kvSet.bind(store);
+      vi.spyOn(store, 'kvSet').mockImplementation(async (key, value) => { writes.push({ key, bytes: value.length }); return kvSet(key, value); });
+      (await items.resolveField(target, 'password', { mode: 'use' }));
+      (await items.resolveField(target, 'password', { mode: 'use' }));
+      expect(writes.map((write) => write.key)).toEqual([`vault:usage:org_usage:${target.id}`, `vault:usage:org_usage:${target.id}`]);
+      expect(Math.max(...writes.map((write) => write.bytes))).toBeLessThan(200);
+      expect((await items.get(target.id))).toMatchObject({ useCount: 2, updatedAt: target.updatedAt });
+      expect((await new VaultItems(store, broker, dir, 'org_usage').get(target.id))?.useCount).toBe(2);
+      (await items.delete(target.id));
+      expect((await store.kvGet(`vault:usage:org_usage:${target.id}`))).toBeUndefined();
+    } finally { (await store.close()); }
   });
 });
 
@@ -359,7 +387,7 @@ describe('the pull model: requests + human resolutions (§7)', () => {
 
 describe('spawn-time materialization (§5A)', () => {
   it('injects env bags, api keys under envVar, and ssh keys as 0600 files', async () => {
-    const { items } = makeService();
+    const { items, dir } = makeService();
     const caps = ['use-credential:*'];
     (await items.save({ type: 'env', label: 'proj env', secrets: { env: '# comment\nFOO=bar\nexport QUOTED="a b"\nbad line\n' } }));
     (await items.save({ type: 'api-key', label: 'openai', envVar: 'OPENAI_API_KEY', secrets: { secret: 'sk-123' } }));
@@ -367,14 +395,26 @@ describe('spawn-time materialization (§5A)', () => {
     // an `ask` item never injects ambiently
     (await items.save({ type: 'api-key', label: 'guarded', envVar: 'GUARDED', policy: { use: 'ask' }, secrets: { secret: 'nope' } }));
 
-    const env = (await items.envFor('t1', caps));
+    // Key files live for one turn, in a directory the turn owns (AU-33).
+    const turn = turnKeyDirectory();
+    const env = (await items.envFor('t1', caps, turn));
     expect(env.FOO).toBe('bar');
     expect(env.QUOTED).toBe('a b');
     expect(env.OPENAI_API_KEY).toBe('sk-123');
     expect(env.GUARDED).toBeUndefined();
     expect(fs.readFileSync(env.DEPLOY_KEY_FILE!, 'utf8')).toBe('PRIVATE\n');
     expect(fs.statSync(env.DEPLOY_KEY_FILE!).mode & 0o777).toBe(0o600);
-    expect(env.DEPLOY_KEY_FILE).toContain(ssh.id);
+    expect(path.dirname(env.DEPLOY_KEY_FILE!)).toBe(turn);
+    expect(fs.existsSync(path.join(dir, 'state', 'vault-items', ssh.id))).toBe(false);
+    await removeTurnKeys(turn);
+    expect(fs.existsSync(env.DEPLOY_KEY_FILE!)).toBe(false);
+    // Without a turn directory a key is not written anywhere.
+    expect((await items.envFor('t1', caps)).DEPLOY_KEY_FILE).toBeUndefined();
+    // Host copies kept by earlier versions are removed at boot.
+    fs.mkdirSync(path.join(dir, 'state', 'vault-items', ssh.id), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'state', 'vault-items', ssh.id, 'key'), 'PRIVATE');
+    removeLegacyKeyCopies(path.join(dir, 'state'));
+    expect(fs.existsSync(path.join(dir, 'state', 'vault-items'))).toBe(false);
     // ungranted task gets nothing
     expect(Object.keys((await items.envFor('t2', [])))).toHaveLength(0);
   });
@@ -410,10 +450,12 @@ describe('zero-exposure CDP fill (§5B)', () => {
         const msg = JSON.parse(String(raw));
         received.push(msg);
         let result: any = {};
+        if (msg.method === 'Page.getFrameTree') result = { frameTree: { frame: { id: 'main' } } };
+        if (msg.method === 'Page.createIsolatedWorld') result = { executionContextId: 7 };
         if (msg.method === 'Runtime.evaluate') {
           result = msg.params.expression === 'location.origin'
             ? { result: { value: origin } }
-            : { result: { value: true } }; // selector focus succeeds
+            : { result: { value: { origin } } }; // the in-page check or write succeeds
         }
         socket.send(JSON.stringify({ id: msg.id, result }));
       });
@@ -434,8 +476,10 @@ describe('zero-exposure CDP fill (§5B)', () => {
     try {
       const out = await fillViaCdp({ cdpUrl: `http://127.0.0.1:${b.port}`, selector: '#password', text: 's3cret', expectDomains: ['github.com'] });
       expect(out.origin).toBe('https://github.com');
-      const insert = b.received.find((m) => m.method === 'Input.insertText');
-      expect(insert?.params?.text).toBe('s3cret');
+      // Checked, then written, in the page's isolated world; the check never carries the secret.
+      const inPage = b.received.filter((m) => m.method === 'Runtime.evaluate' && m.params?.contextId === 7);
+      expect(inPage.map((m) => m.params.expression.includes('"s3cret"'))).toEqual([false, true]);
+      expect(b.received.some((m) => m.method === 'Input.insertText')).toBe(false);
       expect(JSON.stringify(out)).not.toContain('s3cret');
     } finally {
       await b.close();
@@ -503,7 +547,7 @@ describe('zero-exposure CDP fill (§5B)', () => {
       cdpUrl: `http://127.0.0.1:${port}`,
       selector: '#password',
       text: 's3cret', expectDomains: ['example.com'],
-    })).rejects.toThrow(/tavya-managed chrome-devtools browser.*cdpUrl/);
+    })).rejects.toThrow(/Is this task's chrome-devtools browser still open/);
   });
 });
 
@@ -564,4 +608,27 @@ it('rejects blank standalone notes without overwriting a stored note (AU-22)', a
   const item = await items.save({ type: 'note', label: 'Note', secrets: { note: 'retained' } });
   await expect(items.save({ id: item.id, type: 'note', secrets: { note: '  ' } })).rejects.toThrow(/empty/);
   expect(await items.resolveField(item, 'note', { mode: 'reveal' })).toBe('retained');
+});
+
+describe('turn key files after a crash', () => {
+  it('sweeps the directories of dead processes and keeps live turns', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-sweep-'));
+    try {
+      const live = turnKeyDirectory(tmp);
+      fs.writeFileSync(path.join(live, 'key'), 'LIVE');
+      // A pid no process can have: the turn that wrote it crashed.
+      const dead = path.join(tmp, 'karmax-turn-keys-2147483646-abc123');
+      fs.mkdirSync(dead);
+      fs.writeFileSync(path.join(dead, 'key'), 'PLAINTEXT');
+      const unowned = path.join(tmp, 'karmax-turn-keys-abc123');
+      fs.mkdirSync(unowned);
+      const unrelated = path.join(tmp, 'something-else');
+      fs.mkdirSync(unrelated);
+      expect(sweepTurnKeys(tmp)).toBe(2);
+      expect(fs.existsSync(dead)).toBe(false);
+      expect(fs.existsSync(unowned)).toBe(false);
+      expect(fs.readFileSync(path.join(live, 'key'), 'utf8')).toBe('LIVE');
+      expect(fs.existsSync(unrelated)).toBe(true);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
 });

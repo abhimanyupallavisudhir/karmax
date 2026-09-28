@@ -20,7 +20,7 @@ import { openStore } from './store/db.js';
 import { defaultProvider } from './agent/adapters.js';
 import { KarmaxBus } from './contrib/bus.js';
 import { CredentialBroker } from './autonomy/broker.js';
-import { Vault } from './autonomy/vault.js';
+import { Vault, recordQuarantine } from './autonomy/vault.js';
 import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
 import { GitProfiles, inheritPersonalGithubProfile, userGitScope } from './autonomy/git-profiles.js';
 import { KarmaxApi } from './platform/api.js';
@@ -153,6 +153,7 @@ async function main() {
   const openedStore = (await openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL,
     { hosted: deployment.hosted }));
   const store = openedStore.store;
+  await (await import('./ops/backup.js')).recordRestores(store, p.home); // DB-10
   if (process.env.KARMAX_DATABASE_URL) {
     const migrated = openedStore.migration?.imported
       ? `; imported ${openedStore.migration.rows} rows from SQLite`
@@ -172,7 +173,14 @@ async function main() {
         .map((value) => value?.trim()).find(Boolean)! }
       : {}),
   }));
-  const broker = new CredentialBroker(new Vault(p.vault));
+  const vault = new Vault(p.vault);
+  // Binds ciphertext written before AU-27 to its handle; what will not open is quarantined, loudly.
+  // Reported until audited, so a crash between quarantine and audit still reaches the log.
+  await recordQuarantine(vault, (entry) => store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
+  const broker = new CredentialBroker(vault);
+  await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker); // AU-31
+  (await import('./autonomy/vault-items.js')).removeLegacyKeyCopies(p.state); // AU-33
+  (await import('./autonomy/vault-items.js')).sweepTurnKeys(); // key files a crashed turn left behind
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');
   const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
   if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))

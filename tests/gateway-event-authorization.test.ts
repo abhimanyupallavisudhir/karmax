@@ -106,6 +106,23 @@ describe('withdrawn access reaches open sockets at once', () => {
     } finally { f.disconnect(); await f.h.close(); }
   });
 
+  // GW-13: a person's socket token carries the capabilities it was minted with
+  // for up to ten minutes; a narrower grant must not wait for it to rotate.
+  it('stops delivering the moment a person’s grant is narrowed, whatever the socket token says', async () => {
+    const f = await streamFixture(['task:event:read'], { userId: 'member' });
+    try {
+      const authorization = (f.h.gateway as any).deps.authorization;
+      await f.h.store.setOrganizationMembership(f.project.organizationId!, 'member', 'member');
+      await authorization.grant('user:owner', { principalId: 'user:member', scopeKey: `organization:${f.project.organizationId}`, profileId: 'viewer' });
+      await f.publish(f.visible.id, 2);
+      expect(f.received()).toHaveLength(2);
+      await authorization.revoke('user:owner', 'user:member', `organization:${f.project.organizationId}`);
+      expect(await f.h.tokens.verify(f.minted.token)).toBeTruthy();
+      await f.publish(f.visible.id, 3);
+      expect(f.received()).toHaveLength(2);
+    } finally { f.disconnect(); await f.h.close(); }
+  });
+
   it('stops delivering the moment the project moves to another organization', async () => {
     const f = await streamFixture(['task:event:read']);
     try {

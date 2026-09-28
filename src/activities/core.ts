@@ -47,7 +47,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import type { AuthorizationService } from '../platform/authorization.js';
 import { CredentialBroker } from '../autonomy/broker.js';
-import { VaultItems } from '../autonomy/vault-items.js';
+import { VaultItems, removeTurnKeys, turnKeyDirectory } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
@@ -77,9 +77,10 @@ import {
 } from '../integrations/github-actions.js';
 import { isGithubWorkflowPermissionRejection, type GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
-import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
+import { PaymentProvider, PaymentRegistry, BudgetService, paymentPromptContext } from '../autonomy/payments.js';
 import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
+import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
@@ -2346,10 +2347,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const paymentService = deps.payments ? new BudgetService(store, deps.paymentRegistry ?? deps.payments) : undefined;
       const paymentCards = (await paymentService?.cards({ projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant })) ?? [];
       const paymentPolicy = (await paymentService?.policy(args.task.projectId, args.taskId));
-      const paymentContext = paymentCards.length ? `\n\nPayment cards available to this task: ${JSON.stringify(paymentCards.map(c => ({ name: c.label, id: c.id })))}. `
-        + `Task budget (USD): ${paymentPolicy?.budget == null ? 'unlimited' : (paymentPolicy.budget / 100).toFixed(2)}. `
-        + `Spent/reserved (USD): ${((await store.paymentSpent(args.taskId)) / 100).toFixed(2)}. `
-        + 'Use request_spend with card_name to choose a card. Follow the user’s restrictions on each card. Over-budget payments require approval.' : '';
+      const paymentContext = paymentPromptContext(paymentCards, paymentPolicy,
+        paymentCards.length ? (await store.paymentSpent(args.taskId, false, paymentPolicy?.currency)) : 0);
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
@@ -2464,6 +2463,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // call ONLY — the setup above is cheap — and released in `finally` below.
       let releaseSlot: () => void | Promise<void> = () => {};
       let mcpCleanup: (() => Promise<void>) | undefined;
+      let turnKeys: World | string | undefined;
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
@@ -2639,10 +2639,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               : (await gitEnvFor(args.worldHandle, args.taskId));
             // Granted `auto` vault items materialize into the work-command env
             // (wiki plans/PLAN-passwords §5A): .env bags, API keys under their envVar,
-            // SSH keys as 0600 files inside the receiving world.
+            // SSH keys as 0600 files inside the receiving world, removed when the
+            // turn ends (AU-33).
             // Item resolution is per-organization (the tenant boundary), so bind
             // to the task's org — not the module-level personal-org instance.
-            const vaultEnv = await orgVaultItems.envFor(args.taskId, effective, isRemote(args.worldHandle.kind) ? world : undefined);
+            turnKeys = isRemote(args.worldHandle.kind) ? world : turnKeyDirectory();
+            const vaultEnv = await orgVaultItems.envFor(args.taskId, effective, turnKeys);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
@@ -2758,9 +2760,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 onSpend: async (req: any, outcome: any) => { await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }); },
                 fillPaymentCard: async (fill: {
                   requestId: string;
-                  cdpUrl: string;
                   selectors: import('../autonomy/card-fill.js').CardFillSelectors;
                 }) => {
+                  // Fill the browser the agent's MCP drives: inside the world whenever
+                  // the agent itself runs there (cloud sandboxes and containers), else
+                  // the one this task's agent launched on the host (AU-32). Found
+                  // before a fill attempt is counted against the reservation.
+                  const cdpUrl = isRemoteAgentWorld(world) ? WORLD_CDP_URL : localTaskBrowserUrl(args.taskId);
                   const { request, domain } = await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).claimFill({
                     projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
                   }, fill.requestId);
@@ -2780,32 +2786,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   const details = await provider.retrieveCardDetails(card.id);
                   const expected = [domain];
                   let origin: string;
-                  // Fill the browser the agent's MCP drives: inside the world whenever
-                  // the agent itself runs there (cloud sandboxes and containers).
                   if (isRemoteAgentWorld(world)) {
                     origin = (await fillCardInWorld(world, {
-                      cdpUrl: fill.cdpUrl, domain, selectors: fill.selectors, details,
+                      cdpUrl, domain, selectors: fill.selectors, details,
                     })).origin;
                   } else {
-                    origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.number,
+                    origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.number,
                       text: details.number, expectDomains: expected })).origin;
                     const month = String(details.expMonth).padStart(2, '0');
                     if (fill.selectors.expiry) {
-                      origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.expiry,
+                      origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.expiry,
                         text: `${month}/${String(details.expYear).slice(-2)}`, expectDomains: expected })).origin;
                     } else {
-                      origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.expMonth!,
+                      origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.expMonth!,
                         text: month, expectDomains: expected })).origin;
-                      origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.expYear!,
+                      origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.expYear!,
                         text: String(details.expYear), expectDomains: expected })).origin;
                     }
-                    origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.cvc,
+                    origin = (await fillViaCdp({ cdpUrl, selector: fill.selectors.cvc,
                       text: details.cvc, expectDomains: expected })).origin;
                     // Billing fields, where the card carries one and the form asks.
                     for (const field of BILLING_FIELDS) {
                       const selector = fill.selectors[field];
                       const value = details.billing?.[field];
-                      if (selector && value) origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl,
+                      if (selector && value) origin = (await fillViaCdp({ cdpUrl,
                         selector, text: value, expectDomains: expected })).origin;
                     }
                   }
@@ -2893,7 +2897,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           finally {
             releaseConfirm();
             try { await mcpCleanup?.(); }
-            finally { await publishLegacyAgentState(undefined); }
+            finally {
+              // A world that cannot be reached now drops its keys with the world.
+              try { if (turnKeys) await removeTurnKeys(turnKeys).catch((e) => console.warn(`[vault] turn key files not removed: ${e instanceof Error ? e.message : e}`)); }
+              finally { await publishLegacyAgentState(undefined); }
+            }
           }
         }
       }

@@ -31,8 +31,8 @@ export class CredentialBroker {
   constructor(private vault: Vault) {}
 
   /** Write back a (possibly newly created) secret under a handle. */
-  registerHandle(handle: string, secret: string) {
-    return this.vault.put(handle, secret);
+  registerHandle(handle: string, secret: string, options?: { history?: boolean }) {
+    return this.vault.put(handle, secret, options);
   }
 
   /** Initialize a shared encryption key without rotating a concurrent creator's key. */

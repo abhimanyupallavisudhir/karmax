@@ -210,11 +210,11 @@ release their execution lease when finished.
 ./deploy/karmax doctor              # Compose, secrets, containers, database role, DNS/HTTPS
 ./deploy/karmax status
 ./deploy/karmax logs                # or: logs temporal
-./deploy/karmax backup              # deploy/backups/<UTC timestamp>
+./deploy/karmax backup              # deploy/backups/manual-<UTC timestamp>
 ./deploy/karmax prune-backups       # drop automatic snapshots past retention
 ./deploy/karmax update              # backup, validate commit ancestry, rebuild
 ./deploy/karmax down                # preserves all volumes and certificates
-./deploy/karmax restore BACKUP_DIR  # verified, explicit destructive prompt
+./deploy/karmax restore BACKUP_DIR  # verified and signature-checked, explicit destructive prompt
 ```
 
 A backup includes PostgreSQL dumps of Karmax metadata, identity, and Temporal,
@@ -233,10 +233,11 @@ directories as immutable; copy files out before editing them. The live data
 volume is never linked to a backup.
 
 Automatic snapshots are pruned: `update` keeps the newest 10 `predeploy-*`
-snapshots, and the daily `scheduled-*` snapshots are kept for 14 days. A
-successful update also prunes dangling images and caps the Docker build cache
-at 8 GB. Snapshots with any other name (`backup` without a directory, or one
-you name) are never deleted automatically.
+snapshots, and the daily `scheduled-*` snapshots are kept for 14 days, as are
+the bare `<UTC timestamp>` snapshots earlier updaters took. A successful update
+also prunes dangling images and caps the Docker build cache at 8 GB. Snapshots
+with any other name (`manual-*` from `backup`, or a directory you choose) are
+never deleted automatically.
 
 `restore` verifies the control-plane payload, PostgreSQL dumps, and deployment
 secrets, then restores every dump into a staging database (`karmax_restore`,
@@ -252,6 +253,24 @@ current Temporal schema and retains the destination's domain. It requires
 typing `RESTORE` and will not delete Docker volumes as part of ordinary `down`
 or `update` operations.
 
+Backups are signed: the control-plane manifest (`manifest.sig`) and
+`SHA256SUMS` (`SHA256SUMS.sig`), which covers the dumps, the deployment secrets
+and the control-plane manifest, so the two signatures vouch for one backup. The
+key is an Ed25519 key at the root of the app's data volume
+(`/var/lib/karmax/backup-signing.key`), outside everything a backup copies, and
+a restore never replaces it. The manifest stays `version: 1`, so the previous
+release can still restore a signed backup. `backup` prints the key's
+`SHA256:…` fingerprint; record it off-host, since it is what lets another host
+trust the backup. A restore on the same host needs nothing more. On a fresh
+host, run `./deploy/karmax restore --trust-key SHA256:… DIR` with the recorded
+fingerprint. An unsigned backup (taken before signing) is refused unless you
+pass `--accept-unsigned-v1` and type `RESTORE UNSIGNED`. Do that only for a
+backup you know has stayed in trusted storage. `restore` first copies the
+backup into a private directory, refuses symbolic links, and verifies and
+restores only that copy (the backup's size again in free disk space). Every
+restore, signed or not, is written to the audit log at the next boot
+(`backup.restored`, `backup.restored.unsigned`).
+
 ### Replay check
 
 A running workflow replays its recorded history under whatever code the next
@@ -266,7 +285,10 @@ for when the listed workflows are already broken or may break.
 
 `deploy/data-epoch` marks compatibility for automatic code-only rollback. Builds
 without a marker are epoch 1. Epoch 2 separates task conversation storage and
-introduces new durable workflow activity histories. If an update crosses epochs
+introduces new durable workflow activity histories. Epoch 3 binds every vault
+entry to its handle (`v2.` ciphertext, AU-27) and moves each stored card's CVC
+into its own entry (AU-31); the previous release cannot read either, so this
+migration is one-way. If an update crosses epochs
 and then fails readiness, the updater stops the app and preserves the candidate
 code and current data; it does **not** start the incompatible previous image.
 This deliberately trades availability for avoiding a misleading or destructive
@@ -284,6 +306,46 @@ command: it installs `origin/master` in a scratch clone, seeds it through its
 API, backs it up, runs this `update`, verifies every record, and restores the
 backup onto a fresh stack. See "Rehearsing an upgrade" in the project wiki's
 ops/release-and-deploy page for what it checks and its traps.
+
+`update` checks the vault read-only with the new image after the pre-update
+backup and before switching (`npm run vault-preflight`, with the key the app
+itself reads): whether the key would be accepted, which files cannot be read,
+and which secrets the first boot would quarantine. Any finding stops the update
+with the previous app still serving. `./deploy/karmax update REVISION
+--accept-vault-findings` proceeds past secrets to quarantine, never past a
+refused key, an unreadable file or a vault that cannot be opened: the new
+release could not boot with those.
+
+The epoch 3 vault migration moves the previous release's `vault/secrets.json`
+into `vault/entries/`, one bound file per secret, then replaces `secrets.json`
+with a marker the previous release refuses to open ("not a secret map"). It reads everything first; a file it cannot read (permissions, an I/O
+error) stops boot with a list and changes nothing. Secrets that do not parse or
+authenticate under the vault key are moved to `vault/entries/quarantine/` (kept
+30 days) and recorded in the audit log (`vault.entry.quarantined`). The previous
+release cannot read the result: **the only way back is the pre-update backup
+with its code.** There is no vault-only rollback: the previous release cannot
+start on the migrated vault. If `secrets.json` is replaced by hand and it runs
+anyway, the next boot of this release refuses to start ("vault/secrets.json
+holds N secrets although the vault moved"); restore the backup.
+
+"the vault key does not open this vault" says which check failed:
+- "vault/vault.canary fails to authenticate": `KARMAX_VAULT_KEY` (or
+  `vault/vault.key`) is not the key the vault was created with. Restore it; do
+  not delete the canary to get past it.
+- "vault/vault.canary is missing or damaged, and the key opens none of the N
+  entries": no override applies; this key is not the vault's.
+- "... opens M of N entries while vault/vault.key opens K": with no usable
+  canary the secrets decide, and secrets no known key opens are not counted.
+When the message names `KARMAX_VAULT_ACCEPT_KEY=vk-…` and you are certain the
+key is right, set it once: on the turnkey stack, append it to the app's
+`/var/lib/karmax/karmax.env` (`./deploy/karmax` has no flag for it; the Compose
+environment does not pass it through), restart, then remove it. The vault
+preflight reads the same file. Secrets the key cannot open are then
+quarantined. A missing or damaged canary alone is not an error.
+
+"vault entry for H is not bound to its handle" means a secret in the
+pre-upgrade format sits in a bound vault: a file was copied in from an older
+vault or backup. Restore that secret from the backup it belongs to.
 
 ## Cost and idle-world behavior
 

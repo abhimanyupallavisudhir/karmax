@@ -269,6 +269,10 @@ ssh() { (cd ${JSON.stringify(root)} && bash -c "\${@: -1}"); }
     expect(fs.readFileSync(path.join(status, 'status'), 'utf8').trim()).toBe('success');
     expect(fs.readFileSync(path.join(status, 'log'), 'utf8')).toContain(`Update complete at ${candidate}.`);
     expect(git(host, 'rev-parse', 'HEAD')).toBe(candidate);
+    // The image copies sources with their checkout modes and runs as the app
+    // user, so the runner's private umask must not reach the checkout: 0600
+    // sources are unreadable to the app, and so is the rollback's checkout.
+    expect(fs.statSync(path.join(host, 'feature.txt')).mode & 0o044).toBe(0o044);
     const calls = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]);
     // The copy drove the instance's own Compose project and environment.
     expect(calls.some(args => args.includes('up') && args.includes(path.join(host, 'deploy/.turnkey.env')))).toBe(true);

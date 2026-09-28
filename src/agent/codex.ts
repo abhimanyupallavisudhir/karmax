@@ -20,6 +20,7 @@ import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
 import {
+  apiThrottle,
   classifyLimitError,
   nativeProviderDiagnostic,
   providerErrorFromMessage,
@@ -323,7 +324,7 @@ export class CodexAdapter implements AgentAdapter {
       });
       if (!res.ok) {
         const message = `OpenAI Responses API ${res.status}: ${(await res.text()).slice(0, 500)}`;
-        throw providerErrorFromMessage('codex', message, 'structured');
+        throw providerErrorFromMessage('codex', message, 'structured', apiThrottle(res));
       }
       const data = await readOpenAiResponse(res, (text) => ctx.emit(text, 'assistant'));
       (await (await currentTiming())?.markOnce('first.output'));
@@ -481,7 +482,7 @@ export class CodexAdapter implements AgentAdapter {
     const child: any = remote
       ? spawnRemoteAgentProcess({ world: runtimeWorld, provider: 'codex', command: cmd, args: ['app-server', ...mcpFlags], cwd, env, signal: ctx.signal })
       : spawn(cmd, ['app-server', ...mcpFlags], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
-    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
+    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', taskId: input.world.handle.id, role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
     const platformHandlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     let stderr = '';

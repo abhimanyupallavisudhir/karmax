@@ -396,17 +396,78 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
   return { limited: true, kind: 'quota', window, ...(resetHint ? { resetHint } : {}), ...(note ? { note } : {}) };
 }
 
+/** An API-key throttle (HTTP 429, or a rate-limit error inside the stream):
+ * the wait the provider asked for, and when an empty bucket refills, in whole
+ * seconds. */
+export interface ApiThrottle { retryAfterSeconds?: number; refillSeconds?: number }
+
+/** Every throttle wait is capped: a longer one is not a throttle, and the
+ * next 429 says again. */
+const MAX_THROTTLE_SECONDS = 24 * 3600;
+const DURATION_UNIT_SECONDS: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 0.001 };
+
+/** A Go-style relative duration as OpenAI writes it ("1.5s", "120ms", "6m0s"),
+ * in seconds; undefined for anything else. */
+function goDurationSeconds(text: string): number | undefined {
+  if (!/^(?:\d+(?:\.\d+)?(?:ms|h|m|s))+$/.test(text)) return undefined;
+  let seconds = 0;
+  for (const [, amount, unit] of text.matchAll(/(\d+(?:\.\d+)?)(ms|h|m|s)/g)) seconds += Number(amount) * DURATION_UNIT_SECONDS[unit!]!;
+  return seconds;
+}
+const wait = (seconds: number) => Math.ceil(Math.min(seconds, MAX_THROTTLE_SECONDS));
+
+/** Read the wait an API response asks for (AD-3), the way the providers' own
+ * SDKs do: OpenAI's `retry-after-ms`, then `Retry-After` as delta-seconds or an
+ * HTTP date. OpenAI's `x-ratelimit-reset-*` give the time to a FULL refill, so
+ * only an empty bucket's (`x-ratelimit-remaining-*: 0`) says anything, and
+ * less than the message's own wait. Undefined for anything but a 429. */
+export function apiThrottle(res: { status: number; headers: Headers }, nowMs = Date.now()): ApiThrottle | undefined {
+  if (res.status !== 429) return undefined;
+  const raw = res.headers.get('retry-after')?.trim();
+  const retryAfter = [
+    Number(res.headers.get('retry-after-ms') ?? NaN) / 1000,
+    raw && /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : raw ? (Date.parse(raw) - nowMs) / 1000 : NaN,
+  ].find((seconds) => seconds > 0);
+  const refills = ['requests', 'tokens']
+    .filter((bucket) => res.headers.get(`x-ratelimit-remaining-${bucket}`)?.trim() === '0')
+    .map((bucket) => goDurationSeconds(res.headers.get(`x-ratelimit-reset-${bucket}`)?.trim() ?? '') ?? NaN)
+    .filter((seconds) => seconds > 0);
+  return { ...(retryAfter !== undefined ? { retryAfterSeconds: wait(retryAfter) } : {}),
+    ...(refills.length ? { refillSeconds: wait(Math.max(...refills)) } : {}) };
+}
+
+/** The wait a throttle's own message names, read strictly as a relative
+ * duration ("Please try again in 1.5s."). Never a clock time: the general
+ * reset parse reads "in 1.5s" as one o'clock, parking a key for half a day. */
+function throttleMessageSeconds(message: string): number | undefined {
+  const match = /\btry again in\s+(\d+(?:\.\d+)?(?:ms|h|m|s)(?:\d+(?:\.\d+)?(?:ms|h|m|s))*)(?![a-z])/i.exec(message)
+    ?? /\btry again in\s+(\d+(?:\.\d+)?)\s*(milliseconds?|seconds?|minutes?|hours?)\b/i.exec(message);
+  if (!match) return undefined;
+  const seconds = match[2] === undefined ? goDurationSeconds(match[1]!.toLowerCase())
+    : Number(match[1]) * ({ millisecond: 0.001, second: 1, minute: 60, hour: 3600 } as Record<string, number>)[match[2].toLowerCase().replace(/s$/, '')]!;
+  return seconds !== undefined && seconds > 0 ? wait(seconds) : undefined;
+}
+
 /** Convert a provider message into a typed failure when it is recognizable, while
  * leaving unrelated provider errors alone. This is the human-wording fallback; a
- * structured provider signal should call `providerFailure` directly. */
+ * structured provider signal should call `providerFailure` directly.
+ *
+ * `throttle` marks an API-key rate limit. Those windows are seconds to a minute,
+ * so the reset comes from the provider's Retry-After, else a relative wait the
+ * message names, else an empty bucket's refill, else one minute — never the five-hour subscription fallback,
+ * which parked a merely throttled key's login for the rest of the afternoon,
+ * nor the general reset parse, which reads subscription clock times. */
 export function providerErrorFromMessage(
   provider: ProviderFailureMetadata['provider'],
   message: string,
   source: ProviderFailureSource = 'message',
+  throttle?: ApiThrottle,
 ): Error {
   if (isProviderPolicyRejection(message, { providerOrigin: true })) return new ProviderPolicyFailure(message, provider);
   const cls = classifyLimitError(message, { providerOrigin: true });
   if (!cls.limited) return new Error(message);
+  if (throttle && !cls.hard)
+    cls.resetHint = `in ${throttle.retryAfterSeconds ?? throttleMessageSeconds(message) ?? throttle.refillSeconds ?? 60}s`;
   const diagnostic = nativeProviderDiagnostic(message);
   return new ProviderFailure(message, {
     kind: cls.kind ?? 'quota',

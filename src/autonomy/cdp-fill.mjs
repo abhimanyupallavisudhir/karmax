@@ -7,8 +7,10 @@
  * open a private socket to the sandbox's loopback — so this helper runs INSIDE
  * the world (via world.exec) and does the CDP typing there. It mirrors
  * cdp.ts/fill.ts exactly: loopback-only endpoint, page picked by the item's
- * domains, the LIVE page origin re-verified over CDP before anything is typed
- * (anti-phishing), then Input.insertText.
+ * domains, then one in-page step that re-checks the LIVE page origin (https,
+ * or http on loopback) and the field, and writes the value (anti-phishing; AU-38:
+ * a separate check and typing call let a navigation or a focused frame in
+ * between receive the secret).
  *
  * The secret is read from STDIN, never argv/env/a file — so the co-resident
  * agent cannot read it from /proc or disk. It is never echoed. Non-secret args:
@@ -16,7 +18,13 @@
  *   argv[3] expectDomains   comma-separated domains the page origin must match
  *   argv[4] cdpUrl          loopback DevTools endpoint (default 127.0.0.1:9222)
  * On success prints {"origin":"https://..."} to stdout; on failure prints
- * {"error":"..."} and exits 1. Uses only Node built-ins and a hand-rolled
+ * {"error":"..."} and exits 1.
+ *
+ * `--bridge <nonce> <expectDomains> <cdpUrl>` instead relays the matching
+ * page's CDP session over this process's terminal (world-fill.ts
+ * openWorldPage), so the gateway can hold a passkey authenticator in a remote
+ * world's browser across the agent's click. Lines in are base64 CDP messages;
+ * lines out are `@@<nonce>@@ <json>`, which the command's own echo never is. Uses only Node built-ins and a hand-rolled
  * WebSocket client over node:net, so it runs on the sandbox's own node — the
  * default E2B template ships Node 20, which has no global WebSocket.
  */
@@ -37,6 +45,34 @@ function domainMatches(host, domain) {
   const d = String(domain).toLowerCase().replace(/^\*\./, '').replace(/\.$/, '');
   return h === d || h.endsWith(`.${d}`);
 }
+
+// Identical to WRITE_IN_PAGE in fill.ts (tests/fill-origin.browser.test.ts pins it).
+const WRITE_IN_PAGE = `(selector, domains, value) => {
+  const host = location.hostname.toLowerCase().replace(/\\.$/, '');
+  const loopback = ['localhost', '127.0.0.1', '[::1]', '::1'].includes(host);
+  if (location.protocol !== 'https:' && !(location.protocol === 'http:' && loopback))
+    return { error: 'refusing: ' + (location.origin === 'null' ? location.href : location.origin) + ' is not a secure page' };
+  const matches = domains.some((domain) => {
+    const d = String(domain).toLowerCase().replace(/^\\*\\./, '').replace(/\\.$/, '');
+    return host === d || host.endsWith('.' + d);
+  });
+  if (!matches) return { error: 'refusing: the page origin (' + location.origin + ') does not match the expected domains (' + domains.join(', ') + ')' };
+  if (selector === null) return { origin: location.origin };
+  let target = selector === '@focused' ? document.activeElement : document.querySelector(selector);
+  while (selector === '@focused' && target && target.shadowRoot && target.shadowRoot.activeElement) target = target.shadowRoot.activeElement;
+  if (!target || (selector === '@focused' && target === document.body)) return { error: 'no element matches selector ' + selector };
+  if (target.tagName === 'IFRAME' || target.tagName === 'FRAME') return { error: 'refusing: the field is in another frame' };
+  const input = target instanceof HTMLInputElement && ['text', 'password', 'email', 'tel', 'url', 'search', 'number'].includes(target.type);
+  if (!input && !(target instanceof HTMLTextAreaElement) && !target.isContentEditable)
+    return { error: 'refusing: ' + selector + ' is not a text field' };
+  if (value === null) return { origin: location.origin };
+  target.focus();
+  if (target.isContentEditable) target.textContent = value;
+  else Object.getOwnPropertyDescriptor(Object.getPrototypeOf(target), 'value').set.call(target, value);
+  target.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertReplacementText' }));
+  target.dispatchEvent(new Event('change', { bubbles: true }));
+  return { origin: location.origin };
+}`;
 
 function assertLoopback(u) {
   const base = new URL(u);
@@ -77,6 +113,9 @@ function wsClient(wsUrl) {
       sock.write(Buffer.concat([head, mask, masked]));
     };
 
+    let closed;
+    const ended = new Promise((resolve) => { closed = resolve; });
+    sock.on('close', () => closed());
     const onMessage = (text) => {
       for (const l of listeners) l(text);
     };
@@ -136,6 +175,7 @@ function wsClient(wsUrl) {
           setTimeout(() => { if (pending.delete(id)) rej(new Error(`CDP ${method} timed out`)); }, TIMEOUT);
         }),
         close: () => sock.destroy(),
+        raw: { send: (text) => sendFrame(0x1, Buffer.from(text)), listen: (listener) => listeners.add(listener), ended },
       };
     };
 
@@ -154,50 +194,82 @@ function wsClient(wsUrl) {
 
 const connect = wsClient;
 
-async function main() {
-  if (!expectDomains.length) fail('browser fill requires credential domains');
-  const checkOnly = process.argv[5] === '--check';
-  const secret = await readStdin();
-  if (!checkOnly && !secret) fail('no secret on stdin');
+/** The page whose target-list url matches `domains`; its live origin is checked by the caller. */
+async function findPage(cdpUrl, domains) {
   const base = assertLoopback(cdpUrl);
   const list = await (await fetch(new URL('/json/list', base), { signal: AbortSignal.timeout(TIMEOUT) })).json();
   if (process.env.KARMAX_CDP_DEBUG)
     process.stderr.write(`[cdp-fill] /json/list: ${JSON.stringify(list.map((t) => ({ type: t.type, url: t.url, ws: !!t.webSocketDebuggerUrl })))}\n`);
   const pages = list.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-  const page = expectDomains.length
-    ? pages.find((t) => { try { return expectDomains.some((d) => domainMatches(new URL(t.url).hostname, d)); } catch { return false; } })
+  const page = domains.length
+    ? pages.find((t) => { try { return domains.some((d) => domainMatches(new URL(t.url).hostname, d)); } catch { return false; } })
     : pages[0];
-  if (!page) fail(expectDomains.length
-    ? `no open page matches ${expectDomains.join(', ')} — navigate to the login page first`
+  if (!page) throw new Error(domains.length
+    ? `no open page matches ${domains.join(', ')} — navigate to the login page first`
     : 'no open page at the CDP endpoint');
+  return page;
+}
+
+async function bridge(nonce, domainCsv, bridgeCdpUrl) {
+  const emit = (message) => process.stdout.write(`@@${nonce}@@ ${JSON.stringify(message)}\n`);
+  try {
+    const domains = domainCsv.split(',').map((s) => s.trim()).filter(Boolean);
+    if (!/^[0-9a-f]{16,}$/.test(nonce) || !domains.length) throw new Error('bridge needs a nonce and target domains');
+    const session = await connect((await findPage(bridgeCdpUrl, domains)).webSocketDebuggerUrl);
+    session.raw.listen((text) => emit({ cdp: text }));
+    session.raw.ended.then(() => process.exit(0));
+    let pending = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => {
+      pending += chunk;
+      for (let end; (end = pending.search(/[\r\n]/)) >= 0; pending = pending.slice(end + 1)) {
+        const line = pending.slice(0, end).trim();
+        if (line) session.raw.send(Buffer.from(line, 'base64').toString('utf8'));
+      }
+    });
+    process.stdin.on('end', () => { session.close(); process.exit(0); });
+    emit({ ready: true });
+  } catch (e) { emit({ error: e?.message ?? String(e) }); process.exit(1); }
+}
+
+async function main() {
+  if (!expectDomains.length) fail('browser fill requires credential domains');
+  const checkOnly = process.argv[5] === '--check';
+  const secret = await readStdin();
+  if (!checkOnly && !secret) fail('no secret on stdin');
+  let page;
+  try { page = await findPage(cdpUrl, expectDomains); } catch (e) { fail(e.message); }
 
   const session = await connect(page.webSocketDebuggerUrl);
   try {
-    const originResult = await session.call('Runtime.evaluate', { expression: 'location.origin', returnByValue: true });
-    const origin = String(originResult?.result?.value ?? '');
-    if (expectDomains.length) {
-      let host = '';
-      try { host = new URL(origin).hostname; } catch { /* about:blank */ }
-      if (!host || !expectDomains.some((d) => domainMatches(host, d)))
-        fail(`refusing: the page origin (${origin || 'unknown'}) does not match the expected domains (${expectDomains.join(', ')})`);
+    // An isolated world, as in fill.ts: the page's realm cannot redefine the
+    // builtins the check compares with, and a navigation destroys the world.
+    const frameId = (await session.call('Page.getFrameTree'))?.frameTree?.frame?.id;
+    const contextId = (await session.call('Page.createIsolatedWorld', { frameId, worldName: 'karmax-fill' }))?.executionContextId;
+    if (!frameId || !contextId) fail('could not open an isolated world in the page');
+    const inPage = async (target, value) => {
+      const result = await session.call('Runtime.evaluate', { returnByValue: true, contextId,
+        expression: `(${WRITE_IN_PAGE})(${JSON.stringify(target)}, ${JSON.stringify(expectDomains)}, ${JSON.stringify(value)})` });
+      const outcome = result?.result?.value;
+      if (!outcome || typeof outcome !== 'object' || outcome.error) fail(outcome?.error ?? 'the page did not answer the fill');
+      return outcome;
+    };
+    // A check only reads: it never moves focus, so @tab's target is not known yet.
+    if (checkOnly) {
+      const { origin } = await inPage(selector === '@tab' ? null : selector, null);
+      process.stdout.write(JSON.stringify({ origin }));
+      return;
     }
     if (selector === '@tab') {
-      if (!checkOnly) {
       await session.call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab' });
       await session.call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', code: 'Tab' });
-      }
-    } else if (selector !== '@focused') {
-      const focus = await session.call('Runtime.evaluate', {
-        expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.focus(); return true; })()`,
-        returnByValue: true,
-      });
-      if (focus?.result?.value !== true) fail(`no element matches selector ${selector}`);
     }
-    if (!checkOnly) await session.call('Input.insertText', { text: secret });
+    const { origin } = await inPage(selector === '@tab' ? '@focused' : selector, secret);
     process.stdout.write(JSON.stringify({ origin }));
   } finally {
     session.close();
   }
 }
 
-main().then(() => process.exit(0)).catch((e) => fail(e?.message ?? String(e)));
+if (process.argv[2] === '--bridge') void bridge(process.argv[3] ?? '', process.argv[4] ?? '', process.argv[5] ?? '');
+else main().then(() => process.exit(0)).catch((e) => fail(e?.message ?? String(e)));

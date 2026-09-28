@@ -59,7 +59,7 @@ describe('listPages', () => {
   it('explains how to get a reachable browser when discovery fails', async () => {
     const browser = await fakeBrowser([], { listStatus: 500 });
     try {
-      await expect(listPages(browser.url)).rejects.toThrow(/cannot reach Chrome DevTools at http:\/\/127\.0\.0\.1:\d+.*tavya-managed chrome-devtools browser.*HTTP 500/);
+      await expect(listPages(browser.url)).rejects.toThrow(/cannot reach Chrome DevTools at http:\/\/127\.0\.0\.1:\d+.*task's chrome-devtools browser.*HTTP 500/);
     } finally {
       await browser.close();
     }
@@ -192,26 +192,26 @@ describe('openPage', () => {
 });
 
 describe('default CDP endpoint', () => {
-  // The port is read once, at import.
+  // The port is read once, at import. It names the browser the MCP launcher
+  // opens and, inside a task's world, the one fills reach; fills never take a
+  // URL from the environment or the agent (AU-14/AU-32).
   beforeEach(() => { vi.resetModules(); });
 
   it('is the loopback port 9222 unless configured', async () => {
     vi.stubEnv('KARMAX_CDP_PORT', '');
-    vi.stubEnv('KARMAX_CDP_URL', '');
     const defaults = await import('../src/autonomy/cdp-endpoint.js');
+    const { WORLD_CDP_URL } = await import('../src/autonomy/task-browser.js');
     expect(defaults.DEFAULT_CDP_PORT).toBe(9222);
-    expect(defaults.defaultCdpUrl()).toBe('http://127.0.0.1:9222');
-    expect(() => assertLoopback(defaults.defaultCdpUrl())).not.toThrow();
+    expect(WORLD_CDP_URL).toBe('http://127.0.0.1:9222');
+    expect(() => assertLoopback(WORLD_CDP_URL)).not.toThrow();
   });
 
-  it('follows KARMAX_CDP_PORT, and KARMAX_CDP_URL over it', async () => {
+  it('follows KARMAX_CDP_PORT', async () => {
     vi.stubEnv('KARMAX_CDP_PORT', '9333');
-    vi.stubEnv('KARMAX_CDP_URL', '');
     const defaults = await import('../src/autonomy/cdp-endpoint.js');
+    const { WORLD_CDP_URL } = await import('../src/autonomy/task-browser.js');
     expect(defaults.DEFAULT_CDP_PORT).toBe(9333);
-    expect(defaults.defaultCdpUrl()).toBe('http://127.0.0.1:9333');
-    vi.stubEnv('KARMAX_CDP_URL', 'http://browser.internal:9222');
-    expect(defaults.defaultCdpUrl()).toBe('http://browser.internal:9222');
+    expect(WORLD_CDP_URL).toBe('http://127.0.0.1:9333');
   });
 
   it('ignores a KARMAX_CDP_PORT that is not a number', async () => {

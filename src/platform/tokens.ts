@@ -121,6 +121,11 @@ export class TokenAuthority {
   connectIdentitySessions(validate: (sessionId: string, userId: string) => Promise<boolean>): void {
     this.sessionValidator = validate;
   }
+  /** Is a browser (identity) session still signed in? True where none are
+   * tracked. A lookup that fails throws: it is not a sign-out. */
+  async identitySessionLive(sessionId: string, userId: string): Promise<boolean> {
+    return this.sessionValidator ? this.sessionValidator(sessionId, userId) : true;
+  }
 
   constructor(private store?: Store) {}
 

@@ -53,6 +53,8 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(chrome.command).toBe(process.execPath);
     expect(chrome.args[0]).toMatch(/chrome-cdp-launcher\.mjs$/);
     expect(chrome.env).toMatchObject({ KARMAX_CDP_MCP_VERSION: '1.6.0' });
+    // Fills find the task's own browser by its agent's custody marker (AU-14).
+    expect(chrome.forwardEnv).toEqual(['KARMAX_CUSTODY_CHAIN']);
     expect(servers['karmax']).toEqual({ command: 'node', args: ['mcp.js'] });
     expect(mcpServerMap({ browser: 'none' })).toEqual({});
   });
@@ -105,6 +107,7 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(toml.match(/^\[mcp_servers\.karmax\.env]$/gm)).toHaveLength(1);
     expect(toml).not.toContain('[mcp_servers.playwright]');
     expect(toml).toContain('chrome-cdp-launcher.mjs'); // chrome-devtools runs through the CDP-port launcher
+    expect(toml).toContain('env_vars = ["KARMAX_CUSTODY_CHAIN"]');
     expect(toml).toContain('model = "custom"');
     expect(toml).toContain('[mcp_servers.keep]');
     fs.rmSync(dir, { recursive: true, force: true });

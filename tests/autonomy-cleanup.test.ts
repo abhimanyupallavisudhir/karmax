@@ -17,7 +17,10 @@ it('deletes organization secrets, inbox routes and key files without touching pe
     const broker = new CredentialBroker(new Vault(path.join(home, 'vault')));
     const vault = new VaultItems(store, broker, home, org.id);
     const item = await vault.save({ type: 'ssh-key', label: 'Key', envVar: 'APP_KEY', secrets: { privateKey: 'key' } });
-    const env = await vault.envFor('task', ['use-credential:*']);
+    // A host copy of the key, as versions before AU-33 kept one.
+    const legacyKey = path.join(home, 'vault-items', item.id, 'key');
+    fs.mkdirSync(path.dirname(legacyKey), { recursive: true });
+    fs.writeFileSync(legacyKey, 'key');
     const mail = new AgentMail(store);
     const address = await mail.address(org.id);
     const secret = await ingestSecret(store, org.id);
@@ -33,7 +36,7 @@ it('deletes organization secrets, inbox routes and key files without touching pe
     expect(broker.hasHandle(handles[0]!)).toBe(false);
     expect(broker.hasHandle(handles[1]!)).toBe(false);
     expect(broker.hasHandle('other:secret')).toBe(true);
-    expect(fs.existsSync(env.APP_KEY!)).toBe(false);
+    expect(fs.existsSync(legacyKey)).toBe(false);
     expect(await mail.ownerOf(address)).toBeUndefined();
     expect(await ingestScope(store, secret)).toBeUndefined();
     expect(await mail.recent(org.id)).toEqual([]);

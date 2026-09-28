@@ -102,9 +102,10 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
   it('stores secrets encrypted at rest and resolves only with capability', async () => {
     const vault = new Vault(dir);
     (await vault.put('openai', 'sk-secret-123'));
-    // raw file never contains the plaintext secret
-    const raw = fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8');
-    expect(raw).not.toContain('sk-secret-123');
+    // no file in the vault contains the plaintext secret
+    const files = fs.readdirSync(dir, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile());
+    expect(files.length).toBeGreaterThan(0);
+    for (const file of files) expect(fs.readFileSync(path.join(file.parentPath, file.name), 'utf8')).not.toContain('sk-secret-123');
 
     const broker = new CredentialBroker(vault);
     // permitted requester

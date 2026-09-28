@@ -26,7 +26,7 @@ describe('fillInWorld (remote-world credential fill)', () => {
     expect(result.origin).toBe('https://demo.realworld.show');
     // the dep-free helper is written into the world
     expect(calls.writes[0]!.path).toMatch(/cdp-fill\.mjs$/);
-    expect(calls.writes[0]!.content).toContain('Input.insertText');
+    expect(calls.writes[0]!.content).toContain('const WRITE_IN_PAGE = `');
     const ex = calls.execs[1]!;
     expect(calls.execs[0]!.opts.input).toBe('');
     expect(ex.cmd).toBe('node');

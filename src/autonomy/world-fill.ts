@@ -1,6 +1,9 @@
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import type { World } from '../world/types.js';
+import { verifiedPage, type CdpSession } from './cdp.js';
 
 /**
  * Remote-world credential fill (wiki plans/PLAN-passwords §5B, cloud path).
@@ -50,4 +53,97 @@ export async function fillInWorld(world: World, args: {
     throw new Error(parsed.error || res.stderr.trim() || `in-world fill failed (exit ${res.code})`);
   }
   return { origin: parsed.origin };
+}
+
+const HOST_NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+const shellQuote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
+
+/**
+ * A CDP session on the world browser's page matching `expectDomains`, relayed
+ * by the helper's `--bridge` mode over a world terminal (AU-12). A passkey's
+ * virtual authenticator lives only as long as the session that added it, and
+ * the gateway must hold it across the agent's click, which a one-shot
+ * `world.exec` cannot. The live origin is verified here, as for a local page.
+ * The trust boundary is `fillInWorld`'s: the stored credential is loaded into a
+ * browser the agent controls, in a sandbox the agent controls.
+ */
+export async function openWorldPage(world: World, opts: {
+  expectDomains: string[];
+  cdpUrl: string;
+  timeoutMs?: number;
+  onClose?: () => void | Promise<void>;
+}): Promise<{ session: CdpSession; origin: string }> {
+  if (!opts.expectDomains.length) throw new Error('a browser session requires target domains');
+  // Some providers type the command into an interactive shell, where a newline
+  // or control character in a domain would run as a command.
+  for (const domain of opts.expectDomains)
+    if (!HOST_NAME.test(domain)) throw new Error(`${JSON.stringify(domain)} is not a host name`);
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  await world.writeFile(HELPER_REL, HELPER_SOURCE);
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const marker = `@@${nonce}@@ `;
+  const helper = path.posix.join(world.handle.root, HELPER_REL);
+  // Raw mode: no echo of the relayed messages and no line-length limit. Some
+  // providers type the command into an interactive shell, so it is one line.
+  const pty = await world.openPty({ cwd: world.handle.root,
+    command: `stty raw -echo 2>/dev/null; exec node ${[helper, '--bridge', nonce, opts.expectDomains.join(','), opts.cdpUrl].map(shellQuote).join(' ')}` });
+  let nextId = 1;
+  let closed = false;
+  const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+  let ready!: (error?: Error) => void;
+  const started = new Promise<void>((resolve, reject) => { ready = (error) => error ? reject(error) : resolve(); });
+  let tail = '';
+  const stopData = pty.onData((chunk) => {
+    const lines = (tail + chunk).split(/\r?\n/);
+    tail = lines.pop()!.slice(-1_000_000);
+    for (const line of lines) {
+      const at = line.indexOf(marker);
+      if (at < 0) continue;
+      let message: { ready?: boolean; error?: string; cdp?: string };
+      try { message = JSON.parse(line.slice(at + marker.length)); } catch { continue; }
+      if (message.ready) ready();
+      else if (message.error) ready(new Error(message.error));
+      else if (message.cdp) {
+        let reply: any;
+        try { reply = JSON.parse(message.cdp); } catch { continue; }
+        const waiter = reply?.id !== undefined ? pending.get(reply.id) : undefined;
+        if (!waiter) continue;
+        pending.delete(reply.id);
+        if (reply.error) waiter.reject(new Error(`CDP error: ${reply.error.message ?? 'unknown'}`));
+        else waiter.resolve(reply.result);
+      }
+    }
+  });
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    stopData(); stopExit();
+    for (const waiter of pending.values()) waiter.reject(new Error('the browser session closed'));
+    pending.clear();
+    try { await pty.close(); } finally { await opts.onClose?.(); }
+  };
+  const stopExit = pty.onExit(() => {
+    ready(new Error('the world browser session ended before it was ready'));
+    void close();
+  });
+  const session: CdpSession = {
+    call: (method, params) => new Promise((resolve, reject) => {
+      if (closed) return reject(new Error('the browser session closed'));
+      const id = nextId++;
+      pending.set(id, { resolve, reject });
+      void Promise.resolve(pty.write(`${Buffer.from(JSON.stringify({ id, method, params })).toString('base64')}\n`)).catch(reject);
+      setTimeout(() => { if (pending.delete(id)) reject(new Error(`CDP ${method} timed out`)); }, timeoutMs).unref?.();
+    }),
+    close,
+  };
+  const timer = setTimeout(() => ready(new Error('the world browser did not answer in time')), timeoutMs);
+  try {
+    await started;
+  } catch (e) {
+    await close();
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+  return verifiedPage(session, opts.expectDomains);
 }

@@ -79,6 +79,7 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
+import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 
@@ -3970,6 +3971,7 @@ export class Store {
     // an already-finished task is not a repeated delete over the same rows.
     const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
     if (settledNow) (await this.pruneAgentOutput(taskId));
+    if (['done', 'cancelled', 'failed'].includes(view.status)) (await this.retireTaskSpendRequests(taskId, view.status));
     if (prev && WITHDRAW_REQUESTS_STATUS.has(view.status) && !WITHDRAW_REQUESTS_STATUS.has(prev.lastView?.status ?? ''))
       (await this.withdrawPermissionRequests(prev.projectId, taskId, view.status));
     // `retentionSweep` measures its window from here: a workflow's `updatedAt`
@@ -5787,7 +5789,7 @@ export class Store {
     if (scopeKey === 'global' && workflow === 'timing') values = { ...values, revision: crypto.randomUUID() };
     if (workflow === 'payments') {
       if (values.budget !== undefined && values.budget !== null && (!Number.isSafeInteger(values.budget) || Number(values.budget) < 0))
-        throw new Error('Budget must be a non-negative amount in cents');
+        throw new Error('Budget must be a non-negative whole amount in the smallest unit of its currency');
       if (values.cardIds !== undefined) {
         const project = (await this.getProject(scopeKey));
         const org = project?.organizationId ?? (scopeKey.startsWith('organization:') ? scopeKey.slice(13) : 'org_personal');
@@ -7396,11 +7398,13 @@ export class Store {
   async getPaymentSpendRequest(id: string): Promise<any> {
     return (await this.db.prepare('SELECT * FROM payment_spend_requests WHERE id=?').get(id)) as any;
   }
-  async setPaymentSpendRequestCard(id: string, cardId: string): Promise<void> {
+  /** Assign the card an approval chose, with its currency (AU-36). */
+  async setPaymentSpendRequestCard(id: string, cardId: string, currency?: string): Promise<void> {
     return this.db.transaction(async () => {
 
-    (await this.db.prepare('UPDATE payment_spend_requests SET cardId=?, updatedAt=? WHERE id=?')
-      .run(cardId, Date.now(), id));
+    (await (currency
+      ? this.db.prepare('UPDATE payment_spend_requests SET cardId=?, currency=?, updatedAt=? WHERE id=?').run(cardId, currency, Date.now(), id)
+      : this.db.prepare('UPDATE payment_spend_requests SET cardId=?, updatedAt=? WHERE id=?').run(cardId, Date.now(), id)));
   
     });
   }
@@ -7465,14 +7469,16 @@ export class Store {
     return { taskIds: rows.filter(row => ancestors(row.id).includes(root)).map(row => row.id), ancestorIds: lineage.slice(1) };
   }
 
-  async paymentSpent(taskId: string, family = false): Promise<number> {
+  /** Minor units spent or reserved; pass `currency` to count one currency only (AU-36). */
+  async paymentSpent(taskId: string, family = false, currency?: string): Promise<number> {
     return this.db.transaction(async () => {
 
     (await this.expirePaymentSpendRequests());
     const ids = family ? (await this.paymentBudgetFamily(taskId)).taskIds : [taskId];
     const row = (await this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
       WHERE taskId IN (${ids.map(() => '?').join(',')}) AND (status IN ('authorizing','consumed','settled')
-        OR (status='authorized' AND expiresAt>?))`).get(...ids, Date.now())) as any;
+        OR (status='authorized' AND expiresAt>?))${currency ? ' AND LOWER(currency)=?' : ''}`)
+      .get(...ids, Date.now(), ...(currency ? [currency] : []))) as any;
     return Number(row?.amount ?? 0);
   
     });
@@ -7488,18 +7494,34 @@ export class Store {
   
     });
   }
-  async findPaymentAuthorization(cardId: string, amount: number, merchant?: string): Promise<any> {
+  async findPaymentAuthorization(cardId: string, amount: number, merchant: { name?: string; url?: string } = {}): Promise<any> {
     return this.db.transaction(async () => {
 
     (await this.expirePaymentSpendRequests());
     const rows = (await this.db.prepare(`SELECT * FROM payment_spend_requests
       WHERE cardId=? AND status='authorized' AND amount>=? AND expiresAt>?
       ORDER BY CASE WHEN amount=? THEN 0 ELSE 1 END, createdAt`).all(cardId, amount, Date.now(), amount)) as any[];
-    const normalized = normalizePaymentMerchant(merchant);
-    return rows.find((row) => {
-      const expected = normalizePaymentMerchant(row.merchant);
-      return !expected || !normalized || normalized.includes(expected) || expected.includes(normalized);
+    return rows.find((row) => paymentMerchantMatches(row.merchant, merchant));
+  
     });
+  }
+  /** A task that has ended no longer wants what it asked a human to approve
+   * (AU-35): its waiting requests are denied rather than left actionable. */
+  async retireTaskSpendRequests(taskId: string, status: string): Promise<number> {
+    return this.db.transaction(async () => {
+
+    const waiting = await this.db.prepare(`SELECT id, projectId, cardId, amount, status FROM payment_spend_requests
+      WHERE taskId=? AND status IN ('pending_approval', 'needs_funding')`).all(taskId) as Array<{
+        id: string; projectId: string; cardId: string | null; amount: number; status: string }>;
+    const now = Date.now();
+    for (const request of waiting) {
+      await this.db.prepare(`UPDATE payment_spend_requests SET status='denied', reason=?, resolvedBy='system:payments', updatedAt=?
+        WHERE id=? AND status=?`).run(`task ${status} before approval`, now, request.id, request.status);
+      await this.appendAudit({ ts: now, principalId: 'system:payments', action: 'payment.request.retired',
+        scopeKey: `project:${request.projectId}`, detail: { requestId: request.id, taskId, cardId: request.cardId,
+          amount: request.amount, previousStatus: request.status, taskStatus: status } });
+    }
+    return waiting.length;
   
     });
   }
@@ -8092,10 +8114,6 @@ function cardRow(r: any) {
     last4: r.last4 ?? undefined,
     createdAt: r.createdAt,
   };
-}
-
-function normalizePaymentMerchant(value: unknown): string {
-  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 function resourceAttachmentRow(row: any): ResourceAttachment {

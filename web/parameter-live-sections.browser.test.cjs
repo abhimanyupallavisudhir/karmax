@@ -29,7 +29,7 @@ const root = __dirname;
         else if (p === '/api/tasks/fixture/payments') {
           if (request.method() === 'PUT') { const body = request.postDataJSON(); puts.push(body); Object.assign(payments, body); }
           data = { ...payments, cards: [{ id: 'c1', label: 'Main card', last4: '4242', status: 'active' }], canEdit: !['done', 'cancelled', 'failed'].includes(view.status), released: [] };
-        } else if (p === '/api/cards') data = [{ id: 'c1', label: 'Main card', last4: '4242', status: 'active' }, { id: 'c2', label: 'Spare card', last4: '1111', status: 'active' }];
+        } else if (p === '/api/cards') data = [{ id: 'c1', label: 'Main card', last4: '4242', status: 'active' }, { id: 'c2', label: 'Spare card', last4: '1111', status: 'active', currency: 'eur' }];
         else if (p === '/api/vault/items') data = [{ id: 'v1', label: 'GitHub', type: 'login' }, { id: 'v2', label: 'Stripe', type: 'api-key' }];
         else if (p === '/api/organizations/o1/credentials') data = { credentials: [{ key: 'ambient:claude', kind: 'ambient', provider: 'claude' }], task: { own: {}, enabled: ['ambient:claude'] } };
         else if (p === '/api/organizations/o1/accounts') data = { logins: [] };
@@ -89,6 +89,10 @@ const root = __dirname;
     await page.evaluate(() => window.parameterTest.refreshTask());
     assert.equal(await budget.evaluate(el => el === window.budgetNode && document.activeElement === el && el.value === '7.5'), true);
     assert.equal(await page.locator('#tp-payments .payment-save').isDisabled(), false);
+    // Cards in two currencies let the budget choose its own (AU-36).
+    const currency = page.locator('#tp-payments .payment-currency');
+    assert.deepEqual(await currency.evaluate(el => [el.hidden, el.value, [...el.options].map(o => o.value)]), [false, 'usd', ['usd', 'eur']]);
+    await currency.selectOption('eur');
 
     // Spending recorded elsewhere still shows up on the next refresh.
     payments.spent = 250;
@@ -98,8 +102,9 @@ const root = __dirname;
     // Saving is not followed by a Loading… repaint either.
     await page.locator('#tp-payments .payment-save').click();
     await page.waitForFunction(() => document.querySelector('#tp-payments .payment-save').disabled);
-    assert.deepEqual(puts, [{ cardIds: ['c1'], budget: 750 }]);
-    await page.evaluate(() => { window.parameterTest.S.tasks[0].params.paymentPolicy = { cardIds: ['c1'], budget: 750 }; });
+    assert.deepEqual(puts, [{ cardIds: ['c1'], budget: 750, currency: 'eur' }]);
+    assert.equal(await page.locator('#tp-payments .payment-spent').textContent(), `${new Intl.NumberFormat(undefined, { style: 'currency', currency: 'eur' }).format(2.5)} spent`);
+    await page.evaluate(() => { window.parameterTest.S.tasks[0].params.paymentPolicy = { cardIds: ['c1'], budget: 750, currency: 'eur' }; });
     await page.evaluate(() => window.parameterTest.refreshTask());
     assert.deepEqual(await page.evaluate(() => window.flickers), []);
     assert.equal(await stillPinned(), true);

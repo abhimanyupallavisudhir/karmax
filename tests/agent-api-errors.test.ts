@@ -8,6 +8,57 @@ afterEach(() => { vi.unstubAllGlobals(); state.close.mockReset(); });
 for (const provider of ['claude', 'codex'] as const) describe(`${provider} API tool failures`, () => {
   const input: any = { profile: { provider }, world: { handle: { root: '/tmp' } }, role: 'do', messages: [], systemPrompt: 'test', resolvedAuth: { apiKey: 'fake' } };
   const adapter = () => provider === 'claude' ? new ClaudeAdapter() : new CodexAdapter();
+  // AD-3: an API key's per-minute throttle must not park its login for the
+  // five-hour subscription window. The provider's own Retry-After wins; an
+  // unqualified 429 waits a minute. Hard quota exhaustion stays hard.
+  it.each<{ headers: Record<string, string>; detail: string; resetHint: string | RegExp }>([
+    { headers: { 'retry-after': '12' }, detail: 'rate limit exceeded', resetHint: 'in 12s' },
+    { headers: { 'retry-after-ms': '2500', 'retry-after': '9' }, detail: 'rate limit exceeded', resetHint: 'in 3s' },
+    { headers: { 'retry-after': new Date(Date.now() + 90_000).toUTCString() }, detail: 'too many requests', resetHint: /^in (8[89]|9[01])s$/ },
+    { headers: {}, detail: 'too many requests', resetHint: 'in 60s' },
+    { headers: { 'retry-after': 'soon' }, detail: 'rate limit exceeded', resetHint: 'in 60s' },
+    // A zero `retry-after-ms` does not hide a usable Retry-After.
+    { headers: { 'retry-after-ms': '0', 'retry-after': '7' }, detail: 'rate limit exceeded', resetHint: 'in 7s' },
+    // OpenAI's wording is a relative duration, never a clock time: read at
+    // 14:00, "in 1.5s" must not become 1 o'clock (#367 review item 10).
+    { headers: {}, detail: 'Rate limit reached for gpt-5 in organization org-x on tokens per min. Please try again in 1.5s.', resetHint: 'in 2s' },
+    { headers: {}, detail: 'Rate limit reached on requests per min. Please try again in 120ms.', resetHint: 'in 1s' },
+    { headers: {}, detail: 'Rate limit reached on requests per day. Please try again in 6m0s.', resetHint: 'in 360s' },
+    { headers: {}, detail: 'rate limit exceeded, try again at 5:55 PM', resetHint: 'in 60s' },
+    // x-ratelimit-reset-* is the time to a FULL refill, so only the bucket
+    // that is empty says when a request can go again (#367 review item 11).
+    { headers: { 'x-ratelimit-remaining-requests': '0', 'x-ratelimit-reset-requests': '6m0s',
+      'x-ratelimit-remaining-tokens': '5000', 'x-ratelimit-reset-tokens': '1s' }, detail: 'rate limit exceeded', resetHint: 'in 360s' },
+    { headers: { 'x-ratelimit-remaining-tokens': '0', 'x-ratelimit-reset-tokens': '20ms' }, detail: 'rate limit exceeded', resetHint: 'in 1s' },
+    { headers: { 'x-ratelimit-reset-requests': '6m0s' }, detail: 'rate limit exceeded', resetHint: 'in 60s' },
+    // The message's own wait beats a refill time; the probe that parked a key 1,213 minutes.
+    { headers: { 'x-ratelimit-remaining-requests': '150', 'x-ratelimit-reset-requests': '20h13m0s',
+      'x-ratelimit-remaining-tokens': '0', 'x-ratelimit-reset-tokens': '59s' },
+      detail: 'Rate limit reached for gpt-5 on tokens per min. Please try again in 1.5s.', resetHint: 'in 2s' },
+    // Header waits are capped at a day, as message waits are.
+    { headers: { 'retry-after': String(3 * 86_400) }, detail: 'rate limit exceeded', resetHint: 'in 86400s' },
+    { headers: { 'x-ratelimit-remaining-requests': '0', 'x-ratelimit-reset-requests': '40h0m0s' }, detail: 'rate limit exceeded', resetHint: 'in 86400s' },
+  ])('waits out an API throttle as the provider asks ($resetHint)', async ({ headers, detail, resetHint }) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(detail, { status: 429, headers })));
+    const failure: any = await adapter().runTurn(input, { emit() {} } as any).catch((error) => error);
+    expect(failure).toMatchObject({ name: 'ProviderFailure', metadata: { kind: 'quota', permanence: 'transient' } });
+    expect(failure.metadata.resetHint).toMatch(resetHint);
+  });
+  it('keeps exhausted API credit hard, without a throttle wait', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}',
+      { status: 429, headers: { 'retry-after': '5' } })));
+    const failure: any = await adapter().runTurn(input, { emit() {} } as any).catch((error) => error);
+    expect(failure.metadata).toMatchObject({ kind: 'quota', permanence: 'hard' });
+    expect(failure.metadata.resetHint).toBeUndefined();
+  });
+  it('waits a minute when the throttle arrives inside the stream', async () => {
+    const event = provider === 'claude'
+      ? 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}\n\n'
+      : 'data: {"type":"error","code":"rate_limit_exceeded","message":"Rate limit reached for requests"}\n\n';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(event, { status: 200, headers: { 'content-type': 'text/event-stream' } })));
+    const failure: any = await adapter().runTurn(input, { emit() {} } as any).catch((error) => error);
+    expect(failure.metadata).toMatchObject({ kind: 'quota', permanence: 'transient', resetHint: 'in 60s' });
+  });
   it('returns failed tools to the model and does not treat failed completion as success', async () => {
     const bodies: any[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_url, init) => {

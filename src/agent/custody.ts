@@ -146,6 +146,21 @@ function recordFor(pid: number | undefined): AgentRecord | undefined {
   }
 }
 
+/** Custody ids of the task's agents that are running now. A record whose pid
+ *  was recycled does not count: only a verified start tick proves it. */
+export function taskCustodyIds(taskId: string): string[] {
+  let files: string[];
+  try {
+    files = fs.readdirSync(agentsDir()).filter((file) => file.endsWith('.json'));
+  } catch {
+    return [];
+  }
+  return files
+    .map((file) => recordFor(Number(file.slice(0, -5))))
+    .filter((rec): rec is AgentRecord => !!rec?.custodyId && rec.taskId === taskId && alive(rec.pid) && startMatches(rec.pid, rec.pidStart))
+    .map((rec) => rec.custodyId!);
+}
+
 /** Is `pid` a live process? `EPERM` means it exists but we can't signal it. */
 function alive(pid: number): boolean {
   try {

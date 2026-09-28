@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { paths } from '../config/paths.js';
 import { replaceFileSync } from '../util/replace-file.js';
 import { DEFAULT_CDP_PORT } from './cdp-endpoint.js';
+import { CUSTODY_ENV } from '../agent/custody.js';
 import { Provider } from '../domain/types.js';
 import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 
@@ -309,6 +310,9 @@ export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
       command: process.execPath,
       args: [launcher],
       env: { KARMAX_CDP_MCP_VERSION: CHROME_DEVTOOLS_MCP_VERSION, KARMAX_CDP_PORT: String(DEFAULT_CDP_PORT) },
+      // The custody marker is how a fill finds this task's browser (task-browser.ts);
+      // Codex passes an MCP server only the variables it is told to.
+      forwardEnv: [CUSTODY_ENV],
     };
   } else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`] };
   if (spec.platform) out['karmax'] = spec.platform;

@@ -112,9 +112,10 @@ it('keeps the existing ciphertext intact when a mutation fails and releases admi
   const dir = directory();
   const vault = new Vault(dir);
   await vault.put('retained', 'fixture');
-  const before = fs.readFileSync(path.join(dir, 'secrets.json'));
+  const stored = () => fs.readdirSync(path.join(dir, 'entries')).sort().map((file) => [file, fs.readFileSync(path.join(dir, 'entries', file), 'utf8')]);
+  const before = stored();
   await expect(vault.move('missing', 'new')).rejects.toThrow('no secret');
-  expect(fs.readFileSync(path.join(dir, 'secrets.json'))).toEqual(before);
+  expect(stored()).toEqual(before);
   await vault.put('next', 'fixture-2');
   expect(vault.reveal('retained')).toBe('fixture');
 });

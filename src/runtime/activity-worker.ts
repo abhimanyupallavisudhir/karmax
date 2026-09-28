@@ -11,6 +11,7 @@ import { TASK_QUEUE } from '../temporal/config.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { Vault } from '../autonomy/vault.js';
+import { sweepTurnKeys } from '../autonomy/vault-items.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { AuthorizationService } from '../platform/authorization.js';
 import { GitHubAppService } from '../integrations/github-app.js';
@@ -58,6 +59,7 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
     closeClient = connection.close;
     const client = connection.client;
     const broker = new CredentialBroker(new Vault(p.vault));
+    sweepTurnKeys(); // key files a crashed turn of an earlier worker left behind
     const authorization = await AuthorizationService.create(store);
     const githubApp = await GitHubAppService.create(store, broker, {
       appId: process.env.KARMAX_GITHUB_APP_ID, appSlug: process.env.KARMAX_GITHUB_APP_SLUG,
