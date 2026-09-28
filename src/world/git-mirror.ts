@@ -40,7 +40,9 @@ import { canonicalRepositoryIdentity } from './repository-identity.js';
 
 const MAX_MIRRORS = 32;
 const DEFAULT_MAX_BYTES = 2 * 1024 ** 3;
-const LOCK_WAIT_MS = 15 * 60_000;
+/** Longer than the update lock is ever held: a 10-minute fetch, then up to 10
+ * minutes of gc and a local clone. */
+const LOCK_WAIT_MS = 30 * 60_000;
 /** Recorded after every fetch so eviction need not walk every mirror. */
 const SIZE_FILE = 'karmax-bytes';
 /** Scratch checkouts and mirrors must never start background maintenance: it
