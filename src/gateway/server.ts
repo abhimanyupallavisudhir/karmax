@@ -1854,6 +1854,10 @@ export class Gateway {
     const requestedScope = await this.requestScope(p, url);
     const auditScope = requestedScope.projectId ? `project:${requestedScope.projectId}`
       : requestedScope.organizationId ? `organization:${requestedScope.organizationId}` : 'global';
+    if (requestedScope.conflict) {
+      (await this.deps.authorization?.audit('anonymous', 'http.denied.scope-conflict', auditScope, { path: p, method, reason: requestedScope.conflict }));
+      return this.json(res, 403, { error: requestedScope.conflict });
+    }
     const session = await this.auth(req, requestedScope.projectId, requestedScope.organizationId);
     if (!session) {
       // Denials are audited too: cross-tenant probing must be visible to an
@@ -4812,7 +4816,7 @@ export class Gateway {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         if (!this.hostLocal) return this.json(res, 409, { error: `use the Git checkout handoff when ${(await this.siteName)} is not running on your machine` });
         const taskId = materializeMatch[1]!;
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
         try { return this.json(res, 200, await this.deps.handoffs.materialize(taskId, view)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
@@ -4822,7 +4826,7 @@ export class Gateway {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         if (!this.hostLocal) return this.json(res, 409, { error: `file open commands are available only on the machine running ${(await this.siteName)}` });
         const taskId = openCommandMatch[1]!;
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
         const body = await this.body(req);
         const line = body.line == null ? undefined : Number(body.line);
@@ -4837,7 +4841,7 @@ export class Gateway {
       if (fileCheckoutMatch && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         const taskId = fileCheckoutMatch[1]!;
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
         const body = await this.body(req);
         const line = body.line == null ? undefined : Number(body.line);
@@ -5108,7 +5112,7 @@ export class Gateway {
       if (refreshFromGithub && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         const taskId = refreshFromGithub[1]!;
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
         try { return this.json(res, 200, await this.deps.handoffs.refresh(taskId, view)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
@@ -5124,7 +5128,7 @@ export class Gateway {
         // Resolve the action from the AUTHORITATIVE live view (the stored lastView
         // can lag the workflow), by index — the client never supplies the command,
         // so only agent-authored actions are runnable.
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
         const task = (await store.getTask(taskId));
@@ -5530,7 +5534,7 @@ export class Gateway {
         // kept current after an accepted in-flight retune). Besides powering the
         // CLI fork command, the expanded task form uses this to prefill a newly
         // selected fork with the source agent's provider/model/effort.
-        const view = await api.getTaskView(token, id).catch(() => undefined);
+        const view = await api.getTaskView(token, id).catch(liveViewUnavailable);
         const agents = view?.agents;
         const transcriptRoles = (view?.transcripts ?? []).map((transcript) => transcript.role);
         const roles = [...new Set(['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm', ...transcriptRoles])];
@@ -5601,7 +5605,7 @@ export class Gateway {
       if (widgetsMatch && method === 'GET') {
         const id = widgetsMatch[1]!;
         const t = (await store.getTask(id));
-        const view = (await api.getTaskView(token, id).catch(() => undefined)) ?? t?.lastView;
+        const view = (await api.getTaskView(token, id).catch(liveViewUnavailable)) ?? t?.lastView;
         if (!t || !view) return this.json(res, 200, []);
         const { resolveWidgets } = await import('../contrib/widgets.js');
         const slot = (url.searchParams.get('slot') ?? 'task-detail') as any;
@@ -8580,7 +8584,7 @@ export class Gateway {
     return `mailbox:${provider}:${organizationId}:auth`;
   }
 
-  private async requestScope(pathname: string, url: URL): Promise<{ projectId?: string; taskId?: string; organizationId?: string }> {
+  private async requestScope(pathname: string, url: URL): Promise<{ projectId?: string; taskId?: string; organizationId?: string; conflict?: string }> {
     // Routes whose only identifier is a bare record id still belong to exactly
     // one project. Resolving that project here is what arms the tenant guard in
     // `TokenAuthority.check` — without it a `task:edit` token from any project
@@ -8588,24 +8592,32 @@ export class Gateway {
     // view, because the check had no project to compare its scope against.
     const tagId = pathname.match(/^\/api\/tags\/([^/]+)/)?.[1];
     const viewId = pathname.match(/^\/api\/views\/([^/]+)/)?.[1];
-    const projectId = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
+    const pathProject = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]
-      ?? pathname.match(/^\/api\/settings\/(?:quick\/)?project\/([^/]+)/)?.[1]
-      ?? (tagId ? (await this.deps.store.getTag(tagId))?.projectId : undefined)
-      ?? (viewId ? (await this.deps.store.getView(viewId))?.projectId : undefined)
-      ?? url.searchParams.get('projectId') ?? undefined;
+      ?? pathname.match(/^\/api\/settings\/(?:quick\/)?project\/([^/]+)/)?.[1];
     const artifact = pathname.match(/^\/api\/artifacts\/([^/]+)/)?.[1];
     const artifactRecord = artifact ? (await this.deps.store.getPromotedArtifact(artifact)) : undefined;
     const previewId = pathname.match(/^\/api\/preview-leases\/([^/]+)/)?.[1];
     const previewRecord = previewId ? (await this.deps.store.previewLease(previewId)) : undefined;
     const taskId = pathname.match(/^\/api\/tasks\/([^/]+)/)?.[1] ?? artifactRecord?.taskId ?? previewRecord?.taskId
       ?? url.searchParams.get('taskId') ?? undefined;
-    const taskProject = taskId ? await this.deps.store.taskProjectIdAsync(taskId) : undefined;
-    const resolvedProjectId = projectId ?? taskProject;
-    const organizationId = pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1]
-      ?? url.searchParams.get('organizationId')
-      ?? (resolvedProjectId ? await this.deps.store.projectOrganizationAsync(resolvedProjectId) : undefined);
-    return { projectId: resolvedProjectId, organizationId, ...(taskId ? { taskId } : {}) };
+    // A record the request addresses decides its own tenant. `?projectId=` and
+    // `?organizationId=` only name a scope for routes that address none: letting
+    // them outrank a task's own project handed any caller the right to read and
+    // act on another tenant's task by naming a project of its own. Every
+    // identifier that names a scope must agree, or the request is refused.
+    const recordProject = (tagId ? (await this.deps.store.getTag(tagId))?.projectId : undefined)
+      ?? (viewId ? (await this.deps.store.getView(viewId))?.projectId : undefined)
+      ?? (taskId ? await this.deps.store.taskProjectIdAsync(taskId) : undefined);
+    const queryProject = url.searchParams.get('projectId') ?? undefined;
+    const projects = [recordProject, pathProject, queryProject].filter((value): value is string => Boolean(value));
+    if (new Set(projects).size > 1) return { conflict: 'projectId does not match the addressed record' };
+    const resolvedProjectId = projects[0];
+    const projectOrganization = resolvedProjectId ? await this.deps.store.projectOrganizationAsync(resolvedProjectId) : undefined;
+    const organizations = [pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1], url.searchParams.get('organizationId') ?? undefined,
+      projectOrganization].filter((value): value is string => Boolean(value));
+    if (new Set(organizations).size > 1) return { conflict: 'organizationId does not match the addressed record' };
+    return { projectId: resolvedProjectId, organizationId: organizations[0], ...(taskId ? { taskId } : {}) };
   }
   private async sendWebResponse(res: http.ServerResponse, response: Response) {
     const body = Buffer.from(await response.arrayBuffer());
@@ -8703,6 +8715,14 @@ export class Gateway {
       /* ignore */
     }
   }
+}
+
+/** A task's live view may be unavailable (no running workflow), and routes
+ * then fall back to its stored view. A refusal must never take that path: the
+ * stored view would be served without the caller's own access check. */
+function liveViewUnavailable(error: unknown): undefined {
+  if (error instanceof CapabilityError) throw error;
+  return undefined;
 }
 
 /** Keep a service's loopback redirect inside the authenticated preview proxy.
