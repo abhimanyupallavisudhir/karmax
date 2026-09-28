@@ -15,7 +15,7 @@
 # Nothing reaches production or spends credit: the stack is its own Compose
 # project, agents are the mock, worlds come from a local E2B stand-in
 # (scripts/rehearsal/fake-e2b.ts) and the card is the vault-card rail. Needs
-# Linux, Docker with Compose v2, Node >= 22.6 and ~10 GB of disk. The wiki page
+# Linux, Docker with Compose v2 and ~10 GB of disk. The wiki page
 # ops/release-and-deploy ("Rehearsing an upgrade") lists the traps.
 set -euo pipefail
 
@@ -33,6 +33,11 @@ DOMAIN=rehearse.localhost
 export COMPOSE_PROJECT_NAME=karmax-rehearse
 SANDBOX_IMAGE=karmax-rehearsal-sandbox
 SANDBOX_NETWORK=karmax-rehearsal-sandboxes
+FAKE_E2B=karmax-rehearsal-e2b
+# The client and the E2B stand-in are TypeScript run by Node's type stripping,
+# in containers: nothing on the host but Docker, and outside the process tree a
+# sandbox's memory guard may kill.
+NODE_IMAGE=node:22-bookworm-slim
 E2B_API_PORT=${REHEARSAL_E2B_PORT:-13000}
 E2B_ENVD_PORT=$((E2B_API_PORT + 1))
 
@@ -90,7 +95,8 @@ summary() {
   echo; echo 'Timings:'; printf '  %s\n' "${TIMINGS[@]}"
   echo; echo 'Results:'; printf '  %s\n' "${RESULTS[@]}"
   if [ -f "$STATE" ]; then
-    node -e 'for (const gap of JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).gaps ?? []) console.log(`  GAP  ${gap}`)' "$STATE"
+    docker run --rm -v "$STATE:/state.json:ro" "$NODE_IMAGE" node -e \
+      'for (const gap of JSON.parse(require("fs").readFileSync("/state.json", "utf8")).gaps ?? []) console.log(`  GAP  ${gap}`)'
   fi
   echo
   if [ "$FAILED" -eq 0 ]; then echo 'REHEARSAL PASSED'; else echo 'REHEARSAL FAILED'; fi
@@ -117,18 +123,20 @@ wipe_project() {
 }
 wipe_sandboxes() {
   local ids
+  docker rm -f "$FAKE_E2B" >/dev/null 2>&1 || true
   ids=$(docker ps -aq --filter label=karmax.rehearsal.sandbox); [ -z "$ids" ] || docker rm -f $ids >/dev/null
   docker network rm "$SANDBOX_NETWORK" >/dev/null 2>&1 || true
 }
 
-# The seed/verify client runs on this host and reaches the app on its Compose
-# network with the headers Caddy would forward. Caddy itself is bypassed: it
-# never gets a certificate for a .localhost name (its only TLS policy is the
-# previews' on-demand one, whose permission check refuses it).
+# The seed/verify client runs on the stack's network and calls the app with
+# the headers Caddy would forward. Caddy itself is bypassed: it never gets a
+# certificate for a .localhost name (its only TLS policy is the previews'
+# on-demand one, whose permission check refuses it).
 client() {
-  local url; url=$(app_url) || return 1
-  node --experimental-strip-types --no-warnings "$REHEARSAL/client.ts" "$@" \
-    --app "$url" --origin "https://$DOMAIN" --state "$STATE"
+  docker run --rm --network "${COMPOSE_PROJECT_NAME}_default" --user "$(id -u):$(id -g)" \
+    -v "$REHEARSAL:/rehearsal:ro" -v "$WORK:/work" "$NODE_IMAGE" \
+    node --experimental-strip-types --no-warnings /rehearsal/client.ts "$@" \
+    --app http://app:4505 --origin "https://$DOMAIN" --state /work/state.json
 }
 
 # Point the app at the E2B stand-in. $KARMAX_HOME/karmax.env is the operator's
@@ -173,9 +181,10 @@ watch_app() {
 WATCHER=''
 cleanup() {
   [ -z "$WATCHER" ] || kill "$WATCHER" 2>/dev/null || true
-  [ ! -f "$WORK/fake-e2b.pid" ] || kill "$(cat "$WORK/fake-e2b.pid")" 2>/dev/null || true
+  docker logs "$FAKE_E2B" > "$LOGS/fake-e2b.log" 2>&1 || true
   jobs -p | xargs -r kill 2>/dev/null || true
   if [ "$KEEP" -eq 0 ]; then wipe_project; wipe_sandboxes; fi
+  docker image rm "$COMPOSE_PROJECT_NAME-warm-app" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -183,8 +192,7 @@ trap cleanup EXIT
 say "Rehearsing $FROM ($FROM_SHA) -> $TO ($TO_SHA) in $WORK"
 docker info >/dev/null 2>&1 || die 'Docker is not running or not accessible (sudo dockerd &; sudo chmod 666 /var/run/docker.sock)'
 docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required'
-node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 6) ? 0 : 1)' \
-  || die 'Node >= 22.6 is required (the client and the E2B stand-in run with --experimental-strip-types)'
+docker image inspect "$NODE_IMAGE" >/dev/null 2>&1 || docker pull -q "$NODE_IMAGE" >/dev/null
 [ -z "$(by_project)" ] || { echo "Removing the previous rehearsal's $COMPOSE_PROJECT_NAME project…"; wipe_project; }
 wipe_sandboxes
 for port in 80 443; do
@@ -199,18 +207,18 @@ free_gb=$(df -Pk "$WORK" | awk 'NR == 2 { print int($4 / 1048576) }')
 # runs on this host, reached by the app through the docker0 bridge address.
 E2B_HOST=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
 start_fake_e2b() {
-  local pid
   docker build -q -t "$SANDBOX_IMAGE" -f "$REHEARSAL/sandbox.Dockerfile" "$REHEARSAL"
   docker network create "$SANDBOX_NETWORK" >/dev/null
-  node --experimental-strip-types --no-warnings "$REHEARSAL/fake-e2b.ts" --host "$E2B_HOST" \
-    --api-port "$E2B_API_PORT" --envd-port "$E2B_ENVD_PORT" --image "$SANDBOX_IMAGE" --network "$SANDBOX_NETWORK" \
-    > "$LOGS/fake-e2b.log" 2>&1 &
-  pid=$!
-  echo "$pid" > "$WORK/fake-e2b.pid"
+  docker run -d --name "$FAKE_E2B" --network "$SANDBOX_NETWORK" \
+    -v /var/run/docker.sock:/var/run/docker.sock -v "$REHEARSAL:/rehearsal:ro" \
+    -p "$E2B_HOST:$E2B_API_PORT:$E2B_API_PORT" -p "$E2B_HOST:$E2B_ENVD_PORT:$E2B_ENVD_PORT" "$NODE_IMAGE" \
+    node --experimental-strip-types --no-warnings /rehearsal/fake-e2b.ts --host 0.0.0.0 \
+    --api-port "$E2B_API_PORT" --envd-port "$E2B_ENVD_PORT" --image "$SANDBOX_IMAGE" --network "$SANDBOX_NETWORK" >/dev/null
   local attempt=0
-  until grep -q "listening on $E2B_HOST:$E2B_ENVD_PORT" "$LOGS/fake-e2b.log"; do
-    kill -0 "$pid" 2>/dev/null || { cat "$LOGS/fake-e2b.log"; return 1; }
-    attempt=$((attempt + 1)); [ "$attempt" -lt 50 ] || return 1; sleep 0.2
+  until docker logs "$FAKE_E2B" 2>&1 | grep -q "listening on 0.0.0.0:$E2B_ENVD_PORT"; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 50 ] || { docker logs "$FAKE_E2B"; return 1; }
+    sleep 0.2
   done
   echo "E2B stand-in on $E2B_HOST:$E2B_API_PORT (envd $E2B_ENVD_PORT)"
 }
@@ -241,7 +249,8 @@ warm_build() {
   KARMAX_DOMAIN=$DOMAIN KARMAX_PREVIEW_DOMAIN=preview.$DOMAIN POSTGRES_PASSWORD=warm \
     docker compose -p "$COMPOSE_PROJECT_NAME-warm" --project-directory "$warm/deploy" --env-file /dev/null \
     -f "$warm/deploy/compose.turnkey.yml" build --pull app
-  docker image rm "$COMPOSE_PROJECT_NAME-warm-app" >/dev/null 2>&1 || true
+  # Keep the image until the end: with containerd's image store, removing it
+  # also drops the cached layers the update's build is meant to reuse.
   rm -rf "$warm"
 }
 step 'Warm the TO image build (not timed as the update)' warm-build.log warm_build || abort
@@ -289,9 +298,11 @@ deploy_like_production() {
 git -C "$WORK/origin.git" update-ref refs/heads/master "$DEPLOY_SHA"
 watch_app & WATCHER=$!
 update_started=$(date +%s)
+updated=0
 if step "d. Update to TO (TO's deploy/karmax update ${DEPLOY_SHA:0:12})" update.log deploy_like_production; then
   deployed=$(git -C "$WORK/install" rev-parse HEAD)
-  [ "$deployed" = "$DEPLOY_SHA" ] || record FAIL "the install is at $deployed after the update, not $DEPLOY_SHA"
+  if [ "$deployed" = "$DEPLOY_SHA" ]; then updated=1
+  else record FAIL "the install is at $deployed after the update, not $DEPLOY_SHA"; fi
 fi
 sleep 2
 boot=$(awk -v id="$(app_container)" -v since="$update_started" '$1 == id && $2 >= since { print $3 - $2 }' "$LOGS/boots.txt" 2>/dev/null | tail -n 1)
@@ -314,12 +325,14 @@ background_jobs() {
   fi
   echo "No background job failed in app container ${id:0:12}."
 }
-if [ -n "$(app_container)" ]; then
+if [ "$updated" -eq 0 ]; then
+  record FAIL 'e. skipped: the update did not complete, so there is no TO to verify'
+elif [ -z "$(app_container)" ]; then
+  record FAIL 'e. no app is running after the update; nothing to verify'
+else
   step 'e. Verify every record through the TO API' verify-to.log client verify --phase upgraded --resume || true
   step '   doctor: the app connects as its own role' doctor.log doctor_role || true
   step "   The app's background jobs run cleanly" jobs-to.log background_jobs || true
-else
-  record FAIL 'e. no app is running after the update; nothing to verify'
 fi
 
 # ---------------------------------------------------------------- f. restore

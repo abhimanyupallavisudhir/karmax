@@ -12,8 +12,11 @@
  *  recorded but never enforced.
  *
  *    node --experimental-strip-types scripts/rehearsal/fake-e2b.ts \
- *      --host 172.17.0.1 --api-port 13000 --envd-port 13001 \
+ *      --host 0.0.0.0 --api-port 13000 --envd-port 13001 \
  *      --image karmax-rehearsal-sandbox --network karmax-rehearsal-sandboxes
+ *
+ *  It needs the Docker socket and must be on --network, where it reaches each
+ *  sandbox's envd; scripts/rehearse-upgrade.sh runs it in a container.
  */
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -40,7 +43,7 @@ interface DockerReply { status: number; body: unknown }
 function docker(method: string, path: string, body?: unknown): Promise<DockerReply> {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? undefined : JSON.stringify(body);
-    const request = http.request({ socketPath: '/var/run/docker.sock', path: `/v1.43${path}`, method,
+    const request = http.request({ socketPath: '/var/run/docker.sock', path, method,
       headers: payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {} },
     (response) => {
       const chunks: Buffer[] = [];
