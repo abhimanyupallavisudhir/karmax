@@ -172,7 +172,9 @@ test('navigation removes completion feedback and returning does not restore it',
   assert.equal(host.hidden, true);
 });
 
-test('a completion response from the previous page cannot display a notice after navigation', async () => {
+// Creating the first project finishes setup and then opens that project: the
+// write's own refresh is still in flight when the console navigates.
+test('setup finished by an action that then navigates still says so on the new page', async () => {
   const { ctx, host } = onboardingContext();
   unfinishedOnboarding(ctx);
   let resolve;
@@ -181,6 +183,10 @@ test('a completion response from the previous page cannot display a notice after
   beginNavigation(ctx);
   resolve(finishedOnboarding);
   await pending;
+  assert.equal(host.hidden, false);
+  assert.match(host.innerHTML, /Setup complete/);
+  // The next navigation still removes it for good.
+  beginNavigation(ctx);
   assert.equal(host.hidden, true);
 });
 
