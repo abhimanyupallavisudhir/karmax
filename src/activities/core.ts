@@ -21,7 +21,7 @@ import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
-import { Store } from '../store/db.js';
+import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
 import { World, WorldHandle, WorldKind, WorldSpec, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
@@ -5139,6 +5139,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async publishView(taskId: string, publication: PublishedView, conversationReference?: string, options?: { separateLifecycle: boolean }): Promise<string | undefined> {
+      // WF-27: an attempt that timed out still completes, and a stopped run's
+      // last publication can land after its successor's. Drop what the task has
+      // already moved past, before it can rewrite the view. A full publication
+      // still records its snapshot first: the run's next frames may refer to it.
+      let order: ViewPublicationOrder | undefined;
+      try {
+        const runId = activityContext.current().info.workflowExecution?.runId;
+        const revision = runId && conversationReference?.startsWith(`${runId}:`)
+          ? Number(conversationReference.slice(runId.length + 1)) : undefined;
+        if (runId && typeof publication.updatedAt === 'number')
+          order = { runId, seq: publication.updatedAt, ...(Number.isSafeInteger(revision) ? { revision } : {}) };
+      } catch { /* direct invocation has no run to order by */ }
+      const stale = order !== undefined && (await store.viewPublicationStale(taskId, order));
+      if (stale && !(conversationReference && publication.messages !== undefined)) return;
       let view: TaskView;
       if (publication.conversationPatch) {
         const { conversationPatch: patch, ...rest } = publication;
@@ -5154,9 +5168,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (existing !== undefined && existing !== json)
             throw ApplicationFailure.nonRetryable('Conversation publication reference was reused', 'view-publication');
           (await store.kvSet(key, json));
+          if (stale) return;
         }
-        if (!(await store.kvHas(key)))
+        if (!(await store.kvHas(key))) {
+          // A concurrent, newer publication of this run may have replaced and
+          // dropped the snapshot since the order check above (DB-2).
+          if (order && (await store.viewPublicationStale(taskId, order))) return;
           throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+        }
         // The store can reuse the immutable conversation directly in SQL. A
         // status publication must never parse/rewrite the historical transcript.
         view = { ...publication, messages: publication.messages ?? [] };
@@ -5210,7 +5229,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await trace.mark(`queue.observed.${after?.state ?? 'released'}`));
         }
       }
-      (await store.saveView(taskId, view, conversationReference));
+      if (!(await store.saveView(taskId, view, conversationReference, order))) return;
       await notifyChildSettlement(store, deps.client, view);
       if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
         let runId: string | undefined;

@@ -227,8 +227,7 @@ describe('BudgetService over the mock rail', () => {
     (await store.setSettings(projectId, 'payments', { budget: 100 }));
     // Both clear the request-time check independently — 300 ≤ the full 500 cap,
     // because neither is counted until the gate decides. Approving both would put
-    // 600 on a card capped at 500: the cumulative ceiling has to be re-counted
-    // here, exactly as the budget coordinator does (src/coordinators/budget.ts).
+    // 600 on a card capped at 500: the cumulative ceiling has to be re-counted here.
     const task_gate_a = await store.createTask({ projectId: projectId, title: 'gate-a', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
     const first = await budget.request({ projectId, taskId: task_gate_a.id , capabilities: ['use-card:*'] }, { amount: 300, cardId: card.id, why: 'first' });
     const task_gate_b = await store.createTask({ projectId: projectId, title: 'gate-b', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
