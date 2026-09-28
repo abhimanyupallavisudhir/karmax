@@ -129,3 +129,19 @@ it('captures a single-file resource whose path is a symlink (LT-11)', async () =
   expect(manifest.files).toEqual([expect.objectContaining({ path: 'ledger.json',
     sha256: crypto.createHash('sha256').update('linked ledger\n').digest('hex') })]);
 });
+
+it('remembers stamps from a park that found nothing changed (LT-11)', async () => {
+  // The common case: a restored resource the task never touches. The first
+  // park must read every file once; later parks must not.
+  const f = await fixture(40);
+  await settle();
+  const first = await f.measure();
+  expect(first.puts).toBe(0);
+  const second = await f.measure();
+  expect(second.revisionId).toBe(first.revisionId);
+  expect(second.puts).toBe(0);
+  expect(second.execs).toBeLessThanOrEqual(2);
+  const third = await f.measure();
+  expect(third).toMatchObject({ revisionId: first.revisionId, puts: 0 });
+  expect(third.execs).toBeLessThanOrEqual(2);
+});

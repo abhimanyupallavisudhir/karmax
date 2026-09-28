@@ -30,13 +30,11 @@ const RESOURCE_KEY_PREFIX = 'resource-store:key:';
 const COPY_GLOB_SECRET_BYTES = 64 * 1024;
 
 interface SnapshotFile { path: string; bytes: number; sha256: string; chunks: string[] }
-/** `observed` holds each file's stable size/mtime/ctime/inode stamp when it was
- * captured from a world. It is outside rootDigest: content identity only. */
-interface SnapshotManifest { version: 1; attachmentId: string; files: SnapshotFile[]; rootDigest: string; bytes: number;
-  observed?: Record<string, string> }
+interface SnapshotManifest { version: 1; attachmentId: string; files: SnapshotFile[]; rootDigest: string; bytes: number }
 interface SnapshotRef { objectKey: string; sha256: string; storageLocationId?: string }
 /** `data` is consumed only when the file must be read: an input whose
- * `observed` stamp matches the baseline's reuses the baseline's chunks. */
+ * `observed` stamp matches the one recorded with the baseline reuses the
+ * baseline's chunks. */
 export interface SnapshotInputFile { path: string; data: Buffer | AsyncIterable<Buffer>; bytes?: number; observed?: string }
 export interface SnapshotVerification {
   status: 'complete' | 'partial' | 'failed';
@@ -72,11 +70,15 @@ export interface ProposedResourceCandidate {
  * Kopia without changing resource, lease, or workflow records. */
 export interface SnapshotEngine {
   readonly id: string;
-  /** With a `baseline` revision, unchanged files may reuse its chunks, and
-   * `unchanged: true` means the capture equals the baseline, whose sealedRef is
-   * returned instead of a new manifest. */
-  capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>, options?: { baseline?: ResourceRevision }): Promise<{
+  /** An `incremental` capture may reuse its `baseline` revision's chunks, and
+   * `unchanged: true` means it equals the baseline, whose sealedRef is returned
+   * instead of a new manifest. It also returns `observed`, an opaque sealed
+   * record of the file stamps it saw; passing that back with the revision this
+   * capture resolved to lets the next one skip files whose stamps match. */
+  capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>,
+    incremental?: { baseline?: ResourceRevision; observed?: string }): Promise<{
     sealedRef: string; rootDigest: string; bytes: number; files: number; storageLocationId?: string; unchanged?: boolean;
+    observed?: string;
   }>;
   restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>,
     options?: { signal?: AbortSignal }): Promise<void>;
@@ -99,7 +101,8 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     return id && this.storageLocations ? (await this.storageLocations.objectStore(id)) : this.objects;
   }
 
-  async capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>, options: { baseline?: ResourceRevision } = {}) {
+  async capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>,
+    incremental?: { baseline?: ResourceRevision; observed?: string }) {
     const key = await this.key(attachment.organizationId);
     const storageLocationId = this.storageLocations
       ? (await this.storageLocations.requireForOrganization(attachment.organizationId, attachment.storageLocationId)).id
@@ -111,9 +114,11 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     // Chunks referenced by the baseline already exist in this location, so an
     // unchanged file needs neither a read nor an upload (LT-11). The baseline's
     // revision holds their references until the new one retains its own.
-    const baseline = options.baseline?.attachmentId === attachment.id && options.baseline.engine === this.id
-      && (options.baseline.storageLocationId ?? undefined) === (storageLocationId ?? undefined)
-      ? await this.manifest(options.baseline).catch(() => undefined) : undefined;
+    const baselineRevision = incremental?.baseline;
+    const baseline = baselineRevision?.attachmentId === attachment.id && baselineRevision.engine === this.id
+      && (baselineRevision.storageLocationId ?? undefined) === (storageLocationId ?? undefined)
+      ? await this.manifest(baselineRevision).catch(() => undefined) : undefined;
+    const stamps = baseline && incremental?.observed ? openStamps(key, incremental.observed, attachment.id, baseline.rootDigest) : undefined;
     const previous = new Map(baseline?.files.map((file) => [file.path, file]));
     const stored = new Set(baseline?.files.flatMap((file) => file.chunks));
     const manifestFiles: SnapshotFile[] = [];
@@ -124,9 +129,9 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     try {
       for await (const input of files) {
         const relative = safePath(input.path);
-        if (input.observed) observed[relative] = input.observed;
+        if (incremental && input.observed) observed[relative] = input.observed;
         const prior = previous.get(relative);
-        if (prior && input.observed && baseline?.observed?.[relative] === input.observed) {
+        if (prior && input.observed && stamps?.[relative] === input.observed) {
           prior.chunks.forEach((chunkId, index) => {
             if (!retained.has(chunkId)) reused.set(chunkId, Math.min(CHUNK_BYTES, prior.bytes - index * CHUNK_BYTES));
           });
@@ -164,19 +169,21 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
       }
       manifestFiles.sort((a, b) => a.path.localeCompare(b.path));
       const rootDigest = sha256(Buffer.from(JSON.stringify(manifestFiles)));
+      const sealedStamps = Object.keys(observed).length ? sealStamps(key, attachment.id, rootDigest, observed) : undefined;
       if (baseline && rootDigest === baseline.rootDigest && !retained.size)
-        return { sealedRef: options.baseline!.sealedRef, rootDigest, bytes: total, files: manifestFiles.length, storageLocationId, unchanged: true };
+        return { sealedRef: baselineRevision!.sealedRef, rootDigest, bytes: total, files: manifestFiles.length, storageLocationId,
+          unchanged: true, ...(sealedStamps ? { observed: sealedStamps } : {}) };
       if (reused.size) {
         await this.chunkAccounting?.retain(attachment.organizationId, [...reused].map(([id, bytes]) => ({ id, bytes })), storageLocationId);
         for (const [id, bytes] of reused) retained.set(id, bytes);
       }
-      const manifest: SnapshotManifest = { version: 1, attachmentId: attachment.id, files: manifestFiles, rootDigest, bytes: total,
-        ...(Object.keys(observed).length ? { observed } : {}) };
+      const manifest: SnapshotManifest = { version: 1, attachmentId: attachment.id, files: manifestFiles, rootDigest, bytes: total };
       const encrypted = sealRandom(key, Buffer.from(JSON.stringify(manifest)));
       const objectKey = `resources/${attachment.organizationId}/manifests/${attachment.id}/${newId('snapshot')}.bin`;
       await objects.put(objectKey, encrypted);
       return { sealedRef: JSON.stringify({ objectKey, sha256: sha256(encrypted), storageLocationId } satisfies SnapshotRef),
-        rootDigest, bytes: total, files: manifestFiles.length, storageLocationId };
+        rootDigest, bytes: total, files: manifestFiles.length, storageLocationId,
+        ...(sealedStamps ? { observed: sealedStamps } : {}) };
     } catch (error) {
       const zero = (await this.chunkAccounting?.release(attachment.organizationId, [...retained.keys()])) ?? [];
       await Promise.allSettled(zero.map((chunkId) => objects.delete(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`)));
@@ -1008,18 +1015,21 @@ export class ProjectResourceService {
       // The previous park of this lease is the incremental baseline, else the
       // revision the world started from: unchanged files are neither read nor
       // uploaded, and an unchanged resource keeps its existing revision (LT-11).
+      // The stamps each park saw are kept with that pointer even when nothing
+      // changed, so only the first park after a restore reads every file.
       const baselineKey = `resource-checkpoint:${handle.id}:${attachment.id}`;
-      let recorded: { leaseId?: string; revisionId?: string } = {};
+      let recorded: { leaseId?: string; revisionId?: string; observed?: string } = {};
       try { recorded = JSON.parse((await this.store.kvGet(baselineKey)) ?? '{}'); } catch {}
-      const baselineId = recorded.leaseId === lease.id ? recorded.revisionId : lease.revisionId;
+      const sameLease = recorded.leaseId === lease.id;
+      const baselineId = sameLease ? recorded.revisionId : lease.revisionId;
       const baseline = baselineId ? (await this.store.getResourceRevision(baselineId)) : undefined;
-      const { unchanged, ...captured } = await this.engine.capture(attachment,
+      const { unchanged, observed, ...captured } = await this.engine.capture(attachment,
         filesFromWorld(world, resourceAbsolutePath(handle, attachment), attachment, checkContinue),
-        { baseline: baseline?.attachmentId === attachment.id ? baseline : undefined });
+        { baseline: baseline?.attachmentId === attachment.id ? baseline : undefined, observed: sameLease ? recorded.observed : undefined });
       const revisionId = unchanged && baseline ? baseline.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
         parentRevisionId: lease.revisionId, engine: this.engine.id, ...captured, metadata: { checkpoint: true },
         createdByTaskId: lease.taskId })).id;
-      (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId })));
+      (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId, ...(observed ? { observed } : {}) })));
       refs.push({ attachmentId: attachment.id, revisionId });
     }
     return refs;
@@ -1383,6 +1393,19 @@ function sealRandom(key: Buffer, plain: Buffer): Buffer {
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const body = Buffer.concat([cipher.update(plain), cipher.final()]);
   return Buffer.concat([Buffer.from('KRS1'), iv, cipher.getAuthTag(), body]);
+}
+/** File stamps are world-local and never part of a revision: they live with
+ * the lease's checkpoint pointer, sealed like a manifest (paths are private)
+ * and bound to the content they describe. */
+function sealStamps(key: Buffer, attachmentId: string, rootDigest: string, stamps: Record<string, string>): string {
+  return sealRandom(key, Buffer.from(JSON.stringify({ attachmentId, rootDigest, stamps }))).toString('base64');
+}
+function openStamps(key: Buffer, sealed: string, attachmentId: string, rootDigest: string): Record<string, string> | undefined {
+  try {
+    const value = JSON.parse(openRandom(key, Buffer.from(sealed, 'base64')).toString('utf8'));
+    return value?.attachmentId === attachmentId && value.rootDigest === rootDigest && value.stamps && typeof value.stamps === 'object'
+      ? value.stamps : undefined;
+  } catch { return undefined; }
 }
 function openRandom(key: Buffer, blob: Buffer): Buffer {
   if (blob.subarray(0, 4).toString() !== 'KRS1') throw new Error('invalid resource snapshot envelope');
