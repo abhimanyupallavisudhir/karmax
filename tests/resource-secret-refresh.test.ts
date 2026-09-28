@@ -9,6 +9,7 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
+import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
 import { ensureIdentity, gitOrThrow } from '../src/world/git.js';
 import type { World } from '../src/world/types.js';
 
@@ -35,8 +36,9 @@ describe('existing world secret refresh', () => {
     await world?.destroy(); (await store?.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
   async function add(name = 'REFRESH_TEST_TOKEN', projectId = project.id) {
-    const credential = `resource:test:${name}`; (await broker.registerHandle(credential, 'fixture-value'));
-    return (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId, name,
+    const id = `resource_${name.toLowerCase()}`, credential = resourceSecretHandle(id);
+    (await broker.registerHandle(credential, 'fixture-value'));
+    return (await store.createResourceAttachment({ id, organizationId: project.organizationId!, projectId, name,
       driver: 'secret@1', target: { kind: 'environment', name }, access: 'read', isolation: 'fork',
       source: {}, credentialHandles: [credential], publish: 'discard' }));
   }
