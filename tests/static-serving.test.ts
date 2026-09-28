@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { Gateway } from '../src/gateway/server.js';
-import { CONSOLE_CONTENT_SECURITY_POLICY, preferredEncoding } from '../src/gateway/static-assets.js';
+import { consoleContentSecurityPolicy, preferredEncoding } from '../src/gateway/static-assets.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxBus } from '../src/contrib/bus.js';
@@ -129,7 +129,8 @@ describe('console static assets over HTTP', () => {
   it('does not let another site frame the console', async () => {
     const shell = await raw('/', { 'accept-encoding': 'gzip' });
     expect(shell.status).toBe(200);
-    expect(shell.headers['content-security-policy']).toBe(CONSOLE_CONTENT_SECURITY_POLICY);
+    expect(shell.headers['content-security-policy']).toBe(consoleContentSecurityPolicy(new URL(base).host));
+    expect(shell.headers['content-security-policy']).toContain(`connect-src 'self' wss://${new URL(base).host} ws://${new URL(base).host}`);
     expect(shell.headers['content-security-policy']).toMatch(/frame-ancestors 'self'/);
     expect(shell.headers['x-frame-options']).toBe('SAMEORIGIN');
     expect(shell.headers['x-content-type-options']).toBe('nosniff');

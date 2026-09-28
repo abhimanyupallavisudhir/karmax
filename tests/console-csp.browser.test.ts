@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { chromium, type Page } from 'playwright';
 import { afterAll, beforeAll, expect, it } from 'vitest';
-import { staticAssetHeaders, CONSOLE_CONTENT_SECURITY_POLICY } from '../src/gateway/static-assets.js';
+import { consoleContentSecurityPolicy, staticAssetHeaders, CONSOLE_CONTENT_SECURITY_POLICY } from '../src/gateway/static-assets.js';
 import { untrustedContentHeaders } from '../src/gateway/server.js';
 
 // Bodies passed to page.evaluate run in the page; this file has no DOM lib.
@@ -19,8 +19,10 @@ let browser: Awaited<ReturnType<typeof chromium.launch>>;
 beforeAll(async () => { browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--no-sandbox'] }); });
 afterAll(async () => { await browser?.close(); });
 
+const directives = (policy: string) => Object.fromEntries(policy.split(';').map((part) => part.trim().split(/\s+/)).map(([name, ...values]) => [name!, values]));
+
 it('declares a policy with no inline or eval script and no third-party script host but pinned MathJax', () => {
-  const policy = Object.fromEntries(CONSOLE_CONTENT_SECURITY_POLICY.split(';').map((part) => part.trim().split(/\s+/)).map(([name, ...values]) => [name, values]));
+  const policy = directives(CONSOLE_CONTENT_SECURITY_POLICY);
   expect(policy['default-src']).toEqual(["'self'"]);
   expect(policy['script-src']).toEqual(["'self'", 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/']);
   expect(fs.readFileSync(path.join(web, 'markdown.js'), 'utf8')).toContain("const MATHJAX_ROOT = 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/';");
@@ -29,6 +31,22 @@ it('declares a policy with no inline or eval script and no third-party script ho
   expect(policy['frame-ancestors']).toEqual(["'self'"]);
   expect(staticAssetHeaders('/x/index.html')['content-security-policy']).toBe(CONSOLE_CONTENT_SECURITY_POLICY);
   expect(staticAssetHeaders('/x/paddle-checkout.html')['content-security-policy']).toContain('https://cdn.paddle.com');
+});
+
+it('names the socket and blob worker sources that older Safari does not derive', () => {
+  // Older Safari matches neither ws(s): against 'self' nor worker-src.
+  const policy = directives(consoleContentSecurityPolicy('console.test:8080'));
+  expect(policy['connect-src']).toEqual(["'self'", 'wss://console.test:8080', 'ws://console.test:8080']);
+  expect(policy['child-src']).toEqual(["'self'", 'blob:']);
+  expect(staticAssetHeaders('/x/index.html', 'console.test')['content-security-policy']).toBe(consoleContentSecurityPolicy('console.test'));
+  // A Host header is the requester's to choose: it may not add directives or sources.
+  for (const host of ["evil; script-src 'unsafe-inline'", 'a b', 'console.test/x']) {
+    const forged = directives(consoleContentSecurityPolicy(host));
+    expect(forged['connect-src']).toEqual(["'self'"]);
+    expect(forged['script-src']).toEqual(policy['script-src']);
+  }
+  // Agent HTML may script itself but submits nowhere.
+  expect(untrustedContentHeaders('text/html', 'report.html')['content-security-policy']).toMatch(/; form-action 'none'$/);
 });
 
 it('walks the console under its policy without a violation, and agent HTML still runs', async () => {
@@ -62,7 +80,7 @@ it('walks the console under its policy without a violation, and agent HTML still
       const rel = /^\/[\w-]+\.(js|css)$|^\/vendor\/|^\/fonts\/|^\/brand\//.test(p) && fs.existsSync(path.join(web, p)) ? p : '/index.html';
       const file = path.join(web, rel.startsWith('/brand/') ? rel.replace(/^\/brand\//, '/brand/diamond/') : rel);
       if (!fs.existsSync(file)) return route.fulfill({ status: 404, body: '' });
-      return route.fulfill({ headers: staticAssetHeaders(file), body: fs.readFileSync(file) });
+      return route.fulfill({ headers: staticAssetHeaders(file, 'console.test'), body: fs.readFileSync(file) });
     }
     if (p === '/api/tasks/t/review-info.html' || p === '/api/tasks/t/review-artifact')
       return route.fulfill({ headers: untrustedContentHeaders('text/html; charset=utf-8', 'report.html'), body: AGENT_HTML });

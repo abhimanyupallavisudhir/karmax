@@ -9097,7 +9097,7 @@ export function untrustedContentHeaders(mediaType: string, filename: string): Re
     'content-type': inert || active ? mediaType : 'application/octet-stream',
     'content-disposition': `${inert || active ? 'inline' : 'attachment'}; filename="${name}"`,
     'content-security-policy': active
-      ? 'sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads'
+      ? "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads; form-action 'none'"
       : "sandbox; default-src 'none'",
     'x-content-type-options': 'nosniff',
   };
