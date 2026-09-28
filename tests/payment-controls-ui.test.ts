@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { minorUnitDigits } from '../src/util/currency.js';
+import { THREE_DECIMAL, ZERO_DECIMAL, minorUnitDigits } from '../src/util/currency.js';
 
 const app = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
 const fn = (name: string) => {
@@ -39,6 +39,13 @@ describe('compact payment controls', () => {
   // #367 review item 12: minor units follow the payment rail (Stripe), not
   // Intl: ISK has no decimals in Intl but two in Stripe. The console and the
   // server read amounts the same way.
+  it('lists the same zero- and three-decimal currencies as the server', () => {
+    const lists = [...fn('currencyDigits').matchAll(/\[((?:'[a-z]{3}',?\s*)+)\]/g)].map((match) => new Set(match[1]!.match(/[a-z]{3}/g)));
+    expect(lists).toHaveLength(2);
+    expect([...lists[0]!].sort()).toEqual([...ZERO_DECIMAL].sort());
+    expect([...lists[1]!].sort()).toEqual([...THREE_DECIMAL].sort());
+    for (const currency of [...ZERO_DECIMAL, ...THREE_DECIMAL]) expect([currency, digits(currency)]).toEqual([currency, minorUnitDigits(currency)]);
+  });
   it('agrees with the server on every currency’s minor unit', () => {
     for (const currency of ['usd', 'eur', 'gbp', 'jpy', 'krw', 'vnd', 'kwd', 'bhd', 'isk', 'huf', 'twd', 'ugx', 'xyz'])
       expect([currency, digits(currency)]).toEqual([currency, minorUnitDigits(currency)]);
