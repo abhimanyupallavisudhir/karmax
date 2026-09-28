@@ -131,9 +131,10 @@ export class E2BWorldProvider implements WorldProvider {
     private desktopTemplate = process.env.KARMAX_E2B_DESKTOP_TEMPLATE ?? 'desktop',
     private referenceKeys?: WorldReferenceKeys,
   ) {
-    // Hosted deployments must set KARMAX_WORLD_REF_KEY. E2B_API_KEY is a stable
-    // compatibility seed for self-hosted installs; the development constant is
-    // intentionally usable only when neither cloud credential exists.
+    // Legacy KWR1 key. With WorldReferenceKeys (every real boot) new references
+    // are sealed with the vault's world-reference:key:v2, so this only reopens
+    // references sealed before it: under KARMAX_WORLD_REF_KEY, else E2B_API_KEY
+    // on self-hosted installs, else the development constant.
     this.refKey = crypto.createHash('sha256').update(
       process.env.KARMAX_WORLD_REF_KEY ?? process.env.E2B_API_KEY ?? 'karmax-development-world-ref',
     ).digest();

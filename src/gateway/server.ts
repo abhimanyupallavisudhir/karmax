@@ -43,7 +43,7 @@ import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
 import { localCodexFiles } from '../agent/codex-history-files.js';
 import { validCodexSessionId } from '../agent/codex-history.js';
-import { exportConversationWithPanagent } from '../agent/panagent.js';
+import { conversionWarningsHeader, exportConversationWithPanagent, type PanagentWarning } from '../agent/panagent.js';
 import { DEFAULT_MCP_CONNECTIONS, defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { sameRepository } from '../world/repository-identity.js';
@@ -5520,10 +5520,10 @@ export class Gateway {
         try {
           const objects = this.deps.objects ?? new LocalObjectStore(paths().objects);
           const boundId = url.searchParams.get('exportId');
-          let data: Buffer, filename: string, source: string;
+          let data: Buffer, filename: string, source: string, warnings: PanagentWarning[] = [];
           if (boundId) {
             const exported = await readCodexConversationExport(objects, taskId, requestedRole, boundId);
-            ({ data, filename, source } = exported);
+            ({ data, filename, source, warnings } = exported);
           } else {
             const stored = (await storedConversationSession(store, taskId, task.intentId, requestedRole,
               view?.agents?.[requestedRole]?.provider));
@@ -5536,13 +5536,15 @@ export class Gateway {
             if (provider === 'codex') {
               const exported = await createCodexConversationExport(objects, taskId, requestedRole, sessionId,
                 stored.home && stored.id ? { home: stored.home } : { generated: await generate() });
-              ({ data, filename, source } = exported);
+              ({ data, filename, source, warnings } = exported);
             } else {
-              data = stored.source ? await fs.promises.readFile(stored.source) : await generate();
+              if (stored.source) data = await fs.promises.readFile(stored.source);
+              else ({ data, warnings } = await generate());
               filename = `${provider}-${sessionId}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
               source = stored.source ? 'native' : 'generated';
             }
           }
+          const warningsHeader = conversionWarningsHeader(warnings);
           res.writeHead(200, {
             'content-type': 'application/x-ndjson; charset=utf-8',
             'content-disposition': `attachment; filename="${filename}"`,
@@ -5550,6 +5552,7 @@ export class Gateway {
             'cache-control': 'private, no-store',
             'x-content-type-options': 'nosniff',
             'x-karmax-conversation-source': source,
+            ...(warningsHeader ? { 'x-karmax-conversation-warnings': warningsHeader } : {}),
             'x-karmax-cell': this.deps.cellId ?? 'local',
           });
           return void res.end(data);

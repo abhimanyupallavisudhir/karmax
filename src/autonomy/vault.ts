@@ -4,10 +4,11 @@ import path from 'node:path';
 import { acquireFileLock } from '../util/file-lock.js';
 
 /**
- * A local, file-backed secret vault (SPEC §8.4). This is the pluggable backend
- * behind the credential broker — in production it would be HashiCorp Vault, a
- * cloud secret manager, or 1Password. Secrets are encrypted at rest with
- * AES-256-GCM under a key kept in the vault dir (chmod 600).
+ * A local, file-backed secret vault (SPEC §1, §8.4): the credential broker's
+ * storage on every deployment, hosted included. Secrets are encrypted at rest
+ * with AES-256-GCM under `KARMAX_VAULT_KEY` when set (hosted requires it),
+ * otherwise under a key kept in the vault dir (chmod 600). External password
+ * stores are connectors that integrate with it, not replacement backends.
  *
  * Stored values are SECRETS resolved only by the broker; everything else in the
  * system holds opaque handles (pointers), never raw keys.
