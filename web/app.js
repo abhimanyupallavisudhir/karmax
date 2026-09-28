@@ -3755,6 +3755,9 @@ function renderOnboarding() {
     <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
+  // A step's link opens the settings that step needs, which the expanded card
+  // would then cover; tuck it into its progress pill while the person works.
+  host.querySelectorAll('.onboarding-step a[data-spa]').forEach((link) => link.addEventListener('click', () => setOnboardingDisplay('minimized')));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-close')?.addEventListener('click', () => setOnboardingDisplay('closed'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
@@ -19172,7 +19175,9 @@ function renderLogin() {
       location.href = result.url;
     } catch (error) { $('#login-err').textContent = error.message; }
   });
-  $('#signup-open').addEventListener('click', () => openPublicAuth('/signup', renderSignup));
+  // An invitee stays on the invitation link: boot() accepts it once the account
+  // exists, and /signup would drop its token.
+  $('#signup-open').addEventListener('click', () => S.pendingInvite ? renderSignup() : openPublicAuth('/signup', renderSignup));
   $('#forgot-open')?.addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
@@ -19305,7 +19310,7 @@ function renderSignup() {
   $('#signup-btn').addEventListener('click', go);
   wireSocialBtn('signup-google-btn', 'google', '#signup-err', true);
   wireSocialBtn('signup-github-btn', 'github', '#signup-err', true);
-  $('#signup-back').addEventListener('click', () => openPublicAuth('/login', renderLogin));
+  $('#signup-back').addEventListener('click', () => S.pendingInvite ? renderLogin() : openPublicAuth('/login', renderLogin));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
