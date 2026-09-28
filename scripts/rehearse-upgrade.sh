@@ -206,6 +206,10 @@ wipe_sandboxes
 for port in 80 443; do
   [ -z "$(docker ps -q --filter "publish=$port")" ] || die "port $port is published by another container; stop it first (docker ps --filter publish=$port)"
 done
+# The update's replay check bundles every workflow beside the live stack.
+memory_mb=$(awk '/^MemTotal:/ { t = $2 } /^SwapTotal:/ { s = $2 } END { print int((t + s) / 1024) }' /proc/meminfo)
+[ "$memory_mb" -ge 3000 ] || [ "${KARMAX_SKIP_REPLAY_CHECK:-}" = 1 ] \
+  || echo "rehearse: warning: ${memory_mb} MB of memory and swap; the update's replay check may run out beside the stack (add swap, or set KARMAX_SKIP_REPLAY_CHECK=1 to rehearse past it)" >&2
 free_gb=$(df -Pk "$WORK" | awk 'NR == 2 { print int($4 / 1048576) }')
 [ "$free_gb" -ge 10 ] || echo "rehearse: warning: only ${free_gb} GB free; image builds need several (docker builder prune -af frees cache)" >&2
 
@@ -360,30 +364,19 @@ wipe_project
 git clone -q "$WORK/origin.git" "$WORK/restore"
 git -C "$WORK/restore" checkout -q --detach "$DEPLOY_SHA"
 cd "$WORK/restore"
-# Answers the confirmation the restore asks for, whatever its wording.
-restore() { printf '%s\n' "${CONFIRM:-RESTORE}" | ./deploy/karmax restore "$@"; }
-# Releases before CI-37 wrote no SHA256SUMS, and a restore that requires one
-# refuses their backups; one that also verifies signatures refuses unsigned
-# checksums unless told --accept-unsigned-v1. The refusal is recorded as a
-# failure; the rest of the restore is then still exercised the way an operator
-# would get past it: on a copy, with checksums written over the unchanged files.
-with_checksums() {
-  local accept=()
-  cp -a "$BACKUP" "$BACKUP-checksummed"
-  (cd "$BACKUP-checksummed" && sha256sum *.dump deployment-secrets/* control-plane/manifest.json > SHA256SUMS)
-  local CONFIRM=RESTORE
-  if grep -q -- '--accept-unsigned-v1' ./deploy/karmax; then accept=(--accept-unsigned-v1); CONFIRM='RESTORE UNSIGNED'; fi
-  restore "${accept[@]}" "$BACKUP-checksummed"
-}
-restored=0
-if step 'f. Install a fresh TO stack (deploy/karmax up)' up-fresh.log ./deploy/karmax up "$DOMAIN"; then
-  if step 'f. Restore the pre-update backup (deploy/karmax restore)' restore.log restore "$BACKUP"; then
-    restored=1
-  elif [ ! -f "$BACKUP/SHA256SUMS" ] && grep -q 'backup is missing checksums' "$LOGS/restore.log"; then
-    step '   Restore it again with operator-written checksums' restore-checksummed.log with_checksums && restored=1
+# FROM's backup may predate signed backups (every master-era one does). An
+# operator restores that with --accept-unsigned-v1 and its typed confirmation,
+# when TO's restore knows the flag.
+restore() {
+  local accept=() confirm=RESTORE
+  if [ ! -f "$BACKUP/SHA256SUMS.sig" ] && grep -q -- '--accept-unsigned-v1' ./deploy/karmax; then
+    accept=(--accept-unsigned-v1); confirm='RESTORE UNSIGNED'
   fi
-fi
-if [ "$restored" -eq 1 ] && step '   Point the restored stack at the E2B stand-in' e2b-restore.log use_fake_e2b; then
+  printf '%s\n' "$confirm" | ./deploy/karmax restore "${accept[@]}" "$BACKUP"
+}
+if step 'f. Install a fresh TO stack (deploy/karmax up)' up-fresh.log ./deploy/karmax up "$DOMAIN" \
+  && step 'f. Restore the pre-update backup (deploy/karmax restore)' restore.log restore \
+  && step '   Point the restored stack at the E2B stand-in' e2b-restore.log use_fake_e2b; then
   step 'f. Verify every record after the restore' verify-restore.log client verify --phase restored --resume || true
   step '   doctor after the restore' doctor-restore.log doctor_role || true
   step "   The restored app's background jobs run cleanly" jobs-restore.log background_jobs || true
