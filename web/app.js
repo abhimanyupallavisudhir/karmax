@@ -3618,7 +3618,6 @@ function brandMark() {
 async function refreshOnboarding() {
   const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   const userId = S.user?.id;
-  const pageEpoch = S.routeEpoch;
   const organizationId = S.organizationId;
   if (!S.meta?.hosted || !organizationId || !S.user) {
     S.onboarding = null;
@@ -3629,7 +3628,7 @@ async function refreshOnboarding() {
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`);
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
-    acceptOnboardingStatus(status, pageEpoch);
+    acceptOnboardingStatus(status);
   } catch {
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
     // Keep the last known guide and retry even when the first request failed.
@@ -3640,12 +3639,14 @@ async function refreshOnboarding() {
   renderOnboarding();
 }
 
-// Completion feedback belongs only to the page that observed the transition.
-// It is deliberately absent from both the saved preference and browser storage.
-function acceptOnboardingStatus(status, pageEpoch) {
+// Completion feedback lasts until the next navigation (applyRoute) and is
+// deliberately absent from both the saved preference and browser storage. The
+// step that finishes setup may itself navigate (a new project opens), so a
+// response that lands on the next page still confirms it.
+function acceptOnboardingStatus(status) {
   const previous = S.onboarding;
   if (status.complete && previous?.visible && !previous.complete
-    && previous.organizationId === status.organizationId && pageEpoch === S.routeEpoch) {
+    && previous.organizationId === status.organizationId) {
     S.onboardingCompletion = { organizationId: status.organizationId, userId: S.user?.id };
   } else if (!status.complete) {
     S.onboardingCompletion = null;
@@ -3662,14 +3663,13 @@ async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
   const organizationId = S.organizationId;
   const userId = S.user?.id;
-  const pageEpoch = S.routeEpoch;
   const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`, {
       method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
-    acceptOnboardingStatus(status, pageEpoch);
+    acceptOnboardingStatus(status);
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
 }
