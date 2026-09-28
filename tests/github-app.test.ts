@@ -529,6 +529,8 @@ describe('GitHub App integration', () => {
     const beforeBroker = calls.length;
     expect(await service.brokerCredentials(repository)).toMatchObject({
       httpsToken: 'installation-token', env: { GH_TOKEN: 'installation-token' },
+      // Broker mirrors are partitioned by the organization's enrollment.
+      mirrorScope: repository.id,
     });
     expect(calls.slice(beforeBroker).find((call) => call.path.endsWith('/access_tokens'))?.body)
       .toMatchObject({ repository_ids: [7] });
