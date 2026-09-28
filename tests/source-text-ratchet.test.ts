@@ -11,7 +11,6 @@ import { sourceTextAssertions, testFiles } from './helpers/source-text-assertion
  */
 const REMAINING: Record<string, number> = {
   'tests/provider-connections-ui.test.ts': 9,
-  'tests/ui-deverbosification.test.ts': 9,
 };
 
 it('adds no assertions on source text, and lists only files that still have them', () => {
