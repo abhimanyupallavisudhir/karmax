@@ -8,10 +8,10 @@ import { createRequire } from 'node:module';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
-import type { World, WorldPty, WorldPtyTermination } from '../world/types.js';
+import { worldWorkingDirectory, type World, type WorldPty, type WorldPtyTermination } from '../world/types.js';
 import { fileURLToPath } from 'node:url';
-import { CODEX_PACKAGE as PINNED_CODEX_PACKAGE, CodexHistoryError, prepareCodexHistory, selectCodexHistoryCopy,
-  validCodexSessionId, type CodexHistoryFile } from './codex-history.js';
+import { CODEX_PACKAGE as PINNED_CODEX_PACKAGE, CodexHistoryError, codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory,
+  selectCodexHistoryCopy, validCodexSessionId, type CodexHistoryFile } from './codex-history.js';
 import { codexConfigMcpServers } from './codex-config.js';
 import { atomicPrivateWrite, localCodexCopies, publishLocalCodexHistory } from './codex-history-files.js';
 import { publishRemoteCodexHistory } from './codex-history-remote.js';
@@ -89,16 +89,19 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
     await world.writeFileBuffer(target, content);
   }
   const request = bootstrapRequest(world, provider, absolute, session, history);
-  const early = prewarmed.get(world);
-  prewarmed.delete(world);
   // The bootstrap also stops a previous writer and protects the home, so
-  // nothing below lands before either.
-  const bootstrap = await timed('bootstrap.prepare', async () => {
-    const settled = await early?.bootstrap.catch(() => undefined);
-    return (early?.key === request.key ? settled : undefined) ?? runBootstrap(world, request);
-  });
+  // nothing below lands before either. One prewarmed for this very home,
+  // session and history is used once; a failed one is rerun at once, and one
+  // prewarmed for something else is not waited for (the runtime installation
+  // it may still be running is locked in the sandbox).
+  const early = bootstraps.get(world);
+  const reused = early?.key === request.key ? early!.bootstrap.catch(() => undefined) : undefined;
+  const own = (async () => (await reused) ?? runBootstrap(world, request))();
+  bootstraps.set(world, { bootstrap: own });
+  const bootstrap = await timed('bootstrap.prepare', () => own);
   const home: RemoteAgentHome = { absolute, relative, runtimeBin: bootstrap.runtimeBin };
-  const synced = provider === 'codex' ? syncedCodexHistory(relative, history, bootstrap.history) : undefined;
+  const inventory = trustedInventory(world, provider, session, bootstrap.history);
+  const synced = provider === 'codex' ? syncedCodexHistory(relative, history, inventory) : undefined;
   if (synced) home.syncedHistory = synced;
   await onStartupStep?.('prepare-config');
   await Promise.all([
@@ -109,7 +112,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
     provider !== 'codex'
       // A transcript the sandbox holds already, or has extended, stays as it is.
       ? timed('bootstrap.history', () => mapBatches(history.filter(file => {
-        const copy = bootstrap.history?.find(candidate => candidate.file === file.relative.split(path.sep).join('/'));
+        const copy = inventory?.find(candidate => candidate.file === file.relative.split(path.sep).join('/'));
         return !(copy && copy.size >= file.content.length && copy.prefix === sha256(file.content));
       }), seed))
       // Codex resolves rollout identity across the entire home, not by directory.
@@ -138,30 +141,36 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
 
 /** Start the sandbox half of seedRemoteAgentHome for the next turn in this
  * world while the caller prepares its prompt (LT-1). The seed reuses the
- * result when provider, home and session match; otherwise it waits for this
- * one to settle, so two bootstraps never install the runtime at once. */
+ * result when provider, home and session match. */
 export function prewarmRemoteAgentHome(world: World, provider: Provider, localHome: string, session?: string): void {
   const runtimeWorld = world.withoutProjectEnvironment?.() ?? world;
-  if (!localHome || !isRemoteAgentWorld(runtimeWorld) || prewarmed.has(runtimeWorld)) return;
+  if (!localHome || !isRemoteAgentWorld(runtimeWorld) || bootstraps.has(runtimeWorld)) return;
   try {
     const absolute = path.posix.join(runtimeWorld.handle.root, remoteAgentHomeRelative(provider, localHome));
     const request = bootstrapRequest(runtimeWorld, provider, absolute, session, hostHistoryFiles(localHome, provider, session));
     const bootstrap = runBootstrap(runtimeWorld, request);
     bootstrap.catch(() => undefined);
-    prewarmed.set(runtimeWorld, { key: request.key, bootstrap });
+    bootstraps.set(runtimeWorld, { key: request.key, bootstrap });
   } catch { /* the seed reports whatever made this fail */ }
 }
 
-const prewarmed = new WeakMap<World, { key: string; bootstrap: Promise<RemoteBootstrap> }>();
+/** This turn's bootstrap of a world. World objects live for one activity, so
+ * nothing here outlives the turn that measured it. */
+interface WorldBootstrap {
+  /** The home, session and history a prewarmed bootstrap measured, until a seed uses it. */
+  key?: string;
+  bootstrap: Promise<RemoteBootstrap>;
+}
+const bootstraps = new WeakMap<World, WorldBootstrap>();
 
 const workDirectory = (world: World) => path.posix.join(world.handle.root, '.karmax-injection/work-env');
 
-/** The world's private work-environment directory, when this turn's early
+/** The world's private work-environment directory, when this turn's
  * bootstrap (which also git-excludes it) has already made it (AD-12). */
 export async function preparedRemoteWorkDirectory(world: World): Promise<string | undefined> {
   const runtimeWorld = world.withoutProjectEnvironment?.() ?? world;
-  const early = prewarmed.get(runtimeWorld);
-  return early && await early.bootstrap.then(() => true, () => false) ? workDirectory(runtimeWorld) : undefined;
+  const prepared = await bootstraps.get(runtimeWorld)?.bootstrap.catch(() => undefined);
+  return prepared?.workDirectory ? workDirectory(runtimeWorld) : undefined;
 }
 
 /** Every copy of a native history the sandbox holds, measured in place. */
@@ -182,6 +191,8 @@ interface RemoteBootstrap {
   history?: RemoteHistoryCopy[];
   /** Codex also loads /etc/codex, which karmax did not write. */
   systemCodexConfig: boolean;
+  /** The world's private work-environment directory exists (AD-12). */
+  workDirectory: boolean;
 }
 
 interface BootstrapRequest {
@@ -235,9 +246,11 @@ function syncedCodexHistory(relative: string, history: Array<{ relative: string;
 const BOOTSTRAP_NODE = 64, BOOTSTRAP_EXPOSE = 65, BOOTSTRAP_QUIESCE = 66, BOOTSTRAP_PROTECT = 67;
 const HISTORY_MARKER = 'KARMAX_HISTORY_INVENTORY ';
 const SYSTEM_CODEX_CONFIG = 'KARMAX_SYSTEM_CODEX_CONFIG';
+const WORK_DIRECTORY_READY = 'KARMAX_WORK_DIRECTORY_READY';
 
 async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>): Promise<RemoteBootstrap> {
   const runtime = remoteNodeRuntime(world);
+  const node = path.posix.join(runtime.bin, 'node');
   const command = [
     `( ${runtime.install} ) || exit ${BOOTSTRAP_NODE}`,
     // Login shells reset PATH in /etc/profile. Publish the whole paired toolchain
@@ -247,21 +260,27 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
     // `git add -A` without modifying the user's tracked .gitignore.
     "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true",
     ...(request.home && request.quiesce ? [`( ${quiesceCommand(request.home)} ) || exit ${BOOTSTRAP_QUIESCE}`] : []),
-    // Credentials and work environments land only inside private directories:
-    // upload creates files and directories with the sandbox's default modes.
-    ...(request.home ? [`( mkdir -p ${quote(request.home)} ${quote(workDirectory(world))} && chmod 700 ${quote(workDirectory(world))} && find ${quote(request.home)} -type d -exec chmod 700 {} + && find ${quote(request.home)} -type f -exec chmod 600 {} + ) || exit ${BOOTSTRAP_PROTECT}`] : []),
-    ...(request.inventory ? [`${historyInventoryCommand(path.posix.join(runtime.bin, 'node'), request.inventory)} || true`] : []),
-    ...(request.systemCodexConfig ? [`if [ -e /etc/codex ]; then printf '\\n%s\\n' ${SYSTEM_CODEX_CONFIG}; fi`] : []),
+    // Credentials land only inside private directories: upload creates files
+    // and directories with the sandbox's default modes.
+    ...(request.home ? [`( mkdir -p ${quote(request.home)} && find ${quote(request.home)} -type d -exec chmod 700 {} + && find ${quote(request.home)} -type f -exec chmod 600 {} + ) || exit ${BOOTSTRAP_PROTECT}`,
+      // So do Claude's work environments. Only Claude uses them, and it makes
+      // the directory itself when this could not: never fail a turn over it.
+      `( mkdir -p ${quote(workDirectory(world))} && chmod 700 ${quote(workDirectory(world))} ) 2>/dev/null && printf '\\n%s\\n' ${WORK_DIRECTORY_READY}`] : []),
+    ...(request.inventory ? [`${historyInventoryCommand(node, request.inventory)} || true`] : []),
+    ...(request.systemCodexConfig ? [`if [ -e '/etc/codex' ]; then printf '\\n%s\\n' ${SYSTEM_CODEX_CONFIG}; fi`] : []),
     'exit 0',
   ].join('\n');
   const result = await world.exec('bash', ['-lc', command], { timeoutMs: 5 * 60_000 });
   const detail = result.stderr || result.stdout;
+  if (result.code === BOOTSTRAP_NODE) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${detail}`);
   if (result.code === BOOTSTRAP_EXPOSE)
     throw new Error(`could not make managed Node/npm the sandbox default (requires writable /usr/local/bin or passwordless sudo): ${detail}`);
   if (result.code === BOOTSTRAP_QUIESCE) throw new CodexHistoryError(`could not stop previous writer: ${detail}`);
   if (result.code === BOOTSTRAP_PROTECT) throw new Error(`could not protect remote subscription files: ${detail}`);
-  if (result.code !== 0) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${detail}`);
-  return { runtimeBin: runtime.bin, systemCodexConfig: result.stdout.split('\n').some(line => line.trim() === SYSTEM_CODEX_CONFIG),
+  // A killed command (137, 143) or a failing login profile is not a Node problem.
+  if (result.code !== 0) throw new Error(`remote runtime bootstrap failed (status ${result.code}): ${detail}`);
+  const lines = result.stdout.split('\n').map((line) => line.trim());
+  return { runtimeBin: runtime.bin, systemCodexConfig: lines.includes(SYSTEM_CODEX_CONFIG), workDirectory: lines.includes(WORK_DIRECTORY_READY),
     ...(request.inventory ? { history: parseHistoryInventory(result.stdout) } : {}) };
 }
 
@@ -342,13 +361,28 @@ function parseHistoryInventory(stdout: string): RemoteHistoryCopy[] | undefined 
   return copies as RemoteHistoryCopy[];
 }
 
+/** The inventory, when every entry is one the host would have looked for
+ * itself: this session's transcript in this working directory's project
+ * (Claude), or a rollout whose file name carries the identity it claims
+ * (Codex). The sandbox's own Node prints it, and the agent can replace that,
+ * so an entry must never choose a host path; any other entry means the
+ * sandbox cannot be measured and whole files are read instead. */
+function trustedInventory(world: World, provider: Provider, session: string | undefined,
+  copies?: RemoteHistoryCopy[]): RemoteHistoryCopy[] | undefined {
+  if (!copies || !session) return undefined;
+  const transcript = `projects/${claudeCwdSlug(worldWorkingDirectory(world.handle))}/${session}.jsonl`;
+  return copies.every((copy) => provider === 'codex'
+    ? typeof copy.id === 'string' && validCodexSessionId(copy.id) && codexRolloutIdentity(copy.file) === copy.id
+    : copy.id === undefined && copy.file === transcript) ? copies : undefined;
+}
+
 /** Measure the sandbox's copies of a session's history against the host's. */
 async function remoteHistoryInventory(world: World, home: RemoteAgentHome, provider: Provider, session: string,
   known: Record<string, number>): Promise<RemoteHistoryCopy[] | undefined> {
   try {
     const node = home.runtimeBin ? path.posix.join(home.runtimeBin, 'node') : 'node';
     const result = await world.exec('bash', ['-c', historyInventoryCommand(node, { home: home.absolute, provider, session, known })]);
-    return result.code === 0 ? parseHistoryInventory(result.stdout) : undefined;
+    return result.code === 0 ? trustedInventory(world, provider, session, parseHistoryInventory(result.stdout)) : undefined;
   } catch { return undefined; }
 }
 
@@ -419,8 +453,14 @@ async function readRemoteHistory(world: World, file: string, budget: HistoryBudg
 export async function syncRemoteAgentHome(world: World, provider: Provider, remoteHome: RemoteAgentHome,
   localHome: string, session?: string): Promise<void> {
   if (!localHome || !session) return;
+  try {
+    if (await exportHistoryTails(world, provider, remoteHome, localHome, session, { bytes: 0, files: 0 })) return;
+  } catch (error) {
+    // A refused history publishes nothing either way; anything else (a lost
+    // read, a shell that printed too much) is retried by whole verified reads.
+    if (error instanceof CodexHistoryError) throw error;
+  }
   const budget: HistoryBudget = { bytes: 0, files: 0 };
-  if (await exportHistoryTails(world, provider, remoteHome, localHome, session, budget)) return;
   const homePrefix = `${remoteHome.relative}/`;
   const files = [...await remoteHomeFiles(world, remoteHome.absolute)].filter(file => {
     if (!file.startsWith(homePrefix)) return false;
@@ -532,7 +572,11 @@ async function exportHistoryTails(world: World, provider: Provider, remoteHome: 
       const candidates = [];
       for (const copy of matches) candidates.push({ file: copy.file, content: await fetch(copy, host) });
       const kept = selectCodexHistoryCopy(candidates, id);
-      publishLocalCodexHistory(localHome, kept, id);
+      // A new host copy is named after its identity, never after the sandbox's path.
+      let name: string;
+      try { name = codexRolloutFilename(codexHistoryMetadata(kept.content).timestamp, id); }
+      catch { name = codexRolloutFilename(undefined, id); }
+      publishLocalCodexHistory(localHome, { file: path.posix.join('sessions/forked', name), content: kept.content }, id);
       content = kept.content;
     }
     const base = codexHistoryBase(content!);
@@ -542,10 +586,14 @@ async function exportHistoryTails(world: World, provider: Provider, remoteHome: 
 }
 
 async function readRemoteHistoryRange(world: World, file: string, offset: number, length: number): Promise<Buffer> {
+  // The capture allows a whole file's worth, like readRemoteHistory: whatever a
+  // login shell prints before the output must not fail a short read.
   const encoded = await verifiedRemoteOutput(world,
     `tail -c +${offset + 1} -- ${quote(path.posix.join(world.handle.root, file))} | head -c ${length} | base64 -w 0`,
-    Math.ceil(length / 3) * 4, 'read remote history');
-  return Buffer.from(encoded.toString('latin1'), 'base64');
+    Math.ceil((HISTORY_FILE_BYTES + 1) / 3) * 4, 'read remote history');
+  const data = Buffer.from(encoded.toString('latin1'), 'base64');
+  if (data.length !== length) throw new Error('could not read remote history: the sandbox copy changed while it was read');
+  return data;
 }
 
 function localCodexHistory(localHome: string, id: string): Buffer | undefined {
@@ -748,6 +796,9 @@ export function spawnRemoteAgentProcess(opts: {
     `if [ -s "$pidfile" ]; then old=$(cat "$pidfile" 2>/dev/null); cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true); case "$cmd" in *${opts.provider}*) kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true;; esac; rm -f "$pidfile"; fi`,
     'printf \'%s\\n\' "$$" > "$pidfile"',
     trace('previous-process-stopped'),
+    // The seed uploads config and credentials with the sandbox's default modes
+    // into a home the bootstrap made private: close them too before the agent runs.
+    `chmod -R go= -- ${quote(home)} 2>/dev/null`,
     `guard=${quote(path.posix.join(opts.world.handle.root, MEMORY_GUARD))}; [ -f "$guard" ] && sh "$guard" start >/dev/null 2>&1`,
     // Assemble the sentinel at runtime so no echo of the launcher can open the
     // protocol gate before `exec agent` and let the shell consume the JSON
@@ -1331,7 +1382,9 @@ export async function ensureRemoteBrowser(world: World, browser: BrowserKind, ru
  * E2B template merely because its system Node is stale. Reuse the paired runtime
  * on later turns even if task commands replace system Node/npm. */
 export async function ensureRemoteNode(world: World): Promise<string> {
-  return (await timed('bootstrap.node', () => runBootstrap(world, {}))).runtimeBin;
+  // This turn's bootstrap, prewarmed or seeded, already installed it.
+  const prepared = await bootstraps.get(world.withoutProjectEnvironment?.() ?? world)?.bootstrap.catch(() => undefined);
+  return prepared?.runtimeBin ?? (await timed('bootstrap.node', () => runBootstrap(world, {}))).runtimeBin;
 }
 
 function remoteNodeRuntime(world: World): { bin: string; install: string; expose: string } {
@@ -1344,6 +1397,11 @@ function remoteNodeRuntime(world: World): { bin: string; install: string; expose
   const node = path.posix.join(bin, 'node');
   return { bin, expose: exposeRemoteNodeCommand(bin), install: [
     `mkdir -p ${quote(bin)}`,
+    // One installer at a time, including an abandoned turn's still-running
+    // bootstrap: two npm installs into one prefix corrupt it. The kernel
+    // releases the lock with its holder, however that ends.
+    `exec 9>>${quote(path.posix.join(root, '.install.lock'))}`,
+    '{ ! command -v flock >/dev/null 2>&1 || flock -w 240 9; }',
     installRemoteNodeCommand(root, REMOTE_NODE_VERSION, REMOTE_NPM_VERSION),
     `ln -sfn ../node_modules/node/bin/node ${quote(node)}`,
     `ln -sfn ../node_modules/npm/bin/npm-cli.js ${quote(path.posix.join(bin, 'npm'))}`,

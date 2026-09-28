@@ -72,9 +72,7 @@ export async function claudeWorkEnvironment(input: TurnInput, live = false) {
       const created = await world.exec('mkdir', ['-p', '-m', '700', directory]);
       if (created.code !== 0) throw new Error('Could not prepare private work environment');
     } else if (!remote) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    // No command reads the first version yet, so it needs no atomic rename.
-    if (remote) await world.writeFile(`${relative}/env.sh`, content());
-    else await write();
+    await write();
   } catch (error) { await cleanup(); throw error; }
   // A source statement avoids copying secret values into Claude's persistent
   // shell snapshot. Native SessionStart hooks run on fresh, resume and fork.

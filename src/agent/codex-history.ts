@@ -105,19 +105,24 @@ interface Scan {
   repaired: boolean;
   fault?: string;
 }
-const scans = new Map<string, { bytes: number; digest: string; scan: Scan }>();
+const scans = new Map<string, { bytes: number; digest: string; scan: Scan; held: number }>();
 const SCAN_CACHE_ENTRIES = 64;
+/** A scan keeps the history's first record, which can be megabytes of
+ * session metadata; bound what the cache holds by those bytes too. */
+const SCAN_CACHE_BYTES = 8 * 1024 * 1024;
+let scanCacheBytes = 0;
 
 function scanHistory(key: string, session: string, content: Buffer): Scan {
   const digest = crypto.createHash('sha256');
   const cached = scans.get(key);
-  let hashed = 0, scan: Scan | undefined, start = 0;
+  let hashed = 0, scan: Scan | undefined, start = 0, held = cached?.held ?? 0;
   if (cached && cached.bytes <= content.length) {
     digest.update(content.subarray(0, hashed = cached.bytes));
     if (digest.copy().digest('hex') === cached.digest) { scan = { ...cached.scan }; start = cached.bytes; }
   }
   forEachRecord(content, start, session, (value, _end, raw) => {
     if (!scan) {
+      held = raw.length;
       const base = value.payload?.history_base?.end_ordinal_exclusive;
       scan = { first: value, expected: Number.isSafeInteger(base) ? base : 0, previousDecimal: false, repaired: false };
     }
@@ -136,9 +141,14 @@ function scanHistory(key: string, session: string, content: Buffer): Scan {
     scan.previousDecimal = containsDecimalToken(raw);
   });
   digest.update(content.subarray(hashed));
-  scans.delete(key);
-  scans.set(key, { bytes: content.length, digest: digest.digest('hex'), scan: scan! });
-  if (scans.size > SCAN_CACHE_ENTRIES) scans.delete(scans.keys().next().value!);
+  if (cached) { scans.delete(key); scanCacheBytes -= cached.held; }
+  scans.set(key, { bytes: content.length, digest: digest.digest('hex'), scan: scan!, held });
+  scanCacheBytes += held;
+  for (const [oldest, entry] of scans) {
+    if (scans.size <= SCAN_CACHE_ENTRIES && scanCacheBytes <= SCAN_CACHE_BYTES) break;
+    scans.delete(oldest);
+    scanCacheBytes -= entry.held;
+  }
   return scan!;
 }
 

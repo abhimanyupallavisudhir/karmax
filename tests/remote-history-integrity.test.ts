@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import { remoteAgentHomeRelative, syncRemoteAgentHome } from '../src/agent/remote-process.js';
-import { openLocalPty } from '../src/world/local-execution.js';
+import { openLocalPty, runLocalCommand } from '../src/world/local-execution.js';
 import type { World, WorldPty } from '../src/world/types.js';
 
 const dirs: string[] = [];
@@ -22,10 +22,13 @@ function temp(): string {
  * chunk until the next one arrives, and when the command's output is complete
  * (its end-of-output marker is withheld) end the transport, discarding the
  * withheld tail. */
-function lossyWorld(root: string, loses: (terminal: number) => boolean): World {
+function lossyWorld(root: string, loses: (terminal: number) => boolean, withExec = false): World {
   let terminals = 0;
   return {
     handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'task', root, branch: 'task', base: 'main' },
+    // With exec the sandbox measures its history in place and only the reads
+    // cross the lossy terminal; without it every read and listing does.
+    ...(withExec ? { exec: (command: string, args: string[]) => runLocalCommand(command, args, { cwd: root, env: process.env }) } : {}),
     async openPty(spec) {
       const pty = await openLocalPty(root, spec);
       if (!loses(++terminals)) return pty;
@@ -81,21 +84,31 @@ function digest(content: Buffer): string {
 }
 
 it.each([
-  ['listing', (terminal: number) => terminal % 2 === 1],
-  ['rollout read', (terminal: number) => terminal % 2 === 0],
-])('exports the complete Codex history when a sandbox %s loses its final output', async (_, loses) => {
+  ['listing', (terminal: number) => terminal % 2 === 1, false],
+  ['rollout read', (terminal: number) => terminal % 2 === 0, false],
+  ['measured tail read', (terminal: number) => terminal % 2 === 1, true],
+])('exports the complete Codex history when a sandbox %s loses its final output', async (_, loses, withExec) => {
   const root = temp(), localHome = temp();
   const id = '01a0e28b-93ca-7d81-9d6f-2f82e8b44912';
   const { relative, absolute, content } = rollout(root, localHome, id);
-  await syncRemoteAgentHome(lossyWorld(root, loses), 'codex', { relative, absolute }, localHome, id);
+  await syncRemoteAgentHome(lossyWorld(root, loses, withExec), 'codex', { relative, absolute }, localHome, id);
   expect(hostCopies(localHome, id)).toEqual([digest(content)]);
 }, 30_000);
 
-it('publishes nothing when every sandbox read loses its final output', async () => {
+it.each([false, true])('publishes nothing when every sandbox read loses its final output (exec: %s)', async (withExec) => {
   const root = temp(), localHome = temp();
   const id = '01a0e28b-93ca-7d81-9d6f-2f82e8b44913';
   const { relative, absolute } = rollout(root, localHome, id);
-  await expect(syncRemoteAgentHome(lossyWorld(root, () => true), 'codex', { relative, absolute }, localHome, id))
+  await expect(syncRemoteAgentHome(lossyWorld(root, () => true, withExec), 'codex', { relative, absolute }, localHome, id))
     .rejects.toThrow('incomplete');
   expect(hostCopies(localHome, id)).toEqual([]);
+}, 30_000);
+
+it('falls back to whole verified reads when a measured tail read keeps losing its output', async () => {
+  const root = temp(), localHome = temp();
+  const id = '01a0e28b-93ca-7d81-9d6f-2f82e8b44914';
+  const { relative, absolute, content } = rollout(root, localHome, id);
+  // The first three terminals (the tail read and its retries) lose their output; the full export's do not.
+  await syncRemoteAgentHome(lossyWorld(root, (terminal) => terminal <= 3, true), 'codex', { relative, absolute }, localHome, id);
+  expect(hostCopies(localHome, id)).toEqual([digest(content)]);
 }, 30_000);

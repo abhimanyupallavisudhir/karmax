@@ -123,3 +123,23 @@ it('AD-13 validates only what a history gained since it was last validated', asy
   const rewritten = [...grown.slice(0, 100), message(150, 'rewritten'), ...grown.slice(101)];
   await expect(prepareCodexHistory(id, read(jsonl(rewritten)))).rejects.toThrow('unsupported ordinal sequence');
 });
+
+it('AD-13 bounds what the validation cache holds by bytes, not only by entries', async () => {
+  // Each history leads with a 2 MiB session_meta record, which the cache keeps.
+  const history = (id: string, records = 3) => ({
+    file: `sessions/rollout-2026-09-09T00-00-00-${id}.jsonl`,
+    content: jsonl([{ ...meta(id), payload: { ...meta(id).payload, base_instructions: 'x'.repeat(2 * 1024 * 1024) } },
+      ...Array.from({ length: records }, (_, i) => message(i + 1, `turn ${i}`))]),
+  });
+  const ids = Array.from({ length: 9 }, (_, i) => `4444444${i}-4444-4444-8444-444444444444`);
+  for (const id of ids) expect(await prepareCodexHistory(id, async () => history(id))).toBeUndefined();
+  // The first one no longer fits beside the eight after it: validated again from its first record.
+  const parse = vi.spyOn(JSON, 'parse');
+  expect(await prepareCodexHistory(ids[0]!, async () => history(ids[0]!, 4))).toBeUndefined();
+  expect(parse.mock.calls.length).toBeGreaterThan(2);
+  parse.mockClear();
+  // The last one still fits: only its new record is parsed.
+  expect(await prepareCodexHistory(ids[8]!, async () => history(ids[8]!, 4))).toBeUndefined();
+  expect(parse.mock.calls.length).toBeLessThanOrEqual(2);
+  parse.mockRestore();
+});

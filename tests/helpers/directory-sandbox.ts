@@ -4,12 +4,17 @@
  * without a sandbox, a model or provider credit. Optional latency models a
  * provider round trip and bandwidth; the meter counts both. */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { openLocalPty, runLocalCommand } from '../../src/world/local-execution.js';
-import type { World, WorldPty, WorldPtySpec } from '../../src/world/types.js';
+import type { ExecResult, World, WorldPty, WorldPtySpec } from '../../src/world/types.js';
 
-export interface SandboxLatency { roundTripMs: number; bytesPerMs: number; cliStartMs: number; accountReadMs: number }
+export interface SandboxLatency {
+  roundTripMs: number; bytesPerMs: number; cliStartMs: number; accountReadMs: number;
+  /** A baked Chromium's launch smoke test (stageBakedBrowser). */
+  smokeMs?: number;
+}
 export const NO_LATENCY: SandboxLatency = { roundTripMs: 0, bytesPerMs: Infinity, cliStartMs: 0, accountReadMs: 0 };
 
 export interface SandboxMeter {
@@ -18,6 +23,8 @@ export interface SandboxMeter {
   execs: string[];
   uploaded: number;
   downloaded: number;
+  /** Files written through the file API, relative to the world root. */
+  writes: string[];
   /** Native CLI processes launched through the agent launcher, and their scripts. */
   cliStarts: string[];
   launches: string[];
@@ -31,25 +38,68 @@ export interface SandboxMeter {
   events: string[];
 }
 
-export const newMeter = (): SandboxMeter => ({ roundTrips: 0, execs: [], uploaded: 0, downloaded: 0, cliStarts: [], launches: [], requests: [], events: [] });
+export const newMeter = (): SandboxMeter => ({ roundTrips: 0, execs: [], writes: [], uploaded: 0, downloaded: 0, cliStarts: [], launches: [], requests: [], events: [] });
 
 const READY = '\u001eKARMAX_AGENT_READY\u001e';
 const delay = (ms: number) => ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
 
-/** `/usr/local/bin` (where karmax exposes its managed Node) and `/etc/codex`
- * (Codex's system config layer) are redirected into the directory, so no test
- * or benchmark can replace the machine's own Node or depend on its config. */
+/** The directory itself, or a link to it whose path is safe to substitute into
+ * shell text unquoted: a root with spaces or quotes is still a valid sandbox. */
+function inertPath(root: string): string {
+  if (/^[\w./-]+$/.test(root)) return root;
+  const alias = path.join(os.tmpdir(), `karmax-sandbox-alias-${crypto.randomBytes(6).toString('hex')}`);
+  fs.symlinkSync(root, alias);
+  process.once('exit', () => fs.rmSync(alias, { force: true }));
+  return alias;
+}
+
+/** System paths karmax names inside a sandbox, and where the directory keeps them. */
+const SYSTEM_PATHS = [['/usr/local/bin', '.usr-local-bin'], ['/etc/codex', '.etc-codex'], ['/opt/karmax', '.opt-karmax']] as const;
+/** What a sandbox Node process reads through the preload: never a path this
+ * machine's own Node may load itself from (a karmax template keeps it under
+ * /opt/karmax/node-*). */
+const PRELOADED_PATHS = ['/etc/codex', '/opt/karmax/bin', '/opt/karmax/browser', '/opt/karmax/browsers', '/opt/karmax/smoke.mjs'];
+
+/** `/usr/local/bin` (where karmax exposes its managed Node), `/etc/codex`
+ * (Codex's system config layer) and `/opt/karmax` (a template's baked tools)
+ * are redirected into the directory, so no test or benchmark can replace the
+ * machine's own Node or depend on its config. Shell text and arguments are
+ * rewritten; a Node process in the sandbox sees them through a preload.
+ * A login `profile` runs (as ~/.bash_profile) before every sandbox command,
+ * like a template's /etc/profile; `intercept` may answer a command instead. */
 export function directorySandbox(root: string, meter: SandboxMeter, options: {
-  latency?: SandboxLatency; growth?: number;
+  latency?: SandboxLatency; growth?: number; profile?: string;
+  intercept?: (command: string, args: string[]) => ExecResult | Promise<ExecResult> | undefined;
 } = {}): World {
   const latency = options.latency ?? NO_LATENCY;
-  const usrLocalBin = path.join(root, '.usr-local-bin');
-  fs.mkdirSync(usrLocalBin, { recursive: true });
-  const redirect = (value: string) => value.replaceAll('/usr/local/bin', usrLocalBin).replaceAll('/etc/codex', path.join(root, '.etc-codex'));
+  fs.mkdirSync(path.join(root, '.usr-local-bin'), { recursive: true });
+  // The paths substituted into shell text need no quoting in any context,
+  // including a script nested inside another's quotes (`sudo -n sh -c '…'`).
+  const inert = inertPath(root);
+  const redirect = (value: string) => SYSTEM_PATHS.reduce((text, [system, local]) => text.replaceAll(system, path.join(inert, local)), value);
+  const preload = path.join(root, '.sandbox-paths.cjs');
+  fs.writeFileSync(preload, `const fs = require('node:fs');
+const map = ${JSON.stringify(PRELOADED_PATHS.map((system) => [system, redirect(system)]))};
+const redirect = (value) => typeof value !== 'string' ? value
+  : map.reduce((text, [system, local]) => text === system || text.startsWith(system + '/') ? local + text.slice(system.length) : text, value);
+for (const name of ['accessSync', 'existsSync', 'statSync', 'readFileSync', 'openSync', 'readdirSync']) {
+  const original = fs[name];
+  fs[name] = function (file, ...rest) { return original.call(this, redirect(file), ...rest); };
+}
+`);
+  const home = path.join(root, '.home');
+  if (options.profile !== undefined) {
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, '.bash_profile'), options.profile);
+  }
+  const sandboxEnv = (env: Record<string, string | undefined> = {}) => ({
+    ...Object.fromEntries(Object.entries(env).map(([key, value]) => [key, value === undefined ? value : redirect(value)])),
+    NODE_OPTIONS: `--require="${preload}"`, ...(options.profile !== undefined ? { HOME: home } : {}),
+  });
   const trip = async (bytes = 0) => { meter.roundTrips++; await delay(latency.roundTripMs + bytes / latency.bytesPerMs); };
   const file = (relative: string) => path.join(root, relative);
   const write = async (relative: string, content: Buffer) => {
-    meter.uploaded += content.length; await trip(content.length);
+    meter.writes.push(relative); meter.uploaded += content.length; await trip(content.length);
     fs.mkdirSync(path.dirname(file(relative)), { recursive: true });
     fs.writeFileSync(file(relative), content);
   };
@@ -58,8 +108,12 @@ export function directorySandbox(root: string, meter: SandboxMeter, options: {
     async exec(command, args, execOptions = {}) {
       meter.execs.push([command, ...args].join(' '));
       await trip();
-      const result = await runLocalCommand(redirect(command), args.map(redirect), { cwd: execOptions.cwd ?? root,
-        env: { ...process.env, ...execOptions.env } as NodeJS.ProcessEnv, timeoutMs: execOptions.timeoutMs, input: execOptions.input });
+      const intercepted = options.intercept?.(command, args);
+      if (intercepted) return await intercepted;
+      // A shell's script follows its -c flag; every other argument is a plain path or value.
+      const result = await runLocalCommand(redirect(command), args.map((arg) => redirect(arg)), {
+        cwd: execOptions.cwd ?? root, env: { ...process.env, ...sandboxEnv(execOptions.env) } as NodeJS.ProcessEnv,
+        timeoutMs: execOptions.timeoutMs, input: execOptions.input });
       const bytes = Buffer.byteLength(result.stdout);
       meter.downloaded += bytes; await delay(bytes / latency.bytesPerMs);
       return result;
@@ -74,13 +128,14 @@ export function directorySandbox(root: string, meter: SandboxMeter, options: {
     async startProcess() { throw new Error('unused'); },
     async openPty(spec: WorldPtySpec = {}) {
       await trip();
-      const launcher = spec.command?.match(/^exec sh '([^']+)'$/)?.[1];
+      const launcher = spec.command?.match(/^exec sh '((?:[^']|'\\'')+)'$/)?.[1]?.replaceAll(`'\\''`, "'");
       if (launcher) {
         const script = fs.readFileSync(launcher, 'utf8');
         fs.rmSync(launcher, { force: true });
         return fakeCodex(script, String(spec.env?.CODEX_HOME), meter, latency, options.growth ?? 4096);
       }
-      return meteredPty(await openLocalPty(root, spec), meter, latency, redirect);
+      return meteredPty(await openLocalPty(root, { ...spec, env: { ...spec.env, ...sandboxEnv(spec.env) } as Record<string, string> }),
+        meter, latency, redirect);
     },
     async destroy() {},
   };
@@ -201,10 +256,7 @@ function fakeCodex(script: string, home: string, meter: SandboxMeter, latency: S
  * start never downloads Node from npm. */
 export function stageRemoteRuntime(root: string, version = '22.16.0'): void {
   const modules = path.join(root, `.karmax-injection/agent/tools/node-${version}/node_modules`);
-  const node = fs.realpathSync(process.execPath);
-  const npm = [path.join(path.dirname(node), '../lib/node_modules/npm'), path.join(path.dirname(node), '../../npm')]
-    .find((candidate) => fs.existsSync(path.join(candidate, 'bin/npx-cli.js')));
-  if (!npm) throw new Error('the directory sandbox needs the npm that ships with this Node');
+  const npm = npmDirectory();
   fs.mkdirSync(path.join(modules, 'node/bin'), { recursive: true });
   fs.symlinkSync(process.execPath, path.join(modules, 'node/bin/node'));
   fs.symlinkSync(npm, path.join(modules, 'npm'));
@@ -213,6 +265,44 @@ export function stageRemoteRuntime(root: string, version = '22.16.0'): void {
   fs.symlinkSync('../node_modules/node/bin/node', path.join(bin, 'node'));
   fs.symlinkSync('../node_modules/npm/bin/npm-cli.js', path.join(bin, 'npm'));
   fs.symlinkSync('../node_modules/npm/bin/npx-cli.js', path.join(bin, 'npx'));
+}
+
+/** A provider template's baked browser tools at /opt/karmax: MCP executables,
+ * a Chromium, the Playwright package that locates it and the launch smoke
+ * test, which takes `smokeMs` like a real headless Chromium start. */
+export function stageBakedBrowser(root: string, smokeMs = 0): void {
+  const baked = path.join(root, '.opt-karmax');
+  const executable = (file: string, content: string) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content, { mode: 0o755 });
+  };
+  for (const name of ['playwright-mcp', 'chrome-devtools-mcp']) executable(path.join(baked, 'bin', name), '#!/bin/sh\nexit 0\n');
+  executable(path.join(baked, 'browsers/chromium/chrome'), '#!/bin/sh\nexit 0\n');
+  executable(path.join(baked, 'browser/node_modules/playwright/index.js'),
+    "module.exports = { chromium: { executablePath: () => '/opt/karmax/browsers/chromium/chrome' } };\n");
+  executable(path.join(baked, 'smoke.mjs'), `await new Promise((resolve) => setTimeout(resolve, ${smokeMs}));\n`);
+}
+
+/** A provider template's paired runtime at /opt/karmax/node-<version>. Its
+ * version check logs when it starts and ends, so a test can see whether two
+ * bootstraps linked it at the same time. */
+export function stageBakedRuntime(root: string, version = '22.16.0', checkMs = 0): string {
+  const baked = path.join(root, `.opt-karmax/node-${version}`);
+  const log = path.join(root, 'baked-runtime.log');
+  fs.mkdirSync(path.join(baked, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(baked, 'node_modules/node/bin'), { recursive: true });
+  fs.symlinkSync(process.execPath, path.join(baked, 'node_modules/node/bin/node'));
+  fs.symlinkSync(npmDirectory(), path.join(baked, 'node_modules/npm'));
+  fs.writeFileSync(path.join(baked, 'bin/node'), `#!/bin/sh\necho start >> '${log}'\nsleep ${checkMs / 1000}\necho end >> '${log}'\nexit 0\n`, { mode: 0o755 });
+  return log;
+}
+
+function npmDirectory(): string {
+  const node = fs.realpathSync(process.execPath);
+  const npm = [path.join(path.dirname(node), '../lib/node_modules/npm'), path.join(path.dirname(node), '../../npm')]
+    .find((candidate) => fs.existsSync(path.join(candidate, 'bin/npx-cli.js')));
+  if (!npm) throw new Error('the directory sandbox needs the npm that ships with this Node');
+  return npm;
 }
 
 /** A ChatGPT login whose ID token stays fresh for an hour: no host refresh. */
