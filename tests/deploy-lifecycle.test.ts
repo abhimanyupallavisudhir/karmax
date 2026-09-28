@@ -30,8 +30,9 @@ if (args.includes('cp')) {
   const destination = args.at(-1);
   fs.mkdirSync(destination, { recursive: true });
   fs.writeFileSync(path.join(destination, 'manifest.json'), '{}');
-  fs.writeFileSync(path.join(destination, 'manifest.hmac'), 'fixture');
+  fs.writeFileSync(path.join(destination, 'manifest.sig'), 'fixture');
 }
+if (args.includes('--sign-checksums')) { fs.readFileSync(0); process.stdout.write('signature-fixture'); }
 if (args.includes('pg_dump')) process.stdout.write('dump-' + args.at(-1));
 if (args.includes('pg_restore')) fs.readFileSync(0);
 `, { mode: 0o755 });
@@ -49,7 +50,10 @@ it('publishes a complete backup atomically and verifies its checksums (CI-37)', 
   const destination = path.join(h.root, 'snapshot');
   const result = h.run(['backup', destination]);
   expect(result.status, result.stderr).toBe(0);
-  expect(fs.readdirSync(destination).sort()).toEqual(['SHA256SUMS', 'control-plane', 'deployment-secrets', 'karmax.dump', 'temporal-visibility.dump', 'temporal.dump']);
+  expect(fs.readdirSync(destination).sort()).toEqual(['SHA256SUMS', 'SHA256SUMS.sig', 'control-plane', 'deployment-secrets', 'karmax.dump', 'temporal-visibility.dump', 'temporal.dump']);
+  // The dumps are outside the signed control-plane manifest, so their checksums are signed too (DB-10).
+  expect(fs.readFileSync(path.join(destination, 'SHA256SUMS.sig'), 'utf8')).toBe('signature-fixture');
+  expect(h.calls().some(args => args.join(' ').includes('exec -T app npm run --silent backup -- --sign-checksums'))).toBe(true);
   expect(spawnSync('sha256sum', ['-c', 'SHA256SUMS'], { cwd: destination }).status).toBe(0);
   expect(fs.readdirSync(h.root).some(name => name.includes('.partial.'))).toBe(false);
   expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
@@ -128,4 +132,37 @@ it('rejects changed dump bytes and cancelled confirmation before stopping servic
   fs.appendFileSync(path.join(destination, 'temporal.dump'), 'tampered');
   expect(h.run(['restore', destination], '', 'RESTORE\n').status).not.toBe(0);
   expect(h.calls().some(args => args.includes('build') || args.includes('down'))).toBe(false);
+});
+
+// DB-10: a restore checks both signatures before anything stops; a backup from
+// another host is trusted by fingerprint, and one from before signing needs
+// the operator's explicit flag and a stronger confirmation.
+it('verifies backup signatures first, and restores an unsigned backup only when told to', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  h.clear();
+  const fingerprint = 'SHA256:AbCdEf+/0123456789abcdefghijklmnopqrstuvwxyz';
+  expect(h.run(['restore', '--trust-key', fingerprint, destination], '', 'RESTORE\n').status).toBe(0);
+  const calls = h.calls().map(args => args.join(' '));
+  const stopped = calls.findIndex(call => call.endsWith(' down'));
+  const checked = calls.findIndex(call => call.includes(`npm run restore -- --verify-checksums --trust-key ${fingerprint} /backup/SHA256SUMS`));
+  expect(checked).toBeGreaterThan(-1);
+  expect(checked).toBeLessThan(stopped);
+  expect(calls.some(call => call.includes(`npm run restore -- --verify --trust-key ${fingerprint} /restore`))).toBe(true);
+  expect(calls.slice(stopped).some(call => call.includes(`npm run restore -- --trust-key ${fingerprint} /restore`))).toBe(true);
+
+  h.clear();
+  expect(h.run(['restore', '--trust-key', 'not-a-fingerprint', destination], '', 'RESTORE\n').status).not.toBe(0);
+  expect(h.calls().some(args => args.includes('build') || args.includes('run'))).toBe(false);
+  // A plain RESTORE does not accept an unsigned backup.
+  expect(h.run(['restore', '--accept-unsigned-v1', destination], '', 'RESTORE\n').status).not.toBe(0);
+  expect(h.calls().some(args => args.includes('down'))).toBe(false);
+  h.clear();
+  const unsigned = h.run(['restore', '--accept-unsigned-v1', destination], '', 'RESTORE UNSIGNED\n');
+  expect(unsigned.status, unsigned.stderr).toBe(0);
+  expect(unsigned.stdout).toContain('This backup is unsigned');
+  const accepted = h.calls().map(args => args.join(' '));
+  expect(accepted.some(call => call.includes('--verify-checksums --accept-unsigned-v1 /backup/SHA256SUMS'))).toBe(true);
+  expect(accepted.some(call => call.includes('npm run restore -- --accept-unsigned-v1 /restore'))).toBe(true);
 });

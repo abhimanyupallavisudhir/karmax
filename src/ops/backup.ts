@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { paths } from '../config/paths.js';
 import { scanInstances } from '../util/instance.js';
+import { SIGNING_KEY_FILE, signBackupBytes, verifyBackupBytes } from './backup-signing.js';
 
 const sqlite = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
@@ -14,7 +15,9 @@ type Component = typeof COMPONENTS[number];
 
 export interface BackupManifest {
   format: 'karmax-backup';
-  version: 1;
+  /** 2: signed (`manifest.sig`, DB-10). 1: written before signing; restorable
+   *  only when the operator explicitly accepts that it cannot be authenticated. */
+  version: 1 | 2;
   createdAt: string;
   sourceHome: string;
   temporal: 'embedded' | 'external';
@@ -53,6 +56,18 @@ const SECRET_FILES = ['vault/vault.key', 'state/auth.db.secret'] as const;
  *  promises a payload safe to hand off, so these leave with the key files. */
 const PLAINTEXT_SECRET_DIRS = ['state/git-profiles', 'state/vault-items', 'config-homes'] as const;
 
+const MANIFEST_DOMAIN = 'karmax-backup-manifest-v2';
+const CHECKSUMS_DOMAIN = 'karmax-backup-checksums-v1';
+/** Restores recorded for the audit log at the next boot (`recordRestores`). */
+const RESTORE_AUDIT_DIR = 'restore-audit';
+
+export interface BackupTrust {
+  /** Fingerprints of signing keys to accept besides this installation's own. */
+  trustKeys?: string[];
+  /** Restore a version-1 backup, which predates signing and cannot be authenticated. */
+  acceptUnsignedV1?: boolean;
+}
+
 /**
  * Create a consistent, portable control-plane backup. Mutable SQLite files use
  * SQLite's online backup API; copying a WAL-backed database as an ordinary file
@@ -74,7 +89,7 @@ export async function createBackup(options: {
    * preserves the existing self-contained behaviour.
    */
   excludeSecrets?: boolean;
-} = {}): Promise<{ directory: string; manifest: BackupManifest }> {
+} = {}): Promise<{ directory: string; manifest: BackupManifest; signedBy: string }> {
   const home = path.resolve(options.home ?? paths().home);
   const p = paths(home);
   // Components are snapshotted at different instants, so a backup taken while an
@@ -126,7 +141,10 @@ export async function createBackup(options: {
     const passGitCache = path.join('connectors', 'pass-git');
     copyTree(p.state, path.join(payload, 'state'), (file) => {
       const relative = path.relative(p.state, file);
+      // The signing key stays behind: a signature is worth nothing if its key
+      // travels with what it signs.
       return relative !== 'instances' && !relative.startsWith(`instances${path.sep}`)
+        && !relative.startsWith(SIGNING_KEY_FILE) && relative !== RESTORE_AUDIT_DIR && !relative.startsWith(`${RESTORE_AUDIT_DIR}${path.sep}`)
         && relative !== passGitCache && !relative.startsWith(`${passGitCache}${path.sep}`)
         && !/\.(?:db|sqlite)(?:-(?:wal|shm))?$/.test(relative);
     });
@@ -143,7 +161,7 @@ export async function createBackup(options: {
     }
 
     const manifest: BackupManifest = {
-      format: 'karmax-backup', version: 1, createdAt: new Date().toISOString(), sourceHome: home,
+      format: 'karmax-backup', version: 2, createdAt: new Date().toISOString(), sourceHome: home,
       temporal: options.externalTemporal ? 'external' : 'embedded',
       objectStore: options.externalObjectStore ? 'external' : 'local', worldsIncluded: false,
       // Intent, NOT payload contents: `fs.existsSync` over SECRET_FILES reports
@@ -154,8 +172,11 @@ export async function createBackup(options: {
       secretsIncluded: !options.excludeSecrets,
       files: listFiles(payload).map((file) => ({ path: slash(path.relative(payload, file)), bytes: fs.statSync(file).size, sha256: hashFile(file) })),
     };
-    writeAtomic(path.join(destination, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 0o600);
-    return { directory: destination, manifest };
+    const manifestBytes = `${JSON.stringify(manifest, null, 2)}\n`;
+    const { signature, fingerprint } = signBackupBytes(home, MANIFEST_DOMAIN, manifestBytes);
+    writeAtomic(path.join(destination, 'manifest.json'), manifestBytes, 0o600);
+    writeAtomic(path.join(destination, 'manifest.sig'), `${JSON.stringify(signature)}\n`, 0o600);
+    return { directory: destination, manifest, signedBy: fingerprint };
   } catch (error) {
     fs.rmSync(destination, { recursive: true, force: true });
     throw error;
@@ -164,11 +185,29 @@ export async function createBackup(options: {
 
 /** Verify every byte before replacing anything, then restore each component via
  * same-filesystem rename. A failed verification leaves the installation intact. */
-export function verifyBackup(source: string): BackupManifest {
+export function verifyBackup(source: string, options: BackupTrust & { home?: string } = {}): BackupManifest {
+  return authenticate(source, options).manifest;
+}
+
+/** The manifest, checked against its signature (or explicitly accepted as an
+ *  unsigned v1 backup), then every payload byte against the manifest. */
+function authenticate(source: string, options: BackupTrust & { home?: string }): { manifest: BackupManifest; manifestSha256: string; signedBy?: string } {
   const directory = path.resolve(source);
-  const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as BackupManifest;
-  if (manifest.format !== 'karmax-backup' || manifest.version !== 1 || !Array.isArray(manifest.files))
+  const bytes = fs.readFileSync(path.join(directory, 'manifest.json'));
+  const manifest = JSON.parse(bytes.toString('utf8')) as BackupManifest;
+  if (manifest.format !== 'karmax-backup' || ![1, 2].includes(manifest.version) || !Array.isArray(manifest.files))
     throw new Error('unsupported or invalid Krmax backup manifest');
+  let signedBy: string | undefined;
+  if (manifest.version === 1) {
+    if (!options.acceptUnsignedV1)
+      throw new Error(`this backup (${manifest.createdAt}) predates signed backups, so nothing proves it has not been altered. `
+        + 'Restore it only if you know it has stayed in trusted storage, with `--accept-unsigned-v1`; the restore is recorded in the audit log');
+  } else {
+    let signature: string;
+    try { signature = fs.readFileSync(path.join(directory, 'manifest.sig'), 'utf8'); }
+    catch { throw new Error('backup manifest signature is missing; the backup was altered or is incomplete'); }
+    signedBy = verifyBackupBytes(path.resolve(options.home ?? paths().home), MANIFEST_DOMAIN, bytes, signature, options.trustKeys);
+  }
   const payload = path.join(directory, 'payload');
   for (const entry of manifest.files) {
     const file = safeJoin(payload, entry.path);
@@ -189,15 +228,33 @@ export function verifyBackup(source: string): BackupManifest {
     if (!declared.has(relative)) throw new Error(`backup payload file is not listed in the manifest: ${relative}`);
   }
 
-  return manifest;
+  return { manifest, signedBy, manifestSha256: crypto.createHash('sha256').update(bytes).digest('hex') };
 }
 
-export async function restoreBackup(source: string, options: { home?: string; allowRunning?: boolean } = {}): Promise<BackupManifest> {
+/** Sign a deployment backup's checksum list (deploy/karmax), which covers the
+ *  PostgreSQL dumps and deployment secrets outside the control-plane manifest. */
+export function signChecksums(bytes: Buffer, home = paths().home): string {
+  return `${JSON.stringify(signBackupBytes(path.resolve(home), CHECKSUMS_DOMAIN, bytes).signature)}\n`;
+}
+
+/** Check a signed checksum list; an unsigned one needs `acceptUnsignedV1`. Returns the signer, if any. */
+export function verifyChecksums(file: string, options: BackupTrust & { home?: string } = {}): string | undefined {
+  let signature: string;
+  try { signature = fs.readFileSync(`${file}.sig`, 'utf8'); }
+  catch {
+    if (options.acceptUnsignedV1) return undefined;
+    throw new Error('this backup\'s checksums are unsigned (it predates signed backups). Restore it only if you know it has stayed '
+      + 'in trusted storage, with `--accept-unsigned-v1`; the restore is recorded in the audit log');
+  }
+  return verifyBackupBytes(path.resolve(options.home ?? paths().home), CHECKSUMS_DOMAIN, fs.readFileSync(file), signature, options.trustKeys);
+}
+
+export async function restoreBackup(source: string, options: BackupTrust & { home?: string; allowRunning?: boolean } = {}): Promise<BackupManifest> {
   const directory = path.resolve(source);
-  const manifest = verifyBackup(directory);
+  const home = path.resolve(options.home ?? paths().home);
+  const { manifest, manifestSha256, signedBy } = authenticate(directory, { ...options, home });
   const payload = path.join(directory, 'payload');
 
-  const home = path.resolve(options.home ?? paths().home);
   const p = paths(home);
   const running = scanInstances(path.join(p.state, 'instances'), process.pid);
   if (running.length && !options.allowRunning)
@@ -244,6 +301,12 @@ export async function restoreBackup(source: string, options: { home?: string; al
   // the documented restore-onto-a-new-host path that leaves the backup's ciphertext
   // paired with a foreign key — permanently undecryptable, every session invalidated.
   const preserved = new Map<string, Buffer>();
+  // The restored state/ never carries a signing key; keep this installation's.
+  const liveSigningKey = path.join(home, 'state', SIGNING_KEY_FILE);
+  if (present.includes('state') && fs.existsSync(liveSigningKey)) preserved.set(`state/${SIGNING_KEY_FILE}`, fs.readFileSync(liveSigningKey));
+  // …and the record of any earlier restore not yet in the audit log.
+  if (present.includes('state')) for (const file of (() => { try { return fs.readdirSync(path.join(home, 'state', RESTORE_AUDIT_DIR)); } catch { return []; } })())
+    preserved.set(`state/${RESTORE_AUDIT_DIR}/${file}`, fs.readFileSync(path.join(home, 'state', RESTORE_AUDIT_DIR, file)));
   if (manifest.secretsIncluded === false) {
     for (const relative of SECRET_FILES) {
       const component = relative.split('/')[0]!;
@@ -265,6 +328,13 @@ export async function restoreBackup(source: string, options: { home?: string; al
       fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
       writeAtomic(target, bytes, 0o600);
     }
+    // Every restore reaches the audit log, and an unsigned one says so.
+    const audit = path.join(home, 'state', RESTORE_AUDIT_DIR);
+    fs.mkdirSync(audit, { recursive: true, mode: 0o700 });
+    writeAtomic(path.join(audit, `${nonce}.json`), `${JSON.stringify({ restoredAt: new Date().toISOString(),
+      backupCreatedAt: manifest.createdAt, sourceHome: manifest.sourceHome, manifestVersion: manifest.version, manifestSha256,
+      signedBy: signedBy ?? null, acceptedUnsigned: !signedBy, files: manifest.files.length,
+      operator: process.env.SUDO_USER || process.env.USER || null })}\n`, 0o600);
     fs.rmSync(previousRoot, { recursive: true, force: true });
     fs.rmSync(stageRoot, { recursive: true, force: true });
     return manifest;
@@ -280,6 +350,19 @@ export async function restoreBackup(source: string, options: { home?: string; al
     fs.rmSync(stageRoot, { recursive: true, force: true });
     fs.rmSync(previousRoot, { recursive: true, force: true });
     throw error;
+  }
+}
+
+/** Append the restores recorded since the last boot to the audit log. */
+export async function recordRestores(store: { appendAudit(entry: { principalId: string; action: string; detail?: Record<string, unknown> }): unknown }, home = paths().home): Promise<void> {
+  const audit = path.join(home, 'state', RESTORE_AUDIT_DIR);
+  let files: string[];
+  try { files = fs.readdirSync(audit).filter((file) => file.endsWith('.json')).sort(); } catch { return; }
+  for (const file of files) {
+    let detail: Record<string, unknown>;
+    try { detail = JSON.parse(fs.readFileSync(path.join(audit, file), 'utf8')); } catch { detail = { unreadable: file }; }
+    await store.appendAudit({ principalId: 'system:restore', action: detail.acceptedUnsigned ? 'backup.restored.unsigned' : 'backup.restored', detail });
+    fs.rmSync(path.join(audit, file), { force: true });
   }
 }
 
