@@ -55,6 +55,19 @@ describe('repository guidance', () => {
     expect(read('src/activities/core.ts')).toContain('Reduce Concurrent agent turns under Installation → Host capacity');
   });
 
+  it('lists the coordinators that run, not the unused budget coordinator (WK-2k)', () => {
+    const lines = [
+      read('CLAUDE.md').split('\n').find(line => line.startsWith('- `src/coordinators/`')),
+      read('README.md').split('\n').find(line => line.startsWith('- `src/coordinators/`')),
+      read('README.md').split('\n').find(line => line.startsWith('| Coordinators')),
+    ];
+    for (const line of lines) {
+      expect(line).toMatch(/agent-queue/);
+      expect(line).toMatch(/resource-publish/);
+      expect(line).not.toMatch(/\bbudget\b(?!\.ts)/);
+    }
+  });
+
   it('links every tracked benchmark result from a repository doc', () => {
     const ls = (...args: string[]) => execFileSync('git', ['ls-files', ...args], {
       cwd: new URL('..', import.meta.url), encoding: 'utf8',
