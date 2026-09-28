@@ -62,7 +62,12 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
   if (repos.length === 1) return finalizeMergeRepo(repos[0]!, worldRepoTarget(repos[0]!, target), world.handle.id, identity);
 
   const landedFiles: string[] = [];
+  // The reported commit is the one that landed in the world's primary repo (the
+  // one task summaries name). The last repo merged is usually the project wiki
+  // companion, whose untouched target would otherwise stand in for the task's.
+  const primary = world.handle.repo ?? repos.find((r) => r.role !== 'project-wiki')?.repo;
   let sha: string | undefined;
+  let primarySha: string | undefined;
   for (const r of repos) {
     const res = await finalizeMergeRepo(r, worldRepoTarget(r, target), world.handle.id, identity);
     landedFiles.push(...res.landedFiles.map((f) => `${r.name}/${f}`));
@@ -77,9 +82,10 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
       };
     }
     sha = res.sha;
+    if (r.repo === primary) primarySha = res.sha;
   }
   const targets = [...new Set(repos.map((repo) => worldRepoTarget(repo, target)))];
-  return { merged: true, sha, landedFiles,
+  return { merged: true, sha: primarySha ?? sha, landedFiles,
     note: targets.length === 1 ? `merged ${repos.length} repos into ${targets[0]}` : `merged ${repos.length} repos into their configured targets` };
 }
 

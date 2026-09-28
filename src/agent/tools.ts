@@ -787,7 +787,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'platform_request',
-    description: `Call any authenticated ${BRAND} /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, safe mode, and more). Authorization is always enforced, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused. Call describe_platform when unsure.`,
+    description: `Call any authenticated ${BRAND} /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, and more). Authorization is always enforced, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused. Call describe_platform when unsure.`,
     parameters: {
       type: 'object',
       properties: {
