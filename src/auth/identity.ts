@@ -157,7 +157,7 @@ export class IdentityService {
   private async initialize(dbFile: string, opts: IdentityOptions = {}) {
 
     this.db = openSqlDatabase(opts.databaseUrl ?? dbFile);
-    this.pool = opts.databaseUrl ? new Pool({ connectionString: opts.databaseUrl }) : undefined;
+    this.pool = opts.databaseUrl ? new Pool({ connectionString: opts.databaseUrl, application_name: 'karmax' }) : undefined;
     this.sqlite = this.pool ? undefined : identitySqliteDatabase(this.db);
     // Same durability pragmas the metadata store uses (src/store/db.ts): karmax
     // runs the gateway, the worker and every activity in one process, so a

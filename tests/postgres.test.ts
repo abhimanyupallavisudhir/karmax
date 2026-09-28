@@ -60,11 +60,16 @@ integration('PostgreSQL cutover', () => {
   afterAll(async () => { await admin?.end(); });
 
   it('looks up one identity user by primary key', async () => {
+    const named = async () => (await admin!.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE datname = current_database() AND application_name = 'karmax'`)).rows[0].n as number;
+    const before = await named();
     const identity = await IdentityService.open(':memory:', { databaseUrl: url!, baseURL: 'http://localhost:4599',
       secret: 'fixture-only-identity-secret-32-characters' });
     try {
       const user = await identity.createUser({ name: 'Alice', email: 'alice@example.com', password: 'fixture-password-123' });
       expect(await identity.userById(user.id)).toMatchObject({ id: user.id, email: user.email });
+      // Its own pool is named like the store's, so doctor sees it as the app.
+      expect(await named()).toBeGreaterThan(before);
     } finally { await identity.close(); }
   });
 
