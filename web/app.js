@@ -16023,10 +16023,8 @@ async function wireVaultCards(organizationId) {
   };
   // The toast names only what needs attention; a new store opens its import picker.
   const afterConnect = async (name, result) => {
-    const dropped = result.droppedWrites || [];
     toast([`${result.connector?.label || name} connected`,
-      ...(result.connector?.checks || []).filter((check) => !check.encryption || !check.push).map((check) => `${check.store} is read-only`),
-      ...(dropped.length ? [`${dropped.length} pending write${dropped.length === 1 ? '' : 's'} to the previous store dropped: ${dropped.join(', ')}`] : [])].join(' · '));
+      ...(result.connector?.checks || []).filter((check) => !check.encryption || !check.push).map((check) => `${check.store} is read-only`)].join(' · '));
     const conns = await renderConnectors();
     if (result.newStore) await openImportPanel(name, conns.find((c) => c.name === name));
   };

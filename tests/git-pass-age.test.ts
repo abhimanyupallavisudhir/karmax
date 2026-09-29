@@ -363,28 +363,53 @@ it('persists failed write-back, blocks remote conflicts and imports an explicitl
   expect(JSON.parse(kv.get(`pass-writeback:org_personal:${id}`)!).fields).toEqual({});
 });
 
-it('drops a rotation left pending for a store the connection no longer points at', async () => {
-  const f = fixture();
-  const other = fixture();
-  const kv = new Map<string, string>();
-  const db = { transaction: memoryTransaction(kv), kvGet: (k: string) => kv.get(k), kvSet: (k: string, v: string) => { kv.set(k, v); }, appendAudit: () => 0 };
-  const broker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
-  const items = new VaultItems(db, broker, path.join(f.root, 'vault-state'));
-  const service = new Connectors(db, items, broker);
-  service.register(new GitPassConnector(() => service.secretFor('pass-git'), 'org_personal', () => ({}), path.join(f.root, 'state'), { allowLocalRepository: true }));
-  await service.connect('pass-git', JSON.stringify(f.config));
-  const id = (await service.sync('pass-git', ['example'], { writeBack: true })).itemIds[0]!;
-  (await items.save({ id, type: 'login', secrets: { password: 'rotated' } }));
-  fs.writeFileSync(path.join(f.remote, 'hooks', 'pre-receive'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
-  expect((await service.propagate(id, ['password']))?.error).toContain('pending retry');
-  // Re-validating the same store keeps the rotation queued for it.
-  expect(await service.connect('pass-git', JSON.stringify(f.config))).toMatchObject({ newStore: false, droppedWrites: [] });
-  expect((await service.describe())[0]?.pendingWrites).toHaveLength(1);
-  const label = (await items.get(id))!.label;
-  expect(await service.connect('pass-git', JSON.stringify(other.config))).toMatchObject({ newStore: true, droppedWrites: [label] });
-  expect((await service.describe())[0]?.pendingWrites).toEqual([]);
-  expect(items.readSecret((await items.get(id))!, 'password')).toBe('rotated');
-}, 60_000);
+describe('a rotation pending when the connection moves to another store', () => {
+  const setup = async () => {
+    const f = fixture();
+    const kv = new Map<string, string>();
+    const db = { transaction: memoryTransaction(kv), kvGet: (k: string) => kv.get(k), kvSet: (k: string, v: string) => { kv.set(k, v); }, appendAudit: () => 0 };
+    const broker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
+    const items = new VaultItems(db, broker, path.join(f.root, 'vault-state'));
+    const service = new Connectors(db, items, broker);
+    service.register(new GitPassConnector(() => service.secretFor('pass-git'), 'org_personal', () => ({}), path.join(f.root, 'state'), { allowLocalRepository: true }));
+    await service.connect('pass-git', JSON.stringify(f.config));
+    const id = (await service.sync('pass-git', ['example'], { writeBack: true })).itemIds[0]!;
+    (await items.save({ id, type: 'login', secrets: { password: 'rotated' } }));
+    fs.writeFileSync(path.join(f.remote, 'hooks', 'pre-receive'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+    expect((await service.propagate(id, ['password']))?.error).toContain('pending retry');
+    const password = async () => items.readSecret((await items.get(id))!, 'password');
+    return { f, service, id, password };
+  };
+
+  it('writes it to a moved copy of the store once write-back is back on', async () => {
+    const { f, service, id, password } = await setup();
+    const copy = path.join(f.root, 'moved.git');
+    run('git', ['clone', '--bare', f.remote, copy]);
+    expect(await service.connect('pass-git', JSON.stringify({ ...f.config, repositoryUrl: copy }))).toMatchObject({ newStore: true });
+    (await service.sync('pass-git', ['example']));
+    expect(await password()).toBe('rotated');
+    expect(await service.retryWrites()).toEqual([]);
+    (await service.setConfig('pass-git', { writeBack: true }));
+    expect(await service.retryWrites()).toEqual([{ connector: 'pass-git', itemId: id }]);
+    expect((await service.describe())[0]?.pendingWrites).toEqual([]);
+    expect((await connector({ ...f.config, repositoryUrl: copy }, f.root).pull(['example'])).items[0]?.secrets.password).toBe('rotated');
+  }, 60_000);
+
+  it('keeps the newer vault value from a different store until the remote value is chosen', async () => {
+    const { f, service, id, password } = await setup();
+    const other = fixture();
+    expect(await service.connect('pass-git', JSON.stringify(other.config))).toMatchObject({ newStore: true });
+    expect((await service.sync('pass-git', ['example'])).failures[0]?.error).toMatch(/Pending write-back/);
+    expect(await password()).toBe('rotated');
+    (await service.setConfig('pass-git', { writeBack: true }));
+    expect((await service.retryWrites())[0]?.error).toContain('review the remote value');
+    expect(await password()).toBe('rotated');
+    await service.acceptRemote(id);
+    expect(await password()).toBe('pw');
+    expect((await service.describe())[0]?.pendingWrites).toEqual([]);
+    expect((await connector(f.config, f.root).pull(['example'])).items[0]?.secrets.password).toBe('pw');
+  }, 60_000);
+});
 
 it('accepts encrypted age identities, rejects wrong passphrases and cleans temporary plaintext', async () => {
   const f = fixture();

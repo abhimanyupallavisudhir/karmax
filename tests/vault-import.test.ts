@@ -177,17 +177,17 @@ describe('connector import (web)', () => {
     await ui.close();
   });
 
-  it('opens the import picker when a new store connects and names writes the previous store will not get', async () => {
+  it('opens the import picker when a new store connects and names read-only stores', async () => {
     const ui = await passwords(({ path }) => path.startsWith('/api/vault/connectors/pass-git/connect')
       ? { connected: true, connector: { label: 'unix pass (Git)', checks: [{ store: 'root', read: 'verified', encryption: true, push: false }] },
-        newStore: true, droppedWrites: ['deploy key'] } : undefined);
+        newStore: true } : undefined);
     await ui.page.locator('[data-conn="pass-git"] [data-git-pass-connect]').click();
     const dialog = ui.page.getByRole('dialog', { name: 'Connect unix pass through Git' });
     await dialog.locator('.git-pass-repo').fill('git@github.com:me/other.git');
     await dialog.locator('.git-pass-key').fill('-----BEGIN PGP PRIVATE KEY BLOCK-----');
     await dialog.getByRole('button', { name: 'Replace connection' }).click();
     await expect.poll(() => ui.page.locator('.imp-pick').count()).toBe(3);
-    expect(await ui.toasts()).toEqual(['unix pass (Git) connected · root is read-only · 1 pending write to the previous store dropped: deploy key']);
+    expect(await ui.toasts()).toEqual(['unix pass (Git) connected · root is read-only']);
     await ui.close();
   });
 

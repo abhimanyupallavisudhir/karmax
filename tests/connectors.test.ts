@@ -1073,36 +1073,80 @@ describe('pass TOTP import migration', () => {
 });
 
 describe('Git password-store reconfiguration', () => {
-  it('resets auto-sync and write-back when mount bindings change, but not when keys rotate', async () => {
-    const { items, store, broker } = makeVault();
-    const service = new Connectors(store, items, broker);
-    const connector = new GitPassConnector(() => service.secretFor('pass-git'));
-    // Binding/consent unit test; live verification is exercised with real remotes.
+  const config = { repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test-key',
+    mounts: [{ name: 'work', repositoryUrl: 'https://github.com/example/work.git', gpgPrivateKey: 'test-key' }] };
+  const moved = { ...config, mounts: [{ ...config.mounts[0], repositoryUrl: 'https://github.com/example/other.git' }] };
+  // Binding/consent unit tests; live verification is exercised with real remotes.
+  const service = () => {
+    const vault = makeVault();
+    const connectors = new Connectors(vault.store, vault.items, vault.broker);
+    const connector = new GitPassConnector(() => connectors.secretFor('pass-git'));
     connector.validateSecret = async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: true, detail: 'test' });
-    connector.push = async () => { throw new Error('offline'); };
-    service.register(connector);
-    const config = { repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test-key',
-      mounts: [{ name: 'work', repositoryUrl: 'https://github.com/example/work.git', gpgPrivateKey: 'test-key' }] };
-    expect(await service.connect('pass-git', JSON.stringify(config))).toMatchObject({ newStore: true, droppedWrites: [] });
-    (await service.setConfig('pass-git', { writeBack: true }));
-    (await service.setAutoSync('pass-git', { keepUpdated: true, externalIds: ['work/otp'] }));
+    const pushedTo: string[] = [];
+    let online = false;
+    connector.push = async (item) => {
+      if (!online) throw new Error('offline');
+      pushedTo.push(JSON.parse(connectors.secretFor('pass-git')!).mounts[0].repositoryUrl);
+      return { externalId: item.externalId };
+    };
+    connectors.register(connector);
+    return { ...vault, connectors, pushedTo, goOnline: () => { online = true; } };
+  };
+  const queueExport = async ({ connectors, items }: ReturnType<typeof service>) => {
     const created = (await items.save({ type: 'login', label: 'deploy key', secrets: { password: 'generated' },
       provenance: { source: 'task:t1', taskId: 't1' } }));
-    expect((await service.writeBackCreated(created.id))[0]?.error).toMatch(/pending retry/);
-    const [queued] = await service.pendingWrites();
-    expect(broker.hasHandle(queued!.snapshotHandle!)).toBe(true);
-    expect(await service.connect('pass-git', JSON.stringify({ ...config, gpgPrivateKey: 'rotated-key' })))
-      .toMatchObject({ connector: { available: true }, newStore: false, droppedWrites: [] });
-    expect((await service.config('pass-git')).writeBack).toBe(true);
-    expect(await service.pendingWrites()).toHaveLength(1);
-    // A queued write can only ever reach the store it was queued for, so a
-    // different store drops it (and its secret snapshot) and says so.
-    expect(await service.connect('pass-git', JSON.stringify({ ...config, mounts: [{ ...config.mounts[0], repositoryUrl: 'https://github.com/example/other.git' }] })))
-      .toMatchObject({ newStore: true, droppedWrites: ['deploy key'] });
-    expect((await service.config('pass-git')).writeBack).toBeUndefined();
-    expect((await service.config('pass-git')).autoSync).toEqual({ enabled: false, importNew: false, externalIds: [] });
-    expect(await service.pendingWrites()).toEqual([]);
+    expect((await connectors.writeBackCreated(created.id))[0]?.error).toMatch(/pending retry/);
+    return created;
+  };
+
+  it('resets selection and write-back for a different store, and sends its queued writes there once write-back is back on', async () => {
+    const s = service();
+    const { connectors, broker, items } = s;
+    expect(await connectors.connect('pass-git', JSON.stringify(config))).toMatchObject({ newStore: true });
+    (await connectors.setConfig('pass-git', { writeBack: true }));
+    (await connectors.setAutoSync('pass-git', { keepUpdated: true, externalIds: ['work/otp'] }));
+    const created = await queueExport(s);
+    const [queued] = await connectors.pendingWrites();
+    // Rotating keys keeps the store, its consent and its queue.
+    expect(await connectors.connect('pass-git', JSON.stringify({ ...config, gpgPrivateKey: 'rotated-key' })))
+      .toMatchObject({ connector: { available: true }, newStore: false });
+    expect((await connectors.config('pass-git')).writeBack).toBe(true);
+    expect(await connectors.pendingWrites()).toEqual([queued]);
+
+    expect(await connectors.connect('pass-git', JSON.stringify(moved))).toMatchObject({ newStore: true });
+    expect((await connectors.config('pass-git')).writeBack).toBeUndefined();
+    expect((await connectors.config('pass-git')).autoSync).toEqual({ enabled: false, importNew: false, externalIds: [] });
+    const [waiting] = await connectors.pendingWrites();
+    expect(waiting).toMatchObject({ id: queued!.id, attempts: 0 });
+    expect(waiting!.target).not.toBe(queued!.target);
+    expect(waiting!.error).toBeUndefined();
+    s.goOnline();
+    // Paused until write-back is turned on for this store.
+    expect(await connectors.retryWrites()).toEqual([]);
+    expect(s.pushedTo).toEqual([]);
+    (await connectors.setConfig('pass-git', { writeBack: true }));
+    expect(await connectors.retryWrites()).toEqual([{ connector: 'pass-git', itemId: created.id }]);
+    expect(s.pushedTo).toEqual(['https://github.com/example/other.git']);
+    expect(await connectors.pendingWrites()).toEqual([]);
     expect(broker.hasHandle(queued!.snapshotHandle!)).toBe(false);
+    expect((await items.get(created.id))!.provenance.externalIds).toEqual({ 'pass-git': queued!.externalId });
+  });
+
+  it('sends a write queued for an earlier store to the current one when write-back is turned on', async () => {
+    // Releases before this one left such writes pointing at the replaced store.
+    const s = service();
+    const { connectors, store } = s;
+    await connectors.connect('pass-git', JSON.stringify(config));
+    (await connectors.setConfig('pass-git', { writeBack: true }));
+    const created = await queueExport(s);
+    const key = 'vault:write-outbox:org_personal';
+    const [queued] = JSON.parse((await store.kvGet(key))!);
+    (await store.kvSet(key, JSON.stringify([{ ...queued, target: 'replaced-store' }])));
+    (await connectors.setConfig('pass-git', { writeBack: false }));
+    s.goOnline();
+    (await connectors.setConfig('pass-git', { writeBack: true }));
+    expect(await connectors.retryWrites()).toEqual([{ connector: 'pass-git', itemId: created.id }]);
+    expect(s.pushedTo).toEqual(['https://github.com/example/work.git']);
   });
 });
 

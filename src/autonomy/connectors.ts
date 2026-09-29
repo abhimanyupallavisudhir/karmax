@@ -1591,8 +1591,12 @@ export class Connectors {
   }
   async setConfig(name: string, patch: Partial<ConnectorConfig>): Promise<ConnectorConfig> {
     return this.store.transaction(async () => {
-    const next = { ...(await this.config(name)), ...patch };
+    const current = (await this.config(name));
+    const next = { ...current, ...patch };
     (await this.store.kvSet(kvConfig(this.organizationId, name), JSON.stringify(next)));
+    // Turning write-back on consents to the store connected now, so writes
+    // queued while an earlier store was connected go to this one.
+    if (next.writeBack && !current.writeBack) await this.retargetWrites(name);
     return next;
       });
   }
@@ -1694,10 +1698,9 @@ export class Connectors {
 
   /** Validate a connector secret before keeping it. A failed replacement restores
    *  the previous working secret, so clicking Connect can never manufacture a
-   *  false-positive connection or break an existing one. `newStore` is a first
-   *  connection or a different Git store; `droppedWrites` labels the pending
-   *  writes that could only ever have reached the store it replaced. */
-  async connect(name: string, secret: string): Promise<{ connector: ConnectorInfo; newStore: boolean; droppedWrites: string[] }> {
+   *  false-positive connection or break an existing one. `newStore` means a
+   *  first connection or a different Git store: nothing is selected yet. */
+  async connect(name: string, secret: string): Promise<{ connector: ConnectorInfo; newStore: boolean }> {
     const connector = this.get(name);
     if (!connector) throw new Error(`no connector "${name}"`);
     if (!this.broker) throw new Error('credential storage is unavailable');
@@ -1721,19 +1724,22 @@ export class Connectors {
     try {
       const info = validated ?? (await connector.describe());
       if (!info.available) throw new Error(info.detail);
-      // A selection, write-back consent and queued writes belong to one external
-      // store. Never carry them silently to a different repository.
-      const dropped = replacedGitPassStore ? await this.store.transaction(async () => {
-        (await this.store.kvSet(
-          kvConfig(this.organizationId, name),
-          JSON.stringify({
-            autoSync: { enabled: false, importNew: false, externalIds: [] },
-          }),
-        ));
-        return this.dropWrites(name);
-      }) : [];
-      const droppedWrites = await Promise.all([...new Set(dropped)].map(async (id) => (await this.items.get(id))?.label ?? id));
-      return { connector: info, newStore: previous === undefined || replacedGitPassStore, droppedWrites };
+      // A selection and write-back consent belong to one external store. Never
+      // carry them silently to a different repository during reconfiguration.
+      // Pending writes do follow it, still waiting for that consent: a rotation
+      // not yet written anywhere is the only copy of the newest secret, and its
+      // record is what keeps an import from overwriting it.
+      if (replacedGitPassStore)
+        await this.store.transaction(async () => {
+          (await this.store.kvSet(
+            kvConfig(this.organizationId, name),
+            JSON.stringify({
+              autoSync: { enabled: false, importNew: false, externalIds: [] },
+            }),
+          ));
+          await this.retargetWrites(name);
+        });
+      return { connector: info, newStore: previous === undefined || replacedGitPassStore };
     } catch (error) {
       if (previous === undefined) (await this.broker.deleteHandle(handle));
       else (await this.broker.registerHandle(handle, previous));
@@ -2043,22 +2049,40 @@ export class Connectors {
     });
   }
   async discardWrites(name: string): Promise<number> {
-    return (await this.dropWrites(name)).length;
-  }
-  /** Stops every pending write to one connector; returns their item ids. */
-  private async dropWrites(name: string): Promise<string[]> {
     return this.store.transaction(async () => {
     const pending = (await this.pendingWrites()).filter((write) => write.connector === name);
     for (const write of pending) (await this.saveWrite(write, true));
-    const itemIds = pending.map((write) => write.itemId);
+    let rotations = 0;
     if (name === 'pass-git') for (const item of (await this.items.list())) {
       if (Object.keys((await this.pending(item.id)).fields).length) {
         (await this.store.kvSet(this.pendingKey(item.id), JSON.stringify({ fields: {}, generation: randomUUID() })));
-        itemIds.push(item.id);
+        rotations++;
       }
     }
-    return itemIds;
+    return pending.length + rotations;
       });
+  }
+
+  /** Point a Git store's pending writes at the store connected now. Delivery
+   *  still refuses an entry that changed since the rotation was based on it,
+   *  and an export whose destination holds different data. Other connectors
+   *  have no store identity beyond their secret, so theirs stay blocked. */
+  private async retargetWrites(name: string): Promise<void> {
+    if (name !== 'pass-git') return;
+    return this.store.transaction(async () => {
+      const target = this.writeTarget(name);
+      const writes = (await this.pendingWrites());
+      if (writes.some((write) => write.connector === name && write.target !== target))
+        (await this.store.kvSet(connectorOutboxKey(this.organizationId), JSON.stringify(writes.map((write) =>
+          write.connector !== name || write.target === target ? write
+            : { ...write, target, attempts: 0, nextAttemptAt: Date.now(), error: undefined }))));
+      const binding = gitPassRepositoryIdentity(this.secretFor(name));
+      for (const item of (await this.items.list())) {
+        const pending = (await this.pending(item.id));
+        if (Object.keys(pending.fields).length && pending.binding !== binding)
+          (await this.store.kvSet(this.pendingKey(item.id), JSON.stringify({ ...pending, binding })));
+      }
+    });
   }
 
   async retryWrites(
