@@ -54,7 +54,7 @@ import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { conversationPublisher } from '../domain/view-publication.js';
-import { requestedWait, waitForAgent } from './agent-wait.js';
+import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
@@ -2749,12 +2749,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
 
-    // The agent asked to be resumed later (`pause`), or left a durable job running
-    // without waiting for it: park here and resume it with the outcome. A message,
-    // a child's event, or a cancellation ends the wait early.
-    const agentWait = requestedWait(turn);
-    if (agentWait && patched('agent-wait-v1')) {
-      const note = await waitForAgent(agentWait, {
+    // The agent asked to be resumed later (`pause`): park here and resume it with
+    // the outcome. A message, a child's event, or a cancellation ends it early.
+    if (turn.wait && patched('agent-wait-v1')) {
+      const note = await waitForAgent(turn.wait, {
         world,
         ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
@@ -2762,6 +2760,12 @@ Inspect the complete current diff and specifically compare its delta from the re
       });
       if (cancelled) return await abort();
       if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+      continue;
+    }
+    // A job left running without pause: the agent decides what happens to it.
+    const jobsReminder = unattendedJobsReminder(turn);
+    if (jobsReminder && patched('agent-wait-v1')) {
+      msgs.push({ id: `jobs-${msgs.length}`, role: 'user', text: jobsReminder, ts: msgs.length });
       continue;
     }
 

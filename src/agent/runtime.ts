@@ -392,9 +392,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     secretPoll?.();
   }
 
-  // A job started this turn and still running when the agent stopped without
-  // waiting for it: report it, so the workflow resumes the agent when it ends
-  // instead of moving on without its result.
+  // Jobs this turn started and left running without pausing for them: report
+  // them, so the workflow can ask the agent what it meant to do with them.
   let runningJobs: string[] | undefined;
   if (jobsStarted.length && !wait) {
     try {

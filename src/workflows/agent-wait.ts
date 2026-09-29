@@ -3,8 +3,7 @@ import type { coreActivities } from '../activities/core.js';
 import type { AgentWait, TaskView, WorldHandleLike } from './contract.js';
 
 /**
- * The Do-stage half of the agent's `pause` tool (and of `start_job` jobs a turn
- * left running): park the task, then resume the agent when its jobs exit, when
+ * The Do-stage half of the agent's `pause` tool: park the task, then resume the agent when its jobs exit, when
  * the time is up, or when something else needs it — a message, a child event,
  * a cancellation. Shared by software-dev and just-do.
  *
@@ -20,18 +19,19 @@ const jobWatch = proxyActivities<coreActivities>({
   retry: { maximumAttempts: 10, initialInterval: '10s', backoffCoefficient: 2, maximumInterval: '5 minutes' },
 });
 
-/** How long to wait for jobs a turn left running without calling `pause`. */
-export const IMPLICIT_JOB_WAIT_MINUTES = 60;
-
-/** The wait a finished turn asks for, if any: an explicit `pause`, or the jobs
- * it started and left running without opening a PR or raising to its parent. */
-export function requestedWait(turn: {
+/** Durable jobs a turn started and left running, without pausing for them,
+ * opening a PR, or raising to its parent. The task never waits on these on its
+ * own — the job may be runaway or deliberately long-lived — but the agent is
+ * reminded once (only the turn that started a job reports it), so a result it
+ * meant to come back for is not silently dropped. */
+export function unattendedJobsReminder(turn: {
   wait?: AgentWait; runningJobs?: string[]; openPrRequested?: boolean; raise?: unknown;
-}): { wait: AgentWait; implicit: boolean } | undefined {
-  if (turn.wait) return { wait: turn.wait, implicit: false };
-  if (turn.runningJobs?.length && !turn.openPrRequested && !turn.raise)
-    return { wait: { minutes: IMPLICIT_JOB_WAIT_MINUTES, jobs: turn.runningJobs }, implicit: true };
-  return undefined;
+}): string | undefined {
+  const jobs = turn.runningJobs ?? [];
+  if (turn.wait || !jobs.length || turn.openPrRequested || turn.raise) return undefined;
+  const list = jobs.join(', ');
+  const one = jobs.length === 1;
+  return `Your turn ended while ${list} ${one ? 'is' : 'are'} still running. If you need ${one ? 'its' : 'their'} result, call pause with ${one ? 'it' : 'them'} and a time limit, then end your turn. If ${one ? 'it is' : 'they are'} no longer needed, stop ${one ? 'it' : 'them'} with stop_job. Otherwise finish, and say why ${one ? 'it keeps' : 'they keep'} running.`;
 }
 
 export interface AgentWaitHooks {
@@ -48,8 +48,7 @@ export interface AgentWaitHooks {
  * Park until the wait is over. Returns the note to resume the agent with, or
  * undefined when it was interrupted by something that brings its own message.
  */
-export async function waitForAgent(request: { wait: AgentWait; implicit: boolean }, hooks: AgentWaitHooks): Promise<string | undefined> {
-  const { wait, implicit } = request;
+export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Promise<string | undefined> {
   const untilMs = Date.now() + wait.minutes * (hooks.minuteMs ?? 60_000);
   const jobs = wait.jobs ?? [];
   const list = jobs.join(', ');
@@ -61,10 +60,7 @@ export async function waitForAgent(request: { wait: AgentWait; implicit: boolean
     const interrupted = await condition(hooks.interrupted, untilMs - Date.now());
     return interrupted ? undefined : `(Resumed: your ${wait.minutes}-minute pause is over.)`;
   }
-  const intro = implicit
-    ? `(You ended your turn while ${list} ${jobs.length > 1 ? 'were' : 'was'} still running, so the task waited for ${jobs.length > 1 ? 'them' : 'it'}.`
-    : '(Resumed:';
-  if (!hooks.world) return `${intro} the task has no world to check the jobs in.)`;
+  if (!hooks.world) return '(Resumed: the task has no world to check the jobs in.)';
 
   let outcome: { finished: boolean; summary: string } | undefined;
   let failure: unknown;
@@ -82,12 +78,10 @@ export async function waitForAgent(request: { wait: AgentWait; implicit: boolean
   }
   if (!outcome) {
     const reason = failure instanceof Error ? failure.message : String(failure);
-    return `${intro} the task could not check on ${list}: ${reason.slice(0, 300)}. ${jobs.length > 1 ? 'They' : 'It'} may still be running; each log is in .karmax-injection/jobs/<id>/log.)`;
+    return `(Resumed: the task could not check on ${list}: ${reason.slice(0, 300)}. ${jobs.length > 1 ? 'They' : 'It'} may still be running; each log is in .karmax-injection/jobs/<id>/log.)`;
   }
   const head = outcome.finished
-    ? implicit ? `${intro})` : `(Resumed: ${jobs.length > 1 ? 'your jobs have' : 'your job has'} finished.)`
-    : implicit
-      ? `${intro} It gave up after ${wait.minutes} min. Call pause with a longer limit if you still need the result.)`
-      : `(Resumed: your ${wait.minutes}-minute limit passed before ${jobs.length > 1 ? 'every job finished' : 'the job finished'}. Call pause again to keep waiting.)`;
+    ? `(Resumed: ${jobs.length > 1 ? 'your jobs have' : 'your job has'} finished.)`
+    : `(Resumed: your ${wait.minutes}-minute limit passed before ${jobs.length > 1 ? 'every job finished' : 'the job finished'}. Call pause again to keep waiting.)`;
   return `${head}\n\n${outcome.summary}`;
 }

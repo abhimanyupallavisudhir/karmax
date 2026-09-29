@@ -2,7 +2,7 @@ import { currentTiming, timed, withTiming } from '../timing/index.js';
 import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
-import { startJob, jobStatuses, describeJobs, listJobs } from '../world/jobs.js';
+import { startJob, jobStatuses, describeJobs, listJobs, stopJobs } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
@@ -173,6 +173,15 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         jobs: { type: 'array', items: { type: 'string' }, description: 'Job ids from start_job to wait for.' },
       },
       required: ['minutes'],
+    },
+  },
+  {
+    name: 'stop_job',
+    description: 'Stop durable jobs you no longer need (the job and every process it started). Use this rather than kill or pkill.',
+    parameters: {
+      type: 'object',
+      properties: { jobs: { type: 'array', items: { type: 'string' }, description: 'Job ids from start_job.' } },
+      required: ['jobs'],
     },
   },
   {
@@ -893,6 +902,7 @@ export const SDK_CONTROL_TOOL_NAMES = new Set([
   'wait_for_subtasks',
   'start_job',
   'pause',
+  'stop_job',
   'request_spend',
   'fill_payment_card',
   'open_pr',
@@ -994,6 +1004,22 @@ export function platformToolHandlers(
         await ctx.jobStarted(job.id);
         ctx.emit(`$ ${command} (job ${job.id})`);
         return `Started job ${job.id}. Log: ${job.log}\nIt keeps running after this turn. Call pause with jobs ["${job.id}"] to be resumed when it finishes.`;
+      } catch (e: any) {
+        return `error: ${e?.message ?? e}`;
+      }
+    },
+    async stop_job(args) {
+      const ids = Array.isArray(args?.jobs) ? [...new Set(args.jobs.map((id: unknown) => String(id)))] as string[] : [];
+      if (!ids.length) return 'error: jobs is required';
+      try {
+        const before = await jobStatuses(world, ids);
+        const missing = before.filter((job) => job.state === 'missing').map((job) => job.id);
+        if (missing.length) return `error: no such job: ${missing.join(', ')}`;
+        const running = before.filter((job) => job.state === 'running').map((job) => job.id);
+        await stopJobs(world, running);
+        const after = new Map((await jobStatuses(world, running)).map((job) => [job.id, job.state]));
+        return ids.map((id) => !running.includes(id) ? `${id} had already stopped.`
+          : after.get(id) === 'running' ? `${id} is still running.` : `Stopped ${id}.`).join('\n');
       } catch (e: any) {
         return `error: ${e?.message ?? e}`;
       }

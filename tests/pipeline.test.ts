@@ -1709,22 +1709,29 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('rendered');
   }, 60_000);
 
-  it('waits for a job the agent left running without calling pause', async () => {
-    const repo = await h.makeRepo('app-job-implicit');
+  it('asks the agent once about a job it left running, instead of waiting on it silently', async () => {
+    const repo = await h.makeRepo('app-job-unattended');
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
-      // The agent starts the job and just ends its turn ("I'll mux the audio when it
-      // finishes") without opening a PR — the videos #1 mistake.
-      args: [input({ taskId, repo, title: 'Implicit', prompt: '@job sleep 3; echo "@write out.txt :: implicit"\n@incomplete' })],
+      // The agent starts a job and ends its turn without pause or open_pr — the
+      // videos #1 mistake, or a job that is simply runaway. The task must not sit on
+      // it: the agent decides (pause for it, or stop it), and is asked exactly once.
+      args: [input({ taskId, repo, title: 'Unattended', prompt: '@write out.txt :: hi\n@job sleep 120\n@incomplete' })],
     });
 
-    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('job');
     await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
-    await handle.signal('confirm');
-    expect((await handle.result()).stage).toBe('done');
-    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('implicit');
+    const reviewed = await view(handle);
+    const reminders = reviewed.messages.filter((m: any) => /still running/.test(m.text) && /stop_job/.test(m.text));
+    expect(reminders).toHaveLength(1);
+    expect(reminders[0].text).toMatch(/job-[a-f0-9]{8}/);
+    expect(reminders[0].text).toContain('pause');
+    // The task never parked on the job.
+    const kinds = (await h.store.eventsOfType(taskId, 'view.updated')).map((e: any) => e.payload.waitingFor);
+    expect(kinds).not.toContain('job');
+    await handle.signal('cancel');
+    await handle.result();
   }, 60_000);
 
   it('a timed pause resumes the agent when it elapses, or earlier on a message', async () => {

@@ -107,7 +107,7 @@ describe('durable jobs (real worktree world)', () => {
     expect((await jobStatuses(world, [long.id]))[0]!.state).toBe('running');
   });
 
-  describe('start_job and pause tools', () => {
+  describe('start_job, pause and stop_job tools', () => {
     const tools = (ctx: { started: string[]; waits: AgentWait[] }) => platformToolHandlers(world, {
       jobStarted: (id: string) => { ctx.started.push(id); },
       requestWait: (wait: AgentWait) => { ctx.waits.push(wait); },
@@ -115,7 +115,7 @@ describe('durable jobs (real worktree world)', () => {
     } as any, () => ({ SECRET_FOR_WORK: 'value' }));
 
     it('are turn-local controls every rail exposes', () => {
-      for (const name of ['start_job', 'pause']) {
+      for (const name of ['start_job', 'pause', 'stop_job']) {
         expect(TOOL_SCHEMAS.some((tool) => tool.name === name)).toBe(true);
         expect(SDK_CONTROL_TOOL_NAMES.has(name)).toBe(true);
       }
@@ -154,6 +154,17 @@ describe('durable jobs (real worktree world)', () => {
       // A plain pause lets a cloud world be suspended, which would freeze the job.
       expect(await t.pause!({ minutes: 10 })).toBe(`error: ${running.id} is still running. Pass it in jobs: a pause without it lets the world be suspended, which freezes it. You are still resumed after minutes at the latest.`);
       expect(ctx.waits).toEqual([{ minutes: 10 }, { minutes: 90, jobs: [running.id] }]);
+    });
+
+    it('stop_job stops running jobs and reports each one', async () => {
+      const t = tools({ started: [], waits: [] });
+      expect(await t.stop_job!({ jobs: [] })).toBe('error: jobs is required');
+      expect(await t.stop_job!({ jobs: ['job-deadbeef'] })).toBe('error: no such job: job-deadbeef');
+      const runaway = await startJob(world, { command: 'yes > /dev/null' });
+      const reply = await t.stop_job!({ jobs: [runaway.id] });
+      expect(reply).toContain(`Stopped ${runaway.id}.`);
+      expect((await jobStatuses(world, [runaway.id]))[0]!.state).not.toBe('running');
+      expect(await t.stop_job!({ jobs: [runaway.id] })).toBe(`${runaway.id} had already stopped.`);
     });
   });
 
