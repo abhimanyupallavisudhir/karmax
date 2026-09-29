@@ -39,6 +39,7 @@ eval(extractFn('taskRecord'));
 eval(extractFn('stageLabel'));
 eval(extractFn('stageIndicator'));
 eval(extractFn('taskAttempts'));
+eval(extractFn('addAttemptButton'));
 global.workflowLabel = (workflow) => workflow;
 global.priorityFlag = () => '';
 global.tagChips = () => '';
@@ -148,7 +149,8 @@ eval(extractFn('wireAttempts'));
   ok(taskAttempts({ taskId: 'attempt-2' }).includes('Selected to merge'), 'merge winner is clearly identified');
   ok(taskAttempts({ taskId: 'attempt-2' }).includes('disabled'), 'committed group disables creation');
   S.attemptGroup.attempts = [S.attemptGroup.attempts[0]];
-  ok(!taskAttempts({ taskId: 'attempt-1' }).includes('attempt-card'), 'single attempt does not repeat a navigation card');
+  ok(taskAttempts({ taskId: 'attempt-1' }) === '', 'single attempt does not repeat a navigation card');
+  ok(addAttemptButton('tabs-action').includes('id="add-attempt"') && addAttemptButton().includes('disabled'), 'single attempt keeps the creation action, still locked after merge');
   // Two opens of the same attempt can resolve out of order (A → B → A).
   // The old request must not overwrite the most recent page projection.
   global.term = null;

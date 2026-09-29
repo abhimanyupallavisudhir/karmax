@@ -32,6 +32,7 @@ function ok(condition, message) {
 
 // Task detail page — the Parameters tab renders the same control.
 global.paramsSection = () => '';
+global.workflowSection = () => '';
 global.authorizationSection = () => '';
 // Isolate the account-control title from the task/payment sections, including
 // the read-only payment section shown once a task has finished.
