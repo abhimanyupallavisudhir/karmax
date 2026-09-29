@@ -252,12 +252,7 @@ try {
   assert.equal(checks.length, 2);
   assert(checks.every((check: any) => check.read === 'verified' && check.encryption && check.push));
   await page.locator('[data-git-pass-root]').waitFor({ state: 'detached' });
-  const checked = page.waitForResponse(response => response.url().includes('/connectors/pass-git/check'));
-  await row.locator('[data-git-pass-check]').click();
-  const checkedResponse = await checked;
-  assert.equal(checkedResponse.status(), 200);
-  assert.deepEqual((await checkedResponse.json()).checks, checks);
-  await row.locator('[data-conn-import]').click();
+  // A newly connected store opens its import picker by itself.
   await page.waitForFunction(() => document.querySelectorAll('.imp-pick').length === 2);
   await page.locator('.imp-all').check();
   await page.locator('.imp-wb').check();
@@ -268,6 +263,11 @@ try {
   await page.locator('[data-imp-go]').click();
   assert.equal((await imported).status(), 200);
   await page.locator('[data-imp-go]').waitFor({ state: 'detached' });
+  const checked = page.waitForResponse(response => response.url().includes('/connectors/pass-git/check'));
+  await row.locator('[data-git-pass-check]').click();
+  const checkedResponse = await checked;
+  assert.equal(checkedResponse.status(), 200);
+  assert.deepEqual((await checkedResponse.json()).checks, checks);
   const listed = await api('/api/vault/items' + oq);
   assert.equal(listed.status, 200);
   assert.equal(listed.body.length, 2);

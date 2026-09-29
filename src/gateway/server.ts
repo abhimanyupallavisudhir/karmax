@@ -6753,8 +6753,7 @@ export class Gateway {
             const action = connName[2];
             try {
               if (action === 'connect') {
-                const connector = await connectors.connect(connName[1]!, String(b.secret ?? ''));
-                return this.json(res, 200, { connected: true, connector });
+                return this.json(res, 200, { connected: true, ...(await connectors.connect(connName[1]!, String(b.secret ?? ''))) });
               }
               if (action === 'config') {
                 let config = typeof b.writeBack === 'boolean'

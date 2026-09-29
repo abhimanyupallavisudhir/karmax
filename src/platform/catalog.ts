@@ -239,7 +239,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access or report a wrong secret; body {itemId?|domain?, field?, mode?, kind?: access|reset, why, urgency?}; approval is high urgency by default)',
     'POST /api/vault/requests/:id/resolve (credential:write: body {action: once|task|always|deny, itemId?})',
     'GET /api/vault/connectors (hosted 1Password + Git-backed pass; host-local Bitwarden/1Password/pass where available)',
-    'POST /api/vault/connectors/:name/connect|config|list|sync|write-back|retry-writes|discard-writes (selective mirror + opt-in write-back; sync body {externalIds, policy?, writeBack?}; list items carry folder for grouping)',
+    'POST /api/vault/connectors/:name/connect|config|list|sync|write-back|retry-writes|discard-writes (selective mirror + opt-in write-back; connect returns {connector, newStore, droppedWrites}; sync body {externalIds, policy?, writeBack?}; list items carry folder for grouping)',
     'POST /api/vault/passkey/enroll|save|login|release (agent-enrolled passkeys via CDP virtual authenticator)',
   ],
   agentMail: [

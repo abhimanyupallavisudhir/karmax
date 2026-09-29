@@ -177,6 +177,32 @@ describe('connector import (web)', () => {
     await ui.close();
   });
 
+  it('opens the import picker when a new store connects and names writes the previous store will not get', async () => {
+    const ui = await passwords(({ path }) => path.startsWith('/api/vault/connectors/pass-git/connect')
+      ? { connected: true, connector: { label: 'unix pass (Git)', checks: [{ store: 'root', read: 'verified', encryption: true, push: false }] },
+        newStore: true, droppedWrites: ['deploy key'] } : undefined);
+    await ui.page.locator('[data-conn="pass-git"] [data-git-pass-connect]').click();
+    const dialog = ui.page.getByRole('dialog', { name: 'Connect unix pass through Git' });
+    await dialog.locator('.git-pass-repo').fill('git@github.com:me/other.git');
+    await dialog.locator('.git-pass-key').fill('-----BEGIN PGP PRIVATE KEY BLOCK-----');
+    await dialog.getByRole('button', { name: 'Replace connection' }).click();
+    await expect.poll(() => ui.page.locator('.imp-pick').count()).toBe(3);
+    expect(await ui.toasts()).toEqual(['unix pass (Git) connected · root is read-only · 1 pending write to the previous store dropped: deploy key']);
+    await ui.close();
+  });
+
+  it('shows pending writes as paused while write-back is off, not as a Retry that cannot send them', async () => {
+    for (const writeBack of [false, true]) {
+      const ui = await passwords(({ method, path }) => method === 'GET' && path.split('?')[0] === '/api/vault/connectors'
+        ? [{ ...passGit, config: { writeBack }, pendingWrites: [{ id: 'w1', connector: 'pass-git', itemId: 'i1', attempts: 1 }] }] : undefined);
+      const row = ui.page.locator('[data-conn="pass-git"]');
+      expect(await row.locator('[data-conn-retry]').count()).toBe(writeBack ? 1 : 0);
+      expect(await row.locator('.chip', { hasText: '1 pending' }).count()).toBe(writeBack ? 0 : 1);
+      expect(await row.locator('[data-conn-discard]').count()).toBe(1);
+      await ui.close();
+    }
+  });
+
   it('offers selective automatic updates and makes automatic discovery select everything', async () => {
     const ui = await passwords(({ path }) => path.startsWith('/api/vault/connectors/pass-git/sync') ? { count: 1, skipped: 0, failures: [] }
       : path.startsWith('/api/vault/connectors/pass-git/config') ? {} : undefined);

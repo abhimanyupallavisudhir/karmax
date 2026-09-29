@@ -1694,8 +1694,10 @@ export class Connectors {
 
   /** Validate a connector secret before keeping it. A failed replacement restores
    *  the previous working secret, so clicking Connect can never manufacture a
-   *  false-positive connection or break an existing one. */
-  async connect(name: string, secret: string): Promise<ConnectorInfo> {
+   *  false-positive connection or break an existing one. `newStore` is a first
+   *  connection or a different Git store; `droppedWrites` labels the pending
+   *  writes that could only ever have reached the store it replaced. */
+  async connect(name: string, secret: string): Promise<{ connector: ConnectorInfo; newStore: boolean; droppedWrites: string[] }> {
     const connector = this.get(name);
     if (!connector) throw new Error(`no connector "${name}"`);
     if (!this.broker) throw new Error('credential storage is unavailable');
@@ -1719,16 +1721,19 @@ export class Connectors {
     try {
       const info = validated ?? (await connector.describe());
       if (!info.available) throw new Error(info.detail);
-      // A selection and write-back consent belong to one external store. Never
-      // carry them silently to a different repository during reconfiguration.
-      if (replacedGitPassStore)
+      // A selection, write-back consent and queued writes belong to one external
+      // store. Never carry them silently to a different repository.
+      const dropped = replacedGitPassStore ? await this.store.transaction(async () => {
         (await this.store.kvSet(
           kvConfig(this.organizationId, name),
           JSON.stringify({
             autoSync: { enabled: false, importNew: false, externalIds: [] },
           }),
         ));
-      return info;
+        return this.dropWrites(name);
+      }) : [];
+      const droppedWrites = await Promise.all([...new Set(dropped)].map(async (id) => (await this.items.get(id))?.label ?? id));
+      return { connector: info, newStore: previous === undefined || replacedGitPassStore, droppedWrites };
     } catch (error) {
       if (previous === undefined) (await this.broker.deleteHandle(handle));
       else (await this.broker.registerHandle(handle, previous));
@@ -2038,17 +2043,21 @@ export class Connectors {
     });
   }
   async discardWrites(name: string): Promise<number> {
+    return (await this.dropWrites(name)).length;
+  }
+  /** Stops every pending write to one connector; returns their item ids. */
+  private async dropWrites(name: string): Promise<string[]> {
     return this.store.transaction(async () => {
     const pending = (await this.pendingWrites()).filter((write) => write.connector === name);
     for (const write of pending) (await this.saveWrite(write, true));
-    let rotations = 0;
+    const itemIds = pending.map((write) => write.itemId);
     if (name === 'pass-git') for (const item of (await this.items.list())) {
       if (Object.keys((await this.pending(item.id)).fields).length) {
         (await this.store.kvSet(this.pendingKey(item.id), JSON.stringify({ fields: {}, generation: randomUUID() })));
-        rotations++;
+        itemIds.push(item.id);
       }
     }
-    return pending.length + rotations;
+    return itemIds;
       });
   }
 

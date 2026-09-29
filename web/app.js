@@ -16013,8 +16013,7 @@ async function wireVaultCards(organizationId) {
           method: 'POST', body: JSON.stringify({ secret: JSON.stringify(connection) }),
         });
         close();
-        toast('Git-backed pass connected. ' + (result.connector?.checks || []).map(check => `${check.store}: ${check.read === 'verified' ? 'entry decrypted' : 'empty store'}, encryption ${check.encryption ? 'verified' : 'unavailable'}, push transport ${check.push ? 'reachable' : 'unavailable'}`).join('; ') + '. A real push can still be rejected by server policy.');
-        await renderConnectors();
+        await afterConnect('pass-git', result);
       } catch (error) {
         button.disabled = false;
         toast(error.message, true);
@@ -16022,19 +16021,28 @@ async function wireVaultCards(organizationId) {
     });
     overlay.querySelector('.git-pass-repo').focus();
   };
+  // The toast names only what needs attention; a new store opens its import picker.
+  const afterConnect = async (name, result) => {
+    const dropped = result.droppedWrites || [];
+    toast([`${result.connector?.label || name} connected`,
+      ...(result.connector?.checks || []).filter((check) => !check.encryption || !check.push).map((check) => `${check.store} is read-only`),
+      ...(dropped.length ? [`${dropped.length} pending write${dropped.length === 1 ? '' : 's'} to the previous store dropped: ${dropped.join(', ')}`] : [])].join(' · '));
+    const conns = await renderConnectors();
+    if (result.newStore) await openImportPanel(name, conns.find((c) => c.name === name));
+  };
   const renderConnectors = async () => {
     const list = box.querySelector('.connectors-list');
-    if (!list) return;
+    if (!list) return [];
     let conns = [];
-    try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3);font-size:12px">Connectors need a credential broker.</span>'; return; }
+    try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3);font-size:12px">Connectors need a credential broker.</span>'; return []; }
     list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
       <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
         <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}${c.config?.autoSync?.enabled ? ` · ${c.config.autoSync.importNew ? 'imports new credentials automatically' : 'keeps selected credentials updated'}` : ''}${c.config?.lastAutoSync?.error ? ` · sync error: ${esc(c.config.lastAutoSync.error)}` : ''}</div></div>
-      ${c.pendingWrites?.length ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button><button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
+      ${c.pendingWrites?.length ? `${c.config?.writeBack ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button>` : `<span class="chip" title="Write-back is off; turn it on under Import… to send these">${c.pendingWrites.length} pending</span>`}<button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
       ${c.setup === 'git-pass'
         ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>${c.available ? '<button class="btn sm" data-git-pass-check>Check connection</button>' : ''}`
         : c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
-      ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back <button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button><button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}
+      ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back ${c.config?.writeBack ? `<button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button>` : ''}<button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}
       <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
       || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
@@ -16078,9 +16086,7 @@ async function wireVaultCards(organizationId) {
         button.disabled = true;
         try {
           const result = await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret: row.querySelector('.conn-secret').value }) });
-          const connection = result.connector;
-          toast(`${connection.label} connected`);
-          await renderConnectors();
+          await afterConnect(name, result);
         } catch (e) {
           button.disabled = false;
           toast(e.message, true);
@@ -16089,6 +16095,7 @@ async function wireVaultCards(organizationId) {
       row.querySelector('[data-git-pass-connect]')?.addEventListener('click', () => openGitPassConnect(conns.find((c) => c.name === name)));
       row.querySelector('[data-conn-import]')?.addEventListener('click', () => openImportPanel(name, conns.find((c) => c.name === name)));
     });
+    return conns;
   };
   // The full-fledged import interface (mass select by folder / all, choose the
   // import policy + write-back once for everything selected).

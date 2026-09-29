@@ -363,6 +363,29 @@ it('persists failed write-back, blocks remote conflicts and imports an explicitl
   expect(JSON.parse(kv.get(`pass-writeback:org_personal:${id}`)!).fields).toEqual({});
 });
 
+it('drops a rotation left pending for a store the connection no longer points at', async () => {
+  const f = fixture();
+  const other = fixture();
+  const kv = new Map<string, string>();
+  const db = { transaction: memoryTransaction(kv), kvGet: (k: string) => kv.get(k), kvSet: (k: string, v: string) => { kv.set(k, v); }, appendAudit: () => 0 };
+  const broker = new CredentialBroker(new Vault(path.join(f.root, 'vault')));
+  const items = new VaultItems(db, broker, path.join(f.root, 'vault-state'));
+  const service = new Connectors(db, items, broker);
+  service.register(new GitPassConnector(() => service.secretFor('pass-git'), 'org_personal', () => ({}), path.join(f.root, 'state'), { allowLocalRepository: true }));
+  await service.connect('pass-git', JSON.stringify(f.config));
+  const id = (await service.sync('pass-git', ['example'], { writeBack: true })).itemIds[0]!;
+  (await items.save({ id, type: 'login', secrets: { password: 'rotated' } }));
+  fs.writeFileSync(path.join(f.remote, 'hooks', 'pre-receive'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  expect((await service.propagate(id, ['password']))?.error).toContain('pending retry');
+  // Re-validating the same store keeps the rotation queued for it.
+  expect(await service.connect('pass-git', JSON.stringify(f.config))).toMatchObject({ newStore: false, droppedWrites: [] });
+  expect((await service.describe())[0]?.pendingWrites).toHaveLength(1);
+  const label = (await items.get(id))!.label;
+  expect(await service.connect('pass-git', JSON.stringify(other.config))).toMatchObject({ newStore: true, droppedWrites: [label] });
+  expect((await service.describe())[0]?.pendingWrites).toEqual([]);
+  expect(items.readSecret((await items.get(id))!, 'password')).toBe('rotated');
+}, 60_000);
+
 it('accepts encrypted age identities, rejects wrong passphrases and cleans temporary plaintext', async () => {
   const f = fixture();
   const { encryptIdentity } = await import('./helpers/age-encrypted-identity.js');

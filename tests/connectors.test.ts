@@ -75,7 +75,7 @@ describe('Bitwarden connector', () => {
     await expect(connectors.connect('bitwarden', '')).rejects.toThrow(/session key/i);
     expect(connectors.secretFor('bitwarden')).toBeUndefined();
 
-    await expect(connectors.connect('bitwarden', 'sess')).resolves.toMatchObject({ available: true });
+    await expect(connectors.connect('bitwarden', 'sess')).resolves.toMatchObject({ connector: { available: true }, newStore: true });
     expect(connectors.secretFor('bitwarden')).toBe('sess');
   });
 
@@ -1079,17 +1079,30 @@ describe('Git password-store reconfiguration', () => {
     const connector = new GitPassConnector(() => service.secretFor('pass-git'));
     // Binding/consent unit test; live verification is exercised with real remotes.
     connector.validateSecret = async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: true, detail: 'test' });
+    connector.push = async () => { throw new Error('offline'); };
     service.register(connector);
     const config = { repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test-key',
       mounts: [{ name: 'work', repositoryUrl: 'https://github.com/example/work.git', gpgPrivateKey: 'test-key' }] };
-    await service.connect('pass-git', JSON.stringify(config));
+    expect(await service.connect('pass-git', JSON.stringify(config))).toMatchObject({ newStore: true, droppedWrites: [] });
     (await service.setConfig('pass-git', { writeBack: true }));
     (await service.setAutoSync('pass-git', { keepUpdated: true, externalIds: ['work/otp'] }));
-    await service.connect('pass-git', JSON.stringify({ ...config, gpgPrivateKey: 'rotated-key' }));
+    const created = (await items.save({ type: 'login', label: 'deploy key', secrets: { password: 'generated' },
+      provenance: { source: 'task:t1', taskId: 't1' } }));
+    expect((await service.writeBackCreated(created.id))[0]?.error).toMatch(/pending retry/);
+    const [queued] = await service.pendingWrites();
+    expect(broker.hasHandle(queued!.snapshotHandle!)).toBe(true);
+    expect(await service.connect('pass-git', JSON.stringify({ ...config, gpgPrivateKey: 'rotated-key' })))
+      .toMatchObject({ connector: { available: true }, newStore: false, droppedWrites: [] });
     expect((await service.config('pass-git')).writeBack).toBe(true);
-    await service.connect('pass-git', JSON.stringify({ ...config, mounts: [{ ...config.mounts[0], repositoryUrl: 'https://github.com/example/other.git' }] }));
+    expect(await service.pendingWrites()).toHaveLength(1);
+    // A queued write can only ever reach the store it was queued for, so a
+    // different store drops it (and its secret snapshot) and says so.
+    expect(await service.connect('pass-git', JSON.stringify({ ...config, mounts: [{ ...config.mounts[0], repositoryUrl: 'https://github.com/example/other.git' }] })))
+      .toMatchObject({ newStore: true, droppedWrites: ['deploy key'] });
     expect((await service.config('pass-git')).writeBack).toBeUndefined();
     expect((await service.config('pass-git')).autoSync).toEqual({ enabled: false, importNew: false, externalIds: [] });
+    expect(await service.pendingWrites()).toEqual([]);
+    expect(broker.hasHandle(queued!.snapshotHandle!)).toBe(false);
   });
 });
 
