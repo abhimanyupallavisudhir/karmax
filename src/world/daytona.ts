@@ -378,7 +378,7 @@ class DaytonaWorld implements World {
     await this.sandbox.fs.uploadFile(content, target);
   }
   async listFiles(): Promise<string[]> {
-    const result = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print | sed 's#^./##'"],
+    const result = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print -o -type l -not -path '*/.git/*' -print | sed 's#^./##'"],
       { cwd: this.handle.root });
     if (result.code !== 0) throw new Error(result.stderr || 'failed to list remote files');
     return result.stdout.split('\n').map((value) => value.trim()).filter(Boolean);

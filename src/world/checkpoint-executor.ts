@@ -1,6 +1,6 @@
 import { Worker } from 'node:worker_threads';
 
-export interface CheckpointFile { repo: string; path: string; deleted?: boolean; data?: Buffer }
+export interface CheckpointFile { repo: string; path: string; deleted?: boolean; symlink?: boolean; data?: Buffer }
 export interface EncodedCheckpoint { encrypted: Buffer; sha256: string }
 const MAX_WAITING = 16;
 let active = false;

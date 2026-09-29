@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
+import zlib from 'node:zlib';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { provisionGitRepos } from '../src/world/provision-git.js';
@@ -666,4 +667,90 @@ it('captures small dirty files in one bounded sandbox read (WD-19, LT-11)', asyn
     expect(reads).not.toHaveBeenCalled();
     expect(exec.mock.calls.filter(([command]) => command === 'node')).toHaveLength(1);
   } finally { vi.restoreAllMocks(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+describe('symbolic links (WD-33)', () => {
+  const SECRET = 'outside-credential-5d1c0a9e';
+  const decryptedFiles = async (service: WorldCheckpointService, objects: LocalObjectStore, checkpoint: { filesystemDelta?: { objectKey: string } }) => {
+    const plain = await (service as any).decrypt(await objects.get(checkpoint.filesystemDelta!.objectKey));
+    return (JSON.parse(zlib.gunzipSync(plain).toString()) as { files: Array<{ path: string; data?: string; symlink?: boolean }> }).files;
+  };
+  const expectNoSecret = (files: Array<{ data?: string }>) => {
+    for (const file of files) expect(Buffer.from(file.data ?? '', 'base64').toString('latin1')).not.toContain(SECRET);
+  };
+
+  it('captures links without reading through them and recreates them on restore', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-links-'));
+    const secret = path.join(dir, 'secret.txt'); fs.writeFileSync(secret, SECRET);
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-qb', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'tracked\n');
+    fs.writeFileSync(path.join(repo, 'other.txt'), 'other\n');
+    fs.symlinkSync('tracked.txt', path.join(repo, 'tracked-link'));
+    fs.symlinkSync('tracked.txt', path.join(repo, 'gone-link'));
+    await gitOrThrow(repo, ['add', '.']); await gitOrThrow(repo, ['commit', '-qm', 'init']);
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Links', { repos: [repo], defaultBase: 'main', worldProvider: 'worktree' });
+    const task = await store.createTask({ projectId: project.id, title: 'Links', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const objects = new LocalObjectStore(path.join(dir, 'objects'));
+    const service = new WorldCheckpointService(store, worlds, objects, new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+    const world = await worlds.create('worktree', { taskId: task.id, repos: [repo], base: 'main' });
+    world.handle.meta = { projectId: project.id };
+    world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+    const links: Record<string, string> = { 'link.txt': 'tracked.txt', 'nested/up': '../other.txt',
+      'secret-link': secret, dangling: 'missing/file.txt', 'tracked-link': 'other.txt' };
+    for (const [link, target] of Object.entries(links)) {
+      const file = path.join(world.handle.root, link);
+      fs.mkdirSync(path.dirname(file), { recursive: true }); fs.rmSync(file, { force: true });
+      fs.symlinkSync(target, file);
+    }
+    fs.unlinkSync(path.join(world.handle.root, 'gone-link'));
+    try {
+      const checkpoint = await service.checkpoint(world.handle);
+      const files = await decryptedFiles(service, objects, checkpoint);
+      expectNoSecret(files);
+      expect(files.filter(file => file.symlink).map(file => file.path).sort()).toEqual(Object.keys(links).sort());
+      await world.destroy();
+      const restored = await service.restore(checkpoint.id, 'worktree');
+      expect(restored.generation).toBe(2);
+      for (const [link, target] of Object.entries(links)) {
+        const file = path.join(restored.root, link);
+        expect(fs.lstatSync(file).isSymbolicLink()).toBe(true);
+        expect(fs.readlinkSync(file)).toBe(target);
+      }
+      expect(fs.existsSync(path.join(restored.root, 'gone-link'))).toBe(false);
+      expect(fs.readFileSync(secret, 'utf8')).toBe(SECRET);
+      await (await worlds.open(restored)).destroy();
+    } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('captures links in a repositoryless world', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-plain-links-'));
+    const secret = path.join(dir, 'secret.txt'); fs.writeFileSync(secret, SECRET);
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Plain links', { worldProvider: 'worktree' });
+    const task = await store.createTask({ projectId: project.id, title: 'Links', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const objects = new LocalObjectStore(path.join(dir, 'objects'));
+    const service = new WorldCheckpointService(store, worlds, objects, new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+    const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+    world.handle.meta = { projectId: project.id };
+    world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+    await world.writeFile('out/report.txt', 'report');
+    const links: Record<string, string> = { latest: 'out/report.txt', 'secret-link': secret, dangling: 'missing' };
+    for (const [link, target] of Object.entries(links)) fs.symlinkSync(target, path.join(world.handle.root, link));
+    try {
+      const checkpoint = await service.checkpoint(world.handle);
+      expectNoSecret(await decryptedFiles(service, objects, checkpoint));
+      await world.destroy();
+      const restored = await service.restore(checkpoint.id, 'worktree');
+      for (const [link, target] of Object.entries(links))
+        expect(fs.readlinkSync(path.join(restored.root, link))).toBe(target);
+      expect(fs.readFileSync(path.join(restored.root, 'out/report.txt'), 'utf8')).toBe('report');
+      await (await worlds.open(restored)).destroy();
+    } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
 });
