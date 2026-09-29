@@ -726,6 +726,44 @@ describe('symbolic links (WD-33)', () => {
     } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('never writes a regular file through a link still present at its path', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-unlinked-'));
+    const secret = path.join(dir, 'secret.txt'); fs.writeFileSync(secret, SECRET);
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-qb', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'tracked\n');
+    fs.symlinkSync('tracked.txt', path.join(repo, 'config'));
+    fs.symlinkSync(secret, path.join(repo, 'credential'));
+    await gitOrThrow(repo, ['add', '.']); await gitOrThrow(repo, ['commit', '-qm', 'init']);
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Unlinked', { repos: [repo], defaultBase: 'main', worldProvider: 'worktree' });
+    const task = await store.createTask({ projectId: project.id, title: 'Unlinked', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const service = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
+      new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+    const world = await worlds.create('worktree', { taskId: task.id, repos: [repo], base: 'main' });
+    world.handle.meta = { projectId: project.id };
+    world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+    for (const file of ['config', 'credential']) {
+      fs.unlinkSync(path.join(world.handle.root, file));
+      await world.writeFile(file, `regular ${file}`);
+    }
+    try {
+      const checkpoint = await service.checkpoint(world.handle);
+      await world.destroy();
+      const restored = await service.restore(checkpoint.id, 'worktree');
+      expect(restored.generation).toBe(2);
+      for (const file of ['config', 'credential']) {
+        expect(fs.lstatSync(path.join(restored.root, file)).isFile()).toBe(true);
+        expect(fs.readFileSync(path.join(restored.root, file), 'utf8')).toBe(`regular ${file}`);
+      }
+      expect(fs.readFileSync(path.join(restored.root, 'tracked.txt'), 'utf8')).toBe('tracked\n');
+      expect(fs.readFileSync(secret, 'utf8')).toBe(SECRET);
+      await (await worlds.open(restored)).destroy();
+    } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('captures links in a repositoryless world', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-plain-links-'));
     const secret = path.join(dir, 'secret.txt'); fs.writeFileSync(secret, SECRET);
