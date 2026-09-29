@@ -10,7 +10,6 @@ import { WorktreeProvider } from './worktree.js';
 import { paths } from '../config/paths.js';
 import { boundedResponseBody } from './http.js';
 import { openSpawnedPty, runLocalCommand, startSpawnedProcess } from './local-execution.js';
-import { readRegularFilePrefix } from './file-prefix.js';
 
 const pexec = promisify(execFile);
 const IMAGE = process.env.KARMAX_CONTAINER_IMAGE ?? 'node:22';
@@ -195,25 +194,41 @@ class ContainerWorld implements World {
     if (!address) throw new Error('container world has no routable address for previews');
     return address;
   }
-  // file ops use the host bind-mount (fast, and visible inside the container)
+  /**
+   * File access runs inside the container, never on the host through the bind
+   * mount: the agent controls every path component there, so a symlink it made
+   * (`x -> ~/.karmax/vault/vault.key`) must resolve in the container's
+   * filesystem, which cannot see the host's (WD-32). It runs as the host user,
+   * so permissions and ownership match the host access it replaces. Content
+   * crosses stdin/stdout as raw bytes.
+   */
+  private fileCommand(script: string, args: string[], input?: Buffer): Promise<Buffer> {
+    const user = process.getuid && process.getgid ? ['-u', `${process.getuid()}:${process.getgid()}`] : [];
+    const dArgs = ['exec', ...(input ? ['-i'] : []), ...user, this.name, 'sh', '-c', script, 'sh', ...args];
+    return new Promise((resolve, reject) => {
+      const child = execFile('docker', dArgs, { encoding: 'buffer', maxBuffer: Infinity, timeout: 120_000 }, (error, stdout, stderr) => {
+        if (error) reject(new Error(stderr.toString().trim() || error.message));
+        else resolve(stdout);
+      });
+      child.stdin?.on('error', () => { /* EPIPE if the command exits early */ });
+      child.stdin?.end(input);
+    });
+  }
   async readFile(rel: string): Promise<string> {
-    return fs.promises.readFile(this.filePath(rel), 'utf8');
+    return (await this.readFileBuffer(rel)).toString('utf8');
   }
   async readFileBuffer(rel: string): Promise<Buffer> {
-    return fs.promises.readFile(this.filePath(rel));
+    return this.fileCommand('exec cat -- "$1"', [this.containerFile(rel)]);
   }
   async readFilePrefix(rel: string, maxBytes: number): Promise<Buffer> {
-    return readRegularFilePrefix(this.filePath(rel), maxBytes);
+    return this.fileCommand('test -f "$1" || { echo "not a regular file" >&2; exit 1; }; exec head -c "$2" -- "$1"',
+      [this.containerFile(rel), String(maxBytes)]);
   }
   async writeFile(rel: string, content: string): Promise<void> {
-    const abs = this.filePath(rel);
-    await fs.promises.mkdir(path.dirname(abs), { recursive: true });
-    await fs.promises.writeFile(abs, content);
+    await this.writeFileBuffer(rel, Buffer.from(content));
   }
   async writeFileBuffer(rel: string, content: Buffer): Promise<void> {
-    const abs = this.filePath(rel);
-    await fs.promises.mkdir(path.dirname(abs), { recursive: true });
-    await fs.promises.writeFile(abs, content);
+    await this.fileCommand('mkdir -p -- "$(dirname -- "$1")" && exec cat > "$1"', [this.containerFile(rel)], content);
   }
   async startProcess(spec: WorldProcessSpec): Promise<WorldProcess> {
     const args = ['exec'];
@@ -228,18 +243,11 @@ class ContainerWorld implements World {
     args.push(this.name, 'bash', ...(spec.command ? ['-lc', spec.command] : ['--norc', '-i']));
     return openSpawnedPty('docker', args, spec);
   }
+  /** Every non-directory entry outside `.git`; `find` lists a symlinked
+   * directory as an entry and never walks into it. */
   async listFiles(): Promise<string[]> {
-    const out: string[] = [];
-    const walk = (dir: string, prefix: string) => {
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (e.name === '.git') continue;
-        const rel = prefix ? `${prefix}/${e.name}` : e.name;
-        if (e.isDirectory()) walk(path.join(dir, e.name), rel);
-        else out.push(rel);
-      }
-    };
-    if (fs.existsSync(this.handle.root)) walk(this.handle.root, '');
-    return out;
+    const listed = await this.fileCommand('cd /work && find . -name .git -prune -o ! -type d -print0', []);
+    return listed.toString('utf8').split('\0').filter(Boolean).map((file) => file.slice(2));
   }
   /** Another branch of a repo in this sandbox (SPEC §11.1, multi-PR). The repos
    *  here are real clones, so this is one `git worktree add` run in place. */
@@ -260,10 +268,10 @@ class ContainerWorld implements World {
     }
     if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
   }
-  private filePath(relPath: string): string {
+  private containerFile(relPath: string): string {
     const safe = worldRelativePath(relPath);
     if (safe === '.') throw new Error('path is a directory');
-    return path.join(this.handle.root, ...safe.split('/'));
+    return `/work/${safe}`;
   }
   private containerCwd(relPath = '.'): string {
     const safe = worldRelativePath(relPath);
