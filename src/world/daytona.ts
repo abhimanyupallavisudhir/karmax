@@ -608,11 +608,20 @@ async function updateNetwork(sandbox: DaytonaSandboxLike, settings: { networkBlo
 }
 
 /** Deletes are retried by teardown and orphan reconciliation. Daytona's list
- * index can briefly retain a deleted sandbox, so a confirmed 404 is success. */
+ * index can briefly retain a deleted sandbox, so a confirmed 404 is success.
+ * A sandbox mid-transition (starting, stopping, or already being deleted by
+ * another caller) answers 409 "state change in progress": wait for it to
+ * settle and delete again, bounded so teardown can still retry later. */
 async function deleteSandbox(sandbox: DaytonaSandboxLike): Promise<void> {
-  try { await sandbox.delete(60); }
-  catch (error) {
-    if ((error as { statusCode?: number })?.statusCode !== 404) throw error;
+  const until = Date.now() + 120_000;
+  for (;;) {
+    try { await sandbox.delete(60); return; }
+    catch (error) {
+      const status = (error as { statusCode?: number })?.statusCode;
+      if (status === 404) return;
+      if (status !== 409 || Date.now() >= until) throw error;
+      await delay(3000);
+    }
   }
 }
 

@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { bootHarness } from './helpers/harness.js';
+import { liveEnabled } from './helpers/live-gate.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import { DaytonaWorldProvider } from '../src/world/daytona.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import type { WorldHandle } from '../src/world/types.js';
 
-// Explicit opt-in: real Temporal, real cloud credit, deterministic model.
-describe.skipIf(process.env.KARMAX_DAYTONA_LIVE_WORKFLOW !== '1')('Daytona task end to end', () => {
+// Behind the live gate: real Temporal, real cloud credit, deterministic model.
+describe.skipIf(!liveEnabled() || !process.env.DAYTONA_API_KEY)('Daytona task end to end', () => {
   it('runs task setup, agent commands, output checkpointing and teardown with only an API key', async () => {
-    if (!process.env.DAYTONA_API_KEY) throw new Error('DAYTONA_API_KEY is required');
     const provider = new DaytonaWorldProvider();
     const mock = new MockAdapter();
     let observed: WorldHandle | undefined;

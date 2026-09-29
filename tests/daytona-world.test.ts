@@ -324,6 +324,27 @@ describe('Daytona cloud world provider', () => {
     await expect(world.destroy()).rejects.toThrow('denied');
   });
 
+  it('waits out a state change already in progress before deleting, and still fails if it never settles', async () => {
+    const sandbox = fakeSandbox();
+    const busy = () => Object.assign(new Error('Sandbox state change in progress'), { statusCode: 409 });
+    let attempts = 0;
+    sandbox.delete = vi.fn(async () => { if (++attempts < 3) throw busy(); });
+    const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
+      .create({ taskId: 'busy', base: 'main' });
+    vi.useFakeTimers();
+    try {
+      const destroyed = world.destroy();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await destroyed;
+      expect(sandbox.delete).toHaveBeenCalledTimes(3);
+      // Teardown retries a sandbox that never settles later, so the error still surfaces.
+      sandbox.delete = vi.fn(async () => { throw busy(); });
+      const stuck = world.destroy().catch((error: Error) => error);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(await stuck).toMatchObject({ message: 'Sandbox state change in progress' });
+    } finally { vi.useRealTimers(); }
+  });
+
   it('cleans up a terminal when connection setup fails', async () => {
     const sandbox = fakeSandbox();
     const kill = vi.fn(async () => {}), disconnect = vi.fn(async () => {});

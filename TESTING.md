@@ -116,8 +116,9 @@ shards' PostgreSQL and a Temporal dev server; it needs
 
 ## The live-agent test
 
-`tests/live-agent.test.ts`, `tests/cloud-live.test.ts`, and `tests/github-live.test.ts`
-require `KARMAX_RUN_LIVE=1` in addition to their credentials. They spend model or
+Every suite that imports `tests/helpers/live-gate.js` (`live-agent`, `cloud-live`,
+`e2b-workflow-live`, `github-live`, the Daytona suites, …) requires `KARMAX_RUN_LIVE=1`
+in addition to its credentials. They spend model or
 provider credit or write to a GitHub fixture, so ordinary `npm test` never runs them:
 
 ```bash
@@ -146,12 +147,13 @@ environment's branch rule is the control.
 | `models` | `LIVE_ANTHROPIC_API_KEY`, `LIVE_OPENAI_API_KEY` (either) | `live-providers` |
 | `agent` | `LIVE_OPENAI_API_KEY` | `live-agent` |
 | `claude` | `LIVE_CLAUDE_CODE_OAUTH_TOKEN` | `claude-permission` |
-| `e2b` | `LIVE_E2B_API_KEY` | `cloud-live` |
-| `daytona` | `LIVE_DAYTONA_API_KEY` | `daytona-live`, `daytona-environment-live` |
+| `e2b` | `LIVE_E2B_API_KEY` | `cloud-live`, `e2b-workflow-live` (a task that pauses at Review, resumes and tears down) |
+| `daytona` | `LIVE_DAYTONA_API_KEY` | `daytona-live`, `daytona-environment-live`, `daytona-workflow-live` |
 | `github` | `LIVE_GITHUB_TOKEN` (a fixture account; creates `karmax-e2e-tests`) | `github-live` |
 
-`daytona-workflow-live` and the Daytona snapshot build keep their own
-switches and do not run there.
+The Daytona snapshot build keeps its own switch (`KARMAX_DAYTONA_LIVE_BUILD`)
+and does not run there. The `e2b` and `daytona` suites together use about ten
+minutes of sandbox time (2026-09-29); the model suites send a few small requests.
 
 ## Docker test
 
@@ -223,7 +225,7 @@ With `DAYTONA_API_KEY` supplied securely in the environment, run these sequentia
 ```bash
 npx vitest run tests/daytona-live.test.ts tests/daytona-environment-live.test.ts
 KARMAX_DAYTONA_LIVE_BUILD=1 npx vitest run tests/daytona-environment-live.test.ts
-KARMAX_DAYTONA_LIVE_WORKFLOW=1 npx vitest run tests/daytona-workflow-live.test.ts
+KARMAX_RUN_LIVE=1 npx vitest run tests/daytona-workflow-live.test.ts
 KARMAX_MCP_LIVE_WORLD=daytona npx vitest run tests/mcp-deployment.test.ts
 ```
 

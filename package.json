@@ -2,6 +2,7 @@
   "name": "karmax",
   "version": "1.0.0",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
   "description": "An agent-orchestration platform centered on a todo list, on a durable-execution substrate (Temporal).",
   "engines": {

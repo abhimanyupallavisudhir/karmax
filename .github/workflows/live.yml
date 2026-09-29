@@ -128,14 +128,16 @@ jobs:
     needs: plan
     if: github.ref == 'refs/heads/master' && needs.plan.outputs.e2b == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment: live
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/install
-      - run: npx vitest run tests/cloud-live.test.ts
+      - uses: ./.github/actions/temporal-cli
+      # The smoke checks, then a whole task: pause at Review, resume, teardown.
+      - run: npx vitest run tests/cloud-live.test.ts tests/e2b-workflow-live.test.ts
         env:
           KARMAX_RUN_LIVE: '1'
           E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}
@@ -145,15 +147,16 @@ jobs:
     needs: plan
     if: github.ref == 'refs/heads/master' && needs.plan.outputs.daytona == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     environment: live
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/install
+      - uses: ./.github/actions/temporal-cli
       # The snapshot build stays behind its own KARMAX_DAYTONA_LIVE_BUILD switch.
-      - run: npx vitest run tests/daytona-live.test.ts tests/daytona-environment-live.test.ts
+      - run: npx vitest run tests/daytona-live.test.ts tests/daytona-environment-live.test.ts tests/daytona-workflow-live.test.ts
         env:
           KARMAX_RUN_LIVE: '1'
           DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}

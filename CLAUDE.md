@@ -35,7 +35,7 @@ Integration test files each boot a **real** Temporal dev server + Worker (via `t
 - Cheap files (no Temporal server, iterate freely): `ports`, `store`, `world`, `worktree-lock`, `merge`, `merge-wait`, `coordinator-health`, `stage-transitions`, `security`, `mcp`, `overlays`, `repo-path`, `deploy-edge`, `inbox`, `collaboration`, `web-regressions` (runs every `web/*.test.cjs` in a plain node process).
 - Heavy files (boot a Temporal server, one at a time): `temporal`, `pipeline`, `workflows`, `gateway`, `autonomy`, `live-agent`.
 - `tests/live-agent.test.ts` requires `KARMAX_RUN_LIVE=1` and a real API key; it spends real model tokens.
-- `tests/cloud-live.test.ts` requires `KARMAX_RUN_LIVE=1` and `E2B_API_KEY` / `DAYTONA_API_KEY`; it spends provider credit.
+- `tests/cloud-live.test.ts` and `tests/e2b-workflow-live.test.ts` require `KARMAX_RUN_LIVE=1` and `E2B_API_KEY` / `DAYTONA_API_KEY`; they spend provider credit.
 - `tests/github-live.test.ts` requires `KARMAX_RUN_LIVE=1` and a GitHub token (`GH_TOKEN`/`GITHUB_TOKEN`, else the host `gh` login). It creates one private fixture repo (`karmax-e2e-tests`) on first run and reuses it, deleting its task branches and leaving no PR open. Keep it — stub-backed `github-pr*` tests cannot see GitHub's real rules.
 - `tests/container.test.ts` needs Docker (`node:22-slim`); self-skips, or force with `KARMAX_SKIP_DOCKER=1`.
 
