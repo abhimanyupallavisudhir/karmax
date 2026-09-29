@@ -7,7 +7,7 @@ import type { AgentAdapter } from '../../src/agent/types.js';
 // interrupt a turn. They were one file whose ~6.5 minutes no CI shard could
 // beat; each file now boots its own harness.
 
-export function input(over: { taskId: string; projectId?: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any; resolveAgentEnabled?: boolean }) {
+export function input(over: { taskId: string; projectId?: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; waitMinuteMs?: number; recovery?: any; resolveAgentEnabled?: boolean }) {
   return {
     taskId: over.taskId,
     projectId: over.projectId ?? 'p1',
@@ -18,6 +18,7 @@ export function input(over: { taskId: string; projectId?: string; repo: string; 
     project: { repos: [over.repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
     ...(over.subtaskNagMs !== undefined ? { subtaskNagMs: over.subtaskNagMs } : {}),
     ...(over.subagentWaitMs !== undefined ? { subagentWaitMs: over.subagentWaitMs } : {}),
+    ...(over.waitMinuteMs !== undefined ? { waitMinuteMs: over.waitMinuteMs } : {}),
     ...(over.resolveAgentEnabled !== undefined ? { resolveAgentEnabled: over.resolveAgentEnabled } : {}),
     ...(over.recovery ? { recovery: over.recovery } : {}),
   };

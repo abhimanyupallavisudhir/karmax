@@ -42,6 +42,7 @@ import { gateFollowUps } from './follow-up-gate.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
+import { jobStatuses, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
@@ -124,6 +125,10 @@ import {
 } from '../coordinators/names.js';
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 import { BRAND } from '../domain/brand.js';
+
+/** A retried turn's processes did not survive it; agents otherwise assume they did. */
+const INTERRUPTED_COMMANDS = 'Commands that were running in it, including run_in_background shells, were stopped: '
+  + 'check whether they finished before relying on their results. Jobs from start_job kept running.';
 
 // Old executions without a recorded grant retain the normal developer workflow
 // surface (but no administration). New tasks always carry a creator-attenuated
@@ -1105,7 +1110,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   async function maintainWaitingWorld(taskId: string, view: LifecyclePublication, fence: string, retryFailure = true): Promise<void> {
     const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
-    if ((view.status !== 'waiting' && view.status !== 'blocked') || hasLiveWorldWork(view)
+    // A job wait needs the world running: parking would freeze the job.
+    if ((view.status !== 'waiting' && view.status !== 'blocked') || hasLiveWorldWork(view) || view.waitingFor?.kind === 'job'
       || !waitingWorld || !worlds.get(waitingWorld.kind).parkable) return;
     let ctx: ReturnType<typeof activityContext.current> | undefined;
     try { ctx = activityContext.current(); } catch { /* direct tests */ }
@@ -1877,8 +1883,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 // Tell the agent what broke, or it reruns the command that froze the sandbox.
                 ? `(This turn was interrupted mid-run: ${interruption.summary}.${interruption.memoryExhausted
                   ? ' Keep memory-hungry commands (type checks, test suites, builds) within the memory `free -m` reports as available.' : ''}`
-                  + ' Continue from where you left off; if the work was already finished, restate the final result.)'
-                : '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result.)',
+                  + ` ${INTERRUPTED_COMMANDS} Continue from where you left off; if the work was already finished, restate the final result.)`
+                // The only undiagnosed cause left is a lost heartbeat: turns have no time limit.
+                : `(This turn was interrupted mid-run — the worker restarted, the connection dropped, or the host slept. ${INTERRUPTED_COMMANDS} Continue from where you left off; if the work was already finished, restate the final result.)`,
               ts: 0,
             },
           ];
@@ -3333,6 +3340,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (!(await owns())) return;
           const world = await worlds.open(current);
           if (!(await owns())) return;
+          // A remote sandbox takes its jobs with it; a host-side world must stop them.
+          if (!isRemote(current.kind)) await stopJobs(world).catch(() => undefined);
           await world.destroy();
           if (!(await owns())) return;
           await store.setWorldState(current, 'released');
@@ -3385,6 +3394,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               throw new Error('world remains in use; preserving it for recovery');
           };
           await idle();
+          // Cancelling stops the task's durable jobs as well as its agent.
+          const live = prepared ?? (isRemote(current.kind) ? undefined : await worlds.open(current));
+          if (live) await stopJobs(live).catch(() => undefined);
           if (deps.checkpoints) {
             if (prepared) {
               const projectId = String(current.meta?.projectId ?? '');
@@ -3421,6 +3433,38 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           error: error instanceof Error ? error.message : String(error),
         }));
       }
+    },
+
+    /** Wait, durably, for an agent's jobs (src/world/jobs.ts) to exit or for
+     * `untilMs` to pass. A small in-world waiter process keeps a cloud sandbox
+     * awake meanwhile; if its stream drops (a provider pause, a worker restart)
+     * the loop re-reads the job files and starts another. Cancelled when the
+     * task gets a message or is cancelled. */
+    async awaitJobs(handle: WorldHandle, jobs: string[], untilMs: number): Promise<{ finished: boolean; summary: string }> {
+      const ctx = activityContext.current();
+      const signal = ctx.cancellationSignal;
+      const beat = setInterval(() => ctx.heartbeat(), 5_000);
+      try {
+        const world = await openWorld(handle);
+        for (;;) {
+          signal.throwIfAborted();
+          ctx.heartbeat();
+          const running = (await jobStatuses(world, jobs)).filter((job) => job.state === 'running').map((job) => job.id);
+          if (!running.length || Date.now() >= untilMs) {
+            return { finished: !running.length, summary: describeJobs(await jobStatuses(world, jobs, { tailLines: 30 })) };
+          }
+          // Re-check at least every ten minutes even if the waiter never reports.
+          const waiter = await startJobWaiter(world, running, Math.min(600, Math.ceil((untilMs - Date.now()) / 1000)));
+          let abort = () => {};
+          await new Promise<void>((resolve) => {
+            abort = resolve;
+            waiter.onExit(() => resolve());
+            signal.addEventListener('abort', abort, { once: true });
+          });
+          signal.removeEventListener('abort', abort);
+          if (signal.aborted) await Promise.resolve(waiter.kill()).catch(() => undefined);
+        }
+      } finally { clearInterval(beat); }
     },
 
     async pendingServiceConnections(taskId: string): Promise<number> {

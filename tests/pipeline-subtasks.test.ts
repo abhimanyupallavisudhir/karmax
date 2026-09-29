@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import type { Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
@@ -342,6 +344,106 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
     await handle.signal('confirm');
     expect((await handle.result()).stage).toBe('done');
     expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
+  }, 60_000);
+
+  // videos #1: a render the agent ran from its own shell died with its turn. A durable
+  // job outlives the turn, and `pause` resumes the agent with the job's result. The job
+  // prints a mock directive, so the resumed agent acting on it proves the job's output
+  // reached the agent's next turn.
+  it('resumes the agent with a durable job\'s result once the job finishes', async () => {
+    const repo = await h.makeRepo('app-job-wait');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Render', prompt: '@job sleep 3; echo "@write out.txt :: rendered"\n@pause 30 :: last' })],
+    });
+
+    // Parked on the job, with the latest resume time shown.
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('job');
+    const parked = await view(handle);
+    expect(parked.stage).toBe('do');
+    expect(parked.waitingFor.detail).toMatch(/^Waiting for job-[a-f0-9]{8}$/);
+    expect(parked.waitingFor.until).toBeGreaterThan(Date.now() + 25 * 60_000);
+
+    // The job finishes; the agent is resumed with its output and acts on it.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('rendered');
+  }, 60_000);
+
+  it('asks the agent once about a job it left running, instead of waiting on it silently', async () => {
+    const repo = await h.makeRepo('app-job-unattended');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // The agent starts a job and ends its turn without pause or open_pr — the
+      // videos #1 mistake, or a job that is simply runaway. The task must not sit on
+      // it: the agent decides (pause for it, or stop it), and is asked exactly once.
+      args: [input({ taskId, repo, title: 'Unattended', prompt: '@write out.txt :: hi\n@job sleep 120\n@incomplete' })],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const reviewed = await view(handle);
+    const reminders = reviewed.messages.filter((m: any) => /still running/.test(m.text) && /stop_job/.test(m.text));
+    expect(reminders).toHaveLength(1);
+    expect(reminders[0].text).toMatch(/job-[a-f0-9]{8}/);
+    expect(reminders[0].text).toContain('pause');
+    // The task never parked on the job.
+    const kinds = (await h.store.eventsOfType(taskId, 'view.updated')).map((e: any) => e.payload.waitingFor);
+    expect(kinds).not.toContain('job');
+    await handle.signal('cancel');
+    await handle.result();
+  }, 60_000);
+
+  it('a timed pause resumes the agent when it elapses, or earlier on a message', async () => {
+    const repo = await h.makeRepo('app-pause');
+    const elapsesId = newId('task');
+    const elapses = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: elapsesId,
+      // One "minute" is 1.5 s here; the pause alone must bring the agent back.
+      args: [input({ taskId: elapsesId, repo, title: 'Pause', prompt: '@write out.txt :: paused\n@pause 2', waitMinuteMs: 1500 })],
+    });
+    await expect.poll(async () => (await view(elapses)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
+    await expect.poll(async () => (await view(elapses)).stage, { timeout: 30_000 }).toBe('review');
+    await elapses.signal('cancel');
+    await elapses.result();
+
+    const earlyId = newId('task');
+    const early = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: earlyId,
+      args: [input({ taskId: earlyId, repo, title: 'Pause', prompt: '@pause 600' })],
+    });
+    await expect.poll(async () => (await view(early)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
+    const until = (await view(early)).waitingFor.until;
+    expect(until).toBeGreaterThan(Date.now() + 9 * 60 * 60_000);
+    await early.signal('followUp', { id: 'wake', role: 'user', text: '@write early.txt :: woke', ts: 0 });
+    await expect.poll(async () => (await view(early)).stage, { timeout: 30_000 }).toBe('review');
+    await early.signal('confirm');
+    expect((await early.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:early.txt'])).stdout).toContain('woke');
+  }, 90_000);
+
+  it('cancelling a task stops its durable jobs', async () => {
+    const repo = await h.makeRepo('app-job-cancel');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Cancel', prompt: '@job sleep 300\n@pause 30 :: last' })],
+    });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('job');
+    const root = (await view(handle)).world.root as string;
+    const jobs = fs.readdirSync(path.join(root, '.karmax-injection/jobs'));
+    const pid = Number(fs.readFileSync(path.join(root, '.karmax-injection/jobs', jobs[0]!, 'pid'), 'utf8'));
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    await handle.signal('cancel');
+    await handle.result();
+    await expect.poll(() => { try { process.kill(pid, 0); return 'alive'; } catch { return 'gone'; } }, { timeout: 15_000 }).toBe('gone');
   }, 60_000);
 
   it('cancels running sub-task agents when the parent is cancelled (SPEC §5.6)', async () => {

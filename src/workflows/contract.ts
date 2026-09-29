@@ -29,6 +29,7 @@ export type {
   SubTaskRequest,
   SubTaskResponse,
   RaiseToParent,
+  AgentWait,
   RaiseType,
   SubTaskAction,
   RemotePolicy,

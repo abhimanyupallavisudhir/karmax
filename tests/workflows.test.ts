@@ -123,6 +123,21 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(onMain.code).not.toBe(0);
   });
 
+  it('just-do: pauses for a durable job and resumes the agent with its output', async () => {
+    const repo = await h.makeRepo('jd-job');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('justDo', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'job', prompt: '@job sleep 3; echo "@write note.txt :: from the job"\n@pause 30 :: last' })],
+    });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 15_000 }).toBe('job');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', `tavya/${taskId}:note.txt`])).stdout).toContain('from the job');
+  }, 60_000);
+
   it('just-do: applies resources only after every confirmation layer', async () => {
     const repo = await h.makeRepo('jd-resources');
     const project = await h.store.createProject('Just-do resources', { repos: [repo] });

@@ -59,6 +59,8 @@ const ctx: any = {
   respondToSubTask() {},
   raiseToParent() {},
   waitForSubtasks() {},
+  requestWait() {},
+  jobStarted() {},
   saveSkill() {},
   resolveDecision() {},
   confirmDecision() {},

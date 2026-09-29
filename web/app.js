@@ -38,6 +38,11 @@ const ICON = {
   chevron: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>',
   project: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="m3 6 1.5 1.5L7.5 4.5"/><path d="m3 12 1.5 1.5L7.5 10.5"/><path d="m3 18 1.5 1.5L7.5 16.5"/></svg>',
   plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+  // Toolbar actions (conversation head, tab rails): one stroke weight and size.
+  share: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><path d="m16 6-4-4-4 4"/><path d="M12 2v13"/></svg>',
+  fork: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
+  terminal: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>',
+  laptop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>',
   // Window controls: a matched pair, drawn on the same grid and stroke.
   minimize: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="M6 12h12"/></svg>',
   close: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="m7 7 10 10"/><path d="M17 7 7 17"/></svg>',
@@ -4429,7 +4434,7 @@ function renderMain() {
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
-        .join('')}${S.meta?.hosted ? '<span class="tabs-spacer"></span><button class="btn sm tabs-action" id="project-local-checkout">Work locally</button>' : ''}</div>`
+        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
     : '';
 
   let content = '';
@@ -6710,13 +6715,12 @@ const TASK_TABS = [
 
 function visibleTaskTabs() { return TASK_TABS.filter(t => t.key !== 'timing' || S.meta?.timingEnabled === true); }
 
-// The tab a task page opens on when the URL doesn't pin one: while the workflow
-// is asking the human to decide (an enabled `confirm` action — the Review gate),
-// the conversation that led here is the thing to read, so open Check-in on the
-// stage's agent. Otherwise Overview.
+// The tab a task page opens on when the URL doesn't pin one: pending approvals
+// first, a draft's parameters (it has no conversation yet), else Check-in on the
+// stage's agent — the conversation is what people come to a task for.
 function defaultTaskTab(v) {
   if (v.approvalRequests) return 'approvals';
-  return (v.actions || []).some((a) => a.name === 'confirm' && a.enabled) ? 'checkin' : 'overview';
+  return v.state?.draft ? 'parameters' : 'checkin';
 }
 
 // Task navigation owns the main cell immediately. The compact view normally
@@ -6829,28 +6833,33 @@ function runPageRow(r) {
 // principal. Keep navigation separate from the selected attempt's stage control.
 function taskAttempts(v) {
   const g = S.attemptGroup;
-  if (!g?.attempts?.length) return '';
-  const rows = g.attempts.length > 1 ? g.attempts.map((a) => {
+  if (!(g?.attempts?.length > 1)) return '';
+  const rows = g.attempts.map((a) => {
     const av = a.id === v.taskId ? v : a.lastView || {};
     const committed = a.id === g.committedAttemptId;
     const selected = a.id === v.taskId;
     const draft = !!a.params?.draft;
     const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
-    const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${S.taskTab || 'overview'}`;
+    // A draft has nothing to show but its parameters, so it opens straight into its form.
+    const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${draft && !selected ? 'parameters' : S.taskTab || 'overview'}`;
     const principal = a.id === g.principalAttemptId;
     const locked = !!g.committedAttemptId || ['cancelled', 'failed'].includes(av.status);
     const crownTitle = g.committedAttemptId ? 'Principal selection is locked after Merge admission' : locked ? 'Cancelled or failed attempts cannot be principal' : principal ? 'Principal attempt · shown in task list' : 'Show this attempt in the task list';
-    return `<div class="attempt-item"><button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="m3.5 9 3.5 4 .5-7 2.5 6 2-8 2 8 2.5-6 .5 7 3.5-4-2.5 8H6Z"/><circle cx="3" cy="7.5" r="1.2"/><circle cx="7.3" cy="4.5" r="1.2"/><circle cx="12" cy="2.5" r="1.2"/><circle cx="16.7" cy="4.5" r="1.2"/><circle cx="21" cy="7.5" r="1.2"/><rect x="6" y="19" width="12" height="2" rx="1"/></svg></button><a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
+    return `<div class="attempt-item"><a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" ${draft && !selected ? 'data-attempt-draft' : ''} href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
       <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
       <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
-      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note">First selected to merge · others kept</span>' : '<span class="attempt-note">Selected to merge</span>') : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
-    </a></div>`;
-  }).join('') : '';
+      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note" title="Other attempts are kept">Selected to merge</span>' : '<span class="attempt-note">Selected to merge</span>') : ''}
+    </a><button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="m3.5 9 3.5 4 .5-7 2.5 6 2-8 2 8 2.5-6 .5 7 3.5-4-2.5 8H6Z"/><circle cx="3" cy="7.5" r="1.2"/><circle cx="7.3" cy="4.5" r="1.2"/><circle cx="12" cy="2.5" r="1.2"/><circle cx="16.7" cy="4.5" r="1.2"/><circle cx="21" cy="7.5" r="1.2"/><rect x="6" y="19" width="12" height="2" rx="1"/></svg></button></div>`;
+  }).join('');
   return `<section class="attempts" aria-label="Task attempts">
-    <div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span>
-      <button type="button" class="btn sm" id="add-attempt" ${g.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>
-    </div>${rows ? `<nav class="attempts-list" aria-label="Choose an attempt">${rows}</nav>` : ''}
+    <nav class="attempts-list" aria-label="Choose an attempt">${rows}</nav>
+    ${addAttemptButton()}
   </section>`;
+}
+
+function addAttemptButton(cls = '') {
+  const g = S.attemptGroup;
+  return `<button type="button" class="btn tool attempt-add ${cls}" id="add-attempt" ${g?.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g?.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>`;
 }
 
 // Follow the rendered links so keyboard navigation uses the same pinned routes
@@ -6864,6 +6873,16 @@ function cycleAttempt(delta) {
 }
 
 function wireAttempts(v) {
+  document.querySelectorAll('[data-attempt-draft]').forEach((link) => {
+    link.addEventListener('click', async (event) => {
+      if (isNewTabClick(event)) return;
+      event.preventDefault();
+      const id = link.dataset.attemptSelect;
+      await spaNavigate(link.getAttribute('href'));
+      const draft = taskRecord(id);
+      if (S.selected === id && draft) await openTaskForm(draft.workflow, draft);
+    });
+  });
   document.querySelectorAll('[data-attempt-principal]').forEach((button) => {
     button.addEventListener('click', async () => {
       if (button.disabled || button.getAttribute('aria-pressed') === 'true') return;
@@ -7284,13 +7303,11 @@ function orgEditorHtml(rec) {
       <button type="button" class="tag-remove" data-untag="${esc(id)}" title="Remove ${esc(tagPathStr(id))} from this task" aria-label="Remove tag">×</button>
     </span>`;
   }).join('');
-  const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? '▲ ' : ''}${n[0].toUpperCase() + n.slice(1)}</option>`).join('');
+  const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? `▲ ${n[0].toUpperCase() + n.slice(1)}` : 'No priority'}</option>`).join('');
   return `<div class="org-editor">
-    <label class="org-prio">Priority
-      <select class="q-sel org-priority">${prioOpts}</select>
-    </label>
-    <div class="org-tags">${tags || '<span class="pal-sub">no tags</span>'}
-      <button class="btn sm org-add-tag" title="Add a tag">＋ tag</button>
+    <select class="q-sel org-priority${prio ? '' : ' unset'}" aria-label="Priority" title="Priority">${prioOpts}</select>
+    <div class="org-tags">${tags}
+      <button type="button" class="org-add-tag" title="Add a tag">＋ tag</button>
     </div>
   </div>`;
 }
@@ -7312,6 +7329,7 @@ function wireOrgEditor(rootEl, rec, opts) {
       rec.id = id;
       await api(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) });
       rec.params = { ...(rec.params || {}), priority };
+      e.target.classList.toggle('unset', !priority);
       if (S.tab === 'tasks') await runSearch();
       afterChange();
       toast('Priority updated');
@@ -7651,11 +7669,13 @@ function renderTaskPage() {
   // the swap and carry over any half-typed follow-up.
   const fuState = captureFollowupFocus(main);
   const rec = taskRecord(v.taskId);
-  const currentAttempt = S.attemptGroup?.attempts?.find((a) => a.id === v.taskId);
   const previousAttempts = main.querySelector('.attempts-list');
   const attemptScroll = previousAttempts?.querySelector('[aria-current="true"]')?.dataset.attemptSelect === v.taskId
     ? previousAttempts.scrollLeft : null;
   const base = taskUrl(v.taskId);
+  // A lone attempt has no strip to host New attempt, so it joins the tab actions.
+  const tabActions = (S.attemptGroup?.attempts?.length === 1 ? addAttemptButton('tabs-action') : '')
+    + (S.meta?.hosted ? `<button class="btn tool tabs-action" id="local-checkout" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : '');
   const retainedThread = patchTaskPage(main, `
     <div class="task-page">
       <div class="tp-head">
@@ -7664,17 +7684,10 @@ function renderTaskPage() {
           <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          ${currentAttempt && S.attemptGroup.attempts.length > 1 ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1}</span>` : ''}
           ${stageIndicator(v, v.taskId)}
           ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
         </div>
         <div class="meta">
-          <span>${v.workflowOptions?.length > 1
-            ? `<select id="tp-workflow-mode" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
-                ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
-              </select>`
-            : esc(workflowLabel(v.workflow))}
-            ${rec?.workflowVersion ? `<span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${mergeQueueBadge(v)}
@@ -7687,7 +7700,7 @@ function renderTaskPage() {
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
           ${visibleTaskTabs().map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
-          ${S.meta?.hosted ? '<span class="tabs-spacer"></span><button class="btn sm tabs-action" id="local-checkout">Work locally</button>' : ''}
+          ${tabActions ? `<span class="tabs-spacer"></span>${tabActions}` : ''}
         </div>
       </div>
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
@@ -8961,7 +8974,7 @@ function conversationReviewInfo(v) {
 function conversationFullscreenButton() {
   const active = !!S.conversationFullscreen;
   const label = active ? 'Exit full screen' : 'Full screen';
-  return `<button type="button" class="btn sm icon-btn" id="conversation-fullscreen" aria-label="${label}" title="${active ? 'Exit full screen (Esc)' : label}" aria-pressed="${active}">${active ? ICON.collapse : ICON.expand}</button>`;
+  return `<button type="button" class="btn tool icon" id="conversation-fullscreen" aria-label="${label}" title="${active ? 'Exit full screen (Esc)' : label}" aria-pressed="${active}">${active ? ICON.collapse : ICON.expand}</button>`;
 }
 
 function setConversationFullscreen(active) {
@@ -8996,9 +9009,9 @@ function conversationPane(v, t) {
   const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
   const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
   const copy = forkCmd
-    ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
+    ? `<button class="btn tool copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">${ICON.terminal}Fork in CLI</button>`
     : remoteFork
-      ? `<button class="btn sm fork-local" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">⑂ fork locally</button>`
+      ? `<button class="btn tool fork-local" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">${ICON.laptop}Fork locally</button>`
       : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
   // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
@@ -9035,10 +9048,13 @@ function conversationPane(v, t) {
       <span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>
       <span class="pal-sub">${entries.length} item${entries.length === 1 ? '' : 's'}</span>
       <span style="flex:1"></span>
-      <button class="btn sm" id="share-task-conversation" data-role="${esc(t.role)}">Share</button>
-      <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
-      ${copy}
-      ${conversationFullscreenButton()}
+      <div class="ck-tools">
+        <button class="btn tool" id="share-task-conversation" data-role="${esc(t.role)}" title="Share this conversation">${ICON.share}Share</button>
+        <button class="btn tool" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">${ICON.fork}Fork</button>
+        ${copy}
+        <span class="tool-sep" aria-hidden="true"></span>
+        ${conversationFullscreenButton()}
+      </div>
     </div>
     <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationApprovalRequests()}${conversationReviewInfo(v)}</div></div>
     ${fu}`;
@@ -9817,7 +9833,7 @@ async function forkCloudSessionLocally(v, button) {
   const checkout = await materializeLocalCheckout(v);
   if (checkout) await copyToClipboard(forkCommandFor(session, checkout.cwd)).then(() => toast('Fork command copied'));
   button.disabled = false;
-  button.textContent = '⑂ fork locally';
+  button.innerHTML = `${ICON.laptop}Fork locally`;
 }
 
 async function copyNativeAttachCommand(v) {
@@ -9834,9 +9850,10 @@ async function copyNativeAttachCommand(v) {
 // priority + tags (organization), the workflow's declared params (editable or
 // frozen per its lifecycle), and the per-task credential policy.
 function parametersTab(v) {
-  // Priority + tags (organization metadata) now live in the page header, above the
+  // Priority + tags (organization metadata) live in the page header, above the
   // tabs, so they're visible/editable on every tab — not just here (see renderTaskPage).
   return `
+    ${workflowSection(v)}
     ${paramsSection(v)}
     ${authorizationSection(v)}
     ${taskRecord(v.taskId)?.params?.draft ? '' : taskPaymentsHtml('tp-payments', paymentsLiveKey(v))}
@@ -10011,6 +10028,7 @@ function waitingLabel(w) {
     case 'parent': return 'parent';
     case 'confirm': return 'review';
     case 'responder': return 'responder';
+    case 'job': return 'job';
     default: return 'progress';
   }
 }
@@ -10024,6 +10042,11 @@ function waitingText(w) {
     if (summary) return summary.slice(0, 72);
   }
   if (w?.kind === 'human') return 'Needs input';
+  if (w?.kind === 'timer') {
+    return Number.isFinite(w.until)
+      ? `Paused until ${new Date(w.until).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+      : 'Paused';
+  }
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
   return `Waiting for ${label}`;
@@ -10507,6 +10530,19 @@ function wireNotes(v) {
   btn.addEventListener('click', save);
   // Save on blur too, so notes aren't lost when the page closes.
   ta.addEventListener('blur', save);
+}
+
+// The workflow (and its pinned version) configures the task, so it lives with
+// the parameters rather than in the header of every tab.
+function workflowSection(v) {
+  const version = taskRecord(v.taskId)?.workflowVersion;
+  const mode = v.workflowOptions?.length > 1
+    ? `<select id="tp-workflow-mode" class="q-sel" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
+        ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
+      </select>`
+    : `<span>${esc(workflowLabel(v.workflow))}</span>`;
+  return `<div class="section-h">Workflow</div>
+    <div class="tp-workflow">${mode}${version ? `<span class="mono" title="Workflow version this task is pinned to">v${esc(version)}</span>` : ''}</div>`;
 }
 
 function paramsSection(v) {

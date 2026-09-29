@@ -9,7 +9,7 @@ import { SDK_CONTROL_TOOL_SCHEMAS, type ToolSchema } from './tools.js';
 /**
  * Turn-local control-tool bridge (SPEC §5.2 gates).
  *
- * The ten `SDK_CONTROL_TOOL_NAMES` tools (`resolve_decision`, `confirm_decision`,
+ * The `SDK_CONTROL_TOOL_NAMES` tools (`resolve_decision`, `confirm_decision`,
  * `create_review_info`, `signal_completion`, `raise_to_parent`, …) are
  * **turn-local**: they mutate the `AdapterTurn` result of the activity that is
  * running right now, so — unlike every durable platform operation — they cannot

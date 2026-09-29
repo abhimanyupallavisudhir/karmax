@@ -177,7 +177,7 @@ function context(signal: AbortSignal, activities: AgentActivity[],
     signalCompletion() {}, createReviewInfo() {}, createSubTask() {}, respondToSubTask() {}, raiseToParent() {},
     openPr() { throw new Error('PR publication is unavailable in the live smoke test'); },
     addCheckout() { throw new Error('checkout creation is unavailable in the live smoke test'); },
-    waitForSubtasks() {}, saveSkill() {}, resolveDecision() {}, confirmDecision() {},
+    waitForSubtasks() {}, requestWait() {}, jobStarted() {}, saveSkill() {}, resolveDecision() {}, confirmDecision() {},
     async requestSpend() { return { status: 'denied' }; }, emit() {}, emitActivity(activity) {
       activities.push(activity);
       console.error(`[live-cloud] ${activity.phase} ${activity.kind}: ${activity.title}`);
