@@ -186,19 +186,22 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'save_skill')!;
     expect(schema.description).not.toMatch(/installation-wide/i);
     expect(schema.description).toMatch(/organization/i);
+    expect(schema.description).toMatch(/project/i);
 
     const sent: any[] = [];
     const saved: any[] = [];
     const handlers = platformToolHandlers({} as any, {
       platformRequest: async (method: string, requestPath: string, body?: unknown) => {
-        sent.push({ method, requestPath, body }); return { path: '/x' };
+        sent.push({ method, requestPath, body }); return { path: '/x', scope: sent.length === 1 ? 'project' : 'organization' };
       },
       saveSkill: (skill: any) => { saved.push(skill); },
       emit() {}, emitActivity() {},
     } as any);
-    await expect(handlers.save_skill!({ name: 'resolve/npm-eresolve', content: '# fix' })).resolves.toBe('skill saved');
-    expect(sent).toEqual([{ method: 'POST', requestPath: '/api/skills', body: { name: 'resolve/npm-eresolve', content: '# fix' } }]);
-    expect(saved).toEqual([{ name: 'resolve/npm-eresolve', content: '# fix' }]);
+    // The result tells the agent where the skill went.
+    await expect(handlers.save_skill!({ name: 'resolve/npm-eresolve', content: '# fix' })).resolves.toMatch(/project/);
+    await expect(handlers.save_skill!({ name: 'resolve/npm-eresolve', content: '# fix' })).resolves.toMatch(/organization/);
+    expect(sent[0]).toEqual({ method: 'POST', requestPath: '/api/skills', body: { name: 'resolve/npm-eresolve', content: '# fix' } });
+    expect(saved[0]).toEqual({ name: 'resolve/npm-eresolve', content: '# fix' });
   });
 
   /** PL-6: message_agent goes to the conversation-message endpoint, which is

@@ -61,7 +61,7 @@ import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexMo
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
-import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, allows, type Capability } from '../platform/capabilities.js';
+import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
@@ -219,9 +219,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     return read ? 'credential:read' : 'credential:write';
   if (/^\/api\/organizations\/[^/]+\/workflows(?:\/|$)/.test(p))
     return read ? 'workflow:read' : (p.includes('/install') ? 'workflow:install' : 'workflow:edit');
-  // The wiki is the skills store: reads need the scope's read capability, edits
-  // reuse skill:write (agents and developers can both grow it).
-  if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'skill:write';
+  // The wiki is the skills store: reads need the scope's read capability.
+  // Project edits reuse skill:write (agents and developers can both grow it);
+  // organization pages reach every task, so they need organization-wide authority.
+  if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'organization:wiki:write';
   if (/^\/api\/organizations\/[^/]+\/avatar-settings$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   // The agent mailbox is a credential surface, org-scoped by its path (the
   // token/session check enforces the tenant boundary from requestScope).
@@ -2140,6 +2141,7 @@ export class Gateway {
         const error = ['settings:read', 'settings:write'].includes(required)
           && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length)
           ? 'This endpoint configures the shared installation and requires global authority (God). Use /api/organizations/:id/settings/:workflow or /api/settings/project/:id/:workflow for your authorized scope.'
+          : required === 'organization:wiki:write' && checked.reason === `missing capability ${required}` ? ORGANIZATION_WIKI_WRITE_DENIED
           : checked.reason ?? `missing capability ${required}`;
         return this.json(res, 403, { error });
       }
@@ -2741,6 +2743,8 @@ export class Gateway {
         await this.deps.workflows?.removeOrganization(organizationId);
         const { deleteOrganizationAutonomy } = await import('../autonomy/cleanup.js');
         await deleteOrganizationAutonomy(store, this.deps.broker, organizationId);
+        // Before the metadata, so a failed removal leaves the ids a retry needs.
+        await this.deps.api.removeTenantContent({ organizationId, projectIds });
         (await store.deleteOrganization(organizationId));
         for (const attachmentId of resources.attachmentIds)
           if (!(await store.attachmentIsScoped(attachmentId))) this.attachments.delete(attachmentId);
@@ -3852,6 +3856,7 @@ export class Gateway {
           return this.withDeletionFence([id], undefined, async () => {
             await this.requestGuards.get(req)?.();
             const resources = await this.removeProjectExternalResources(id, 'project deleted');
+            await this.deps.api.removeTenantContent({ projectIds: [id] });
             await store.deleteProject(id);
             for (const attachmentId of resources.attachmentIds)
               if (!(await store.attachmentIsScoped(attachmentId))) this.attachments.delete(attachmentId);

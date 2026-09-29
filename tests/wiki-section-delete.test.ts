@@ -31,7 +31,7 @@ describe('organization wiki section delete', () => {
     contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-'));
     organizationId = (await store.createOrganization({ name: 'Acme', ownerUserId: 'a' })).id;
     api = new KarmaxApi({ store, client: {} as any, taskQueue: 'karmax', tokens, contentDir, worlds: new WorldRegistry() });
-    token = (await tokens.mintPrincipal('user:a', ['skill:write', 'organization:read'], undefined, 60_000, organizationId)).token;
+    token = (await tokens.mintPrincipal('user:a', ['organization:wiki:write', 'organization:read'], undefined, 60_000, organizationId)).token;
     for (const page of ['guides/deploy', 'guides/rollback', 'guides/nested/oncall']) {
       (await api.saveWikiPage(token, 'organization', organizationId,
         { path: page, content: `# ${page}\n\nirreplaceable`, kind: 'skill', create: true }));
