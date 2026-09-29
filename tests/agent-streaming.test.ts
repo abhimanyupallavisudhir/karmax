@@ -159,6 +159,7 @@ function toolContext(emitted: string[], activities: any[] = []): PlatformToolCon
     addCheckout: async () => ({ name: '', root: '', branch: '' }), respondToSubTask: () => {},
     raiseToParent: () => {}, waitForSubtasks: () => {}, saveSkill: () => {}, resolveDecision: () => {},
     confirmDecision: () => {}, requestSpend: async () => ({ status: 'denied' as const }),
+    requestWait: () => {}, jobStarted: () => {},
     emit: (text, source) => { if (source === 'assistant') emitted.push(text); },
     emitActivity: (activity) => { activities.push(activity); },
   };

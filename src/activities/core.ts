@@ -104,7 +104,7 @@ import { assembleTaskInput } from '../platform/params.js';
 import { subTaskParams } from '../platform/agent-params.js';
 import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type SubTaskRequest, type SubTaskResponse } from '../domain/types.js';
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type SubTaskRequest, type SubTaskResponse, type WorldHandleRef } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -3440,12 +3440,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * awake meanwhile; if its stream drops (a provider pause, a worker restart)
      * the loop re-reads the job files and starts another. Cancelled when the
      * task gets a message or is cancelled. */
-    async awaitJobs(handle: WorldHandle, jobs: string[], untilMs: number): Promise<{ finished: boolean; summary: string }> {
+    async awaitJobs(handle: WorldHandleRef, jobs: string[], untilMs: number): Promise<{ finished: boolean; summary: string }> {
       const ctx = activityContext.current();
       const signal = ctx.cancellationSignal;
       const beat = setInterval(() => ctx.heartbeat(), 5_000);
       try {
-        const world = await openWorld(handle);
+        const world = await openWorld(handle as WorldHandle);
         for (;;) {
           signal.throwIfAborted();
           ctx.heartbeat();
