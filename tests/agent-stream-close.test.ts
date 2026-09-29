@@ -91,6 +91,8 @@ async function runTurn(reviewInfos: ReviewInfo[]) {
     respondToSubTask: () => {},
     raiseToParent: () => {},
     waitForSubtasks: () => {},
+    requestWait: () => {},
+    jobStarted: () => {},
     saveSkill: () => {},
     resolveDecision: () => {},
     confirmDecision: () => {},
@@ -311,6 +313,59 @@ describe('Claude Agent-SDK input stream vs. the harness control channel', () => 
     expect(h.current!.inputClosed).toBe(true);
     expect(failure).toBeInstanceOf(AgentChannelLost);
     expect((failure as InstanceType<typeof AgentChannelLost>).summary).toMatch(/background task/);
+  });
+
+  // videos #1: a waiter loop that never ended (its `pgrep -f` matched itself) kept one
+  // shell outstanding all turn, so the grace ran out long before the agent started a
+  // render 25 minutes later — the input closed the instant it went idle and the render
+  // died with it. The grace must count from the agent's last idle moment.
+  it('gives every idle period a full grace — a never-ending shell does not use it up', async () => {
+    process.env.KARMAX_AGENT_BG_SETTLE_MS = '250';
+    const seen: string[] = [];
+    fakeHarness(async function* (h) {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-10' };
+      yield { type: 'system', subtype: 'task_started', task_id: 'sh-stuck', description: 'Wait for render to finish' };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'Rendering; waiting.' }] } };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-10' };
+      // The agent keeps being woken (monitor events) and working well past the grace.
+      for (let i = 0; i < 4; i++) {
+        await sleep(100);
+        yield { type: 'assistant', message: { content: [{ type: 'text', text: `progress ${i}` }] } };
+        yield { type: 'result', subtype: 'success', session_id: 'sess-10' };
+      }
+      // Much later it starts the real work in the background and goes idle.
+      yield { type: 'system', subtype: 'task_started', task_id: 'sh-render', description: 'Re-render full video' };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'Re-rendering.' }] } };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-10' };
+      await sleep(50);
+      try { seen.push(await h.control('create_review_info', { caption: 'watch the video' })); }
+      catch (e) { seen.push(`error: ${(e as Error).message}`); }
+      await sleep(400); // the fresh grace expires with both shells still running
+    });
+
+    const turn = await runTurn([]);
+    expect(seen).toEqual(['review info recorded']);
+    expect(turn.pendingBackgroundShells).toBe(2);
+    expect(turn.stoppedBackgroundShells).toEqual(['Wait for render to finish', 'Re-render full video']);
+  });
+
+  it('reports shells the closed input stopped, even once the harness settles them', async () => {
+    // Claude Code stops backgrounded shells when its input ends and reports them as
+    // settled. Counting only what is still tracked afterwards reported zero, so the
+    // workflow never told the agent its render had been killed.
+    process.env.KARMAX_AGENT_BG_SETTLE_MS = '0';
+    fakeHarness(async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-11' };
+      yield { type: 'system', subtype: 'task_started', task_id: 'sh-render', description: 'Re-render full video' };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: "I'll mux audio when it finishes." }] } };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-11' };
+      await sleep(30); // the input closes
+      yield { type: 'system', subtype: 'task_notification', task_id: 'sh-render', status: 'stopped' };
+    });
+
+    const turn = await runTurn([]);
+    expect(turn.pendingBackgroundShells).toBe(1);
+    expect(turn.stoppedBackgroundShells).toEqual(['Re-render full video']);
   });
 
   it('bounds the wait — a deliberately long-lived background shell cannot wedge the turn', async () => {

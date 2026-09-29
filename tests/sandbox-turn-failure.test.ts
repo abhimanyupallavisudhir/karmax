@@ -124,7 +124,9 @@ describe('sandbox-caused turn failures', () => {
       attempt = 2;
       await turn();
       expect(prompts[1]).toEqual([`(This turn was interrupted mid-run: ${exhausted.summary}. Keep memory-hungry commands `
-        + '(type checks, test suites, builds) within the memory `free -m` reports as available. Continue from where you left off; '
+        + '(type checks, test suites, builds) within the memory `free -m` reports as available. '
+        + 'Commands that were running in it, including run_in_background shells, were stopped: check whether they finished '
+        + 'before relying on their results. Jobs from start_job kept running. Continue from where you left off; '
         + 'if the work was already finished, restate the final result.)']);
     } finally {
       context.mockRestore();

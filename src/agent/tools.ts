@@ -2,6 +2,7 @@ import { currentTiming, timed, withTiming } from '../timing/index.js';
 import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
+import { startJob, jobStatuses, describeJobs, listJobs, stopJobs } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
@@ -9,6 +10,9 @@ import {
 } from '../platform/platform-request.js';
 import { URGENCY_LEVELS } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
+
+/** The longest a single wait may last: a week, after which a parked world may hibernate. */
+export const MAX_WAIT_MINUTES = 7 * 24 * 60;
 
 /** Provider-neutral tool descriptor (mapped to OpenAI / MCP shapes per adapter). */
 export interface ToolSchema {
@@ -144,6 +148,41 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     description:
       'Pause until your running sub-tasks finish (or one raises to you). Your sub-tasks run in the background — you can keep working instead of calling this; call it only when you have nothing to do but wait for them. You are resumed the moment a sub-task finishes or needs you.',
     parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'start_job',
+    description:
+      'Run a long command (a render, build, training run, large test suite) as a durable job. Unlike your own shell — foreground, run_in_background, even nohup/setsid — a job keeps running after your turn ends or is interrupted. Output goes to the returned log file. Then call pause with the job id to be resumed when it finishes.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Shell command, run with bash.' },
+        cwd: { type: 'string', description: 'Directory to run in; relative paths are from your working directory (the default).' },
+      },
+      required: ['command'],
+    },
+  },
+  {
+    name: 'pause',
+    description:
+      'End your turn and be resumed later: when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. After calling it, end your turn.',
+    parameters: {
+      type: 'object',
+      properties: {
+        minutes: { type: 'number', description: `Resume after this many minutes at the latest (1–${MAX_WAIT_MINUTES}). With jobs, set it comfortably above their expected run time.` },
+        jobs: { type: 'array', items: { type: 'string' }, description: 'Job ids from start_job to wait for.' },
+      },
+      required: ['minutes'],
+    },
+  },
+  {
+    name: 'stop_job',
+    description: 'Stop durable jobs you no longer need (the job and every process it started). Use this rather than kill or pkill.',
+    parameters: {
+      type: 'object',
+      properties: { jobs: { type: 'array', items: { type: 'string' }, description: 'Job ids from start_job.' } },
+      required: ['jobs'],
+    },
   },
   {
     name: 'create_branch',
@@ -861,6 +900,9 @@ export const SDK_CONTROL_TOOL_NAMES = new Set([
   'respond_to_sub_task',
   'raise_to_parent',
   'wait_for_subtasks',
+  'start_job',
+  'pause',
+  'stop_job',
   'request_spend',
   'fill_payment_card',
   'open_pr',
@@ -952,6 +994,59 @@ export function platformToolHandlers(
     async wait_for_subtasks() {
       await ctx.waitForSubtasks();
       return 'waiting for sub-tasks to finish (or raise)';
+    },
+    async start_job(args) {
+      const command = String(args?.command ?? '').trim();
+      if (!command) return 'error: command is required';
+      try {
+        const env = workEnv?.();
+        const job = await startJob(world, { command, ...(args?.cwd ? { cwd: String(args.cwd) } : {}), ...(env ? { env } : {}) });
+        await ctx.jobStarted(job.id);
+        ctx.emit(`$ ${command} (job ${job.id})`);
+        return `Started job ${job.id}. Log: ${job.log}\nIt keeps running after this turn. Call pause with jobs ["${job.id}"] to be resumed when it finishes.`;
+      } catch (e: any) {
+        return `error: ${e?.message ?? e}`;
+      }
+    },
+    async stop_job(args) {
+      const ids = Array.isArray(args?.jobs) ? [...new Set(args.jobs.map((id: unknown) => String(id)))] as string[] : [];
+      if (!ids.length) return 'error: jobs is required';
+      try {
+        const before = await jobStatuses(world, ids);
+        const missing = before.filter((job) => job.state === 'missing').map((job) => job.id);
+        if (missing.length) return `error: no such job: ${missing.join(', ')}`;
+        const running = before.filter((job) => job.state === 'running').map((job) => job.id);
+        await stopJobs(world, running);
+        const after = new Map((await jobStatuses(world, running)).map((job) => [job.id, job.state]));
+        return ids.map((id) => !running.includes(id) ? `${id} had already stopped.`
+          : after.get(id) === 'running' ? `${id} is still running.` : `Stopped ${id}.`).join('\n');
+      } catch (e: any) {
+        return `error: ${e?.message ?? e}`;
+      }
+    },
+    async pause(args) {
+      const minutes = Number(args?.minutes);
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > MAX_WAIT_MINUTES)
+        return `error: minutes must be between 1 and ${MAX_WAIT_MINUTES}`;
+      const requested = Array.isArray(args?.jobs) ? [...new Set(args.jobs.map((id: unknown) => String(id)))] as string[] : [];
+      let jobs: string[] = [];
+      if (requested.length) {
+        const statuses = await jobStatuses(world, requested, { tailLines: 20 });
+        const missing = statuses.filter((job) => job.state === 'missing').map((job) => job.id);
+        if (missing.length) return `error: no such job: ${missing.join(', ')}`;
+        jobs = statuses.filter((job) => job.state === 'running').map((job) => job.id);
+        // Nothing left to wait for: hand the results back now, no turn needed.
+        if (!jobs.length) return `Every job has already finished — nothing to wait for.\n\n${describeJobs(statuses)}`;
+      }
+      const unlisted = (await jobStatuses(world, await listJobs(world)))
+        .filter((job) => job.state === 'running' && !jobs.includes(job.id)).map((job) => job.id);
+      if (unlisted.length)
+        return `error: ${unlisted.join(', ')} ${unlisted.length > 1 ? 'are' : 'is'} still running. Pass ${unlisted.length > 1 ? 'them' : 'it'} in jobs: a pause without ${unlisted.length > 1 ? 'them' : 'it'} lets the world be suspended, which freezes ${unlisted.length > 1 ? 'them' : 'it'}. You are still resumed after minutes at the latest.`;
+      try { await ctx.requestWait({ minutes: Math.round(minutes), ...(jobs.length ? { jobs } : {}) }); }
+      catch (e: any) { return `error: ${e?.message ?? e}`; }
+      return jobs.length
+        ? `Waiting for ${jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up.`
+        : `Pausing for ${Math.round(minutes)} min. End your turn now; you will be resumed then, or sooner if a message arrives.`;
     },
     async create_branch(args) {
       try {

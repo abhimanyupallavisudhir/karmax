@@ -1,7 +1,8 @@
 import { currentTiming } from '../timing/index.js';
 import { AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
-import { AgentActivity, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { jobStatuses } from '../world/jobs.js';
 import { BRAND } from '../domain/brand.js';
 
 const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
@@ -18,6 +19,8 @@ export interface TurnJournal {
   confirmDecision?: ConfirmDecision;
   raise?: RaiseToParent;
   waitForSubtasks?: boolean;
+  wait?: AgentWait;
+  jobsStarted?: string[];
   subTasks?: { title: string; prompt: string }[];
   subTaskResponses?: SubTaskResponse[];
   skills?: { name: string; content: string }[];
@@ -135,6 +138,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let confirmDecision: ConfirmDecision | undefined = restored.confirmDecision;
   let raise: RaiseToParent | undefined = restored.raise;
   let waitForSubtasks = restored.waitForSubtasks ?? false;
+  let wait: AgentWait | undefined = restored.wait;
+  const jobsStarted: string[] = [...(restored.jobsStarted ?? [])];
   const subTasks: { title: string; prompt: string }[] = [...(restored.subTasks ?? [])];
   const subTaskResponses: SubTaskResponse[] = [...(restored.subTaskResponses ?? [])];
   const skills: { name: string; content: string }[] = [...(restored.skills ?? [])];
@@ -150,6 +155,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       ...(reviewInfo ? { reviewInfo } : {}), ...(resolution ? { resolution } : {}),
       ...(confirmDecision ? { confirmDecision } : {}), ...(raise ? { raise } : {}),
       ...(waitForSubtasks ? { waitForSubtasks } : {}),
+      ...(wait ? { wait } : {}), ...(jobsStarted.length ? { jobsStarted: [...jobsStarted] } : {}),
       ...(subTasks.length ? { subTasks: [...subTasks] } : {}),
       ...(subTaskResponses.length ? { subTaskResponses: [...subTaskResponses] } : {}),
       ...(skills.length ? { skills: [...skills] } : {}),
@@ -221,6 +227,16 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     },
     waitForSubtasks() {
       waitForSubtasks = true;
+      return journal();
+    },
+    requestWait(next) {
+      // Only the Do loop parks and resumes an agent; other roles' turns are one-shot.
+      if (input.role !== 'do') throw new Error('wait is available only to the Do agent');
+      wait = next;
+      return journal();
+    },
+    jobStarted(id) {
+      if (!jobsStarted.includes(id)) jobsStarted.push(id);
       return journal();
     },
     saveSkill(s) {
@@ -376,6 +392,15 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     secretPoll?.();
   }
 
+  // Jobs this turn started and left running without pausing for them: report
+  // them, so the workflow can ask the agent what it meant to do with them.
+  let runningJobs: string[] | undefined;
+  if (jobsStarted.length && !wait) {
+    try {
+      runningJobs = (await jobStatuses(input.world, jobsStarted)).filter((job) => job.state === 'running').map((job) => job.id);
+    } catch { /* the turn's outcome never depends on this probe */ }
+  }
+
   return {
     session: turn.session,
     providerCompleted: true,
@@ -392,6 +417,9 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     waitForSubtasks,
     pendingSubagents: turn.pendingSubagents,
     pendingBackgroundShells: turn.pendingBackgroundShells,
+    ...(turn.stoppedBackgroundShells?.length ? { stoppedBackgroundShells: turn.stoppedBackgroundShells } : {}),
+    ...(wait ? { wait } : {}),
+    ...(runningJobs?.length ? { runningJobs } : {}),
     subTasks: subTasks.length ? subTasks : undefined,
     subTaskResponses: subTaskResponses.length ? subTaskResponses : undefined,
     skills: skills.length ? skills : undefined,
@@ -400,6 +428,6 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     // providerCompleted and do not interpret a missing optional tool call as a stall.
     needsInput:
       !completed && subTasks.length === 0 && subTaskResponses.length === 0 && !raise &&
-      !waitForSubtasks && !turn.pendingSubagents && !turn.pendingBackgroundShells,
+      !waitForSubtasks && !wait && !turn.pendingSubagents && !turn.pendingBackgroundShells,
   };
 }

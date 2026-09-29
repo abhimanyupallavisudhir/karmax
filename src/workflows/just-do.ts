@@ -19,6 +19,7 @@ import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldH
   releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
 import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
 import { SIG } from './names.js';
+import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
@@ -300,6 +301,25 @@ async function justDoImpl(
     // turn's last poll stay after `seen` → delivered on the next turn.
     seen = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    // `pause`: resume the agent when it is over.
+    if (turn.wait && patched('agent-wait-v1')) {
+      const note = await waitForAgent(turn.wait, {
+        world,
+        park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
+        interrupted: () => cancelled || msgs.length > seen,
+      });
+      if (cancelled) break;
+      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+      status = 'active';
+      waitingFor = undefined;
+      continue;
+    }
+    // A job left running without pause: the agent decides what happens to it.
+    const jobsReminder = unattendedJobsReminder(turn);
+    if (jobsReminder && patched('agent-wait-v1')) {
+      msgs.push({ id: `jobs-${msgs.length}`, role: 'user', text: jobsReminder, ts: msgs.length });
+      continue;
+    }
     if (pendingCollaborations.size > 0) {
       status = 'waiting';
       waitingFor = {

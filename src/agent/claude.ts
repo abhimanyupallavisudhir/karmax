@@ -13,7 +13,7 @@ import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { createFollowUpInjector, toSdkUserMessage, followUpContent, withClaudeStartupDeadline } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
-import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
+import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount, backgroundShellDescriptions } from './subagents.js';
 import {
   AgentChannelLost,
   ProviderFailure,
@@ -562,8 +562,15 @@ export class ClaudeAdapter implements AgentAdapter {
     // sent has been answered. Unanswered input and tracked in-harness work both hold the
     // stream open, bounded because a backgrounded shell may be a dev server the task
     // deliberately left running.
+    // The grace counts from when the agent last went idle, not from when work was
+    // first outstanding: one never-ending shell must not use it up for the rest of
+    // the turn (videos #1 — a stuck waiter left a render started 25 minutes later
+    // with no grace at all).
     const settleGraceMs = Number(process.env.KARMAX_AGENT_BG_SETTLE_MS ?? 300_000);
     let settleDeadline: number | undefined;
+    // Backgrounded shells still running when the input closed. Closing it stops
+    // them (or leaves them to finish unobserved), so their results are lost.
+    let stoppedShells: string[] = [];
     const harnessStillWorking = (): boolean => {
       if (!subagents.size && !unanswered.size) return false;
       settleDeadline ??= Date.now() + settleGraceMs;
@@ -580,7 +587,11 @@ export class ClaudeAdapter implements AgentAdapter {
       harnessIdle = true;
       if (settleTimer) { clearTimeout(settleTimer); settleTimer = undefined; }
       if (!completionSeen && await drainFollowUps()) { harnessIdle = false; return; }
-      if (!harnessStillWorking()) { await injector.close(); return; }
+      if (!harnessStillWorking()) {
+        stoppedShells = backgroundShellDescriptions(subagents);
+        await injector.close();
+        return;
+      }
       settleTimer = setTimeout(() => { if (harnessIdle) void settleInput(); },
         Math.max(0, (settleDeadline ?? Date.now()) - Date.now()));
     };
@@ -752,6 +763,7 @@ export class ClaudeAdapter implements AgentAdapter {
         }
         if (message.type === 'assistant') {
           harnessIdle = false; // working again: a pending settle re-check must not close under it
+          settleDeadline = undefined; // and the next idle period gets a full grace
           const answered: unknown = (message as any).user_message_uuids ?? [(message as any).user_message_uuid];
           if (Array.isArray(answered)) for (const id of answered) if (typeof id === 'string') { harnessEchoes = true; unanswered.delete(id); }
         }
@@ -996,7 +1008,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // Only a subtype=success result is a turn boundary. `delivered` = every message
     // this turn consumed (initial delta + in-flight injections).
     const pending = pendingSubagentCount(subagents);
-    const pendingShells = pendingBackgroundShellCount(subagents);
+    const pendingShells = Math.max(pendingBackgroundShellCount(subagents), stoppedShells.length);
     return {
       termination: {
         kind: 'success',
@@ -1015,6 +1027,7 @@ export class ClaudeAdapter implements AgentAdapter {
       })(),
       ...(pending ? { pendingSubagents: pending } : {}),
       ...(pendingShells ? { pendingBackgroundShells: pendingShells } : {}),
+      ...(stoppedShells.length ? { stoppedBackgroundShells: stoppedShells } : {}),
     };
   }
 }

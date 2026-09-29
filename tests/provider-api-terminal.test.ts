@@ -8,7 +8,7 @@ const world: any = { handle: { id: 'w', root: '/tmp', branch: 'task', base: 'mai
 const messages: any[] = [{ id: 'm', role: 'user', text: 'do the task', ts: 0 }];
 const ctx: any = {
   signalCompletion() {}, createReviewInfo() {}, createSubTask() {}, respondToSubTask() {},
-  raiseToParent() {}, waitForSubtasks() {}, saveSkill() {}, resolveDecision() {},
+  raiseToParent() {}, waitForSubtasks() {}, requestWait() {}, jobStarted() {}, saveSkill() {}, resolveDecision() {},
   confirmDecision() {}, requestSpend: async () => ({ status: 'denied' }), emit() {},
 };
 

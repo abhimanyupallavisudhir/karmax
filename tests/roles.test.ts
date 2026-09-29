@@ -130,6 +130,19 @@ describe('prompt assembly derives from the declared role (not a hardcoded map)',
     expect(out).toContain('Add factorial'); // {{title}} bound
   });
 
+  it('tells every Do agent its own shell dies with the turn, and how to wait on long work (videos #1)', () => {
+    const out = assemblePrompt({ profile: profile({ role: 'do' }), role: 'do', task, world, globalInstructions: GLOBAL_INSTRUCTIONS });
+    expect(out).toContain('- start_job(command, cwd?):');
+    expect(out).toContain('- pause(minutes, jobs?):');
+    expect(out).toContain('- stop_job(jobs):');
+    expect(out).toContain('Anything you run from your own shell stops when your turn ends.');
+    // The default organization prompt carries the working practice.
+    expect(out).toContain('- Long-running commands:');
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/even nohup or setsid/);
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/pgrep -f pattern/);
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/Never end a turn saying you will continue when something finishes unless you called pause/);
+  });
+
   it('a profile promptTemplate overrides the role template', () => {
     const out = assemblePrompt({ profile: profile({ promptTemplate: 'CUSTOM {{title}}' }), role: 'do', task, world });
     expect(out).toBe('CUSTOM Add factorial');

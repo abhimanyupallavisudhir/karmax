@@ -40,6 +40,8 @@ export interface TrackedTask {
   agentType?: string;
   /** The agent backgrounded it (Ctrl+B); still outstanding, just no longer foreground. */
   backgrounded: boolean;
+  /** What the harness called it (e.g. the Bash tool's description). */
+  description?: string;
 }
 
 /** The mutable set of tasks seen this turn that have not yet settled. */
@@ -80,7 +82,8 @@ export function trackTaskMessage(tracker: SubagentTracker, msg: any): void {
         // A shell/Bash task. It only *matters* once it outlives the turn (backgrounded
         // or still running at turn end); tracking it from the start lets the settlement
         // path clear a fast foreground command before we ever count it.
-        tracker.set(msg.task_id, { id: msg.task_id, kind: 'shell', backgrounded: false });
+        tracker.set(msg.task_id, { id: msg.task_id, kind: 'shell', backgrounded: false,
+          ...(typeof msg.description === 'string' && msg.description.trim() ? { description: msg.description.trim() } : {}) });
       }
       break;
     }
@@ -116,4 +119,11 @@ export function pendingBackgroundShellCount(tracker: SubagentTracker): number {
   let n = 0;
   for (const t of tracker.values()) if (t.kind === 'shell') n++;
   return n;
+}
+
+/** What each still-running backgrounded shell is (its description, else its id). */
+export function backgroundShellDescriptions(tracker: SubagentTracker): string[] {
+  const out: string[] = [];
+  for (const t of tracker.values()) if (t.kind === 'shell') out.push(t.description ?? t.id);
+  return out;
 }
