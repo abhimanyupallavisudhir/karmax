@@ -464,7 +464,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   });
 
   it('permits a tool call when the token carries the capability', async () => {
-    // A saved skill is organization-wide, so save_skill also needs organization:wiki:write.
+    // Without a project of its own or organization:wiki:write there is nowhere to save.
     currentToken = (await tokens.mint({
       taskId: 't1',
       profileId: 'do',
@@ -474,7 +474,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     })).token;
     const refused: any = await client.callTool({ name: 'save_skill', arguments: { name: 'greet', content: '# hi' } });
     expect(refused.isError).toBe(true);
-    expect(refused.content[0].text).toMatch(/organization wiki/i);
+    expect(refused.content[0].text).toMatch(/organization:wiki:write/);
     currentToken = (await tokens.mint({
       taskId: 't1',
       profileId: 'do',

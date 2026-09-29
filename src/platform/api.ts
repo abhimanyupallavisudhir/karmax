@@ -14,7 +14,7 @@ import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } f
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
-import { organizationSkillsDir } from '../resolve/skills.js';
+import { organizationSkillsDir, projectSkillsDir } from '../resolve/skills.js';
 import { validGitBranch } from '../util/git-ref.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import {
@@ -5202,16 +5202,28 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     });
   }
 
-  async saveSkill(token: string, args: { name: string; content: string }): Promise<{ path: string }> {
+  /** Save a skill organization-wide with `organization:wiki:write` (its index
+   *  reaches every Resolve prompt in the organization, PL-12); otherwise into the
+   *  caller's own project, so an agent without that authority still learns. */
+  async saveSkill(token: string, args: { name: string; content: string }): Promise<{ path: string; scope: 'project' | 'organization' }> {
     const caller = (await this.require(token, 'save_skill'));
+    const projectId = caller.projectId
+      ?? (caller.taskId && caller.taskId !== '*' ? (await this.deps.store.getTask(caller.taskId))?.projectId : undefined);
     // Skills are tenant knowledge: an agent's saved resolution is indexed into
     // its own organization's Resolve prompts, never another tenant's.
     const organizationId = caller.organizationId
-      ?? (caller.projectId ? (await this.deps.store.getProject(caller.projectId))?.organizationId : undefined)
+      ?? (projectId ? (await this.deps.store.getProject(projectId))?.organizationId : undefined)
       ?? 'org_personal';
-    // Its index reaches every Resolve prompt in the organization.
-    (await this.requireOrganizationWikiWrite(token, organizationId));
-    const skillsDir = organizationSkillsDir(this.deps.contentDir ?? paths().content, organizationId);
+    const contentDir = this.deps.contentDir ?? paths().content;
+    let scope: 'project' | 'organization', skillsDir: string;
+    if ((await this.deps.tokens.check(token, 'organization:wiki:write', { organizationId })).ok) {
+      scope = 'organization';
+      skillsDir = organizationSkillsDir(contentDir, organizationId);
+    } else if (projectId && (await this.deps.tokens.check(token, 'skill:write', { projectId })).ok) {
+      scope = 'project';
+      skillsDir = projectSkillsDir(contentDir, projectId);
+    } else throw new CapabilityError('save_skill saves to your task\'s project (needs skill:write there) or, with '
+      + 'organization:wiki:write, to the whole organization; this caller has neither.');
     // Preserve namespacing subdirs (e.g. "resolve/<slug>" → resolve/<slug>.md,
     // which listResolveSkills indexes for the self-healing loop, §3.4). Sanitize each
     // path segment and drop any traversal (`..`) so a name can't escape the directory.
@@ -5219,7 +5231,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const file = path.join(skillsDir, `${rel}.md`);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, args.content);
-    return { path: file };
+    return { path: file, scope };
   }
 
   // ── Wiki (org/project skills, memories, prompts — SPEC §4.4 content) ──────
@@ -5228,8 +5240,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   // not the same store (`saveSkill` writes flat files under `<contentDir>/skills/`,
   // the wiki is the scoped, labelled store, SPEC §19.6). Organization content
   // reaches every task in the organization, so writing it — wiki pages and
-  // saved skills alike — takes `organization:wiki:write`, which only an
-  // organization-wide grant of Project maintainer or above carries (PL-12).
+  // organization-wide saved skills alike — takes `organization:wiki:write`, which
+  // only an organization-wide grant of Project maintainer or above carries (PL-12).
   // All paths are traversal-checked inside src/wiki.
 
   private async requireOrganizationWikiWrite(token: string, organizationId: string) {

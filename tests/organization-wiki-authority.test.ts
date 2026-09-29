@@ -65,6 +65,7 @@ describe('organization wiki edits need organization-scoped maintainer authority'
     agents['project-scoped maintainer task'] = await agentToken({ level: 'maintainer', scope: 'projects', projectIds: [project.id] });
     agents['organization-scoped maintainer task'] = await agentToken({ level: 'maintainer', scope: 'organization' });
     agents['organization-scoped developer task'] = await agentToken({ level: 'developer', scope: 'organization' });
+    agents['project-scoped viewer task'] = await agentToken({ level: 'viewer', scope: 'projects', projectIds: [project.id] });
 
     const client = { workflow: { getHandle: () => ({}), list: async function* () {} } } as any;
     const worlds = new WorldRegistry();
@@ -140,14 +141,19 @@ describe('organization wiki edits need organization-scoped maintainer authority'
     expect((await call('project-scoped maintainer task', 'PUT', `/api/projects/${projectId}/wiki/page`,
       { path: 'notes/project-agent', content: 'Project notes.' })).status).toBe(200);
 
-    // save_skill writes organization-wide knowledge (indexed into every Resolve prompt).
+    // save_skill still lets every agent learn: without organization-wide
+    // authority the skill lands in the task's own project.
     const skill = { name: 'resolve/flaky-clone', content: 'Retry the clone.' };
-    const refused = await call('project-scoped maintainer task', 'POST', '/api/skills', skill);
-    expect(refused.status).toBe(403);
-    expect(refused.body.error).toMatch(/organization wiki/i);
+    const local = await call('project-scoped maintainer task', 'POST', '/api/skills', skill);
+    expect(local.status).toBe(200);
+    expect(local.body.scope).toBe('project');
+    expect(local.body.path.replace(/\\/g, '/')).toContain(`/skills/projects/${projectId}/resolve/flaky-clone.md`);
     const saved = await call('organization-scoped maintainer task', 'POST', '/api/skills', skill);
     expect(saved.status).toBe(200);
+    expect(saved.body.scope).toBe('organization');
     expect(saved.body.path.replace(/\\/g, '/')).toContain(`/skills/organizations/${organizationId}/resolve/flaky-clone.md`);
+    // A Viewer task holds neither skill:write nor organization:wiki:write.
+    expect((await call('project-scoped viewer task', 'POST', '/api/skills', skill)).status).toBe(403);
   });
 
   it('shows edit controls only to readers who may edit', async () => {
