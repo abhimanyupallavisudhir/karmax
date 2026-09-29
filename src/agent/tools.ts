@@ -172,7 +172,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'save_skill',
-    description: 'Save a reusable skill (markdown content) for future tasks in your organization; saving the same name overwrites it. For content that belongs to one project, or that task prompts should include, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
+    description: 'Save a reusable skill (markdown) for future tasks; saving the same name overwrites it. It is saved to your task\'s project, or for your whole organization if your task has organization-wide authority (organization:wiki:write); the result says which. For content that task prompts should include, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
     parameters: {
       type: 'object',
       properties: { name: { type: 'string' }, content: { type: 'string' } },
@@ -975,11 +975,12 @@ export function platformToolHandlers(
     },
     async save_skill(args) {
       const skill = { name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') };
-      // The gateway writes it under the caller's organization; the turn result
-      // only records that it was saved.
-      await platformRequest('POST', '/api/skills', skill);
+      // The gateway saves it for the organization or the task's project,
+      // depending on the task's authority; the turn result only records it.
+      const saved = await platformRequest('POST', '/api/skills', skill) as { scope?: string } | undefined;
       await ctx.saveSkill(skill);
-      return 'skill saved';
+      return saved?.scope === 'organization' ? 'skill saved for your whole organization'
+        : saved?.scope === 'project' ? 'skill saved to your task\'s project' : 'skill saved';
     },
     async read_wiki(args) {
       const scope = args?.scope === 'organization' ? 'organizations' : 'projects';

@@ -108,3 +108,33 @@ it('RT-14 polls execution state without parsing stored conversation', async () =
     JSON.stringify({ status: 'waiting', agentTurn: { state: 'running' } }), 'intentionally invalid conversation', task.id);
   expect(await store.taskExecutionState(task.id)).toEqual({ status: 'waiting', agentTurn: true });
 });
+
+it('lists a project\'s saved resolutions in its own Resolve prompts only', async () => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-review-'));
+  store = await Store.create(':memory:');
+  const organization = await store.createOrganization({ name: 'Acme' });
+  const web = await store.createProject('Web', {}, organization.id);
+  const docs = await store.createProject('Docs', {}, organization.id);
+  fs.mkdirSync(path.join(home, 'skills', 'projects', web.id, 'resolve'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'skills', 'projects', web.id, 'resolve', 'flaky-clone.md'), 'Retry the clone.\n');
+  const worlds = new WorldRegistry();
+  let prompt = '';
+  const core = makeCoreActivities({ store, worlds, contentDir: home, profiles: new ProfileResolver(store, 'mock'),
+    adapters: new Map([['mock', { provider: 'mock', runTurn: async (input: any) => {
+      prompt = `${input.systemPrompt}\n${JSON.stringify(input.messages)}`;
+      return { output: 'done', termination: { kind: 'success', status: 'fixture' } };
+    } }]]) as any });
+  const resolvePrompt = async (projectId: string) => {
+    const task = await store.createTask({ projectId, title: 'Work', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
+    world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    vi.spyOn(worlds, 'open').mockResolvedValue(world);
+    await core.runAgentTurn({ taskId: task.id, role: 'resolve', agentSlotGranted: true, worldHandle: world.handle, messages: [],
+      task: { taskId: task.id, projectId, title: 'Work', prompt: 'work', project: {}, agents: { resolve: { provider: 'mock' } } } } as any);
+    await world.destroy();
+    vi.restoreAllMocks();
+    return prompt;
+  };
+  expect(await resolvePrompt(web.id)).toContain('resolve/flaky-clone — Retry the clone.');
+  expect(await resolvePrompt(docs.id)).not.toContain('resolve/flaky-clone');
+  world = undefined;
+});

@@ -636,7 +636,7 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
   it('round-trips pages, exposes the read-only built-in, and enforces create/rename guards', async () => {
     const { k, contentDir, organization, project, mint } = (await harness());
     try {
-      const rw = (await mint(['project:read', 'organization:read', 'skill:write']));
+      const rw = (await mint(['project:read', 'organization:read', 'skill:write', 'organization:wiki:write']));
       (await k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: '---\ndescription: how\n---\nShip it.', kind: 'skill', create: true }));
       const projectRoot = wikiRoot(contentDir, 'project', project.id);
       expect(fs.existsSync(path.join(projectRoot, '.git'))).toBe(true);
@@ -661,11 +661,11 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       expect(builtinPage.page.builtin).toBe(true);
       // Editing a built-in writes its override; deleting the override restores the default.
       // Built-in and `default`-labelled organization pages reach every prompt in the
-      // organization, so `skill:write` alone (every Do agent) is refused: it takes
-      // an organization administrator.
+      // organization, so even `organization:wiki:write` is refused: it takes an
+      // organization administrator.
       await expect((async () => (await k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' })))()).rejects.toThrow(/organization:edit/);
       await expect((async () => (await k.saveWikiPage(rw, 'organization', organization.id, { path: 'rules/everywhere', content: '---\nlabels: default\n---\nEverywhere.', create: true })))()).rejects.toThrow(/organization:edit/);
-      const admin = (await mint(['project:read', 'organization:read', 'skill:write', 'organization:edit']));
+      const admin = (await mint(['project:read', 'organization:read', 'skill:write', 'organization:wiki:write', 'organization:edit']));
       (await k.saveWikiPage(admin, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' }));
       expect((await k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)).versions[0])
         .toMatchObject({ version: 2, operation: 'write', content: expect.stringContaining('Our own rules.') });
@@ -708,6 +708,10 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       const ro = (await mint(['project:read', 'organization:read']));
       await (async () => (await k.readWiki(ro, 'project', project.id)))();
       await expect((async () => (await k.saveWikiPage(ro, 'project', project.id, { path: 'x', content: 'y' })))()).rejects.toThrow(/skill:write/);
+      // skill:write edits the project wiki but not the organization's.
+      const developer = (await mint(['project:read', 'organization:read', 'skill:write']));
+      await expect((async () => (await k.saveWikiPage(developer, 'organization', organization.id, { path: 'x', content: 'y' })))()).rejects.toThrow(/organization:wiki:write/);
+      expect(((await k.readWiki(developer, 'organization', organization.id)) as any).view.writable).toBe(false);
       // Unknown project refuses rather than minting a stray directory.
       await expect((async () => (await k.readWiki(rw, 'project', 'nope')))()).rejects.toThrow(/no project/);
       expect(fs.existsSync(path.join(contentDir, 'wiki', 'project', project.id))).toBe(true);

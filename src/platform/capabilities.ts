@@ -25,7 +25,7 @@ export const CAPABILITIES = [
   'project:settings:read', 'project:settings:write',
   'project:transfer-out', 'project:transfer-in',
   'project:resource:shared-write',
-  'organization:read', 'organization:create', 'organization:edit',
+  'organization:read', 'organization:create', 'organization:edit', 'organization:wiki:write',
   'organization:member:read', 'organization:member:write',
   'team:read', 'team:write', 'repository:read', 'repository:write',
   'github:actions:read', 'github:actions:write',
@@ -42,6 +42,10 @@ export const CAPABILITIES = [
 ] as const;
 
 export type KnownCapability = (typeof CAPABILITIES)[number];
+
+/** The refusal the gateway and the API both give without `organization:wiki:write`. */
+export const ORGANIZATION_WIKI_WRITE_DENIED =
+  'Editing the organization wiki needs Project maintainer or higher, granted for the whole organization (organization:wiki:write).';
 
 /** Ordinary developer operations shared by every role that works in a task
  * world. Workflow-internal decisions are added by concrete role declarations. */
@@ -118,6 +122,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['organization:read', 'View organizations', 'Discover organizations in which the principal is a member.'],
       ['organization:create', 'Create organizations', 'Create a new tenant boundary.'],
       ['organization:edit', 'Edit organizations', 'Change organization settings and lifecycle.'],
+      ['organization:wiki:write', 'Edit organization wiki', 'Create, change, and delete organization wiki pages, which every task in the organization sees. Takes effect only through an organization-wide grant.'],
       ['organization:member:read', 'View members', 'View organization membership, invitations, and teams.'],
       ['organization:member:write', 'Manage members', 'Invite, remove, and change organization members.'],
       ['team:read', 'View teams', 'View organization and project teams.'],
