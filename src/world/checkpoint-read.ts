@@ -3,7 +3,12 @@ import type { World } from './types.js';
 const READ = `const fs = require('node:fs');
 const files = JSON.parse(process.argv[1]);
 const result = files.map(([file, size]) => {
-  const fd = fs.openSync(file, 'r');
+  if (fs.lstatSync(file).isSymbolicLink()) {
+    const target = fs.readlinkSync(file, { encoding: 'buffer' });
+    if (target.length !== size) throw Error('checkpoint file changed');
+    return { symlink: target.toString('base64') };
+  }
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     if (fs.fstatSync(fd).size !== size) throw Error('checkpoint file changed');
     const data = Buffer.alloc(size);
@@ -20,9 +25,10 @@ const result = files.map(([file, size]) => {
 process.stdout.write(JSON.stringify(result));`;
 
 /** A bounded batch uses one sandbox/lease round trip. Sizes are checked again
- * inside the sandbox, and no file API can buffer an unexpectedly growing file. */
+ * inside the sandbox, and no file API can buffer an unexpectedly growing file.
+ * A symbolic link is captured as its exact target and never read through (WD-33). */
 export async function* readCheckpointFiles(world: World, sizes: Map<string, number>,
-  checkContinue?: () => Promise<void>): AsyncGenerator<{ path: string; data: Buffer }> {
+  checkContinue?: () => Promise<void>): AsyncGenerator<{ path: string; data: Buffer; symlink?: true }> {
   const entries = [...sizes];
   for (let index = 0; index < entries.length;) {
     const batch: Array<[string, number]> = [];
@@ -38,10 +44,12 @@ export async function* readCheckpointFiles(world: World, sizes: Map<string, numb
     const data = JSON.parse(result.stdout) as unknown;
     if (!Array.isArray(data) || data.length !== batch.length) throw new Error('invalid checkpoint batch');
     for (let i = 0; i < batch.length; i++) {
-      if (typeof data[i] !== 'string') throw new Error('invalid checkpoint file');
-      const buffer = Buffer.from(data[i], 'base64');
+      const symlink = typeof data[i]?.symlink === 'string';
+      const encoded = symlink ? data[i].symlink : data[i];
+      if (typeof encoded !== 'string') throw new Error('invalid checkpoint file');
+      const buffer = Buffer.from(encoded, 'base64');
       if (buffer.length !== batch[i]![1]) throw new Error('checkpoint file changed during capture');
-      yield { path: batch[i]![0], data: buffer };
+      yield { path: batch[i]![0], data: buffer, ...(symlink ? { symlink: true as const } : {}) };
     }
   }
 }

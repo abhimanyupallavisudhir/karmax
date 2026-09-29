@@ -528,7 +528,7 @@ class E2BWorld implements World {
   }
 
   async listFiles(): Promise<string[]> {
-    const listed = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print | sed 's#^./##'"],
+    const listed = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print -o -type l -not -path '*/.git/*' -print | sed 's#^./##'"],
       { cwd: this.handle.root, timeoutMs: 120_000 });
     if (listed.code !== 0) throw new Error(listed.stderr || 'failed to list remote world files');
     return listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
