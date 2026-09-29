@@ -262,6 +262,13 @@ async function justDoImpl(
   await publish();
   const worldKind = input.project.worldProvider ?? 'worktree';
   world = (await createTaskWorld(core, { taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
+  // A failed Do or Review releases the world as a finished run does: left
+  // allocated, a cloud sandbox stays billed until the hibernation sweep. Once
+  // the work is approved a failure retains the world instead, as a failed
+  // finalization does: it holds the only copy of that work. Recorded failures
+  // emitted no release.
+  let approved = false;
+  try {
   if (leaser) await leaser.init();
 
   let infraRetries = 0;
@@ -408,6 +415,7 @@ async function justDoImpl(
     }
     if (cancelled) break;
     if (!backToDo) {
+      approved = true;
       if (automaticResources) {
         applyingResources = true;
         status = 'active';
@@ -419,6 +427,18 @@ async function justDoImpl(
     }
     stage = 'do';
     status = 'active';
+  }
+  } catch (err) {
+    if (!isCancellation(err) && !approved && world && releaseWorldOnCompletion(world)
+      && patched('just-do-failure-releases-world-v1')) {
+      const remote = remoteWorldProvider(world.provider ?? world.kind);
+      await core.destroyWorld(world as any);
+      if (remote) {
+        world = undefined;
+        await publish();
+      }
+    }
+    throw err;
   }
 
   // No merge machinery: the world IS the deliverable. Persist approved output
