@@ -83,6 +83,8 @@ ok(scopeRows.includes('Existing permissions for all task roles apply there too')
 
 ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'approvals', 'a task needing approval opens its dedicated tab');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [{ name: 'confirm', enabled: true }] }) === 'checkin', 'review-only tasks retain the Check-in default');
+ok(defaultTaskTab({ approvalRequests: 0, actions: [] }) === 'checkin', 'tasks open on Check-in by default');
+ok(defaultTaskTab({ approvalRequests: 0, actions: [], state: { draft: true } }) === 'parameters', 'drafts open on their parameters');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
