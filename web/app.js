@@ -507,7 +507,10 @@ function go(path, opts = {}) {
 // behind it, so the user can navigate mid-edit. Any navigation closes it like
 // leaving any other page — via its close button, which flushes the draft.
 function closeTaskFormPage() {
-  if ($('#tf-page')) $('#tf-close')?.click();
+  const page = $('#tf-page');
+  if (!page) return;
+  page.dataset.navigating = 'true'; // a draft's own page must not navigate again on close
+  $('#tf-close')?.click();
 }
 
 // Resolve a per-project task URL key (a numeric #num, or a raw task id) → task id.
@@ -740,6 +743,7 @@ async function applyRoute() {
     if (S.selected !== taskId) return openTask(taskId, r.taskTab, r.taskKey === taskId);
     S.viewingAttempt = r.taskKey === taskId ? taskId : null;
     if (r.taskTab) S.taskTab = r.taskTab;
+    showDraftPage(taskId);
     return renderTaskPage();
   }
   S.taskFile = null;
@@ -6011,11 +6015,16 @@ async function consumeTaskFormDefaults(projectId, workflow) {
   finally { if (taskFormDefaultRequests.get(key) === request) taskFormDefaultRequests.delete(key); }
 }
 
+function taskFormTitle(draft) {
+  const p = draft?.params || {};
+  return !draft ? 'New task' : p.triggerState === 'armed' || p.repeatable ? 'Edit task' : 'Edit draft';
+}
+
 function taskFormLoadingPage(project, draft) {
   return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
     <div class="tf-head"><div class="tf-head-inner">
       <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
-      <h2>${draft ? 'Edit task' : 'New task'}</h2>
+      <h2>${taskFormTitle(draft)}</h2>
       ${project ? `<span class="tf-crumb">in ${esc(project.name)}</span>` : ''}
     </div></div>
     <div class="tf-loading" role="status"><span class="global-search-loading">Loading task form…</span></div>
@@ -6028,7 +6037,10 @@ function taskFormLoadingPage(project, draft) {
 // form's (possibly empty) DOM and `replace:true`-wipes the draft it was editing.
 let activeFormToken = null;
 let activeTaskFormKeyController = null;
-async function openTaskForm(workflow, draft, seedText, seedParams) {
+// `page`: the form is a draft's own task page (see showDraftPage), so leaving it
+// leaves the task, and running the draft reveals its live task page.
+async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
+  const page = !!opts?.page;
   activeTaskFormKeyController?.abort();
   activeTaskFormKeyController = null;
   const formToken = (activeFormToken = {});
@@ -6060,9 +6072,16 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   // and this loading page never reaches a paint; otherwise it provides instant
   // feedback while keeping the not-yet-hydrated controls safely non-interactive.
   root.innerHTML = taskFormLoadingPage(proj, draft);
+  // Closing a draft's own page returns to where the task was opened from —
+  // unless a navigation is what closed it.
+  const leavePage = (navigating) => {
+    if (page && !navigating && S.selected === draft.id) closeTask();
+  };
   $('#tf-close').addEventListener('click', () => {
+    const navigating = !!root.querySelector('#tf-page')?.dataset.navigating;
     if (activeFormToken === formToken) activeFormToken = null;
     root.innerHTML = '';
+    leavePage(navigating);
   });
   const projectOrganizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
   const authorizationProjects = S.projects.filter((project) => project.organizationId === projectOrganizationId);
@@ -6075,10 +6094,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   // A draft can open directly from the list, without its task page having loaded
   // the intent. Fetch the group so the shared confirmer freezes after any sibling
   // queues, while remaining editable (and propagated) when every sibling is a draft.
-  const cachedAttemptGroup = draft?.id && S.attemptGroup?.intentId === draft.intentId ? S.attemptGroup : null;
-  const attemptGroupRequest = draft?.id && !cachedAttemptGroup
+  // Always fresh: the attempt switcher must list a sibling created a moment ago.
+  const attemptGroupRequest = draft?.id
     ? api(`/api/tasks/${draft.id}/attempts`).catch(() => null)
-    : Promise.resolve(cachedAttemptGroup);
+    : Promise.resolve(null);
   const [inherited, formAttemptGroup, inheritedVault] = await Promise.all([
     consumeTaskFormDefaults(projectId, wf),
     attemptGroupRequest,
@@ -6097,8 +6116,11 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
       <div class="tf-head">
         <div class="tf-head-inner">
           <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
-          <h2>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</h2>
+          <h2>${taskFormTitle(draft)}</h2>
           ${proj ? `<span class="tf-crumb">in ${esc(proj.name)}</span>` : ''}
+          ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
+            ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
+          </nav>` : ''}
           <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
           <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
         </div>
@@ -6167,7 +6189,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
     if (activeFormToken === formToken) activeFormToken = null;
   };
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
-  let closeForm = () => { releaseFormKeys(); root.innerHTML = ''; };
+  const navigatingAway = () => !!root.querySelector('#tf-page')?.dataset.navigating;
+  let closeForm = () => { const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; leavePage(navigating); };
   $('#tf-wf')?.addEventListener('change', async () => {
     const select = $('#tf-wf');
     const nextWorkflow = select.value;
@@ -6182,7 +6205,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
         });
         const at = S.tasks.findIndex((task) => task.id === draftId);
         if (at >= 0 && changed.task) S.tasks[at] = changed.task;
-        return openTaskForm(nextWorkflow, changed.task);
+        return openTaskForm(nextWorkflow, changed.task, undefined, undefined, { page });
       }
       const carried = consumingField(fields)
         ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(consumingField(fields).name)}"]`)?.value
@@ -6502,7 +6525,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
 
   // Flush any pending edits when the form is dismissed, so closing without
   // clicking a button still keeps the draft.
-  closeForm = () => { clearTimeout(saveTimer); const st = formState(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st); };
+  closeForm = () => { clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st); leavePage(navigating); };
 
   let submitInFlight = false;
   const submit = async (draftMode, authorizationDecision, activeFeedback) => {
@@ -6604,6 +6627,18 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
       succeeded = true;
       releaseFormKeys();
       root.innerHTML = '';
+      if (page && S.selected === draft.id) {
+        // A saved draft leaves its page like Back; a started one shows its live page.
+        if (draftMode) closeTask();
+        else {
+          S.attemptGroup = null; // its cached record still says draft
+          await refreshTasks();
+          if (S.selected === draft.id) {
+            history.replaceState({ kx: 1 }, '', taskUrl(draft.id));
+            openTask(draft.id, null, S.viewingAttempt === draft.id);
+          }
+        }
+      }
       // Keep the toast in the button's vocabulary: "Run task" → "Task started",
       // whether the task was just written or was an existing draft. Starting an
       // EXISTING draft used to say "Task created" — nothing was created, so the
@@ -6643,6 +6678,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
           }) });
           releaseFormKeys();
           root.innerHTML = '';
+          leavePage(false);
           toast('Authorization request sent — the task will queue when approved');
           refreshTasks();
           succeeded = true;
@@ -6836,25 +6872,33 @@ function taskAttempts(v) {
   if (!(g?.attempts?.length > 1)) return '';
   const rows = g.attempts.map((a) => {
     const av = a.id === v.taskId ? v : a.lastView || {};
-    const committed = a.id === g.committedAttemptId;
-    const selected = a.id === v.taskId;
-    const draft = !!a.params?.draft;
-    const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
-    // A draft has nothing to show but its parameters, so it opens straight into its form.
-    const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${draft && !selected ? 'parameters' : S.taskTab || 'overview'}`;
     const principal = a.id === g.principalAttemptId;
     const locked = !!g.committedAttemptId || ['cancelled', 'failed'].includes(av.status);
     const crownTitle = g.committedAttemptId ? 'Principal selection is locked after Merge admission' : locked ? 'Cancelled or failed attempts cannot be principal' : principal ? 'Principal attempt · shown in task list' : 'Show this attempt in the task list';
-    return `<div class="attempt-item"><a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" ${draft && !selected ? 'data-attempt-draft' : ''} href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
-      <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
-      <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
-      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note" title="Other attempts are kept">Selected to merge</span>' : '<span class="attempt-note">Selected to merge</span>') : ''}
-    </a><button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="m3.5 9 3.5 4 .5-7 2.5 6 2-8 2 8 2.5-6 .5 7 3.5-4-2.5 8H6Z"/><circle cx="3" cy="7.5" r="1.2"/><circle cx="7.3" cy="4.5" r="1.2"/><circle cx="12" cy="2.5" r="1.2"/><circle cx="16.7" cy="4.5" r="1.2"/><circle cx="21" cy="7.5" r="1.2"/><rect x="6" y="19" width="12" height="2" rx="1"/></svg></button></div>`;
+    return `<div class="attempt-item">${attemptCard(a, g, v, { tab: S.taskTab || 'overview' })}<button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="m3.5 9 3.5 4 .5-7 2.5 6 2-8 2 8 2.5-6 .5 7 3.5-4-2.5 8H6Z"/><circle cx="3" cy="7.5" r="1.2"/><circle cx="7.3" cy="4.5" r="1.2"/><circle cx="12" cy="2.5" r="1.2"/><circle cx="16.7" cy="4.5" r="1.2"/><circle cx="21" cy="7.5" r="1.2"/><rect x="6" y="19" width="12" height="2" rx="1"/></svg></button></div>`;
   }).join('');
   return `<section class="attempts" aria-label="Task attempts">
     <nav class="attempts-list" aria-label="Choose an attempt">${rows}</nav>
     ${addAttemptButton()}
   </section>`;
+}
+
+// One attempt's card: a link to its pinned page, or — in the draft form, which
+// has no tabs to preserve — a plain marker for the attempt already open. A
+// draft's page is its form, so its link never pins a tab.
+function attemptCard(a, g, v, { tab = '', form = false } = {}) {
+  const av = a.id === v.taskId ? v : a.lastView || {};
+  const committed = a.id === g.committedAttemptId;
+  const selected = a.id === v.taskId;
+  const draft = !!a.params?.draft;
+  const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
+  const pinnedTab = draft ? '' : tab;
+  const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}${pinnedTab ? `/${pinnedTab}` : ''}`;
+  const body = `<span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
+      <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
+      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note" title="Other attempts are kept">Selected to merge</span>' : '<span class="attempt-note">Selected to merge</span>') : ''}`;
+  if (form && selected) return `<span class="attempt-card selected" data-attempt-select="${esc(a.id)}" aria-current="true">${body}</span>`;
+  return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>${body}</a>`;
 }
 
 function addAttemptButton(cls = '') {
@@ -6863,26 +6907,17 @@ function addAttemptButton(cls = '') {
 }
 
 // Follow the rendered links so keyboard navigation uses the same pinned routes
-// and tab selection as clicking an attempt card.
+// and tab selection as clicking an attempt card. A draft's form floats above its
+// task page, so the form's own switcher wins.
 function cycleAttempt(delta) {
   if (!S.selected || !S.view) return;
-  const links = [...document.querySelectorAll('[data-attempt-select]')];
-  const index = links.findIndex((link) => link.dataset.attemptSelect === S.selected);
-  if (links.length < 2 || index < 0) return;
-  links[(index + delta + links.length) % links.length].click();
+  const cards = [...($('#tf-page') || document).querySelectorAll('[data-attempt-select]')];
+  const index = cards.findIndex((card) => card.dataset.attemptSelect === S.selected);
+  if (cards.length < 2 || index < 0) return;
+  cards[(index + delta + cards.length) % cards.length].click();
 }
 
 function wireAttempts(v) {
-  document.querySelectorAll('[data-attempt-draft]').forEach((link) => {
-    link.addEventListener('click', async (event) => {
-      if (isNewTabClick(event)) return;
-      event.preventDefault();
-      const id = link.dataset.attemptSelect;
-      await spaNavigate(link.getAttribute('href'));
-      const draft = taskRecord(id);
-      if (S.selected === id && draft) await openTaskForm(draft.workflow, draft);
-    });
-  });
   document.querySelectorAll('[data-attempt-principal]').forEach((button) => {
     button.addEventListener('click', async () => {
       if (button.disabled || button.getAttribute('aria-pressed') === 'true') return;
@@ -6908,8 +6943,7 @@ function wireAttempts(v) {
       const draft = await api(`/api/tasks/${v.taskId}/attempts`, { method: 'POST', body: '{}' });
       await refreshTasks();
       if (S.selected !== v.taskId) return;
-      await spaNavigate(`${projectBase(draft.projectId || S.projectId)}/tasks/${encodeURIComponent(draft.id)}/parameters`);
-      if (S.selected === draft.id) await openTaskForm(draft.workflow, draft);
+      await spaNavigate(`${projectBase(draft.projectId || S.projectId)}/tasks/${encodeURIComponent(draft.id)}`);
     } catch (e) { toast(e.message, true); }
     finally {
       S.addingAttempt = false;
@@ -7065,6 +7099,19 @@ function ensureTaskApprovals(taskId) {
   return promise;
 }
 
+// A draft has nothing to show but its parameters, so its page is its form —
+// however it is reached (attempt card, keyboard, permalink, New attempt). An
+// archived draft keeps its task page, which owns Unarchive.
+function showDraftPage(taskId) {
+  const rec = taskRecord(taskId);
+  if (S.selected !== taskId || !rec?.params?.draft || rec.params.archived || $('#tf-page')) return false;
+  // The URL leads: a late load must not reopen a draft the user just left.
+  const key = parseRoute(currentPath())?.taskKey;
+  if (key !== taskId && key !== String(rec.num)) return false;
+  openTaskForm(rec.workflow, rec, undefined, undefined, { page: true });
+  return true;
+}
+
 async function openTask(taskId, wantTab, explicitAttempt = false) {
   const openEpoch = S.taskOpenEpoch = (S.taskOpenEpoch || 0) + 1;
   S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
@@ -7098,6 +7145,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     await renderSeriesPage(rec);
     return;
   }
+  showDraftPage(taskId);
   S.taskEvents = [];
   S.taskHistoryLoading = false;
   S.taskHistoryError = null;
@@ -7166,6 +7214,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.attemptGroup = attempts;
     S.connections = connections;
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
+    // A non-principal draft opened by permalink is only known once its group loads.
+    showDraftPage(taskId);
   } catch (e) {
     toast(e.message, true);
     if (S.selected === taskId && S.taskOpenEpoch === openEpoch) renderTaskLoadingPage(rec, e.message);
@@ -7232,9 +7282,12 @@ async function refreshTask(reason = 'all') {
       await openTask(attempts.principalAttemptId, S.taskTab);
       return;
     }
+    const becameDraft = !!view?.state?.draft && !S.view?.state?.draft;
     S.view = pendingCancellationView(view, id);
     Object.assign(S, Object.fromEntries(Object.entries({ widgets, sessions, attemptGroup: attempts, approvalRequests,
       permissionRequests, authorizationRequests, approvalItems, connections }).filter(([, value]) => value !== undefined)));
+    // Moved back to a draft (stage picker) while open: its page becomes its form.
+    if (becameDraft) showDraftPage(id);
     if (!approvals && showsTaskApprovals(S.view)) ensureTaskApprovals(id);
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This

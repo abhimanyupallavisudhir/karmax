@@ -767,6 +767,9 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .tf-crumb { color: var(--ink-3); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tf-savestate { margin-left: auto; color: var(--ink-3); font-size: 12px; flex: none; }
 .tf-savestate:not(:empty)::before { content: '✓ '; color: var(--merged); }
+/* Attempt switcher in the Edit draft bar: the task page's cards, minus the crown. */
+.tf-attempts { flex: 0 100 auto; margin-left: 4px; } /* scrolls before the crumb truncates */
+.tf-attempts .attempt-card { padding-right: 10px; }
 .tf-head select { flex: none; border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; padding: 6px 9px; font-weight: 550; }
 .tf-scroll { flex: 1; overflow-y: auto; }
 .tf-loading { flex: 1; display: grid; place-items: center; color: var(--ink-3); }
