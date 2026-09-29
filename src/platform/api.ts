@@ -47,7 +47,7 @@ import { defaultProvider } from '../agent/adapters.js';
 import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, sanitizeAttachmentName } from '../store/attachments.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES, BUILTIN_WIKI_PREFIX } from '../wiki/wiki.js';
 import { copyRemoteWiki, RemoteWikiSnapshots } from '../wiki/remote-snapshot.js';
-import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
+import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, removeProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
 import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
@@ -5232,6 +5232,28 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, args.content);
     return { path: file, scope };
+  }
+
+  /** Remove what the content directory holds for deleted tenants: each
+   *  project's wiki, branch views, saved skills and its tasks' cached wiki
+   *  copies, then the organization's wiki and skills. Idempotent, so a retried
+   *  deletion finishes an interrupted one. Deletion calls it with the ids its
+   *  fence resolved, while their metadata still exists. */
+  async removeTenantContent(scope: { organizationId?: string; projectIds: string[] }): Promise<void> {
+    const contentDir = this.deps.contentDir ?? paths().content;
+    // Each id must name exactly one directory entry: an empty or dotted id
+    // would widen the removal to a directory every tenant shares.
+    for (const id of [...(scope.organizationId === undefined ? [] : [scope.organizationId]), ...scope.projectIds])
+      if (!id || id === '.' || id === '..' || id !== path.basename(id) || id.includes('\\'))
+        throw new Error(`refusing to remove content for tenant id ${JSON.stringify(id)}`);
+    for (const projectId of scope.projectIds) {
+      for (const task of (await this.deps.store.listTaskAttempts(projectId))) this.remoteWikiReadCache?.remove(task.id);
+      await removeProjectWikiRepository(contentDir, projectId);
+      await fs.promises.rm(projectSkillsDir(contentDir, projectId), { recursive: true, force: true });
+    }
+    if (scope.organizationId === undefined) return;
+    await fs.promises.rm(wikiRoot(contentDir, 'organization', scope.organizationId), { recursive: true, force: true });
+    await fs.promises.rm(organizationSkillsDir(contentDir, scope.organizationId), { recursive: true, force: true });
   }
 
   // ── Wiki (org/project skills, memories, prompts — SPEC §4.4 content) ──────

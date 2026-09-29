@@ -2743,6 +2743,8 @@ export class Gateway {
         await this.deps.workflows?.removeOrganization(organizationId);
         const { deleteOrganizationAutonomy } = await import('../autonomy/cleanup.js');
         await deleteOrganizationAutonomy(store, this.deps.broker, organizationId);
+        // Before the metadata, so a failed removal leaves the ids a retry needs.
+        await this.deps.api.removeTenantContent({ organizationId, projectIds });
         (await store.deleteOrganization(organizationId));
         for (const attachmentId of resources.attachmentIds)
           if (!(await store.attachmentIsScoped(attachmentId))) this.attachments.delete(attachmentId);
@@ -3854,6 +3856,7 @@ export class Gateway {
           return this.withDeletionFence([id], undefined, async () => {
             await this.requestGuards.get(req)?.();
             const resources = await this.removeProjectExternalResources(id, 'project deleted');
+            await this.deps.api.removeTenantContent({ projectIds: [id] });
             await store.deleteProject(id);
             for (const attachmentId of resources.attachmentIds)
               if (!(await store.attachmentIsScoped(attachmentId))) this.attachments.delete(attachmentId);

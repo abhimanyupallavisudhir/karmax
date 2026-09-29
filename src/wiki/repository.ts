@@ -85,6 +85,16 @@ export function ensureProjectWikiRepository(contentDir: string, projectId: strin
   return root;
 }
 
+/** Remove a deleted project's wiki: its repository and branch views. It runs in
+ * the wiki's Git lane, so an in-flight sync cannot write into it mid-removal. */
+export async function removeProjectWikiRepository(contentDir: string, projectId: string): Promise<void> {
+  const root = wikiRoot(contentDir, 'project', projectId);
+  await serializeProjectWikiOperation(root, async () => {
+    await fs.promises.rm(path.join(contentDir, 'wiki-views', projectId), { recursive: true, force: true });
+    await fs.promises.rm(root, { recursive: true, force: true });
+  });
+}
+
 /** Gateway startup must not run Git synchronously on the HTTP event loop. */
 export async function ensureProjectWikiRepositoryAsync(contentDir: string, projectId: string): Promise<string> {
   const root = wikiRoot(contentDir, 'project', projectId);

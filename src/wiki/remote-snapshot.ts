@@ -61,6 +61,13 @@ export class RemoteWikiSnapshots {
     if (entry.root) this.retire(entry.root);
   }
 
+  /** Delete a deleted task's copy now: nothing may read it any more. */
+  remove(taskId: string): void {
+    const entry = this.entries.get(taskId);
+    this.entries.delete(taskId);
+    if (entry?.root) fs.rmSync(entry.root, { recursive: true, force: true });
+  }
+
   private refresh(taskId: string, worldKey: string, copy: (root: string) => Promise<void>): Promise<string> {
     const entry = this.entries.get(taskId) ?? { worldKey, fetchedAt: 0 };
     this.entries.set(taskId, entry);
