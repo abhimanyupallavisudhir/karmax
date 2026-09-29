@@ -174,8 +174,8 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/install
       - uses: ./.github/actions/temporal-cli
-      # A token for the fixture account: it owns the private karmax-e2e-tests
-      # repository, which the suite creates once and reuses.
+      # A fine-grained token limited to the private karmax-e2e-tests repository,
+      # which the suite reuses; it clones and pushes over HTTPS with it.
       - run: npx vitest run tests/github-live.test.ts
         env:
           KARMAX_RUN_LIVE: '1'

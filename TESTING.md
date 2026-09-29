@@ -149,7 +149,7 @@ environment's branch rule is the control.
 | `claude` | `LIVE_CLAUDE_CODE_OAUTH_TOKEN` | `claude-permission` |
 | `e2b` | `LIVE_E2B_API_KEY` | `cloud-live`, `e2b-workflow-live` (a task that pauses at Review, resumes and tears down) |
 | `daytona` | `LIVE_DAYTONA_API_KEY` | `daytona-live`, `daytona-environment-live`, `daytona-workflow-live` |
-| `github` | `LIVE_GITHUB_TOKEN` (a fixture account; creates `karmax-e2e-tests`) | `github-live` |
+| `github` | `LIVE_GITHUB_TOKEN`: a fine-grained token for the private `karmax-e2e-tests` repository only (Contents, Issues and Pull requests read and write; Commit statuses read). Clones and pushes go over HTTPS with it. | `github-live` |
 
 The Daytona snapshot build keeps its own switch (`KARMAX_DAYTONA_LIVE_BUILD`)
 and does not run there. The `e2b` and `daytona` suites together use about ten

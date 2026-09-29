@@ -64,15 +64,27 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
     return full;
   }
 
+  /** Git configuration this run adds through the environment, restored afterwards. */
+  const savedGitConfig: Record<string, string | undefined> = {};
+
   beforeAll(async () => {
     process.env.GH_TOKEN = token!;
     slug = await ensureTestRepo();
     mainBranch = (await pexec('gh', ['repo', 'view', slug, '--json', 'defaultBranchRef',
       '--jq', '.defaultBranchRef.name'], { timeout: 30_000 })).stdout.trim();
     expect(mainBranch).toBeTruthy();
-    expect(githubSlug(`git@github.com:${slug}.git`)).toBe(slug);
+    expect(githubSlug(`https://github.com/${slug}.git`)).toBe(slug);
     api = new GithubPrApi(token!);
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-gh-live-'));
+    // The token is the only credential a CI runner has: clones and karmax's own
+    // pushes go over HTTPS, through a helper that reads it from a private file.
+    // Host Git takes operator configuration from GIT_CONFIG_* (src/world/git.ts).
+    const tokenFile = path.join(dir, '.token');
+    fs.writeFileSync(tokenFile, token!, { mode: 0o600 });
+    for (const key of ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0']) savedGitConfig[key] = process.env[key];
+    process.env.GIT_CONFIG_COUNT = '1';
+    process.env.GIT_CONFIG_KEY_0 = 'credential.https://github.com.helper';
+    process.env.GIT_CONFIG_VALUE_0 = `!f() { test "$1" = get || exit 0; echo username=x-access-token; printf 'password=%s\\n' "$(cat '${tokenFile}')"; }; f`;
     h = await bootHarness('mock');
   }, 240_000);
 
@@ -86,6 +98,9 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
         .catch(() => undefined);
     }
     delete process.env.GH_TOKEN;
+    for (const [key, value] of Object.entries(savedGitConfig)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
     await h?.stop();
     fs.rmSync(dir, { recursive: true, force: true });
   }, 120_000);
@@ -94,7 +109,7 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
    *  so `origin` is the real GitHub remote and every push is a real push. */
   async function cloneFixture(name: string): Promise<string> {
     const local = path.join(dir, name);
-    await gitOrThrow(dir, ['clone', '-q', `git@github.com:${slug}.git`, local]);
+    await gitOrThrow(dir, ['clone', '-q', `https://github.com/${slug}.git`, local]);
     await git(local, ['config', 'user.name', 'karmax-live-test']);
     await git(local, ['config', 'user.email', 'karmax-live-test@localhost']);
     return local;
