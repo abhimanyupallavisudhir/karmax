@@ -85,4 +85,20 @@ describe('organization provider connection UI', () => {
     expect(saved(local)[0]).toMatchObject({ maxActiveWorlds: 6 });
     await local.close();
   });
+  // UI-43: a rejected save changed nothing, so the form keeps what was typed.
+  it('keeps the typed key and settings when saving a provider fails', async () => {
+    for (const [provider, field, value] of [['e2b', '.provider-template', 'my-template'], ['daytona', '.provider-snapshot', 'my-snapshot']] as const) {
+      const ui = await organization('#org-providers .provider-key', ({ method, path }) => method === 'PUT'
+        && path === `/api/organizations/o/world-providers/${provider}` ? { status: 400, json: { error: 'API key rejected by provider' } } : undefined);
+      const row = ui.page.locator(`#org-providers [data-provider="${provider}"]`);
+      if (provider === 'daytona') await row.locator('summary').click(); // its settings sit under Advanced
+      await row.locator('.provider-key').fill('sk-typed-key');
+      await row.locator(field).fill(value);
+      await row.getByRole('button', { name: 'Connect & verify' }).click();
+      await expect.poll(() => ui.toasts()).toContain('API key rejected by provider');
+      expect(await row.locator('.provider-key').inputValue()).toBe('sk-typed-key');
+      expect(await row.locator(field).inputValue()).toBe(value);
+      await ui.close();
+    }
+  });
 });

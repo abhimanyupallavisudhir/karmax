@@ -18294,7 +18294,11 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
             : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
                 desktopSnapshot: row.querySelector('.provider-desktop-snapshot').value, desktopImage: row.querySelector('.provider-desktop-image').value,
                 apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
-          try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await refresh('compute'); }
+          // A rejected save changed nothing: keep what was typed. Once saved, the
+          // redraw shows the stored connection and any verification error.
+          try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); }
+          catch (e) { toast(e.message, true); return; }
+          try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await refresh('compute'); }
           catch (e) { toast(e.message, true); await refresh('compute'); }
         });
         row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await refresh('compute'); } catch (e) { toast(e.message, true); await refresh('compute'); } });
