@@ -193,7 +193,7 @@ export class WorktreeProvider implements WorldProvider {
         fs.rmSync(wt, { recursive: true, force: true });
       }
       await git(repo, ['worktree', 'prune']);
-      if (spec.resetBranch) await git(repo, ['branch', '-D', branch]);
+      if (spec.resetBranch) await deleteForReset(repo, branch, base);
       // Reuse the branch if it already exists, else create it.
       const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
       const originBranch = spec.sourceAuthority === 'origin' && spec.branch && !spec.resetBranch
@@ -582,6 +582,23 @@ export function managedRepoPath(source: string, home = paths().worlds): string {
   const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
   const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
   return path.join(home, '.repositories', `${name}-${hash}`);
+}
+
+/**
+ * Delete a task branch so a reset world starts from its base. A branch that
+ * survives would be reused below with its old commits, so any failure other
+ * than "no such branch" stops the reset. Git refuses to delete (or force-move)
+ * a branch checked out in another worktree, and moving it anyway would rewrite
+ * that checkout under its owner, so the owner is told how to release it.
+ */
+async function deleteForReset(repo: string, branch: string, base: string): Promise<void> {
+  const deleted = await git(repo, ['branch', '-D', branch]);
+  if (deleted.code === 0 || (await git(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])).code !== 0) return;
+  const holder = /(?:checked out|used by worktree) at '([^']+)'/.exec(deleted.stderr)?.[1];
+  throw new Error(holder
+    ? `can't reset branch "${branch}" to "${base}": it is checked out at ${holder}. `
+      + `Switch that checkout off it (\`git -C ${holder} switch --detach\`), then reset again.`
+    : `can't reset branch "${branch}" to "${base}": ${deleted.stderr.trim() || `git branch -D exited ${deleted.code}`}`);
 }
 
 /** The repo's basename (its worktree subdirectory name in a multi-repo world). */

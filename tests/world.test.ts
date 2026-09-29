@@ -411,6 +411,43 @@ describe('WorktreeProvider (real git)', () => {
     } finally { await world.destroy(); }
   });
 
+  it('starts a reset world from the base, discarding the task branch\'s old commits', async () => {
+    const provider = new WorktreeProvider(home);
+    const first = await provider.create({ taskId: 'reset', repo, base: 'main', target: 'main' });
+    fs.writeFileSync(path.join(first.handle.root, 'old.txt'), 'old work\n');
+    await gitOrThrow(first.handle.root, ['add', '-A']);
+    await gitOrThrow(first.handle.root, ['commit', '-q', '-m', 'old work']);
+    const reset = await provider.create({ taskId: 'reset', repo, base: 'main', target: 'main', resetBranch: true });
+    try {
+      expect(await gitOrThrow(repo, ['rev-parse', 'tavya/reset'])).toBe(await gitOrThrow(repo, ['rev-parse', 'main']));
+      expect(fs.existsSync(path.join(reset.handle.root, 'old.txt'))).toBe(false);
+    } finally { await reset.destroy(); }
+  });
+
+  it('refuses to reset a task branch checked out in another worktree, naming it (WD-34)', async () => {
+    const provider = new WorktreeProvider(home);
+    const first = await provider.create({ taskId: 'held', repo, base: 'main', target: 'main' });
+    fs.writeFileSync(path.join(first.handle.root, 'old.txt'), 'old work\n');
+    await gitOrThrow(first.handle.root, ['add', '-A']);
+    await gitOrThrow(first.handle.root, ['commit', '-q', '-m', 'old work']);
+    const old = await gitOrThrow(repo, ['rev-parse', 'tavya/held']);
+    await first.destroy();
+    // "Work locally": the user checked the task branch out in a checkout of their own.
+    const local = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-')), 'checkout');
+    await gitOrThrow(repo, ['worktree', 'add', local, 'tavya/held']);
+    try {
+      const reset = provider.create({ taskId: 'held', repo, base: 'main', target: 'main', resetBranch: true });
+      await expect(reset).rejects.toThrow(`can't reset branch "tavya/held" to "main": it is checked out at ${local}`);
+      await expect(reset).rejects.toThrow(`git -C ${local} switch --detach`);
+      // Nothing moved under the user's checkout.
+      expect(await gitOrThrow(repo, ['rev-parse', 'tavya/held'])).toBe(old);
+      expect(await currentBranch(local)).toBe('tavya/held');
+    } finally {
+      await git(repo, ['worktree', 'remove', '--force', local]);
+      fs.rmSync(path.dirname(local), { recursive: true, force: true });
+    }
+  });
+
   it('does not warn when the configured base branch exists', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'okbase', repo, base: 'main', target: 'main' });
