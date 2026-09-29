@@ -50,7 +50,7 @@ const attempt = (n, extra = {}) => ({
       const file = path.join(root, p === '/' ? 'index.html' : p);
       if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return route.abort();
       let body = fs.readFileSync(p === '/app.js' && process.env.APP_SOURCE || file, 'utf8');
-      if (p === '/app.js') body = body.replace(/^boot\(\)\.catch\(.*$/m, 'window.headerTest = { S, openTask, setTaskTab };');
+      if (p === '/app.js') body = body.replace(/^boot\(\)\.catch\(.*$/m, 'window.headerTest = { S, openTask, setTaskTab }; installLinkRouter();');
       return route.fulfill({ body, contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html' });
     });
     await page.goto('http://header.test/');
@@ -122,7 +122,7 @@ const attempt = (n, extra = {}) => ({
     await open('overview');
     await page.locator('[data-attempt-select="a2"]').click();
     await page.waitForSelector('#tf-page');
-    assert.match(await page.evaluate(() => location.pathname), /\/tasks\/a2\/parameters$/);
+    assert.match(await page.evaluate(() => location.pathname), /\/tasks\/a2$/);
     await page.evaluate(() => document.getElementById('overlay-root').replaceChildren());
 
     // One attempt: no attempt strip, but New attempt remains reachable.
