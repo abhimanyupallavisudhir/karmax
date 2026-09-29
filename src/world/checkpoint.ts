@@ -17,7 +17,7 @@ import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
 import { sameRepository } from './repository-identity.js';
 
-import type { PortableDelta } from './checkpoint-encoding.js';
+import type { DeltaFile, PortableDelta } from './checkpoint-encoding.js';
 import { encodeEncryptedCheckpoint, type CheckpointFile } from './checkpoint-executor.js';
 const gunzip = promisify(zlib.gunzip);
 const MAX_CHECKPOINT_FILE_BYTES = 32 * 1024 * 1024;
@@ -177,9 +177,9 @@ export class WorldCheckpointService {
     async function* contents(): AsyncGenerator<CheckpointFile> {
       for (const { readPath, ...file } of files) if (readPath === undefined) yield file;
       const byPath = new Map(files.flatMap(file => file.readPath === undefined ? [] : [[file.readPath, file] as const]));
-      for await (const { path, data } of readCheckpointFiles(world, fileSizes, options.checkContinue)) {
+      for await (const { path, data, symlink } of readCheckpointFiles(world, fileSizes, options.checkContinue)) {
         const { readPath, ...file } = byPath.get(path)!;
-        yield { ...file, data };
+        yield { ...file, ...(symlink ? { symlink } : {}), data };
       }
     }
     const { encrypted, sha256: digest } = await encodeEncryptedCheckpoint(contents(), await this.key());
@@ -364,6 +364,7 @@ export class WorldCheckpointService {
         world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,
           checkpoint.generation + 1, revisions);
       }
+      const writes: Array<[string, DeltaFile]> = [];
       for (const file of delta.files) {
         const checkout = checkpoint.repos.find(repo => repo.checkoutPath === file.repo) ?? checkpoint.repos[0];
         const relative = checkout && checkout.checkoutPath !== '.' ? `${checkout.checkoutPath}/${file.path}` : file.path;
@@ -371,12 +372,9 @@ export class WorldCheckpointService {
           const removed = await world.exec('rm', ['-f', '--', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
           if (removed.code !== 0) throw new Error(`could not restore deletion: ${file.path}`);
         }
-        else {
-          const content = Buffer.from(file.data ?? '', 'base64');
-          if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
-          else await world.writeFile(relative, content.toString('utf8'));
-        }
+        else writes.push([relative, file]);
       }
+      await writeDeltaFiles(world, writes);
       const runtime = await activateProjectRuntime({ world, store: this.store, projectId: checkpoint.projectId,
         taskId: checkpoint.worldId, selection: environment, resources: this.resources,
         services: checkpoint.services, runSetupIfUnbuilt: true });
@@ -444,6 +442,7 @@ export class WorldCheckpointService {
       // Single-repo legacy deltas store the checkout name even though the manifest says '.'.
       if (checkpoint.repos.length === 1) for (const file of delta.files) destinations.set(file.repo, destination);
     }
+    const writes: Array<[string, DeltaFile]> = [];
     for (const file of delta.files) {
       options.signal?.throwIfAborted();
       const repo = destinations.get(file.repo);
@@ -453,12 +452,9 @@ export class WorldCheckpointService {
       if (file.deleted) {
         const removed = await world.exec('rm', ['-f', '--', file.path], { cwd: repo?.root ?? world.handle.root });
         if (removed.code !== 0) throw new Error(`could not restore deletion: ${file.path}`);
-      } else {
-        const content = Buffer.from(file.data ?? '', 'base64');
-        if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
-        else await world.writeFile(relative, content.toString('utf8'));
-      }
+      } else writes.push([relative, file]);
     }
+    await writeDeltaFiles(world, writes, options.signal);
     options.signal?.throwIfAborted();
   }
 
@@ -473,6 +469,49 @@ export class WorldCheckpointService {
     const decipher = crypto.createDecipheriv('aes-256-gcm', await this.key(), blob.subarray(4, 16));
     decipher.setAuthTag(blob.subarray(16, 32));
     return Buffer.concat([decipher.update(blob.subarray(32)), decipher.final()]);
+  }
+}
+
+// Replaces whatever is at the path; the target bytes are never resolved.
+const SYMLINK = `const fs = require('node:fs'), path = require('node:path');
+const [target, file] = process.argv.slice(1);
+fs.rmSync(file, { recursive: true, force: true });
+fs.mkdirSync(path.dirname(file), { recursive: true });
+fs.symlinkSync(Buffer.from(target, 'base64'), file);`;
+
+// Removes only links, never following them, so a regular file is not written
+// through a tracked link the task turned into a file.
+const UNLINK = `const fs = require('node:fs');
+for (const file of JSON.parse(process.argv[1])) {
+  let stat;
+  try { stat = fs.lstatSync(file); } catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') continue; throw error; }
+  if (stat.isSymbolicLink()) fs.unlinkSync(file);
+}`;
+
+/** Deletions are already applied. One bounded exec per batch replaces links at
+ * regular-file paths before any content is written (WD-33). */
+async function writeDeltaFiles(world: World, writes: Array<[string, DeltaFile]>, signal?: AbortSignal): Promise<void> {
+  const regular = writes.flatMap(([relative, file]) => file.symlink ? [] : [relative]);
+  for (let index = 0; index < regular.length;) {
+    const batch: string[] = [];
+    let names = 0;
+    while (index < regular.length && (!batch.length || (batch.length < 128 && names + regular[index]!.length <= 8192))) {
+      names += regular[index]!.length; batch.push(regular[index++]!);
+    }
+    signal?.throwIfAborted();
+    const unlinked = await world.exec('node', ['-e', UNLINK, JSON.stringify(batch)], { cwd: world.handle.root });
+    if (unlinked.code !== 0) throw new Error(`could not replace links: ${unlinked.stderr}`);
+  }
+  for (const [relative, file] of writes) {
+    signal?.throwIfAborted();
+    if (file.symlink) {
+      const linked = await world.exec('node', ['-e', SYMLINK, file.data ?? '', relative], { cwd: world.handle.root });
+      if (linked.code !== 0) throw new Error(`could not restore link: ${file.path}`);
+      continue;
+    }
+    const content = Buffer.from(file.data ?? '', 'base64');
+    if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
+    else await world.writeFile(relative, content.toString('utf8'));
   }
 }
 

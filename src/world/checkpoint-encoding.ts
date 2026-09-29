@@ -2,7 +2,8 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGzip } from 'node:zlib';
 
-export interface DeltaFile { repo: string; path: string; deleted?: boolean; data?: string }
+/** `symlink` entries carry the link's exact target as `data` (WD-33). */
+export interface DeltaFile { repo: string; path: string; deleted?: boolean; symlink?: boolean; data?: string }
 export interface PortableDelta { version: 1; files: DeltaFile[] }
 
 /** Preserve the version-1 wire format while compressing one file at a time.
