@@ -54,6 +54,7 @@ import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { conversationPublisher } from '../domain/view-publication.js';
+import { requestedWait, waitForAgent } from './agent-wait.js';
 
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
@@ -209,6 +210,8 @@ export interface SoftwareDevInput extends TaskInput {
    *  sub-agents were still running when its turn returned — interruptible by a human
    *  follow-up. Overridable so tests don't wait the full interval. */
   subagentWaitMs?: number;
+  /** Length of one `pause` minute (ms). Overridable so tests don't wait real minutes. */
+  waitMinuteMs?: number;
   /** Test/embedding override for GitHub policy polling. Production uses the
    * durable 30-second poll from the domain contract. */
   githubPollMs?: number;
@@ -2746,6 +2749,22 @@ Inspect the complete current diff and specifically compare its delta from the re
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
 
+    // The agent asked to be resumed later (`pause`), or left a durable job running
+    // without waiting for it: park here and resume it with the outcome. A message,
+    // a child's event, or a cancellation ends the wait early.
+    const agentWait = requestedWait(turn);
+    if (agentWait && patched('agent-wait-v1')) {
+      const note = await waitForAgent(agentWait, {
+        world,
+        ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
+        park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
+        interrupted: () => cancelled || msgs.length > seen || raises.length > 0 || settled.length > 0,
+      });
+      if (cancelled) return await abort();
+      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+      continue;
+    }
+
     // v1.2 advances only after an adapter observed the provider's successful terminal
     // event. v1.0/v1.1 retain their immutable signal/idle semantics for replay.
     // Software Dev treats a clean provider return as the turn boundary and asks
@@ -2871,7 +2890,15 @@ Inspect the complete current diff and specifically compare its delta from the re
       // cancel wakes us early.
       await condition(() => cancelled || msgs.length > seen, input.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS);
       if (cancelled) return await abort();
-      if (msgs.length === seen) {
+      if (msgs.length === seen && turn.stoppedBackgroundShells?.length) {
+        // The turn ended under them, and ending a turn stops them: say so.
+        msgs.push({
+          id: `sh-${msgs.length}`,
+          role: 'user',
+          text: `Your turn ended while background shells you started were still running, and ending a turn stops them, so their results are lost:\n${turn.stoppedBackgroundShells.map((d) => `- ${d}`).join('\n')}\nIf you need a result, run the command with start_job and then call pause. If it was deliberately temporary (e.g. a dev server), finish now and say so.`,
+          ts: msgs.length,
+        });
+      } else if (msgs.length === seen) {
         msgs.push({
           id: `sh-${msgs.length}`,
           role: 'user',

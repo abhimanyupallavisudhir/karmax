@@ -56,4 +56,22 @@ describe('turn journal', () => {
       skills: [{ name: 'earlier', content: 'from the first attempt' }, { name: 'later', content: 'from the retry' }],
     });
   });
+
+  it('keeps a requested wait and the jobs a turn started across an interruption', async () => {
+    const saved: TurnJournal[] = [];
+    await runTurn(input(), {
+      adapters: new Map([['mock', adapterDoing(async (ctx) => {
+        await ctx.jobStarted('job-0000000a');
+        await ctx.requestWait({ minutes: 45, jobs: ['job-0000000a'] });
+      })]]) as any,
+      journal: { async save(journal) { saved.push(journal); } },
+    });
+    expect(saved.at(-1)).toEqual({ wait: { minutes: 45, jobs: ['job-0000000a'] }, jobsStarted: ['job-0000000a'] });
+
+    const retried = await runTurn(input(), {
+      adapters: new Map([['mock', adapterDoing(async () => {})]]) as any,
+      journal: { restored: saved.at(-1), async save() {} },
+    });
+    expect(retried.wait).toEqual({ minutes: 45, jobs: ['job-0000000a'] });
+  });
 });

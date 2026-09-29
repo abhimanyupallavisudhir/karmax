@@ -30,6 +30,8 @@ const ctx = (): PlatformToolContext => ({
   respondToSubTask() {},
   raiseToParent() {},
   waitForSubtasks() {},
+  requestWait() {},
+  jobStarted() {},
   saveSkill() {},
   resolveDecision() {},
   confirmDecision() {},

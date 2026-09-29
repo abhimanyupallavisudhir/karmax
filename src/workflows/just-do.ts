@@ -19,6 +19,7 @@ import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldH
   releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
 import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
 import { SIG } from './names.js';
+import { requestedWait, waitForAgent } from './agent-wait.js';
 
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
@@ -300,6 +301,20 @@ async function justDoImpl(
     // turn's last poll stay after `seen` → delivered on the next turn.
     seen = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    // `pause`, or a durable job left running: resume the agent when it is over.
+    const agentWait = requestedWait(turn);
+    if (agentWait && patched('agent-wait-v1')) {
+      const note = await waitForAgent(agentWait, {
+        world,
+        park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
+        interrupted: () => cancelled || msgs.length > seen,
+      });
+      if (cancelled) break;
+      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+      status = 'active';
+      waitingFor = undefined;
+      continue;
+    }
     if (pendingCollaborations.size > 0) {
       status = 'waiting';
       waitingFor = {

@@ -9689,6 +9689,7 @@ function waitingLabel(w) {
     case 'parent': return 'parent';
     case 'confirm': return 'review';
     case 'responder': return 'responder';
+    case 'job': return 'job';
     default: return 'progress';
   }
 }
@@ -9702,6 +9703,11 @@ function waitingText(w) {
     if (summary) return summary.slice(0, 72);
   }
   if (w?.kind === 'human') return 'Needs input';
+  if (w?.kind === 'timer') {
+    return Number.isFinite(w.until)
+      ? `Paused until ${new Date(w.until).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+      : 'Paused';
+  }
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
   return `Waiting for ${label}`;

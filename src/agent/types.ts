@@ -1,4 +1,4 @@
-import { AgentActivity, AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, AgentProfile, AgentRole, AgentWait, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
@@ -31,6 +31,11 @@ export interface PlatformToolContext {
    *  one raises). Use when you have nothing to do but wait; otherwise just keep
    *  working — sub-tasks run in the background either way. */
   waitForSubtasks(): void | Promise<void>;
+  /** End the turn and resume later: when the listed durable jobs exit, when a
+   *  message arrives, or after `minutes` (the fallback), whichever is first. */
+  requestWait(wait: AgentWait): void | Promise<void>;
+  /** A durable job was started this turn (see src/world/jobs.ts). */
+  jobStarted(id: string): void | Promise<void>;
   /** Persist a reusable skill (content, freely editable; SPEC §4.4). */
   saveSkill(s: { name: string; content: string }): void | Promise<void>;
   /** Do-agent ONLY: partition this task's change across another branch, checked
@@ -177,6 +182,9 @@ export interface AdapterTurn {
    *  main loop returned. The workflow nudges the agent to wait for them (bounded, so a
    *  deliberately-left-running dev server can't wedge the task). */
   pendingBackgroundShells?: number;
+  /** Descriptions of the backgrounded shells that were still running when the
+   *  turn's input closed. Ending a turn stops them, so their results are lost. */
+  stoppedBackgroundShells?: string[];
 }
 
 export interface AgentAdapter {
@@ -216,6 +224,12 @@ export interface TurnResult {
    *  returned. The workflow nudges the agent to wait for them before Review, bounded so
    *  a deliberately-left-running background process (e.g. a dev server) can't wedge it. */
   pendingBackgroundShells?: number;
+  /** See AdapterTurn.stoppedBackgroundShells. */
+  stoppedBackgroundShells?: string[];
+  /** The agent asked to end its turn and be resumed later (the `pause` tool). */
+  wait?: AgentWait;
+  /** Durable jobs this turn started that were still running when it returned. */
+  runningJobs?: string[];
   skills?: { name: string; content: string }[];
   /** The world handle after any branch the agent added this turn (SPEC §11.1).
    *  Present only when it changed, so a workflow version that predates multi-PR
