@@ -147,6 +147,34 @@ const page = (p, body) => ({ page: { path: p, name: p, kind: 'skill', content: b
     assert.equal(await tab.evaluate(() => location.pathname + location.search), '/acme/app/wiki');
     await tab.waitForSelector('#wiki-pane >> text=Main table of contents');
     assert.equal(await tab.evaluate(() => location.hash), '');
+
+    // The organization wiki shows edit controls only where the server says the
+    // reader may edit: none for a developer; for an organization-wide maintainer,
+    // ordinary pages but not the prompt-wide (`default`) ones.
+    const orgIndex = (writable) => ({ ...index('Org'), view: { writable },
+      unconditional: [{ path: 'rules/everywhere', name: 'Everywhere', body: 'Everywhere body', labels: ['default'], writable: false }] });
+    const showOrg = async (writable, entry = '') => {
+      await tab.evaluate(({ data, entry, writable }) => {
+        forgetWikiReads();
+        window.currentOrg = () => ({ id: 'o1', name: 'Acme' });
+        window.api = async (url) => (new URL(url, location.origin).searchParams.get('path')
+          ? { page: { path: 'notes/a', name: 'Org notes', kind: 'skill', content: 'Org notes body', labels: [] }, view: { writable } }
+          : data);
+        history.replaceState({}, '', `/acme/wiki${entry ? `#${encodeURIComponent(entry)}` : ''}`);
+        $('#main').innerHTML = wikiView(null); wireWikiView(null);
+      }, { data: orgIndex(writable), entry, writable });
+      await tab.waitForSelector(entry ? '#wiki-pane >> text=Org notes body' : '#wiki-pane >> text=Everywhere body');
+    };
+    await showOrg(false);
+    assert.equal(await tab.locator('#wiki-new, .wiki-uncond-edit').count(), 0);
+    await showOrg(false, 'notes/a');
+    assert.equal(await tab.locator('#wiki-page-edit, #wiki-page-delete').count(), 0);
+    assert.doesNotMatch(await tab.textContent('#wiki-pane'), /Read-only branch view/);
+    await showOrg(true);
+    assert.equal(await tab.locator('#wiki-new').count(), 1);
+    assert.equal(await tab.locator('.wiki-uncond-edit').count(), 0);
+    await showOrg(true, 'notes/a');
+    assert.equal(await tab.locator('#wiki-page-edit').count(), 1);
     console.log('Wiki view browser checks passed');
   } finally {
     await browser.close();

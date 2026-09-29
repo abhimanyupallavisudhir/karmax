@@ -58,7 +58,9 @@ describe('saveSkill → listResolveSkills round-trip', () => {
     const tokens = new TokenAuthority();
     const store = (await Store.create(':memory:'));
     const k = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens, contentDir } as any);
-    const token = (await tokens.mint({ taskId: 't', profileId: 'resolve', principal: 'user:a', ceiling: ['save-skill'], grantorCaps: ['save-skill'] })).token;
+    // Saved skills reach every Resolve prompt in the organization: organization-wide authority.
+    const caps = ['save-skill', 'organization:wiki:write'];
+    const token = (await tokens.mint({ taskId: 't', profileId: 'resolve', principal: 'user:a', ceiling: caps, grantorCaps: caps })).token;
     return { k, token, contentDir };
   };
 

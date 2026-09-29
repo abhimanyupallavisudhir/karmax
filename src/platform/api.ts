@@ -10,7 +10,7 @@ import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Clien
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
-import { TOOL_CAPABILITY, Capability, allows } from './capabilities.js';
+import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
@@ -5209,6 +5209,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const organizationId = caller.organizationId
       ?? (caller.projectId ? (await this.deps.store.getProject(caller.projectId))?.organizationId : undefined)
       ?? 'org_personal';
+    // Its index reaches every Resolve prompt in the organization.
+    (await this.requireOrganizationWikiWrite(token, organizationId));
     const skillsDir = organizationSkillsDir(this.deps.contentDir ?? paths().content, organizationId);
     // Preserve namespacing subdirs (e.g. "resolve/<slug>" → resolve/<slug>.md,
     // which listResolveSkills indexes for the self-healing loop, §3.4). Sanitize each
@@ -5221,12 +5223,30 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   // ── Wiki (org/project skills, memories, prompts — SPEC §4.4 content) ──────
-  // Reads need the scope's read capability; writes reuse `skill:write` because
-  // authoring wiki content and saving a skill are the same authority, not
-  // because they are the same store. They are NOT: `saveSkill` writes a flat
-  // file under `<contentDir>/skills/` that is never inlined into a prompt,
-  // while the wiki is the scoped, labelled store that is (SPEC §19.6).
+  // Reads need the scope's read capability. Project writes reuse `skill:write`:
+  // authoring wiki content and saving a skill are the same authority, though
+  // not the same store (`saveSkill` writes flat files under `<contentDir>/skills/`,
+  // the wiki is the scoped, labelled store, SPEC §19.6). Organization content
+  // reaches every task in the organization, so writing it — wiki pages and
+  // saved skills alike — takes `organization:wiki:write`, which only an
+  // organization-wide grant of Project maintainer or above carries (PL-12).
   // All paths are traversal-checked inside src/wiki.
+
+  private async requireOrganizationWikiWrite(token: string, organizationId: string) {
+    const checked = (await this.deps.tokens.check(token, 'organization:wiki:write', { organizationId }));
+    if (!checked.ok) throw new CapabilityError(checked.reason === 'missing capability organization:wiki:write'
+      ? ORGANIZATION_WIKI_WRITE_DENIED : checked.reason ?? 'denied: organization:wiki:write');
+    return checked.record!;
+  }
+
+  /** Whether the caller may edit this organization wiki entry: prompt-wide
+   *  (`default`, `@builtin/*`) entries also need `organization:edit`. Drives
+   *  the console's edit controls; writes are checked independently. */
+  private async organizationWikiEntryWritable(token: string, organizationId: string, writable: boolean,
+    entry: { path: string; labels?: string[] }): Promise<boolean> {
+    if (!writable || !(entry.path.startsWith(`${BUILTIN_WIKI_PREFIX}/`) || isDefaultDelivered(entry))) return writable;
+    return (await this.deps.tokens.check(token, 'organization:edit', { organizationId })).ok;
+  }
 
   /**
    * A `default`-labelled organization page is inlined into every task prompt in
@@ -5281,8 +5301,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
       return { root: canonical, branch: PROJECT_WIKI_BRANCH, writable: true, principal: caller.principal };
     } else {
-      caller = (await this.require(token, write ? 'skill:write' : 'organization:read', { organizationId: id }));
-      return { root: wikiRoot(this.deps.contentDir ?? paths().content, scope, id), writable: true, principal: caller.principal };
+      caller = write ? (await this.requireOrganizationWikiWrite(token, id)) : (await this.require(token, 'organization:read', { organizationId: id }));
+      const writable = write || (await this.deps.tokens.check(token, 'organization:wiki:write', { organizationId: id })).ok;
+      return { root: wikiRoot(this.deps.contentDir ?? paths().content, scope, id), writable, principal: caller.principal };
     }
   }
 
@@ -5298,18 +5319,21 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const entryOf = ({ content: _c, files: _f, ...entry }: (typeof BUILTIN_WIKI_ENTRIES)[number]) => entry;
     const builtins = scope === 'organization' ? resolveBuiltins(root) : [];
     const builtin = builtins.find((b) => b.path === safeWikiPath(rel));
-    if (builtin) return { scope, id, path: builtin.path, page: builtin, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
+    const entryView = async (entry: { path: string; labels?: string[] }) => ({ branch: view.branch, taskId: view.taskId,
+      writable: scope === 'organization' ? (await this.organizationWikiEntryWritable(token, id, view.writable, entry)) : view.writable });
+    if (builtin) return { scope, id, path: builtin.path, page: builtin, view: (await entryView(builtin)) };
     const page = rel ? readWikiPage(root, rel) : undefined;
-    if (page) return { scope, id, path: page.path, page, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
+    if (page) return { scope, id, path: page.path, page, view: (await entryView(page)) };
     const toc = listWiki(root, rel);
     if (rel) return { scope, id, path: safeWikiPath(rel), toc, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
     // `default` entries are inlined into every task's prompt (built-ins first).
-    const unconditional = [
+    const unconditional = (await __asyncCollections.map([
       ...builtins
         .filter(isDefaultDelivered)
         .map((b) => ({ ...entryOf(b), body: parseFrontmatter(b.content).body.trim() || b.content })),
       ...collectDefaultPages(root, toc).map(({ files: _files, content: _content, ...rest }) => rest),
-    ];
+    ], async (entry) => scope === 'organization'
+      ? { ...entry, writable: (await this.organizationWikiEntryWritable(token, id, view.writable, entry)) } : entry));
     toc.children = [...builtins.map(entryOf), ...(toc.children ?? [])];
     // The TOC lists every entry except the `default` ones inlined above (shown
     // in full as their own cards) — the same rendering agents get.

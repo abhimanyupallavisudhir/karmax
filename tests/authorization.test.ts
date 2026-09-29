@@ -32,8 +32,9 @@ describe('durable authorization policy', () => {
       const authz = (await AuthorizationService.create(store));
       for (const id of ['maintainer', 'administrator']) {
         const profile = (await authz.profile(id))!;
+        // Those releases predate organization:wiki:write.
         (await store.setAuthorizationProfile('global', { ...profile,
-          capabilities: [...profile.capabilities, 'workflow:install'] }));
+          capabilities: [...profile.capabilities.filter((cap) => cap !== 'organization:wiki:write'), 'workflow:install'] }));
       }
       const upgraded = (await AuthorizationService.create(store));
       for (const id of ['maintainer', 'administrator']) {
@@ -148,6 +149,47 @@ describe('durable authorization policy', () => {
     }));
     (await AuthorizationService.create(store));
     expect((await store.getAuthorizationProfile('global', 'maintainer')).capabilities).toEqual(['project:read', 'task:read']);
+  });
+
+  it('gives untouched stored Project maintainers organization:wiki:write and leaves customized ones alone', async () => {
+    const store = (await Store.create(':memory:'));
+    try {
+      const current = DEFAULT_AUTHORIZATION_PROFILES.find((p) => p.id === 'maintainer')!;
+      const previous = current.capabilities.filter((cap) => cap !== 'organization:wiki:write');
+      (await store.setAuthorizationProfile('global', { ...current, capabilities: previous }));
+      (await AuthorizationService.create(store));
+      expect((await store.getAuthorizationProfile('global', 'maintainer')).capabilities).toContain('organization:wiki:write');
+
+      const customized = previous.filter((cap) => cap !== 'review:approve');
+      (await store.setAuthorizationProfile('global', { ...current, capabilities: customized }));
+      (await AuthorizationService.create(store));
+      expect((await store.getAuthorizationProfile('global', 'maintainer')).capabilities).toEqual(customized);
+    } finally { (await store.close()); }
+  });
+
+  it('carries organization:wiki:write only through organization or global grants', async () => {
+    const store = (await Store.create(':memory:'));
+    try {
+      const authz = (await AuthorizationService.create(store));
+      const organization = (await store.createOrganization({ name: 'Acme' }));
+      const project = (await store.createProject('One', {}, organization.id));
+      const holds = async (principal: string) =>
+        allows((await authz.capabilities(principal, project.id, organization.id)), 'organization:wiki:write');
+      for (const level of ['viewer', 'developer']) expect(allows((await authz.profile(level))!.capabilities, 'organization:wiki:write')).toBe(false);
+      for (const level of ['maintainer', 'administrator', 'god']) expect(allows((await authz.profile(level))!.capabilities, 'organization:wiki:write')).toBe(true);
+      (await authz.grant('root', { principalId: 'user:project', scopeKey: projectScope(project.id), profileId: 'maintainer' }));
+      (await authz.grant('root', { principalId: 'user:org', scopeKey: `organization:${organization.id}`, profileId: 'maintainer' }));
+      (await authz.grant('root', { principalId: 'user:member', scopeKey: `organization:${organization.id}`, profileId: 'developer' }));
+      (await authz.bootstrapOrganizationOwner('root', 'owner', organization.id));
+      expect((await holds('user:project'))).toBe(false);
+      expect((await holds('user:member'))).toBe(false);
+      expect((await holds('user:org'))).toBe(true);
+      expect((await holds('user:owner'))).toBe(true);
+      // Project membership as an owner/admin maps to a project-scoped maintainer.
+      (await store.setOrganizationMembership(organization.id, 'lead', 'member'));
+      (await store.setProjectMembership(project.id, { kind: 'user', userId: 'lead' }, 'owner'));
+      expect((await holds('user:lead'))).toBe(false);
+    } finally { (await store.close()); }
   });
 
   it('upgrades every untouched shipped built-in, including the July payments release', async () => {
