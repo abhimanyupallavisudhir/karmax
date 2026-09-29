@@ -18,6 +18,9 @@ import { historyFromJson } from './helpers/stub-task-worker.js';
 // threshold. Recorded at a14b89e4: a merge-queue wait polling its position.
 // Recorded at dac51479: a replacement parent parked at the sub-task barrier
 // with a restored child, before the barrier reread such children.
+// Recorded at 8e6d93a0, before failed runs released their worlds (WF-37): a
+// mergeOnly@1.7.0 merge that failed on a conflict and a justDo@1.7.0 turn
+// that failed outright, each a whole closed execution.
 it('replays task histories recorded before history bounding', async () => {
   const workflowBundle = await bundleWorkflowCode({
     workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)),
@@ -25,7 +28,7 @@ it('replays task histories recorded before history bounding', async () => {
   for (const name of ['history-long-prechange', 'history-landing-duplicate-prechange',
     'history-admission-prechange', 'history-admission-justdo-prechange', 'history-long-past-threshold-prechange',
     'history-landing-duplicate-v1_20-prechange', 'history-long-v1_23-prechange', 'history-merge-queue-prechange',
-    'history-subtask-barrier-prechange']) {
+    'history-subtask-barrier-prechange', 'history-merge-failed-prechange', 'history-turn-failed-prechange']) {
     const file = new URL(`./fixtures/${name}.json`, import.meta.url);
     const json = JSON.parse(fs.existsSync(file) ? fs.readFileSync(file, 'utf8')
       : zlib.gunzipSync(fs.readFileSync(new URL(`${file.href}.gz`))).toString('utf8'));

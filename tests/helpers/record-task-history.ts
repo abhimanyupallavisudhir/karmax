@@ -8,15 +8,18 @@
  * To record what a change must keep replaying, run it from a checkout of the
  * commit before the change (copy this file and stub-task-worker.ts there if
  * they are newer). Scenarios: landing-duplicate, merge-queue-wait, long,
- * subtask-barrier.
+ * subtask-barrier, merge-failed (mergeOnly), turn-failed (justDo); the last two
+ * record the whole closed execution.
  */
 import fs from 'node:fs';
+import { ApplicationFailure } from '@temporalio/common';
 import { startStubTaskWorker, historyChain, type StubActivities } from './stub-task-worker.js';
 
 const [scenario, workflowType, out] = process.argv.slice(2);
 if (!scenario || !workflowType || !out) throw new Error('usage: record-task-history <scenario> <workflowType> <out.json>');
 
-const world = { id: `${scenario}-fixture`, kind: 'memory', root: '/fixture', branch: 'task', base: 'main' };
+// just-do releases only remote worlds, so its failure runs in a (stub) sandbox.
+const world = { id: `${scenario}-fixture`, kind: scenario === 'turn-failed' ? 'e2b' : 'memory', root: '/fixture', branch: 'task', base: 'main' };
 const prs = [{ slug: 'test/repo', number: 1, headSha: 'abc', url: 'https://github.com/test/repo/pull/1' }];
 const calls = new Map<string, number>();
 const count = (name: string) => calls.get(name) ?? 0;
@@ -25,6 +28,7 @@ const common: StubActivities = {
   restoreChildTasks: async () => scenario === 'subtask-barrier' ? [{ taskId: 'child-1', title: 'Child', waiting: false }] : [],
   publishView: async () => 'fence', parkWaitingWorld: async () => {},
   recordEvent: async () => {}, createWorld: async () => world, prepareAgentTurn: async () => ({ accountPool: 0 }),
+  accountPoolSize: async () => 0,
   agentUsesHostCapacity: async () => false, pendingServiceConnections: async () => 0,
   buildReview: async () => ({ summary: 'fixture', changedFiles: [] }), checkProposal: async () => ({ ready: true }),
   suspendWorldForRecovery: async () => {}, closePrs: async () => prs, destroyWorld: async () => {},
@@ -35,6 +39,7 @@ const common: StubActivities = {
     if (scenario !== 'merge-queue-wait') await env.client.workflow.getHandle(taskId).signal('mergeGranted');
   }, releaseMerge: async () => {}, cancelMerge: async () => {},
   mergeQueuePosition: async () => ({ position: 2, total: 3 }),
+  finalizeMergeActivity: async () => ({ merged: false, conflict: 'CONFLICT (content): Merge conflict in index.js' }),
   mergeGithubPrs: async () => ({ status: 'needs-revision', prs, detail: 'CI failed on the same head.',
     repair: { kind: 'ci', preserveAuthorization: true, fingerprint: 'test/repo#1:abc:ci' } }),
 };
@@ -42,8 +47,11 @@ let turns = 0;
 const replies = (i: number) => `Reply ${i}. ${'r'.repeat(200)}`;
 const counted = Object.fromEntries(Object.entries({
   ...common,
-  runAgentTurn: async () => ({ output: replies(turns++), providerCompleted: true,
-    ...(scenario === 'subtask-barrier' ? { waitForSubtasks: true } : {}) }),
+  runAgentTurn: async () => {
+    if (scenario === 'turn-failed') throw ApplicationFailure.nonRetryable('agent refused the task', 'agent-error');
+    return { output: replies(turns++), providerCompleted: true,
+      ...(scenario === 'subtask-barrier' ? { waitForSubtasks: true } : {}) };
+  },
 }).map(([name, fn]) => [name, async (...args: unknown[]) => {
   calls.set(name, count(name) + 1);
   return (fn as (...values: unknown[]) => unknown)(...args);
@@ -59,6 +67,10 @@ const inputs: Record<string, unknown> = {
     project: { repos: ['/fixture'] }, recovery: { resumeStage: 'merge', messages: [], world } },
   'subtask-barrier': { taskId: workflowId, projectId: 'fixture', title: 'Barrier fixture', prompt: '',
     project: { repos: ['/fixture'] }, recovery: { resumeStage: 'do', messages: [{ id: 'm0', role: 'user', text: 'Delegate', ts: 0 }], world } },
+  'merge-failed': { taskId: workflowId, projectId: 'fixture', title: 'Failed merge fixture', prompt: '',
+    branch: 'task', project: { repos: ['/fixture'] }, confirm: { layers: [] } },
+  'turn-failed': { taskId: workflowId, projectId: 'fixture', title: 'Failed turn fixture', prompt: 'Work',
+    project: { repos: ['/fixture'], worldProvider: 'e2b' } },
   long: { taskId: workflowId, projectId: 'fixture', title: 'Long task', prompt: `Start. ${'p'.repeat(500)}`,
     project: { repos: ['/fixture'], remote: 'pr' } },
 };
@@ -88,6 +100,8 @@ try {
       if ((await handle.describe()).historyLength >= target) break;
       await handle.signal('followUp', { id: `u${i}`, role: 'user', text: `Follow-up ${i}. ${'u'.repeat(100)}`, ts: i });
     }
+  } else if (scenario === 'merge-failed' || scenario === 'turn-failed') {
+    await handle.result().catch(() => undefined);
   } else await wait(until[scenario]!);
   if (scenario === 'subtask-barrier') {
     // A follow-up wakes the barrier, so the parked wait is followed by events

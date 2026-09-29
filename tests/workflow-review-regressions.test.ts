@@ -1,4 +1,4 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const wf = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => any>(),
@@ -726,4 +726,79 @@ it('WF-3/WF-4: without the reread patch a restored child takes the untimed wait'
   wf.wait = () => { waits.push(wf.timeout); wf.handlers.get('cancel')!(); };
   expect(await softwareDevV1_26(next)).toEqual({ stage: 'cancelled' });
   expect(waits[0]).toBeUndefined();
+});
+
+describe('WF-37: a failed merge-only or just-do run releases its world', () => {
+  const remote = { id: 'task', kind: 'e2b', root: '/sandbox', branch: 'b', base: 'main' };
+  beforeEach(() => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.destroyWorld = vi.fn(async () => undefined);
+    wf.activities.enqueueMerge = vi.fn(async () => wf.handlers.get('mergeGranted')!());
+    wf.activities.releaseMerge = vi.fn(async () => undefined);
+  });
+
+  it('merge-only: a failed merge publishes the failure, then destroys the world', async () => {
+    wf.activities.finalizeMergeActivity = vi.fn(async () => ({ merged: false, conflict: 'CONFLICT in index.js' }));
+    expect(await mergeOnlyV1_7({ ...input, branch: 'b' })).toEqual({ stage: 'failed' });
+    expect(wf.activities.destroyWorld).toHaveBeenCalledWith(expect.objectContaining({ id: 'task', kind: 'worktree' }));
+    const failed = wf.activities.publishView.mock.invocationCallOrder[
+      wf.activities.publishView.mock.calls.findIndex((call: any[]) => call[1].status === 'failed')];
+    expect(failed).toBeLessThan(wf.activities.destroyWorld.mock.invocationCallOrder[0]);
+  });
+
+  it('merge-only: a remote world is dropped from the view once released', async () => {
+    wf.activities.createWorld.mockResolvedValue(remote);
+    wf.activities.finalizeMergeActivity = vi.fn(async () => { throw new Error('merge activity failed'); });
+    await expect(mergeOnlyV1_7({ ...input, branch: 'b', project: { repos: [], worldProvider: 'e2b' } }))
+      .rejects.toThrow('merge activity failed');
+    expect(wf.activities.releaseMerge).toHaveBeenCalled();
+    expect(wf.activities.destroyWorld).toHaveBeenCalledWith(expect.objectContaining({ kind: 'e2b' }));
+    expect(wf.activities.publishView.mock.calls.at(-1)[1].world).toBeUndefined();
+  });
+
+  it('merge-only: a failure before the Review gate releases the world too', async () => {
+    wf.activities.accountPoolSize.mockRejectedValue(new Error('coordinator unavailable'));
+    await expect(mergeOnlyV1_7({ ...input, branch: 'b' })).rejects.toThrow('coordinator unavailable');
+    expect(wf.activities.destroyWorld).toHaveBeenCalledOnce();
+  });
+
+  it('just-do: a failed turn destroys its remote world and drops it from the view', async () => {
+    wf.activities.createWorld.mockResolvedValue(remote);
+    wf.activities.runAgentTurn.mockRejectedValue(new Error('agent refused the task'));
+    await expect(justDoV1_7({ ...input, project: { repos: [], worldProvider: 'e2b' } })).rejects.toThrow('agent refused the task');
+    expect(wf.activities.destroyWorld).toHaveBeenCalledWith(expect.objectContaining({ kind: 'e2b' }));
+    expect(wf.activities.publishView.mock.calls.at(-1)[1].world).toBeUndefined();
+  });
+
+  it('just-do: a failed turn keeps a local worktree for inspection, as a finished one does', async () => {
+    wf.activities.runAgentTurn.mockRejectedValue(new Error('agent refused the task'));
+    await expect(justDoV1_7(input)).rejects.toThrow('agent refused the task');
+    expect(wf.activities.destroyWorld).not.toHaveBeenCalled();
+  });
+
+  it('just-do: an approved run whose work cannot be saved still retains its world', async () => {
+    wf.activities.createWorld.mockResolvedValue(remote);
+    wf.activities.checkpointResourceOnlyWork = vi.fn(async () => false);
+    wf.activities.commitWork.mockResolvedValue({ committed: false });
+    await expect(justDoV1_7({ ...input, project: { repos: ['/repo'], worldProvider: 'e2b' } }))
+      .rejects.toThrow('retaining the world for recovery');
+    expect(wf.activities.destroyWorld).not.toHaveBeenCalled();
+  });
+
+  it('just-do: a failure while applying approved resources retains the world', async () => {
+    wf.activities.createWorld.mockResolvedValue(remote);
+    wf.activities.settleResourceReview = vi.fn(async () => { throw new Error('resource store unavailable'); });
+    await expect(justDoV1_7({ ...input, project: { repos: [], worldProvider: 'e2b' } })).rejects.toThrow('resource store unavailable');
+    expect(wf.activities.destroyWorld).not.toHaveBeenCalled();
+  });
+
+  it('keeps histories recorded without the patch releasing nothing', async () => {
+    wf.absentPatches = new Set(['merge-only-failure-releases-world-v1', 'just-do-failure-releases-world-v1']);
+    wf.activities.finalizeMergeActivity = vi.fn(async () => ({ merged: false, conflict: 'CONFLICT in index.js' }));
+    expect(await mergeOnlyV1_7({ ...input, branch: 'b' })).toEqual({ stage: 'failed' });
+    wf.activities.createWorld.mockResolvedValue(remote);
+    wf.activities.runAgentTurn.mockRejectedValue(new Error('agent refused the task'));
+    await expect(justDoV1_7({ ...input, project: { repos: [], worldProvider: 'e2b' } })).rejects.toThrow();
+    expect(wf.activities.destroyWorld).not.toHaveBeenCalled();
+  });
 });
