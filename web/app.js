@@ -805,10 +805,12 @@ function installInfoDotTips() {
 
 // Tag chips are navigation everywhere they appear. Capture before row/form click
 // handlers so a chip never opens a task or mutates its tags as a side effect.
+// A dialog owns its chips: navigating from one would leave it over the list or
+// tear it down behind its close handler.
 function installTagRouter() {
   document.addEventListener('click', (ev) => {
     const chip = ev.target.closest('[data-tag-link]');
-    if (!chip) return;
+    if (!chip || chip.closest('#modal-root')) return;
     ev.preventDefault();
     ev.stopPropagation();
     navigateToTagSection(chip.dataset.tagLink);
@@ -3307,12 +3309,12 @@ async function setQuery(q) {
   if (S.tab === 'tasks') renderMain();
 }
 
-// Leave any detail/modal surface, restore the canonical tag-grouped list, and
-// place the requested tag section at the top of the viewport.
+// Leave any detail surface, restore the canonical tag-grouped list, and place
+// the requested tag section at the top of the viewport. Dialogs are the
+// caller's to close, through their own close handlers.
 async function navigateToTagSection(tagId) {
   const tag = tagById(tagId);
   if (!tag) return;
-  $('#modal-root').innerHTML = '';
   // Section by the tag's own kind so the target section is present in the grouping.
   const q = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
   await go(projectRoute(tag.projectId, 'tasks', q));
@@ -4732,11 +4734,14 @@ function tagGroupVisibleTasks(group, keep, seen = new Map()) {
   return seen;
 }
 
-// Small colored tag chip + priority flag shown on a task row.
-function tagChips(t) {
+// Small colored tag chip + priority flag shown on a task row. `link: false`
+// renders plain labels, for rows whose click means something else (a picker).
+function tagChips(t, link = true) {
   if (!t.tags || !t.tags.length) return '';
   return t.tags
-    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<button type="button" class="tag-chip tag-link ${esc(tag.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`; })
+    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : '';
+      return link ? `<button type="button" class="tag-chip tag-link ${esc(tag.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`
+        : `<span class="tag-chip ${esc(tag.kind || '')}"${c}>${esc(tagPathStr(id))}</span>`; })
     .join('');
 }
 function priorityFlag(t) {
@@ -5220,7 +5225,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
       <span class="status-dot ${status}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}</div>
-        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t)}</div>
+        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
     </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
@@ -5403,6 +5408,10 @@ function openTagsManager(initialEditId = null) {
     const close = () => (root.innerHTML = '');
     $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') close(); });
     $('#tagm-close').addEventListener('click', close);
+    root.querySelectorAll('.tagm-row [data-tag-link]').forEach((chip) => chip.addEventListener('click', () => {
+      close();
+      navigateToTagSection(chip.dataset.tagLink);
+    }));
     const addTag = async () => {
       const name = $('#tagm-name').value.trim(); if (!name) return;
       try {
