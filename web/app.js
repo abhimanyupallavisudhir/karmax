@@ -395,8 +395,9 @@ function parseRoute(url) {
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
   const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
+  const avatarId = tab === 'avatars' && seg[3] ? seg[3] : null;
   return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
-    ...(wikiView ? { wikiView } : {}) };
+    ...(wikiView ? { wikiView } : {}), ...(avatarId ? { avatarId } : {}) };
 }
 
 // Which branch the project wiki shows is part of the page, so it lives in the
@@ -413,6 +414,11 @@ function wikiRoute(pid, view = '', entry = '') {
   const query = kind === 'task' && value ? `?task=${encodeURIComponent(value)}`
     : kind === 'branch' && value ? `?branch=${encodeURIComponent(value)}` : '';
   return `${projectRoute(pid, 'wiki')}${query}${entry ? `#${encodeURIComponent(entry)}` : ''}`;
+}
+
+// An open Avatar: /<org>/<project>/avatars/<id>; the list without an id.
+function avatarRoute(pid, avatarId) {
+  return `${projectRoute(pid, 'avatars')}${avatarId ? `/${encodeURIComponent(avatarId)}` : ''}`;
 }
 
 function fileRouteTarget(query) {
@@ -648,7 +654,6 @@ async function applyRoute() {
     // below, so a link into another project's search still lands filtered.
     S.projectId = pid;
     syncLiveWatch();
-    S.avatarSelected = null;
     S.search = '';
     S.searchResult = null;
     S.searchPending = false;
@@ -662,6 +667,10 @@ async function applyRoute() {
   const reads = [];
   if (!sameProject || !S.tasks?.length) reads.push(loadTasks().catch(() => {}));
   if (!sameProject || !S.avatarAvailability || S.avatarProjectId !== pid) reads.push(loadAvatars().catch(() => {}));
+  // The URL owns the open Avatar, as it owns the open task.
+  S.avatarSelected = tab === 'avatars' ? r.avatarId || null : null;
+  S.avatarAuthorizationRequests = [];
+  if (S.avatarSelected) reads.push(loadAvatarAuthorizationRequests(S.avatarSelected));
   let organizationRead = null, listSearch = null;
   if (!projectOrganizationLoaded) {
     organizationRead = loadOrg().catch(() => false);
@@ -672,6 +681,10 @@ async function applyRoute() {
   }
   await Promise.all(reads);
   if (!routeIsCurrent()) return;
+  if (S.avatarSelected && !S.avatars.some((avatar) => avatar.id === S.avatarSelected)) {
+    toast('Avatar not found', true);
+    return go(avatarRoute(pid), { replace: true });
+  }
   // Same-project tabs are local navigation. Their complete last-painted inputs
   // are already in memory, so reveal the destination before refreshing tags,
   // views, fields, and (for the task list) the authoritative search result.
@@ -12474,9 +12487,10 @@ function avatarDetailView(avatar) {
 }
 async function loadAvatarAuthorizationRequests(avatarId) {
   const project = projectById(S.projectId);
-  S.avatarAuthorizationRequests = avatarId && project?.organizationId
+  const requests = avatarId && project?.organizationId
     ? await api(`/api/authorization-requests?organizationId=${encodeURIComponent(project.organizationId)}&avatarId=${encodeURIComponent(avatarId)}`).catch(() => [])
     : [];
+  if (S.avatarSelected === avatarId) S.avatarAuthorizationRequests = requests; // not a page left meanwhile
 }
 // Shown wherever Avatars are managed. An Avatar acts with a person's delegated
 // authority on whatever it reads, so anything it reads can steer it.
@@ -12490,7 +12504,7 @@ function avatarsView(proj) {
   return `<div class="avatars-page"><div class="settings-header avatar-list-head"><div><h1 class="page-title">Avatars</h1><p class="settings-intro">Trusted agents with delegated authority.</p></div>${disabled ? '' : '<button class="btn primary avatar-new" type="button">+ New avatar</button>'}</div>
     ${AVATAR_RISK_NOTE}
     ${disabled ? '<div class="avatar-disabled card"><div><b>Avatars are disabled for this project.</b><p>Existing Avatars and their history remain visible, but they cannot be called.</p></div><button class="btn avatar-project-enable" type="button">Enable for project</button></div>' : ''}
-    <div class="avatar-list">${S.avatars.map((avatar) => `<button class="avatar-row" type="button" data-avatar="${esc(avatar.id)}"><span class="avatar-mark" aria-hidden="true">✦</span><span class="avatar-row-main"><b>${esc(avatar.name)}</b><span>${esc(avatar.purpose || 'User-authored autonomous principal')}</span><small>Owned by ${esc(avatarOwnerName(avatar))} · ${avatar.authorityMode === 'full' ? 'Full delegation' : 'Restricted'} · ${esc(avatarCallerSummary(avatar))}</small></span><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span><span class="avatar-chevron">›</span></button>`).join('') || (disabled ? '' : '<div class="empty avatar-empty"><span class="avatar-mark">✦</span><b>No Avatars yet</b><span>Create a trusted agent with its own instructions and delegated authority.</span><button class="btn primary avatar-new" type="button">Create your first Avatar</button></div>')}</div></div>`;
+    <div class="avatar-list">${S.avatars.map((avatar) => `<a class="avatar-row" data-spa href="${esc(avatarRoute(proj.id, avatar.id))}" data-avatar="${esc(avatar.id)}"><span class="avatar-mark" aria-hidden="true">✦</span><span class="avatar-row-main"><b>${esc(avatar.name)}</b><span>${esc(avatar.purpose || 'User-authored autonomous principal')}</span><small>Owned by ${esc(avatarOwnerName(avatar))} · ${avatar.authorityMode === 'full' ? 'Full delegation' : 'Restricted'} · ${esc(avatarCallerSummary(avatar))}</small></span><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span><span class="avatar-chevron">›</span></a>`).join('') || (disabled ? '' : '<div class="empty avatar-empty"><span class="avatar-mark">✦</span><b>No Avatars yet</b><span>Create a trusted agent with its own instructions and delegated authority.</span><button class="btn primary avatar-new" type="button">Create your first Avatar</button></div>')}</div></div>`;
 }
 
 async function openAvatarEditor(proj, avatar) {
@@ -12563,20 +12577,20 @@ async function fillAvatarEditor(overlay, close, proj, avatar) {
             target: { kind: 'avatar', avatarId: saved.id, enableAfterApproval: !avatar },
             authorization: requestedAuthorization, audience: decision.audience, reason: decision.reason,
           }) });
-          close(); await loadAvatars(); S.avatarSelected = saved.id; await loadAvatarAuthorizationRequests(saved.id); renderMain();
+          close(); await loadAvatars(); await go(avatarRoute(proj.id, saved.id));
           toast('Authorization request sent'); return;
         }
       }
-      close(); await loadAvatars(); S.avatarSelected = saved.id; renderMain(); toast(avatar ? 'Avatar saved' : 'Avatar created');
+      close(); await loadAvatars(); await go(avatarRoute(proj.id, saved.id)); toast(avatar ? 'Avatar saved' : 'Avatar created');
     } catch (error) { button.disabled = false; toast(error.message, true); }
   }); overlay.querySelector('#avatar-name').focus();
 }
 
 function wireAvatarsView(proj) {
-  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj))); document.querySelectorAll('.avatar-row').forEach((row) => row.addEventListener('click', async () => { S.avatarSelected = row.dataset.avatar; await loadAvatarAuthorizationRequests(S.avatarSelected); renderMain(); })); document.querySelector('.avatar-back')?.addEventListener('click', () => { S.avatarSelected = null; S.avatarAuthorizationRequests = []; renderMain(); });
+  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj))); document.querySelector('.avatar-back')?.addEventListener('click', () => go(avatarRoute(proj.id)));
   const avatar = S.avatars.find((item) => item.id === S.avatarSelected); document.querySelector('.avatar-edit')?.addEventListener('click', () => openAvatarEditor(proj, avatar)); document.querySelector('.avatar-start')?.addEventListener('click', () => { S.pendingAvatarId = avatar.id; openTaskForm('software-dev'); });
   document.querySelector('.avatar-toggle')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'PUT', body: JSON.stringify({ enabled: !avatar.enabled }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
-  document.querySelector('.avatar-remove')?.addEventListener('click', async () => { if (!confirm(`Remove ${avatar.name}? Its audit history will be retained.`)) return; try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'DELETE' }); S.avatarSelected = null; await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
+  document.querySelector('.avatar-remove')?.addEventListener('click', async () => { if (!confirm(`Remove ${avatar.name}? Its audit history will be retained.`)) return; try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'DELETE' }); await loadAvatars(); await go(avatarRoute(proj.id), { replace: true }); } catch (error) { toast(error.message, true); } });
   document.querySelector('.avatar-project-enable')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatar-settings`, { method: 'PUT', body: JSON.stringify({ value: 'enabled' }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
   wireAuthorizationRequestActions(document.querySelector('.avatar-authorization-requests'), proj.organizationId, async () => {
     await Promise.all([loadAvatars(), loadAvatarAuthorizationRequests(S.avatarSelected), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
@@ -16932,13 +16946,7 @@ async function openInboxItem(item) {
   }
   if (item.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId); if (!project) return;
-    await go(projectRoute(project.id, 'avatars'));
-    // A cross-project navigation resets project-local selection state, so choose
-    // the Avatar only after the route has switched projects.
-    S.avatarSelected = item.subject.avatarId;
-    await loadAvatarAuthorizationRequests(item.subject.avatarId);
-    renderMain();
-    return;
+    return go(avatarRoute(project.id, item.subject.avatarId));
   }
   const project = projectById(item.task.projectId); if (!project) return;
   const tab = item.kind === 'approval-requested' ? '/approvals' : '';
