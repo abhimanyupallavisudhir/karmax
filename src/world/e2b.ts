@@ -1,4 +1,5 @@
 import { TextDecoder } from 'node:util';
+import { e2bTemplate } from './e2b-template.js';
 import type { WorldReferenceKeys } from './reference-keys.js';
 import { isMissingSandbox } from './provider-errors.js';
 import { timed } from '../timing/index.js';
@@ -37,9 +38,7 @@ import { taskBranch } from '../domain/brand.js';
 const HOME = '/home/user';
 const ROOT = '/home/user/karmax';
 const DEFAULT_IDLE_MS = 10 * 60_000;
-// Public, package-only browser/runtime build; usable with each organization's
-// own E2B key. Keep this release default aligned with environments/browser.
-export const DEFAULT_E2B_TEMPLATE = 'uj125w982t7wflqad4ig';
+export { DEFAULT_E2B_TEMPLATE } from './e2b-template.js';
 // `createWorld` has a five-minute Temporal boundary that also includes Git
 // provisioning. Give E2B twice its SDK default without consuming the entire
 // activity budget; an indeterminate timeout is reconciled by metadata below.
@@ -127,7 +126,7 @@ export class E2BWorldProvider implements WorldProvider {
   constructor(
     private factory: E2BFactory = defaultE2BFactory(),
     private idleMs = envPositiveInt('KARMAX_E2B_IDLE_MS', DEFAULT_IDLE_MS),
-    private template = process.env.KARMAX_E2B_TEMPLATE?.trim() || DEFAULT_E2B_TEMPLATE,
+    private template = e2bTemplate(),
     private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopTemplate = process.env.KARMAX_E2B_DESKTOP_TEMPLATE ?? 'desktop',
     private referenceKeys?: WorldReferenceKeys,

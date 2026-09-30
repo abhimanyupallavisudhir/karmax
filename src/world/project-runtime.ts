@@ -4,6 +4,7 @@ import { ProjectEnvironment } from '../store/project-environment.js';
 import { ProjectServices } from '../store/project-services.js';
 import { bootCommands, setupCommands } from './environment-build.js';
 import type { ProjectResourceService } from './resources.js';
+import { e2bTemplate } from './e2b-template.js';
 import { launchWorldServices } from './services.js';
 import { worldRepos, type World, type WorldHandle } from './types.js';
 
@@ -23,7 +24,7 @@ export async function selectProjectEnvironment(store: Store, projectId: string, 
   const spec = pinnedSpec ?? (await environments.spec(projectId));
   if (!spec) return { built: false, environment: base };
   const digest = environments.digest(spec);
-  const build = (await environments.readyBuild(projectId, provider, digest));
+  const build = (await environments.readyBuild(projectId, provider, digest, await environmentBase(store, projectId, provider)));
   if (build?.ref && build.ref !== 'host') return {
     spec, digest, built: true,
     environment: { ...base, ...(provider === 'container' ? { image: build.ref } : { snapshot: build.ref }) },
@@ -33,6 +34,14 @@ export async function selectProjectEnvironment(store: Store, projectId: string, 
   // portable there.
   const image = spec.image && (provider === 'container' || provider === 'daytona') ? spec.image : undefined;
   return { spec, digest, built: false, environment: image ? { ...base, image } : base };
+}
+
+/** The provider template a new environment build for this project would start
+ * from (E2B only): the one its task worlds boot from without an environment. */
+export async function environmentBase(store: Store, projectId: string, provider: string): Promise<string | undefined> {
+  if (provider !== 'e2b') return undefined;
+  const organizationId = (await store.getProject(projectId))?.organizationId;
+  return e2bTemplate(organizationId ? (await store.getWorldProviderConnection(organizationId, 'e2b'))?.config.template : undefined);
 }
 
 export async function snapshotProjectRuntime(store: Store, projectId: string): Promise<{

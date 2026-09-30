@@ -16,6 +16,7 @@ import ts from 'typescript';
 import * as environmentBuilder from '../src/world/environment-build.js';
 import * as environmentRecords from '../src/store/project-environment.js';
 import { selectProjectEnvironment } from '../src/world/project-runtime.js';
+import { DEFAULT_E2B_TEMPLATE } from '../src/world/e2b-template.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 
 // Bodies passed to page.evaluate run in the page; this file has no DOM lib.
@@ -293,6 +294,25 @@ describe('environment builds across project transfers', () => {
     expect((await environments.readyBuild(f.project.id, 'e2b', digest))?.ref).toBe('new-snapshot');
   });
 
+  it('records the template an E2B build started from and marks builds made on another one stale', async () => {
+    const f = await fixture();
+    const environments = new environmentRecords.ProjectEnvironment(f.store);
+    const digest = environments.digest((await environments.setSpec(f.project.id, { setup: ['echo test'] })));
+    const route = `/api/projects/${f.project.id}/environment`;
+    const stale = async () => ((await (await f.request(route)).json()) as any).builds.map((build: any) => build.stale ?? false);
+    // Made before builds recorded their base: E2B's stock image, not a task-world template.
+    (await environments.recordBuild(f.project.id, { organizationId: f.source.id, transferGeneration: '', provider: 'e2b', digest,
+      buildId: 'legacy', status: 'ready', ref: 'stock-snapshot' }));
+    expect(await stale()).toEqual([true]);
+    expect((await selectProjectEnvironment(f.store, f.project.id, 'e2b', undefined)).built).toBe(false);
+    vi.spyOn(environmentBuilder, 'buildEnvironment').mockResolvedValueOnce({ ref: 'rebuilt-snapshot', base: DEFAULT_E2B_TEMPLATE });
+    expect((await f.request(route + '/build', { provider: 'e2b' })).status).toBe(202);
+    await expect.poll(async () => (await environments.builds(f.project.id))[0]?.status).toBe('ready');
+    expect((await environments.builds(f.project.id))[0]).toMatchObject({ ref: 'rebuilt-snapshot', base: DEFAULT_E2B_TEMPLATE });
+    expect(await stale()).toEqual([false]);
+    expect((await selectProjectEnvironment(f.store, f.project.id, 'e2b', undefined)).environment?.snapshot).toBe('rebuilt-snapshot');
+  });
+
   it('blocks active builds and duplicate launches, then invalidates the old preview when the build finishes', async () => {
     const f = await fixture();
     const environments = new environmentRecords.ProjectEnvironment(f.store);
@@ -344,7 +364,7 @@ describe('environment builds across project transfers', () => {
     await move(f.destination.id);
     if (roundTrip) await move(f.source.id);
     expect((await f.request(buildRoute, { provider: 'e2b' })).status).toBe(202);
-    current.resolve({ ref: 'current-generation-snapshot' });
+    current.resolve({ ref: 'current-generation-snapshot', base: DEFAULT_E2B_TEMPLATE });
     await expect.poll(async () => (await environments.readyBuild(f.project.id, 'e2b', digest))?.ref).toBe('current-generation-snapshot');
     const beforeCompletion = (await environments.builds(f.project.id));
     if (outcome === 'success') old.resolve({ ref: 'source-org-private-snapshot' });
