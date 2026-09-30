@@ -416,3 +416,17 @@ HTTPS origins are separated, stable keys exist, PostgreSQL and Temporal are
 durable, and the object-store profile is appropriate. Hosted projects cannot select worktree,
 memory, or Docker worlds, so repository code never executes in the control-plane
 container.
+
+The Linux deployment runs Caddy on the host network so IPv6 connections keep
+their real peer addresses (Docker's userland proxy would present every IPv6
+client as one bridge address). The app publishes port 4505 on host loopback
+only, and `KARMAX_TRUSTED_PROXY_IP=gateway` makes it believe Caddy's overwritten,
+single-address X-Forwarded-For only from its own bridge gateway, where host
+connections to that port arrive from. No subnet is pinned, so an update never
+rebuilds the Compose network. Host-local processes are trusted at this boundary.
+Never expose port 4505 publicly or trust an entire proxy subnet. Other installs
+ignore forwarded headers unless `KARMAX_TRUSTED_PROXY_IP` names an exact proxy
+address. The gateway groups IPv6 clients by /64 for login lockout and hosted
+request budgets; Caddy also enforces its per-address edge budgets. These budgets
+are per replica. Host-network Caddy binds ports 80 and 443 itself, so a host
+firewall must allow them (Docker's published ports used to bypass it).

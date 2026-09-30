@@ -1,3 +1,4 @@
+import { clientAddress, ClientRequestLimits } from './client-address.js';
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
 import type { PasskeyCredential } from '../autonomy/passkey.js';
 import { ExecutionOutput } from './execution-output.js';
@@ -606,6 +607,7 @@ export class Gateway {
   private requestGuards = new WeakMap<http.IncomingMessage, () => Promise<void>>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number }>();
+  private requestLimits = new ClientRequestLimits();
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
    *  directly, so without this a password could be guessed online. */
@@ -1020,9 +1022,7 @@ export class Gateway {
   }
 
   private clientAddress(req: http.IncomingMessage): string {
-    // Only a hosted cell sits behind a proxy whose forwarded header is trustworthy.
-    const forwarded = this.deps.hosted ? String(req.headers['x-forwarded-for'] ?? '').split(',')[0]!.trim() : '';
-    return forwarded || req.socket.remoteAddress || 'unknown';
+    return clientAddress(req);
   }
   private loginBlocked(keys: string[]): boolean {
     const now = Date.now();
@@ -1585,6 +1585,8 @@ export class Gateway {
         { 'cache-control': 'no-store', 'content-length': '0' });
       return void res.end();
     }
+    if (this.deps.hosted && !p.startsWith('/api/health/') && !this.requestLimits.allow(this.clientAddress(req), p))
+      return this.json(res, 429, { error: 'too many requests; try again later' });
     if (p.startsWith('/share/conversations/')) {
       const share = req.method === 'GET' ? (await publicShare(this.deps.store, p.slice('/share/conversations/'.length))) : undefined;
       const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));

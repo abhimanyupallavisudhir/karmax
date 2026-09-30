@@ -219,6 +219,33 @@ wait_ready() {
   done
 }
 
+# Caddy is the only way in, so "ready" means a request crosses it: the host's
+# own HTTPS to this domain, answered by the app's readiness route. -k because
+# the question is whether the edge reaches the app, not whether the certificate
+# is publicly trusted; --resolve keeps DNS out of it.
+edge_answers() {
+  domain=$(env_value KARMAX_DOMAIN)
+  [ -n "$domain" ] && command -v curl >/dev/null 2>&1 || return 1
+  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$domain:443:127.0.0.1" \
+    "https://$domain/api/health/ready" 2>/dev/null) || code=000
+  [ "$code" = 200 ]
+}
+
+wait_edge() {
+  note 'Waiting for the public edge (Caddy) to reach the control plane…'
+  attempt=0
+  until edge_answers; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 30 ]; then
+      dc ps caddy || true
+      dc logs --tail=50 caddy >&2 || true
+      echo "karmax: https://$(env_value KARMAX_DOMAIN) no longer answers through Caddy; its logs are above" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 print_finish() {
   domain=$(env_value KARMAX_DOMAIN)
   preview=$(env_value KARMAX_PREVIEW_DOMAIN)
@@ -664,13 +691,22 @@ cmd_update() {
     die "deployment $target could not boot on this vault (see the vault preflight above); production remains at $previous. Fix what it reported first"
   fi
 
+  # An update must not break an edge that worked before it (a release can move
+  # Caddy's ports or how it reaches the app). One that could not answer yet (no
+  # certificate or DNS) does not gate the release.
+  edge_before=0
+  if edge_answers; then edge_before=1; fi
+  app_ready=0
   if dc up -d --remove-orphans && wait_ready; then
-    cleanup_migration
-    migration_backup=''
-    report_app_role || true
-    reclaim_space
-    note "Update complete at $target."
-    return 0
+    app_ready=1
+    if [ "$edge_before" = 0 ] || wait_edge; then
+      cleanup_migration
+      migration_backup=''
+      report_app_role || true
+      reclaim_space
+      note "Update complete at $target."
+      return 0
+    fi
   fi
 
   # Candidate startup can change durable data and advance Temporal histories.
@@ -678,6 +714,9 @@ cmd_update() {
   # data. Preserve the candidate/data and stop serving instead; recovery must
   # repair forward or explicitly restore a coordinated pre-update backup.
   if [ "$previous_epoch" != "$target_epoch" ]; then
+    # A healthy app behind a broken edge keeps working its tasks; stopping it
+    # would only add to the outage.
+    [ "$app_ready" = 0 ] || die "deployment $target runs across data epochs $previous_epoch -> $target_epoch, but https://$(env_value KARMAX_DOMAIN) no longer answers through Caddy; code-only rollback refused, app left running. Repair the edge forward (./deploy/karmax logs caddy)"
     dc stop app || die "deployment $target failed across data epochs; could not stop the app; manual recovery required"
     die "deployment $target failed across data epochs $previous_epoch -> $target_epoch; app stopped, data retained, code-only rollback refused. Repair forward or restore the pre-update backup at $destination with its matching code and Temporal history"
   fi
@@ -687,7 +726,7 @@ cmd_update() {
   note "Deployment $target failed; rolling back to $previous…"
   git -C "$ROOT_DIR" checkout --detach "$previous"
   restore_migration
-  if dc build app && dc up -d --remove-orphans && wait_ready; then
+  if dc build app && dc up -d --remove-orphans && wait_ready && { [ "$edge_before" = 0 ] || wait_edge; }; then
     cleanup_migration
     migration_backup=''
     die "deployment $target failed; production was restored to $previous"

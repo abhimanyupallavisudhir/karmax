@@ -1,6 +1,6 @@
 {
 	on_demand_tls {
-		ask http://app:4505/api/tls/preview-allow
+		ask http://127.0.0.1:4505/api/tls/preview-allow
 	}
 }
 
@@ -65,7 +65,9 @@
 	# so a page added later is not left unprotected. Previews are exempt: they
 	# serve people's own apps on their own origins.
 	header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
-	reverse_proxy app:4505
+	reverse_proxy 127.0.0.1:4505 {
+		header_up X-Forwarded-For {http.request.remote.host}
+	}
 }
 
 # People type the www host out of habit, and without this they get a
@@ -87,7 +89,9 @@ www.{$KARMAX_DOMAIN} {
 	import karmax_security
 	import karmax_ratelimit
 	handle /api/github/webhook {
-		reverse_proxy app:4505
+		reverse_proxy 127.0.0.1:4505 {
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
 	}
 	handle {
 		redir https://{$KARMAX_DOMAIN}{uri} permanent
@@ -112,7 +116,9 @@ https:// {
 	handle @preview {
 		import karmax_security
 		header Referrer-Policy no-referrer
-		reverse_proxy app:4505
+		reverse_proxy 127.0.0.1:4505 {
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
 	}
 	handle {
 		abort
