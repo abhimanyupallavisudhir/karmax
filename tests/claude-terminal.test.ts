@@ -71,6 +71,15 @@ const ctx: any = {
 describe('Claude Agent SDK terminal outcome contract', () => {
   beforeEach(() => { sdkState.messages = []; sdkState.options = undefined; sdkState.run = undefined; });
 
+  it('names each selected MCP connection that did not start, with its status', async () => {
+    sdkState.messages = [{ type: 'system', subtype: 'init', session_id: 's', mcp_servers: [
+      { name: 'chrome-devtools', status: 'failed' }, { name: 'linear', status: 'needs-auth' }, { name: 'github', status: 'connected' },
+    ] }, { type: 'result', subtype: 'success' }];
+    const agentMcp = ['chrome-devtools', 'linear', 'github', 'absent'].map((name) => ({ name, command: 'node' }));
+    await expect(new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, mcpConnections: [] }, agentMcp }, ctx))
+      .rejects.toThrow('MCP connections could not start: chrome-devtools (failed), linear (needs-auth), absent (missing). Check Agent tools settings.');
+  });
+
   it('passes explicit per-turn and profile caps to the SDK', async () => {
     sdkState.messages = [{ type: 'result', subtype: 'success' }];
     await new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, maxTurns: 7 } }, ctx);
