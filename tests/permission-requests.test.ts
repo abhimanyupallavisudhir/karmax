@@ -215,6 +215,8 @@ describe('agent permission approval requests', () => {
         (await f.store.saveView(f.task.id, f.view('failed')));
         expect((await f.service.requests({ status: 'pending' })).map((request) => request.id)).toEqual([f.pending.id]);
         expect((await f.store.listInbox('owner', f.organization.id)).map((item) => item.kind)).toContain('approval-requested');
+        (await f.store.pruneStaleInbox()); // boot's discharge keeps the still-pending ask as well
+        expect((await f.store.listInbox('owner', f.organization.id)).map((item) => item.kind)).toContain('approval-requested');
         (await f.store.retentionSweep());
         expect((await f.service.requests({ status: 'pending' })).map((request) => request.id)).toEqual([f.pending.id]);
         (await f.store.saveView(f.task.id, f.view('cancelled')));

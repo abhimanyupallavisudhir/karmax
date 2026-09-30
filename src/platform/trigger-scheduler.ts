@@ -36,6 +36,14 @@ import {
  * state is re-derived from each dep's last recorded status. Runs in-process off
  * the same bus the self-heal loop uses (main.ts), so no new durable machinery.
  *
+ * **Dependencies are level-triggered, not only edge-triggered.** The lifecycle
+ * feed is the fast path, but a dependency must never hinge on one event being
+ * delivered: a manual Done that wrote its view without one left #367's
+ * dependents armed until the next reboot happened to re-derive them. So every
+ * `reconcileMs` the armed dependency triggers are re-derived from the store and
+ * fire on any rising edge the feed missed (a crash between commit and delivery,
+ * a writer in a process with no relay, a future writer that forgets).
+ *
  * **Cron catch-up is real, not aspirational.** `nextCronFire` is strictly after
  * the instant it is given, so nothing in the expression itself can express "the
  * 09:00 run you missed". The mark that makes it representable is
@@ -61,6 +69,9 @@ export interface TriggerSchedulerDeps {
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (h: unknown) => void;
   log?: (msg: string) => void;
+  /** How often armed dependency triggers are re-derived from the store
+   *  (default one minute; `0` disables — tests that count store reads). */
+  reconcileMs?: number;
 }
 
 /** The dispatcher outlives principal-token TTLs. Give each start its own bounded
@@ -107,6 +118,9 @@ const MAX_RETRY_MS = 60_000;
 const MAX_CATCHUP_WINDOW_MS = 7 * 24 * 3600 * 1000;
 /** Hard stop on the catch-up walk, so no expression can make boot pathological. */
 const MAX_CATCHUP_STEPS = 20_000;
+/** The dependency safety net's period: the longest a missed lifecycle event can
+ *  delay a dependent. Each pass costs one indexed read per armed dependency. */
+const DEPENDENCY_RECONCILE_MS = 60_000;
 
 export class TriggerScheduler {
   private armed = new Map<string, ArmedEntry>();
@@ -115,6 +129,7 @@ export class TriggerScheduler {
   private epoch = 0;
   private versions = new Map<string, number>();
   private unsub?: () => void;
+  private reconcileTimer?: unknown;
   private now: () => number;
   private setTimer: (fn: () => void, ms: number) => unknown;
   private clearTimer: (h: unknown) => void;
@@ -130,20 +145,11 @@ export class TriggerScheduler {
 
   /** Subscribe to the bus and re-arm every stored armed task (call once on boot). */
   async start(): Promise<void> {
-    const startEpoch = this.epoch;
-    for (const task of (await this.deps.store.listArmedTasks())) {
-      // A stored task can have become invalid since it was armed — most often a
-      // dependency task that has since been deleted. Boot must never die on one
-      // bad row, so the refusal is logged per task and the rest still arm.
-      try {
-        if (this.epoch !== startEpoch) return;
-        (await this.arm(task));
-      } catch (e) {
-        this.log(`refusing to arm ${task.id}: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
-    if (this.epoch !== startEpoch) return;
     const epoch = this.epoch;
+    // Subscribe BEFORE re-arming. Arming reads each dependency's status and
+    // registers the entry; a dependency that finished between that read and a
+    // later subscription reached nobody, so its dependent waited for the next
+    // boot. Subscribed first, the event finds the entry arm() just registered.
     this.unsub = this.deps.bus.onAny(ev => {
       // Do not retain high-volume output or perform attribution reads unless
       // an already-armed trigger could consume this event. Capture entry
@@ -158,8 +164,51 @@ export class TriggerScheduler {
       this.eventTail = next.catch(error => this.log(`trigger event failed: ${String(error)}`));
       return next;
     });
+    for (const task of (await this.deps.store.listArmedTasks())) {
+      // A stored task can have become invalid since it was armed — most often a
+      // dependency task that has since been deleted. Boot must never die on one
+      // bad row, so the refusal is logged per task and the rest still arm.
+      try {
+        if (this.epoch !== epoch) return;
+        (await this.arm(task));
+      } catch (e) {
+        this.log(`refusing to arm ${task.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    if (this.epoch !== epoch) return;
+    this.scheduleDependencyReconcile(epoch);
     const n = this.armed.size;
     if (n) this.log(`trigger dispatcher armed ${n} task(s)`);
+  }
+
+  /** Re-derive dependency triggers from the store periodically (see the class
+   *  comment). Serialized with event routing so the two never interleave. */
+  private scheduleDependencyReconcile(epoch: number): void {
+    const every = this.deps.reconcileMs ?? DEPENDENCY_RECONCILE_MS;
+    if (!(every > 0)) return;
+    this.reconcileTimer = this.setTimer(async () => {
+      if (this.epoch !== epoch) return;
+      const pass = this.eventTail.then(() => this.epoch === epoch ? this.reconcileDependencies() : undefined);
+      this.eventTail = pass.catch(error => this.log(`dependency reconciliation failed: ${String(error)}`));
+      await this.eventTail;
+      if (this.epoch === epoch) this.scheduleDependencyReconcile(epoch);
+    }, every);
+  }
+
+  /** Fire every armed entry whose dependencies became satisfied without the
+   *  lifecycle feed saying so. Rising edges only, exactly like an event: a
+   *  repeatable series whose dependency simply stays done must not re-run. */
+  private async reconcileDependencies(): Promise<void> {
+    for (const entry of this.armed.values()) {
+      if (entry.fired || !entry.triggers.some((t) => t.kind === 'dependency')) continue;
+      const satisfied = (await this.satisfiedDependencies(entry));
+      if (this.armed.get(entry.task.id) !== entry || entry.fired) continue;
+      const missed = [...satisfied].filter((dep) => !entry.satisfiedDeps.has(dep));
+      entry.satisfiedDeps = satisfied;
+      if (!missed.length) continue;
+      this.log(`dependency reconciliation: ${missed.join(', ')} finished without a lifecycle event reaching ${entry.task.id}`);
+      this.evaluate(entry);
+    }
   }
 
   private async organizationOfTask(taskId: string, task?: TaskRecord): Promise<string | undefined> {
@@ -191,6 +240,8 @@ export class TriggerScheduler {
     this.epoch++;
     this.unsub?.();
     this.unsub = undefined;
+    if (this.reconcileTimer !== undefined) this.clearTimer(this.reconcileTimer);
+    this.reconcileTimer = undefined;
     for (const e of this.armed.values()) for (const t of e.timers) this.clearTimer(t);
     this.armed.clear();
     await this.eventTail;
@@ -255,7 +306,13 @@ export class TriggerScheduler {
   }
 
   private async refreshDependencies(entry: ArmedEntry): Promise<void> {
-    entry.satisfiedDeps.clear();
+    entry.satisfiedDeps = (await this.satisfiedDependencies(entry));
+  }
+
+  /** The declared dependency ids whose logical task is currently in the state
+   *  its trigger waits for, read from the store (never from event history). */
+  private async satisfiedDependencies(entry: ArmedEntry): Promise<Set<string>> {
+    const satisfied = new Set<string>();
     for (const trig of entry.triggers) {
       if (trig.kind !== 'dependency') continue;
       for (const dep of trig.tasks ?? []) {
@@ -263,9 +320,10 @@ export class TriggerScheduler {
         const status = group
           ? group.status
           : (await this.deps.store.taskMetadata(dep))?.lastView?.status;
-        if (status && statusSatisfiesDependency(trig.on, status)) entry.satisfiedDeps.add(dep);
+        if (status && statusSatisfiesDependency(trig.on, status)) satisfied.add(dep);
       }
     }
+    return satisfied;
   }
 
   disarm(taskId: string): void {
