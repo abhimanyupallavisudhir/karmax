@@ -5,7 +5,7 @@ import { ProjectServices } from '../store/project-services.js';
 import { bootCommands, setupCommands } from './environment-build.js';
 import type { ProjectResourceService } from './resources.js';
 import { launchWorldServices } from './services.js';
-import type { World, WorldHandle } from './types.js';
+import { worldRepos, type World, type WorldHandle } from './types.js';
 
 export interface ProjectEnvironmentSelection {
   spec?: ProjectEnvironmentSpec;
@@ -72,6 +72,17 @@ export async function activateProjectRuntime(args: {
         warnings.push(`environment command "${command}" failed: ${(result.stderr || result.stdout).slice(-300)}`);
     }
   }
+  // Dependency installs need the checkout, so no snapshot can hold them, and
+  // running them here would delay every task (~45 s for a typical Node project)
+  // though many never build or test. The agent runs them when it needs them.
+  const repos = worldRepos(world.handle);
+  const installs: Array<{ repository: string; root: string; commands: string[] }> = [];
+  for (const [name, commands] of Object.entries(selection.spec?.install ?? {})) {
+    const repo = repos.find((candidate) => candidate.name === name);
+    if (repo) installs.push({ repository: name, root: repo.root, commands });
+    else warnings.push(`environment install for "${name}" skipped: this world has no repository with that name`);
+  }
+  if (installs.length) world.handle.meta = { ...world.handle.meta, environmentInstall: installs };
 
   const declarations = args.services ?? (await new ProjectServices(args.store).list(args.projectId));
   const perWorld = declarations.filter((service) => service.kind === 'per-world');

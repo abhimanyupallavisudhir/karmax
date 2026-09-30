@@ -140,7 +140,9 @@ describe('Project settings browser source', () => {
     expect(source).toContain('Base image <small>(optional)</small>');
     expect(source).toContain('list="environment-image-options"');
     expect(source).toContain('python:3.13-slim');
-    expect(source).toContain('uv sync');
+    // Dependency installs need the checkout, so they are suggested per repository, not as build setup.
+    expect(source).toContain('id="environment-setup" rows="3" placeholder="sudo apt-get install -y postgresql-client"');
+    expect(source).toContain('placeholder="npm ci&#10;npx playwright install --with-deps chromium"');
     expect(source).toContain('uv run python manage.py migrate');
   });
 

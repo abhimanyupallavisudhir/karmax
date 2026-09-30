@@ -13474,7 +13474,8 @@ async function hydrateProjectServices(proj) {
 async function hydrateProjectEnvironment(proj) {
   const box = $('#project-environment-box'); if (!box) return;
   try {
-    const { spec, digest, builds } = await api(`/api/projects/${proj.id}/environment`);
+    const { spec, digest, builds, repositories = [] } = await api(`/api/projects/${proj.id}/environment`);
+    const installRepos = [...new Set([...repositories, ...Object.keys(spec?.install || {})])];
     const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div>${record.status === 'building' ? `<button class="btn sm" data-environment-recover="${esc(record.recoveryRevision)}">Recover abandoned build…</button>` : ''}</div>`;
     box.innerHTML = `<div class="inline-form"><button class="btn sm" id="environment-propose">Discover from repo</button><div id="environment-evidence"></div></div>
       <datalist id="environment-image-options">
@@ -13487,8 +13488,9 @@ async function hydrateProjectEnvironment(proj) {
       </datalist>
       <div class="project-form-grid">
         <label class="form-row wide"><span>Base image <small>(optional)</small></span><input id="environment-image" list="environment-image-options" value="${esc(spec?.image || '')}" placeholder="Use provider default"></label>
-        <label class="form-row wide"><span>Setup commands</span><textarea id="environment-setup" rows="4" placeholder="npm ci&#10;pip install -r requirements.txt&#10;uv sync">${esc((spec?.setup || []).join('\n'))}</textarea></label>
-        <label class="form-row wide"><span>Boot commands</span><textarea id="environment-boot" rows="3" placeholder="npm run db:migrate&#10;python manage.py migrate&#10;uv run python manage.py migrate">${esc((spec?.boot || []).join('\n'))}</textarea></label>
+        <label class="form-row wide"><span title="Baked into builds, before any repository is checked out">Setup commands</span><textarea id="environment-setup" rows="3" placeholder="sudo apt-get install -y postgresql-client">${esc((spec?.setup || []).join('\n'))}</textarea></label>
+        ${installRepos.map((name) => `<label class="form-row wide"><span title="Agents run these in ${esc(name)} before building or testing">Install in ${esc(name)}</span><textarea data-environment-install="${esc(name)}" rows="2" placeholder="npm ci&#10;npx playwright install --with-deps chromium">${esc((spec?.install?.[name] || []).join('\n'))}</textarea></label>`).join('')}
+        <label class="form-row wide"><span title="Runs as each task starts">Boot commands</span><textarea id="environment-boot" rows="3" placeholder="npm run db:migrate&#10;python manage.py migrate&#10;uv run python manage.py migrate">${esc((spec?.boot || []).join('\n'))}</textarea></label>
         <label class="switch form-row wide"><input id="environment-docker" type="checkbox" ${spec?.includeDocker ? 'checked' : ''}><span><b>Include Docker</b><small class="field-help">Required when per-task Services run as containers inside the world.</small></span></label>
       </div>
       <div class="project-form-actions"><button class="btn sm" id="environment-save">Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
@@ -13517,7 +13519,10 @@ async function hydrateProjectEnvironment(proj) {
       try {
         const proposal = await api(`/api/projects/${proj.id}/environment/proposal`);
         if (proposal.spec.image) $('#environment-image').value = proposal.spec.image;
-        if (proposal.spec.setup?.length) $('#environment-setup').value = proposal.spec.setup.join('\n');
+        for (const [name, commands] of Object.entries(proposal.spec.install || {})) {
+          const field = box.querySelector(`[data-environment-install="${CSS.escape(name)}"]`);
+          if (field) field.value = commands.join('\n');
+        }
         if (proposal.spec.includeDocker) $('#environment-docker').checked = true;
         $('#environment-evidence').innerHTML = proposal.evidence.length
           ? `<p class="task-sub">Evidence: ${proposal.evidence.map(esc).join(' · ')}</p>`
@@ -13529,6 +13534,8 @@ async function hydrateProjectEnvironment(proj) {
         await api(`/api/projects/${proj.id}/environment`, { method: 'PUT', body: JSON.stringify({
           image: $('#environment-image').value.trim() || undefined,
           setup: $('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
+          install: Object.fromEntries([...box.querySelectorAll('[data-environment-install]')].map((field) =>
+            [field.dataset.environmentInstall, field.value.split('\n').map((value) => value.trim()).filter(Boolean)])),
           boot: $('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
           includeDocker: $('#environment-docker').checked,
         }) }); toast('Environment recipe saved'); await hydrateProjectEnvironment(proj);
