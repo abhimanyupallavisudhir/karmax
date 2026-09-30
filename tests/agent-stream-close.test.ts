@@ -35,6 +35,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 }));
 
 const { ClaudeAdapter } = await import('../src/agent/claude.js');
+const { controlClient } = await import('./helpers/control-server.js');
 const { AgentChannelLost } = await import('../src/agent/limits.js');
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -52,13 +53,13 @@ interface Harness {
 function fakeHarness(script: (h: Harness) => AsyncGenerator<any>, { echo = true } = {}): { current?: Harness } {
   const handle: { current?: Harness } = {};
   sdk.query = (args: any) => {
-    const tools = new Map<string, any>((args.options.mcpServers.karmax_control.tools ?? []).map((t: any) => [t.name, t]));
+    const controls = controlClient(args.options.mcpServers.karmax_control);
     let inputClosed = false;
     const h: Harness = {
       get inputClosed() { return inputClosed; },
       async control(name, input) {
         if (inputClosed) throw new Error('Stream closed');
-        return (await tools.get(name)!.run(input)).content[0].text;
+        return (await controls).call(name, input);
       },
     };
     // The harness reads stdin until the SDK ends it (`transport.endInput()`), and, like
@@ -81,7 +82,7 @@ function fakeHarness(script: (h: Harness) => AsyncGenerator<any>, { echo = true 
   return handle;
 }
 
-async function runTurn(reviewInfos: ReviewInfo[]) {
+async function runTurn(reviewInfos: ReviewInfo[], extra: Partial<PlatformToolContext> = {}) {
   const ctx: PlatformToolContext = {
     openPr: () => {},
     signalCompletion: () => {},
@@ -99,6 +100,7 @@ async function runTurn(reviewInfos: ReviewInfo[]) {
     requestSpend: async () => ({ status: 'denied' as const }),
     emit: () => {},
     emitActivity: () => {},
+    ...extra,
   };
   const input: TurnInput = {
     profile: { id: 'do', name: 'do', provider: 'claude', role: 'do', capabilities: [] },
@@ -269,6 +271,48 @@ describe('Claude Agent-SDK input stream vs. the harness control channel', () => 
     expect(seen).toEqual([expect.not.stringMatching(/^error:/)]);
     expect(Date.now() - started).toBeLessThan(5_000); // closed at idle, not at the settle bound
   });
+
+  it('counts a follow-up read mid-turn as answered once the harness replays it', async () => {
+    // Task #438: a message sent while the agent works joins the running model turn.
+    // The real CLI (2.1.281) never names it in an assistant frame's
+    // `user_message_uuids`; it re-emits it as a replayed user frame when asked to
+    // (--replay-user-messages). Waiting for an assistant echo held every such turn
+    // open for the whole five-minute settle grace after the agent had finished.
+    let replays = false;
+    sdk.query = (args: any) => {
+      replays = args.options.extraArgs?.['replay-user-messages'] === null;
+      const consumed: any[] = [];
+      let arrived!: () => void;
+      let next = new Promise<void>((resolve) => { arrived = resolve; });
+      // Like the CLI, its output stays open until the adapter ends its input.
+      const inputEnded = (async () => { for await (const m of args.prompt) { consumed.push(m); arrived(); } })();
+      const wait = async () => { await next; next = new Promise<void>((resolve) => { arrived = resolve; }); };
+      return (async function* () {
+        yield { type: 'system', subtype: 'session_state_changed', state: 'running' };
+        await wait();
+        if (replays) yield { type: 'user', isReplay: true, uuid: consumed[0].uuid, message: consumed[0].message };
+        yield { type: 'system', subtype: 'init', session_id: 'sess-10' };
+        yield { type: 'assistant', user_message_uuids: [consumed[0].uuid], message: { content: [{ type: 'text', text: 'working' }] } };
+        await wait(); // the follow-up, queued while a tool runs
+        if (replays) yield { type: 'user', isReplay: true, uuid: consumed[1].uuid, message: consumed[1].message };
+        yield { type: 'assistant', message: { content: [{ type: 'text', text: 'done, noted' }] } };
+        yield { type: 'result', subtype: 'success', num_turns: 2, session_id: 'sess-10' };
+        yield { type: 'system', subtype: 'session_state_changed', state: 'idle' };
+        await inputEnded;
+      })();
+    };
+    let offered = false;
+    const pullFollowUps = async (from: number) => {
+      if (offered || from !== 1) return [];
+      offered = true;
+      return [{ id: 'm2', role: 'user' as const, ts: 1, text: 'also check the other tasks' }];
+    };
+    const started = Date.now();
+    const turn = await runTurn([], { pullFollowUps });
+    expect(offered).toBe(true);
+    expect(turn.output).toBe('done, noted');
+    expect(Date.now() - started).toBeLessThan(5_000); // closed at idle, not at the settle bound
+  }, 20_000);
 
   it('closes on the harness idle signal even when no result is pending', async () => {
     const h = fakeHarness(async function* () {

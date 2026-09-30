@@ -6,7 +6,8 @@ import path from 'node:path';
 import { z } from 'zod';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { MESSAGES_API_TOOLS, buildSdkTools } from '../src/agent/claude.js';
+import { MESSAGES_API_TOOLS, controlMcpServer } from '../src/agent/claude.js';
+import { controlClient } from './helpers/control-server.js';
 import { CodexAdapter, RESPONSES_API_TOOLS, codexDynamicTools, ensureLocalCodexSessionTools } from '../src/agent/codex.js';
 import {
   CONTROL_SERVER_NAME,
@@ -43,8 +44,6 @@ const CONTROL_NAMES = [...SDK_CONTROL_TOOL_NAMES].sort();
  *  end-to-end (spawn the real stdio MCP child and ask it for tools/list). */
 type Rail = { rail: string; names: () => Promise<string[]> };
 
-const fakeTool = (name: string, description: string, shape: Record<string, any>, run: any) =>
-  ({ name, description, shape, run });
 const allHandlers = Object.fromEntries(TOOL_SCHEMAS.map((t) => [t.name, async () => 'ok'])) as any;
 
 /** Connect a real MCP client to the bridge's real child process. */
@@ -69,10 +68,10 @@ describe('turn-local control tools reach every rail', () => {
   const rails: Rail[] = [
     // ── in-process / protocol-native rails ────────────────────────────────────
     { rail: 'claude messages API', names: async () => MESSAGES_API_TOOLS.map((t) => t.name) },
-    { rail: 'claude agent SDK (local)', names: async () => buildSdkTools(fakeTool as any, z, allHandlers).map((d: any) => d.name) },
+    { rail: 'claude agent SDK (local)', names: async () => (await controlClient(controlMcpServer(z, allHandlers))).names() },
     {
       rail: 'claude agent SDK (remote world)',
-      names: async () => buildSdkTools(fakeTool as any, z, allHandlers, PLATFORM_TOOL_SCHEMAS).map((d: any) => d.name),
+      names: async () => (await controlClient(controlMcpServer(z, allHandlers, PLATFORM_TOOL_SCHEMAS))).names(),
     },
     { rail: 'codex responses API', names: async () => RESPONSES_API_TOOLS.map((t) => t.name) },
     { rail: 'codex app-server (local)', names: async () => codexDynamicTools(false).map((t) => t.name) },
@@ -147,7 +146,7 @@ describe('control bridge (codex exec / ACP transport)', () => {
   });
 
   it('serves only the controls whose handler this turn actually has', async () => {
-    // Defensive parity with buildSdkTools: a handler map missing an entry must not
+    // Defensive parity with controlMcpServer: a handler map missing an entry must not
     // advertise that tool, so the model can never call a door that isn't wired.
     const handlers: any = platformToolHandlers({} as any, { emit() {}, emitActivity() {} } as any);
     delete handlers.confirm_decision;
