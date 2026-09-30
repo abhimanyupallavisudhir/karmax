@@ -16,6 +16,7 @@ import { Store } from '../src/store/db.js';
 import { storeBackends } from './helpers/store-backends.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { EntitlementQueueReconciler } from '../src/platform/entitlement-queue-reconciler.js';
+import { usageAdmissionId } from '../src/domain/turn-admission.js';
 
 describe.each(storeBackends)('hosted plan entitlements ($name)', ({ name, open }) => {
   it.skipIf(name !== 'SQLite')('keeps launch pricing and limits in one billing-safe catalog', () => {
@@ -260,6 +261,30 @@ describe.each(storeBackends)('hosted agent-run admission integration ($name)', (
     expect(signals).not.toContainEqual(expect.objectContaining({ name: 'cancelAgentSlot' }));
     expect((await store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(staleTurn)))
       .toEqual({ state: 'released' });
+  });
+
+  // Audit R-7: a retried turn's admission is `<turn>:attempt:N`, while the task
+  // view names the plain turn. The reconciler released every retried live turn.
+  it('keeps the admission of a live turn on a retried attempt', async () => {
+    const store = (await open({ hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Retried', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Product', {}, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Retried turn', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'Run' } }));
+    const turnId = `${task.id}#0`;
+    const retried = usageAdmissionId(turnId, 2);
+    expect(retried).toBe(`${turnId}:attempt:2`);
+    (await store.admitAgentUsage({ id: retried, organizationId: organization.id,
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' }));
+    const queueHandle = { signal: vi.fn(async () => undefined), query: vi.fn(async () => ({ capacity: 1,
+      current: [{ taskId: task.id, turnId, role: 'do' }], queue: [] })) };
+    const client = { workflow: { getHandle: vi.fn((id: string) => id === `agent-queue:${organization.id}`
+      ? queueHandle : { query: vi.fn(async () => ({ status: 'active', agentTurn: { turnId, state: 'running' } })) }) } } as any;
+
+    await new EntitlementQueueReconciler({ store, client, intervalMs: 0 }).reconcileOrganization(organization.id);
+
+    expect((await store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(retried)))
+      .toEqual({ state: 'active' });
   });
 
   it('preserves queue and usage leases when task ownership cannot be queried', async () => {

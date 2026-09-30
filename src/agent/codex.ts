@@ -32,6 +32,7 @@ import {
   ProviderPolicyFailure,
   isProviderPolicyRejection,
   type ProviderFailureMetadata,
+  SandboxProviderFailure,
 } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { activityDetail, codexItemActivity, toolActivityDetail } from './activity.js';
@@ -153,9 +154,9 @@ export class CodexAdapter implements AgentAdapter {
     try { return await this.runSubscriptionWithRecovery(input, ctx); }
     catch (error) {
       // A sandbox controls its PTY bytes. Preserve its turn failure, but shared
-      // account health must come from a host-side provider request or probe.
+      // account health must come from a host-side check (confirmSandboxFailure).
       if (isRemoteAgentWorld(input.world) && (error instanceof ProviderFailure || error instanceof ProviderStreamError))
-        throw new Error(error.message, { cause: error });
+        throw new SandboxProviderFailure(error);
       throw error;
     }
   }

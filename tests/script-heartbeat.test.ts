@@ -27,7 +27,12 @@ it('WF-26: scripts heartbeat while their world command runs and clear the timer'
   } finally {
     release({ code: 0, stdout: 'done', stderr: '' });
     await run;
-    expect(vi.getTimerCount()).toBe(0);
+    // The script's own heartbeat timer is cleared: no beat after it finished.
+    // (Not vi.getTimerCount(): that also counts timers other files' leftover
+    // background work creates while this window fakes them, and flaked in CI.)
+    const beats = heartbeat.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(heartbeat).toHaveBeenCalledTimes(beats);
     vi.useRealTimers(); context.mockRestore(); await store.close();
   }
 });

@@ -539,7 +539,9 @@ export class ProjectResourceService {
 
   /** Write every leased file secret (`changedOnly`: only those whose target or
    * value differs from what this process last wrote, so a running agent's own
-   * edits survive until the project value actually changes). */
+   * edits survive until the project value actually changes). The cache is this
+   * process's alone: a file another process scrubbed, or the agent deleted, is
+   * written again (audit R-9). */
   private async writeSecretFiles(world: World, changedOnly: boolean): Promise<void> {
     for (const lease of (await this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1))) {
       if (lease.state !== 'active') continue;
@@ -549,7 +551,8 @@ export class ProjectResourceService {
       const value = await this.resolveSecret(attachment, lease.taskId);
       const key = `${writtenPrefix(world.handle)}${attachment.id}`;
       const digest = sha256(Buffer.from(`${target}\0${value}`));
-      if (changedOnly && this.writtenSecrets.get(key) === digest) continue;
+      if (changedOnly && this.writtenSecrets.get(key) === digest
+        && (await world.exec('test', ['-e', target], { cwd: world.handle.root }).catch(() => undefined))?.code === 0) continue;
       await world.writeFile(target, value);
       await world.exec('chmod', ['600', target], { cwd: world.handle.root });
       await ensureWorldExcluded(world, target);
