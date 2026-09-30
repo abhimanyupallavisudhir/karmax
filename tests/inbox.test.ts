@@ -12,6 +12,10 @@ import { storeBackends, type StoreBackend } from './helpers/store-backends.js';
  * as review requests, and nothing was ever removed once it had been answered.
  */
 
+/** These views stand in for a workflow's publication, whose events (or, for
+ * legacy databases, inbox rows) the tests write themselves. */
+const PUBLISHED = { lifecycleEvent: false };
+
 async function fixture(open: StoreBackend['open']) {
   const store = (await open());
   const organization = (await store.createOrganization({ name: 'Team', ownerUserId: 'owner' }));
@@ -26,7 +30,7 @@ async function fixture(open: StoreBackend['open']) {
   const view = async (patch: Record<string, unknown>) => {
     const next = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
       messages: [], actions: [], state: {}, updatedAt: Date.now(), ...patch } as any;
-    (await store.saveView(task.id, next));
+    (await store.saveView(task.id, next, undefined, undefined, undefined, PUBLISHED));
     (await store.appendEvent({ taskId: task.id, type: 'view.updated', ts: Date.now(), payload: {
       stage: next.stage, status: next.status, waitingFor: next.waitingFor?.kind ?? null,
     } }));
@@ -42,7 +46,7 @@ async function fixture(open: StoreBackend['open']) {
     }));
     const next = { taskId: extra.id, title, workflow: 'software-dev', stage: 'do', status: 'active',
       messages: [], actions: [], state: {}, updatedAt: Date.now(), ...patch } as any;
-    (await store.saveView(extra.id, next));
+    (await store.saveView(extra.id, next, undefined, undefined, undefined, PUBLISHED));
     return { task: extra, next };
   };
   return { store, organization, project, task, view, inbox, other };
@@ -186,9 +190,9 @@ describe.each(storeBackends)('inbox ($name)', ({ name, open }) => {
     const live = (await legacy.createTask({ projectId: project.id, title: 'Still going', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'go' }, createdBy: { kind: 'user', userId: 'owner' } }));
     const base = { taskId: task.id, title: 'Ship', workflow: 'software-dev', messages: [], actions: [], state: {}, updatedAt: 1 } as any;
-    (await legacy.saveView(task.id, { ...base, stage: 'done', status: 'done' }));
+    (await legacy.saveView(task.id, { ...base, stage: 'done', status: 'done' }, undefined, undefined, undefined, PUBLISHED));
     (await legacy.saveView(live.id, { ...base, taskId: live.id, stage: 'review', status: 'waiting',
-      waitingFor: { kind: 'human', audience: ['@creator'] } }));
+      waitingFor: { kind: 'human', audience: ['@creator'] } }, undefined, undefined, undefined, PUBLISHED));
     // The shape older builds wrote: one row per event, none ever removed.
     (await legacy.db.exec('DROP INDEX idx_inbox_live'));
     for (let seq = 1; seq <= 40; seq++) {
@@ -294,7 +298,7 @@ describe.each(storeBackends)('inbox urgency ($name)', ({ name, open }) => {
       workflowVersion: '1.0.0', params: { prompt: 'ship it' }, createdBy: { kind: 'user', userId: 'owner' } }));
     (await before.saveView(task.id, { taskId: task.id, title: 'Ship', workflow: 'software-dev', stage: 'review',
       status: 'waiting', waitingFor: { kind: 'human', audience: ['@creator'] },
-      messages: [], actions: [], state: {}, updatedAt: 1 } as any));
+      messages: [], actions: [], state: {}, updatedAt: 1 } as any, undefined, undefined, undefined, PUBLISHED));
     (await before.db.prepare(`INSERT INTO inbox (id, organizationId, userId, eventSeq, taskId, kind, unread, actionable, createdAt)
       VALUES ('inbox_old', ?, 'owner', 1, ?, 'review-requested', 1, 1, 1000)`).run(organization.id, task.id));
     // Exactly the schema shipped before urgency existed.

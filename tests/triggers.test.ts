@@ -989,6 +989,64 @@ describe('TriggerScheduler (dispatcher)', () => {
     s.stop();
   });
 
+  // A dependency must never hinge on one lifecycle event arriving: a manual
+  // Done that wrote no event left #367's dependents armed until a reboot.
+  it('starts a dependent whose dependency finished without a lifecycle event', async () => {
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const b = (await armedTask([{ kind: 'dependency', tasks: [dep.id] }]));
+    const s = makeScheduler();
+    (await s.start());
+    (await store.saveView(dep.id, { taskId: dep.id, title: 'dep', workflow: 'just-do', stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 }));
+    (await clock.advance(59_999));
+    expect(fired).toHaveLength(0);
+    (await clock.advance(1));
+    await vi.waitFor(() => expect(fired).toEqual([[b.id, 'self']]));
+    expect(s.size).toBe(0);
+    s.stop();
+  });
+
+  it('reconciliation re-runs a repeatable dependency series once per completion, not once per pass', async () => {
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const series = (await store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', repeatable: true, triggers: [{ kind: 'dependency', tasks: [dep.id] }] } }));
+    (await store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' }));
+    const status = (value: 'active' | 'done') => store.saveView(dep.id, { taskId: dep.id, title: 'dep', workflow: 'just-do', stage: value === 'done' ? 'done' : 'do', status: value, messages: [], actions: [], state: {}, updatedAt: 1 });
+    const s = makeScheduler();
+    (await s.start());
+    (await status('done'));
+    (await clock.advance(60_000));
+    await vi.waitFor(() => expect(fired).toEqual([[series.id, 'clone']]));
+    (await clock.advance(120_000)); // still done: no new edge
+    (await emitDone(dep.id, 'done')); // nor from a late duplicate event
+    expect(fired).toHaveLength(1);
+    (await status('active'));
+    (await clock.advance(60_000));
+    (await status('done'));
+    (await clock.advance(60_000));
+    await vi.waitFor(() => expect(fired).toEqual([[series.id, 'clone'], [series.id, 'clone']]));
+    s.stop();
+  });
+
+  it('hears a dependency that finishes while boot is still arming', async () => {
+    const dep = (await store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } }));
+    const b = (await armedTask([{ kind: 'dependency', tasks: [dep.id] }]));
+    const read = store.attemptPrincipalState.bind(store);
+    const s = new TriggerScheduler({ store, bus, reconcileMs: 0, fire: async (taskId, mode) => void fired.push([taskId, mode]) });
+    // Arming reads the dependency as still running; it finishes right after.
+    const spy = vi.spyOn(store, 'attemptPrincipalState').mockImplementationOnce(async (id) => {
+      const before = (await read(id));
+      (await store.saveView(dep.id, { taskId: dep.id, title: 'dep', workflow: 'just-do', stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 }));
+      void emitDone(dep.id);
+      return before;
+    });
+    try {
+      (await s.start());
+      await vi.waitFor(() => expect(fired).toEqual([[b.id, 'self']]));
+    } finally {
+      spy.mockRestore();
+      s.stop();
+    }
+  });
+
   it('fires a repeatable series once per event, not once per matching trigger', async () => {
     const series = (await store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0',
       params: { prompt: 'p', repeatable: true, triggers: [

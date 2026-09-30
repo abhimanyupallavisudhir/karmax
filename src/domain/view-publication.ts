@@ -165,6 +165,23 @@ export function lifecyclePublication(view: PublishedView): LifecyclePublication 
     state: { recoveryWorld: view.state?.recoveryWorld } };
 }
 
+/** The payload of a `view.updated` event: the task lifecycle feed that
+ * dependency triggers, the inbox, completion stamps, collaboration requests
+ * and live consoles follow. One builder, so every writer reports alike. */
+export function lifecycleEventPayload(view: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'agentTurn'>) {
+  return {
+    stage: view.stage,
+    status: view.status,
+    waitingFor: view.waitingFor?.kind ?? null,
+    waitingDetail: view.waitingFor?.detail ?? null,
+    waitingSummary: view.waitingFor?.summary ?? null,
+    waitingProvider: view.waitingFor?.provider ?? null,
+    waitingResetAt: view.waitingFor?.earliestResetAt ?? null,
+    agentTurn: view.agentTurn?.state ?? null,
+    agentRole: view.agentTurn?.role ?? null,
+  };
+}
+
 /** These waits still own live work or are about to enter a turn. */
 export function hasLiveWorldWork(view: Pick<TaskView, 'waitingFor'>): boolean {
   return view.waitingFor?.kind === 'agentSlot' || view.waitingFor?.kind === 'subagent'

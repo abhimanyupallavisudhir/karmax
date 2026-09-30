@@ -14,7 +14,7 @@ import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
-import { applyConversationPatch, conversationPage, hasLiveWorldWork, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
+import { applyConversationPatch, conversationPage, hasLiveWorldWork, lifecycleEventPayload, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -2451,17 +2451,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               agentTurn: { turnId: legacyAgentTurnId, role: args.role, provider: profile.provider, state },
             }
           : { ...prev, status: prev.status === 'waiting' ? 'active' : prev.status, waitingFor: undefined, agentTurn: undefined };
-        (await store.saveView(args.taskId, next));
+        (await store.saveView(args.taskId, next, undefined, undefined, undefined, { lifecycleEvent: false }));
         (await record(args.taskId, 'view.updated', {
-          stage: next.stage,
-          status: next.status,
-          waitingFor: next.waitingFor?.kind ?? null,
-          waitingDetail: next.waitingFor?.detail ?? null,
-          waitingSummary: next.waitingFor?.summary ?? null,
-          waitingProvider: next.waitingFor?.provider ?? null,
-          waitingResetAt: next.waitingFor?.earliestResetAt ?? null,
-          agentTurn: next.agentTurn?.state ?? null,
-          agentRole: next.agentTurn?.role ?? null,
+          ...lifecycleEventPayload(next),
           compatibility: 'legacy-agent-turn',
         }));
       };
@@ -5355,7 +5347,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await trace.mark(`queue.observed.${after?.state ?? 'released'}`));
         }
       }
-      if (!(await store.saveView(taskId, view, conversationReference, order, retain))) return;
+      // The publication below is this write's lifecycle event (and its fence).
+      if (!(await store.saveView(taskId, view, conversationReference, order, retain, { lifecycleEvent: false }))) return;
       await notifyChildSettlement(store, deps.client, view);
       if (view.status === 'done' || view.status === 'cancelled' || view.status === 'failed') {
         let runId: string | undefined;
@@ -5376,17 +5369,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (!claim.accepted) throw ApplicationFailure.nonRetryable('Another attempt cancelled this proposal at Merge admission', 'attempt-superseded');
       }
-      const publicationSeq = (await record(taskId, 'view.updated', {
-        stage: view.stage,
-        status: view.status,
-        waitingFor: view.waitingFor?.kind ?? null,
-        waitingDetail: view.waitingFor?.detail ?? null,
-        waitingSummary: view.waitingFor?.summary ?? null,
-        waitingProvider: view.waitingFor?.provider ?? null,
-        waitingResetAt: view.waitingFor?.earliestResetAt ?? null,
-        agentTurn: view.agentTurn?.state ?? null,
-        agentRole: view.agentTurn?.role ?? null,
-      }));
+      const publicationSeq = (await record(taskId, 'view.updated', lifecycleEventPayload(view)));
       let fence = `${publicationSeq}:${newId('publication')}`;
       // Legacy publishView performs maintenance inline. Its retry must retain
       // the FIRST publication's message boundary, including replies accepted

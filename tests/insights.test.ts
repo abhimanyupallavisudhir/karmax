@@ -19,8 +19,10 @@ async function seed() {
     await store.db.prepare('UPDATE tasks SET createdAt=? WHERE id=?').run(createdAt, created.id);
     return created;
   };
+  // A workflow's view; `publish` records its lifecycle events at chosen times.
   const view = (taskId: string, stage: string, status: string, extra: Record<string, unknown> = {}) =>
-    store.saveView(taskId, { taskId, stage, status, actions: [], messages: [], transcripts: {}, ...extra } as any);
+    store.saveView(taskId, { taskId, stage, status, actions: [], messages: [], transcripts: {}, ...extra } as any,
+      undefined, undefined, undefined, { lifecycleEvent: false });
   const publish = (taskId: string, ts: number, stage: string, status: string) =>
     store.appendEvent({ taskId, type: 'view.updated', ts, payload: { stage, status } });
   return { store, organization, other, web, api, foreign, task, view, publish };
