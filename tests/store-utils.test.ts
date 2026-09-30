@@ -43,7 +43,7 @@ describe('devcontainer JSONC parsing', () => {
     expect(doc.postCreateCommand).toBe('npm i --workspaces, [dev]');
     expect(doc.onCreateCommand).toEqual(['echo', 'x, ]']);
     // (a string command passes through verbatim; an array form is shell-quoted)
-    expect(parseDevcontainer(text).setup).toEqual([`echo 'x, ]'`, 'npm i --workspaces, [dev]']);
+    expect(parseDevcontainer(text).commands).toEqual([`echo 'x, ]'`, 'npm i --workspaces, [dev]']);
   });
 
   it('still removes genuine trailing commas and comments', () => {

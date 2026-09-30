@@ -233,4 +233,19 @@ describe('prompt assembly surfaces the multi-repo layout', () => {
     expect(out).not.toContain('spans');
     expect(out).toContain('Working directory: /w/t');
   });
+
+  it('gives a project agent the install commands to run before building or testing', () => {
+    const world = { kind: 'e2b', id: 't', root: '/w/t', branch: 'karmax/t', base: 'main', target: 'main',
+      repos: [{ name: 'only', repo: 'git@github.com:acme/only.git', root: '/w/t', branch: 'karmax/t', base: 'main' }],
+      meta: { projectId: 'p', environmentInstall: [
+        { repository: 'only', root: '/w/t', commands: ['npm ci', 'npx playwright install --with-deps chromium'] },
+      ] } } as any;
+    const out = assemblePrompt({ profile: profile(), role: 'do', task, world });
+    expect(out).toContain('Before building or running tests, install this project\'s toolchain once per task: '
+      + 'in /w/t run `npm ci && npx playwright install --with-deps chromium`.');
+    expect(out).toContain('Project Settings → Environment');
+    const bare = assemblePrompt({ profile: profile(), role: 'do', task, world: { ...world, meta: { projectId: 'p' } } });
+    expect(bare).not.toContain('Before building or running tests');
+    expect(bare).toContain('Project Settings → Environment');
+  });
 });

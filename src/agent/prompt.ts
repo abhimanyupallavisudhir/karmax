@@ -110,7 +110,7 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: worldWorkingDirectory(args.world),
-    worldRepos: describeRepos(args.world),
+    worldRepos: [describeRepos(args.world), describeEnvironment(args.world)].filter(Boolean).join('\n'),
     branch: args.world.branch,
     base: args.world.base,
     target,
@@ -126,6 +126,20 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
   // summary and file names, a failing stage's output — are quoted as data.
   for (const key of AGENT_AUTHORED_BINDINGS) if (values[key]) values[key] = untrustedBlock(key, values[key]);
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
+}
+
+/** The project's install commands, run on demand, and where a missing step
+ * belongs so later tasks get it. */
+function describeEnvironment(world: WorldHandle): string {
+  if (!world.meta?.projectId) return '';
+  const installs = Array.isArray(world.meta.environmentInstall)
+    ? world.meta.environmentInstall as Array<{ root: string; commands: string[] }> : [];
+  return [
+    ...(installs.length ? ['Before building or running tests, install this project\'s toolchain once per task: '
+      + installs.map((entry) => `in ${entry.root} run \`${entry.commands.join(' && ')}\``).join('; ') + '.'] : []),
+    'If this project is missing a toolchain step that every task needs (dependencies, browsers, CLIs), work around it, '
+      + 'then suggest the exact command for Project Settings → Environment in your final response so future tasks start ready.',
+  ].join(' ');
 }
 
 /**

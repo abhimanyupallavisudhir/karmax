@@ -185,7 +185,8 @@ describe('Project settings', () => {
   });
 
   it('keeps forms concise and offers optional base-image suggestions', async () => {
-    const ui = await settings();
+    const ui = await settings({ api: ({ method, path }) => method === 'GET' && path.split('?')[0]!.endsWith('/environment')
+      ? { spec: {}, builds: [], repositories: ['app'] } : undefined });
     await ui.page.locator('#environment-image').waitFor({ state: 'attached' });
     const text = await ui.page.locator('#main').innerText();
     for (const removed of [
@@ -200,10 +201,11 @@ describe('Project settings', () => {
     expect(await ui.page.locator('#environment-image').getAttribute('list')).toBe('environment-image-options');
     expect(await ui.page.locator('#environment-image-options option').evaluateAll((options) =>
       options.map((option) => (option as any).value))).toContain('python:3.13-slim');
-    const suggestions = (await ui.page.locator('#environment-setup, #environment-boot').evaluateAll((fields) =>
-      fields.map((field) => (field as any).placeholder))).join('\n');
-    expect(suggestions).toContain('uv sync');
-    expect(suggestions).toContain('uv run python manage.py migrate');
+    const placeholder = (selector: string) => ui.page.locator(selector).getAttribute('placeholder');
+    // Dependency installs need the checkout, so they are suggested per repository, not as build setup.
+    expect(await placeholder('#environment-setup')).toBe('sudo apt-get install -y postgresql-client');
+    expect(await placeholder('[data-environment-install="app"]')).toBe('npm ci\nnpx playwright install --with-deps chromium');
+    expect(await placeholder('#environment-boot')).toContain('uv run python manage.py migrate');
     await ui.close();
   });
 

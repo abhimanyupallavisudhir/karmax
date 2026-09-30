@@ -1626,11 +1626,17 @@ describe('gateway HTTP API (real server end-to-end)', () => {
 
     const proposal: any = await fetch(`${base}/api/projects/${project.id}/environment/proposal`, { headers: auth() })
       .then((response) => response.json());
-    expect(proposal.spec).toMatchObject({ image: 'node:22-slim', setup: ['npm run setup', 'npm ci'] });
+    const checkout = path.basename(repo);
+    expect(proposal.spec).toMatchObject({ image: 'node:22-slim', install: { [checkout]: ['npm run setup', 'npm ci'] } });
+    expect(proposal.spec.setup).toBeUndefined();
     const savedEnvironment = await fetch(`${base}/api/projects/${project.id}/environment`, {
       method: 'PUT', headers: auth(), body: JSON.stringify(proposal.spec),
     });
     expect(savedEnvironment.status).toBe(200);
+    expect((await savedEnvironment.json() as any).spec.install).toEqual({ [checkout]: ['npm run setup', 'npm ci'] });
+    const environment: any = await fetch(`${base}/api/projects/${project.id}/environment`, { headers: auth() })
+      .then((response) => response.json());
+    expect(environment.repositories).toEqual([checkout]);
 
     const compose: any = await fetch(`${base}/api/projects/${project.id}/services/compose-import`, { headers: auth() })
       .then((response) => response.json());
@@ -1648,6 +1654,49 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(secrets.suggestions).toEqual([]);
     expect(secrets.secrets.every((secret: any) => secret.credentialConfigured)).toBe(true);
     expect(JSON.stringify(secrets)).not.toContain('postgres://external');
+  });
+
+  it('proposes repository installs for a hosted project from its GitHub repositories', async () => {
+    const organization = (await h.store.createOrganization({ name: 'Hosted environment proposal' }));
+    const project = (await h.store.createProject('Hosted environment project', {}, organization.id));
+    const files: Record<string, unknown> = {
+      'package-lock.json': '{}',
+      'package.json': JSON.stringify({ devDependencies: { playwright: '1.63.0' } }),
+    };
+    const requested: string[] = [];
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/app/installations/321/access_tokens' && init.method === 'POST')
+        return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      const match = url.pathname.match(/^\/repos\/acme\/storefront\/contents\/(.*)$/);
+      if (match && new Headers(init.headers).get('authorization') === 'Bearer installation-token') {
+        const file = decodeURIComponent(match[1]!);
+        requested.push(file);
+        // GitHub omits content for files over 1 MB; a listing proves the lockfile exists.
+        if (file === '') return Response.json(Object.keys(files).map((name) => ({ name, type: 'file' })));
+        if (typeof files[file] === 'string')
+          return Response.json({ content: Buffer.from(files[file] as string).toString('base64'), encoding: 'base64' });
+      }
+      return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+    };
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+      privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
+    (await h.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
+    const githubApp = (await GitHubAppService.create(h.store, h.broker, { appId: '1', fetch: fakeFetch as typeof fetch }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '321', accountLogin: 'acme', accountType: 'Organization' }));
+    const repository = (await h.store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '500',
+      owner: 'acme', name: 'storefront', sshUrl: 'git@github.com:acme/storefront.git', defaultBranch: 'main', private: true,
+      gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id, baseBranch: 'main', targetBranch: 'main' }));
+    const hosted = await h.startGateway({ githubApp });
+
+    const session: any = await (await fetch(`${hosted.url}/api/session`)).json();
+    const proposal: any = await fetch(`${hosted.url}/api/projects/${project.id}/environment/proposal`,
+      { headers: { authorization: `Bearer ${session.token}` } }).then((response) => response.json());
+    expect(proposal.spec).toEqual({ install: { storefront: ['npm ci', 'npx playwright install --with-deps chromium'] } });
+    expect(proposal.evidence).toContain('storefront: "npm ci" (package-lock.json)');
+    expect(requested).not.toContain('package-lock.json');
   });
 
   it('migrates copyGlobs through the typed resource API and returns no secret values', async () => {
