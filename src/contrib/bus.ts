@@ -1,6 +1,8 @@
 import { EventEmitter } from 'node:events';
 import { KarmaxEvent } from '../domain/types.js';
 
+const DELIVERED_WINDOW = 4096;
+
 /**
  * In-process event bus. Activities push typed events here; the gateway streams
  * them to the UI over WebSocket. This is the transport layer (SPEC §3.3) — a
@@ -8,6 +10,8 @@ import { KarmaxEvent } from '../domain/types.js';
  */
 export class KarmaxBus {
   private ee = new EventEmitter();
+  /** Recently delivered event-log sequence numbers, oldest first. */
+  private delivered = new Set<number>();
   constructor() {
     this.ee.setMaxListeners(0);
   }
@@ -22,6 +26,15 @@ export class KarmaxBus {
    * is that consumer's problem.
    */
   emit(ev: KarmaxEvent & { seq?: number }): Promise<void> {
+    // A recorded event can arrive twice: from the writer that recorded it and
+    // from the store, which delivers every committed row (Store.onEventRecorded)
+    // so that no writer has to remember to. Subscribers see each row once. The
+    // window only has to span those two deliveries, microseconds apart.
+    if (ev.seq !== undefined) {
+      if (this.delivered.has(ev.seq)) return Promise.resolve();
+      this.delivered.add(ev.seq);
+      if (this.delivered.size > DELIVERED_WINDOW) this.delivered.delete(this.delivered.values().next().value!);
+    }
     const pending: Promise<unknown>[] = [];
     for (const channel of ['event', `task:${ev.taskId}`]) {
       for (const listener of this.ee.listeners(channel) as Array<(e: unknown) => unknown>) {

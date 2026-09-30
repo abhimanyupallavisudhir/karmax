@@ -82,6 +82,7 @@ import { newId } from '../util/id.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
+import { lifecycleEventPayload } from '../domain/view-publication.js';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -188,6 +189,7 @@ export class Store {
    hosted!: boolean;
   private userNames?: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>;
   private organizationEntitlementListeners = new Set<(organizationId: string) => unknown>();
+  private recordedEventListeners = new Set<(event: KarmaxEvent & { seq: number }) => unknown>();
 
   constructor(private readonly dbPath = ':memory:', options: { hosted?: boolean } = {}) {
   }
@@ -1629,6 +1631,18 @@ export class Store {
   onOrganizationEntitlementsChanged(listener: (organizationId: string) => unknown): () => void {
     this.organizationEntitlementListeners.add(listener);
     return () => this.organizationEntitlementListeners.delete(listener);
+  }
+
+  /**
+   * Observe every event this process records, once its row has committed. The
+   * composition root forwards them onto the in-process bus, which makes a
+   * recorded event reach local subscribers exactly as the event relay makes a
+   * foreign one reach them: no writer has to remember to emit. Writers that
+   * still emit by hand are harmless — the bus delivers each `seq` once.
+   */
+  onEventRecorded(listener: (event: KarmaxEvent & { seq: number }) => unknown): () => void {
+    this.recordedEventListeners.add(listener);
+    return () => this.recordedEventListeners.delete(listener);
   }
 
   private notifyOrganizationEntitlementsChanged(organizationId: string): void {
@@ -3522,7 +3536,8 @@ export class Store {
       messages: [], actions: [], state: { supersededBy: winnerId }, updatedAt: Date.now(),
     };
     (await this.updateTaskParams(taskId, { ...t.params, draft: false, archived: true }));
-    (await this.saveView(taskId, view));
+    // A draft never ran: closing it is bookkeeping, not a lifecycle to report.
+    (await this.saveView(taskId, view, undefined, undefined, undefined, { lifecycleEvent: false }));
   
     });
   }
@@ -3895,9 +3910,22 @@ export class Store {
     return Boolean(current?.conversationRef && conversationSupersedes(current.conversationRef, reference));
   }
 
-  /** Returns false, and changes nothing, for a publication `order` shows is stale. */
+  /**
+   * Store a task's view. Returns false, and changes nothing, for a publication
+   * `order` shows is stale.
+   *
+   * A write that changes the task's lifecycle (stage, status, wait, agent
+   * turn) also records the `view.updated` event for it, in the same
+   * transaction: every consumer of the lifecycle feed — dependency triggers,
+   * the inbox, completion stamps, collaboration requests, live consoles — must
+   * see a manual Done or a reconciliation exactly as it sees a workflow's own
+   * publication. Before this was the store's job, each writer
+   * had to remember, and a manual Done never started its dependents (#367).
+   * Only a caller that records the event itself passes `lifecycleEvent: false`.
+   * The recorded event reaches this process's bus through `onEventRecorded`.
+   */
   async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder,
-    retain?: string[]): Promise<boolean> {
+    retain?: string[], options?: { lifecycleEvent?: boolean }): Promise<boolean> {
     return this.db.transaction(async () => {
     if (order && !(await this.admitViewPublication(taskId, order))) return false;
 
@@ -3979,6 +4007,11 @@ export class Store {
     if (['done', 'cancelled', 'failed'].includes(view.status))
       (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:settled:${taskId}`, String(Date.now())));
     else (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:settled:${taskId}`));
+    const lifecycle = lifecycleEventPayload(view);
+    if (options?.lifecycleEvent !== false
+      && (!prev?.lastView || JSON.stringify(lifecycleEventPayload(prev.lastView)) !== JSON.stringify(lifecycle))) {
+      (await this.appendEvent({ type: 'view.updated', taskId, ts: Date.now(), payload: lifecycle }));
+    }
     return true;
 
     });
@@ -4195,7 +4228,8 @@ export class Store {
     // deleting it out from under the intent.
     if (prior && prior.id === prior.intentId && siblings.length > 1) {
       (await this.updateTaskParams(taskId, { ...prior.params, draft: false, archived: true }));
-      (await this.saveView(taskId, { taskId, title: prior.title, workflow: prior.workflow, stage: 'cancelled', status: 'cancelled', messages: [], actions: [], state: { deletedDraft: true }, updatedAt: Date.now() }));
+      (await this.saveView(taskId, { taskId, title: prior.title, workflow: prior.workflow, stage: 'cancelled', status: 'cancelled', messages: [], actions: [], state: { deletedDraft: true }, updatedAt: Date.now() },
+        undefined, undefined, undefined, { lifecycleEvent: false }));
       return;
     }
     // One transaction, and the SAME table set `deleteProject` clears. Five loose
@@ -4608,7 +4642,10 @@ export class Store {
       if (!(await this.hasPendingApprovals(task.id))) (await this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]));
       return;
     }
-    if (finished) (await this.deleteInbox('taskId=? AND actionable=1', [task.id]));
+    // A failed task keeps its approval asks: its requests stay pending, since
+    // recovery resumes it still waiting on them (WITHDRAW_REQUESTS_STATUS).
+    if (finished) (await this.deleteInbox(status === 'failed'
+      ? "taskId=? AND actionable=1 AND kind<>'approval-requested'" : 'taskId=? AND actionable=1', [task.id]));
     else if (ev.type === 'view.updated') {
       // The task is live again, so its last outcome has stopped being news — and
       // any ask it had parked on is answered unless it is STILL on a human.
@@ -4704,7 +4741,10 @@ export class Store {
     let dropped = 0;
     dropped += (await this.deleteInbox('subject IS NULL AND taskId NOT IN (SELECT id FROM tasks)', []));
     dropped += (await this.deleteInbox(`actionable=1 AND taskId IN (SELECT id FROM tasks
-      WHERE json_extract(lastView, '$.status') IN ('done', 'failed', 'cancelled'))`, []));
+      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled'))`, []));
+    // A failed task's pending approvals are still asks (answered ones go below).
+    dropped += (await this.deleteInbox(`actionable=1 AND kind<>'approval-requested' AND taskId IN (SELECT id FROM tasks
+      WHERE json_extract(lastView, '$.status')='failed')`, []));
     dropped += (await this.deleteInbox(`kind='update' AND taskId IN (SELECT id FROM tasks
       WHERE COALESCE(json_extract(lastView, '$.status'), 'setup') NOT IN ('done', 'failed', 'cancelled'))`, []));
     dropped += (await this.deleteInbox(`kind IN ('review-requested', 'escalated') AND taskId IN (SELECT id FROM tasks
@@ -5600,6 +5640,7 @@ export class Store {
       if (ev.type === 'view.updated' && ev.payload.status === 'done')
         (await this.db.prepare('UPDATE tasks SET completedAt=? WHERE id=? AND completedAt IS NULL').run(ev.ts, ev.taskId));
       (await this.materializeInbox(seq, ev));
+      for (const listener of this.recordedEventListeners) this.db.afterCommit(() => listener({ ...ev, seq }));
       if (!nested) (await this.db.exec('COMMIT'));
       return seq;
     } catch (error) {

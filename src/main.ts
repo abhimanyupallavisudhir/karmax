@@ -242,6 +242,10 @@ async function main() {
     await createExecutionServices({ store, client, broker, githubApp, p, deployment, provider, bootstrap: true,
       ...(separateWorker ? { coordinationDirectory: path.join(p.state, 'world-coordination') } : {}) });
   const bus = new KarmaxBus();
+  // Every event this process records reaches its subscribers once committed —
+  // including a manual Done's lifecycle change, which no writer emitted (#367).
+  // Other processes' rows arrive through the event relay below.
+  store.onEventRecorded((event) => bus.emit(event));
   const relayCursor = separateWorker ? await store.latestEventSeq() : undefined;
   // Installation-wide outbound email (account confirmation, password reset, org
   // invites). Reads its live config + vaulted secret on each send, so connecting

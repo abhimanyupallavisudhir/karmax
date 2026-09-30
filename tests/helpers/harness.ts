@@ -115,6 +115,7 @@ export async function bootHarness(
   if (adapterOverride) adapters.set(provider, adapterOverride);
   const profiles = new ProfileResolver(store, provider);
   const bus = new KarmaxBus();
+  store.onEventRecorded((event) => bus.emit(event)); // as src/main.ts wires it
   const contentDir = tempDir('karmax-content-');
   const vaultHome = tempDir('karmax-vault-');
   const objectHome = tempDir('karmax-objects-');
