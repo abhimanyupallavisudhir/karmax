@@ -1541,6 +1541,20 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     await put(orgUrl, { enabled: false });
   });
 
+  it('lists created Avatars with each caller-specific view', async () => {
+    const project = (await h.store.createProject('Listed Avatars'));
+    (await h.store.kvSet(`avatars:project:${project.id}`, 'enabled'));
+    const url = `${base}/api/projects/${project.id}/avatars`;
+    const created = await fetch(url, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Atlas', prompt: 'Help with project work.', runtime: { provider: 'mock' } }) });
+    expect(created.status).toBe(201);
+    const { id } = await created.json() as { id: string };
+    const listed: any = await (await fetch(url, { headers: auth() })).json();
+    expect(listed.avatars).toEqual([expect.objectContaining({
+      id, name: 'Atlas', effectiveEnabled: true, callable: true, canEdit: true, canDisable: true,
+    })]);
+  });
+
   it('allows delegated Avatar administration without widening the agent grant', async () => {
     const project = (await h.store.createProject('Delegated Avatars'));
     (await h.store.kvSet(`avatars:project:${project.id}`, 'enabled'));
@@ -2209,7 +2223,7 @@ esac
         }),
       })).json();
       expect(created.writeBack).toEqual([
-        { connector: 'pass', externalId: `karmax/${created.id}.login` },
+        { connector: 'pass', externalId: `tavya/${created.id}.login` },
       ]);
       expect(fs.readFileSync(entryFile, 'utf8')).toBe('initial\nusername: agent@example.com\n');
 
@@ -2240,7 +2254,7 @@ esac
         });
         expect(response.status).toBe(200);
         const saved: any = await response.json();
-        expect(saved.writeBack).toEqual([{connector:'pass',externalId:`karmax/${saved.itemId}.passkey`}]);
+        expect(saved.writeBack).toEqual([{connector:'pass',externalId:`tavya/${saved.itemId}.passkey`}]);
         expect(parsePassItem(fs.readFileSync(entryFile,'utf8')).secrets.passkey).toBe(JSON.stringify(credentials));
       } finally { harvest.mockRestore(); }
 

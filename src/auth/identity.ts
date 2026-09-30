@@ -9,6 +9,7 @@ import path from 'node:path';
 import { canonicalAccountName } from '../domain/account-names.js';
 import { openSqlDatabase, type SqlDatabase } from '../store/sql.js';
 import { importSqliteDatabase, type SqliteImportResult } from '../store/postgres-migration.js';
+import { BRAND, DEFAULT_SITE_NAME } from '../domain/brand.js';
 
 export interface IdentityUser {
   id: string;
@@ -33,7 +34,7 @@ export interface Mailer {
 
 /** A small, provider-agnostic HTML body for a one-action transactional email. */
 export function emailHtml(heading: string, body: string, cta: string, url: string, footer: string,
-  siteName = 'krmax'): string {
+  siteName = DEFAULT_SITE_NAME): string {
   const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
   return `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a">
   <div style="font-size:20px;font-weight:600;margin-bottom:16px">◇ ${esc(siteName)}</div>
@@ -182,7 +183,7 @@ export class IdentityService {
         console.error('[github] could not connect sign-in authorization:', error instanceof Error ? error.message : error);
       }
     };
-    const siteName = async () => (await opts.siteName?.()) || 'krmax';
+    const siteName = async () => (await opts.siteName?.()) || DEFAULT_SITE_NAME;
     this.auth = betterAuth({
       appName: (await siteName()),
       database: this.pool ?? { db: this.sqlite!, type: 'sqlite', transaction: true },
@@ -434,7 +435,7 @@ export class IdentityService {
   async bootstrap(input: { name: string; email: string; password: string }, headers?: Headers): Promise<{ response: Response; user: IdentityUser }> {
     return this.db.transaction(async () => {
 
-    if ((await this.hasUsers())) throw new Error('krmax has already been set up');
+    if ((await this.hasUsers())) throw new Error(`${BRAND} has already been set up`);
     const response = await this.auth.api.signUpEmail({
       body: { ...input, name: (await this.assertUserNameAvailable(input.name)) }, headers, asResponse: true });
     if (!response.ok) throw new Error((await response.clone().json().catch(() => ({})) as any)?.message ?? 'could not create account');

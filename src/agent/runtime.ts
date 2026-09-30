@@ -1,9 +1,33 @@
 import { currentTiming } from '../timing/index.js';
 import { AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
-import { AgentActivity, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { jobStatuses } from '../world/jobs.js';
+import { BRAND } from '../domain/brand.js';
 
 const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
+
+/** What a turn's tools recorded for the workflow to act on after the turn, plus
+ * how many workflow messages reached the agent mid-turn. Saved as each happens,
+ * so a retried activity attempt (worker restart, lost heartbeat) keeps every
+ * outcome of the attempt it replaces instead of silently dropping them. */
+export interface TurnJournal {
+  completed?: boolean;
+  openPrRequested?: boolean;
+  reviewInfo?: ReviewInfo;
+  resolution?: Transition;
+  confirmDecision?: ConfirmDecision;
+  raise?: RaiseToParent;
+  waitForSubtasks?: boolean;
+  wait?: AgentWait;
+  jobsStarted?: string[];
+  subTasks?: { title: string; prompt: string }[];
+  subTaskResponses?: SubTaskResponse[];
+  skills?: { name: string; content: string }[];
+  worldHandle?: import('../world/types.js').WorldHandle;
+  /** Absolute `msgs` index delivered so far (initial snapshot + mid-turn follow-ups). */
+  delivered?: number;
+}
 
 export interface RunTurnDeps {
   adapters: Map<Provider, AgentAdapter>;
@@ -36,6 +60,9 @@ export interface RunTurnDeps {
   /** Pull follow-up messages queued in the workflow at/after `fromIndex` so a
    *  streaming adapter can inject them into the live session mid-turn (SPEC §5.6). */
   pullFollowUps?: (fromIndex: number) => Promise<import('../domain/types.js').Message[]>;
+  /** Durable per-turn journal: `restored` is what an interrupted earlier attempt of
+   *  this same turn recorded; `save` must persist before the tool call returns. */
+  journal?: { restored?: TurnJournal; save(journal: TurnJournal): Promise<void> };
   /** Resolve the project's work-command secrets as they stand now, so a secret
    *  added, rotated or disabled in project settings reaches the running turn. */
   pullSecretEnv?: () => Promise<Record<string, string>>;
@@ -102,19 +129,43 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   const opaqueEnd = (await trace?.start('adapter.to-first-output.opaque'));
   const observedTools = new Map<string, Awaited<ReturnType<NonNullable<typeof trace>['start']>>>();
   const outputObserved = async () => { await Promise.all([trace?.markOnce('first.output'), opaqueEnd?.()]); };
-  let completed = false;
-  let openPrRequested = false;
-  let reviewInfo: ReviewInfo | undefined;
+  const restored = deps.journal?.restored ?? {};
+  let completed = restored.completed ?? false;
+  let openPrRequested = restored.openPrRequested ?? false;
+  let reviewInfo: ReviewInfo | undefined = restored.reviewInfo;
   let reviewPublication = Promise.resolve();
-  let resolution: Transition | undefined;
-  let confirmDecision: ConfirmDecision | undefined;
-  let raise: RaiseToParent | undefined;
-  let waitForSubtasks = false;
-  const subTasks: { title: string; prompt: string }[] = [];
-  const subTaskResponses: SubTaskResponse[] = [];
-  const skills: { name: string; content: string }[] = [];
+  let resolution: Transition | undefined = restored.resolution;
+  let confirmDecision: ConfirmDecision | undefined = restored.confirmDecision;
+  let raise: RaiseToParent | undefined = restored.raise;
+  let waitForSubtasks = restored.waitForSubtasks ?? false;
+  let wait: AgentWait | undefined = restored.wait;
+  const jobsStarted: string[] = [...(restored.jobsStarted ?? [])];
+  const subTasks: { title: string; prompt: string }[] = [...(restored.subTasks ?? [])];
+  const subTaskResponses: SubTaskResponse[] = [...(restored.subTaskResponses ?? [])];
+  const skills: { name: string; content: string }[] = [...(restored.skills ?? [])];
   // Set only if the agent partitioned its change across another branch this turn.
-  let worldHandle: import('../world/types.js').WorldHandle | undefined;
+  let worldHandle: import('../world/types.js').WorldHandle | undefined = restored.worldHandle;
+  let delivered = restored.delivered;
+  // Saves are serialized so a later snapshot can never be overwritten by an earlier one.
+  let journalSaves = Promise.resolve();
+  const journal = (): Promise<void> => {
+    if (!deps.journal) return Promise.resolve();
+    const snapshot: TurnJournal = {
+      ...(completed ? { completed } : {}), ...(openPrRequested ? { openPrRequested } : {}),
+      ...(reviewInfo ? { reviewInfo } : {}), ...(resolution ? { resolution } : {}),
+      ...(confirmDecision ? { confirmDecision } : {}), ...(raise ? { raise } : {}),
+      ...(waitForSubtasks ? { waitForSubtasks } : {}),
+      ...(wait ? { wait } : {}), ...(jobsStarted.length ? { jobsStarted: [...jobsStarted] } : {}),
+      ...(subTasks.length ? { subTasks: [...subTasks] } : {}),
+      ...(subTaskResponses.length ? { subTaskResponses: [...subTaskResponses] } : {}),
+      ...(skills.length ? { skills: [...skills] } : {}),
+      ...(worldHandle ? { worldHandle } : {}), ...(delivered !== undefined ? { delivered } : {}),
+    };
+    // A failed save leaves this attempt's in-memory outcome intact; only a later
+    // retry would lose it, which is no worse than before the journal existed.
+    journalSaves = journalSaves.then(() => deps.journal!.save(snapshot)).catch(() => {});
+    return journalSaves;
+  };
   // Adapters copy `input` (e.g. to resume after a credential refresh), so live
   // secrets are one record shared by every copy and updated in place.
   const liveSecretEnv = deps.pullSecretEnv ? { ...input.secretEnv } : undefined;
@@ -126,6 +177,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       if (input.role !== 'do') throw new Error('open_pr is available only to the Do agent');
       openPrRequested = true;
       completed = true;
+      return journal();
     },
     // Optional, structured task-finish annotation. Provider completion is established
     // independently by the adapter's verified terminal event; this tool may add a summary
@@ -134,14 +186,17 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     signalCompletion(summary) {
       completed = true;
       if (summary && !reviewInfo?.summary) reviewInfo = { ...reviewInfo, summary };
+      return journal();
     },
     resolveDecision(t) {
       resolution = t;
       completed = true; // a decision ends the resolve turn
+      return journal();
     },
     confirmDecision(d) {
       confirmDecision = d;
       completed = true; // a verdict ends the confirm turn
+      return journal();
     },
     async createReviewInfo(info) {
       // Providers can dispatch tools concurrently. Serialize accumulation with
@@ -152,6 +207,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
         const nextReviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
         await deps.onReviewInfo?.(nextReviewInfo, info);
         reviewInfo = nextReviewInfo;
+        await journal();
       });
       // A rejected attachment must not prevent the agent correcting it later.
       reviewPublication = publication.catch(() => {});
@@ -159,18 +215,38 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     },
     createSubTask(t) {
       subTasks.push(t);
+      return journal();
     },
     respondToSubTask(r) {
       subTaskResponses.push(r);
+      return journal();
     },
     raiseToParent(r) {
       raise = r;
+      return journal();
     },
     waitForSubtasks() {
       waitForSubtasks = true;
+      return journal();
+    },
+    requestWait(next) {
+      // Only the Do loop parks and resumes an agent; other roles' turns are one-shot.
+      if (input.role !== 'do') throw new Error('wait is available only to the Do agent');
+      wait = next;
+      return journal();
+    },
+    jobStarted(id) {
+      if (!jobsStarted.includes(id)) jobsStarted.push(id);
+      return journal();
     },
     saveSkill(s) {
       skills.push(s);
+      return journal();
+    },
+    followUpsDelivered(index) {
+      if (delivered !== undefined && index <= delivered) return;
+      delivered = index;
+      void journal();
     },
     // Do the checkout NOW, so the agent can work in the new branch for the rest
     // of this turn, and hand the updated handle back for the workflow to adopt.
@@ -189,6 +265,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       worldHandle = await input.world.addCheckout(spec);
       const added = worldHandle.repos?.[worldHandle.repos.length - 1];
       if (!added) throw new Error('checkout was not recorded on the world handle');
+      await journal();
       return { name: added.name, root: added.root, branch: added.branch };
     },
     async requestSpend(args) {
@@ -215,11 +292,12 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
           : [];
         reviewInfo = { ...reviewInfo, summary: note,
           actions: [...(reviewInfo?.actions ?? []), ...actions] };
+        await journal();
       }
       return outcome;
     },
     async platformRequest(method, path, body) {
-      if (!deps.platformRequest) throw new Error('karmax gateway is unavailable to this turn');
+      if (!deps.platformRequest) throw new Error(`${BRAND} gateway is unavailable to this turn`);
       return deps.platformRequest(method, path, body);
     },
     fillPaymentCard: deps.fillPaymentCard,
@@ -314,6 +392,15 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     secretPoll?.();
   }
 
+  // Jobs this turn started and left running without pausing for them: report
+  // them, so the workflow can ask the agent what it meant to do with them.
+  let runningJobs: string[] | undefined;
+  if (jobsStarted.length && !wait) {
+    try {
+      runningJobs = (await jobStatuses(input.world, jobsStarted)).filter((job) => job.state === 'running').map((job) => job.id);
+    } catch { /* the turn's outcome never depends on this probe */ }
+  }
+
   return {
     session: turn.session,
     providerCompleted: true,
@@ -330,6 +417,9 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     waitForSubtasks,
     pendingSubagents: turn.pendingSubagents,
     pendingBackgroundShells: turn.pendingBackgroundShells,
+    ...(turn.stoppedBackgroundShells?.length ? { stoppedBackgroundShells: turn.stoppedBackgroundShells } : {}),
+    ...(wait ? { wait } : {}),
+    ...(runningJobs?.length ? { runningJobs } : {}),
     subTasks: subTasks.length ? subTasks : undefined,
     subTaskResponses: subTaskResponses.length ? subTaskResponses : undefined,
     skills: skills.length ? skills : undefined,
@@ -338,6 +428,6 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     // providerCompleted and do not interpret a missing optional tool call as a stall.
     needsInput:
       !completed && subTasks.length === 0 && subTaskResponses.length === 0 && !raise &&
-      !waitForSubtasks && !turn.pendingSubagents && !turn.pendingBackgroundShells,
+      !waitForSubtasks && !wait && !turn.pendingSubagents && !turn.pendingBackgroundShells,
   };
 }

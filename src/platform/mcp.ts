@@ -10,6 +10,7 @@ import {
   platformRequestPathError,
   type CompactTask,
 } from './platform-request.js';
+import { BRAND } from '../domain/brand.js';
 
 // Re-exported so the platform MCP module stays the one place a reader looks for
 // the agent-facing contract; `src/agent/tools.ts` imports the same definitions
@@ -327,7 +328,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'connect_world_provider',
     {
-      description: 'Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted Karmax vault and never returned.',
+      description: `Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted ${BRAND} vault and never returned.`,
       inputSchema: {
         organizationId: z.string(), provider: z.enum(['e2b', 'daytona']), apiKey: z.string().optional(), name: z.string().optional(),
         template: z.string().optional(), snapshot: z.string().optional(), image: z.string().optional(),
@@ -483,7 +484,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'request_agent_action',
     {
-      description: 'Ask another task agent to publish its branch in the background. Returns immediately with a durable request id; Karmax injects completion or failure into this agent automatically. Continue other work and do not poll.',
+      description: `Ask another task agent to publish its branch in the background. Returns immediately with a durable request id; ${BRAND} injects completion or failure into this agent automatically. Continue other work and do not poll.`,
       inputSchema: {
         taskId: z.string(), role: z.string().default('do'),
         action: z.literal('publish_branch'), message: z.string().optional(),
@@ -499,7 +500,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     },
     async (a) => wrap(async () => (await ops.cancelAgentAction(a.requestId))),
   );
-  server.registerTool('list_events', { description: 'Read durable karmax events for a task after an optional sequence number.', inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(async () => (await ops.listEvents(a.taskId, a.since))));
+  server.registerTool('list_events', { description: `Read durable ${BRAND} events for a task after an optional sequence number.`, inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(async () => (await ops.listEvents(a.taskId, a.since))));
   server.registerTool('list_github_actions_runs', {
     description: 'List GitHub Actions workflow runs for a repository attached to the calling task’s project. The GitHub credential remains in the control plane.',
     inputSchema: {
@@ -535,7 +536,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       ref: z.string(), inputs: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional() },
   }, async (a) => wrap(async () => (await ops.dispatchGithubActionsWorkflow(a))));
   server.registerTool('publish_task_branch', {
-    description: 'Publish this task’s clean, committed branch through Karmax’s trusted Git broker so another agent can import it.', inputSchema: {},
+    description: `Publish this task’s clean, committed branch through ${BRAND}’s trusted Git broker so another agent can import it.`, inputSchema: {},
   }, async () => wrap(async () => (await ops.publishTaskBranch())));
   server.registerTool('import_task_branch', {
     description: 'Fetch another task’s published branch into namespaced refs in this world. Inspect/test/cherry-pick or merge it locally afterward.',
@@ -605,7 +606,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'request_credential',
     {
       description:
-        'Ask for access to a credential in the user\'s vault (site login, API key, SSH key, .env bag) that list_credentials does not show, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
+        `Ask for access to a credential in the user's vault (site login, API key, SSH key, .env bag) that list_credentials does not show, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human and this turn may stop — ${BRAND} automatically resumes the task with the decision; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human's own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then ${BRAND} resumes the task.`,
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), kind: z.enum(['access', 'reset']).optional(), why: z.string(), urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/requests', a))),
@@ -614,7 +615,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'fill_credential',
     {
       description:
-        'Type a vault credential into the page open in your browser WITHOUT the secret entering your context — karmax resolves and types it over CDP after verifying the page origin matches the credential\'s domains. Call once per field (username, password, then totp for a one-time code). The karmax browser MCP already runs a Chrome that exposes this DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+        `Type a vault credential into the page open in your browser WITHOUT the secret entering your context — ${BRAND} resolves and types it over CDP after verifying the page origin matches the credential's domains. Call once per field (username, password, then totp for a one-time code). The ${BRAND} browser MCP already runs a Chrome that exposes this DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string(), cdpUrl: z.string().optional() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/fill', a))),
@@ -664,7 +665,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'enroll_passkey',
     {
       description:
-        'Enroll a NEW passkey belonging to karmax on the account open in your browser (the user\'s own passkeys are unusable — the OS biometric is theirs). karmax preps a virtual authenticator (origin-verified); you trigger the site\'s "create a passkey" button; then call save_passkey with the returned authenticatorId. Afterwards use_passkey logs in with no 2FA prompt.',
+        'Enroll a NEW passkey belonging to tavya on the account open in your browser (the user\'s own passkeys are unusable — the OS biometric is theirs). tavya preps a virtual authenticator (origin-verified); you trigger the site\'s "create a passkey" button; then call save_passkey with the returned authenticatorId. Afterwards use_passkey logs in with no 2FA prompt.',
       inputSchema: { domain: z.string(), cdpUrl: z.string().optional() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/enroll', a))),
@@ -681,7 +682,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'use_passkey',
     {
       description:
-        'Log in with a karmax-enrolled passkey: karmax loads the stored credential into a virtual authenticator on the page; you trigger the site\'s "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticatorId (release it when done via platform_request POST /api/vault/passkey/release), or needs_approval/not_in_vault.',
+        `Log in with a ${BRAND}-enrolled passkey: ${BRAND} loads the stored credential into a virtual authenticator on the page; you trigger the site's "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticatorId (release it when done via platform_request POST /api/vault/passkey/release), or needs_approval/not_in_vault.`,
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), cdpUrl: z.string().optional() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/login', a))),
@@ -694,7 +695,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'platform_request',
     {
-      description: 'Call any authenticated karmax gateway API operation, including project/account/payment/settings/user/safe-mode/review administration. Call describe_platform first when unsure. This never bypasses authorization, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused.',
+      description: `Call any authenticated ${BRAND} gateway API operation, including project/account/payment/settings/user/safe-mode/review administration. Call describe_platform first when unsure. This never bypasses authorization, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused.`,
       // See PLATFORM_REQUEST_BODY_SCHEMA for why `body` must declare a concrete
       // shape; the zod union below is its zod twin (both are asserted equivalent
       // in tests/platform-surface.test.ts).
@@ -767,7 +768,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', {
-    description: 'Save a reusable skill (markdown) for future tasks. This writes INSTALLATION-WIDE global state — the skill is visible to every project and organization on this karmax, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
+    description: `Save a reusable skill (markdown) for future tasks. This writes INSTALLATION-WIDE global state — the skill is visible to every project and organization on this ${BRAND}, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).`,
     inputSchema: { name: z.string(), content: z.string() },
   }, async (a) => wrap(async () => (await ops.saveSkill(a))));
   server.registerTool(

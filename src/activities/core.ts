@@ -9,7 +9,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -30,6 +30,7 @@ import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
+import { jobStatuses, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
@@ -59,6 +60,7 @@ import {
   githubRequiredCheckKey,
   reconcileGithubActionsRuns,
   renderGithubActionsFailure,
+  summarizeGithubActionsFailure,
   type GithubActionsApi,
   type GithubActionsFailureDecision,
 } from '../integrations/github-actions.js';
@@ -107,6 +109,11 @@ import {
   agentQueueId,
 } from '../coordinators/names.js';
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
+import { BRAND } from '../domain/brand.js';
+
+/** A retried turn's processes did not survive it; agents otherwise assume they did. */
+const INTERRUPTED_COMMANDS = 'Commands that were running in it, including run_in_background shells, were stopped: '
+  + 'check whether they finished before relying on their results. Jobs from start_job kept running.';
 
 // Old executions without a recorded grant retain the normal developer workflow
 // surface (but no administration). New tasks always carry a creator-attenuated
@@ -155,7 +162,8 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
   // Admission happens before a provider process exists. Temporal coordinator
   // backpressure/outages therefore cannot be an agent error and must retain
   // their retryable infrastructure classification through this outer boundary.
-  if (err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError) {
+  if (err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError
+    || err instanceof AgentChannelLost) {
     return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   }
   if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) {
@@ -237,7 +245,7 @@ function signalKillMessage(raw: string): string {
   const diagnosis = hostMemoryTight()
     ? `host out of memory — the agent was likely killed by the OS OOM killer (${mem}). ` +
       `Reduce Concurrent agent turns in Global settings (or raise KARMAX_AGENT_MIN_FREE_MB), or free RAM.`
-    : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a krmax ` +
+    : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a ${BRAND} ` +
       `restart/reload/redeploy tearing down in-flight turns (orphan-sweep or shutdown escalation) or an external kill.`;
   return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
 }
@@ -281,7 +289,7 @@ export interface OpenPrDetails {
  *  dispatcher's branch matching relies on being true). */
 function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoName?: string): string {
   const summary = details.summary?.trim() || '_No review summary was recorded for this task._';
-  const task = num != null ? `karmax task #${num} (\`${handle.id}\`)` : `karmax task \`${handle.id}\``;
+  const task = num != null ? `${BRAND} task #${num} (\`${handle.id}\`)` : `${BRAND} task \`${handle.id}\``;
   return `${summary}\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
 }
 
@@ -662,7 +670,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           coherent: false,
           target,
           checkout: authority,
-          detail: `GitHub merged the project-wiki pull request, but Karmax could not reconcile concurrent canonical and task edits: ${error instanceof Error ? error.message : String(error)}`,
+          detail: `GitHub merged the project-wiki pull request, but ${BRAND} could not reconcile concurrent canonical and task edits: ${error instanceof Error ? error.message : String(error)}`,
         };
       }
       return finish(result, 'the reconciled project wiki');
@@ -676,7 +684,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         coherent: false,
         retryable: true,
         target,
-        detail: `GitHub merged the pull request, but Karmax could not fetch origin/${target} into the enrolled local checkout: ${fetched.stderr || fetched.stdout}`,
+        detail: `GitHub merged the pull request, but ${BRAND} could not fetch origin/${target} into the enrolled local checkout: ${fetched.stderr || fetched.stdout}`,
       };
     }
 
@@ -851,8 +859,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
    * Git comparison. */
   async function commitsAheadOfPrBase(world: World, repo: ReturnType<typeof worldRepos>[number], base: string) {
     const local = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
-    if (local.code === 0 || base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return local;
+    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return local;
     const remoteBase = `refs/remotes/origin/${base}`;
+    const remoteKnown = (await world.exec('git', ['rev-parse', '--verify', '--quiet', `${remoteBase}^{commit}`], { cwd: repo.root })).code === 0;
+    // GitHub compares against its own copy of the target. A local target ref is
+    // frozen at world setup, so a branch that merely caught up with the newer
+    // origin target (refresh_upstream + merge) must not count as ahead.
+    if (local.code === 0 && remoteKnown) {
+      const both = await world.exec('git', ['rev-list', '--count', repo.branch, '--not', base, remoteBase], { cwd: repo.root });
+      if (both.code === 0) return both;
+    }
+    if (local.code === 0) return local;
     const remote = await world.exec('git', ['rev-list', '--count', `${remoteBase}..${repo.branch}`], { cwd: repo.root });
     if (remote.code === 0) return remote;
     if (repo.baseSha) {
@@ -1033,7 +1050,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   async function maintainWaitingWorld(taskId: string, view: LifecyclePublication, fence: string, retryFailure = true): Promise<void> {
     const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
     const startingAgent = view.waitingFor?.kind === 'agentSlot' && view.waitingFor.detail === 'Starting agent';
-    if ((view.status !== 'waiting' && view.status !== 'blocked') || startingAgent
+    // A job wait needs the world running: parking would freeze the job.
+    if ((view.status !== 'waiting' && view.status !== 'blocked') || startingAgent || view.waitingFor?.kind === 'job'
       || !waitingWorld || !worlds.get(waitingWorld.kind).parkable) return;
     let ctx: ReturnType<typeof activityContext.current> | undefined;
     try { ctx = activityContext.current(); } catch { /* direct tests */ }
@@ -1209,10 +1227,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         gitIdentity = profile
           ? (await gitProfiles.identity(profile, { taskId: args.taskId }))
           : gitBinding.userId
-            ? { name: 'karmax', email: `karmax+${gitBinding.userId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` }
+            ? { name: BRAND, email: `${BRAND}+${gitBinding.userId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` }
             : organizationId === 'org_personal'
               ? undefined
-              : { name: 'karmax', email: `karmax+${organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` };
+              : { name: BRAND, email: `${BRAND}+${organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` };
       } catch (e) {
         (await record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}": ${e instanceof Error ? e.message : e}` }));
       }
@@ -1731,6 +1749,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let turnSessionKey: string | undefined;
       let resumedActivityAttempt = false;
       let activityAttempt = 1;
+      // What earlier attempts of THIS turn recorded (open_pr, sub-tasks, decisions,
+      // mid-turn deliveries). Restored so a retry never drops them.
+      let restoredJournal: import('../agent/runtime.js').TurnJournal | undefined;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -1750,6 +1771,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
         turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
+        if (actx.info.attempt > 1 && turnSessionKey) {
+          try { restoredJournal = JSON.parse((await store.kvGet(`${turnSessionKey}:journal`)) ?? 'null') ?? undefined; }
+          catch { restoredJournal = undefined; }
+        }
         // Heartbeat details are Temporal's primary retry checkpoint. The per-turn
         // SQLite key closes the small hard-kill window before a heartbeat reaches the
         // service; unlike session:<task>:<role>, it cannot accidentally pick up a
@@ -1776,8 +1801,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 // Tell the agent what broke, or it reruns the command that froze the sandbox.
                 ? `(This turn was interrupted mid-run: ${interruption.summary}.${interruption.memoryExhausted
                   ? ' Keep memory-hungry commands (type checks, test suites, builds) within the memory `free -m` reports as available.' : ''}`
-                  + ' Continue from where you left off; if the work was already finished, restate the final result.)'
-                : '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result.)',
+                  + ` ${INTERRUPTED_COMMANDS} Continue from where you left off; if the work was already finished, restate the final result.)`
+                // The only undiagnosed cause left is a lost heartbeat: turns have no time limit.
+                : `(This turn was interrupted mid-run — the worker restarted, the connection dropped, or the host slept. ${INTERRUPTED_COMMANDS} Continue from where you left off; if the work was already finished, restate the final result.)`,
               ts: 0,
             },
           ];
@@ -1982,7 +2008,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (spec.resumeFrom.sessionId && !share && !allowProviderId) {
           throw ApplicationFailure.create({
-            message: 'Provider conversation IDs are available only on a host-local Karmax. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.',
+            message: `Provider conversation IDs are available only on a host-local ${BRAND}. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.`,
             type: 'agent-error',
             nonRetryable: true,
           });
@@ -2024,7 +2050,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (!materialized) {
             (await record(args.taskId, 'session.resume-failed', { session, provider: profile.provider }));
             throw ApplicationFailure.create({
-              message: `Cannot find conversation "${session}" in this Karmax installation's Codex or Claude history. Check the provider conversation ID and try again.`,
+              message: `Cannot find conversation "${session}" in this ${BRAND} installation's Codex or Claude history. Check the provider conversation ID and try again.`,
               type: 'agent-error',
               nonRetryable: true,
             });
@@ -2481,6 +2507,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal,
           heartbeat,
           pullFollowUps,
+          ...(turnSessionKey ? { journal: {
+            restored: restoredJournal,
+            save: async (journal: import('../agent/runtime.js').TurnJournal) => {
+              (await store.kvSet(`${turnSessionKey}:journal`, JSON.stringify(journal)));
+            },
+          } } : {}),
           pullSecretEnv: () => pullSecretEnv?.() ?? Promise.resolve({}),
           // Coalesce the live-output stream: adapters re-emit the growing *cumulative*
           // message text, so consecutive identical/prefix emits carry no new info.
@@ -2665,6 +2697,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
         }
+        // A resumed attempt was handed only a continuation notice, so its adapter's
+        // count is not in the workflow's index space. The replaced attempt already
+        // delivered the scheduled batch plus whatever it injected mid-turn.
+        if (resumedActivityAttempt && args.role !== 'confirm') {
+          result.delivered = Math.max(restoredJournal?.delivered ?? 0, args.messages.length);
+        }
         if (args.role === 'confirm' && result.confirmDecision?.action === 'confirm' && result.confirmDecision.otherAttempts) {
           (await store.kvSet(`attempt-choice:${args.taskId}`, result.confirmDecision.otherAttempts));
         }
@@ -2686,6 +2724,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : err;
         }
+        // Tell the resumed attempt why it was interrupted, as for a sandbox freeze.
+        if (err instanceof AgentChannelLost && turnSessionKey)
+          (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify({ summary: err.summary })));
         const failure = classifyTurnError(err, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else
         // in a remote world may be the sandbox's fault, which its metrics can show.
@@ -3100,6 +3141,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (!(await owns())) return;
           const world = await worlds.open(current);
           if (!(await owns())) return;
+          // A remote sandbox takes its jobs with it; a host-side world must stop them.
+          if (!isRemote(current.kind)) await stopJobs(world).catch(() => undefined);
           await world.destroy();
           if (!(await owns())) return;
           await store.setWorldState(current, 'released');
@@ -3151,6 +3194,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               throw new Error('world remains in use; preserving it for recovery');
           };
           await idle();
+          // Cancelling stops the task's durable jobs as well as its agent.
+          const live = prepared ?? (isRemote(current.kind) ? undefined : await worlds.open(current));
+          if (live) await stopJobs(live).catch(() => undefined);
           if (deps.checkpoints) {
             if (prepared) {
               const projectId = String(current.meta?.projectId ?? '');
@@ -3187,6 +3233,38 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           error: error instanceof Error ? error.message : String(error),
         }));
       }
+    },
+
+    /** Wait, durably, for an agent's jobs (src/world/jobs.ts) to exit or for
+     * `untilMs` to pass. A small in-world waiter process keeps a cloud sandbox
+     * awake meanwhile; if its stream drops (a provider pause, a worker restart)
+     * the loop re-reads the job files and starts another. Cancelled when the
+     * task gets a message or is cancelled. */
+    async awaitJobs(handle: WorldHandle, jobs: string[], untilMs: number): Promise<{ finished: boolean; summary: string }> {
+      const ctx = activityContext.current();
+      const signal = ctx.cancellationSignal;
+      const beat = setInterval(() => ctx.heartbeat(), 5_000);
+      try {
+        const world = await openWorld(handle);
+        for (;;) {
+          signal.throwIfAborted();
+          ctx.heartbeat();
+          const running = (await jobStatuses(world, jobs)).filter((job) => job.state === 'running').map((job) => job.id);
+          if (!running.length || Date.now() >= untilMs) {
+            return { finished: !running.length, summary: describeJobs(await jobStatuses(world, jobs, { tailLines: 30 })) };
+          }
+          // Re-check at least every ten minutes even if the waiter never reports.
+          const waiter = await startJobWaiter(world, running, Math.min(600, Math.ceil((untilMs - Date.now()) / 1000)));
+          let abort = () => {};
+          await new Promise<void>((resolve) => {
+            abort = resolve;
+            waiter.onExit(() => resolve());
+            signal.addEventListener('abort', abort, { once: true });
+          });
+          signal.removeEventListener('abort', abort);
+          if (signal.aborted) await Promise.resolve(waiter.kill()).catch(() => undefined);
+        }
+      } finally { clearInterval(beat); }
     },
 
     async pendingServiceConnections(taskId: string): Promise<number> {
@@ -3296,8 +3374,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const repository = await enrolledRepositoryForCheckout(handle, repo);
             const guidance = repository && deps.githubApp
               ? await deps.githubApp.workflowPermissionGuidance(repository).catch(() =>
-                'Grant the krmax GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.')
-              : 'Grant the krmax GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.';
+                `Grant the ${BRAND} GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.`)
+              : `Grant the ${BRAND} GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.`;
             throw ApplicationFailure.create({
               message: `GitHub App workflow permission required for ${slug}. ${guidance}`,
               type: 'github-workflows-permission',
@@ -3316,15 +3394,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to origin`
             + `${pushError ? `: ${pushError}` : ''}`);
         }
-        const { pr, created } = await api.openOrUpdate(slug, {
+        const result = await api.openOrUpdate(slug, {
           head: repo.branch, base,
           // With several branches in flight the task title alone names none of
           // them; say which pull request this one is.
           title: changed.length > 1
-            ? `${details.title?.trim() || 'karmax'} (${repo.name})`
-            : details.title?.trim() || `karmax: ${repo.branch}`,
+            ? `${details.title?.trim() || BRAND} (${repo.name})`
+            : details.title?.trim() || `${BRAND}: ${repo.branch}`,
           body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
+        }).catch((error: unknown) => {
+          // GitHub is the authority on "ahead": its target may have moved past
+          // every ref this world has seen. Nothing to propose is not a failure.
+          if (/No commits between/i.test(error instanceof Error ? error.message : String(error))) return undefined;
+          throw error;
         });
+        if (!result) {
+          (await record(handle.id, 'pr.skipped', { repo: repo.name, reason: `no commits ahead of ${base} on GitHub` }));
+          continue;
+        }
+        const { pr, created } = result;
         const ref: TaskPullRequest = {
           repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged,
           ...(pr.headSha ? { headSha: pr.headSha } : {}),
@@ -3499,7 +3587,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (error instanceof GithubApiError && [404, 410, 422].includes(error.status)) {
           return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `${detail} The pull request or branch needs human attention on GitHub before krmax can continue.`,
+            detail: `${detail} The pull request or branch needs human attention on GitHub before ${BRAND} can continue.`,
           };
         }
         return {
@@ -3507,10 +3595,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           detail: `GitHub could not be inspected or updated: ${detail}`,
         };
       };
-      const ciFailureDetail = (ref: TaskPullRequest, readiness: GithubPullRequestReadiness) => {
+      // `brief` is for people: a line of each check's output, not its log.
+      const ciFailureDetail = (ref: TaskPullRequest, readiness: GithubPullRequestReadiness, brief = false) => {
         const failures = (readiness.failedChecks ?? []).slice(0, 12).map((check) => {
           const detail = check.detail?.trim();
-          return `- ${check.name}: ${check.state}${check.url ? ` (${check.url})` : ''}${detail ? `\n${detail.slice(0, 12_000)}` : ''}`;
+          const limit = brief ? 300 : 12_000;
+          const shown = detail && detail.length > limit ? `${detail.slice(0, limit)}…` : detail;
+          return `- ${check.name}: ${check.state}${check.url ? ` (${check.url})` : ''}${shown ? `\n${shown}` : ''}`;
         });
         return [
           `Pull request ${ref.slug}#${ref.number} has terminally failing CI (${readiness.checks}).`,
@@ -3524,6 +3615,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         inspection: Awaited<ReturnType<typeof inspectionFor>>,
       ): Promise<GitHubMergeAuthorization | { status: 'checks-satisfied' }> => {
         const summary = ciFailureDetail(ref, readiness);
+        const briefSummary = ciFailureDetail(ref, readiness, true);
         const runIds = [...new Set((readiness.failedChecks ?? [])
           .map((check) => githubActionsRunIdFromUrl(check.url)).filter((id): id is number => Boolean(id)))];
         const fallbackIdentityKey = githubRequiredCheckKey({
@@ -3562,14 +3654,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }));
           recordedCurrents.add(observation);
         };
-        const externalWait = async (key: string, detail: string): Promise<GitHubMergeAuthorization> => {
+        const externalWait = async (key: string, detail: string, exhausted?: string): Promise<GitHubMergeAuthorization> => {
           const previous = events.filter((event) => event.type === 'github.ci.external-wait'
             && event.payload?.key === key).length;
           (await record(handle.id, 'github.ci.external-wait', { key, slug: ref.slug, number: ref.number,
             candidateHead: ref.headSha, poll: previous + 1 }));
           if (previous + 1 >= MAX_SUPERSEDED_CI_POLLS) return {
             status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
-            detail: `${detail}\n\nGitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry. The task owns no admission slot while parked.`,
+            detail: `${detail}\n\n${exhausted ?? `GitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry.`} The task owns no admission slot while parked.`,
             eligibleUserIds: [actorUserId],
           };
           return { status: 'waiting', prs: current, actorUserId, releaseAdmission: true, detail };
@@ -3711,38 +3803,38 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
           if (reconciling.length) return {
             status: 'waiting', prs: current, actorUserId,
-            detail: 'A current GitHub Actions run was cancelled with no replacement yet visible. Karmax is performing bounded exact-head reconciliation before classification or rerun.',
+            detail: `A current GitHub Actions run was cancelled with no replacement yet visible. ${BRAND} is performing bounded exact-head reconciliation before classification or rerun.`,
           };
           const providerFailure = classifyGithubCheckStates((readiness.failedChecks ?? []).map(check => check.state));
           if (providerFailure?.disposition === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `${summary}\n\n${providerFailure.reason}`,
+            detail: `${briefSummary}\n\n${providerFailure.reason}`,
             waitReason: providerFailure.waitReason,
             eligibleUserIds: [actorUserId],
           };
           if (providerFailure?.disposition === 'retry') {
             (await fallbackObservation(fallbackIdentityKey, providerFailure.disposition));
             return (await externalWait(fallbackIdentityKey,
-              `${summary}\n\nGitHub reports an interrupted check, but exact-head Actions inspection is unavailable. Waiting for a replacement without rerunning or reopening the proposal; admission is released while inspection is unavailable.`));
+              `${briefSummary}\n\nGitHub reports an interrupted check, but exact-head Actions inspection is unavailable. Waiting for a replacement without rerunning or reopening the proposal; admission is released while inspection is unavailable.`));
           }
           const permissionFailure = inspectionFailures.find(({ error }) =>
             error instanceof GithubActionsApiError && [401, 403].includes(error.status));
           if (permissionFailure || (runIds.length > 0 && !inspection.actions)) return {
             status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
             waitReason: 'GitHub Actions inspection unavailable',
-            detail: `${summary}\n\nExact-head Actions inspection is unavailable. Restore the GitHub App Actions read permission or inspect the run on GitHub before deciding whether code needs repair. Check text alone cannot establish the cause.`,
+            detail: `${briefSummary}\n\nExact-head Actions inspection is unavailable. Restore the GitHub App Actions read permission or inspect the run on GitHub before deciding whether code needs repair. Check text alone cannot establish the cause.`,
             eligibleUserIds: [actorUserId],
           };
           if (actionReconciliationFailed && runIds.length && !permissionFailure) return {
             status: 'retryable-error', prs: current, actorUserId,
-            detail: `${summary}\n\nExact-head GitHub Actions reconciliation was unavailable. Retrying inspection without rerunning or reopening the proposal.`,
+            detail: `${briefSummary}\n\nExact-head GitHub Actions reconciliation was unavailable. Retrying inspection without rerunning or reopening the proposal.`,
           };
           const fallbackKey = fallbackIdentityKey;
           (await fallbackObservation(fallbackKey, 'revision'));
           const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
             && event.payload?.key === fallbackKey);
           if (repairRequested) return (await externalWait(fallbackKey,
-            `${summary}\n\nThis exact terminal CI result was already sent for repair, but the pull-request candidate is unchanged. Waiting for a new run or candidate instead of waking Do again.`));
+            `${briefSummary}\n\nThis exact terminal CI result was already sent for repair, but the pull-request candidate is unchanged. Waiting for a new run or candidate instead of waking Do again.`));
           (await record(handle.id, 'github.ci.repair-requested', {
             key: fallbackKey, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
             runId: runIds[0] ?? 0, attempt: 0,
@@ -3755,9 +3847,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           };
         }
         const detail = decisions.map(({ decision }) => renderGithubActionsFailure(decision)).join('\n\n').slice(0, 128_000);
+        // Full diagnostics are for the agent; a person gets the brief form.
+        const brief = decisions.map(({ decision }) => summarizeGithubActionsFailure(decision)).join('\n\n');
+        // Reruns the failed jobs of one exact run; returns a decision only when
+        // GitHub refuses.
+        const rerun = async (
+          { decision, key }: (typeof decisions)[number], rerunNumber: number, reason?: string,
+        ): Promise<GitHubMergeAuthorization | undefined> => {
+          const { id, attempt } = decision.inspection.run;
+          try {
+            await inspection.actions!.rerun(ref.slug, id, true);
+          } catch (error) {
+            const blocked = error instanceof GithubActionsApiError && [401, 403, 404, 422].includes(error.status);
+            return {
+              status: blocked ? 'needs-human' : 'retryable-error', prs: current, actorUserId,
+              detail: `${brief}\n\nGitHub rejected the automatic rerun: ${error instanceof Error ? error.message : String(error)}`,
+              ...(blocked ? { eligibleUserIds: [actorUserId] } : {}),
+            };
+          }
+          (await record(handle.id, 'github.ci.rerun-requested', {
+            ...ref, key, runId: id, observedAttempt: attempt, rerunNumber, ...(reason ? { reason } : {}),
+          }));
+          return undefined;
+        };
         const human = decisions.find(({ decision }) => decision.disposition === 'human');
         if (human) return {
-          status: 'needs-human', prs: current, actorUserId, detail,
+          status: 'needs-human', prs: current, actorUserId,
+          detail: `${brief}\n\n${human.decision.reason}`,
           waitReason: human.decision.waitReason,
           eligibleUserIds: [actorUserId],
         };
@@ -3765,8 +3881,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (revision) {
           const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
             && event.payload?.key === revision.key);
-          if (repairRequested) return (await externalWait(revision.key,
-            `${detail}\n\nThis exact terminal run was already sent for repair, but the repository, pull request, candidate head, run, and attempt are unchanged. Waiting for a substantive external change instead of reopening the proposal.`));
+          // The key pins the head, so a repair that is already recorded means
+          // Do resubmitted the exact revision: it found nothing to fix. Only a
+          // new run can change GitHub's answer, so start one (task 389). A
+          // second failure on the same revision is evidence the agent missed
+          // something, which a person must weigh.
+          if (repairRequested) {
+            const run = revision.decision.inspection.run;
+            const reruns = events.filter((event) => event.type === 'github.ci.rerun-requested'
+              && event.payload?.key === revision.key && event.payload?.reason === 'unchanged-after-repair');
+            if (reruns.some((event) => Number(event.payload?.runId) === run.id
+              && Number(event.payload?.observedAttempt) === run.attempt))
+              return { status: 'waiting', prs: current, actorUserId, detail: 'Rerunning CI' };
+            if (reruns.length) return {
+              status: 'needs-human', prs: current, actorUserId,
+              waitReason: 'CI failed again after a rerun',
+              detail: `The agent found no code problem, but CI failed again after an automatic rerun of the same commit.\n${brief}\n\nSend a follow-up to return it to the agent, or rerun CI on GitHub and confirm.`,
+              eligibleUserIds: [actorUserId],
+            };
+            return (await rerun(revision, reruns.length + 1, 'unchanged-after-repair'))
+              ?? { status: 'waiting', prs: current, actorUserId, detail: 'Rerunning CI' };
+          }
           (await record(handle.id, 'github.ci.repair-requested', {
             key: revision.key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
             runId: revision.decision.inspection.run.id, attempt: revision.decision.inspection.run.attempt,
@@ -3785,25 +3920,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             Number(event.payload?.runId) === retry.decision.inspection.run.id
             && Number(event.payload?.observedAttempt) === retry.decision.inspection.run.attempt);
           if (!alreadyRequested && reruns.length < 2) {
-            try {
-              await inspection.actions.rerun(ref.slug, retry.decision.inspection.run.id, true);
-              (await record(handle.id, 'github.ci.rerun-requested', {
-                ...ref, key: retry.key, runId: retry.decision.inspection.run.id,
-                observedAttempt: retry.decision.inspection.run.attempt,
-                rerunNumber: reruns.length + 1,
-              }));
-            } catch (error) {
-              const blocked = error instanceof GithubActionsApiError && [401, 403, 404, 422].includes(error.status);
-              return {
-                status: blocked ? 'needs-human' : 'retryable-error', prs: current, actorUserId,
-                detail: `${detail}\n\nGitHub rejected the automatic rerun: ${error instanceof Error ? error.message : String(error)}`,
-                ...(blocked ? { eligibleUserIds: [actorUserId] } : {}),
-              };
-            }
+            const rejected = await rerun(retry, reruns.length + 1);
+            if (rejected) return rejected;
           } else if (!alreadyRequested && reruns.length >= 2) {
             return {
               status: 'needs-human', prs: current, actorUserId,
-              detail: `${detail}\n\nThe exact workflow run remained transiently broken after two automatic reruns. Inspect GitHub's runner or repository configuration before retrying.`,
+              detail: `${brief}\n\nThe exact workflow run remained transiently broken after two automatic reruns. Inspect GitHub's runner or repository configuration before retrying.`,
               eligibleUserIds: [actorUserId],
             };
           }
@@ -3882,7 +4004,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }));
             return {
               status: 'needs-revision', prs: current, actorUserId,
-              detail: `Pull request ${ref.slug}#${ref.number} changed outside krmax's authorized repair cycle. Inspect the new head and send the proposal through human Review before landing.`,
+              detail: `Pull request ${ref.slug}#${ref.number} changed outside ${BRAND}'s authorized repair cycle. Inspect the new head and send the proposal through human Review before landing.`,
               repair: { kind: 'head-changed', preserveAuthorization: false },
             };
           }
@@ -3916,7 +4038,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               actorUserId,
               detail: intentAuthorizedLanding
                 ? fairLanding
-                  ? `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or landing candidate. It has no Karmax admission slot; resolve it against the newest target, verify it, and request landing again.`
+                  ? `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or landing candidate. It has no ${BRAND} admission slot; resolve it against the newest target, verify it, and request landing again.`
                   : `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or merge group. GitHub has ejected this entry; resolve it against the newest target and reopen it for automated integration review.`
                 : `Pull request ${ref.slug}#${ref.number} conflicts with its target. Resolve it in the task branch, reopen the proposal, and review the new head.`,
               ...(intentAuthorizedLanding ? { repair: { kind: 'conflict' as const, preserveAuthorization: true,
@@ -4039,7 +4161,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (frontHeldExact && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
           return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `Pull request ${ref.slug}#${ref.number} is already controlled by GitHub's merge queue or auto-merge. Remove it there before retrying: this workflow keeps one authoritative karmax queue position through exact-candidate review and repair.`,
+            detail: `Pull request ${ref.slug}#${ref.number} is already controlled by GitHub's merge queue or auto-merge. Remove it there before retrying: this workflow keeps one authoritative ${BRAND} queue position through exact-candidate review and repair.`,
             eligibleUserIds: [actorUserId],
           };
         }
@@ -4051,7 +4173,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : undefined;
           return {
             status: 'waiting', prs: current, actorUserId,
-            detail: `GitHub has not granted krmax read access to CI for ${ref.slug}#${ref.number}. `
+            detail: `GitHub has not granted ${BRAND} read access to CI for ${ref.slug}#${ref.number}. `
               + 'Grant the GitHub App read-only Checks and Commit statuses permissions, then approve the updated installation permissions; '
               + `this task will retain the front landing slot and retry automatically.${appSlug
                 ? ` App settings: https://github.com/settings/apps/${appSlug}/permissions`
@@ -4107,7 +4229,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           || (intentAuthorizedLanding && mirroredReviews.length === 0 && voters.includes(actorUserId));
         if (mayMirrorApproval && !alreadyMirrored) {
           await api.approve(ref.slug, ref.number, ref.headSha,
-            'Approved in krmax after reviewing this exact pull-request head.')
+            `Approved in ${BRAND} after reviewing this exact pull-request head.`)
             .then(async () => (await record(handle.id, 'github.pr.review-approved', { ...ref, actorUserId })))
             .catch(async (error) => (await record(handle.id, 'github.pr.review-skipped', {
               ...ref, actorUserId, detail: error instanceof Error ? error.message : String(error),
@@ -4174,7 +4296,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (readinessError) return errorDecision(readinessError, current);
             return {
               status: 'retryable-error', prs: current, actorUserId,
-              detail: `GitHub did not expose policy and check state for ${ref.slug}#${ref.number}; karmax cannot certify the exact candidate yet.`,
+              detail: `GitHub did not expose policy and check state for ${ref.slug}#${ref.number}; ${BRAND} cannot certify the exact candidate yet.`,
             };
           }
           if (readiness.mergeStateStatus === 'BEHIND') {
@@ -4242,7 +4364,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (/fast.?forward|behind|reference update failed|not a valid head/i.test(advanced.message)) {
             return {
               status: 'needs-revision', prs: current, actorUserId,
-              detail: `The target moved outside karmax's landing coordinator before exact head ${ref.headSha} could land for ${ref.slug}#${ref.number}: ${advanced.message}. Repair against that live target while retaining the front slot.`,
+              detail: `The target moved outside ${BRAND}'s landing coordinator before exact head ${ref.headSha} could land for ${ref.slug}#${ref.number}: ${advanced.message}. Repair against that live target while retaining the front slot.`,
               repair: { kind: 'base-moved', preserveAuthorization: true,
                 ...(repairFingerprint('base-moved', advanced.message) ? { fingerprint: repairFingerprint('base-moved', advanced.message) } : {}) },
             };
@@ -4279,7 +4401,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (landingAuthority === 'external') {
             queued = true;
             queuedOwner = 'external';
-            pendingDetail = 'The configured external landing authority owns landing; Karmax is observing the PRs and will act only on a terminal failure or merge.';
+            pendingDetail = `The configured external landing authority owns landing; ${BRAND} is observing the PRs and will act only on a terminal failure or merge.`;
             const externalParticipant = participant('external', 'queued');
             if (externalParticipant) participants.push(externalParticipant);
             settled.push(next);
@@ -4493,7 +4615,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (mergeMethod !== 'merge') {
             return {
               status: 'needs-human', prs: current, actorUserId,
-              detail: `Repository policy requests ${mergeMethod} landing, but GitHub did not accept this PR into a merge queue. Enable the native queue for ${mergeMethod} landing; krmax will not substitute an unvalidated direct merge.`,
+              detail: `Repository policy requests ${mergeMethod} landing, but GitHub did not accept this PR into a merge queue. Enable the native queue for ${mergeMethod} landing; ${BRAND} will not substitute an unvalidated direct merge.`,
               eligibleUserIds: [actorUserId],
             };
           }
@@ -4639,7 +4761,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           participants,
           landingOwner: fallback ? 'karmax' : external ? 'external' : 'provider',
           detail: fallback
-            ? 'No repository landing scheduler accepted this participant; it requires guarded Karmax fallback admission.'
+            ? `No repository landing scheduler accepted this participant; it requires guarded ${BRAND} fallback admission.`
             : pendingDetail ?? 'The repository landing authority accepted this participant.',
           ...(!fallback ? { providerQueue: { state: 'queued' as const } } : {}),
         };
@@ -4744,9 +4866,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
           const after = await api.get(ref.slug, ref.number);
           await api.comment(ref.slug, ref.number,
-            after.merged ? `Merged into \`${outcome.target}\` by karmax${as}.`
-            : landed ? `karmax merged this branch into \`${outcome.target}\`${as} and pushed it. Closing.`
-            : `karmax merged this branch into \`${outcome.target}\` locally${as}, but could not push`
+            after.merged ? `Merged into \`${outcome.target}\` by ${BRAND}${as}.`
+            : landed ? `${BRAND} merged this branch into \`${outcome.target}\`${as} and pushed it. Closing.`
+            : `${BRAND} merged this branch into \`${outcome.target}\` locally${as}, but could not push`
               + ` \`${outcome.target}\` to origin. This pull request stays open until that target lands.`);
           const next = { ...ref, state: after.state, merged: after.merged };
           (await record(handle.id, after.merged ? 'pr.merged' : after.state === 'closed' ? 'pr.closed' : 'pr.open', next));

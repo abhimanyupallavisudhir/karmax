@@ -48,15 +48,15 @@ describe('fork_agent reauthorize', () => {
     const f = (await fixture());
     const token = (await f.tokenFor('owner'));
     (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'cancelled',
-      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any));
+      branch: 'tavya/source', targetBranch: 'release', messages: [], state: {} } as any));
     const fork = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'continue' });
-    expect(fork.params.base).toBe('karmax/source');
-    expect(fork.params._forkWorld).toMatchObject({ taskId: f.source.id, base: 'karmax/source', unpublished: true });
+    expect(fork.params.base).toBe('tavya/source');
+    expect(fork.params._forkWorld).toMatchObject({ taskId: f.source.id, base: 'tavya/source', unpublished: true });
     const changed = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'fresh', base: 'main', target: 'release' });
     expect(changed.params.base).toBe('main');
     expect(changed.params.target).toBe('release');
     (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'done',
-      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any));
+      branch: 'tavya/source', targetBranch: 'release', messages: [], state: {} } as any));
     const landed = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'follow up' });
     expect(landed.params.base).toBe('release');
     expect(landed.params._forkWorld).toMatchObject({ unpublished: false });
@@ -66,12 +66,12 @@ describe('fork_agent reauthorize', () => {
   it('ignores injected world provenance and honors an explicit default branch from the form', async () => {
     const f = (await fixture());
     (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'waiting',
-      branch: 'karmax/source', targetBranch: 'main', messages: [], state: {} } as any));
+      branch: 'tavya/source', targetBranch: 'main', messages: [], state: {} } as any));
     const fork = await f.api.createTask((await f.tokenFor('owner')), { projectId: f.project.id, draft: true,
       params: { prompt: 'fresh', base: 'main', 'agent:do': { resumeFrom: { taskId: f.source.id } },
         _forkWorld: { taskId: 'another-project', base: 'main' } } });
     expect(fork.params.base).toBe('main');
-    expect(fork.params._forkWorld).toMatchObject({ taskId: f.source.id, base: 'karmax/source' });
+    expect(fork.params._forkWorld).toMatchObject({ taskId: f.source.id, base: 'tavya/source' });
     const edited = await f.api.updateArmedParams((await f.tokenFor('owner')), fork.id, { base: 'release' }, { keepArmed: false });
     expect(edited.params._forkWorld).toEqual(fork.params._forkWorld);
     const cleared = await f.api.updateArmedParams((await f.tokenFor('owner')), fork.id,
@@ -84,16 +84,16 @@ describe('fork_agent reauthorize', () => {
     const f = (await fixture());
     const token = (await f.tokenFor('owner'));
     (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'waiting',
-      branch: 'karmax/source', targetBranch: 'release', messages: [], state: {} } as any));
+      branch: 'tavya/source', targetBranch: 'release', messages: [], state: {} } as any));
     const fork = (triggers: unknown[], base?: string) => f.api.createTask(token, { projectId: f.project.id, draft: true,
       params: { prompt: 'after it lands', ...(base ? { base } : {}), triggers, 'agent:do': { resumeFrom: { taskId: f.source.id } } } });
     expect((await fork([{ kind: 'dependency', tasks: [f.source.id] }])).params.base).toBe('release');
     expect((await fork([{ kind: 'dependency', tasks: ['task_other', f.source.id], on: 'done' }])).params.base).toBe('release');
     // Only a guaranteed landing moves the start; an explicit branch always wins.
-    expect((await fork([{ kind: 'dependency', tasks: [f.source.id], on: 'failed' }])).params.base).toBe('karmax/source');
-    expect((await fork([{ kind: 'dependency', tasks: ['task_other', f.source.id], mode: 'any' }])).params.base).toBe('karmax/source');
-    expect((await fork([{ kind: 'dependency', tasks: ['task_other'] }])).params.base).toBe('karmax/source');
-    expect((await fork([{ kind: 'dependency', tasks: [f.source.id] }], 'karmax/source')).params.base).toBe('karmax/source');
+    expect((await fork([{ kind: 'dependency', tasks: [f.source.id], on: 'failed' }])).params.base).toBe('tavya/source');
+    expect((await fork([{ kind: 'dependency', tasks: ['task_other', f.source.id], mode: 'any' }])).params.base).toBe('tavya/source');
+    expect((await fork([{ kind: 'dependency', tasks: ['task_other'] }])).params.base).toBe('tavya/source');
+    expect((await fork([{ kind: 'dependency', tasks: [f.source.id] }], 'tavya/source')).params.base).toBe('tavya/source');
     (await f.store.close());
   });
 

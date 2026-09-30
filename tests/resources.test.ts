@@ -9,6 +9,7 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
+import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
@@ -68,9 +69,9 @@ describe('project resources', () => {
       name: 'Model', driver: 'volume@1', target: { kind: 'path', path: 'resources/model' }, access: 'write',
       isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
     const initial = await resources.importFiles(volume.id, [{ path: 'model.bin', data: Buffer.from('base-model') }]);
-    const secretHandle = `resource:test:token`;
+    const secretHandle = resourceSecretHandle('resource_training_token');
     (await broker.registerHandle(secretHandle, 'secret-token'));
-    (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    (await store.createResourceAttachment({ id: 'resource_training_token', organizationId: project.organizationId!, projectId: project.id,
       name: 'Training token', driver: 'secret@1', target: { kind: 'environment', name: 'TRAINING_TOKEN' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [secretHandle], publish: 'discard' }));
 
@@ -385,9 +386,12 @@ describe('project resources', () => {
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
-    const handle = itemHandle('vi_agent_key', 'secret'); (await broker.registerHandle(handle, 'sk-agent-created'));
+    // The item the agent stored, as KarmaxApi finds it before proposing it.
+    const item = await new VaultItems(store, broker, dir, project.organizationId).save({ type: 'api-key', label: 'Agent key',
+      secrets: { secret: 'sk-agent-created' }, provenance: { source: 'task', taskId: task.id } });
+    const handle = itemHandle(item.id, 'secret');
     const proposed = await resources.proposeCredential(task.id, {
-      itemId: 'vi_agent_key', field: 'secret', credentialHandle: handle, name: 'Agent API key', driver: 'secret@1',
+      itemId: item.id, field: 'secret', credentialHandle: handle, name: 'Agent API key', driver: 'secret@1',
       target: { kind: 'environment', name: 'AGENT_API_KEY' }, access: 'read',
     });
     expect(JSON.stringify(proposed)).not.toContain('sk-agent-created');

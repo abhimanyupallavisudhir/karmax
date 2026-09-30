@@ -30,7 +30,7 @@ import { withTimeout } from './util/timeout.js';
 import { claimWorkerOwnership, duplicateInstanceMessage, registerAppInstance } from './util/instance.js';
 import { AuthorizationService } from './platform/authorization.js';
 import { IdentityService, type GitHubAuthorization } from './auth/identity.js';
-import { siteNameOf } from './domain/brand.js';
+import { siteNameOf, BRAND } from './domain/brand.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
   GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
 import { GitHubDeploymentMonitor } from './integrations/github-deployment-monitor.js';
@@ -91,7 +91,7 @@ async function main() {
   const p = ensurePaths();
   const { provider, reason } = defaultProvider();
 
-  console.log('\n  krmax ' + VERSION + '  — an AI-era todo list on a durable substrate\n');
+  console.log(`\n  ${BRAND} ` + VERSION + '  — an AI-era todo list on a durable substrate\n');
   if (envFile) console.log(`  • Operator settings from ${envFile}`);
 
   // Duplicate app-instance guard (karmax#4): more than one worker against the
@@ -317,10 +317,10 @@ async function main() {
     authorization, defaultAgentProvider: provider, hosted: deployment.hosted, hostLocal: deployment.hostLocal,
     providerConnections, worlds,
     worldAccess, runners, resources, broker, githubApp, bus,
-    refreshCredentialHealth: async (task, credentialProvider) => {
+    refreshCredentialHealth: async (task, credentialProvider, options) => {
       if (!credentialProvider) return;
       const { retryCredentials } = await import('./agent/credential-health.js');
-      await retryCredentials({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, task, credentialProvider);
+      await retryCredentials({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, task, credentialProvider, options);
     },
   });
 
@@ -406,7 +406,7 @@ async function main() {
   const { reapOrphans } = await import('./agent/custody.js');
   const orphans = reapOrphans();
   if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process tree(s) from a prior run`);
-  if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live krmax instance untouched`);
+  if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live ${BRAND} instance untouched`);
   const serviceOrphans = await sweepOrphanedServiceContainers(async (taskId) => (await store.worldState(taskId))).catch(() => 0);
   if (serviceOrphans) console.log(`  • Reaped ${serviceOrphans} orphaned per-world service container(s)`);
   // A concurrently running dogfooding instance can die after this app has
@@ -430,6 +430,13 @@ async function main() {
   (await sweepRetention());
   const retentionTimer = new AsyncInterval(sweepRetention, 3600_000);
   retentionTimer.unref();
+
+  // Claude sign-ins lapse about four weeks after sign-in and only a person can
+  // renew them: warn owners critically three days ahead, and when one lapses.
+  const { notifyCredentialAttention } = await import('./agent/credential-health.js');
+  const credentialAttentionTimer = new AsyncInterval(() => notifyCredentialAttention({ store, configHomes }), 3600_000);
+  credentialAttentionTimer.unref();
+  void credentialAttentionTimer.run();
 
   // Re-derive effective plans from the last signed provider state at boot and
   // throughout the process lifetime. In particular, this closes past-due grace
@@ -616,7 +623,7 @@ async function main() {
   void deploymentSweep.run();
   deploymentSweep.unref();
 
-  console.log(`\n  ✓ krmax is running:  ${url}\n`);
+  console.log(`\n  ✓ ${BRAND} is running:  ${url}\n`);
   if (!(await identity.hasUsers())) console.log('  (first run — create the initial administrator in the browser)');
   try {
     if (deployment.hostLocal) {
@@ -659,7 +666,7 @@ async function main() {
     // service cannot consume the worker's shutdown grace period. The existing
     // process-exit backstop bounds shutdown; do not close Store under these jobs.
     const maintenanceDrain = Promise.allSettled([
-      retentionTimer.stop(), subscriptionEntitlementTimer.stop(), subscriptionSeatTimer.stop(),
+      retentionTimer.stop(), credentialAttentionTimer.stop(), subscriptionEntitlementTimer.stop(), subscriptionSeatTimer.stop(),
       reconcileSweep.stop(), deploymentSweep.stop(),
       triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(),
     ]);
@@ -709,6 +716,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error('krmax failed to start:', e);
+  console.error(`${BRAND} failed to start:`, e);
   process.exit(1);
 });

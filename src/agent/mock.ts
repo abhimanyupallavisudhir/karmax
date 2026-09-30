@@ -1,6 +1,7 @@
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/types.js';
+import { platformToolHandlers } from './tools.js';
 
 /**
  * Deterministic mock agent for hermetic tests. It executes simple directives
@@ -16,6 +17,9 @@ import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/
  *   @respond <action> [:: text]     parent answers a raising child (open_pr/confirm/comment/retry/cancel)
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
  *   @wait                           parent parks until its sub-tasks finish/raise
+ *   @job <command>                  start a durable job (the start_job tool)
+ *   @pause <minutes> [:: last]      the pause tool: a timed pause, or (`last`) also wait
+ *                                   for the job this turn started last
  *   @subagents <n>                  report in-harness sub-agents (Task tool) still running:
  *                                   N this turn, then N-1, … draining by one each turn until
  *                                   0 — models sub-agents that settle over several turns
@@ -66,6 +70,7 @@ export class MockAdapter implements AgentAdapter {
 
     let complete = true;
     let pendingSubagents = 0;
+    let lastJob: string | undefined;
     const outputs: string[] = [];
     // How many `msgs` this turn has consumed — the schedule snapshot to start, then
     // one more per in-flight follow-up injected below (SPEC §5.6). Reported so the
@@ -88,6 +93,7 @@ export class MockAdapter implements AgentAdapter {
             injected++;
           }
           deliveredIndex++;
+          ctx.followUpsDelivered?.(deliveredIndex);
         }
       }
       return injected;
@@ -170,6 +176,19 @@ export class MockAdapter implements AgentAdapter {
           ctx.waitForSubtasks();
           complete = false;
           outputs.push('wait');
+          break;
+        }
+        case 'job': {
+          const result = await platformToolHandlers(input.world, ctx).start_job!({ command: rest });
+          lastJob = result.match(/job-[a-f0-9]{8}/)?.[0];
+          outputs.push(result.split('\n')[0]!);
+          break;
+        }
+        case 'pause': {
+          const [minutes, which = ''] = splitOn(rest, '::');
+          const jobs = which.trim() === 'last' && lastJob ? [lastJob] : undefined;
+          outputs.push(await platformToolHandlers(input.world, ctx).pause!({ minutes: Number(minutes.trim()), ...(jobs ? { jobs } : {}) }));
+          complete = false;
           break;
         }
         case 'review': {

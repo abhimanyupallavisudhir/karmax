@@ -353,7 +353,7 @@ describe('organization and collaboration domain', () => {
     const task = (await store.createTask({ projectId: project.id, title: 'Delete all of me', workflow: 'just-do',
       workflowVersion: '1', params: { prompt: 'customer data' } }));
     (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', branch: 'karmax/task', base: 'main', sealedProviderRef: 'opaque', meta: {} }, project.id));
+      root: '/workspace', branch: 'tavya/task', base: 'main', sealedProviderRef: 'opaque', meta: {} }, project.id));
     (await store.saveWorldCheckpoint({ id: 'checkpoint-1', worldId: task.id, generation: 1, projectId: project.id,
       runnerPoolId: 'pool-1', environmentDigest: 'image', repos: [],
       filesystemDelta: { objectKey: 'checkpoints/one', sha256: 'abc', bytes: 3 }, createdAt: 1 }));
@@ -379,6 +379,8 @@ describe('organization and collaboration domain', () => {
     (await store.setSettings(`quick:${project.id}`, 'software-dev', { secret: 'quick' }));
     (await store.kvSet(`session:${task.id}:do`, 'session-secret'));
     (await store.kvSet(`turnsession:${task.id}#1`, 'turn-secret'));
+    (await store.kvSet(`turnsession:${task.id}:run-1#0`, 'run-scoped-turn-secret'));
+    (await store.kvSet(`turnsession:${task.id}:run-1#0:journal`, '{"openPrRequested":true}'));
     (await store.kvSet(`wfpin:${project.id}:software-dev`, '1.0.0'));
     (await store.setPrincipalGrant('user:owner', `project:${project.id}`, { profileId: 'developer' }));
     (await store.createCard({ id: 'card-1', provider: 'test', scope: 'project', scopeId: project.id,
@@ -401,6 +403,8 @@ describe('organization and collaboration domain', () => {
       expect((await store.db.prepare(`SELECT COUNT(*) n FROM ${table}`).get())).toMatchObject({ n: 0 });
     expect((await store.kvGet(`session:${task.id}:do`))).toBeUndefined();
     expect((await store.kvGet(`turnsession:${task.id}#1`))).toBeUndefined();
+    expect((await store.kvGet(`turnsession:${task.id}:run-1#0`))).toBeUndefined();
+    expect((await store.kvGet(`turnsession:${task.id}:run-1#0:journal`))).toBeUndefined();
     expect((await store.kvGet(`wfpin:${project.id}:software-dev`))).toBeUndefined();
     expect((await store.db.prepare('SELECT projectId, taskId, worldId, metadata FROM usage_events').get()))
       .toMatchObject({ projectId: null, taskId: null, worldId: null, metadata: null });

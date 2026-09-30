@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import type { WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, ExecResult } from './types.js';
 import { worldRelativePath } from './types.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * A one-shot local command with optional STDIN — the async equivalent of
@@ -63,7 +64,7 @@ export async function openLocalPty(root: string, spec: WorldPtySpec = {}): Promi
     cols: spec.cols ?? 80,
     rows: spec.rows ?? 24,
     cwd: localCwd(root, spec.cwd),
-    env: { ...process.env, PS1: 'karmax:\\W$ ', ...(spec.env ?? {}) },
+    env: { ...process.env, PS1: `${BRAND}:\\W$ `, ...(spec.env ?? {}) },
   });
   return wrapPty(term);
 }

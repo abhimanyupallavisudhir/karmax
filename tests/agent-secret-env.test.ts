@@ -12,6 +12,7 @@ import { Store } from '../src/store/db.js';
 import { LocalObjectStore } from '../src/store/objects.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
+import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
 
 describe('agent project-secret delivery', () => {
   it('resolves attachment and service handles JIT into the dedicated turn channel', async () => {
@@ -30,9 +31,9 @@ describe('agent project-secret delivery', () => {
     const worlds = new WorldRegistry();
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
-    const credential = 'resource:test:agent-token';
+    const credential = resourceSecretHandle('resource_agent_token');
     (await broker.registerHandle(credential, 'secret-project-token'));
-    const initial = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+    const initial = (await store.createResourceAttachment({ id: 'resource_agent_token', organizationId: project.organizationId!, projectId: project.id,
       name: 'Agent token', driver: 'secret@1', target: { kind: 'environment', name: 'PROJECT_TOKEN' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [credential], publish: 'discard' }));
 
@@ -72,9 +73,9 @@ describe('agent project-secret delivery', () => {
         expect(received?.extraEnv ?? {}).not.toHaveProperty('ANTHROPIC_API_KEY');
       } finally { vaultEnvironment.mockRestore(); }
       // A resumed turn opens the same world, without materializing its files again.
-      const lateHandle = 'resource:test:late-token';
+      const lateHandle = resourceSecretHandle('resource_late_token');
       (await broker.registerHandle(lateHandle, 'late-project-token'));
-      const late = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      const late = (await store.createResourceAttachment({ id: 'resource_late_token', organizationId: project.organizationId!, projectId: project.id,
         name: 'Late token', driver: 'secret@1', target: { kind: 'environment', name: 'LATE_TOKEN' },
         access: 'read', isolation: 'fork', source: {}, credentialHandles: [lateHandle], publish: 'discard' }));
       const resume = () => core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: handle,
@@ -94,17 +95,19 @@ describe('agent project-secret delivery', () => {
       await resume();
       expect(received?.secretEnv).toEqual({ DATABASE_URL: 'postgres://task-service' });
       // A secret added while the agent is already running reaches that same turn.
-      const midHandle = 'resource:test:mid-turn-token';
-      (await broker.registerHandle(midHandle, 'mid-turn-token'));
       let midTurn: Record<string, string> | undefined;
       let midTurnWorld: TurnInput['world'] | undefined;
       adapter.runTurn = async (input: TurnInput, ctx?: any) => {
         received = input;
         const changed = new Promise<void>((resolve) => ctx.onSecretEnvChange(resolve));
-        for (const target of [{ kind: 'environment', name: 'MID_TURN_TOKEN' }, { kind: 'path', path: '.mid-turn-key' }] as const)
-          (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+        for (const target of [{ kind: 'environment', name: 'MID_TURN_TOKEN' }, { kind: 'path', path: '.mid-turn-key' }] as const) {
+          // Each resource owns its own copy of the value.
+          const id = `resource_mid_${target.kind}`;
+          (await broker.registerHandle(resourceSecretHandle(id), 'mid-turn-token'));
+          (await store.createResourceAttachment({ id, organizationId: project.organizationId!, projectId: project.id,
             name: target.kind, driver: 'secret@1', target, access: 'read', isolation: 'fork', source: {},
-            credentialHandles: [midHandle], publish: 'discard' }));
+            credentialHandles: [resourceSecretHandle(id)], publish: 'discard' }));
+        }
         await changed;
         midTurn = { ...input.secretEnv };
         midTurnWorld = input.world;

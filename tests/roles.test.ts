@@ -6,7 +6,7 @@ import { GLOBAL_INSTRUCTIONS } from '../src/agent/instructions.js';
 import { autoResolve } from '../src/resolve/cases.js';
 import { allows } from '../src/platform/capabilities.js';
 
-const world = { id: 'w', root: '/tmp/w', branch: 'karmax/t', base: 'main', target: 'main' } as any;
+const world = { id: 'w', root: '/tmp/w', branch: 'tavya/t', base: 'main', target: 'main' } as any;
 const task = { taskId: 't', projectId: 'p', title: 'Add factorial', prompt: 'implement it' } as any;
 const profile = (over: any = {}) => ({ id: 'do', name: 'Do', provider: 'claude', role: 'do', ...over } as any);
 
@@ -130,6 +130,19 @@ describe('prompt assembly derives from the declared role (not a hardcoded map)',
     expect(out).toContain('Add factorial'); // {{title}} bound
   });
 
+  it('tells every Do agent its own shell dies with the turn, and how to wait on long work (videos #1)', () => {
+    const out = assemblePrompt({ profile: profile({ role: 'do' }), role: 'do', task, world, globalInstructions: GLOBAL_INSTRUCTIONS });
+    expect(out).toContain('- start_job(command, cwd?):');
+    expect(out).toContain('- pause(minutes, jobs?):');
+    expect(out).toContain('- stop_job(jobs):');
+    expect(out).toContain('Anything you run from your own shell stops when your turn ends.');
+    // The default organization prompt carries the working practice.
+    expect(out).toContain('- Long-running commands:');
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/even nohup or setsid/);
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/pgrep -f pattern/);
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/Never end a turn saying you will continue when something finishes unless you called pause/);
+  });
+
   it('a profile promptTemplate overrides the role template', () => {
     const out = assemblePrompt({ profile: profile({ promptTemplate: 'CUSTOM {{title}}' }), role: 'do', task, world });
     expect(out).toBe('CUSTOM Add factorial');
@@ -223,7 +236,7 @@ describe('workflow-declared resolve rules (SPEC §5.2)', () => {
 describe('prompt preamble (SPEC §5.4)', () => {
   it('uses the platform preamble when the workflow declares no override', () => {
     const out = assemblePrompt({ profile: profile(), role: 'do', task: { ...task, workflow: 'software-dev' } as any, world });
-    expect(out).toContain('running inside karmax'); // platform TOOLS_PREAMBLE
+    expect(out).toContain('running inside tavya'); // platform TOOLS_PREAMBLE
     expect(out).toMatch(/create_review_info.*optional/i);
     expect(out).toContain('limited to 280 characters');
     expect(out).toContain('Source code is not a human-readable output');

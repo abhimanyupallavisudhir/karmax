@@ -13,8 +13,9 @@ import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { createFollowUpInjector, toSdkUserMessage, followUpContent, withClaudeStartupDeadline } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
-import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
+import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount, backgroundShellDescriptions } from './subagents.js';
 import {
+  AgentChannelLost,
   ProviderFailure,
   classifyLimitError,
   isTransportError,
@@ -32,6 +33,7 @@ import { worldWorkingDirectory } from '../world/types.js';
 import { recoverClaudeToolInputs } from './claude-history.js';
 import { ensureClaudeAccessTokenFresh, refreshClaudeAccessToken } from './usage.js';
 import { boundedStartupProbe } from './startup-diagnostics.js';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -128,6 +130,7 @@ export class ClaudeAdapter implements AgentAdapter {
             added++;
           }
           deliveredIndex++;
+          ctx.followUpsDelivered?.(deliveredIndex);
         }
       } catch { /* a failed poll must never break the turn */ }
       return added;
@@ -275,7 +278,8 @@ export class ClaudeAdapter implements AgentAdapter {
         ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'failed',
           title: 'Could not refresh Claude access token',
           detail: activityDetail(refreshError instanceof Error ? refreshError.message : refreshError) });
-        throw error;
+        // A signed-out login is the more precise diagnosis than the expiry.
+        throw refreshError instanceof ProviderFailure ? refreshError : error;
       }
       if (ctx.signal?.aborted) throw error;
       ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'completed',
@@ -307,7 +311,7 @@ export class ClaudeAdapter implements AgentAdapter {
       const here = path.dirname(fileURLToPath(import.meta.url));
       if (!fs.existsSync(here)) {
         throw new Error(
-          `krmax is running from a deleted directory (${here}) — an orphaned app instance, ` +
+          `${BRAND} is running from a deleted directory (${here}) — an orphaned app instance, ` +
             `likely booted from a task world that has since merged and been removed (karmax#3). ` +
             `Kill this process (pid ${process.pid}); it is poisoning the shared task queue. ` +
             `Original error: ${String(e)}`,
@@ -461,6 +465,7 @@ export class ClaudeAdapter implements AgentAdapter {
             injected++;
           }
           deliveredIndex++;
+          ctx.followUpsDelivered?.(deliveredIndex);
         }
         return injected;
       } catch {
@@ -557,8 +562,15 @@ export class ClaudeAdapter implements AgentAdapter {
     // sent has been answered. Unanswered input and tracked in-harness work both hold the
     // stream open, bounded because a backgrounded shell may be a dev server the task
     // deliberately left running.
+    // The grace counts from when the agent last went idle, not from when work was
+    // first outstanding: one never-ending shell must not use it up for the rest of
+    // the turn (videos #1 — a stuck waiter left a render started 25 minutes later
+    // with no grace at all).
     const settleGraceMs = Number(process.env.KARMAX_AGENT_BG_SETTLE_MS ?? 300_000);
     let settleDeadline: number | undefined;
+    // Backgrounded shells still running when the input closed. Closing it stops
+    // them (or leaves them to finish unobserved), so their results are lost.
+    let stoppedShells: string[] = [];
     const harnessStillWorking = (): boolean => {
       if (!subagents.size && !unanswered.size) return false;
       settleDeadline ??= Date.now() + settleGraceMs;
@@ -575,7 +587,11 @@ export class ClaudeAdapter implements AgentAdapter {
       harnessIdle = true;
       if (settleTimer) { clearTimeout(settleTimer); settleTimer = undefined; }
       if (!completionSeen && await drainFollowUps()) { harnessIdle = false; return; }
-      if (!harnessStillWorking()) { await injector.close(); return; }
+      if (!harnessStillWorking()) {
+        stoppedShells = backgroundShellDescriptions(subagents);
+        await injector.close();
+        return;
+      }
       settleTimer = setTimeout(() => { if (harnessIdle) void settleInput(); },
         Math.max(0, (settleDeadline ?? Date.now()) - Date.now()));
     };
@@ -735,8 +751,19 @@ export class ClaudeAdapter implements AgentAdapter {
         // the stream to its end lets any in-turn settlements clear before we report —
         // only genuinely still-running sub-agents remain (see subagents.ts).
         trackTaskMessage(subagents, message);
+        // The harness woke after we ended its input (a background task finished past
+        // the settle grace; task 388). Every control tool would now fail with "Stream
+        // closed", so stop it and let the retry resume the session with a live channel.
+        if (message.type === 'assistant' && injector.closed) {
+          onAbort();
+          throw new AgentChannelLost(
+            'Claude resumed work after its control channel closed; resuming the session with a working channel',
+            'a background task you were waiting on finished after your tool channel had closed, so your tools stopped working; they work again now',
+          );
+        }
         if (message.type === 'assistant') {
           harnessIdle = false; // working again: a pending settle re-check must not close under it
+          settleDeadline = undefined; // and the next idle period gets a full grace
           const answered: unknown = (message as any).user_message_uuids ?? [(message as any).user_message_uuid];
           if (Array.isArray(answered)) for (const id of answered) if (typeof id === 'string') { harnessEchoes = true; unanswered.delete(id); }
         }
@@ -952,7 +979,7 @@ export class ClaudeAdapter implements AgentAdapter {
           try { await boundedStartupProbe(() => diagnoseStartup('error'), 5000, undefined); }
           catch { /* retain the original startup failure */ }
         }
-        if (e instanceof ProviderFailure) throw e;
+        if (e instanceof ProviderFailure || e instanceof AgentChannelLost) throw e;
         if (remoteProcess?.lost) throw remoteProcess.lost;
         const message = e instanceof Error ? e.message : String(e);
         const classified = providerErrorFromMessage('claude', message);
@@ -981,7 +1008,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // Only a subtype=success result is a turn boundary. `delivered` = every message
     // this turn consumed (initial delta + in-flight injections).
     const pending = pendingSubagentCount(subagents);
-    const pendingShells = pendingBackgroundShellCount(subagents);
+    const pendingShells = Math.max(pendingBackgroundShellCount(subagents), stoppedShells.length);
     return {
       termination: {
         kind: 'success',
@@ -1000,6 +1027,7 @@ export class ClaudeAdapter implements AgentAdapter {
       })(),
       ...(pending ? { pendingSubagents: pending } : {}),
       ...(pendingShells ? { pendingBackgroundShells: pendingShells } : {}),
+      ...(stoppedShells.length ? { stoppedBackgroundShells: stoppedShells } : {}),
     };
   }
 }

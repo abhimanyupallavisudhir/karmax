@@ -7,6 +7,7 @@
  * they can enter an agent conversation.
  */
 import net from 'node:net';
+import { BRAND } from '../domain/brand.js';
 
 export type GithubActionsStatus =
   | 'completed' | 'action_required' | 'cancelled' | 'failure' | 'neutral'
@@ -446,7 +447,7 @@ export class GithubActionsApi {
       this.seenTokens.add(token);
       return this.fetcher(`${this.apiBase}${pathname}`, { ...init, redirect: 'manual', headers: {
         accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
-        'x-github-api-version': '2022-11-28', 'user-agent': 'karmax', ...(init.headers ?? {}),
+        'x-github-api-version': '2022-11-28', 'user-agent': BRAND, ...(init.headers ?? {}),
       }, signal: AbortSignal.timeout(30000) }).catch(() => { throw new GithubActionsApiError(502, 'GitHub Actions request failed'); });
     };
     let response = await once();
@@ -536,6 +537,23 @@ export function renderGithubActionsFailure(
   if (notices.length) lines.push('', 'Inspection notices:', ...notices.map((notice) => `- ${notice}`));
   const rendered = lines.join('\n').trim();
   return rendered.length <= maxChars ? rendered : `${rendered.slice(0, maxChars)}\n[Additional diagnostics omitted at the task-event safety limit.]`;
+}
+
+/** A person-sized account of the same failure: which run and job failed and
+ * where to look. Logs belong in the repair prompt and on GitHub, not in a
+ * request for human input. */
+export function summarizeGithubActionsFailure(decision: GithubActionsFailureDecision): string {
+  const { run, failedJobs, notices } = decision.inspection;
+  const failed = failedJobs.slice(0, 6).map((job) => {
+    const steps = job.steps.filter((step) => FAILURE_CONCLUSIONS.has(String(step.conclusion ?? '').toLowerCase()));
+    return `- ${job.name}${steps.length ? `: ${steps.map((step) => step.name).join(', ')}` : ''}`;
+  });
+  return [
+    `GitHub Actions run ${run.name} #${run.runNumber} (attempt ${run.attempt}) concluded ${run.conclusion ?? run.status}.`,
+    ...(run.url ? [`Run: ${run.url}`] : []),
+    ...(failed.length ? ['Failed:', ...failed] : []),
+    ...notices.slice(0, 3).map((notice) => `Note: ${notice.slice(0, 200)}`),
+  ].join('\n');
 }
 
 export function githubActionsRunIdFromUrl(value: string | undefined): number | undefined {

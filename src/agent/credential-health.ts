@@ -1,6 +1,7 @@
 import type { Client } from '@temporalio/client';
 import type { Store } from '../store/db.js';
-import type { ConfigHomeManager } from '../autonomy/config-homes.js';
+import { claudeSignIn, type ConfigHomeManager } from '../autonomy/config-homes.js';
+import type { CredentialNotice } from '../domain/types.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { makeCoordinatorActivities } from '../activities/coordinator.js';
 import { enumerateCredentials, resolveCredentials } from '../platform/credentials.js';
@@ -28,12 +29,14 @@ const usageProbes = new Map<string, Promise<UsageResult>>();
  * A usage probe cannot be the gate: setup tokens and API keys have no usage API,
  * and an expired access-only probe cannot refresh the login it is checking.
  * Only enabled credentials in this task's policy are eligible. The coordinator's
- * atomic guard preserves manual disables and known quota-reset waits.
+ * atomic guard preserves manual disables and, unless the person retrying a
+ * quota wait asks for it (`includeExhausted`), known quota-reset waits.
  */
 export async function retryCredentials(
   deps: CredentialHealthDeps,
   task: { id: string; projectId: string },
   provider: string,
+  options: { includeExhausted?: boolean } = {},
 ): Promise<void> {
   const organizationId = (await deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
   const all = enumerateCredentials(gatherCredentialSources({ ...deps, organizationId }));
@@ -45,9 +48,10 @@ export async function retryCredentials(
     aliases.includes(credential.provider)
     || (credential.provider === 'opencode' && !!credential.modelProvider && aliases.includes(credential.modelProvider)));
   const coordinator = makeCoordinatorActivities(deps);
+  const statuses = options.includeExhausted ? ['needs-attention', 'exhausted'] as const : ['needs-attention'] as const;
   for (const credential of eligible) {
-    await coordinator.setAccountAvailability({
-      accountId: credential.key, status: 'available', onlyIfStatus: 'needs-attention',
+    for (const onlyIfStatus of statuses) await coordinator.setAccountAvailability({
+      accountId: credential.key, status: 'available', onlyIfStatus,
     });
   }
 }
@@ -101,4 +105,40 @@ export async function refreshCredentialHealth(
     out[credential.key] = await probe;
   }));
   return out;
+}
+
+/** How early a person is warned that a Claude sign-in will lapse. Claude Code
+ * itself starts telling interactive users to `/login` at the same point. */
+export const SIGN_IN_WARNING_MS = 3 * 86_400_000;
+
+/** Logins in an organization that only a person can restore. A Claude sign-in
+ * lapses about four weeks after it was made regardless of refreshes (its
+ * `refreshTokenExpiresAt` never moves), and then Anthropic signs it out. */
+export function credentialNotices(configHomes: ConfigHomeManager, organizationId: string, now = Date.now()): CredentialNotice[] {
+  return configHomes.list(organizationId).flatMap((login): CredentialNotice[] => {
+    if (login.provider !== 'claude' || !login.account) return [];
+    const state = claudeSignIn(login.path);
+    if (!state) return [];
+    const reason = state.signedOut ? 'signed-out' : state.expiresAt - now < SIGN_IN_WARNING_MS ? 'expiring' : undefined;
+    if (!reason) return [];
+    const credentialKey = organizationId === 'org_personal'
+      ? `login:${login.provider}:${login.account}` : `login:${organizationId}:${login.provider}:${login.account}`;
+    return [{ kind: 'credential', credentialKey, provider: login.provider, account: login.account, reason, expiresAt: state.expiresAt }];
+  });
+}
+
+/** Tell every organization's owners, critically, about logins they must sign in
+ * to again; withdraw notices that no longer apply. Runs hourly and after logins. */
+export async function notifyCredentialAttention(
+  deps: { store: Store; configHomes?: ConfigHomeManager },
+  now = Date.now(),
+  organizationIds?: string[],
+): Promise<void> {
+  if (!deps.configHomes) return;
+  const ids = organizationIds ?? (await deps.store.listOrganizations()).map((organization) => organization.id);
+  for (const organizationId of ids) {
+    const owners = (await deps.store.listOrganizationMemberships(organizationId))
+      .filter((membership) => membership.role === 'owner').map((membership) => membership.userId);
+    await deps.store.syncCredentialInbox(organizationId, owners, credentialNotices(deps.configHomes, organizationId, now), now);
+  }
 }

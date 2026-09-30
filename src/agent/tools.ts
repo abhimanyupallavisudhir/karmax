@@ -2,12 +2,17 @@ import { currentTiming, timed, withTiming } from '../timing/index.js';
 import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
+import { startJob, jobStatuses, describeJobs, listJobs, stopJobs } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
   compactSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
 import { URGENCY_LEVELS } from '../domain/types.js';
+import { BRAND } from '../domain/brand.js';
+
+/** The longest a single wait may last: a week, after which a parked world may hibernate. */
+export const MAX_WAIT_MINUTES = 7 * 24 * 60;
 
 /** Provider-neutral tool descriptor (mapped to OpenAI / MCP shapes per adapter). */
 export interface ToolSchema {
@@ -145,6 +150,41 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: {} },
   },
   {
+    name: 'start_job',
+    description:
+      'Run a long command (a render, build, training run, large test suite) as a durable job. Unlike your own shell — foreground, run_in_background, even nohup/setsid — a job keeps running after your turn ends or is interrupted. Output goes to the returned log file. Then call pause with the job id to be resumed when it finishes.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Shell command, run with bash.' },
+        cwd: { type: 'string', description: 'Directory to run in; relative paths are from your working directory (the default).' },
+      },
+      required: ['command'],
+    },
+  },
+  {
+    name: 'pause',
+    description:
+      'End your turn and be resumed later: when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. After calling it, end your turn.',
+    parameters: {
+      type: 'object',
+      properties: {
+        minutes: { type: 'number', description: `Resume after this many minutes at the latest (1–${MAX_WAIT_MINUTES}). With jobs, set it comfortably above their expected run time.` },
+        jobs: { type: 'array', items: { type: 'string' }, description: 'Job ids from start_job to wait for.' },
+      },
+      required: ['minutes'],
+    },
+  },
+  {
+    name: 'stop_job',
+    description: 'Stop durable jobs you no longer need (the job and every process it started). Use this rather than kill or pkill.',
+    parameters: {
+      type: 'object',
+      properties: { jobs: { type: 'array', items: { type: 'string' }, description: 'Job ids from start_job.' } },
+      required: ['jobs'],
+    },
+  },
+  {
     name: 'create_branch',
     description:
       'Multi-PR tasks ONLY: split this task\'s change across another branch, so it is reviewed and merged as its own pull request. The branch is checked out beside your current one immediately — work in it during this same turn (`cd` to the path returned). Use it when one review would mix unrelated concerns: a prep/refactor under a feature, or slices of different repos. Stack with `base`: pass a SIBLING checkout\'s name and this branch builds on it and lands after it. All branches stay one task with one Review and one Merge — if a piece needs its own review timing or cancellation, use create_sub_task instead. Fails on a single-branch task; do not retry, just keep working in the one branch.',
@@ -164,7 +204,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'save_skill',
-    description: 'Save a reusable skill (markdown content) for future tasks. This writes INSTALLATION-WIDE global state — visible to every project and organization on this karmax, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
+    description: `Save a reusable skill (markdown content) for future tasks. This writes INSTALLATION-WIDE global state — visible to every project and organization on this ${BRAND}, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).`,
     parameters: {
       type: 'object',
       properties: { name: { type: 'string' }, content: { type: 'string' } },
@@ -264,7 +304,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_credential',
     description:
-      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that list_credentials does not show, identified by item_id or the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
+      `Ask for access to a credential in the user's vault (a site login, API key, SSH key, or .env bag) that list_credentials does not show, identified by item_id or the site's domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — ${BRAND} automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human's own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then ${BRAND} resumes the task.`,
     parameters: {
       type: 'object',
       properties: {
@@ -281,7 +321,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'fill_credential',
     description:
-      'Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: karmax resolves it and types it over CDP, verifying the page origin matches the credential\'s domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). The karmax browser MCP already runs a Chrome that exposes the DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+      `Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: ${BRAND} resolves it and types it over CDP, verifying the page origin matches the credential's domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). The ${BRAND} browser MCP already runs a Chrome that exposes the DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
     parameters: {
       type: 'object',
       properties: {
@@ -376,7 +416,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'enroll_passkey',
     description:
-      'Enroll a NEW passkey that belongs to karmax on the account open in your browser (you cannot use the user\'s own passkeys — the OS biometric is theirs). karmax prepares a virtual authenticator (origin-verified against `domain`); you then trigger the site\'s "create a passkey / add passkey" button; then call save_passkey with the returned authenticator_id. After this, use_passkey logs in with no 2FA prompt.',
+      'Enroll a NEW passkey that belongs to tavya on the account open in your browser (you cannot use the user\'s own passkeys — the OS biometric is theirs). tavya prepares a virtual authenticator (origin-verified against `domain`); you then trigger the site\'s "create a passkey / add passkey" button; then call save_passkey with the returned authenticator_id. After this, use_passkey logs in with no 2FA prompt.',
     parameters: {
       type: 'object',
       properties: {
@@ -403,7 +443,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'use_passkey',
     description:
-      'Log in with a karmax-enrolled passkey: karmax loads the stored credential into a virtual authenticator on the page; you then trigger the site\'s "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticator_id (call the passkey release route when done), or needs_approval/not_in_vault.',
+      `Log in with a ${BRAND}-enrolled passkey: ${BRAND} loads the stored credential into a virtual authenticator on the page; you then trigger the site's "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticator_id (call the passkey release route when done), or needs_approval/not_in_vault.`,
     parameters: {
       type: 'object',
       properties: {
@@ -528,7 +568,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'connect_world_provider',
-    description: 'Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted Karmax vault and never returned.',
+    description: `Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted ${BRAND} vault and never returned.`,
     parameters: {
       type: 'object',
       properties: {
@@ -622,7 +662,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'request_agent_action',
-    description: 'Ask another task agent to publish its branch in the background. Returns a durable request id immediately; Karmax injects completion or failure into this conversation. Continue other work and do not poll.',
+    description: `Ask another task agent to publish its branch in the background. Returns a durable request id immediately; ${BRAND} injects completion or failure into this conversation. Continue other work and do not poll.`,
     parameters: {
       type: 'object',
       properties: {
@@ -672,7 +712,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_permission',
     description:
-      'Request exact Karmax capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ' +
+      `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
       'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
       'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
       'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task.',
@@ -723,7 +763,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'list_events',
-    description: 'Read durable karmax events for a task after an optional sequence number.',
+    description: `Read durable ${BRAND} events for a task after an optional sequence number.`,
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, since: { type: 'number' } }, required: ['task_id'] },
   },
   {
@@ -784,7 +824,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'platform_request',
-    description: 'Call any authenticated karmax /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, safe mode, and more). Authorization is always enforced, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused. Call describe_platform when unsure.',
+    description: `Call any authenticated ${BRAND} /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, safe mode, and more). Authorization is always enforced, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused. Call describe_platform when unsure.`,
     parameters: {
       type: 'object',
       properties: {
@@ -860,6 +900,9 @@ export const SDK_CONTROL_TOOL_NAMES = new Set([
   'respond_to_sub_task',
   'raise_to_parent',
   'wait_for_subtasks',
+  'start_job',
+  'pause',
+  'stop_job',
   'request_spend',
   'fill_payment_card',
   'open_pr',
@@ -880,7 +923,7 @@ export function platformToolHandlers(
   workEnv?: () => Record<string, string>,
 ): Record<string, (args: any) => Promise<string>> {
   const platformRequest = (method: string, requestPath: string, body?: unknown) => {
-    if (!ctx.platformRequest) throw new Error('karmax gateway is unavailable to this agent');
+    if (!ctx.platformRequest) throw new Error(`${BRAND} gateway is unavailable to this agent`);
     return ctx.platformRequest(method, requestPath, body);
   };
   const handlers: Record<string, (args: any) => Promise<string>> = {
@@ -927,14 +970,14 @@ export function platformToolHandlers(
       return 'review info recorded';
     },
     async create_sub_task(args) {
-      ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
+      await ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
       return 'sub-task spawned (branches off your work; you are its confirmer)';
     },
     async respond_to_sub_task(args) {
       const action = String(args?.action ?? '');
       if (!['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(action))
         return 'invalid action — use open_pr | confirm | comment | retry | cancel';
-      ctx.respondToSubTask({
+      await ctx.respondToSubTask({
         childTaskId: args?.child_task_id ? String(args.child_task_id) : undefined,
         action: action as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel',
         text: args?.text ? String(args.text) : undefined,
@@ -945,12 +988,65 @@ export function platformToolHandlers(
       const type = String(args?.type ?? '');
       if (!['needs_info', 'needs_permission', 'needs_confirmation', 'blocked'].includes(type))
         return 'invalid type — use needs_info | needs_permission | needs_confirmation | blocked';
-      ctx.raiseToParent({ type: type as 'needs_info' | 'needs_permission' | 'needs_confirmation' | 'blocked', detail: args?.detail ? String(args.detail) : undefined });
+      await ctx.raiseToParent({ type: type as 'needs_info' | 'needs_permission' | 'needs_confirmation' | 'blocked', detail: args?.detail ? String(args.detail) : undefined });
       return `raised to parent: ${type}`;
     },
     async wait_for_subtasks() {
-      ctx.waitForSubtasks();
+      await ctx.waitForSubtasks();
       return 'waiting for sub-tasks to finish (or raise)';
+    },
+    async start_job(args) {
+      const command = String(args?.command ?? '').trim();
+      if (!command) return 'error: command is required';
+      try {
+        const env = workEnv?.();
+        const job = await startJob(world, { command, ...(args?.cwd ? { cwd: String(args.cwd) } : {}), ...(env ? { env } : {}) });
+        await ctx.jobStarted(job.id);
+        ctx.emit(`$ ${command} (job ${job.id})`);
+        return `Started job ${job.id}. Log: ${job.log}\nIt keeps running after this turn. Call pause with jobs ["${job.id}"] to be resumed when it finishes.`;
+      } catch (e: any) {
+        return `error: ${e?.message ?? e}`;
+      }
+    },
+    async stop_job(args) {
+      const ids = Array.isArray(args?.jobs) ? [...new Set(args.jobs.map((id: unknown) => String(id)))] as string[] : [];
+      if (!ids.length) return 'error: jobs is required';
+      try {
+        const before = await jobStatuses(world, ids);
+        const missing = before.filter((job) => job.state === 'missing').map((job) => job.id);
+        if (missing.length) return `error: no such job: ${missing.join(', ')}`;
+        const running = before.filter((job) => job.state === 'running').map((job) => job.id);
+        await stopJobs(world, running);
+        const after = new Map((await jobStatuses(world, running)).map((job) => [job.id, job.state]));
+        return ids.map((id) => !running.includes(id) ? `${id} had already stopped.`
+          : after.get(id) === 'running' ? `${id} is still running.` : `Stopped ${id}.`).join('\n');
+      } catch (e: any) {
+        return `error: ${e?.message ?? e}`;
+      }
+    },
+    async pause(args) {
+      const minutes = Number(args?.minutes);
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > MAX_WAIT_MINUTES)
+        return `error: minutes must be between 1 and ${MAX_WAIT_MINUTES}`;
+      const requested = Array.isArray(args?.jobs) ? [...new Set(args.jobs.map((id: unknown) => String(id)))] as string[] : [];
+      let jobs: string[] = [];
+      if (requested.length) {
+        const statuses = await jobStatuses(world, requested, { tailLines: 20 });
+        const missing = statuses.filter((job) => job.state === 'missing').map((job) => job.id);
+        if (missing.length) return `error: no such job: ${missing.join(', ')}`;
+        jobs = statuses.filter((job) => job.state === 'running').map((job) => job.id);
+        // Nothing left to wait for: hand the results back now, no turn needed.
+        if (!jobs.length) return `Every job has already finished — nothing to wait for.\n\n${describeJobs(statuses)}`;
+      }
+      const unlisted = (await jobStatuses(world, await listJobs(world)))
+        .filter((job) => job.state === 'running' && !jobs.includes(job.id)).map((job) => job.id);
+      if (unlisted.length)
+        return `error: ${unlisted.join(', ')} ${unlisted.length > 1 ? 'are' : 'is'} still running. Pass ${unlisted.length > 1 ? 'them' : 'it'} in jobs: a pause without ${unlisted.length > 1 ? 'them' : 'it'} lets the world be suspended, which freezes ${unlisted.length > 1 ? 'them' : 'it'}. You are still resumed after minutes at the latest.`;
+      try { await ctx.requestWait({ minutes: Math.round(minutes), ...(jobs.length ? { jobs } : {}) }); }
+      catch (e: any) { return `error: ${e?.message ?? e}`; }
+      return jobs.length
+        ? `Waiting for ${jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up.`
+        : `Pausing for ${Math.round(minutes)} min. End your turn now; you will be resumed then, or sooner if a message arrives.`;
     },
     async create_branch(args) {
       try {
@@ -970,7 +1066,7 @@ export function platformToolHandlers(
       }
     },
     async save_skill(args) {
-      ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
+      await ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
       return 'skill saved';
     },
     async read_wiki(args) {
@@ -1334,24 +1430,24 @@ export function platformToolHandlers(
       return JSON.stringify(await platformRequest(method, requestPath, normalizeRequestBody(args?.body)));
     },
     async signal_completion(args) {
-      ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);
+      await ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);
       return 'completion recorded';
     },
     async open_pr() {
-      ctx.openPr();
+      await ctx.openPr();
       return 'pull request requested; finish this turn now';
     },
     async resolve_decision(args) {
       const t = parseTransition(args);
       if (!t) return 'invalid resolve decision — use action: resume | retryStage | gotoStage | parkUntil | escalate';
-      ctx.resolveDecision(t);
+      await ctx.resolveDecision(t);
       return `resolution recorded: ${t.do}`;
     },
     async confirm_decision(args) {
       const action = String(args?.action ?? '');
       if (!['confirm', 'revise', 'reject'].includes(action)) return 'invalid confirm decision — use action: confirm | revise | reject';
       if (args?.otherAttempts !== undefined && !['keep', 'cancel'].includes(args.otherAttempts)) return 'otherAttempts must be keep or cancel';
-      ctx.confirmDecision({ otherAttempts: args?.otherAttempts, action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
+      await ctx.confirmDecision({ otherAttempts: args?.otherAttempts, action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
       return `confirm decision recorded: ${action}`;
     },
   };

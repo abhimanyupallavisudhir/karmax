@@ -4,8 +4,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { emailHtml } from '../src/auth/identity.js';
 import { policyDocument, publicLaunchInfo } from '../src/launch/legal.js';
-import { BRAND_ICONS, BRAND_FILES, DEFAULT_BRAND_ICON, DEFAULT_SITE_NAME, MAX_SITE_NAME_LENGTH,
-  brandIconOf, isBrandIcon, siteNameError, siteNameOf } from '../src/domain/brand.js';
+import { BRAND, BRAND_ICONS, BRAND_FILES, DEFAULT_BRAND_ICON, DEFAULT_SITE_NAME, MAX_SITE_NAME_LENGTH,
+  brandIconOf, isBrandIcon, siteNameError, siteNameOf, taskBranch, taskIdOfBranch } from '../src/domain/brand.js';
+import { taskIdOfBranch as githubTaskIdOfBranch } from '../src/integrations/github-pr.js';
+import { MemoryWorldProvider } from '../src/world/memory.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -14,10 +16,11 @@ const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
 describe('installation identity', () => {
   it('defaults safely and accepts a trimmed human-facing site name', () => {
     expect(siteNameOf(undefined)).toBe(DEFAULT_SITE_NAME);
-    expect(siteNameOf({})).toBe('krmax');
-    expect(siteNameOf({ siteName: '  tavya  ' })).toBe('tavya');
-    expect(siteNameOf({ siteName: '' })).toBe('krmax');
-    expect(siteNameOf({ siteName: 'x'.repeat(MAX_SITE_NAME_LENGTH + 1) })).toBe('krmax');
+    expect(BRAND).toBe('tavya');
+    expect(siteNameOf({})).toBe('tavya');
+    expect(siteNameOf({ siteName: '  Acme  ' })).toBe('Acme');
+    expect(siteNameOf({ siteName: '' })).toBe('tavya');
+    expect(siteNameOf({ siteName: 'x'.repeat(MAX_SITE_NAME_LENGTH + 1) })).toBe('tavya');
   });
 
   it('rejects empty, overlong, and control-character names', () => {
@@ -29,17 +32,18 @@ describe('installation identity', () => {
   });
 
   it('brands transactional email and public policy copy at request time', () => {
-    const html = emailHtml('Heading', 'Body', 'Do it', 'https://example.test/a', 'Footer', 'tavya');
-    expect(html).toContain('◇ tavya');
-    expect(html).not.toMatch(/◇ krmax/i);
-    expect(publicLaunchInfo({}, undefined, 'tavya').policies.find((p) => p.slug === 'terms')?.summary)
-      .toContain('using tavya');
-    expect(JSON.stringify(policyDocument('privacy', {}, undefined, 'tavya'))).not.toMatch(/krmax/i);
+    const html = emailHtml('Heading', 'Body', 'Do it', 'https://example.test/a', 'Footer', 'Acme');
+    expect(html).toContain('◇ Acme');
+    expect(html).not.toMatch(/◇ tavya/i);
+    expect(emailHtml('Heading', 'Body', 'Do it', 'https://example.test/a', 'Footer')).toContain('◇ tavya');
+    expect(publicLaunchInfo({}, undefined, 'Acme').policies.find((p) => p.slug === 'terms')?.summary)
+      .toContain('using Acme');
+    expect(JSON.stringify(policyDocument('privacy', {}, undefined, 'Acme'))).not.toMatch(/krmax|karmax|tavya/i);
   });
 
   it('uses one dynamic name source throughout public and authenticated UI', () => {
     const app = read('web/app.js');
-    expect(app).toContain("function siteName() { return S.meta?.siteName || 'krmax'; }");
+    expect(app).toContain("function siteName() { return S.meta?.siteName || 'tavya'; }");
     expect(app).toContain('Site name<input id="site-name"');
     expect(app).toContain("api('/api/settings/installation'");
     expect(app).toContain('${siteNameMarkup()}');
@@ -110,18 +114,19 @@ describe('brand icon selection', () => {
 });
 
 /**
- * Technical identifiers deliberately keep the original `karmax` spelling: env
- * vars (`KARMAX_*`), the state home (`~/.karmax`), task branches and the CLI are
- * compatibility wiring rather than installation identity. The checked-in web
- * shell likewise retains `krmax` as the safe default; the gateway replaces it
- * in the response with the configured name.
+ * Everything people or other services see says `tavya`: task branches, commits,
+ * PR text, local checkout commands and the CLI. Internal identifiers keep the
+ * original `karmax` spelling for compatibility: env vars (`KARMAX_*`), the state
+ * home (`~/.karmax`), metric names, storage/lookup keys and MCP server ids. The
+ * checked-in web shell carries `tavya` as the default; the gateway replaces it in
+ * the response with the configured name.
  */
 describe('branding — portable defaults and dynamic surfaces', () => {
   it('keeps a usable default in the static PWA files', () => {
     const manifest = JSON.parse(read('web/app.webmanifest'));
-    expect(manifest.name).toBe('Krmax');
-    expect(manifest.short_name).toBe('Krmax');
-    expect(read('web/index.html')).toContain('<title>krmax</title>');
+    expect(manifest.name).toBe('tavya');
+    expect(manifest.short_name).toBe('tavya');
+    expect(read('web/index.html')).toContain('<title>tavya</title>');
   });
 
   it('uses the configured name for account email and invitations', () => {
@@ -146,27 +151,72 @@ describe('branding — portable defaults and dynamic surfaces', () => {
 
 describe('branding — stable technical and operator identifiers', () => {
   it('keeps Phone Access and platform recovery diagnostics recognizable', () => {
-    expect(read('src/remote/access.ts')).toContain('Krmax stays on localhost');
-    expect(read('src/platform/api.ts')).toContain('Krmax recovered this task');
+    expect(read('src/remote/access.ts')).toContain('${BRAND} stays on localhost');
+    expect(read('src/platform/api.ts')).toContain('${BRAND} recovered this task');
   });
 
   it('keeps Prometheus metric names stable', () => {
     const gateway = read('src/gateway/server.ts');
     expect(gateway).toContain('karmax_info 1');
-    expect(gateway).toContain('karmax_info Krmax control-plane information.');
+    expect(gateway).toContain('# HELP karmax_info ${BRAND} control-plane information.');
   });
 
   it('keeps the technical boot and process labels stable', () => {
     const main = read('src/main.ts');
-    expect(main).toContain('✓ krmax is running');
-    expect(main).toContain("'\\n  krmax ' + VERSION");
-    expect(read('src/util/processes.ts')).toContain('krmax (gateway + worker)');
+    expect(main).toContain('✓ ${BRAND} is running');
+    expect(main).toContain('`\\n  ${BRAND} ` + VERSION');
+    expect(read('src/util/processes.ts')).toContain('`${BRAND} (gateway + worker)`');
     expect(read('src/world/runners.ts')).toContain('organization BYOK');
   });
 
   it('keeps backup format diagnostics compatible', () => {
     const backup = read('src/ops/backup.ts');
-    expect(backup).toContain('stop Krmax before restore');
-    expect(backup).toContain('unsupported or invalid Krmax backup manifest');
+    expect(backup).toContain('stop ${BRAND} before restore');
+    expect(backup).toContain('unsupported or invalid ${BRAND} backup manifest');
+    expect(backup).toContain("format: 'karmax-backup'");
+  });
+});
+
+describe('outward-facing brand', () => {
+  it('puts new task branches under tavya/ and still recognizes pre-rename karmax/ branches', async () => {
+    expect(taskBranch('task_abc')).toBe('tavya/task_abc');
+    expect(taskIdOfBranch('tavya/task_abc')).toBe('task_abc');
+    expect(taskIdOfBranch('karmax/task_old')).toBe('task_old');
+    expect(taskIdOfBranch('feature/tavya/task_abc')).toBeUndefined();
+    expect(taskIdOfBranch('main')).toBeUndefined();
+    expect(githubTaskIdOfBranch('karmax/task_old')).toBe('task_old');
+    const world = await new MemoryWorldProvider().create({ taskId: 'task_abc', base: 'main' } as any);
+    expect(world.handle.branch).toBe('tavya/task_abc');
+  });
+
+  it('shows the brand for the persisted karmax landing-authority value', () => {
+    expect(read('src/contrib/manifests.ts')).toContain("options: ['auto', 'external', 'karmax'],\n  // The stored value predates the product name.\n  optionLabels: { karmax: BRAND },");
+    expect(read('web/app.js')).toContain("esc(f.optionLabels?.[o] ?? o)");
+  });
+
+  // Guard against reintroducing the internal platform name in places people see:
+  // GitHub branches, commits and PR text, local commands, third-party clients.
+  it('keeps the old name out of branch, commit and client identities', () => {
+    const offenders: string[] = [];
+    const patterns = [
+      /`karmax\/\$\{/, // task branch names
+      /['"`]karmax: /, // commit messages and PR titles
+      /user\.name=karmax|'karmax@localhost'|`karmax\+/, // git author identity
+      /'user-agent': 'karmax/, /clientInfo: \{ name: 'karmax/,
+      /\bkrmax\b(?!-issues)/, // retired display name
+      /\b(Karmax|Krmax)\b(?![\w-]|’s? [a-z]*[A-Z])/, // the old name in prose
+    ];
+    const walk = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const file = path.join(dir, entry.name);
+      return entry.isDirectory() ? walk(file) : /\.(ts|mjs|js)$/.test(entry.name) ? [file] : [];
+    });
+    for (const file of [...walk('src'), 'web/app.js']) {
+      fs.readFileSync(file, 'utf8').split('\n').forEach((line, index) => {
+        if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
+        if (line.includes('`tavya/${')) return; // recognizes the legacy branch name next to the current one
+        if (patterns.some((pattern) => pattern.test(line))) offenders.push(`${file}:${index + 1}: ${line.trim()}`);
+      });
+    }
+    expect(offenders).toEqual([]);
   });
 });

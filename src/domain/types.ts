@@ -230,7 +230,18 @@ export interface InboxItem {
   readAt?: number;
   /** Resource-backed asks use the inbox without manufacturing a task merely to
    * carry a notification. */
-  subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string };
+  subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string }
+    | CredentialNotice;
+}
+
+/** A login only a person can restore: its sign-in lapses soon, or already did. */
+export interface CredentialNotice {
+  kind: 'credential';
+  credentialKey: string;
+  provider: string;
+  account: string;
+  reason: 'expiring' | 'signed-out';
+  expiresAt: number;
 }
 
 export interface DeliveryPreferences {
@@ -1375,6 +1386,8 @@ export interface FieldSpec {
   help?: string;
   required?: boolean;
   options?: string[];
+  /** Display text for select options whose stored value is not what people should read. */
+  optionLabels?: Record<string, string>;
   default?: unknown;
   placeholder?: string;
   scopes: FieldScope[];
@@ -1579,7 +1592,9 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder' | 'job' | 'timer'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience;
+    /** `job` / `timer`: when the agent is resumed at the latest (epoch ms). */
+    until?: number };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
@@ -1776,6 +1791,14 @@ export interface SubTaskResponse {
 }
 
 /** A child-agent's explicit request up to its parent (the `raise_to_parent` tool). */
+/** An agent's request to end its turn and be resumed later: when every listed
+ * durable job has exited, when a message arrives, or after `minutes` —
+ * whichever comes first. Without jobs it is a timed pause. */
+export interface AgentWait {
+  minutes: number;
+  jobs?: string[];
+}
+
 export interface RaiseToParent {
   type: RaiseType;
   detail?: string;

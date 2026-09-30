@@ -1,6 +1,7 @@
 import { brokerEnrollRepository, type GitBrokerAuth } from './git-broker.js';
 import { sameRepository } from './repository-identity.js';
 import { worldRepos, worldRepoSource, type World, type WorldRepo } from './types.js';
+import { BRAND } from '../domain/brand.js';
 
 export interface EnrolledProjectRepository {
   baseBranch?: string;
@@ -38,8 +39,8 @@ export async function enrollWorldRepositories(
       target,
       targetPinned: Boolean(attachment.targetBranch),
       identity: {
-        name: nameResult?.code === 0 && nameResult.stdout.trim() ? nameResult.stdout.trim() : 'karmax',
-        email: emailResult?.code === 0 && emailResult.stdout.trim() ? emailResult.stdout.trim() : 'karmax@localhost',
+        name: nameResult?.code === 0 && nameResult.stdout.trim() ? nameResult.stdout.trim() : BRAND,
+        email: emailResult?.code === 0 && emailResult.stdout.trim() ? emailResult.stdout.trim() : `${BRAND}@localhost`,
       },
     }, auth);
     await onEnrolled?.(enrolled);

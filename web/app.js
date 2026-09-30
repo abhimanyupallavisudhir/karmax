@@ -38,6 +38,11 @@ const ICON = {
   chevron: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>',
   project: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="m3 6 1.5 1.5L7.5 4.5"/><path d="m3 12 1.5 1.5L7.5 10.5"/><path d="m3 18 1.5 1.5L7.5 16.5"/></svg>',
   plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+  // Toolbar actions (conversation head, tab rails): one stroke weight and size.
+  share: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><path d="m16 6-4-4-4 4"/><path d="M12 2v13"/></svg>',
+  fork: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
+  terminal: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>',
+  laptop: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>',
   // Window controls: a matched pair, drawn on the same grid and stroke.
   minimize: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="M6 12h12"/></svg>',
   close: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="m7 7 10 10"/><path d="M17 7 7 17"/></svg>',
@@ -382,7 +387,25 @@ function parseRoute(url) {
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
-  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}) };
+  const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
+  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
+    ...(wikiView ? { wikiView } : {}) };
+}
+
+// Which branch the project wiki shows is part of the page, so it lives in the
+// URL: `?task=<num>` (a task's live checkout) or `?branch=<name>`; the open
+// entry rides in the hash.
+function wikiViewFromQuery(query) {
+  const task = query.get('task'), branch = query.get('branch');
+  return task ? `task:${task}` : branch ? `branch:${branch}` : '';
+}
+
+function wikiRoute(pid, view = '', entry = '') {
+  const [kind, ...rest] = String(view).split(':');
+  const value = rest.join(':');
+  const query = kind === 'task' && value ? `?task=${encodeURIComponent(value)}`
+    : kind === 'branch' && value ? `?branch=${encodeURIComponent(value)}` : '';
+  return `${projectRoute(pid, 'wiki')}${query}${entry ? `#${encodeURIComponent(entry)}` : ''}`;
 }
 
 function fileRouteTarget(query) {
@@ -466,7 +489,10 @@ function go(path, opts = {}) {
 // behind it, so the user can navigate mid-edit. Any navigation closes it like
 // leaving any other page — via its close button, which flushes the draft.
 function closeTaskFormPage() {
-  if ($('#tf-page')) $('#tf-close')?.click();
+  const page = $('#tf-page');
+  if (!page) return;
+  page.dataset.navigating = 'true'; // a draft's own page must not navigate again on close
+  $('#tf-close')?.click();
 }
 
 // Resolve a per-project task URL key (a numeric #num, or a raw task id) → task id.
@@ -609,6 +635,7 @@ async function applyRoute() {
   await loadOrganizationRuntimeCatalog();
   if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
+  S.wikiView = r.wikiView || '';
   if (!sameProject) {
     // Switching projects: drop the previous project's per-project view state so
     // its query/roving-cursor/search-result can't bleed into the new project
@@ -684,6 +711,7 @@ async function applyRoute() {
     if (S.selected !== taskId) return openTask(taskId, r.taskTab, r.taskKey === taskId);
     S.viewingAttempt = r.taskKey === taskId ? taskId : null;
     if (r.taskTab) S.taskTab = r.taskTab;
+    showDraftPage(taskId);
     return renderTaskPage();
   }
   S.taskFile = null;
@@ -993,7 +1021,7 @@ function renderField(f, own, inherited, withChips, alt) {
     // dynamic) option list — e.g. an inherited provider not connected locally.
     const opts = [...(f.options || [])];
     if (v !== '' && !opts.includes(v)) opts.push(v);
-    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${opts.map((o) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${o === '' ? 'Inherit default' : esc(o)}</option>`).join('')}</select></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${opts.map((o) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${o === '' ? 'Inherit default' : esc(f.optionLabels?.[o] ?? o)}</option>`).join('')}</select></div>`;
   }
   if (f.type === 'list') {
     const text = Array.isArray(v) ? v.join('\n') : v;
@@ -1238,11 +1266,18 @@ function cfLayersOf(v) {
 }
 function humanAudienceOptions() {
   return [
-    ['@creator', 'Task creator'], ['@all', 'Everyone in the organization'],
-    ['@owners', 'Organization owners'], ['@project', 'Everyone with project access'],
-    ...S.organizationMembers.map((m) => [`user:${m.userId}`, `Person · ${principalLabel({ kind: 'user', userId: m.userId })}`]),
-    ...S.teams.map((t) => [`@team:${t.slug}`, `Team · ${t.name}`]),
+    { value: '@creator', label: 'Task creator' }, { value: '@all', label: 'Everyone in the organization' },
+    { value: '@owners', label: 'Organization owners' }, { value: '@project', label: 'Everyone with project access' },
+    ...S.organizationMembers.map((m) => ({ value: `user:${m.userId}`, label: `Person · ${principalLabel({ kind: 'user', userId: m.userId })}` })),
+    ...S.teams.map((t) => ({ value: `@team:${t.slug}`, label: `Team · ${t.name}` })),
   ];
+}
+// A comma-separated audience box whose suggestions follow the entry being typed.
+function audienceComboHtml(className, audience) {
+  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" autocomplete="off" spellcheck="false" /><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
+}
+function wireAudienceCombos(root) {
+  root.querySelectorAll('.audience-combo').forEach((combo) => wireCombo(combo, humanAudienceOptions, null, { multiple: true }));
 }
 function cfLayerHtml(f, layer, agentDefault) {
   const isAgent = layer.kind === 'agent';
@@ -1258,10 +1293,7 @@ function cfLayerHtml(f, layer, agentDefault) {
       <button type="button" class="btn sm cf-del" title="Remove this step">✕</button>
     </div>
     <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-      <label class="form-row">Who confirms
-        <input class="cf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" />
-      </label>
-      <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+      <label class="form-row">Who confirms${audienceComboHtml('cf-audience', audience)}</label>
       <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
@@ -1339,8 +1371,7 @@ function renderResponderField(f, own, inherited, alt) {
         <select class="cf-kind rf-kind"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
       </div>
       <div class="cf-human rf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-        <label class="form-row">Who responds<input class="cf-audience rf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" /></label>
-        <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+        <label class="form-row">Who responds${audienceComboHtml('cf-audience rf-audience', audience)}</label>
         <div class="task-sub">Comma-separated. Any selected person may answer this single input step.</div>
       </div>
       <div class="cf-agent rf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}
@@ -1800,7 +1831,9 @@ function wireAuthorizationEditor(root, projects, onChange) {
   drawChips();
 }
 
-function wireCombo(combo, getOptions, onChange) {
+// `multiple`: the value is a comma-separated list — suggestions follow the entry
+// under the cursor, skip entries already listed, and choosing replaces just that entry.
+function wireCombo(combo, getOptions, onChange, { multiple = false } = {}) {
   const input = combo.querySelector('input');
   const menu = combo.querySelector('.combo-menu');
   const caret = combo.querySelector('.combo-caret');
@@ -1816,11 +1849,23 @@ function wireCombo(combo, getOptions, onChange) {
       if (on) el.scrollIntoView({ block: 'nearest' });
     });
   };
+  // The [start, end) span of the entry being edited, and the other listed entries.
+  const entry = () => {
+    const value = input.value;
+    if (!multiple) return { start: 0, end: value.length, others: [] };
+    const caret = input.selectionStart ?? value.length;
+    const start = caret ? value.lastIndexOf(',', caret - 1) + 1 : 0;
+    const next = value.indexOf(',', caret);
+    const end = next < 0 ? value.length : next;
+    const others = `${value.slice(0, start)},${value.slice(end)}`.split(',').map((v) => v.trim()).filter(Boolean);
+    return { start, end, others };
+  };
   const draw = () => {
-    const q = input.value.trim().toLowerCase();
+    const { start, end, others } = entry();
+    const q = input.value.slice(start, end).trim().toLowerCase();
     const opts = (getOptions() || [])
       .map(normalizeComboOption)
-      .filter((o) => o.value && (!q || `${o.value} ${o.label} ${o.description}`.toLowerCase().includes(q)));
+      .filter((o) => o.value && !others.includes(o.value) && (!q || `${o.value} ${o.label} ${o.description}`.toLowerCase().includes(q)));
     menu.innerHTML = opts.length
       ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o.value)}">
           <div class="combo-opt-head"><span>${esc(o.label)}</span>${o.label !== o.value ? `<code>${esc(o.value)}</code>` : ''}</div>
@@ -1832,7 +1877,17 @@ function wireCombo(combo, getOptions, onChange) {
   const show = () => { draw(); menu.hidden = false; open = true; };
   const hide = () => { menu.hidden = true; open = false; active = -1; };
   const choose = (opt) => {
-    input.value = opt.dataset.v; hide(); onChange && onChange();
+    if (multiple) {
+      // Keep the other entries; a completed last entry gets a separator so the
+      // next one can be typed straight away.
+      const { start, end } = entry();
+      const before = input.value.slice(0, start), after = input.value.slice(end);
+      const head = `${before ? before.replace(/\s*$/, ' ') : ''}${opt.dataset.v}`;
+      input.value = head + (after || ', ');
+      const caret = after ? head.length : input.value.length;
+      input.setSelectionRange?.(caret, caret);
+    } else input.value = opt.dataset.v;
+    hide(); onChange && onChange();
     input.dispatchEvent(new Event('change', { bubbles: true }));
   };
   input.addEventListener('focus', show);
@@ -1854,7 +1909,15 @@ function wireCombo(combo, getOptions, onChange) {
       if (open && active >= 0 && els[active]) { e.preventDefault(); choose(els[active]); }
     }
   });
-  input.addEventListener('blur', () => setTimeout(hide, 150)); // let a menu click land first
+  input.addEventListener('blur', () => {
+    if (multiple) input.value = input.value.replace(/[\s,]+$/, ''); // drop a dangling separator
+    setTimeout(hide, 150); // let a menu click land first
+  });
+  // Moving the cursor to another entry re-targets the suggestions.
+  if (multiple) {
+    input.addEventListener('click', () => { if (open) draw(); });
+    input.addEventListener('keyup', (e) => { if (open && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) draw(); });
+  }
   // mousedown (not click) so it fires before the input's blur closes the menu
   caret.addEventListener('mousedown', (e) => {
     e.preventDefault();
@@ -2140,6 +2203,7 @@ function wireConfirmerField(box) {
       if (kind === 'agent' && firstHuman) list.insertBefore(row, firstHuman);
       else list.appendChild(row);
       row.querySelectorAll('.agent-field').forEach(wireAgentBox);
+      wireAudienceCombos(row);
       wireConfirmerWikiPrompts(row);
       cfSync(box); changed();
     }
@@ -2154,6 +2218,7 @@ function wireConfirmerField(box) {
     const hb = row.querySelector('.cf-human');
     if (hb) hb.style.display = e.target.value === 'human' ? '' : 'none';
   });
+  wireAudienceCombos(box);
   wireConfirmerWikiPrompts(box);
   cfSync(box);
 }
@@ -2166,6 +2231,7 @@ function wireResponderField(box) {
     if (agent) agent.style.display = isAgent ? '' : 'none';
     if (human) human.style.display = isAgent ? 'none' : '';
   });
+  wireAudienceCombos(box);
   if (typeof wireWikiMention === 'function') {
     box.querySelectorAll('.rf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
   }
@@ -2279,6 +2345,7 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   // the box, so only the fresh agent sub-forms need wiring.
   list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
   list.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  wireAudienceCombos(list);
   wireConfirmerWikiPrompts(list);
   cfSync(box);
   // This composite control is rebuilt rather than assigned through an input.
@@ -3435,7 +3502,7 @@ const BRAND_ICON_CHOICES = [
 
 /** Installation branding arrives from the public metadata endpoint so it is
  * available on landing, sign-in, setup and authenticated screens alike. */
-function siteName() { return S.meta?.siteName || 'krmax'; }
+function siteName() { return S.meta?.siteName || 'tavya'; }
 function siteNameMarkup() { return esc(siteName()); }
 
 function applyDocumentBrand() {
@@ -4173,7 +4240,7 @@ function renderMain() {
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
-        .join('')}${S.meta?.hosted ? '<span class="tabs-spacer"></span><button class="btn sm tabs-action" id="project-local-checkout">Work locally</button>' : ''}</div>`
+        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
     : '';
 
   let content = '';
@@ -4619,14 +4686,15 @@ function taskRow(t, { showTags = true } = {}) {
     </div>`;
 }
 
-// Every task gets an isolated worktree on an auto-generated `karmax/<taskId>`
+// Every task gets an isolated worktree on an auto-generated `tavya/<taskId>`
 // branch — the taskId is a noisy random slug, so echoing it in the byline just
 // clutters the list/page (it's still reachable via the check-in terminal +
 // fork commands, which carry the world path). Only surface the branch when it's
 // a *custom* one the human would recognize — e.g. an existing branch checked out
 // by a merge-only workflow.
+// (`karmax/<taskId>` is the pre-rename name older tasks still carry.)
 function customBranch(v, taskId) {
-  return v.branch && v.branch !== `karmax/${taskId}`;
+  return v.branch && ![`tavya/${taskId}`, `karmax/${taskId}`].includes(v.branch);
 }
 
 // The task's GitHub pull requests (remote policy 'pr'), with their live state —
@@ -4652,6 +4720,8 @@ function stageLabel(v) {
   // where to resume. Direct provider blockers may supply a concise specific
   // summary; ordinary holds retain the stable "Needs input" label.
   if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
+  // So is a turn parked on its credential or quota: nothing is working.
+  if (v.status === 'waiting' && v.waitingFor?.kind === 'account') return waitingText(v.waitingFor);
   // `do` and `merge` are the replay-stable workflow keys; a person reads them
   // as "working" and "landing" and never has to learn the internal names.
   return { do: 'working', merge: 'landing' }[v.stage || 'setup'] || v.stage || 'setup';
@@ -5720,11 +5790,16 @@ async function consumeTaskFormDefaults(projectId, workflow) {
   finally { if (taskFormDefaultRequests.get(key) === request) taskFormDefaultRequests.delete(key); }
 }
 
+function taskFormTitle(draft) {
+  const p = draft?.params || {};
+  return !draft ? 'New task' : p.triggerState === 'armed' || p.repeatable ? 'Edit task' : 'Edit draft';
+}
+
 function taskFormLoadingPage(project, draft) {
   return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
     <div class="tf-head"><div class="tf-head-inner">
       <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
-      <h2>${draft ? 'Edit task' : 'New task'}</h2>
+      <h2>${taskFormTitle(draft)}</h2>
       ${project ? `<span class="tf-crumb">in ${esc(project.name)}</span>` : ''}
     </div></div>
     <div class="tf-loading" role="status"><span class="global-search-loading">Loading task form…</span></div>
@@ -5737,7 +5812,10 @@ function taskFormLoadingPage(project, draft) {
 // form's (possibly empty) DOM and `replace:true`-wipes the draft it was editing.
 let activeFormToken = null;
 let activeTaskFormKeyController = null;
-async function openTaskForm(workflow, draft, seedText, seedParams) {
+// `page`: the form is a draft's own task page (see showDraftPage), so leaving it
+// leaves the task, and running the draft reveals its live task page.
+async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
+  const page = !!opts?.page;
   activeTaskFormKeyController?.abort();
   activeTaskFormKeyController = null;
   const formToken = (activeFormToken = {});
@@ -5769,9 +5847,16 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   // and this loading page never reaches a paint; otherwise it provides instant
   // feedback while keeping the not-yet-hydrated controls safely non-interactive.
   root.innerHTML = taskFormLoadingPage(proj, draft);
+  // Closing a draft's own page returns to where the task was opened from —
+  // unless a navigation is what closed it.
+  const leavePage = (navigating) => {
+    if (page && !navigating && S.selected === draft.id) closeTask();
+  };
   $('#tf-close').addEventListener('click', () => {
+    const navigating = !!root.querySelector('#tf-page')?.dataset.navigating;
     if (activeFormToken === formToken) activeFormToken = null;
     root.innerHTML = '';
+    leavePage(navigating);
   });
   const projectOrganizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
   const authorizationProjects = S.projects.filter((project) => project.organizationId === projectOrganizationId);
@@ -5784,10 +5869,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
   // A draft can open directly from the list, without its task page having loaded
   // the intent. Fetch the group so the shared confirmer freezes after any sibling
   // queues, while remaining editable (and propagated) when every sibling is a draft.
-  const cachedAttemptGroup = draft?.id && S.attemptGroup?.intentId === draft.intentId ? S.attemptGroup : null;
-  const attemptGroupRequest = draft?.id && !cachedAttemptGroup
+  // Always fresh: the attempt switcher must list a sibling created a moment ago.
+  const attemptGroupRequest = draft?.id
     ? api(`/api/tasks/${draft.id}/attempts`).catch(() => null)
-    : Promise.resolve(cachedAttemptGroup);
+    : Promise.resolve(null);
   const [inherited, formAttemptGroup, inheritedVault] = await Promise.all([
     consumeTaskFormDefaults(projectId, wf),
     attemptGroupRequest,
@@ -5806,8 +5891,11 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
       <div class="tf-head">
         <div class="tf-head-inner">
           <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
-          <h2>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</h2>
+          <h2>${taskFormTitle(draft)}</h2>
           ${proj ? `<span class="tf-crumb">in ${esc(proj.name)}</span>` : ''}
+          ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
+            ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
+          </nav>` : ''}
           <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
           <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
         </div>
@@ -5876,7 +5964,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
     if (activeFormToken === formToken) activeFormToken = null;
   };
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
-  let closeForm = () => { releaseFormKeys(); root.innerHTML = ''; };
+  const navigatingAway = () => !!root.querySelector('#tf-page')?.dataset.navigating;
+  let closeForm = () => { const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; leavePage(navigating); };
   $('#tf-wf')?.addEventListener('change', async () => {
     const select = $('#tf-wf');
     const nextWorkflow = select.value;
@@ -5891,7 +5980,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
         });
         const at = S.tasks.findIndex((task) => task.id === draftId);
         if (at >= 0 && changed.task) S.tasks[at] = changed.task;
-        return openTaskForm(nextWorkflow, changed.task);
+        return openTaskForm(nextWorkflow, changed.task, undefined, undefined, { page });
       }
       const carried = consumingField(fields)
         ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(consumingField(fields).name)}"]`)?.value
@@ -6211,7 +6300,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
 
   // Flush any pending edits when the form is dismissed, so closing without
   // clicking a button still keeps the draft.
-  closeForm = () => { clearTimeout(saveTimer); const st = formState(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st); };
+  closeForm = () => { clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st); leavePage(navigating); };
 
   let submitInFlight = false;
   const submit = async (draftMode, authorizationDecision, activeFeedback) => {
@@ -6313,6 +6402,18 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
       succeeded = true;
       releaseFormKeys();
       root.innerHTML = '';
+      if (page && S.selected === draft.id) {
+        // A saved draft leaves its page like Back; a started one shows its live page.
+        if (draftMode) closeTask();
+        else {
+          S.attemptGroup = null; // its cached record still says draft
+          await refreshTasks();
+          if (S.selected === draft.id) {
+            history.replaceState({ kx: 1 }, '', taskUrl(draft.id));
+            openTask(draft.id, null, S.viewingAttempt === draft.id);
+          }
+        }
+      }
       // Keep the toast in the button's vocabulary: "Run task" → "Task started",
       // whether the task was just written or was an existing draft. Starting an
       // EXISTING draft used to say "Task created" — nothing was created, so the
@@ -6352,6 +6453,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
           }) });
           releaseFormKeys();
           root.innerHTML = '';
+          leavePage(false);
           toast('Authorization request sent — the task will queue when approved');
           refreshTasks();
           succeeded = true;
@@ -6424,13 +6526,12 @@ const TASK_TABS = [
 
 function visibleTaskTabs() { return TASK_TABS.filter(t => t.key !== 'timing' || S.meta?.timingEnabled === true); }
 
-// The tab a task page opens on when the URL doesn't pin one: while the workflow
-// is asking the human to decide (an enabled `confirm` action — the Review gate),
-// the conversation that led here is the thing to read, so open Check-in on the
-// stage's agent. Otherwise Overview.
+// The tab a task page opens on when the URL doesn't pin one: pending approvals
+// first, a draft's parameters (it has no conversation yet), else Check-in on the
+// stage's agent — the conversation is what people come to a task for.
 function defaultTaskTab(v) {
   if (v.approvalRequests) return 'approvals';
-  return (v.actions || []).some((a) => a.name === 'confirm' && a.enabled) ? 'checkin' : 'overview';
+  return v.state?.draft ? 'parameters' : 'checkin';
 }
 
 // Task navigation owns the main cell immediately. The compact view normally
@@ -6543,38 +6644,52 @@ function runPageRow(r) {
 // principal. Keep navigation separate from the selected attempt's stage control.
 function taskAttempts(v) {
   const g = S.attemptGroup;
-  if (!g?.attempts?.length) return '';
-  const rows = g.attempts.length > 1 ? g.attempts.map((a) => {
+  if (!(g?.attempts?.length > 1)) return '';
+  const rows = g.attempts.map((a) => {
     const av = a.id === v.taskId ? v : a.lastView || {};
-    const committed = a.id === g.committedAttemptId;
-    const selected = a.id === v.taskId;
-    const draft = !!a.params?.draft;
-    const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
-    const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${S.taskTab || 'overview'}`;
     const principal = a.id === g.principalAttemptId;
     const locked = !!g.committedAttemptId || ['cancelled', 'failed'].includes(av.status);
     const crownTitle = g.committedAttemptId ? 'Principal selection is locked after Merge admission' : locked ? 'Cancelled or failed attempts cannot be principal' : principal ? 'Principal attempt · shown in task list' : 'Show this attempt in the task list';
-    return `<div class="attempt-item"><button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="m3.5 9 3.5 4 .5-7 2.5 6 2-8 2 8 2.5-6 .5 7 3.5-4-2.5 8H6Z"/><circle cx="3" cy="7.5" r="1.2"/><circle cx="7.3" cy="4.5" r="1.2"/><circle cx="12" cy="2.5" r="1.2"/><circle cx="16.7" cy="4.5" r="1.2"/><circle cx="21" cy="7.5" r="1.2"/><rect x="6" y="19" width="12" height="2" rx="1"/></svg></button><a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
-      <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
-      <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
-      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note">First selected to merge · others kept</span>' : '<span class="attempt-note">Selected to merge</span>') : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
-    </a></div>`;
-  }).join('') : '';
+    return `<div class="attempt-item">${attemptCard(a, g, v, { tab: S.taskTab || 'overview' })}<button type="button" class="attempt-crown${principal ? ' principal' : ''}" data-attempt-principal="${esc(a.id)}" aria-label="${esc(crownTitle)}" aria-pressed="${principal}" title="${esc(crownTitle)}" ${locked ? 'disabled' : ''}><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="m3.5 9 3.5 4 .5-7 2.5 6 2-8 2 8 2.5-6 .5 7 3.5-4-2.5 8H6Z"/><circle cx="3" cy="7.5" r="1.2"/><circle cx="7.3" cy="4.5" r="1.2"/><circle cx="12" cy="2.5" r="1.2"/><circle cx="16.7" cy="4.5" r="1.2"/><circle cx="21" cy="7.5" r="1.2"/><rect x="6" y="19" width="12" height="2" rx="1"/></svg></button></div>`;
+  }).join('');
   return `<section class="attempts" aria-label="Task attempts">
-    <div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span>
-      <button type="button" class="btn sm" id="add-attempt" ${g.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>
-    </div>${rows ? `<nav class="attempts-list" aria-label="Choose an attempt">${rows}</nav>` : ''}
+    <nav class="attempts-list" aria-label="Choose an attempt">${rows}</nav>
+    ${addAttemptButton()}
   </section>`;
 }
 
+// One attempt's card: a link to its pinned page, or — in the draft form, which
+// has no tabs to preserve — a plain marker for the attempt already open. A
+// draft's page is its form, so its link never pins a tab.
+function attemptCard(a, g, v, { tab = '', form = false } = {}) {
+  const av = a.id === v.taskId ? v : a.lastView || {};
+  const committed = a.id === g.committedAttemptId;
+  const selected = a.id === v.taskId;
+  const draft = !!a.params?.draft;
+  const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
+  const pinnedTab = draft ? '' : tab;
+  const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}${pinnedTab ? `/${pinnedTab}` : ''}`;
+  const body = `<span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
+      <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
+      ${committed ? (g.otherAttempts === 'keep' ? '<span class="attempt-note" title="Other attempts are kept">Selected to merge</span>' : '<span class="attempt-note">Selected to merge</span>') : ''}`;
+  if (form && selected) return `<span class="attempt-card selected" data-attempt-select="${esc(a.id)}" aria-current="true">${body}</span>`;
+  return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>${body}</a>`;
+}
+
+function addAttemptButton(cls = '') {
+  const g = S.attemptGroup;
+  return `<button type="button" class="btn tool attempt-add ${cls}" id="add-attempt" ${g?.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g?.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>`;
+}
+
 // Follow the rendered links so keyboard navigation uses the same pinned routes
-// and tab selection as clicking an attempt card.
+// and tab selection as clicking an attempt card. A draft's form floats above its
+// task page, so the form's own switcher wins.
 function cycleAttempt(delta) {
   if (!S.selected || !S.view) return;
-  const links = [...document.querySelectorAll('[data-attempt-select]')];
-  const index = links.findIndex((link) => link.dataset.attemptSelect === S.selected);
-  if (links.length < 2 || index < 0) return;
-  links[(index + delta + links.length) % links.length].click();
+  const cards = [...($('#tf-page') || document).querySelectorAll('[data-attempt-select]')];
+  const index = cards.findIndex((card) => card.dataset.attemptSelect === S.selected);
+  if (cards.length < 2 || index < 0) return;
+  cards[(index + delta + cards.length) % cards.length].click();
 }
 
 function wireAttempts(v) {
@@ -6603,8 +6718,7 @@ function wireAttempts(v) {
       const draft = await api(`/api/tasks/${v.taskId}/attempts`, { method: 'POST', body: '{}' });
       await refreshTasks();
       if (S.selected !== v.taskId) return;
-      await spaNavigate(`${projectBase(draft.projectId || S.projectId)}/tasks/${encodeURIComponent(draft.id)}/parameters`);
-      if (S.selected === draft.id) await openTaskForm(draft.workflow, draft);
+      await spaNavigate(`${projectBase(draft.projectId || S.projectId)}/tasks/${encodeURIComponent(draft.id)}`);
     } catch (e) { toast(e.message, true); }
     finally {
       S.addingAttempt = false;
@@ -6695,6 +6809,19 @@ async function refreshTaskHistory(taskId) {
   }
 }
 
+// A draft has nothing to show but its parameters, so its page is its form —
+// however it is reached (attempt card, keyboard, permalink, New attempt). An
+// archived draft keeps its task page, which owns Unarchive.
+function showDraftPage(taskId) {
+  const rec = taskRecord(taskId);
+  if (S.selected !== taskId || !rec?.params?.draft || rec.params.archived || $('#tf-page')) return false;
+  // The URL leads: a late load must not reopen a draft the user just left.
+  const key = parseRoute(currentPath())?.taskKey;
+  if (key !== taskId && key !== String(rec.num)) return false;
+  openTaskForm(rec.workflow, rec, undefined, undefined, { page: true });
+  return true;
+}
+
 async function openTask(taskId, wantTab, explicitAttempt = false) {
   const openEpoch = S.taskOpenEpoch = (S.taskOpenEpoch || 0) + 1;
   S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
@@ -6718,6 +6845,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     await renderSeriesPage(rec);
     return;
   }
+  showDraftPage(taskId);
   S.taskEvents = [];
   S.taskHistoryLoading = false;
   S.taskHistoryError = null;
@@ -6792,6 +6920,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.approvalItems = approvalItems;
     S.connections = connections;
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
+    // A non-principal draft opened by permalink is only known once its group loads.
+    showDraftPage(taskId);
   } catch (e) {
     toast(e.message, true);
     if (S.selected === taskId && S.taskOpenEpoch === openEpoch) renderTaskLoadingPage(rec, e.message);
@@ -6841,10 +6971,13 @@ async function refreshTask() {
       await openTask(attempts.principalAttemptId, S.taskTab);
       return;
     }
+    const becameDraft = !!view?.state?.draft && !S.view?.state?.draft;
     S.view = pendingCancellationView(view, id);
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
+    // Moved back to a draft (stage picker) while open: its page becomes its form.
+    if (becameDraft) showDraftPage(id);
     S.approvalRequests = approvalRequests;
     S.permissionRequests = permissionRequests;
     S.authorizationRequests = authorizationRequests;
@@ -6901,13 +7034,11 @@ function orgEditorHtml(rec) {
       <button type="button" class="tag-remove" data-untag="${esc(id)}" title="Remove ${esc(tagPathStr(id))} from this task" aria-label="Remove tag">×</button>
     </span>`;
   }).join('');
-  const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? '▲ ' : ''}${n[0].toUpperCase() + n.slice(1)}</option>`).join('');
+  const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? `▲ ${n[0].toUpperCase() + n.slice(1)}` : 'No priority'}</option>`).join('');
   return `<div class="org-editor">
-    <label class="org-prio">Priority
-      <select class="q-sel org-priority">${prioOpts}</select>
-    </label>
-    <div class="org-tags">${tags || '<span class="pal-sub">no tags</span>'}
-      <button class="btn sm org-add-tag" title="Add a tag">＋ tag</button>
+    <select class="q-sel org-priority${prio ? '' : ' unset'}" aria-label="Priority" title="Priority">${prioOpts}</select>
+    <div class="org-tags">${tags}
+      <button type="button" class="org-add-tag" title="Add a tag">＋ tag</button>
     </div>
   </div>`;
 }
@@ -6929,6 +7060,7 @@ function wireOrgEditor(rootEl, rec, opts) {
       rec.id = id;
       await api(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) });
       rec.params = { ...(rec.params || {}), priority };
+      e.target.classList.toggle('unset', !priority);
       if (S.tab === 'tasks') await runSearch();
       afterChange();
       toast('Priority updated');
@@ -7029,6 +7161,12 @@ async function hydrateTaskFilePage(v, target, key) {
       method: 'POST', body: JSON.stringify(target),
     });
     if (taskFileKey(v, target) !== key || S.taskFileLoad?.key !== key) return;
+    // A wiki file is shown in the wiki itself, on this task's branch.
+    if (result.wiki) {
+      S.taskFileLoad = null;
+      if (S.selected !== v.taskId || !S.taskFile) return;
+      return go(wikiRoute(taskRecord(v.taskId)?.projectId || S.projectId, `task:${v.num ?? v.taskId}`, result.wiki.path), { replace: true });
+    }
     S.taskFileLoad = { key, status: 'ready', result };
   } catch (error) {
     if (taskFileKey(v, target) !== key || S.taskFileLoad?.key !== key) return;
@@ -7262,11 +7400,13 @@ function renderTaskPage() {
   // the swap and carry over any half-typed follow-up.
   const fuState = captureFollowupFocus(main);
   const rec = taskRecord(v.taskId);
-  const currentAttempt = S.attemptGroup?.attempts?.find((a) => a.id === v.taskId);
   const previousAttempts = main.querySelector('.attempts-list');
   const attemptScroll = previousAttempts?.querySelector('[aria-current="true"]')?.dataset.attemptSelect === v.taskId
     ? previousAttempts.scrollLeft : null;
   const base = taskUrl(v.taskId);
+  // A lone attempt has no strip to host New attempt, so it joins the tab actions.
+  const tabActions = (S.attemptGroup?.attempts?.length === 1 ? addAttemptButton('tabs-action') : '')
+    + (S.meta?.hosted ? `<button class="btn tool tabs-action" id="local-checkout" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : '');
   const retainedThread = patchTaskPage(main, `
     <div class="task-page">
       <div class="tp-head">
@@ -7275,17 +7415,10 @@ function renderTaskPage() {
           <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          ${currentAttempt && S.attemptGroup.attempts.length > 1 ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1}</span>` : ''}
           ${stageIndicator(v, v.taskId)}
           ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
         </div>
         <div class="meta">
-          <span>${v.workflowOptions?.length > 1
-            ? `<select id="tp-workflow-mode" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
-                ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
-              </select>`
-            : esc(workflowLabel(v.workflow))}
-            ${rec?.workflowVersion ? `<span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${mergeQueueBadge(v)}
@@ -7298,7 +7431,7 @@ function renderTaskPage() {
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
           ${visibleTaskTabs().map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
-          ${S.meta?.hosted ? '<span class="tabs-spacer"></span><button class="btn sm tabs-action" id="local-checkout">Work locally</button>' : ''}
+          ${tabActions ? `<span class="tabs-spacer"></span>${tabActions}` : ''}
         </div>
       </div>
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
@@ -8552,7 +8685,7 @@ function conversationReviewInfo(v) {
 function conversationFullscreenButton() {
   const active = !!S.conversationFullscreen;
   const label = active ? 'Exit full screen' : 'Full screen';
-  return `<button type="button" class="btn sm icon-btn" id="conversation-fullscreen" aria-label="${label}" title="${active ? 'Exit full screen (Esc)' : label}" aria-pressed="${active}">${active ? ICON.collapse : ICON.expand}</button>`;
+  return `<button type="button" class="btn tool icon" id="conversation-fullscreen" aria-label="${label}" title="${active ? 'Exit full screen (Esc)' : label}" aria-pressed="${active}">${active ? ICON.collapse : ICON.expand}</button>`;
 }
 
 function setConversationFullscreen(active) {
@@ -8589,9 +8722,9 @@ function conversationPane(v, t) {
   const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
   const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
   const copy = forkCmd
-    ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
+    ? `<button class="btn tool copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">${ICON.terminal}Fork in CLI</button>`
     : remoteFork
-      ? `<button class="btn sm fork-local" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">⑂ fork locally</button>`
+      ? `<button class="btn tool fork-local" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">${ICON.laptop}Fork locally</button>`
       : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
   // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
@@ -8628,10 +8761,13 @@ function conversationPane(v, t) {
       <span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>
       <span class="pal-sub">${entries.length} item${entries.length === 1 ? '' : 's'}</span>
       <span style="flex:1"></span>
-      <button class="btn sm" id="share-task-conversation" data-role="${esc(t.role)}">Share</button>
-      <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
-      ${copy}
-      ${conversationFullscreenButton()}
+      <div class="ck-tools">
+        <button class="btn tool" id="share-task-conversation" data-role="${esc(t.role)}" title="Share this conversation">${ICON.share}Share</button>
+        <button class="btn tool" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">${ICON.fork}Fork</button>
+        ${copy}
+        <span class="tool-sep" aria-hidden="true"></span>
+        ${conversationFullscreenButton()}
+      </div>
     </div>
     <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationApprovalRequests()}${conversationReviewInfo(v)}</div></div>
     ${fu}`;
@@ -8882,7 +9018,7 @@ function renderConversationText(text, role, v = S.view) {
     const href = match[2].startsWith('<') ? match[2].slice(1, -1) : match[2];
     const fileUrl = worldFileHref(href, v);
     html += fileUrl
-      ? `<a href="${esc(fileUrl)}" class="world-file-link" target="_blank" rel="noopener" title="Open this file from its task workspace">${esc(match[1])}</a>`
+      ? `${worldFileAnchor(fileUrl)}${esc(match[1])}</a>`
       : `<a href="${esc(safeHref(href))}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
     at = match.index + match[0].length;
   }
@@ -8934,7 +9070,28 @@ function worldFileHref(raw, v = S.view) {
   // confinement check; a transient `worldAvailable` hint must not decide
   // whether an agent-authored filesystem path becomes a handoff permalink.
   const target = worldFileTarget(raw, v?.worldPath, !!v?.taskId && !v?.worldPath);
-  return target && v?.taskId ? `${taskUrl(v.taskId)}/file?${fileTargetQuery(target)}` : null;
+  if (!target || !v?.taskId) return null;
+  return worldWikiHref(target, v) || `${taskUrl(v.taskId)}/file?${fileTargetQuery(target)}`;
+}
+
+// A file in the task's wiki checkout is a wiki entry (its SKILL.md/MEMORY.md,
+// or an attachment): link to that entry in the wiki view, on this task's live
+// branch. The gateway also resolves these, for links minted before this.
+function worldWikiHref(target, v) {
+  if (!v?.worldWiki) return null;
+  const parts = String(target.path).replace(/\\/g, '/').split('/');
+  const at = parts.indexOf(v.worldWiki);
+  const relative = !String(target.path).startsWith('/');
+  if (at < 0 || (relative && parts.slice(0, at).some((part) => part && part !== '.' && part !== '..'))) return null;
+  const entry = parts.slice(at + 1).filter((part) => part && part !== '.');
+  if (entry.length && /\.[A-Za-z0-9]+$/.test(entry[entry.length - 1])) entry.pop();
+  const projectId = taskRecord(v.taskId)?.projectId || S.projectId;
+  return wikiRoute(projectId, `task:${v.num ?? v.taskId}`, entry.join('/'));
+}
+
+function worldFileAnchor(href) {
+  const wiki = !/\/tasks\/[^/]+\/file\?/.test(href);
+  return `<a href="${esc(href)}" class="world-file-link" target="_blank" rel="noopener" title="${wiki ? 'Open in the wiki' : 'Open this file from its task workspace'}">`;
 }
 
 function decodeMarkdownAttribute(value) {
@@ -8950,7 +9107,7 @@ function annotateWorldFileLinks(html, v = S.view) {
     const local = attrs.match(/\sdata-md-local="([^"]*)"/);
     const fileUrl = worldFileHref(decodeMarkdownAttribute(local ? local[1] : href), v);
     return fileUrl
-      ? `<a href="${esc(fileUrl)}" class="world-file-link" target="_blank" rel="noopener" title="Open this file from its task workspace">`
+      ? worldFileAnchor(fileUrl)
       : anchor;
   });
 }
@@ -9218,17 +9375,17 @@ function portableForkCommandFor(session, cwd) {
   const sessionId = session.exportId || session.id;
   const source = `$HOME/Downloads/${filename}`;
   if (session.provider === 'codex') return [
-    'mkdir -p "$HOME/.codex/sessions/karmax"',
-    `cp -n "${source}" "$HOME/.codex/sessions/karmax/${filename}"`,
+    'mkdir -p "$HOME/.codex/sessions/tavya"',
+    `cp -n "${source}" "$HOME/.codex/sessions/tavya/${filename}"`,
     `cd ${shellQuote(cwd)}`,
     `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.156.1"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
-    `krmax_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
-    `krmax_slug="$(printf '%s' "$krmax_cwd" | sed 's/[^a-zA-Z0-9]/-/g')"`,
-    'mkdir -p "$HOME/.claude/projects/$krmax_slug"',
-    `cp "${source}" "$HOME/.claude/projects/$krmax_slug/${sessionId}.jsonl"`,
-    'cd "$krmax_cwd"',
+    `tavya_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
+    `tavya_slug="$(printf '%s' "$tavya_cwd" | sed 's/[^a-zA-Z0-9]/-/g')"`,
+    'mkdir -p "$HOME/.claude/projects/$tavya_slug"',
+    `cp "${source}" "$HOME/.claude/projects/$tavya_slug/${sessionId}.jsonl"`,
+    'cd "$tavya_cwd"',
     `CLAUDE_CONFIG_DIR="$HOME/.claude" claude --resume ${JSON.stringify(sessionId)} --fork-session`,
   ].join('\n');
   return '';
@@ -9407,13 +9564,13 @@ async function forkCloudSessionLocally(v, button) {
   const checkout = await materializeLocalCheckout(v);
   if (checkout) await copyToClipboard(forkCommandFor(session, checkout.cwd)).then(() => toast('Fork command copied'));
   button.disabled = false;
-  button.textContent = '⑂ fork locally';
+  button.innerHTML = `${ICON.laptop}Fork locally`;
 }
 
 async function copyNativeAttachCommand(v) {
   try {
     const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/terminal-ticket`, { method: 'POST', body: '{}' });
-    const command = [...(result.attachArgv || ['karmax']), 'attach', v.taskId, '--url', result.gatewayUrl, '--ticket', result.ticket]
+    const command = [...(result.attachArgv || ['tavya']), 'attach', v.taskId, '--url', result.gatewayUrl, '--ticket', result.ticket]
       .map((part) => JSON.stringify(String(part))).join(' ');
     await copyToClipboard(command);
     toast('One-time attach command copied');
@@ -9424,9 +9581,10 @@ async function copyNativeAttachCommand(v) {
 // priority + tags (organization), the workflow's declared params (editable or
 // frozen per its lifecycle), and the per-task credential policy.
 function parametersTab(v) {
-  // Priority + tags (organization metadata) now live in the page header, above the
+  // Priority + tags (organization metadata) live in the page header, above the
   // tabs, so they're visible/editable on every tab — not just here (see renderTaskPage).
   return `
+    ${workflowSection(v)}
     ${paramsSection(v)}
     ${authorizationSection(v)}
     ${taskRecord(v.taskId)?.params?.draft ? '' : taskPaymentsHtml('tp-payments', paymentsLiveKey(v))}
@@ -9589,7 +9747,7 @@ function renderDiff(d) {
 function waitingLabel(w) {
   if (!w) return '';
   switch (w.kind) {
-    case 'account': return w.earliestResetAt ? 'quota' : 'account';
+    case 'account': return w.earliestResetAt ? 'quota' : 'credential';
     case 'agentSlot': return 'agent';
     case 'mergeSlot': return 'merge';
     case 'github': return /\b(?:ci|checks?|validat(?:e|es|ed|ing|ion))\b/i.test(w.detail || '') ? 'CI' : 'GitHub';
@@ -9601,6 +9759,7 @@ function waitingLabel(w) {
     case 'parent': return 'parent';
     case 'confirm': return 'review';
     case 'responder': return 'responder';
+    case 'job': return 'job';
     default: return 'progress';
   }
 }
@@ -9614,6 +9773,11 @@ function waitingText(w) {
     if (summary) return summary.slice(0, 72);
   }
   if (w?.kind === 'human') return 'Needs input';
+  if (w?.kind === 'timer') {
+    return Number.isFinite(w.until)
+      ? `Paused until ${new Date(w.until).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+      : 'Paused';
+  }
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
   return `Waiting for ${label}`;
@@ -9690,6 +9854,48 @@ function beginAsyncElementRender(element) {
   return () => element.isConnected && asyncElementRenderEpoch.get(element) === epoch;
 }
 
+// Start (or restart) a provider sign-in and walk the person through it in `out`:
+// the device URL, an authorization code when the provider asks for one, and the
+// result. Starting is an explicit re-authentication, so it is always forced —
+// otherwise an expired credential file reads as "Already signed in".
+async function runLoginFlow(out, { organizationId, provider, account, modelProvider, authMethod, onSignedIn }) {
+  const base = `/api/organizations/${encodeURIComponent(organizationId)}/accounts`;
+  const show = (html, color) => { out.innerHTML = html; out.style.color = color; };
+  show(`Launching ${esc(provider)}:${esc(account)} sign-in…`, 'var(--ink-2)');
+  let r;
+  try {
+    r = await api(`${base}/connect`, {
+      method: 'POST',
+      body: JSON.stringify({ provider, account, browserMcp: 'none', modelProvider, authMethod, force: true }),
+    });
+  } catch (e) { out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; return false; }
+  if (r.status === 'logged_in') { show('🟢 Already signed in.', 'var(--ok, green)'); onSignedIn?.(); return true; }
+  if (r.status !== 'awaiting_oauth' || !r.loginUrl) {
+    out.textContent = `Could not start login: ${r.detail || r.status}`;
+    out.style.color = 'var(--bad, crimson)';
+    return false;
+  }
+  const codeEntry = r.requiresCode
+    ? '<br><label class="form-row">Authorization code shown after sign-in<input class="login-authorization-code" autocomplete="off" /></label><button class="btn sm login-code-submit">Submit code</button>'
+    : '';
+  show(`Open this URL to finish signing in ${esc(provider)}:${esc(account)} (${siteNameMarkup()} won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}${codeEntry}`, 'var(--ink-1)');
+  out.querySelector('.login-code-submit')?.addEventListener('click', async () => {
+    const code = out.querySelector('.login-authorization-code')?.value.trim();
+    if (!code) return toast('authorization code required', true);
+    const submit = out.querySelector('.login-code-submit');
+    submit.disabled = true;
+    try {
+      const completed = await api(`${base}/connect/code`, { method: 'POST', body: JSON.stringify({ provider, account, code }) });
+      if (completed.status === 'logged_in') { show('🟢 Signed in.', 'var(--ok, green)'); onSignedIn?.(); }
+      else out.textContent = completed.detail || 'Authorization code submitted.';
+    } catch (e) {
+      submit.disabled = false;
+      toast(e.message, true);
+    }
+  });
+  return true;
+}
+
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
   const renderIsCurrent = beginAsyncElementRender(el);
@@ -9752,8 +9958,6 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       // and inherited Explainer-only render as the same binary Off state there.
       const mode = scope === 'task' ? (isOn ? 'on' : 'off')
         : c.kind === 'key' ? (sd.modes?.[key] || (isOn ? 'on' : 'off')) : (isOn ? 'on' : 'off');
-      const login = loginByKey[key];
-      const warn = login && !login.loggedIn ? ' <span style="color:var(--warn,#e0b15a)">·oauth</span>' : '';
       const loginActions = canManage && c.kind === 'login';
       const keyActions = canManage && c.kind === 'key' && c.key.startsWith('key:handle:') && c.account;
       // Compact inline chip: the kind is obvious from the label (a login is
@@ -9761,22 +9965,35 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       const ambientHomes = { claude: '~/.claude', codex: '~/.codex', opencode: '~/.local/share/opencode', kimi: '~/.kimi-code', grok: '~/.grok' };
       const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
-      const stateControl = c.kind === 'key' && scope !== 'task'
+      // A login the provider signed out cannot run until someone signs in again;
+      // a Claude sign-in lapses about four weeks after it was made, so flag it in
+      // its last three days rather than let tasks stall on it. Either way the `!`
+      // starts the sign-in.
+      const renewInDays = !c.signedOut && c.signInExpiresAt && c.signInExpiresAt - Date.now() < 3 * 86_400_000
+        ? Math.max(0, Math.ceil((c.signInExpiresAt - Date.now()) / 86_400_000)) : undefined;
+      const signInAlert = c.signedOut
+        ? 'Signed out — click to sign in again'
+        : renewInDays === undefined ? ''
+          : `Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — click to renew`;
+      const alertButton = signInAlert
+        ? `<button class="cred-signin" title="${esc(signInAlert)}" aria-label="${esc(signInAlert)}">!</button>` : '';
+      const stateControl = c.signedOut ? ''
+        : c.kind === 'key' && scope !== 'task'
         ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
             <option value="on"${mode === 'on' ? ' selected' : ''}>On</option>
             <option value="off"${mode === 'off' ? ' selected' : ''}>Off</option>
             <option value="explainer-only"${mode === 'explainer-only' ? ' selected' : ''}>Explainer-only</option>
           </select>`
         : `<button class="cred-toggle ${mode}" title="${mode === 'on' ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${mode}</button>`;
-      return `<div class="cred-row ${esc(mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
+      return `<div class="cred-row ${esc(c.signedOut ? 'signed-out' : mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
         ${stateControl}
-        <span class="cred-label mono">${icon}${esc(label)}${warn}</span>
+        <span class="cred-label mono">${icon}${esc(label)}</span>${alertButton}
         ${loginActions ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}
         ${keyActions ? '<span class="cred-key-edit" title="Edit API key">✎</span><span class="cred-key-del" title="Delete API key">✕</span>' : ''}
       </div>`;
     })
-    .join('')}</div>`;
+    .join('')}</div><div class="cred-login-flow" hidden></div>`;
   const save = async (policy) => {
     // Local mode: keep the change client-side (applied when the task is created); else
     // persist immediately, keyed by taskId/projectId scope.
@@ -9804,6 +10021,14 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     });
     const login = loginByKey[key];
     const credential = byKey[key];
+    row.querySelector('.cred-signin')?.addEventListener('click', () => {
+      const out = el.querySelector('.cred-login-flow');
+      out.hidden = false;
+      runLoginFlow(out, {
+        organizationId, provider: credential.provider, account: credential.account,
+        onSignedIn: () => renderCredentialEditor(el, scope, opts),
+      });
+    });
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
       const to = prompt(`Rename login ${login.account} to:`, login.account);
       if (!to || to === login.account) return;
@@ -10027,6 +10252,19 @@ function wireNotes(v) {
   btn.addEventListener('click', save);
   // Save on blur too, so notes aren't lost when the page closes.
   ta.addEventListener('blur', save);
+}
+
+// The workflow (and its pinned version) configures the task, so it lives with
+// the parameters rather than in the header of every tab.
+function workflowSection(v) {
+  const version = taskRecord(v.taskId)?.workflowVersion;
+  const mode = v.workflowOptions?.length > 1
+    ? `<select id="tp-workflow-mode" class="q-sel" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
+        ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
+      </select>`
+    : `<span>${esc(workflowLabel(v.workflow))}</span>`;
+  return `<div class="section-h">Workflow</div>
+    <div class="tp-workflow">${mode}${version ? `<span class="mono" title="Workflow version this task is pinned to">v${esc(version)}</span>` : ''}</div>`;
 }
 
 function paramsSection(v) {
@@ -11736,11 +11974,13 @@ function flashSaved(button) {
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
 const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
-// `confirm` (the Review route) stays a shared/common value on the wire, but it is
-// edited in the Agents card beside the task agents it gates — not here.
-const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
+// Review route and Responder stay shared/common values on the wire, but their
+// controls live in the Agent card.
+const agentRouteSettingsFields = (scope) => ['confirm', 'responder']
+  .map((name) => settingsFields('software-dev', scope).find((field) => field.name === name)).filter(Boolean);
+const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && !['confirm', 'responder'].includes(field.name));
 // The stored `__common__` row is shared by several forms (task defaults here; the
-// Review route and Git profile elsewhere) and a settings PUT replaces the whole
+// agent routes and Git profile elsewhere) and a settings PUT replaces the whole
 // row — so every save read-merge-writes: fetch the raw row, drop exactly the keys
 // this form owns, and lay the collected values on top.
 async function saveCommonSettings(scope, projectId, organizationId, ownNames, collected) {
@@ -11775,7 +12015,8 @@ function settingsForms(scope, projectId) {
       </details>`;
     })
     .join('');
-  return common + resourceDefaultsHtml(scope) + unique;
+  return common + profilesCard(scope) + quickSettingsForms(scope, projectId)
+    + resourceDefaultsHtml(scope) + explanationSettingsCard(scope) + unique;
 }
 
 function resourceDefaultsHtml(scope) {
@@ -12027,11 +12268,15 @@ async function openAvatarEditor(proj, avatar) {
   const overlay = document.createElement('div'); overlay.className = 'overlay avatar-editor-overlay';
   overlay.innerHTML = '<div class="modal-card avatar-editor"><div class="loading">Loading…</div></div>'; document.body.appendChild(overlay);
   const close = () => overlay.remove(); overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  try { await fillAvatarEditor(overlay, close, proj, avatar); } catch (error) { close(); toast(error.message, true); }
+}
+
+async function fillAvatarEditor(overlay, close, proj, avatar) {
   const [vaultItems, githubData] = await Promise.all([api(`/api/vault/items?organizationId=${encodeURIComponent(proj.organizationId)}`).catch(() => []), api('/api/user/github-accounts').catch(() => ({ accounts: [] }))]);
   const githubAccounts = githubData.accounts || [], activeGithub = githubAccounts.find((account) => account.active);
   const selectedCredentialIds = new Set((avatar?.authorization?.capabilities || []).filter((cap) => cap.startsWith('use-credential:item:')).map((cap) => cap.slice('use-credential:item:'.length)));
   let credentialPolicies = JSON.parse(JSON.stringify(avatar?.credentialPolicies || {}));
-  const callMode = avatar?.callableBy?.includes('@project') ? 'project' : avatar?.callableBy?.length === 1 && avatar.callableBy[0] === `user:${avatar.ownerUserId}` ? 'me' : 'specific';
+  const callMode = !avatar ? 'me' : avatar.callableBy?.includes('@project') ? 'project' : avatar.callableBy?.length === 1 && avatar.callableBy[0] === `user:${avatar.ownerUserId}` ? 'me' : 'specific';
   const roles = new Set(avatar?.roles || []), selectedAuth = avatar?.authorityMode === 'restricted' ? avatar.authorization : { level: 'developer', scope: 'projects', projectIds: [proj.id] };
   const runtime = avatar?.runtime || { provider: agentProviderChoice(), model: '', effort: '' };
   overlay.querySelector('.avatar-editor').innerHTML = `<div class="avatar-editor-head"><div><h2>${avatar ? 'Edit Avatar' : 'New Avatar'}</h2><p>Create a named autonomous principal. Only you can edit its instructions.</p></div><button class="icon-btn avatar-editor-close" type="button" aria-label="Close">✕</button></div><div class="avatar-editor-scroll">
@@ -12053,7 +12298,7 @@ async function openAvatarEditor(proj, avatar) {
   const anyRole = overlay.querySelector('#avatar-any-role'), roleGrid = overlay.querySelector('.avatar-role-grid'); anyRole.addEventListener('change', () => { roleGrid.hidden = anyRole.checked; });
   overlay.querySelector('.avatar-editor-save').addEventListener('click', async () => {
     const button = overlay.querySelector('.avatar-editor-save'); button.disabled = true; const authorityMode = authorityInputs.find((input) => input.checked)?.value || 'full';
-    const callableBy = callModeEl.value === 'me' ? [`user:${S.user.id}`] : callModeEl.value === 'project' ? ['@project'] : overlay.querySelector('#avatar-callers').value.split(',').map((value) => value.trim()).filter(Boolean);
+    const callableBy = callModeEl.value === 'me' ? [`user:${typeof S.user === 'string' ? S.user : S.user?.id}`] : callModeEl.value === 'project' ? ['@project'] : overlay.querySelector('#avatar-callers').value.split(',').map((value) => value.trim()).filter(Boolean);
     const requestedAuthorization = authorityMode === 'restricted'
       ? readAuthorizationEditor(overlay.querySelector('#avatar-authorization')) : null;
     const payload = { name: overlay.querySelector('#avatar-name').value, purpose: overlay.querySelector('#avatar-purpose').value,
@@ -12118,10 +12363,10 @@ function wireAvatarsView(proj) {
 // the URL hash so wiki pages deep-link like settings panes.
 function wikiScopeInfo(proj) {
   if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki`,
-    selector: S.wikiViews?.[proj.id] || '' };
+    view: S.wikiView || '' };
   const org = currentOrg();
   if (!org) return null;
-  return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki` };
+  return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki`, view: '' };
 }
 
 function wikiView(proj) {
@@ -12129,19 +12374,110 @@ function wikiView(proj) {
   if (!info) return `<div class="empty">No organization yet.</div>`;
   return `<div class="organization-settings wiki-page"><div class="settings-header"><div>
       <h1 class="page-title">${esc(info.title)} — wiki</h1>
-    </div>${proj ? `<div class="wiki-view-picker"><label for="wiki-view-input">Viewing</label>
-      <input id="wiki-view-input" list="wiki-view-options" placeholder="Default branch" autocomplete="off">
-      <datalist id="wiki-view-options"></datalist></div>` : ''}</div>
+    </div>${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout">
+      <span>Viewing</span><select id="wiki-view-select">${wikiViewOptionsHtml(proj)}</select></label>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
 }
 
+// The default branch, every task whose checkout can still be opened, and the
+// other branches. The current view is always an option, even before (or
+// without) the server's list, so the control never misstates what is shown.
+function wikiViewOptionsHtml(proj) {
+  const refs = S.wikiRefs?.[proj.id]?.data;
+  const view = S.wikiView || '';
+  const tasks = (refs?.tasks || []).map((task) => ({ value: `task:${task.num ?? task.id}`,
+    label: `#${task.num ?? '–'} ${task.title}`, title: task.branch }));
+  const branches = (refs?.branches || []).filter((branch) => branch !== refs.defaultBranch)
+    .map((branch) => ({ value: `branch:${branch}`, label: branch }));
+  if (view && ![...tasks, ...branches].some((option) => option.value === view)) {
+    const key = view.slice(view.indexOf(':') + 1);
+    if (view.startsWith('task:')) {
+      const task = (S.tasks || []).find((t) => String(t.num) === key || t.id === key);
+      tasks.unshift({ value: view, label: `#${task?.num ?? key} ${task?.title || ''}`.trim() });
+    } else branches.unshift({ value: view, label: key });
+  }
+  const option = (o) => `<option value="${esc(o.value)}"${o.value === view ? ' selected' : ''}${o.title ? ` title="${esc(o.title)}"` : ''}>${esc(o.label)}</option>`;
+  return option({ value: '', label: refs?.defaultBranch || 'main' })
+    + (tasks.length ? `<optgroup label="Tasks">${tasks.map(option).join('')}</optgroup>` : '')
+    + (branches.length ? `<optgroup label="Branches">${branches.map(option).join('')}</optgroup>` : '');
+}
+
+// The picker's list changes only as tasks start and finish: fetch it at most
+// every half minute, in the background, and never rebuild an open dropdown.
+function loadWikiRefs(proj) {
+  S.wikiRefs ||= {};
+  const entry = S.wikiRefs[proj.id];
+  if (entry?.pending || (entry?.at && Date.now() - entry.at < 30_000)) return;
+  const pending = api(`/api/projects/${encodeURIComponent(proj.id)}/wiki/refs`).then((data) => {
+    S.wikiRefs[proj.id] = { data, at: Date.now() };
+    const select = $('#wiki-view-select');
+    if (!select || S.projectId !== proj.id || S.tab !== 'wiki') return;
+    const refresh = () => { select.innerHTML = wikiViewOptionsHtml(proj); };
+    if (document.activeElement === select) select.addEventListener('blur', refresh, { once: true });
+    else refresh();
+  }).catch(() => { S.wikiRefs[proj.id] = { ...entry, pending: null }; });
+  S.wikiRefs[proj.id] = { ...entry, pending };
+}
+
 function wikiUrl(info, suffix = '', params = {}) {
   const url = new URL(`${info.base}${suffix}`, location.origin);
-  if (info.selector?.startsWith('task:')) url.searchParams.set('taskId', info.selector.slice(5));
-  else if (info.selector?.startsWith('branch:')) url.searchParams.set('branch', info.selector.slice(7));
+  if (info.taskId) url.searchParams.set('taskId', info.taskId);
+  else if (info.view?.startsWith('branch:')) url.searchParams.set('branch', info.view.slice(7));
   for (const [key, value] of Object.entries(params)) if (value != null && value !== '') url.searchParams.set(key, value);
   return `${url.pathname}${url.search}`;
+}
+
+// Wiki reads are cached by URL: a repaint, an entry switch or Back paints the
+// last copy at once and then revalidates (unless it is only seconds old), and
+// concurrent callers share one request. A task view can be slow to read (its
+// checkout may live in a cloud sandbox), so navigation never waits on it.
+const wikiReadCache = new Map(); // url → { data, at }
+const wikiReadsInFlight = new Map();
+function wikiRead(url) {
+  const cached = wikiReadCache.get(url);
+  let fresh = wikiReadsInFlight.get(url);
+  if (!fresh && cached && Date.now() - cached.at < 5_000) fresh = Promise.resolve(cached.data);
+  if (!fresh) {
+    const request = api(url).then((data) => {
+      if (wikiReadsInFlight.get(url) === request) {
+        wikiReadCache.delete(url);
+        wikiReadCache.set(url, { data, at: Date.now() });
+        if (wikiReadCache.size > 200) wikiReadCache.delete(wikiReadCache.keys().next().value);
+      }
+      return data;
+    }).finally(() => { if (wikiReadsInFlight.get(url) === request) wikiReadsInFlight.delete(url); });
+    wikiReadsInFlight.set(url, fresh = request);
+  }
+  return { cached: cached?.data, fresh };
+}
+// After a write nothing cached may be shown again.
+function forgetWikiReads() { wikiReadCache.clear(); wikiReadsInFlight.clear(); }
+// Paint the cached copy synchronously, then the fresh one if it differs.
+function paintWikiRead(read, paint, fail) {
+  const seen = read.cached === undefined ? undefined : JSON.stringify(read.cached);
+  if (read.cached !== undefined) paint(read.cached);
+  read.fresh.then((data) => { if (JSON.stringify(data) !== seen) paint(data); },
+    (error) => { if (read.cached === undefined) fail(error); });
+}
+
+// Move to another entry (or the Index, path ''), keeping the branch view.
+// Entries are history entries, so Back returns to the previous one.
+function openWikiEntry(proj, path, { replace = false } = {}) {
+  S.wikiEditing = null;
+  history[replace ? 'replaceState' : 'pushState']({ kx: 1 }, '',
+    `${location.pathname}${location.search}${path ? `#${encodeURIComponent(path)}` : ''}`);
+  wireWikiView(proj);
+}
+
+// The entry that encloses `path` (an attachment or a sub-folder of one), if any.
+function wikiEnclosingEntry(toc, path) {
+  const entries = new Set();
+  const walk = (list) => (list || []).forEach((e) => (e.kind === 'section' ? walk(e.children) : entries.add(e.path)));
+  walk(toc?.children);
+  for (let cut = path; cut; cut = cut.includes('/') ? cut.slice(0, cut.lastIndexOf('/')) : '')
+    if (entries.has(cut)) return cut;
+  return '';
 }
 
 const wikiIsDefault = (e) => (e.labels || []).includes('default');
@@ -12155,75 +12491,88 @@ function wikiTreeHtml(entries, sel, depth = 0) {
   ).join('');
 }
 
+const wikiTaskIds = new Map(); // `${projectId}:${num}` → task id, for ?task= views
+let wikiGeneration = 0;
+
 async function wireWikiView(proj) {
   const info = wikiScopeInfo(proj);
   const nav = $('#wiki-nav');
   const pane = $('#wiki-pane');
   if (!info || !nav || !pane) return;
-  if (proj) {
-    try {
-      const refs = await api(`${info.base}/refs`);
-      const input = $('#wiki-view-input');
-      const options = $('#wiki-view-options');
-      const entries = [
-        { value: '', label: `Default branch · ${refs.defaultBranch}` },
-        ...(refs.tasks || []).map((task) => ({ value: `task:${task.id}`, label: `#${task.num || '–'} ${task.title} · ${task.branch}` })),
-        ...(refs.branches || []).filter((branch) => branch !== refs.defaultBranch)
-          .map((branch) => ({ value: `branch:${branch}`, label: `Branch · ${branch}` })),
-      ];
-      const selected = entries.find((entry) => entry.value === info.selector) || entries[0];
-      input.value = selected.label;
-      options.innerHTML = entries.map((entry) => `<option value="${esc(entry.label)}"></option>`).join('');
-      input.onchange = () => {
-        const chosen = entries.find((entry) => entry.label === input.value.trim());
-        if (!chosen) return;
-        S.wikiViews ||= {};
-        S.wikiViews[proj.id] = chosen.value;
-        S.wikiEditing = null;
-        wireWikiView(proj);
-      };
-    } catch { /* the canonical wiki remains usable without the selector metadata */ }
-  }
-  const key = `${info.scope}:${info.id}`;
-  let data;
-  try { data = await api(wikiUrl(info)); }
-  catch (e) { pane.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; nav.textContent = ''; return; }
+  // Only the latest call may paint: a slow answer for an entry the user has
+  // already left must not replace the one they moved to.
+  const generation = ++wikiGeneration;
+  const current = () => generation === wikiGeneration && pane.isConnected;
   const sel = decodeURIComponent((location.hash || '').slice(1));
+  const key = `${info.scope}:${info.id}`;
+  if (proj) {
+    const select = $('#wiki-view-select');
+    if (select) select.onchange = () => { S.wikiEditing = null; go(wikiRoute(proj.id, select.value, sel)); };
+    loadWikiRefs(proj);
+    if (info.view.startsWith('task:')) {
+      const taskKey = info.view.slice(5);
+      info.taskId = wikiTaskIds.get(`${proj.id}:${taskKey}`)
+        || (S.wikiRefs?.[proj.id]?.data?.tasks || []).find((task) => String(task.num) === taskKey)?.id
+        || await resolveProjectTaskKey(proj.id, taskKey);
+      if (!current()) return;
+      if (!info.taskId) { nav.textContent = ''; pane.innerHTML = '<span class="task-sub">Task not found.</span>'; return; }
+      wikiTaskIds.set(`${proj.id}:${taskKey}`, info.taskId);
+    }
+  }
 
-  nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
-    <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
-    ${wikiTreeHtml(data.toc?.children, sel)}
-    ${data.view?.writable !== false ? '<button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>' : ''}`;
-  const open = (path) => {
-    S.wikiEditing = null;
-    history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
-    wireWikiView(proj);
+  let indexData;
+  const paintNav = (data) => {
+    nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
+      <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
+      ${wikiTreeHtml(data?.toc?.children, sel)}
+      ${data && data.view?.writable !== false ? '<button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>' : ''}`;
+    nav.querySelectorAll('[data-wiki-home], [data-wiki-path]').forEach((a) => a.addEventListener('click', (ev) => {
+      if (isNewTabClick(ev)) return;
+      ev.preventDefault();
+      openWikiEntry(proj, a.dataset.wikiPath || '');
+    }));
+    $('#wiki-new')?.addEventListener('click', () => renderWikiEditor(info, proj, pane, null));
   };
-  nav.querySelector('[data-wiki-home]')?.addEventListener('click', (ev) => { ev.preventDefault(); open(''); });
-  nav.querySelectorAll('[data-wiki-path]').forEach((a) => a.addEventListener('click', (ev) => { ev.preventDefault(); open(a.dataset.wikiPath); }));
-  $('#wiki-new')?.addEventListener('click', () => renderWikiEditor(info, proj, pane, null));
+  paintNav(undefined);
 
-  // A page fetch goes through the base route so built-ins resolve (a virtual
-  // built-in has no on-disk page for /page to find).
-  const fetchPage = async (p) => {
-    const read = await api(wikiUrl(info, '', { path: p }));
-    return read.page ? { ...read.page, _wikiWritable: read.view?.writable !== false } : null;
-  };
   // A background re-render (WS task event) must not blow away an in-progress
   // editor: restore it for the same scope before painting the read view.
   if (S.wikiEditing?.wikiKey === key) {
     if (!S.wikiEditing.path) return renderWikiEditor(info, proj, pane, null);
     try {
-      const editing = await fetchPage(S.wikiEditing.path);
-      if (editing) return renderWikiEditor(info, proj, pane, editing);
+      const read = await wikiRead(wikiUrl(info, '', { path: S.wikiEditing.path })).fresh;
+      if (!current()) return;
+      if (read.page) return renderWikiEditor(info, proj, pane, { ...read.page, _wikiWritable: read.view?.writable !== false });
     } catch { /* fall through */ }
     S.wikiEditing = null;
   }
-  if (!sel) return renderWikiHome(info, proj, pane, data);
-  let page;
-  try { page = await fetchPage(sel); } catch { page = null; }
-  if (!page) return renderWikiHome(info, proj, pane, data); // stale hash → fall back
-  renderWikiPage(info, proj, pane, page);
+
+  const index = wikiRead(wikiUrl(info));
+  const page = sel ? wikiRead(wikiUrl(info, '', { path: sel })) : null;
+  if ((page || index).cached === undefined) pane.innerHTML = '<span class="task-sub" role="status">Loading…</span>';
+  paintWikiRead(index, (data) => {
+    if (!current()) return;
+    indexData = data;
+    paintNav(data);
+    if (!sel) renderWikiHome(info, proj, pane, data);
+  }, (error) => {
+    if (current() && !sel) pane.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
+  });
+  if (!page) return;
+  // Not an entry on this view (a stale link, or a cited attachment inside an
+  // entry): open the enclosing entry, else the Index.
+  const fallback = async (error) => {
+    const data = indexData || await index.fresh.catch(() => null);
+    if (!current()) return;
+    if (!data) { pane.innerHTML = `<span class="task-sub">${esc(error?.message || 'This wiki is unavailable.')}</span>`; return; }
+    const enclosing = wikiEnclosingEntry(data.toc, sel);
+    openWikiEntry(proj, enclosing !== sel ? enclosing : '', { replace: true });
+  };
+  paintWikiRead(page, (read) => {
+    if (!current()) return;
+    if (read.page) renderWikiPage(info, proj, pane, { ...read.page, _wikiWritable: read.view?.writable !== false });
+    else fallback();
+  }, (error) => { if (current()) fallback(error); });
 }
 
 // Everything above the frontmatter fence is metadata; render only the body.
@@ -12641,10 +12990,7 @@ function wireWikiPathEditor(el, warnEl, kindOf) {
 function wireWikiLocalLinks(root, proj) {
   root?.querySelectorAll('a[data-md-local]').forEach((a) => a.addEventListener('click', (ev) => {
     ev.preventDefault();
-    const path = (a.dataset.mdLocal || '').replace(/^\.?\//, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
-    S.wikiEditing = null;
-    history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
-    wireWikiView(proj);
+    openWikiEntry(proj, (a.dataset.mdLocal || '').replace(/^\.?\//, '').replace(/[?#].*$/, '').replace(/\/+$/, ''));
   }));
 }
 
@@ -12668,7 +13014,7 @@ function renderWikiHome(info, proj, pane, data) {
     try {
       const read = await api(wikiUrl(info, '', { path: b.dataset.path }));
       if (!read.page) return toast('Entry not found', true);
-      history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(read.page.path)}`);
+      history.replaceState({ kx: 1 }, '', `${location.pathname}${location.search}#${encodeURIComponent(read.page.path)}`);
       renderWikiEditor(info, proj, pane, read.page);
     } catch (e) { toast(e.message, true); }
   }));
@@ -12701,7 +13047,8 @@ function renderWikiPage(info, proj, pane, page) {
     if (!confirm(q)) return;
     try {
       await api(wikiUrl(info, '/page', { path: page.path }), { method: 'DELETE' });
-      if (!page.builtin) history.replaceState({ kx: 1 }, '', location.pathname);
+      forgetWikiReads();
+      if (!page.builtin) history.replaceState({ kx: 1 }, '', `${location.pathname}${location.search}`);
       wireWikiView(proj);
     } catch (e) { toast(e.message, true); }
   });
@@ -12813,8 +13160,9 @@ function renderWikiEditor(info, proj, pane, page) {
     else if (path !== page.path) body.prevPath = page.path;
     try {
       await api(wikiUrl(info, '/page'), { method: 'PUT', body: JSON.stringify(body) });
+      forgetWikiReads();
       S.wikiEditing = null;
-      history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(path)}`);
+      history.replaceState({ kx: 1 }, '', `${location.pathname}${location.search}#${encodeURIComponent(path)}`);
       wireWikiView(proj);
     } catch (e) { toast(e.message, true); }
   });
@@ -12846,13 +13194,10 @@ function settingsView(proj) {
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
-    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
-    ${explanationSettingsCard('project')}
-    ${profilesCard('project')}
-    ${quickSettingsForms('project', proj.id)}
     <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
     <div class="settings-section-title" id="project-people"><div>People &amp; authorization<small>Who can work here, and what they may do</small></div></div>
     <div class="card"><div id="project-access">Loading…</div></div>
+    <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
@@ -13820,9 +14165,6 @@ function globalSettingsView(embedded = false) {
   return `
     ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
-    ${explanationSettingsCard('global')}
-    ${profilesCard('global')}
-    ${quickSettingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps</div>
       <p class="task-sub">List of connected apps. To set defaults, go to <a href="#settings-defaults">Task defaults</a>.</p>
@@ -15977,15 +16319,14 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   }));
 }
 
-// The Review route — who checks the work at Review: human layers, agent layers,
-// or none (auto-confirm). Stored with the shared task defaults (__common__/
-// confirm) but edited here, beside the task agents it gates.
+// Review route and Responder share the task-defaults row (__common__) but are
+// edited beside the operational agent, with one save for both routes.
 async function hydrateReviewRoute(scope, projectId, organizationId) {
   const box = $(`#review-route-${scope}`);
   if (!box) return;
   const renderIsCurrent = beginAsyncElementRender(box);
-  const field = schemaFor('software-dev').find((f) => f.name === 'confirm');
-  if (!field) { box.innerHTML = ''; return; }
+  const fields = agentRouteSettingsFields(scope);
+  if (!fields.length) { box.innerHTML = ''; return; }
   let own = {};
   let inherited = {};
   try {
@@ -15995,16 +16336,16 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
     inherited = d[scope].inherited;
   } catch {}
   if (!renderIsCurrent()) return;
-  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
-    <button class="btn primary sm" data-save-review-route>Save review route</button>`;
+  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields(fields, own, inherited)}</div>
+    <button class="btn primary sm" data-save-review-route>Save routes</button>`;
   box.dataset.mcpScope = mcpScope(projectId || null, organizationId);
   wireAgentFields(box);
-  wireFieldResets(box, [field]);
+  wireFieldResets(box, fields);
   const saveButton = box.querySelector('[data-save-review-route]');
   saveButton.addEventListener('click', async () => {
-    const values = collectForm(box.querySelector('.wf-form'), [field]);
+    const values = collectForm(box.querySelector('.wf-form'), fields);
     try {
-      await saveCommonSettings(scope, projectId, organizationId, ['confirm'], values);
+      await saveCommonSettings(scope, projectId, organizationId, fields.map((field) => field.name), values);
       flashSaved(saveButton);
     } catch (err) { toast(err.message, true); }
   });
@@ -16078,58 +16419,16 @@ function wireGlobalSettings(organizationId) {
   $('#login-connect')?.addEventListener('click', async () => {
     const provider = $('#login-provider').value;
     const account = $('#login-name').value.trim();
-    const browserMcp = 'none';
     const [modelProvider, authMethod] = provider === 'opencode'
       ? $('#login-opencode-target').value.split('|', 2)
       : [];
-    const out = $('#login-result');
     if (!account) return toast('account name required', true);
-    out.textContent = 'Launching provider login…';
-    out.style.color = 'var(--ink-2)';
-    try {
-      const btn = $('#login-connect'); btn.disabled = true;
-      const r = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect`, {
-        method: 'POST',
-        // Clicking Connect is an explicit re-authentication request. Without
-        // force, an expired native credential file was mistaken for a healthy
-        // login and the UI misleadingly reported "Already signed in."
-        body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod, force: true }),
-      });
-      btn.disabled = false;
-      if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }
-      else if (r.status === 'awaiting_oauth' && r.loginUrl) {
-        const codeEntry = r.requiresCode
-          ? '<br><label class="form-row">Authorization code shown after sign-in<input id="login-authorization-code" autocomplete="off" /></label><button class="btn sm" id="login-code-submit">Submit code</button>'
-          : '';
-        out.innerHTML = `Open this URL to finish signing in (${siteNameMarkup()} won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}${codeEntry}`;
-        out.style.color = 'var(--ink-1)';
-        out.querySelector('#login-code-submit')?.addEventListener('click', async () => {
-          const code = out.querySelector('#login-authorization-code')?.value.trim();
-          if (!code) return toast('authorization code required', true);
-          const submit = out.querySelector('#login-code-submit');
-          submit.disabled = true;
-          try {
-            const completed = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect/code`, {
-              method: 'POST', body: JSON.stringify({ provider, account, code }),
-            });
-            if (completed.status === 'logged_in') {
-              out.innerHTML = '🟢 Signed in.';
-              out.style.color = 'var(--ok, green)';
-              hydrateAccounts(organizationId);
-              hydrateProfiles('global', undefined, organizationId);
-            } else {
-              out.textContent = completed.detail || 'Authorization code submitted.';
-            }
-          } catch (e) {
-            submit.disabled = false;
-            toast(e.message, true);
-          }
-        });
-      } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
-      $('#login-name').value = '';
-      hydrateAccounts(organizationId);
-      hydrateProfiles('global', undefined, organizationId);
-    } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
+    const btn = $('#login-connect');
+    btn.disabled = true;
+    const refresh = () => { hydrateAccounts(organizationId); hydrateProfiles('global', undefined, organizationId); };
+    const started = await runLoginFlow($('#login-result'), { organizationId, provider, account, modelProvider, authMethod, onSignedIn: refresh });
+    btn.disabled = false;
+    if (started) { $('#login-name').value = ''; refresh(); }
   });
   const syncLoginTarget = () => {
     const show = $('#login-provider')?.value === 'opencode';
@@ -16217,7 +16516,17 @@ function inboxTabs() {
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
+  if (item.subject?.kind === 'credential') {
+    if (item.subject.reason === 'signed-out') return 'Signed out — sign in again';
+    const days = Math.max(0, Math.ceil((item.subject.expiresAt - Date.now()) / 86_400_000));
+    return `Sign-in expires ${days ? `in ${days} day${days === 1 ? '' : 's'}` : 'today'} — renew it`;
+  }
   return item.kind === 'update' ? (item.task?.status || 'update') : item.kind.replaceAll('-', ' ');
+}
+// What a row is about, for rows that are not a task's (resource asks, logins).
+function inboxTitle(item, fallback = item.kind) {
+  if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
+  return item.task?.title || item.resource?.name || fallback;
 }
 // Every priority is explicit; color and bars make the urgent levels scannable.
 function urgencyChip(urgency) {
@@ -16258,7 +16567,7 @@ function inboxView() {
     <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0">
       <span class="status-dot ${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}" title="${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}"></span>
       <div class="task-main">
-        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(item.task?.title || item.resource?.name || item.kind)}</div>
+        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(inboxTitle(item))}</div>
         <div class="task-sub">${inboxProjectLabel(item) ? `<span class="inbox-project" title="${esc(inboxProjectLabel(item))}">${esc(inboxProjectLabel(item))}</span>` : ''}<span class="chip">${esc(inboxRowLabel(item))}</span></div>
       </div>
       <div class="task-right">${urgencyChip(item.urgency)}<time datetime="${new Date(item.createdAt).toISOString()}" title="${esc(new Date(item.createdAt).toLocaleString())}">${esc(inboxTimeLabel(item.createdAt))}</time><button class="icon-btn inbox-read" data-inbox-toggle="${esc(item.id)}" aria-label="${item.unread ? 'Mark as read' : 'Mark as unread'}" title="${item.unread ? 'Mark as read' : 'Mark as unread'}" aria-pressed="${!item.unread}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button></div></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
@@ -16388,7 +16697,7 @@ function showVisualNotification(item) {
   const alert = document.createElement('div');
   alert.className = 'notification-alert';
   alert.dataset.id = item.id;
-  alert.innerHTML = `<button class="notification-open"><strong>${esc(item.task?.title || item.resource?.name || 'karmax')}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
+  alert.innerHTML = `<button class="notification-open"><strong>${esc(inboxTitle(item, '') || siteName())}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
   alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(liveInboxItem(item)); };
   alert.lastElementChild.onclick = () => alert.remove();
   region.prepend(alert);
@@ -16405,7 +16714,7 @@ function showSystemNotification(item) {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
   try {
     const number = item.task?.num != null ? `#${item.task.num} · ` : '';
-    const notification = new Notification(item.task?.title || item.resource?.name || 'karmax', {
+    const notification = new Notification(inboxTitle(item, '') || siteName(), {
       body: `${URGENCY_LEVELS[urgencyRank(item.urgency)].toUpperCase()} · ${number}${inboxRowLabel(item)}`,
       silent: true, // Sound is controlled separately by this browser’s per-level preference.
       tag: item.id,                                    // a restated ask replaces its own popup
@@ -16465,6 +16774,9 @@ async function openInboxItem(item) {
     markInboxItemReadLocally(item);
     api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
       .catch(() => { item.unread = true; updateBell(); });
+  }
+  if (item.subject?.kind === 'credential') {
+    return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-agents`);
   }
   if (item.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId); if (!project) return;
@@ -17696,8 +18008,8 @@ async function hydrateOrganizationView() {
     ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
     <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
       <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
-      <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-karmax"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
-      <label class="form-row">Restricted prefix<input id="storage-prefix" value="karmax/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
+      <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-tavya"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
+      <label class="form-row">Restricted prefix<input id="storage-prefix" value="tavya/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
       <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
       <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the ${siteNameMarkup()} vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
   const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');

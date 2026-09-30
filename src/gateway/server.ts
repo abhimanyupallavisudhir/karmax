@@ -22,7 +22,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { TaskView } from '../domain/types.js';
-import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf } from '../domain/brand.js';
+import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
 import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
@@ -74,11 +74,11 @@ import type { RemoteAccessController } from '../remote/access.js';
 import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent,
   type GithubVaultPushEvent } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
-import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
+import { credentialResource, resourceDriverCatalog, resourceSecretHandle, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
-import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
+import { worldRepos, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
@@ -523,6 +523,10 @@ export function toPublicPayload(value: unknown): unknown {
         ? handle.meta as Record<string, unknown>
         : undefined;
       if (handleMeta?.environmentFlavor === 'desktop') out.worldDesktop = true;
+      // The wiki checkout's folder name (never its location), so citations of
+      // wiki files link to the wiki view rather than to a file handoff.
+      const wiki = worldRepos(handle as unknown as WorldHandle).find((repo) => repo.role === 'project-wiki');
+      if (wiki?.root) out.worldWiki = wiki.root.replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop();
     }
   }
   return out;
@@ -640,6 +644,10 @@ export class Gateway {
     // leaves a visibly connected login absent from the runnable coordinator pool.
     this.stopLoginPoolSync = deps.login?.onStateChange(async (state) => {
       await this.refreshLoginPool();
+      // A renewed sign-in withdraws its "sign in again" notice at once.
+      const { notifyCredentialAttention } = await import('../agent/credential-health.js');
+      await notifyCredentialAttention({ store: this.deps.store, configHomes: this.deps.configHomes }, Date.now(), [state.organizationId])
+        .catch(() => undefined);
       if (!state.loggedIn) return;
       const credential = enumerateCredentials(gatherCredentialSources({
         configHomes: this.deps.configHomes,
@@ -1851,6 +1859,10 @@ export class Gateway {
     const requestedScope = await this.requestScope(p, url);
     const auditScope = requestedScope.projectId ? `project:${requestedScope.projectId}`
       : requestedScope.organizationId ? `organization:${requestedScope.organizationId}` : 'global';
+    if (requestedScope.conflict) {
+      (await this.deps.authorization?.audit('anonymous', 'http.denied.scope-conflict', auditScope, { path: p, method, reason: requestedScope.conflict }));
+      return this.json(res, 403, { error: requestedScope.conflict });
+    }
     const session = await this.auth(req, requestedScope.projectId, requestedScope.organizationId);
     if (!session) {
       // Denials are audited too: cross-tenant probing must be visible to an
@@ -2126,7 +2138,7 @@ export class Gateway {
         };
         const label = String(identityData.profile.email ?? identityData.profile.name ?? 'user')
           .split('@')[0]!.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'user';
-        return this.downloadJson(res, `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
+        return this.downloadJson(res, `${BRAND}-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (p === '/api/settings/access' && method === 'GET') {
         if (!requestedScope.projectId && !requestedScope.organizationId)
@@ -2463,7 +2475,7 @@ export class Gateway {
         const label = String(organization?.slug || organizationId).toLowerCase()
           .replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'organization';
         return this.downloadJson(res,
-          `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
+          `${BRAND}-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (organizationMatch && method === 'DELETE') {
         const organizationId = organizationMatch[1]!;
@@ -3314,7 +3326,7 @@ export class Gateway {
               ? this.json(res, 200, (await view(avatar)))
               : this.json(res, 404, { error: 'avatar not found' });
           }
-          return this.json(res, 200, { availability, avatars: (await store.listAvatars(projectId)).map(view) });
+          return this.json(res, 200, { availability, avatars: (await Promise.all((await store.listAvatars(projectId)).map(view))) });
         }
 
         const subject = requireHumanSubject(callerIdentity);
@@ -3724,11 +3736,15 @@ export class Gateway {
               const existing = resources.find((resource) =>
                 resource.name === entry.name || (resource.target.kind === 'environment' && resource.target.name === entry.name));
               if (existing) {
-                const handle = existing.credentialHandles[0] ?? `resource:${existing.id}:credential`;
+                // A new value becomes the resource's own secret; a stored
+                // handle may name someone else's (AU-40).
+                const handle = entry.value ? resourceSecretHandle(existing.id)
+                  : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
                 if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value));
                 saved.push((await store.updateResourceAttachment(existing.id, {
                   target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
                   credentialHandles: [handle], enabled: true,
+                  ...(entry.value ? { source: withoutVaultProjection(existing.source) } : {}),
                 })));
               } else {
                 if (!entry.value) continue;
@@ -3903,7 +3919,7 @@ export class Gateway {
           if (credentialResource(driver)) {
             if (!secret) return this.json(res, 400, { error: 'secret value is required for this resource driver' });
             if (!this.deps.broker) return this.json(res, 503, { error: 'credential broker is unavailable' });
-            const handle = `resource:${id}:credential`;
+            const handle = resourceSecretHandle(id);
             (await this.deps.broker.registerHandle(handle, secret));
             credentialHandles.push(handle);
           }
@@ -4000,12 +4016,20 @@ export class Gateway {
           revisions: (await store.listResourceRevisions(resource.id)).map(redactResourceRevision) });
         if (method === 'PATCH') {
           const b = await this.body(req);
+          // The server alone decides which vault handles a resource uses, since
+          // the resource grants itself their use (AU-40).
+          if (b.credentialHandles !== undefined)
+            return this.json(res, 400, { error: 'a resource\'s credential is set by sending its secret, not a vault handle' });
           try {
             let secretUpdate: { handle: string; value: string } | undefined;
+            let source = b.source && typeof b.source === 'object' ? withReservedSource(b.source, resource.source) : undefined;
             if (typeof b.secret === 'string') {
               if (!this.deps.broker) throw new Error('credential broker is unavailable');
-              const handle = resource.credentialHandles[0] ?? `resource:${resource.id}:credential`;
+              // A new value becomes the resource's own secret, never the handle
+              // it names: that may be a vault item's or someone else's.
+              const handle = resourceSecretHandle(resource.id);
               b.credentialHandles = [handle];
+              source = withoutVaultProjection(source ?? resource.source);
               secretUpdate = { handle, value: b.secret };
             }
             const next = (await store.updateResourceAttachment(resource.id, {
@@ -4013,7 +4037,7 @@ export class Gateway {
               ...(b.target !== undefined ? { target: normalizeResourceTarget(b.target, resource.driver, resource.name) } : {}),
               ...(b.access !== undefined ? { access: b.access } : {}), ...(b.isolation !== undefined ? { isolation: b.isolation } : {}),
               ...(b.publish !== undefined ? { publish: b.publish } : {}), ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
-              ...(b.source && typeof b.source === 'object' ? { source: b.source } : {}),
+              ...(source ? { source } : {}),
               ...(b.storageLocationId !== undefined && isSnapshotResourceDriver(resource.driver)
                 ? { storageLocationId: (await this.deps.resources?.storageLocationFor(resource.organizationId, String(b.storageLocationId))) }
                 : {}),
@@ -4026,7 +4050,8 @@ export class Gateway {
         if (method === 'DELETE') {
           await this.deps.resources?.deleteAttachment(resource.id);
           if (!this.deps.resources) {
-            for (const handle of resource.credentialHandles) (await this.deps.broker?.deleteHandle(handle));
+            if (resource.credentialHandles.includes(resourceSecretHandle(resource.id)))
+              (await this.deps.broker?.deleteHandle(resourceSecretHandle(resource.id)));
             (await store.deleteResourceAttachment(resource.id));
           }
           return this.json(res, 200, { deleted: true, resourceId: resource.id });
@@ -4795,7 +4820,7 @@ export class Gateway {
         for (const [candidate, record] of this.terminalTickets) if (record.expiresAt <= Date.now()) this.terminalTickets.delete(candidate);
         this.terminalTickets.set(ticket, { taskId, session, expiresAt });
         // A path into this install's checkout only means something to the machine it lives on.
-        const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))] : ['karmax'];
+        const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/tavya.js', import.meta.url))] : [BRAND];
         return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
       }
       const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
@@ -4814,7 +4839,7 @@ export class Gateway {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         if (!this.hostLocal) return this.json(res, 409, { error: `use the Git checkout handoff when ${(await this.siteName)} is not running on your machine` });
         const taskId = materializeMatch[1]!;
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
         try { return this.json(res, 200, await this.deps.handoffs.materialize(taskId, view)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
@@ -4824,12 +4849,14 @@ export class Gateway {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         if (!this.hostLocal) return this.json(res, 409, { error: `file open commands are available only on the machine running ${(await this.siteName)}` });
         const taskId = openCommandMatch[1]!;
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
         const body = await this.body(req);
         const line = body.line == null ? undefined : Number(body.line);
         if (line !== undefined && (!Number.isInteger(line) || line < 1))
           return this.json(res, 400, { error: 'line must be a positive integer' });
+        const wiki = await this.deps.handoffs.wikiCitation(taskId, String(body.path ?? ''));
+        if (wiki) return this.json(res, 200, wiki);
         try { return this.json(res, 200, await this.deps.handoffs.openFile(taskId, view, String(body.path ?? ''), line)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
@@ -4837,12 +4864,14 @@ export class Gateway {
       if (fileCheckoutMatch && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         const taskId = fileCheckoutMatch[1]!;
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
         const body = await this.body(req);
         const line = body.line == null ? undefined : Number(body.line);
         if (line !== undefined && (!Number.isInteger(line) || line < 1))
           return this.json(res, 400, { error: 'line must be a positive integer' });
+        const wiki = await this.deps.handoffs.wikiCitation(taskId, String(body.path ?? ''));
+        if (wiki) return this.json(res, 200, wiki);
         try { return this.json(res, 200,
           (await this.deps.handoffs.fileCheckout(taskId, view, String(body.path ?? ''), line))); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
@@ -5106,7 +5135,7 @@ export class Gateway {
       if (refreshFromGithub && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         const taskId = refreshFromGithub[1]!;
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
         try { return this.json(res, 200, await this.deps.handoffs.refresh(taskId, view)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
@@ -5122,7 +5151,7 @@ export class Gateway {
         // Resolve the action from the AUTHORITATIVE live view (the stored lastView
         // can lag the workflow), by index — the client never supplies the command,
         // so only agent-authored actions are runnable.
-        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? (await store.getTask(taskId))?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
         const task = (await store.getTask(taskId));
@@ -5528,7 +5557,7 @@ export class Gateway {
         // kept current after an accepted in-flight retune). Besides powering the
         // CLI fork command, the expanded task form uses this to prefill a newly
         // selected fork with the source agent's provider/model/effort.
-        const view = await api.getTaskView(token, id).catch(() => undefined);
+        const view = await api.getTaskView(token, id).catch(liveViewUnavailable);
         const agents = view?.agents;
         const transcriptRoles = (view?.transcripts ?? []).map((transcript) => transcript.role);
         const roles = [...new Set(['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm', ...transcriptRoles])];
@@ -5599,7 +5628,7 @@ export class Gateway {
       if (widgetsMatch && method === 'GET') {
         const id = widgetsMatch[1]!;
         const t = (await store.getTask(id));
-        const view = (await api.getTaskView(token, id).catch(() => undefined)) ?? t?.lastView;
+        const view = (await api.getTaskView(token, id).catch(liveViewUnavailable)) ?? t?.lastView;
         if (!t || !view) return this.json(res, 200, []);
         const { resolveWidgets } = await import('../contrib/widgets.js');
         const slot = (url.searchParams.get('slot') ?? 'task-detail') as any;
@@ -7195,8 +7224,25 @@ export class Gateway {
         const global = resolved({ global: g });
         const project = projectId ? resolved({ global: g, project: pr }) : undefined;
         const task = taskId ? resolved({ global: g, project: pr, task: tk }) : undefined;
+        const { claudeSignInExpiresAt } = await import('../autonomy/config-homes.js');
+        // Logins the provider signed out cannot run, but must stay visible so a
+        // person can sign in again; hiding them made a login silently vanish.
+        const loginKey = (provider: string, account: string) => scopedOrganizationId === 'org_personal'
+          ? `login:${provider}:${account}` : `login:${scopedOrganizationId}:${provider}:${account}`;
+        const signedOut = (this.deps.configHomes?.list(scopedOrganizationId) ?? [])
+          .filter((login) => !login.loggedIn && isLoginProvider(login.provider) && login.account)
+          .map((login) => ({ key: loginKey(login.provider, login.account), label: `${login.provider}:${login.account}`,
+            provider: login.provider, kind: 'login' as const, account: login.account, signedOut: true }));
         return this.json(res, 200, {
-          credentials: creds.map((c) => ({ key: c.key, label: c.label, provider: c.provider, kind: c.kind, account: c.account })),
+          credentials: [
+            ...creds.map((c) => {
+              const signInExpiresAt = c.kind === 'login' && c.provider === 'claude' && c.configHome
+                ? claudeSignInExpiresAt(c.configHome) : undefined;
+              return { key: c.key, label: c.label, provider: c.provider, kind: c.kind, account: c.account,
+                ...(signInExpiresAt ? { signInExpiresAt } : {}) };
+            }),
+            ...signedOut,
+          ],
           global: { own: g ?? {}, ...global },
           ...(projectId && project ? { project: { own: pr ?? {}, ...project } } : {}),
           ...(taskId && task ? { task: { own: tk ?? {}, ...task } } : {}),
@@ -7223,6 +7269,11 @@ export class Gateway {
           return this.json(res, 400, { error: 'scope must be organization, global, project, or task' });
         }
         (await store.kvSet(key, JSON.stringify(b.policy ?? {})));
+        // Parked turns resolved their allow-lists under the old policy.
+        if (this.deps.client) {
+          const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
+          await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).relistAccountLeases();
+        }
         return this.json(res, 200, { ok: true });
       }
 
@@ -7876,10 +7927,10 @@ export class Gateway {
         const name = (await this.siteName);
         const origin = req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '';
         data = Buffer.from(data.toString('utf8')
-          .replace(/^# krmax$/m, `# ${name}`)
-          .replace(/^> krmax is /m, `> ${name} is `)
-          .replace(/^krmax gives /m, `${name} gives `)
-          .replace(/https:\/\/krmax\.io/g, origin || 'https://krmax.io'));
+          .replace(/^# tavya$/m, `# ${name}`)
+          .replace(/^> tavya is /m, `> ${name} is `)
+          .replace(/^tavya gives /m, `${name} gives `)
+          .replace(/https:\/\/tavya\.io/g, origin || 'https://tavya.io'));
       }
       res.writeHead(200, staticAssetHeaders(file));
       res.end(data);
@@ -8556,7 +8607,7 @@ export class Gateway {
     return `mailbox:${provider}:${organizationId}:auth`;
   }
 
-  private async requestScope(pathname: string, url: URL): Promise<{ projectId?: string; taskId?: string; organizationId?: string }> {
+  private async requestScope(pathname: string, url: URL): Promise<{ projectId?: string; taskId?: string; organizationId?: string; conflict?: string }> {
     // Routes whose only identifier is a bare record id still belong to exactly
     // one project. Resolving that project here is what arms the tenant guard in
     // `TokenAuthority.check` — without it a `task:edit` token from any project
@@ -8564,24 +8615,32 @@ export class Gateway {
     // view, because the check had no project to compare its scope against.
     const tagId = pathname.match(/^\/api\/tags\/([^/]+)/)?.[1];
     const viewId = pathname.match(/^\/api\/views\/([^/]+)/)?.[1];
-    const projectId = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
+    const pathProject = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]
-      ?? pathname.match(/^\/api\/settings\/(?:quick\/)?project\/([^/]+)/)?.[1]
-      ?? (tagId ? (await this.deps.store.getTag(tagId))?.projectId : undefined)
-      ?? (viewId ? (await this.deps.store.getView(viewId))?.projectId : undefined)
-      ?? url.searchParams.get('projectId') ?? undefined;
+      ?? pathname.match(/^\/api\/settings\/(?:quick\/)?project\/([^/]+)/)?.[1];
     const artifact = pathname.match(/^\/api\/artifacts\/([^/]+)/)?.[1];
     const artifactRecord = artifact ? (await this.deps.store.getPromotedArtifact(artifact)) : undefined;
     const previewId = pathname.match(/^\/api\/preview-leases\/([^/]+)/)?.[1];
     const previewRecord = previewId ? (await this.deps.store.previewLease(previewId)) : undefined;
     const taskId = pathname.match(/^\/api\/tasks\/([^/]+)/)?.[1] ?? artifactRecord?.taskId ?? previewRecord?.taskId
       ?? url.searchParams.get('taskId') ?? undefined;
-    const taskProject = taskId ? await this.deps.store.taskProjectIdAsync(taskId) : undefined;
-    const resolvedProjectId = projectId ?? taskProject;
-    const organizationId = pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1]
-      ?? url.searchParams.get('organizationId')
-      ?? (resolvedProjectId ? await this.deps.store.projectOrganizationAsync(resolvedProjectId) : undefined);
-    return { projectId: resolvedProjectId, organizationId, ...(taskId ? { taskId } : {}) };
+    // A record the request addresses decides its own tenant. `?projectId=` and
+    // `?organizationId=` only name a scope for routes that address none: letting
+    // them outrank a task's own project handed any caller the right to read and
+    // act on another tenant's task by naming a project of its own. Every
+    // identifier that names a scope must agree, or the request is refused.
+    const recordProject = (tagId ? (await this.deps.store.getTag(tagId))?.projectId : undefined)
+      ?? (viewId ? (await this.deps.store.getView(viewId))?.projectId : undefined)
+      ?? (taskId ? await this.deps.store.taskProjectIdAsync(taskId) : undefined);
+    const queryProject = url.searchParams.get('projectId') ?? undefined;
+    const projects = [recordProject, pathProject, queryProject].filter((value): value is string => Boolean(value));
+    if (new Set(projects).size > 1) return { conflict: 'projectId does not match the addressed record' };
+    const resolvedProjectId = projects[0];
+    const projectOrganization = resolvedProjectId ? await this.deps.store.projectOrganizationAsync(resolvedProjectId) : undefined;
+    const organizations = [pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1], url.searchParams.get('organizationId') ?? undefined,
+      projectOrganization].filter((value): value is string => Boolean(value));
+    if (new Set(organizations).size > 1) return { conflict: 'organizationId does not match the addressed record' };
+    return { projectId: resolvedProjectId, organizationId: organizations[0], ...(taskId ? { taskId } : {}) };
   }
   private async sendWebResponse(res: http.ServerResponse, response: Response) {
     const body = Buffer.from(await response.arrayBuffer());
@@ -8681,6 +8740,14 @@ export class Gateway {
   }
 }
 
+/** A task's live view may be unavailable (no running workflow), and routes
+ * then fall back to its stored view. A refusal must never take that path: the
+ * stored view would be served without the caller's own access check. */
+function liveViewUnavailable(error: unknown): undefined {
+  if (error instanceof CapabilityError) throw error;
+  return undefined;
+}
+
 /** Keep a service's loopback redirect inside the authenticated preview proxy.
  * External HTTP(S) redirects remain explicit; non-web schemes are discarded. */
 export function previewLocation(taskId: string, port: number, value: string,
@@ -8733,7 +8800,7 @@ function scimList(Resources: unknown[]) {
 }
 
 function prometheusMetrics(snapshot: Record<string, unknown>): string {
-  const lines = ['# HELP karmax_info Krmax control-plane information.', '# TYPE karmax_info gauge', 'karmax_info 1'];
+  const lines = [`# HELP karmax_info ${BRAND} control-plane information.`, '# TYPE karmax_info gauge', 'karmax_info 1'];
   const scalar = (name: string, help: string, value: unknown) => {
     lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${Number(value ?? 0)}`);
   };
@@ -8912,6 +8979,23 @@ function parseEnvironmentValues(text: string): Array<{ name: string; value: stri
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
   const { credentialHandles, ...safe } = resource;
   return { ...safe, credentialConfigured: credentialHandles.length > 0 };
+}
+
+/** Source keys that carry a resource's provenance and authority: which vault
+ * item it projects, and whether it is a task's staged candidate. Only the
+ * server sets them; a request keeps whatever is stored. */
+const RESERVED_SOURCE_KEYS = ['vaultItemId', 'vaultField', 'vaultItemLabel', 'vaultItemType', 'candidate', 'createdByTaskId'];
+
+function withReservedSource(requested: Record<string, unknown>, stored: Record<string, unknown>): Record<string, unknown> {
+  const source = Object.fromEntries(Object.entries(requested).filter(([key]) => !RESERVED_SOURCE_KEYS.includes(key)));
+  for (const key of RESERVED_SOURCE_KEYS) if (key in stored) source[key] = stored[key];
+  return source;
+}
+
+/** A resource that now holds its own secret no longer projects a vault item. */
+function withoutVaultProjection(source: Record<string, unknown>): Record<string, unknown> {
+  const { vaultItemId: _item, vaultField: _field, vaultItemLabel: _label, vaultItemType: _type, ...rest } = source;
+  return rest;
 }
 
 function stagedResourceCandidate(resource: ResourceAttachment): boolean {

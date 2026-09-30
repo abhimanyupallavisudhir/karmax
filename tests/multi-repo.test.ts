@@ -43,7 +43,7 @@ describe('multi-repo worlds (real git)', () => {
     fs.rmSync(scratch, { recursive: true, force: true });
   });
 
-  it('checks out one worktree per repo under the world root, each on the karmax branch', async () => {
+  it('checks out one worktree per repo under the world root, each on the tavya branch', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 't1', repos: [alpha, beta], base: 'main', target: 'main' });
 
@@ -54,7 +54,7 @@ describe('multi-repo worlds (real git)', () => {
     for (const wr of world.handle.repos!) {
       expect(fs.existsSync(wr.root)).toBe(true);
       expect(path.dirname(wr.root)).toBe(world.handle.root);
-      expect(await currentBranch(wr.root)).toBe('karmax/t1');
+      expect(await currentBranch(wr.root)).toBe('tavya/t1');
     }
     // each repo's base file is present in its own subdirectory
     expect(await world.readFile('alpha/a.js')).toContain('export const a');
@@ -63,8 +63,8 @@ describe('multi-repo worlds (real git)', () => {
     await world.destroy();
     expect(fs.existsSync(world.handle.root)).toBe(false);
     // branches are preserved in each source repo after destroy
-    expect((await git(alpha, ['rev-parse', '--verify', 'karmax/t1'])).code).toBe(0);
-    expect((await git(beta, ['rev-parse', '--verify', 'karmax/t1'])).code).toBe(0);
+    expect((await git(alpha, ['rev-parse', '--verify', 'tavya/t1'])).code).toBe(0);
+    expect((await git(beta, ['rev-parse', '--verify', 'tavya/t1'])).code).toBe(0);
   });
 
   it('listFiles aggregates across repos, prefixed by the repo subdirectory', async () => {
@@ -107,8 +107,8 @@ describe('multi-repo worlds (real git)', () => {
     expect((await git(alpha, ['show', 'main:feature.js'])).stdout).toContain('fa');
     expect((await git(beta, ['show', 'main:feature.js'])).stdout).toContain('fb');
     // a real merge commit exists in each
-    expect((await git(alpha, ['log', '--oneline', 'main'])).stdout).toMatch(/merge karmax\/t3 into main/);
-    expect((await git(beta, ['log', '--oneline', 'main'])).stdout).toMatch(/merge karmax\/t3 into main/);
+    expect((await git(alpha, ['log', '--oneline', 'main'])).stdout).toMatch(/merge tavya\/t3 into main/);
+    expect((await git(beta, ['log', '--oneline', 'main'])).stdout).toMatch(/merge tavya\/t3 into main/);
     await world.destroy();
   });
 
@@ -194,13 +194,13 @@ describe('multi-repo worlds (real git)', () => {
 
 describe('worldRepos() tolerates handles predating repos[]', () => {
   it('synthesizes a single-repo list from the top-level fields', () => {
-    const legacy = { kind: 'worktree', id: 'x', root: '/w/x', branch: 'karmax/x', base: 'main', repo: '/src/proj' } as any;
+    const legacy = { kind: 'worktree', id: 'x', root: '/w/x', branch: 'tavya/x', base: 'main', repo: '/src/proj' } as any;
     const repos = worldRepos(legacy);
     expect(repos).toHaveLength(1);
-    expect(repos[0]).toMatchObject({ name: 'proj', repo: '/src/proj', root: '/w/x', branch: 'karmax/x', base: 'main' });
+    expect(repos[0]).toMatchObject({ name: 'proj', repo: '/src/proj', root: '/w/x', branch: 'tavya/x', base: 'main' });
   });
   it('returns [] for a non-git (scratch-less) handle', () => {
-    const mem = { kind: 'memory', id: 'm', root: '/tmp/m', branch: 'karmax/m', base: 'main' } as any;
+    const mem = { kind: 'memory', id: 'm', root: '/tmp/m', branch: 'tavya/m', base: 'main' } as any;
     expect(worldRepos(mem)).toEqual([]);
   });
   it('prefers repos[] when present', () => {
@@ -215,10 +215,10 @@ describe('prompt assembly surfaces the multi-repo layout', () => {
 
   it('describes each repo subdirectory for a multi-repo world', () => {
     const world = {
-      kind: 'worktree', id: 't', root: '/w/t', branch: 'karmax/t', base: 'main', target: 'main', repo: '/src/frontend',
+      kind: 'worktree', id: 't', root: '/w/t', branch: 'tavya/t', base: 'main', target: 'main', repo: '/src/frontend',
       repos: [
-        { name: 'frontend', repo: '/src/frontend', root: '/w/t/frontend', branch: 'karmax/t', base: 'main' },
-        { name: 'backend', repo: '/src/backend', root: '/w/t/backend', branch: 'karmax/t', base: 'main' },
+        { name: 'frontend', repo: '/src/frontend', root: '/w/t/frontend', branch: 'tavya/t', base: 'main' },
+        { name: 'backend', repo: '/src/backend', root: '/w/t/backend', branch: 'tavya/t', base: 'main' },
       ],
     } as any;
     const out = assemblePrompt({ profile: profile(), role: 'do', task, world });
@@ -228,7 +228,7 @@ describe('prompt assembly surfaces the multi-repo layout', () => {
   });
 
   it('adds no repo block for a single-repo world', () => {
-    const world = { kind: 'worktree', id: 't', root: '/w/t', branch: 'karmax/t', base: 'main', target: 'main', repo: '/src/only', repos: [{ name: 'only', repo: '/src/only', root: '/w/t', branch: 'karmax/t', base: 'main' }] } as any;
+    const world = { kind: 'worktree', id: 't', root: '/w/t', branch: 'tavya/t', base: 'main', target: 'main', repo: '/src/only', repos: [{ name: 'only', repo: '/src/only', root: '/w/t', branch: 'tavya/t', base: 'main' }] } as any;
     const out = assemblePrompt({ profile: profile(), role: 'do', task, world });
     expect(out).not.toContain('spans');
     expect(out).toContain('Working directory: /w/t');

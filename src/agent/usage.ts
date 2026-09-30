@@ -14,6 +14,8 @@ import { withTimeout } from '../util/timeout.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { localProviderCli } from './provider-cli.js';
 import { createCustodyEnv, killAgent } from './custody.js';
+import { BRAND } from '../domain/brand.js';
+import { providerFailure } from './limits.js';
 
 /**
  * Proactive quota (RESOLVE-PLAN §2 / #6). `claude -p '/usage'` prints a parseable
@@ -378,7 +380,13 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
 /** Refresh the ONE canonical Claude login and return its current access token.
  * Remote turns call this before projection and after terminal OAuth expiry;
  * their sandboxes never receive the rotating refresh token. Concurrent calls
- * share one provider process so a refresh-token family has one writer. */
+ * share one provider process so a refresh-token family has one writer.
+ *
+ * Claude Code refreshes only inside the last five minutes of an access token,
+ * so a still-valid token may come back unchanged; callers must accept it. A
+ * login whose tokens are gone afterwards was signed out by the provider (its
+ * refresh token expired about a month after sign-in, or was revoked): that is
+ * a hard credential failure a person resolves by signing in again. */
 export async function refreshClaudeAccessToken(
   opts: { configHome: string; timeoutMs?: number; run?: UsageRunner },
 ): Promise<string> {
@@ -387,12 +395,13 @@ export async function refreshClaudeAccessToken(
   if (existing) return existing;
   const created = (async () => {
     if (opts.run) await opts.run(key);
-    else await runUsageCli(key, opts.timeoutMs ?? 30_000);
+    else await runUsageCli(key, opts.timeoutMs ?? 30_000).catch((error) => {
+      // A signed-out login makes the CLI exit non-zero; judge the credential file.
+      if (claudeAccessToken(key)) throw error;
+    });
     const token = claudeAccessToken(key);
-    if (!token) throw new Error('Claude OAuth refresh completed without a fresh access token');
     const expiresAt = claudeAccessTokenExpiresAt(key);
-    if (expiresAt !== undefined && expiresAt <= Date.now())
-      throw new Error('Claude OAuth refresh left the canonical access token expired');
+    if (!token || (expiresAt !== undefined && expiresAt <= Date.now())) throw claudeSignedOut(key);
     return token;
   })().finally(() => {
     if (claudeRefreshes.get(key) === created) claudeRefreshes.delete(key);
@@ -401,10 +410,23 @@ export async function refreshClaudeAccessToken(
   return created;
 }
 
+function claudeSignedOut(configHome: string) {
+  const account = path.basename(configHome).replace(/^claude-/, '');
+  const message = `Claude login claude:${account} was signed out by Anthropic (its sign-in expired or was revoked); sign in again in Settings → Codex/Claude`;
+  return providerFailure(message, {
+    kind: 'credential',
+    permanence: 'hard',
+    provider: 'claude',
+    diagnostic: { message, operation: 'oauth refresh' },
+  });
+}
+
 /** A remote Claude home intentionally has no refresh token. Ensure the canonical
  * host access token is usable before copying that access-only projection into the
  * sandbox; otherwise Claude can reject the initial request before asking the SDK
- * for a replacement token. Returns whether a refresh was performed. */
+ * for a replacement token. Returns whether a refresh was attempted. A token the
+ * CLI declined to refresh still has more than Claude Code's own five-minute
+ * margin, and mid-turn expiry is recovered by the adapter. */
 export async function ensureClaudeAccessTokenFresh(
   opts: {
     configHome: string;
@@ -427,11 +449,6 @@ export async function ensureClaudeAccessTokenFresh(
     timeoutMs: opts.timeoutMs,
     run: opts.run,
   });
-  const refreshedToken = claudeAccessToken(opts.configHome);
-  const refreshedExpiry = claudeAccessTokenExpiresAt(opts.configHome);
-  if (!refreshedToken || (refreshedExpiry !== undefined && refreshedExpiry - now < minValidityMs)) {
-    throw new Error('Claude login refresh completed without a sufficiently fresh access token');
-  }
   return true;
 }
 
@@ -523,7 +540,7 @@ async function runCodexUsageCli(configHome: string | undefined, timeoutMs: numbe
   child.once('exit', untrack);
   try {
     await withTimeout(client.request('initialize', {
-      clientInfo: { name: 'karmax-usage-probe', title: 'karmax', version: '1.0.0' },
+      clientInfo: { name: `${BRAND}-usage-probe`, title: BRAND, version: '1.0.0' },
       capabilities: null,
     }), timeoutMs);
     client.notify('initialized');

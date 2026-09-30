@@ -83,11 +83,25 @@ describe('waiting labels in task summaries', () => {
         detail: 'GitHub returned action_required for CI run 410.',
       },
     })).toBe('GitHub Actions approval required');
+    // A turn parked on its credential is not working (task 384 read "working"
+    // for hours behind an exhausted login).
     expect(stageLabel({
       stage: 'do',
       status: 'waiting',
       state: {},
-      waitingFor: { kind: 'account', provider: 'claude' },
+      waitingFor: { kind: 'account', provider: 'claude', detail: 'Every allowed credential needs attention — sign in again or add one' },
+    })).toBe('Waiting for credential');
+    expect(stageLabel({
+      stage: 'do',
+      status: 'waiting',
+      state: {},
+      waitingFor: { kind: 'account', provider: 'codex', earliestResetAt: Date.now() + 60_000 },
+    })).toBe('Waiting for quota');
+    expect(stageLabel({
+      stage: 'do',
+      status: 'waiting',
+      state: {},
+      waitingFor: { kind: 'agentSlot', provider: 'claude', detail: 'Starting agent' },
     })).toBe('working');
     expect(stageLabel({
       stage: 'merge',
@@ -146,6 +160,15 @@ describe('waiting labels in task summaries', () => {
       kind: 'responder',
       detail: 'The response agent is answering the working agent',
     })).toBe('Waiting for responder');
+    expect(waitingText({
+      kind: 'job',
+      detail: 'Waiting for job-0123abcd',
+      until: Date.now() + 3_600_000,
+    })).toBe('Waiting for job');
+    const until = Date.UTC(2026, 8, 29, 14, 5);
+    expect(waitingText({ kind: 'timer', detail: 'Paused for 30 min', until }))
+      .toBe(`Paused until ${new Date(until).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
+    expect(waitingText({ kind: 'timer' })).toBe('Paused');
   });
 
   it('keeps an actionable admission failure in the agent-turn card', () => {

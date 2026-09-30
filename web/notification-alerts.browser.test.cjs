@@ -30,7 +30,7 @@ function statement(prefix) {
 const code = [
   statement('const URGENCY_LEVELS = '), statement('const NOTIFY_DEFAULTS = '), statement('const systemNotifications = '), statement('const liveInboxItem = '),
   ...['urgencyRank', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxRowLabel', 'notifyPrefs', 'inboxArrivals',
-    'announceInbox', 'showVisualNotification', 'showSystemNotification', 'syncNotificationAlerts', 'updateBell',
+    'announceInbox', 'inboxTitle', 'showVisualNotification', 'showSystemNotification', 'syncNotificationAlerts', 'updateBell',
     'markInboxItemReadLocally', 'loadInbox'].map(fn),
 ].join('\n');
 

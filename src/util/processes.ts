@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { BRAND } from '../domain/brand.js';
 
 /**
  * Live process accounting for the dashboard task manager (GET /api/processes).
@@ -273,9 +274,9 @@ export function sampleProcesses(): ProcessSample {
     let g = groups.get(key);
     if (g) return g;
     if (key === 'self') {
-      g = { key, kind: 'app', label: 'krmax (gateway + worker)', protected: true, cpuPct: 0, rssMb: 0, procs: [] };
+      g = { key, kind: 'app', label: `${BRAND} (gateway + worker)`, protected: true, cpuPct: 0, rssMb: 0, procs: [] };
     } else if (key === 'untracked') {
-      g = { key, kind: 'untracked', label: 'other krmax children', cpuPct: 0, rssMb: 0, procs: [] };
+      g = { key, kind: 'untracked', label: `other ${BRAND} children`, cpuPct: 0, rssMb: 0, procs: [] };
     } else {
       const t = registry.get(Number(key))!;
       g = { key, kind: t.kind, label: t.label, taskId: t.taskId, protected: t.protected, cpuPct: 0, rssMb: 0, procs: [] };
@@ -325,7 +326,7 @@ export function sampleProcesses(): ProcessSample {
  */
 export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM'): Promise<{ ok: boolean; error?: string }> {
   if (!Number.isInteger(pid) || pid <= 1) return { ok: false, error: 'invalid pid' };
-  if (pid === process.pid) return { ok: false, error: 'refusing to kill krmax itself' };
+  if (pid === process.pid) return { ok: false, error: `refusing to kill ${BRAND} itself` };
   const entry = registry.get(pid);
   if (entry && !sameProcess(entry)) {
     // The registered process exited and an unrelated one took its pid.
@@ -339,7 +340,7 @@ export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM
   const sample = sampleProcesses();
   if (!sample.supported) return { ok: false, error: 'process control unavailable on this platform' };
   const inScope = sample.groups.some((g) => (g.key === 'self' ? false : g.procs.some((r) => r.pid === pid)));
-  if (!inScope) return { ok: false, error: 'pid is not a krmax-managed process' };
+  if (!inScope) return { ok: false, error: `pid is not a ${BRAND}-managed process` };
 
   try {
     if (entry?.kill) {

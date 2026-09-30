@@ -7,7 +7,7 @@ const remoteWorld = {
   kind: 'e2b',
   id: 'sandbox-secret-id',
   root: '/home/user/project',
-  branch: 'karmax/task-1',
+  branch: 'tavya/task-1',
   base: 'main',
   repo: 'git@github.com:acme/private.git',
   meta: { trafficAccessToken: 'secret' },
@@ -42,6 +42,17 @@ describe('public gateway payloads', () => {
       worldAvailable: true,
       worldProvider: 'e2b',
     });
+  });
+
+  it('names the wiki checkout folder so wiki citations link to the wiki, without its location', () => {
+    const withWiki = { ...remoteWorld, repos: [
+      { name: 'private', repo: remoteWorld.repo, root: '/home/user/project/private', branch: remoteWorld.branch, base: 'main' },
+      { name: 'acme-wiki', role: 'project-wiki', repo: 'git@github.com:acme/acme-wiki.git',
+        root: '/home/user/project/acme-wiki', branch: remoteWorld.branch, base: 'main' },
+    ] };
+    const payload = toPublicPayload(view(withWiki, withWiki.root)) as Record<string, unknown>;
+    expect(payload.worldWiki).toBe('acme-wiki');
+    expect(JSON.stringify(payload)).not.toContain('/home/user/project');
   });
 
   it('redacts world handles nested in event payloads', () => {

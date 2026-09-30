@@ -5,6 +5,7 @@ import { HOSTED_PLANS, hostedMonthlyPriceCents, isHostedPlanId,
 import type { SubscriptionRuntimeConfig } from '../launch/settings.js';
 import { STRIPE_BILLING_API_VERSION } from './stripe-contract.js';
 import { BillingRequestRejected } from './paddle.js';
+import { BRAND } from '../domain/brand.js';
 
 export type PaidHostedPlanId = Exclude<HostedPlanId, 'free'>;
 const isPaidHostedPlanId = (value: unknown): value is PaidHostedPlanId =>
@@ -685,7 +686,7 @@ export class SubscriptionBillingService {
         seats += quantity; items.teamSeat = String(item.id);
       } else if (provider.customerMode === 'checkout') throw new Error('Paddle subscription contains an unexpected price');
     }
-    if (!plan) throw new Error('subscription contains no configured Karmax plan price');
+    if (!plan) throw new Error(`subscription contains no configured ${BRAND} plan price`);
     if (provider.customerMode === 'checkout' && plan === 'individual' && items.teamSeat)
       throw new Error('Individual subscription contains Team seats');
     return { plan, seats: plan === 'team' ? seats : HOSTED_PLANS.individual.includedActiveUsers, items };

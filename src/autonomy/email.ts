@@ -1,3 +1,4 @@
+import { BRAND } from '../domain/brand.js';
 /**
  * Installation-wide OUTBOUND email (account confirmation, password reset, org
  * invitations). This is the send side; `mailbox.ts` is the inbound agent-mail
@@ -126,13 +127,13 @@ export function guessSmtpHost(from: string | undefined): { host: string; port: n
  *  registers the secret in the vault and stitches in `secretHandle`. */
 export function connectOutboundEmail(input: ConnectOutboundInput): ConnectOutboundResult {
   const from = input.from?.trim();
-  if (!from || !fromAddress(from)) return { status: 'unavailable', detail: 'enter a valid From address, e.g. Krmax <noreply@yourdomain.com>' };
+  if (!from || !fromAddress(from)) return { status: 'unavailable', detail: `enter a valid From address, e.g. ${BRAND} <noreply@yourdomain.com>` };
   const provider = input.provider === 'smtp' ? 'smtp' : input.provider === 'resend' ? 'resend' : undefined;
   if (!provider) return { status: 'unavailable', detail: 'choose a provider: smtp or resend' };
 
   if (provider === 'resend') {
     if (!input.secret?.trim()) return { status: 'unavailable', detail: 'paste your Resend API key' };
-    return { status: 'connected', detail: `Connected. Krmax will send from ${from} via Resend.`, config: { provider, from } };
+    return { status: 'connected', detail: `Connected. ${BRAND} will send from ${from} via Resend.`, config: { provider, from } };
   }
 
   // smtp
@@ -143,7 +144,7 @@ export function connectOutboundEmail(input: ConnectOutboundInput): ConnectOutbou
   const port = Number(input.port) || guess?.port || 587;
   const secure = input.secure ?? guess?.secure ?? port === 465;
   const user = input.user?.trim() || fromAddress(from);
-  return { status: 'connected', detail: `Connected. Krmax will send from ${from} via ${host}.`, config: { provider, from, host, port, secure, user } };
+  return { status: 'connected', detail: `Connected. ${BRAND} will send from ${from} via ${host}.`, config: { provider, from, host, port, secure, user } };
 }
 
 /**

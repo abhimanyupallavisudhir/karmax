@@ -19,21 +19,27 @@ import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldH
   releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
 import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
 import { SIG } from './names.js';
+import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
 });
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
+// An agent turn has no wall-clock limit: long investigations and builds are
+// normal work. The 2-minute heartbeat timeout is what detects a dead worker or
+// a slept host. Temporal requires some start-to-close bound, so this one is
+// deliberately beyond any real turn.
+const AGENT_TURN_START_TO_CLOSE = '30 days';
 // Agent turns heartbeat every ~1s; a 2-minute gap = dead/slept worker → Temporal
 // retries the turn and the next attempt resumes the interrupted session (see
 // software-dev.ts / failures.ts for the full taxonomy).
 const turns = proxyActivities<coreActivities>({
-  startToCloseTimeout: '45 minutes',
+  startToCloseTimeout: AGENT_TURN_START_TO_CLOSE,
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
 });
 const cancellationAwareTurns = proxyActivities<coreActivities>({
-  startToCloseTimeout: '45 minutes',
+  startToCloseTimeout: AGENT_TURN_START_TO_CLOSE,
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
@@ -295,6 +301,25 @@ async function justDoImpl(
     // turn's last poll stay after `seen` → delivered on the next turn.
     seen = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    // `pause`: resume the agent when it is over.
+    if (turn.wait && patched('agent-wait-v1')) {
+      const note = await waitForAgent(turn.wait, {
+        world,
+        park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
+        interrupted: () => cancelled || msgs.length > seen,
+      });
+      if (cancelled) break;
+      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+      status = 'active';
+      waitingFor = undefined;
+      continue;
+    }
+    // A job left running without pause: the agent decides what happens to it.
+    const jobsReminder = unattendedJobsReminder(turn);
+    if (jobsReminder && patched('agent-wait-v1')) {
+      msgs.push({ id: `jobs-${msgs.length}`, role: 'user', text: jobsReminder, ts: msgs.length });
+      continue;
+    }
     if (pendingCollaborations.size > 0) {
       status = 'waiting';
       waitingFor = {
@@ -413,7 +438,7 @@ async function justDoImpl(
     const resourceOnly = resourceOnlyFinalization
       && await core.checkpointResourceOnlyWork(world as any, input.project.repos ?? []);
     if (!resourceOnly) {
-      const result = await core.commitWork(world as any, `karmax: ${input.title}`);
+      const result = await core.commitWork(world as any, `tavya: ${input.title}`);
       if (resourceOnlyFinalization && !result.committed)
         throw ApplicationFailure.nonRetryable('task work was not committed; retaining the world for recovery');
       if (remoteWorldProvider(world.provider ?? world.kind)) await core.publishTaskBranch(world as any);

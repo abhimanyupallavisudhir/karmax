@@ -39,6 +39,11 @@ export const SIG_LEASE_ACCOUNT = 'leaseAccount';
 export const SIG_CANCEL_ACCOUNT = 'cancelAccountLease';
 export const SIG_RETURN_ACCOUNT = 'returnAccount';
 export const SIG_ACCOUNT_GRANTED = 'accountGranted';
+/** Grant sentinel: the credentials changed while this request was parked, so
+ * its owner re-resolves its allowed credentials and requests again. */
+export const RELIST_ACCOUNT_GRANT = '(relist)';
+/** A credential policy changed: every parked request re-resolves its allow-list. */
+export const SIG_RELIST_ACCOUNT_LEASES = 'relistAccountLeases';
 export const SIG_REGISTER_ACCOUNTS = 'registerAccounts';
 /** Ground-truth exhaustion feed from auto-resolve: mark a login unavailable +
  *  arm a refresh timer (SPEC §6.2). */
