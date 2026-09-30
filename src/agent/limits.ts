@@ -18,6 +18,8 @@
  */
 export type LimitWindow = '5h' | 'weekly' | 'model';
 export type ProviderFailureKind = 'quota' | 'credential';
+import type { UsageResult } from './usage.js';
+
 export type ProviderFailureSource = 'structured' | 'message';
 
 /** Secret-safe subset of a provider's native error envelope. Raw envelopes are
@@ -52,6 +54,8 @@ export interface LimitClassification {
   kind?: ProviderFailureKind;
   provider?: ProviderFailureMetadata['provider'];
   diagnostic?: ProviderNativeDiagnostic;
+  /** Unconfirmed sandbox report: the task waits, the shared login is untouched. */
+  taskScoped?: boolean;
 }
 
 /** Serializable metadata carried through Temporal ApplicationFailure.details.
@@ -66,6 +70,9 @@ export interface ProviderFailureMetadata {
   note?: string;
   /** Whitelisted provider-native fields suitable for logs and durable history. */
   diagnostic?: ProviderNativeDiagnostic;
+  /** `task`: reported from inside a sandbox and not confirmed by the host, so it
+   * may make this task wait but must not change the shared login's availability. */
+  scope?: 'task';
 }
 
 /** A provider-originated account failure. It remains a normal Error to adapters,
@@ -87,6 +94,50 @@ export class ProviderStreamError extends Error {
     super(message);
     this.name = 'ProviderStreamError';
   }
+}
+
+/** A provider failure a remote sandbox reported. The sandbox controls those bytes
+ * (AD-7), so the report may end the turn but only a host-side check can let it
+ * change a shared login's availability (`confirmSandboxFailure`). */
+export class SandboxProviderFailure extends Error {
+  constructor(readonly failure: ProviderFailure | ProviderStreamError) {
+    super(failure.message, { cause: failure });
+    this.name = 'SandboxProviderFailure';
+  }
+}
+
+/**
+ * Decide what a sandbox-reported provider failure may do, from the host's own
+ * reading of the leased login (`probe`, a native usage check). A quota the
+ * probe confirms, or a sign-in failure on a login the host sees signed out, is
+ * trusted: the coordinator may park or flag the login and rotate. Anything else
+ * that still looks like an account limit stays task-scoped, so the task waits
+ * for the reported reset instead of escalating (audit R-4). A failure that is no
+ * account limit at all remains an ordinary error.
+ */
+export async function confirmSandboxFailure(
+  err: SandboxProviderFailure,
+  probe: () => Promise<UsageResult | undefined>,
+  nowMs: number,
+): Promise<Error> {
+  const { classification, metadata } = classifyProviderTurnError(err.failure);
+  if (!classification.limited || !metadata) return new Error(err.message, { cause: err.failure });
+  const reading = await probe().catch(() => undefined);
+  const inSeconds = (at?: number) => (at !== undefined && at > nowMs ? `in ${Math.ceil((at - nowMs) / 1000)}s` : undefined);
+  if (classification.hard) {
+    if (reading && !reading.ok && reading.reason === 'logged-out') return providerFailure(err.message, metadata);
+  } else if (reading?.ok) {
+    const full = (w?: { pct: number; resetAt?: number }) => !!w && w.pct >= 100;
+    const hit = metadata.window === 'model'
+      ? reading.models?.find((m) => full(m) && (!metadata.note || m.name.toLowerCase().includes(metadata.note.toLowerCase())))
+      : full(reading.session) ? reading.session : full(reading.week) ? reading.week : undefined;
+    if (hit) {
+      const window: LimitWindow = metadata.window === 'model' ? 'model' : hit === reading.week ? 'weekly' : '5h';
+      const resetHint = inSeconds(hit.resetAt) ?? metadata.resetHint;
+      return providerFailure(err.message, { ...metadata, window, ...(resetHint ? { resetHint } : {}) });
+    }
+  }
+  return providerFailure(err.message, { ...metadata, scope: 'task' });
 }
 
 /** The agent's harness resumed work after karmax had closed its input stream —
@@ -508,6 +559,7 @@ export function classifyProviderTurnError(
         resetHint: m.resetHint,
         note: m.note,
         diagnostic: m.diagnostic,
+        ...(m.scope === 'task' ? { taskScoped: true } : {}),
       },
       metadata: m,
     };

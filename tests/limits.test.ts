@@ -11,7 +11,11 @@ import {
   providerErrorFromMessage,
   providerFailure,
   resetAtFromHint,
+  ProviderStreamError,
+  SandboxProviderFailure,
+  confirmSandboxFailure,
 } from '../src/agent/limits.js';
+import type { UsageSnapshot } from '../src/agent/usage.js';
 
 describe('classifyLimitError', () => {
   it.each([
@@ -335,5 +339,58 @@ describe('isResourceKill (OOM / signal-9 predicate — karmax#4)', () => {
     expect(isResourceKill('Anthropic API 429: too many requests')).toBe(false);
     // A graceful SIGTERM (cancellation) is not an OOM kill.
     expect(isResourceKill('process terminated by signal SIGTERM')).toBe(false);
+  });
+});
+
+// Audit R-4 (2026-09-30): AD-7 made every limit a remote sandbox reported an
+// ordinary agent error, so a task on an exhausted login retried three times and
+// escalated instead of waiting. The host now checks the leased login itself.
+describe('confirmSandboxFailure (limits reported from inside a sandbox)', () => {
+  const quota = () => providerFailure('Claude usage limit reached', {
+    kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: '5h', resetHint: 'in 7200s',
+  });
+  const now = 1_790_000_000_000;
+  const snapshot = (session: number, week: number, extra: Partial<UsageSnapshot> = {}): UsageSnapshot => ({ ok: true, at: now,
+    session: { pct: session, resetLabel: '3pm', resetAt: now + 3_600_000 }, week: { pct: week, resetLabel: 'Mon', resetAt: now + 86_400_000 }, ...extra });
+
+  it('trusts a limit the host probe confirms, with the reset the probe reports', async () => {
+    const result = await confirmSandboxFailure(new SandboxProviderFailure(quota()), async () => snapshot(100, 40), now);
+    const { classification, metadata } = classifyProviderTurnError(result);
+    expect(classification).toMatchObject({ limited: true, window: '5h', resetHint: 'in 3600s' });
+    expect(metadata?.scope).toBeUndefined(); // shared: the coordinator may park the login
+    const weekly = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(quota()), async () => snapshot(20, 100), now));
+    expect(weekly.classification).toMatchObject({ limited: true, window: 'weekly', resetHint: 'in 86400s' });
+  });
+
+  it('keeps an unconfirmed limit to the task, so a sandbox cannot park a shared login', async () => {
+    for (const probe of [async () => snapshot(30, 40), async () => ({ ok: false as const, at: now, reason: 'setup-token' }),
+      async () => { throw new Error('probe crashed'); }]) {
+      const { classification, metadata } = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(quota()), probe, now));
+      expect(classification).toMatchObject({ limited: true, taskScoped: true, window: '5h', resetHint: 'in 7200s' });
+      expect(metadata?.scope).toBe('task');
+    }
+  });
+
+  it('confirms a model-specific limit only against that model window', async () => {
+    const model = providerFailure('Opus limit reached', { kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: 'model', note: 'opus' });
+    const hit = snapshot(10, 10, { models: [{ name: 'Opus', pct: 100, resetLabel: 'Mon', resetAt: now + 7_200_000 }] });
+    expect(classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(model), async () => hit, now)).metadata?.scope).toBeUndefined();
+    expect(classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(model), async () => snapshot(10, 10), now)).metadata?.scope).toBe('task');
+  });
+
+  it('flags a hard credential failure only when the host sees the login signed out', async () => {
+    const auth = providerFailure('Claude credential rejected (authentication_failed)', { kind: 'credential', permanence: 'hard', provider: 'claude', source: 'structured' });
+    const signedOut = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(auth), async () => ({ ok: false as const, at: now, reason: 'logged-out' }), now));
+    expect(signedOut.classification).toMatchObject({ limited: true, hard: true });
+    expect(signedOut.metadata?.scope).toBeUndefined();
+    const healthy = classifyProviderTurnError(await confirmSandboxFailure(new SandboxProviderFailure(auth), async () => snapshot(10, 10), now));
+    expect(healthy.classification).toMatchObject({ limited: true, hard: true, taskScoped: true });
+  });
+
+  it('leaves a sandbox failure that is not an account limit an ordinary error', async () => {
+    const policy = new SandboxProviderFailure(new ProviderStreamError('stream ended'));
+    const result = await confirmSandboxFailure(policy, async () => { throw new Error('must not probe'); }, now);
+    expect(classifyProviderTurnError(result).classification.limited).toBe(false);
+    expect((result as Error).message).toBe('stream ended');
   });
 });

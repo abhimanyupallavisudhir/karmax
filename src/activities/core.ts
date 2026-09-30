@@ -19,7 +19,8 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { AgentChannelLost, ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -266,6 +267,9 @@ export interface CoreActivityDeps {
   contentDir?: string;
   /** Snapshot of whether this console is running on the user's own machine. */
   hostLocal?: boolean;
+  /** Host-side usage reading of a leased login, which decides whether a limit a
+   * sandbox reported may park it (defaults to the native usage probes; tests). */
+  probeUsage?: (login: { provider: Provider; configHome: string }) => Promise<UsageResult | undefined>;
 }
 
 /** What the PR stage puts on the pull request it opens for the task. */
@@ -2879,6 +2883,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // Tell the resumed attempt why it was interrupted, as for a sandbox freeze.
         if (err instanceof AgentChannelLost && turnSessionKey)
           (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify({ summary: err.summary })));
+        // A limit reported from inside a sandbox changes shared login availability
+        // only when the host's own reading of the leased login confirms it (AD-7);
+        // otherwise it stays with this task, which waits instead of escalating.
+        if (err instanceof SandboxProviderFailure) {
+          const login = resolvedAuth?.configHome && (profile.provider === 'claude' || profile.provider === 'codex')
+            ? { provider: profile.provider, configHome: resolvedAuth.configHome } : undefined;
+          const probe = deps.probeUsage ?? (({ provider, configHome }) => provider === 'codex'
+            ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }));
+          err = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now());
+        }
         const failure = classifyTurnError(err, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else
         // in a remote world may be the sandbox's fault, which its metrics can show.

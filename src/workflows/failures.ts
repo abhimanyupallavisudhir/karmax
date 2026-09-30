@@ -49,6 +49,8 @@ export function limitFailureClassification(err: unknown): LimitClassification | 
       resetHint: detail.resetHint,
       note: detail.note,
       diagnostic: detail.diagnostic,
+      // Additive like `diagnostic`: only failures recorded by this version carry it.
+      ...(detail.scope === 'task' ? { taskScoped: true } : {}),
     };
   }
   const legacy = classifyLimitError(cause.message ?? '', { providerOrigin: true, legacy: true });
