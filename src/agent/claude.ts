@@ -14,6 +14,8 @@ import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { createFollowUpInjector, toSdkUserMessage, followUpContent, withClaudeStartupDeadline } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount, backgroundShellDescriptions } from './subagents.js';
 import {
   AgentChannelLost,
@@ -354,7 +356,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }
       throw new Error(`Claude Agent SDK not installed: ${String(e)}`);
     }
-    const { query, createSdkMcpServer, tool } = sdk;
+    const { query } = sdk;
     const zod = (await import('zod')).z;
     const handlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
     const remote = isRemoteAgentWorld(runtimeWorld);
@@ -412,14 +414,10 @@ export class ClaudeAdapter implements AgentAdapter {
     // instance shadowed the durable bridge and could lose its transport during a
     // continuation re-init, surfacing only "Stream closed". Separate names and
     // disjoint tool sets remove that collision.
-    const controls = createSdkMcpServer({
-      name: 'karmax_control',
-      version: '1.0.0',
-      // A remote CLI cannot launch the control plane's absolute stdio-MCP path.
-      // Keep every platform/control tool in the SDK host process instead; the
-      // Claude wire protocol already supports SDK MCP servers across custom spawn.
-      tools: buildSdkTools(tool, zod, handlers, remote ? PLATFORM_TOOL_SCHEMAS : SDK_CONTROL_TOOL_SCHEMAS),
-    });
+    // A remote CLI cannot launch the control plane's absolute stdio-MCP path.
+    // Keep every platform/control tool in the SDK host process instead; the
+    // Claude wire protocol already supports SDK MCP servers across custom spawn.
+    const controls = controlMcpServer(zod, handlers, remote ? PLATFORM_TOOL_SCHEMAS : SDK_CONTROL_TOOL_SCHEMAS);
     const configuredMcp = input.profile.mcpConnections === undefined ? configHomeMcpServers(input.resolvedAuth?.configHome) : {};
     if (input.profile.mcpConnections !== undefined) {
       delete configuredMcp['chrome-devtools']; delete configuredMcp.playwright;
@@ -464,7 +462,8 @@ export class ClaudeAdapter implements AgentAdapter {
     // agent's reply and advances its boundary past exactly what was delivered.
     let deliveredIndex = input.messages.length;
     // Every message we send stays outstanding until the harness echoes its uuid on an
-    // assistant frame (`user_message_uuids`) — proof the agent actually read it. A
+    // assistant frame (`user_message_uuids`) or replays it (`isReplay`, as it folds a
+    // mid-turn message into the running turn) — proof the agent actually read it. A
     // producer that never echoes is answered by any result that ran a model turn
     // (the orphan-settling result below has `num_turns: 0`).
     const unanswered = new Set<string>();
@@ -710,6 +709,7 @@ export class ClaudeAdapter implements AgentAdapter {
           karmax_control: controls,
         },
         strictMcpConfig: true,
+        extraArgs: CLAUDE_EXTRA_ARGS,
         env,
         // Spawn the agent harness ourselves (same call the SDK makes internally:
         // stdio ['pipe','pipe','ignore'], the SDK's forwarded abort signal) so the
@@ -931,6 +931,11 @@ export class ClaudeAdapter implements AgentAdapter {
             ctx.emit(streamingText, 'assistant');
           }
         } else if (message.type === 'user') {
+          const replay = message as { isReplay?: boolean; uuid?: unknown };
+          if (replay.isReplay && typeof replay.uuid === 'string' && unanswered.delete(replay.uuid)) {
+            harnessEchoes = true;
+            acknowledgeInput();
+          }
           const content = Array.isArray((message as any).message?.content) ? (message as any).message.content : [];
           for (const block of content) {
             if (block?.type !== 'tool_result') continue;
@@ -1160,6 +1165,13 @@ export function jsonSchemaToZodShape(zod: any, schema: any): Record<string, any>
   return shape;
 }
 
+/** CLI flags for every Agent-SDK turn. `replay-user-messages` re-emits each input
+ * message, with our uuid, as the harness consumes it. A message sent while the agent
+ * works joins the running model turn and is never named in an assistant frame's
+ * `user_message_uuids`; without this receipt the turn waited out the whole settle
+ * grace after the agent had finished (#438). */
+export const CLAUDE_EXTRA_ARGS: Record<string, string | null> = { 'replay-user-messages': null };
+
 /** Read a config home's MCP servers so strict SDK isolation can preserve its
  * browser/user servers while replacing the on-disk karmax entry for this turn. */
 export function configHomeMcpServers(home: string | undefined): Record<string, any> {
@@ -1174,17 +1186,36 @@ export function configHomeMcpServers(home: string | undefined): Record<string, a
   }
 }
 
-/** Build in-process defs only for turn-local controls. Durable platform tools are
- * intentionally served by the stdio karmax MCP, never registered a second time. */
-export function buildSdkTools(
-  tool: (name: string, description: string, shape: Record<string, any>, run: (a: any) => Promise<any>) => any,
+/**
+ * The in-process `karmax_control` MCP server: every schema with a handler. Durable
+ * platform tools are served by the stdio karmax MCP locally, never registered twice.
+ *
+ * A low-level `Server` advertises the shared JSON Schemas verbatim, as
+ * control-mcp.mjs does. The SDK's own `createSdkMcpServer` converts `tool()` zod
+ * shapes with the zod it bundles; shapes built with karmax's zod (4.6.5 against a
+ * bundled 4.4.3) made that conversion throw, failing the whole tools/list, so the
+ * server connected with no tools at all (task #438). Arguments are still checked
+ * with karmax's own zod before a handler runs.
+ */
+export function controlMcpServer(
   zod: any,
   handlers: Record<string, (args: any) => Promise<string>>,
   schemas = SDK_CONTROL_TOOL_SCHEMAS,
-): any[] {
-  return schemas.filter((schema) => typeof handlers[schema.name] === 'function').map((schema) =>
-    tool(schema.name, schema.description, jsonSchemaToZodShape(zod, schema.parameters), async (a: any) => ({
-      content: [{ type: 'text', text: await handlers[schema.name]!(a) }],
-    })),
-  );
+): { type: 'sdk'; name: string; instance: Server } {
+  const exposed = schemas.filter((schema) => typeof handlers[schema.name] === 'function');
+  const inputs = new Map(exposed.map((schema) => [schema.name, zod.object(jsonSchemaToZodShape(zod, schema.parameters))]));
+  const server = new Server({ name: 'karmax_control', version: '1.0.0' }, { capabilities: { tools: {} } });
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: exposed.map((schema) => ({ name: schema.name, description: schema.description, inputSchema: { ...schema.parameters, type: 'object' as const } })),
+  }));
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const failed = (text: string) => ({ content: [{ type: 'text' as const, text }], isError: true });
+    const input = inputs.get(request.params.name);
+    if (!input) return failed(`unknown tool ${request.params.name}`);
+    const parsed = input.safeParse(request.params.arguments ?? {});
+    if (!parsed.success) return failed(`Invalid arguments for ${request.params.name}: ${parsed.error.message}`);
+    try { return { content: [{ type: 'text' as const, text: await handlers[request.params.name]!(parsed.data) }] }; }
+    catch (error) { return failed(error instanceof Error ? error.message : String(error)); }
+  });
+  return { type: 'sdk', name: 'karmax_control', instance: server };
 }

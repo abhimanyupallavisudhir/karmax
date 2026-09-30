@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { buildSdkTools, jsonSchemaToZodShape } from '../src/agent/claude.js';
+import { controlMcpServer, jsonSchemaToZodShape } from '../src/agent/claude.js';
+import { controlClient } from './helpers/control-server.js';
 import {
   MAX_REVIEW_TEXT_LENGTH,
   SDK_CONTROL_TOOL_SCHEMAS,
+  PLATFORM_TOOL_SCHEMAS,
   TOOL_SCHEMAS,
   SDK_NATIVE_TOOLS,
   platformToolHandlers,
@@ -18,13 +20,10 @@ import {
  * the stdio server, avoiding duplicate `karmax` registration.
  */
 describe('Claude Agent-SDK tool exposure (no drift)', () => {
-  // Fake SDK `tool()` + handlers so we can build the defs without the real SDK/login.
-  const fakeTool = (name: string, description: string, shape: Record<string, any>, run: any) => ({ name, description, shape, run });
   const allHandlers = Object.fromEntries(TOOL_SCHEMAS.map((t) => [t.name, async () => 'ok']));
 
-  it('exposes every turn-local control and no gateway-backed platform tools', () => {
-    const defs = buildSdkTools(fakeTool as any, z, allHandlers as any);
-    const names = defs.map((d: any) => d.name).sort();
+  it('exposes every turn-local control and no gateway-backed platform tools', async () => {
+    const names = (await (await controlClient(controlMcpServer(z, allHandlers as any))).names()).sort();
     expect(names).toEqual(SDK_CONTROL_TOOL_SCHEMAS.map((t) => t.name).sort());
     // The specific tools whose absence caused the bug:
     expect(names).toEqual(expect.arrayContaining(['open_pr', 'respond_to_sub_task', 'raise_to_parent', 'wait_for_subtasks']));
@@ -33,10 +32,27 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     for (const native of SDK_NATIVE_TOOLS) expect(names).not.toContain(native);
   });
 
-  it('drops a tool only when its handler is missing (defensive)', () => {
+  it('advertises the shared JSON Schemas verbatim (#438)', async () => {
+    // The SDK's zod conversion made `tools/list` throw on free-form objects and
+    // hid every control tool; the schemas now reach the harness untranslated.
+    const tools = await (await controlClient(controlMcpServer(z, allHandlers as any, PLATFORM_TOOL_SCHEMAS))).tools();
+    expect(tools.map((t) => [t.name, t.inputSchema])).toEqual(PLATFORM_TOOL_SCHEMAS.map((t) => [t.name, t.parameters]));
+  });
+
+  it('validates arguments with the declared schema before a handler runs', async () => {
+    const calls: any[] = [];
+    const handlers = { ...allHandlers, create_sub_task: async (args: any) => { calls.push(args); return 'created' } } as any;
+    const client = await controlClient(controlMcpServer(z, handlers, PLATFORM_TOOL_SCHEMAS));
+    await expect(client.call('create_sub_task', { title: 't', prompt: 'p', params: { 'agent:do': { provider: 'codex' } } })).resolves.toBe('created');
+    await expect(client.call('create_sub_task', { title: 't' })).rejects.toThrow(/Invalid arguments for create_sub_task/);
+    await expect(client.call('no_such_tool', {})).rejects.toThrow(/unknown tool/);
+    expect(calls).toEqual([{ title: 't', prompt: 'p', params: { 'agent:do': { provider: 'codex' } } }]);
+  });
+
+  it('drops a tool only when its handler is missing (defensive)', async () => {
     const partial = { ...allHandlers } as any;
     delete partial.respond_to_sub_task;
-    const names = buildSdkTools(fakeTool as any, z, partial).map((d: any) => d.name);
+    const names = await (await controlClient(controlMcpServer(z, partial))).names();
     expect(names).not.toContain('respond_to_sub_task');
     expect(names).toContain('create_sub_task');
   });

@@ -42,6 +42,7 @@ import { CUSTODY_ENV } from '../src/agent/custody.js';
 import { ProviderFailure, isTransportError } from '../src/agent/limits.js';
 import { remoteAgentHomeRelative } from '../src/agent/remote-process.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
+import { controlClient } from './helpers/control-server.js';
 
 const input: any = {
   profile: { id: 'p', name: 'claude', provider: 'claude', role: 'do', capabilities: [] },
@@ -357,7 +358,7 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       expect(sdkState.options.spawnClaudeCodeProcess).toBeTypeOf('function');
       expect(sdkState.options).not.toHaveProperty('getOAuthToken');
       expect(sdkState.options.mcpServers.karmax).toBeUndefined();
-      expect(sdkState.options.mcpServers.karmax_control.tools.map((tool: any) => tool.name))
+      expect(await (await controlClient(sdkState.options.mcpServers.karmax_control)).names())
         .toEqual(expect.arrayContaining(['message_agent', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource']));
       expect(files.get(`${remoteAgentHomeRelative('claude', home)}/.credentials.json`)?.toString()).toContain('subscription');
       expect(files.get(`${remoteAgentHomeRelative('claude', home)}/.credentials.json`)?.toString()).not.toContain('host-only-refresh');

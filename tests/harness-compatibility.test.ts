@@ -8,6 +8,8 @@ import { once } from 'node:events';
 import crypto from 'node:crypto';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
+import { CLAUDE_EXTRA_ARGS, controlMcpServer } from '../src/agent/claude.js';
+import { PLATFORM_TOOL_SCHEMAS } from '../src/agent/tools.js';
 
 it('Claude 2.1.281 preserves SDK tools, explicit effort, resume and fork', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-sdk-compat-'));
@@ -125,6 +127,7 @@ it('Claude keeps SDK tools when resuming a session orphaned with a background sh
   const base = `http://127.0.0.1:${(server.address() as any).port}`;
   const options = (abortController: AbortController, resume?: string) => ({
     cwd: home, model: 'claude-opus-5-5', resume, tools: ['Bash'], strictMcpConfig: true, settingSources: [],
+    extraArgs: CLAUDE_EXTRA_ARGS,
     mcpServers: { compat: createSdkMcpServer({ name: 'compat', tools: [tool('echo', 'Echo a test marker', { text: z.string() }, async ({ text }) => {
       calls.push(text); return { content: [{ type: 'text' as const, text }] };
     })] }) },
@@ -165,16 +168,134 @@ it('Claude keeps SDK tools when resuming a session orphaned with a background sh
       for await (const m of resumed as AsyncIterable<any>) {
         if (m.type === 'system' && m.subtype === 'init') inventory = m.mcp_servers;
         if (m.type === 'assistant' && m.user_message_uuids?.includes(promptId)) answered = true;
+        if (m.type === 'user' && m.isReplay && m.uuid === promptId) events.push('replay');
         if (m.type === 'result') events.push(answered ? 'result' : 'early-result');
+        if (m.type === 'system' && m.subtype === 'session_state_changed' && m.state === 'idle') events.push('idle');
         if (m.type === 'system' && m.subtype === 'session_state_changed' && m.state === 'idle' && answered) release();
       }
     } finally { clearTimeout(timer); resumed.close(); }
     expect(inventory).toContainEqual(expect.objectContaining({ name: 'compat', status: 'connected' }));
     expect(calls).toEqual(['resumed-call']);
-    expect(events).toEqual(['early-result', 'result']);
+    // The resumed prompt's replay (the adapter's read receipt) comes only once the
+    // orphan-settling pass is over, never with its early result or idle.
+    expect(events.filter((e) => e !== 'idle')).toEqual(['early-result', 'replay', 'result']);
+    expect(events.at(-1)).toBe('idle');
   } finally {
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
     fs.rmSync(home, { recursive: true, force: true });
   }
 }, 90_000);
+
+const lastUser = (body: any) => JSON.stringify(body.messages.filter((m: any) => m.role === 'user').at(-1));
+
+/** A local Messages fixture whose model answers `reply(request)` as one streamed block. */
+async function messagesFixture(reply: (body: any) => any) {
+  const requests: any[] = [];
+  const server = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    if (!req.url?.startsWith('/v1/messages')) { res.writeHead(200); res.end('{}'); return; }
+    if (req.url.includes('count_tokens')) { res.end(JSON.stringify({ input_tokens: 10 })); return; }
+    const body = JSON.parse(raw);
+    requests.push(body);
+    const block = reply(body);
+    const stop = block.type === 'tool_use' ? 'tool_use' : 'end_turn';
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const event of [
+      { type: 'message_start', message: { id: `msg_${requests.length}`, type: 'message', role: 'assistant', model: body.model,
+        content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 5 } } },
+      { type: 'content_block_start', index: 0, content_block: block.type === 'tool_use' ? { ...block, input: {} } : { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: block.type === 'tool_use'
+        ? { type: 'input_json_delta', partial_json: JSON.stringify(block.input) }
+        : { type: 'text_delta', text: block.text } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' },
+    ]) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    res.end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-sdk-fixture-'));
+  const env = { PATH: process.env.PATH, HOME: home, CLAUDE_CONFIG_DIR: home,
+    ANTHROPIC_API_KEY: 'local-fixture-only', ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as any).port}`,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' };
+  return { requests, home, env, async close() {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    fs.rmSync(home, { recursive: true, force: true });
+  } };
+}
+
+// Task #438: a message karmax sends while the agent works joins the running model
+// turn. The CLI never names it in `user_message_uuids`; only the replay the adapter
+// asks for (CLAUDE_EXTRA_ARGS) proves it was read. Without it every such turn ended
+// the full settle grace (5 minutes) after the agent's last word.
+it('Claude replays a message sent mid-turn with its uuid, the adapter\'s read receipt', async () => {
+  const fixture = await messagesFixture((body) => {
+    const last = lastUser(body);
+    return last.includes('start-marker') ? { type: 'tool_use', id: 'tool_sleep', name: 'Bash', input: { command: 'sleep 4', description: 'wait' } }
+      : { type: 'text', text: JSON.stringify(body.messages).includes('mid-turn-marker') ? 'saw-follow-up' : 'missed-follow-up' };
+  });
+  const first = crypto.randomUUID(), second = crypto.randomUUID();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let push!: () => void;
+  const sent = new Promise<void>((resolve) => { push = resolve; });
+  async function* prompt() {
+    yield { type: 'user', message: { role: 'user', content: 'start-marker' }, parent_tool_use_id: null, uuid: first };
+    await sent;
+    yield { type: 'user', message: { role: 'user', content: 'mid-turn-marker' }, parent_tool_use_id: null, uuid: second };
+    await held;
+  }
+  const echoed: string[] = [], replayed: string[] = [];
+  let text = '';
+  const session = query({ prompt: prompt() as any, options: {
+    cwd: fixture.home, model: 'claude-opus-5-5', tools: ['Bash'], strictMcpConfig: true, settingSources: [],
+    extraArgs: CLAUDE_EXTRA_ARGS, env: fixture.env,
+    canUseTool: async (_name: string, input: any) => ({ behavior: 'allow' as const, updatedInput: input }),
+  } as any });
+  const timer = setTimeout(() => { push(); release(); }, 45_000);
+  try {
+    for await (const m of session as AsyncIterable<any>) {
+      // Send the follow-up once the tool is running (it sleeps for 4 s).
+      if (m.type === 'assistant' && m.message?.content?.some((b: any) => b.type === 'tool_use')) setTimeout(push, 1000);
+      if (m.type === 'assistant') {
+        echoed.push(...(m.user_message_uuids ?? []));
+        text += (m.message?.content ?? []).map((b: any) => b.text ?? '').join('');
+      }
+      if (m.type === 'user' && m.isReplay) replayed.push(m.uuid);
+      if (m.type === 'system' && m.subtype === 'session_state_changed' && m.state === 'idle' && replayed.includes(second)) release();
+    }
+  } finally { clearTimeout(timer); session.close(); await fixture.close(); }
+  expect(text).toContain('saw-follow-up'); // the model did read it…
+  expect(echoed).not.toContain(second); // …the CLI never echoes it on an assistant frame…
+  expect(replayed).toEqual([first, second]); // …but replays it, with our uuid.
+}, 60_000);
+
+// Task #438: the in-process control server connected with zero tools. The Agent SDK
+// converts `tool()` zod shapes with the zod it bundles (4.4.3); karmax's own zod
+// moved to 4.6.5 and its record schemas made that conversion throw, failing the
+// whole tools/list. Serve the shared JSON Schemas verbatim and check the real CLI
+// sees every tool and can call one taking a free-form object.
+it('Claude sees every karmax_control tool and passes free-form objects through', async () => {
+  const fixture = await messagesFixture((body) => lastUser(body).includes('tool_result')
+    ? { type: 'text', text: 'done' }
+    : { type: 'tool_use', id: 'tool_child', name: 'mcp__karmax_control__create_sub_task',
+      input: { title: 'child', prompt: 'do it', params: { 'agent:do': { provider: 'codex' } } } });
+  const calls: any[] = [];
+  const handlers = Object.fromEntries(PLATFORM_TOOL_SCHEMAS.map((t) => [t.name, async (args: any) => { calls.push([t.name, args]); return 'ok'; }]));
+  let tools: string[] = [];
+  const session = query({ prompt: 'spawn-marker', options: {
+    cwd: fixture.home, model: 'claude-opus-5-5', tools: [], strictMcpConfig: true, settingSources: [], env: fixture.env,
+    mcpServers: { karmax_control: controlMcpServer(z, handlers, PLATFORM_TOOL_SCHEMAS) },
+    canUseTool: async (_name: string, input: any) => ({ behavior: 'allow' as const, updatedInput: input }),
+  } as any });
+  try {
+    for await (const m of session as AsyncIterable<any>) if (m.type === 'system' && m.subtype === 'init') tools = m.tools;
+  } finally { session.close(); await fixture.close(); }
+  expect(tools.filter((t) => t.startsWith('mcp__karmax_control__')).sort())
+    .toEqual(PLATFORM_TOOL_SCHEMAS.map((t) => `mcp__karmax_control__${t.name}`).sort());
+  expect(calls).toEqual([['create_sub_task', { title: 'child', prompt: 'do it', params: { 'agent:do': { provider: 'codex' } } }]]);
+}, 60_000);
