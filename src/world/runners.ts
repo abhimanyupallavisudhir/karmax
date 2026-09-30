@@ -1,3 +1,4 @@
+import { checkpointStale } from './checkpoint-staleness.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Store } from '../store/db.js';
@@ -292,7 +293,11 @@ export class WorldLifecycleManager {
         };
         if (!(await eligible(true))) return;
         let checkpoint = await this.store.latestWorldCheckpoint(candidate.handle.id);
-        if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1))
+        // A failed park checkpoint leaves newer work only in the sandbox: capture it
+        // first. If that fails too the sandbox stays, under the sweep's backoff
+        // (WD-2), rather than being destroyed against the older one (audit R-6).
+        if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1)
+          || await checkpointStale(this.store, candidate.handle))
           checkpoint = await this.checkpoints.checkpoint(candidate.handle);
         if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1) || !(await eligible())) return;
         try {

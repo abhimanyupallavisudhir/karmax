@@ -4,6 +4,7 @@ import { Store } from '../src/store/db.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import type { TaskView } from '../src/domain/types.js';
+import { checkpointStale } from '../src/world/checkpoint-staleness.js';
 
 describe('parking during agent admission', () => {
   it.each((['do', 'review', 'merge', 'resolve'] as const).flatMap(stage =>
@@ -79,6 +80,29 @@ describe('parking during agent admission', () => {
       expect(checkpoint).not.toHaveBeenCalled();
       expect(park).not.toHaveBeenCalled();
     } finally { ctx.mockRestore(); await store.close(); }
+  });
+
+  // Audit R-6: the world still parks when its checkpoint fails, but the failure
+  // is recorded so hibernation re-checkpoints before destroying the sandbox.
+  it('records a failed park checkpoint so hibernation will not trust an older one', async () => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Oversized');
+    const task = await store.createTask({ projectId: project.id, title: 'Big output', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' } });
+    const handle = { id: task.id, kind: 'container', root: '/workspace', branch: 'task', base: 'main' };
+    const park = vi.fn(async () => handle);
+    const checkpoint = vi.fn(async () => { throw new Error('checkpoint total size limit exceeded'); });
+    const core = makeCoreActivities({ store, worlds: { get: () => ({ parkable: true }), status: async () => 'ready', park } as any,
+      adapters: new Map(), profiles: new ProfileResolver(store, 'mock'), checkpoints: { checkpoint } as any });
+    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] }, messages: [], actions: [], updatedAt: 1,
+      state: {}, world: handle } as TaskView;
+    try {
+      await core.publishView(task.id, view);
+      expect(park).toHaveBeenCalledTimes(1);
+      expect(await store.eventsOfType(task.id, 'checkpoint.warning')).toHaveLength(1);
+      expect(await checkpointStale(store, handle as any)).toBe(true);
+    } finally { await store.close(); }
   });
 
   it.each(['conversation.message', 'task.cancel-requested', 'task.transition-requested'])('stops checkpoint work at its next safe boundary after %s', async eventType => {

@@ -21,6 +21,7 @@ import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
+import { markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -1182,6 +1183,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (error === deferred) return;
             if (ctx?.cancellationSignal.aborted) throw error;
             (await record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) }));
+            // The world still parks, but hibernation must not trust an older checkpoint.
+            await markCheckpointStale(store, waitingWorld, error instanceof Error ? error.message : String(error));
           }
         }
 
