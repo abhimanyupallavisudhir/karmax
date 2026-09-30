@@ -83,6 +83,8 @@ export interface IdentityOptions {
    * immediately, without restarting the identity service. */
   siteName?: () => string | Promise<string>;
   oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] };
+  /** First wait before retrying an unreachable IdP; doubles up to 5 minutes (tests). */
+  ssoRetryMs?: number;
   google?: { clientId: string; clientSecret: string };
   github?: {
     clientId: string;
@@ -121,6 +123,12 @@ export class IdentityService {
   }
 
    oidcProviderId?: string;
+  /** Enterprise SSO is configured AND its provider is registered: the IdP's
+   * discovery document was fetched, so sign-in can start (audit R-11). */
+  get ssoAvailable(): boolean { return !!this.oidcProviderId && this.ssoRegistered; }
+  private ssoRegistered = false;
+  private ssoRetry?: ReturnType<typeof setTimeout>;
+  private buildAuth?: () => Promise<any>;
   /** Whether "Continue with Google" is offered. Google is a *consumer* identity
    *  option and deliberately does not consume the single generic-OIDC enterprise
    *  slot above — an installation pointed at Okta must still be able to offer it. */
@@ -142,17 +150,42 @@ export class IdentityService {
   }
 
   static async create(dbFile: string, opts: IdentityOptions = {}) {
-    if (opts.oidc?.issuer) {
-      // Better Auth now verifies ID tokens against the discovered issuer, but
-      // no longer accepts an operator-specified issuer in GenericOAuthConfig.
-      const response = await fetch(opts.oidc.discoveryUrl, { signal: AbortSignal.timeout(5_000) });
-      if (!response.ok) throw new Error(`OIDC discovery failed: HTTP ${response.status}`);
-      const discovered = await response.json() as { issuer?: string };
-      if (discovered.issuer !== opts.oidc.issuer) throw new Error('OIDC discovery issuer mismatch');
-    }
+    // A misconfigured issuer is an operator error worth failing on; an IdP that
+    // is merely unreachable must not stop karmax booting (audit R-11).
+    if (opts.oidc && (await IdentityService.discoverIssuer(opts.oidc)) === 'mismatch')
+      throw new Error('OIDC discovery issuer mismatch');
     const instance = new IdentityService(dbFile, opts);
     await instance.initialize(dbFile, opts);
     return instance;
+  }
+
+  /** Better Auth verifies ID tokens against the discovered issuer, but no longer
+   * accepts an operator-specified one, so karmax checks it against discovery. */
+  private static async discoverIssuer(oidc: NonNullable<IdentityOptions['oidc']>): Promise<'ok' | 'unreachable' | 'mismatch'> {
+    try {
+      const response = await fetch(oidc.discoveryUrl, { signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) return 'unreachable';
+      const discovered = await response.json() as { issuer?: string };
+      return !oidc.issuer || discovered.issuer === oidc.issuer ? 'ok' : 'mismatch';
+    } catch { return 'unreachable'; }
+  }
+
+  /** Better Auth 1.7 fetches discovery once, while building its instance, and
+   * skips the provider (logging only) if that fails. Until it is registered,
+   * SSO is hidden and retried with backoff; a success rebuilds the instance. */
+  private async registerSso(opts: IdentityOptions, attempt = 0): Promise<void> {
+    if (!opts.oidc) return;
+    const context = await this.auth.$context;
+    this.ssoRegistered = !!context?.socialProviders?.some((provider: { id?: string }) => provider.id === opts.oidc!.providerId);
+    if (this.ssoRegistered) return;
+    const delay = Math.min((opts.ssoRetryMs ?? 30_000) * 2 ** attempt, 300_000);
+    this.ssoRetry = setTimeout(() => void (async () => {
+      const issuer = await IdentityService.discoverIssuer(opts.oidc!);
+      if (issuer === 'mismatch') console.error('[sso] the IdP now names a different issuer; enterprise SSO stays off');
+      if (issuer === 'ok' && this.buildAuth) this.auth = await this.buildAuth();
+      await this.registerSso(opts, attempt + 1);
+    })().catch((error) => console.error('[sso] could not register the identity provider:', error)), delay);
+    this.ssoRetry.unref?.();
   }
 
   private async initialize(dbFile: string, opts: IdentityOptions = {}) {
@@ -207,7 +240,7 @@ export class IdentityService {
       }
     };
     const siteName = async () => (await opts.siteName?.()) || DEFAULT_SITE_NAME;
-    this.auth = betterAuth({
+    this.buildAuth = async () => betterAuth({
       appName: (await siteName()),
       database: this.pool ?? { db: this.sqlite!, type: 'sqlite', transaction: true },
       secret: secretFor(dbFile, opts.secret),
@@ -335,6 +368,8 @@ export class IdentityService {
           clientSecret: opts.oidc.clientSecret, scopes: opts.oidc.scopes ?? ['openid', 'profile', 'email'],
           pkce: true, requireIdTokenVerification: true }] })] : [])],
     });
+    this.auth = await this.buildAuth();
+    await this.registerSso(opts);
   }
 
   static async open(dbFile: string, opts: IdentityOptions = {}): Promise<IdentityService> {
@@ -446,6 +481,7 @@ export class IdentityService {
 
   async beginSso(callbackURL: string, headers?: Headers): Promise<Response> {
     if (!this.oidcProviderId) throw new Error('enterprise SSO is not configured');
+    if (!this.ssoRegistered) throw new Error('enterprise SSO is temporarily unavailable: the identity provider could not be reached');
     // better-auth 1.7 serves generic-OAuth providers through the core social
     // sign-in and `/api/auth/callback/<providerId>`; the plugin's own endpoint
     // (`signInWithOAuth2`, `/api/auth/oauth2/callback/…`) is gone (audit R-5).
@@ -522,6 +558,7 @@ export class IdentityService {
   }
 
   async close(): Promise<void> {
+    clearTimeout(this.ssoRetry);
     await this.sqlite?.destroy();
     (await this.db.close());
     await this.pool?.end();

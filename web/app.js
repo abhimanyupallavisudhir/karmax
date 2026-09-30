@@ -19604,7 +19604,7 @@ function renderLogin() {
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
     ${googleBtn('google-btn')}
     ${githubBtn('github-btn')}
-    ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
+    ${S.sso ? `<button class="btn" id="sso-btn" style="width:100%;margin-top:8px"${S.sso.unavailable ? ' disabled title="Company sign-in is temporarily unavailable. Try again in a few minutes."' : ''}>Continue with company SSO</button>` : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
     ${S.emailDelivery ? '<div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>' : ''}
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>
