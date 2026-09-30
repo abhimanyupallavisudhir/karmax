@@ -10324,14 +10324,23 @@ async function renderCredentialEditor(el, scope, opts = {}) {
         ${keyActions ? '<span class="cred-key-edit" title="Edit API key">✎</span><span class="cred-key-del" title="Delete API key">✕</span>' : ''}
       </div>`;
     })
-    .join('')}</div><div class="cred-login-flow" hidden></div>`;
+    .join('')}</div>${opts.local ? '' : `<button class="btn sm cred-save" type="button" hidden title="Save the new order"><span class="cred-save-alert" aria-hidden="true">!</span>Unsaved changes${ICON.save}</button>`}<div class="cred-login-flow" hidden></div>`;
+  // A reorder is staged until Save (the New Task form is itself a draft, so it
+  // applies there at once). Any other save persists the staged order with it,
+  // so what is saved is always what is on screen.
+  let stagedOrder = null;
+  const saveButton = el.querySelector('.cred-save');
   const save = async (policy) => {
+    if (stagedOrder) policy = { ...policy, order: stagedOrder };
     // Local mode: keep the change client-side (applied when the task is created); else
     // persist immediately, keyed by taskId/projectId scope.
     if (opts.local) { opts.onChange?.(policy); renderCredentialEditor(el, scope, { ...opts, policy }); return; }
     const authScope = opts.taskId ? `?taskId=${encodeURIComponent(opts.taskId)}` : opts.projectId ? `?projectId=${encodeURIComponent(opts.projectId)}` : '';
     try { await api(`${organizationBase}/credentials/policy${authScope}`, { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
-    catch (e) { toast(e.message, true); }
+    catch (e) {
+      toast(e.message, true);
+      if (stagedOrder) { saveButton.disabled = false; return; } // keep the unsaved order on screen
+    }
     renderCredentialEditor(el, scope, opts);
   };
   el.querySelectorAll('.cred-row').forEach((row) => {
@@ -10385,7 +10394,12 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     });
   });
   // Drag-to-reorder → precedence order for this scope.
-  wireCredDrag(el.querySelector('.cred-list'), (order) => save({ ...own, order }));
+  wireCredDrag(el.querySelector('.cred-list'), (order) => {
+    if (opts.local) return save({ ...own, order });
+    stagedOrder = order.join('\n') === ordered.join('\n') ? null : order;
+    saveButton.hidden = !stagedOrder;
+  });
+  saveButton?.addEventListener('click', () => { saveButton.disabled = true; save(own); });
 }
 
 function openApiKeyEditor({ organizationBase, credential, onSaved }) {
@@ -10418,13 +10432,18 @@ function openApiKeyEditor({ organizationBase, credential, onSaved }) {
   host.querySelector('.api-key-edit-account').focus();
 }
 
-// HTML5 drag-and-drop reordering for the credential rows; calls onReorder(keys[]) on drop.
+// HTML5 drag-and-drop reordering for the credential rows; calls onReorder(keys[])
+// when a drag ends. Not on `drop`: releasing just off the one-line strip fires
+// no drop, yet the rows have already moved to where the person put them.
 function wireCredDrag(list, onReorder) {
   if (!list) return;
   let dragging = null;
   list.querySelectorAll('.cred-row').forEach((row) => {
     row.addEventListener('dragstart', (e) => { dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', row.dataset.key); } catch {} });
-    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+    row.addEventListener('dragend', () => {
+      row.classList.remove('dragging'); dragging = null;
+      onReorder([...list.querySelectorAll('.cred-row')].map((r) => r.dataset.key));
+    });
   });
   list.addEventListener('dragover', (e) => {
     e.preventDefault();
@@ -10443,7 +10462,7 @@ function wireCredDrag(list, onReorder) {
     }
     best ? list.insertBefore(dragging, best) : list.appendChild(dragging);
   });
-  list.addEventListener('drop', (e) => { e.preventDefault(); onReorder([...list.querySelectorAll('.cred-row')].map((r) => r.dataset.key)); });
+  list.addEventListener('drop', (e) => e.preventDefault());
 }
 
 // Which agent role "owns" a given stage — drives which transcript opens by default.

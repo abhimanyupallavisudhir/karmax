@@ -35,6 +35,7 @@ global.S = { organizationId: 'org' };
 global.projectById = () => null;
 global.esc = (value) => String(value);
 global.wireCredDrag = () => {};
+global.ICON = { save: '<svg></svg>' };
 const renderEpochs = new WeakMap();
 global.beginAsyncElementRender = (target) => {
   const epoch = (renderEpochs.get(target) || 0) + 1;
