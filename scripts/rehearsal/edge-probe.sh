@@ -27,6 +27,9 @@ mode=${1:-}; domain=${2:-}; label=${3:-probe}
 command -v curl >/dev/null || { echo 'SKIP curl is not installed'; exit 2; }
 
 https() { curl -sk --max-time 10 --resolve "$domain:443:$1" "${@:2}"; }
+# The installation's Caddy container (its Compose project's, when named).
+caddy() { docker ps -q --filter label=com.docker.compose.service=caddy \
+  ${COMPOSE_PROJECT_NAME:+--filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME"} | head -n 1; }
 
 reach() {
   local failed=0 code headers ask
@@ -40,7 +43,7 @@ reach() {
   else echo "FAIL nothing listens on UDP 443"; failed=1; fi
   # Caddy asks the app before minting a preview certificate. A refusal (4xx) is
   # an answer; no answer means Caddy cannot reach the app to ask.
-  ask=$(docker exec "$(docker ps -q --filter label=com.docker.compose.service=caddy | head -n 1)" \
+  ask=$(docker exec "$(caddy)" \
     wget -q -S -O /dev/null "$(ask_url)?domain=p-probe.preview.$domain" 2>&1 | awk '/HTTP\//{print $2}' | tail -n 1)
   case "$ask" in
     2??|4??) echo "ok   Caddy's on-demand TLS check reaches the app ($ask)" ;;
@@ -51,7 +54,7 @@ reach() {
 
 # The `ask` URL the running Caddy was configured with.
 ask_url() {
-  docker exec "$(docker ps -q --filter label=com.docker.compose.service=caddy | head -n 1)" \
+  docker exec "$(caddy)" \
     sed -n 's/^[[:space:]]*ask[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' /etc/caddy/Caddyfile | head -n 1
 }
 

@@ -376,6 +376,19 @@ if step "d. Update to TO (TO's deploy/karmax update ${DEPLOY_SHA:0:12})" update.
   deployed=$(git -C "$WORK/install" rev-parse HEAD)
   if [ "$deployed" = "$DEPLOY_SHA" ]; then updated=1
   else record FAIL "the install is at $deployed after the update, not $DEPLOY_SHA"; fi
+else
+  # A failed update must leave the previous release serving: its app ready and,
+  # when the edge answered before, its edge too (the updater's own rollback).
+  serves_again() {
+    local id; id=$(app_container)
+    [ -n "$id" ] || { echo 'no app container is running'; return 1; }
+    docker exec "$id" node -e "fetch('http://127.0.0.1:4505/api/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" \
+      || { echo 'the app is not ready'; return 1; }
+    echo "The app in ${id:0:12} is ready; the install is at $(git -C "$WORK/install" rev-parse --short HEAD) (FROM is ${FROM_SHA:0:12})."
+    [ "$(git -C "$WORK/install" rev-parse HEAD)" = "$FROM_SHA" ] || { echo 'the install is not back at FROM'; return 1; }
+  }
+  step '   After the failed update: FROM serves again' rolled-back.log serves_again || true
+  judge_edge '   After the failed update: HTTPS through Caddy' rolled-back-edge.log edge_probe reach rollback
 fi
 # The first boot: from the new app container's start to its first ready
 # answer. The container FROM ran before the update does not count.
