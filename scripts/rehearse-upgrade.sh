@@ -366,11 +366,19 @@ git -C "$WORK/restore" checkout -q --detach "$DEPLOY_SHA"
 cd "$WORK/restore"
 # FROM's backup may predate signed backups (every master-era one does). An
 # operator restores that with --accept-unsigned-v1 and its typed confirmation,
-# when TO's restore knows the flag.
+# when TO's restore knows the flag. A signed one comes from another
+# installation as far as this fresh stack is concerned (it has its own
+# signing key), so it restores only with the fingerprint the backup printed,
+# as after losing a host: the operator kept it off-host (--trust-key).
 restore() {
-  local accept=() confirm=RESTORE
+  local accept=() confirm=RESTORE fingerprint
   if [ ! -f "$BACKUP/SHA256SUMS.sig" ] && grep -q -- '--accept-unsigned-v1' ./deploy/karmax; then
     accept=(--accept-unsigned-v1); confirm='RESTORE UNSIGNED'
+  fi
+  fingerprint=$(grep -o 'signed by SHA256:[A-Za-z0-9+/]*' "$LOGS/backup.log" | head -n 1 | cut -d' ' -f3)
+  if [ -f "$BACKUP/SHA256SUMS.sig" ]; then
+    [ -n "$fingerprint" ] || { echo 'rehearse: the backup is signed but its log names no fingerprint'; return 1; }
+    accept+=(--trust-key "$fingerprint")
   fi
   printf '%s\n' "$confirm" | ./deploy/karmax restore "${accept[@]}" "$BACKUP"
 }
