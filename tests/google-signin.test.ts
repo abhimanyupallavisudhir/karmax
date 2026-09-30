@@ -373,6 +373,30 @@ describe('Google and enterprise OIDC coexist', () => {
     } finally { fetcher.mockRestore(); }
   });
 
+  // Audit R-5: better-auth 1.7 removed the generic-OAuth plugin's own sign-in
+  // endpoint (`signInWithOAuth2`); beginSso still called it, so "Continue with
+  // SSO" returned 400 on every install with KARMAX_OIDC_* set.
+  it('starts an enterprise SSO sign-in at the IdP with PKCE, returning via the core callback', async () => {
+    const real = globalThis.fetch;
+    // The IdP's discovery document, fetched when the provider is registered.
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) =>
+      String(input?.url ?? input) === OIDC.discoveryUrl
+        ? new Response(JSON.stringify({ issuer: 'https://idp.example.com', authorization_endpoint: 'https://idp.example.com/authorize',
+          token_endpoint: 'https://idp.example.com/token', jwks_uri: 'https://idp.example.com/jwks' }), { status: 200, headers: { 'content-type': 'application/json' } })
+        : real(input, init));
+    try {
+      const { identity } = await boot({ oidc: OIDC });
+      const res = await identity.beginSso('/');
+      expect(res.status).toBe(200);
+      const url = new URL((await res.json() as any).url);
+      expect(url.origin + url.pathname).toBe('https://idp.example.com/authorize');
+      expect(url.searchParams.get('client_id')).toBe(OIDC.clientId);
+      expect(url.searchParams.get('code_challenge_method')).toBe('S256');
+      // Operators register this at their IdP (HOSTING.md, deploy/README.md).
+      expect(new URL(url.searchParams.get('redirect_uri')!).pathname).toBe('/api/auth/callback/enterprise');
+    } finally { fetcher.mockRestore(); }
+  });
+
   it('keeps Google, GitHub, and enterprise slots working together', async () => {
     const { identity, base } = await boot({ google: GOOGLE, github: GITHUB, oidc: OIDC });
     expect(identity.googleEnabled).toBe(true);

@@ -446,7 +446,10 @@ export class IdentityService {
 
   async beginSso(callbackURL: string, headers?: Headers): Promise<Response> {
     if (!this.oidcProviderId) throw new Error('enterprise SSO is not configured');
-    return this.auth.api.signInWithOAuth2({ body: { providerId: this.oidcProviderId, callbackURL }, headers, asResponse: true });
+    // better-auth 1.7 serves generic-OAuth providers through the core social
+    // sign-in and `/api/auth/callback/<providerId>`; the plugin's own endpoint
+    // (`signInWithOAuth2`, `/api/auth/oauth2/callback/…`) is gone (audit R-5).
+    return this.auth.api.signInSocial({ body: { provider: this.oidcProviderId, callbackURL }, headers, asResponse: true });
   }
 
   async providersForUser(userId: string): Promise<string[]> {
