@@ -113,6 +113,21 @@ describe('existing world secret refresh', () => {
     expect(fs.readFileSync(fileAt(), 'utf8')).toBe('rotated');
   });
 
+  // Audit R-9: the digest cache belongs to one process. When another process
+  // (the gateway, in hosted mode) scrubbed the file, or the agent ran
+  // `git clean -fdx`, this process still believed it written and skipped it.
+  it('restores a secret file removed outside this process on reopen', async () => {
+    await addFile();
+    await resources.prepare(world);
+    fs.rmSync(fileAt());
+    await resources.prepare(world);
+    expect(fs.readFileSync(fileAt(), 'utf8')).toBe('fixture-value');
+    // ...while an agent's own edit to it still survives an unchanged value.
+    fs.writeFileSync(fileAt(), 'agent edit');
+    await resources.prepare(world);
+    expect(fs.readFileSync(fileAt(), 'utf8')).toBe('agent edit');
+  });
+
   it('keeps a running agent current without reopening: adds, rotates and withdraws secrets', async () => {
     const opened = await resources.prepare(world);
     expect(await resources.refresh(opened)).toEqual({});
