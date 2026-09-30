@@ -102,8 +102,10 @@ export class CodexAppServerClient {
       this.pending.delete(msg.id);
       if (msg.error) {
         const providerCode = msg.error.data?.codexErrorInfo;
+        // Values of the pinned Codex protocol's CodexErrorInfo (0.156.1): account
+        // limits and a rejected login. `usageLimitReached` never existed (audit R-10).
         const providerFailure = ['turn/start', 'turn/steer'].includes(p.method)
-          && ['usageLimitReached', 'unauthorized'].includes(providerCode);
+          && ['usageLimitExceeded', 'rateLimitExceeded', 'unauthorized'].includes(providerCode);
         p.reject(providerFailure
           ? new ProviderStreamError(`${errorText(msg.error)} (${providerCode})`)
           : new Error(errorText(msg.error)));

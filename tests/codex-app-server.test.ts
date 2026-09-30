@@ -31,7 +31,8 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     setTimeout(() => send({ id: msg.id, result: {} }), 100);
   }
   else if (msg.method === 'turn/start') {
-    if (process.env.STUB_MODE === 'rpc-limit') { send({ id: msg.id, error: { code: -32000, message: 'try again in 20s', data: { codexErrorInfo: 'usageLimitReached' } } }); return; }
+    // Codes from the pinned Codex protocol (0.156.1 has no usageLimitReached; audit R-10).
+    if (process.env.STUB_MODE?.startsWith('rpc-limit')) { send({ id: msg.id, error: { code: -32000, message: 'try again in 20s', data: { codexErrorInfo: process.env.STUB_MODE === 'rpc-limit-rate' ? 'rateLimitExceeded' : 'usageLimitExceeded' } } }); return; }
     if (process.env.STUB_MODE?.startsWith('rpc-local-')) { send({ id: msg.id, error: { code: -32603, message: process.env.STUB_MODE === 'rpc-local-disk' ? 'Disk quota exceeded' : 'npm registry HTTP 401 unauthorized' } }); return; }
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
     if (process.env.STUB_MODE === 'stream') {
@@ -277,8 +278,8 @@ describe('CodexAdapter app-server security policy', () => {
     expect(failure.name).not.toBe('ProviderFailure');
   });
 
-  it('preserves an account failure received as a provider RPC rejection', async () => {
-    await expect(run(undefined, 'rpc-limit')).rejects.toMatchObject({ name: 'ProviderFailure',
+  it.each(['rpc-limit', 'rpc-limit-rate'])('preserves an account failure received as a provider RPC rejection (%s)', async (mode) => {
+    await expect(run(undefined, mode)).rejects.toMatchObject({ name: 'ProviderFailure',
       metadata: { kind: 'quota', permanence: 'transient' } });
   });
 

@@ -401,7 +401,10 @@ export function classifyLimitError(message: string, options: LimitClassifierOpti
   const knownHardCredit = /out of (?:usage )?credits?|insufficient (?:usage )?credits?/.test(lc)
     || (!options.legacy && /credit balance is too low/.test(lc));
   const knownLimit =
-    /you'?ve hit your|usage limit|usagelimitreached|session limit|weekly limit|rate.?limit|too many requests|\b429\b/.test(lc);
+    /you'?ve hit your|usage limit|usagelimitreached|session limit|weekly limit|rate.?limit|too many requests|\b429\b/.test(lc)
+    // Codex's real CodexErrorInfo code (audit R-10); new histories only, so replay
+    // of recorded messages keeps its classification.
+    || (!options.legacy && /usagelimitexceeded/.test(lc));
 
   // Provider-scoped semantic fallback: combine a state word with an account/quota
   // noun within a short window. This generalizes across wording changes without
