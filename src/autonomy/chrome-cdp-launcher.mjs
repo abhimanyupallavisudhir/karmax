@@ -57,6 +57,51 @@ function cdpUp(port) {
   });
 }
 
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/**
+ * Linux processes that hold the socket a connection to 127.0.0.1:`port` reaches
+ * and were started on `profile` (`--user-data-dir`). Naming the profile is not
+ * proof on its own; holding the port's listening socket as well is. Elsewhere
+ * this finds nothing, so an unrecorded browser stays refused.
+ */
+function profileBrowsers(port, profile) {
+  if (process.platform !== 'linux') return [];
+  const reachable = new Set(['0100007F', '00000000', '0000000000000000FFFF00000100007F']);
+  const inodes = new Set();
+  for (const table of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let text = '';
+    try { text = fs.readFileSync(table, 'utf8'); } catch { continue; }
+    for (const line of text.split('\n').slice(1)) {
+      const fields = line.trim().split(/\s+/);
+      const [address, hexPort] = fields[1]?.split(':') ?? [];
+      if (fields[3] === '0A' && parseInt(hexPort ?? '', 16) === port && reachable.has(address ?? '')) inodes.add(fields[9]);
+    }
+  }
+  if (!inodes.size) return [];
+  const read = (fn) => { try { return fn(); } catch { return undefined; } };
+  return fs.readdirSync('/proc').filter((entry) => /^\d+$/.test(entry)).map(Number).filter((pid) => {
+    const fds = read(() => fs.readdirSync(`/proc/${pid}/fd`)) ?? [];
+    const listens = fds.some((fd) => inodes.has(/^socket:\[(\d+)\]$/.exec(read(() => fs.readlinkSync(`/proc/${pid}/fd/${fd}`)) ?? '')?.[1]));
+    return listens && (read(() => fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')) ?? []).includes(`--user-data-dir=${profile}`);
+  });
+}
+
+/** SIGTERM (Chrome flushes its profile), SIGKILL after 5s; true once they have
+ * exited, releasing the port and the profile lock, or false after 10s. */
+async function stop(pids) {
+  for (const [signal, waits] of [['SIGTERM', 20], ['SIGKILL', 20]]) {
+    for (const pid of pids) { try { process.kill(pid, signal); } catch { /* already gone */ } }
+    for (let i = 0; i < waits; i++) {
+      if (!pids.some(alive) && !await cdpUp(PORT)) return true;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+  return false;
+}
+
 function findChrome() {
   if (process.env.KARMAX_CDP_CHROME) return process.env.KARMAX_CDP_CHROME;
   const candidates = process.platform === 'darwin'
@@ -137,14 +182,21 @@ async function main() {
   if (await cdpUp(PORT)) {
     let owner;
     try { owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8')); } catch { /* unowned endpoint */ }
-    if (!KEEP_ALIVE || owner?.port !== PORT || !Number.isSafeInteger(owner?.pid))
-      throw new Error(`CDP port ${PORT} is already in use by an unowned browser`);
-    try { process.kill(owner.pid, 0); }
-    catch { throw new Error(`CDP port ${PORT} is already in use by an unowned browser`); }
-    log(`reusing existing CDP browser on :${PORT}`);
-    const mcp = runMcp(`http://127.0.0.1:${PORT}`);
-    mcp.on('exit', (code) => process.exit(code ?? 0));
-    return;
+    const recorded = KEEP_ALIVE && owner?.port === PORT && Number.isSafeInteger(owner?.pid) && alive(owner.pid);
+    if (recorded) {
+      log(`reusing existing CDP browser on :${PORT}`);
+      const mcp = runMcp(`http://127.0.0.1:${PORT}`);
+      mcp.on('exit', (code) => process.exit(code ?? 0));
+      return;
+    }
+    // A browser serving this port from the world's own profile is this world's,
+    // opened by a launcher that predates the owner record or whose record was
+    // lost. Reusing it would keep that launcher's flags (it allowed any Origin),
+    // so stop it and open a fresh one below; the profile, and its logins, stay.
+    const stale = KEEP_ALIVE && profile ? profileBrowsers(PORT, profile) : [];
+    if (!stale.length) throw new Error(`CDP port ${PORT} is already in use by an unowned browser`);
+    log(`replacing the unrecorded browser on :${PORT} (pid ${stale.join(', ')})`);
+    if (!await stop(stale)) throw new Error(`CDP port ${PORT} is still held by a browser that would not stop`);
   }
 
   const chrome = findChrome();

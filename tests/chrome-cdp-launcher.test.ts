@@ -98,3 +98,72 @@ it('runs the pinned chrome-devtools-mcp release when no version is configured (C
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A browser left running by a launcher that predates the owner record (or one
+// whose record was lost) must not wedge every later turn of its world: the
+// deploy of AU-20 made each resumed remote task fail with "MCP connections
+// could not start: chrome-devtools" (task #438). The world's own profile proves
+// the browser is its own; a browser on any other profile is still refused.
+it.each([
+  ['an earlier launcher left no owner record', undefined],
+  ['its owner record names a process that is gone', { pid: 2 ** 22 + 7 }],
+])('replaces a retained browser on the world profile when %s', async (_case, record) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-browser-legacy-'));
+  const reservation = http.createServer();
+  await new Promise<void>(resolve => reservation.listen(0, '127.0.0.1', resolve));
+  const port = (reservation.address() as { port: number }).port;
+  await new Promise<void>(resolve => reservation.close(() => resolve()));
+  const chrome = path.join(dir, 'chrome');
+  const mcp = path.join(dir, 'mcp');
+  const profile = path.join(dir, 'profile');
+  fs.writeFileSync(chrome, `#!${process.execPath}
+const http = require('node:http');
+const port = Number(/--remote-debugging-port=(\\d+)/.exec(process.argv.join(' '))[1]);
+http.createServer((req, res) => res.end(JSON.stringify({ pid: process.pid, args: process.argv.slice(2) }))).listen(port, '127.0.0.1');
+`, { mode: 0o700 });
+  fs.writeFileSync(mcp, `#!${process.execPath}
+fetch('http://127.0.0.1:' + process.env.KARMAX_CDP_PORT + '/json/version').then(r => r.json()).then(s => console.log(JSON.stringify(s)));
+`, { mode: 0o700 });
+  fs.mkdirSync(profile, { mode: 0o700 });
+  if (record) fs.writeFileSync(path.join(profile, '.karmax-browser-owner.json'), JSON.stringify({ port, ...record }));
+  // What the pre-AU-20 launcher ran: detached, wildcard origins, no record.
+  const legacy = execFile(chrome, ['--headless=new', `--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1',
+    '--remote-allow-origins=*', `--user-data-dir=${profile}`, 'about:blank']);
+  const pids: number[] = [legacy.pid!];
+  try {
+    await expect.poll(async () => { try { return (await fetch(`http://127.0.0.1:${port}/json/version`)).ok; } catch { return false; } }).toBe(true);
+    const env = { ...process.env, KARMAX_CDP_PORT: String(port), KARMAX_CDP_CHROME: chrome, KARMAX_CDP_MCP_BIN: mcp,
+      KARMAX_CDP_KEEP_ALIVE: '1', KARMAX_CDP_USER_DATA_DIR: profile };
+    const attached = JSON.parse((await exec(process.execPath, [launcher], { env, timeout: 20_000 })).stdout);
+    pids.push(attached.pid);
+    // A fresh, hardened browser on the same (persistent) profile, now recorded.
+    expect(attached.pid).not.toBe(legacy.pid);
+    expect(attached.args).toContain(`--user-data-dir=${profile}`);
+    expect(attached.args).not.toContain('--remote-allow-origins=*');
+    expect(legacy.exitCode ?? legacy.signalCode).not.toBeNull();
+    expect(JSON.parse(fs.readFileSync(path.join(profile, '.karmax-browser-owner.json'), 'utf8'))).toEqual({ port, pid: attached.pid });
+    // …and the next turn reuses it instead of replacing it again.
+    expect(JSON.parse((await exec(process.execPath, [launcher], { env, timeout: 20_000 })).stdout).pid).toBe(attached.pid);
+  } finally {
+    for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it('still refuses a retained-world endpoint served from another profile (AU-20)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-browser-foreign-'));
+  const server = http.createServer((_req, res) => res.end('{}'));
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  try {
+    await expect(exec(process.execPath, [launcher], { timeout: 5000, env: { ...process.env,
+      KARMAX_CDP_PORT: String(port), KARMAX_CDP_KEEP_ALIVE: '1', KARMAX_CDP_MCP_BIN: process.execPath,
+      KARMAX_CDP_USER_DATA_DIR: path.join(dir, 'profile'),
+    } })).rejects.toThrow(/already in use by an unowned browser/);
+    // The foreign server keeps running.
+    expect((await fetch(`http://127.0.0.1:${port}/`)).ok).toBe(true);
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

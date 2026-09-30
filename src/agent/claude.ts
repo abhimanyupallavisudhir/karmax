@@ -796,8 +796,9 @@ export class ClaudeAdapter implements AgentAdapter {
         (await (await currentTiming())?.markOnce('provider.first-event'));
         if (input.profile.mcpConnections !== undefined && message.type === 'system' && (message as any).subtype === 'init') {
           const inventory = (message as any).mcp_servers ?? [];
-          const missing = (input.agentMcp ?? []).filter((s) => !inventory.some((c: any) => c.name === s.name && c.status === 'connected'));
-          if (missing.length) throw new Error(`MCP connections could not start: ${missing.map((s) => s.name).join(', ')}. Check Agent tools settings.`);
+          const status = (name: string): string => inventory.find((c: any) => c.name === name)?.status ?? 'missing';
+          const missing = (input.agentMcp ?? []).filter((s) => status(s.name) !== 'connected');
+          if (missing.length) throw new Error(`MCP connections could not start: ${missing.map((s) => `${s.name} (${status(s.name)})`).join(', ')}. Check Agent tools settings.`);
         }
         if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
         // Publish the session id the moment it's known — the SDK's init message carries
