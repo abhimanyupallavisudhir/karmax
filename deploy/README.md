@@ -177,7 +177,11 @@ both approval pages and verifies every permission at both layers.
 
 `KARMAX_OIDC_*` (enterprise SSO) is another separate slot, so an installation
 can offer Google, GitHub, and company SSO together. Every provider button appears
-only when its full credential pair is non-empty.
+only when its full credential pair is non-empty. Register
+`https://karmax.example.com/api/auth/callback/enterprise` as the redirect URI at
+your identity provider. Installations set up before the better-auth 1.7 upgrade
+registered `/api/auth/oauth2/callback/enterprise`; that path no longer exists, so
+update it at the IdP when upgrading.
 
 That same HTTPS URL works from a phone—no VPN and no Karmax-specific native app
 are required. **Organization settings → Phone Access** offers an

@@ -373,7 +373,75 @@ describe('Google and enterprise OIDC coexist', () => {
     } finally { fetcher.mockRestore(); }
   });
 
+  // Audit R-5: better-auth 1.7 removed the generic-OAuth plugin's own sign-in
+  // endpoint (`signInWithOAuth2`); beginSso still called it, so "Continue with
+  // SSO" returned 400 on every install with KARMAX_OIDC_* set.
+  it('starts an enterprise SSO sign-in at the IdP with PKCE, returning via the core callback', async () => {
+    const real = globalThis.fetch;
+    // The IdP's discovery document, fetched when the provider is registered.
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) =>
+      String(input?.url ?? input) === OIDC.discoveryUrl
+        ? new Response(JSON.stringify({ issuer: 'https://idp.example.com', authorization_endpoint: 'https://idp.example.com/authorize',
+          token_endpoint: 'https://idp.example.com/token', jwks_uri: 'https://idp.example.com/jwks' }), { status: 200, headers: { 'content-type': 'application/json' } })
+        : real(input, init));
+    try {
+      const { identity } = await boot({ oidc: OIDC });
+      const res = await identity.beginSso('/');
+      expect(res.status).toBe(200);
+      const url = new URL((await res.json() as any).url);
+      expect(url.origin + url.pathname).toBe('https://idp.example.com/authorize');
+      expect(url.searchParams.get('client_id')).toBe(OIDC.clientId);
+      expect(url.searchParams.get('code_challenge_method')).toBe('S256');
+      // Operators register this at their IdP (HOSTING.md, deploy/README.md).
+      expect(new URL(url.searchParams.get('redirect_uri')!).pathname).toBe('/api/auth/callback/enterprise');
+    } finally { fetcher.mockRestore(); }
+  });
+
+  // Audit R-11: better-auth 1.7 fetches the IdP's discovery document once, while
+  // building its auth instance, and skips the provider if that fails. The
+  // button stayed visible and every sign-in failed until karmax restarted.
+  it('disables SSO while the IdP is unreachable and enables it once discovery succeeds', async () => {
+    const real = globalThis.fetch;
+    let reachable = false;
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      if (String(input?.url ?? input) !== OIDC.discoveryUrl) return real(input, init);
+      if (!reachable) throw new TypeError('fetch failed');
+      return new Response(JSON.stringify({ issuer: 'https://idp.example.com', authorization_endpoint: 'https://idp.example.com/authorize',
+        token_endpoint: 'https://idp.example.com/token', jwks_uri: 'https://idp.example.com/jwks' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      // An issuer check that cannot reach the IdP must not stop karmax booting.
+      const { identity, base } = await boot({ oidc: { ...OIDC, issuer: 'https://idp.example.com' }, ssoRetryMs: 50 });
+      expect(identity.ssoAvailable).toBe(false);
+      expect(((await (await fetch(`${base}/api/session`)).json()) as any).sso).toEqual({ providerId: 'enterprise', unavailable: true });
+      await expect(identity.beginSso('/')).rejects.toThrow(/temporarily unavailable/);
+
+      reachable = true;
+      await vi.waitFor(() => expect(identity.ssoAvailable).toBe(true), { timeout: 5_000, interval: 25 });
+      expect(((await (await fetch(`${base}/api/session`)).json()) as any).sso).toEqual({ providerId: 'enterprise' });
+      const url = new URL(((await (await identity.beginSso('/')).json()) as any).url);
+      expect(url.origin + url.pathname).toBe('https://idp.example.com/authorize');
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it('keeps SSO off, and says why, when the IdP names another issuer', async () => {
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({
+      issuer: 'https://other-idp.example.com' }), { status: 200 }));
+    try {
+      await expect(IdentityService.create(':memory:', { oidc: { ...OIDC, issuer: 'https://idp.example.com' } }))
+        .rejects.toThrow(/issuer mismatch/);
+    } finally { fetcher.mockRestore(); }
+  });
+
   it('keeps Google, GitHub, and enterprise slots working together', async () => {
+    // SSO is offered only once its IdP's discovery document was fetched (R-11).
+    const real = globalThis.fetch;
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) =>
+      String(input?.url ?? input) === OIDC.discoveryUrl
+        ? new Response(JSON.stringify({ issuer: 'https://idp.example.com', authorization_endpoint: 'https://idp.example.com/authorize',
+          token_endpoint: 'https://idp.example.com/token', jwks_uri: 'https://idp.example.com/jwks' }), { status: 200, headers: { 'content-type': 'application/json' } })
+        : real(input, init));
+    closers.push(async () => fetcher.mockRestore());
     const { identity, base } = await boot({ google: GOOGLE, github: GITHUB, oidc: OIDC });
     expect(identity.googleEnabled).toBe(true);
     expect(identity.githubEnabled).toBe(true);

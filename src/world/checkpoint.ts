@@ -16,6 +16,7 @@ import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntim
 import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
 import { sameRepository } from './repository-identity.js';
+import { clearCheckpointStale } from './checkpoint-staleness.js';
 
 import type { DeltaFile, PortableDelta } from './checkpoint-encoding.js';
 import { encodeEncryptedCheckpoint, type CheckpointFile } from './checkpoint-executor.js';
@@ -153,6 +154,7 @@ export class WorldCheckpointService {
       if (previous?.filesystemDelta) {
         await options.checkContinue?.();
         if (options.scrubSecrets !== false) await this.resources?.scrubSecrets(handle);
+        await clearCheckpointStale(this.store, handle.id); // unchanged since `previous`
         return previous;
       }
     }
@@ -204,6 +206,7 @@ export class WorldCheckpointService {
     catch (error) { await this.objects.delete(objectKey).catch(() => undefined); throw error; }
     finally { if (managedStorage) (await this.store.releaseStorageUpload(`checkpoint:${checkpointId}`)); }
     (await this.store.attachWorldCheckpoint(handle, checkpoint.id));
+    await clearCheckpointStale(this.store, handle.id);
     await this.store.updateWorldMeta(handle, { cleanCheckpoint: cleanFingerprint
       ? { id: checkpoint.id, fingerprint: cleanFingerprint } : null });
     (await this.store.recordUsage({ organizationId: project.organizationId, projectId, taskId: handle.id, worldId: handle.id,

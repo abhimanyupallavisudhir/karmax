@@ -83,6 +83,7 @@ export async function bootHarness(
     configHomes?: ConfigHomeManager;
     githubPr?: import('../../src/integrations/github-pr.js').GithubPrApiOptions;
     githubApp?: import('../../src/integrations/github-app.js').GitHubAppService;
+    probeUsage?: import('../../src/activities/core.js').CoreActivityDeps['probeUsage'];
   } = {},
 ): Promise<Harness> {
   const server = await startDevServer({ headless: true, logLevel: 'never' });

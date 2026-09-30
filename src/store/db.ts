@@ -7919,6 +7919,11 @@ export class Store {
                 'authorization.approval-resolved', 'connection.resolved',
                 'permission.approval-dismissed', 'authorization.approval-dismissed')
               AND json_extract(r.payload, '$.requestId')=json_extract(e.payload, '$.requestId')))
+          -- The newest published head per repository is state: force-with-lease
+          -- reads it (expectedTaskRemoteHeads), however long the task was idle (audit R-8).
+          AND NOT (e.type IN ('push.head', 'pr.opened', 'pr.updated') AND NOT EXISTS (SELECT 1 FROM events n
+            WHERE n.taskId=e.taskId AND n.seq>e.seq AND n.type IN ('push.head', 'pr.opened', 'pr.updated')
+              AND json_extract(n.payload, '$.repo')=json_extract(e.payload, '$.repo')))
           ORDER BY e.ts, e.seq LIMIT 10000)`)
         .run(now - 90 * 86400_000)).changes),
       auditEntries: Number((await this.db.prepare(`DELETE FROM audit_log WHERE seq IN

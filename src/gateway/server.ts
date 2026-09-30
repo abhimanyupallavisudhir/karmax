@@ -581,6 +581,15 @@ interface Session {
   expiresAt?: number;
 }
 
+/** Enterprise SSO as the sign-in card shows it: configured, and whether its
+ * provider is registered yet (audit R-11). While the IdP is unreachable the
+ * button stays visible but disabled, so an organization that requires SSO sees
+ * why nobody can sign in rather than no way in at all. */
+function ssoSession(identity: { oidcProviderId?: string; ssoAvailable: boolean } | undefined) {
+  return identity?.oidcProviderId
+    ? { providerId: identity.oidcProviderId, ...(identity.ssoAvailable ? {} : { unavailable: true }) } : null;
+}
+
 export class Gateway {
   private sessions = new Map<string, Session>();
   private passwordlessSession?: Promise<{ sid: string; session: Session }>;
@@ -1581,7 +1590,7 @@ export class Gateway {
           if (((await this.deps.paidLaunchSettings?.publicLaunchInfo()) ?? publicLaunchInfo()).paidLaunch && !(await this.deps.store.policyAcceptances(current.user.id))
             .some((acceptance) => acceptance.context === 'signup')) {
             return this.json(res, 200, { authRequired: true, authenticated: false, policyAcceptanceRequired: true,
-              user: current.user, sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+              user: current.user, sso: ssoSession(this.deps.identity),
               google: this.deps.identity.googleEnabled, github: this.deps.identity.githubEnabled });
           }
           const onboardingKey = `git:onboarding:${current.user.id}`;
@@ -1595,7 +1604,7 @@ export class Gateway {
           if (gitOnboarding) (await this.deps.store.kvSet(onboardingKey, 'seen'));
           return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user, gitOnboarding,
           emailDelivery: (await this.deps.identity.canSendEmail?.()) ?? false,
-          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+          sso: ssoSession(this.deps.identity),
           google: this.deps.identity.googleEnabled,
           github: this.deps.identity.githubEnabled });
         }
@@ -1606,7 +1615,7 @@ export class Gateway {
           signupAvailable: (await this.deps.identity.hasUsers()),
           // Whether "Forgot password?" can deliver anything.
           emailDelivery: (await this.deps.identity.canSendEmail?.()) ?? false,
-          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+          sso: ssoSession(this.deps.identity),
           google: this.deps.identity.googleEnabled,
           github: this.deps.identity.githubEnabled,
         });
@@ -2032,7 +2041,7 @@ export class Gateway {
         // again (the failure was logged server-side only). Report the truth and let
         // the UI disable what cannot work.
         deliveryChannels: this.deps.deliveryChannels ?? ['browser'],
-        sso: this.deps.identity?.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+        sso: ssoSession(this.deps.identity),
         google: this.deps.identity?.googleEnabled ?? false,
         github: this.deps.identity?.githubEnabled ?? false,
       });
@@ -4021,9 +4030,18 @@ export class Gateway {
             const { remoteName } = await import('../world/provision-git.js');
             const repositories = [...new Set([...(project.config.repos ?? []).map(remoteName),
               ...(await store.listProjectRepositories(project.id)).map(({ repository }) => repository.name)])];
+            const { environmentBase } = await import('../world/project-runtime.js');
+            const bases = new Map<string, string | undefined>();
+            const builds = [];
+            for (const build of (await environments.builds(project.id))) {
+              if (!bases.has(build.provider)) bases.set(build.provider, await environmentBase(store, project.id, build.provider));
+              const base = bases.get(build.provider);
+              // Worlds skip a build made on another template (selectProjectEnvironment).
+              builds.push({ ...build, recoveryRevision: environmentBuildRevision(build),
+                ...(base !== undefined && build.base !== base ? { stale: true } : {}) });
+            }
             return this.json(res, 200, { spec: spec ?? null, repositories,
-              digest: spec ? environments.digest(spec) : null, builds: (await environments.builds(project.id)).map(build => ({ ...build,
-                recoveryRevision: environmentBuildRevision(build) })) });
+              digest: spec ? environments.digest(spec) : null, builds });
           }
           if (method === 'PUT' && !sub) {
             const body = await this.body(req);
@@ -4066,7 +4084,7 @@ export class Gateway {
               ...(connection ? { connection: { apiKey: connection.apiKey,
                 apiUrl: (connection.config as any)?.apiUrl, target: (connection.config as any)?.target,
                 template: (connection.config as any)?.template } } : {}) })
-              .then((result) => finishEnvironmentBuild(store, attempt, { ref: result.ref, status: 'ready' }),
+              .then((result) => finishEnvironmentBuild(store, attempt, { ref: result.ref, ...(result.base ? { base: result.base } : {}), status: 'ready' }),
                 (error) => finishEnvironmentBuild(store, attempt,
                   { status: 'failed', error: String(error instanceof Error ? error.message : error).slice(0, 800) }))
               .catch(error => console.error('Failed to persist environment build completion', error));

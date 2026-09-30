@@ -5,7 +5,8 @@ import path from 'node:path';
 import { bootHarness, type Harness } from './helpers/harness.js';
 import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
 import { MockAdapter } from '../src/agent/mock.js';
-import { providerFailure } from '../src/agent/limits.js';
+import { providerFailure, SandboxProviderFailure } from '../src/agent/limits.js';
+import type { UsageResult } from '../src/agent/usage.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { accountCoordinatorId } from '../src/coordinators/names.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
@@ -25,6 +26,9 @@ describe('credential Retry end to end', () => {
   let turns = 0;
   let expectedHome = '';
   let quotaFailures = 0;
+  let sandboxQuotaFailures = 0;
+  let hostUsage: UsageResult | undefined;
+  const probed: string[] = [];
   const accountId = 'login:claude:personal';
   const mock = new MockAdapter();
 
@@ -41,6 +45,13 @@ describe('credential Retry end to end', () => {
       async runTurn(input, ctx) {
         turns++;
         expect(input.resolvedAuth?.configHome).toBe(expectedHome || home);
+        if (sandboxQuotaFailures > 0) {
+          sandboxQuotaFailures--;
+          // What the adapters throw for a limit the CLI reported inside a remote sandbox.
+          throw new SandboxProviderFailure(providerFailure('Claude usage limit reached · resets in 2s', {
+            kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: '5h', resetHint: 'in 2s',
+          }));
+        }
         if (quotaFailures > 0) {
           quotaFailures--;
           throw providerFailure('Claude usage limit reached · resets in 1s', {
@@ -52,7 +63,7 @@ describe('credential Retry end to end', () => {
         });
         return mock.runTurn(input, ctx);
       },
-    }, { configHomes: homes });
+    }, { configHomes: homes, probeUsage: async ({ configHome }) => { probed.push(configHome); return hostUsage; } });
     base = (await h.startGateway()).url;
     const session: any = await fetch(`${base}/api/session`).then(r => r.json());
     headers = { authorization: `Bearer ${session.token}`, 'content-type': 'application/json' };
@@ -204,6 +215,55 @@ describe('credential Retry end to end', () => {
     const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
     await expect.poll(async () => (await view()).stage, { timeout: 60_000 }).toBe('review');
     expect(turns).toBe(before + 5);
+    await h.api.signalTask(token, task.id, 'cancel');
+  }, 90_000);
+
+  // Audit R-4: a limit reported from inside a sandbox used to become an ordinary
+  // agent error — three retries on the exhausted login, then needs-human.
+  it('waits out a sandbox-reported limit the host cannot confirm, leaving the shared login alone', async () => {
+    const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await coordinator.setAccountAvailability({ accountId, status: 'available' });
+    healthy = true;
+    hostUsage = { ok: false, at: Date.now(), reason: 'setup-token' };
+    sandboxQuotaFailures = 4; // more than the Resolve attempt budget
+    probed.length = 0;
+    const before = turns;
+    const repo = await h.makeRepo('sandbox-quota');
+    const project = (await h.store.createProject('Sandbox quota', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    const task = await h.api.createTask(token, { projectId: project.id, title: 'Sandbox quota task',
+      prompt: '@write sq.txt :: SQ\n@run git add sq.txt && git commit -m sq\n@review Sandbox quota',
+      params: { 'agent:do': { provider: 'claude', model: 'claude-fable-5-1' } },
+    });
+    const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
+    await expect.poll(async () => (await view()).waitingFor?.kind, { timeout: 30_000, interval: 100 }).toBe('account');
+    expect(await status(accountId)).toBe('available'); // unconfirmed: not parked
+    await expect.poll(async () => (await view()).stage, { timeout: 60_000 }).toBe('review');
+    expect(turns).toBe(before + 5);
+    expect(probed).toEqual(Array(4).fill(home));
+    expect(await status(accountId)).toBe('available');
+    await h.api.signalTask(token, task.id, 'cancel');
+  }, 90_000);
+
+  it('parks the login when the host confirms a sandbox-reported limit', async () => {
+    const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await coordinator.setAccountAvailability({ accountId, status: 'available' });
+    healthy = true;
+    hostUsage = { ok: true, at: Date.now(), session: { pct: 100, resetLabel: 'soon', resetAt: Date.now() + 3_000 } };
+    sandboxQuotaFailures = 1;
+    const before = turns;
+    const repo = await h.makeRepo('confirmed-quota');
+    const project = (await h.store.createProject('Confirmed quota', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    const task = await h.api.createTask(token, { projectId: project.id, title: 'Confirmed quota task',
+      prompt: '@write cq.txt :: CQ\n@run git add cq.txt && git commit -m cq\n@review Confirmed quota',
+      params: { 'agent:do': { provider: 'claude', model: 'claude-fable-5-1' } },
+    });
+    await expect.poll(async () => status(accountId), { timeout: 30_000, interval: 100 }).toBe('exhausted');
+    const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
+    await expect.poll(async () => (await view()).stage, { timeout: 60_000 }).toBe('review');
+    expect(turns).toBe(before + 2);
+    hostUsage = undefined;
     await h.api.signalTask(token, task.id, 'cancel');
   }, 90_000);
 
