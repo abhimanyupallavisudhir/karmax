@@ -44,7 +44,7 @@ reach() {
   # Caddy asks the app before minting a preview certificate. A refusal (4xx) is
   # an answer; no answer means Caddy cannot reach the app to ask.
   ask=$(docker exec "$(caddy)" \
-    wget -q -S -O /dev/null "$(ask_url)?domain=p-probe.preview.$domain" 2>&1 | awk '/HTTP\//{print $2}' | tail -n 1)
+    wget -q -S -O /dev/null "$(ask_url)?domain=p-probe.preview.$domain" 2>&1 | awk '$1 ~ /^HTTP\// { print $2; exit }')
   case "$ask" in
     2??|4??) echo "ok   Caddy's on-demand TLS check reaches the app ($ask)" ;;
     *) echo "FAIL Caddy's on-demand TLS check got no answer from the app"; failed=1 ;;
