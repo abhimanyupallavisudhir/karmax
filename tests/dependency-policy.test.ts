@@ -10,7 +10,7 @@ const minimums: Record<string, string> = {
   '@temporalio/client': '1.24.0',
   'better-auth': '1.7.6',
   'e2b': '2.51.0',
-  'nodemailer': '9.1.1',
+  'nodemailer': '10.0.12',
   'vitest': '4.1.11',
 };
 
