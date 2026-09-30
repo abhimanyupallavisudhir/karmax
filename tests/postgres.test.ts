@@ -671,6 +671,10 @@ integration('PostgreSQL cutover', () => {
     expect((await opened.store.listTags(project.id)).map((tag) => tag.name)).toEqual(['database']);
     (await opened.store.saveView(task.id, { status: 'active', stage: 'do', messages: [], transcripts: {} } as any));
     expect((await opened.store.listTaskSummaries(project.id))[0]).toMatchObject({ id: task.id, lastView: { status: 'active', stage: 'do' } });
+    // The view's lifecycle event is the first row written after cutover: the
+    // PostgreSQL sequence continues after the imported events.
+    expect((await opened.store.eventsSince(task.id, 0)).map((event) => [event.seq, event.type]))
+      .toEqual([[eventSeq, 'view.updated'], [eventSeq + 1, 'view.updated']]);
     (await opened.store.setTaskArchived(task.id, true));
     expect((await opened.store.getTask(task.id))?.params.archived).toBe(true);
     expect(Number((await opened.store.operationalSnapshot()).databaseBytes)).toBeGreaterThan(0);
@@ -679,7 +683,7 @@ integration('PostgreSQL cutover', () => {
     const postCutoverTask = (await opened.store.createTask({ projectId: postCutoverProject.id, title: 'Written in PostgreSQL',
       workflow: 'software-dev', workflowVersion: 'software-dev@1', params: { prompt: 'Written in PostgreSQL', draft: false } }));
     expect((await opened.store.appendEvent({ taskId: postCutoverTask.id, type: 'task.created', ts: Date.now(), payload: {} })))
-      .toBe(eventSeq + 1);
+      .toBe(eventSeq + 2);
     (await opened.store.deleteProject(postCutoverProject.id));
     expect((await opened.store.getProject(postCutoverProject.id))).toBeUndefined();
     (await opened.store.close());
@@ -703,7 +707,8 @@ integration('PostgreSQL cutover', () => {
 
     const reopened = (await openStore(storeFile, url!));
     expect(reopened.migration).toEqual({ imported: false, tables: 0, rows: 0 });
-    expect((await reopened.store.eventsSince(task.id, 0))).toHaveLength(1);
+    // The imported event and the view's lifecycle event, not imported twice.
+    expect((await reopened.store.eventsSince(task.id, 0))).toHaveLength(2);
     (await reopened.store.close());
 
     const reopenedIdentity = await IdentityService.open(authFile, { secret, databaseUrl: url! });
