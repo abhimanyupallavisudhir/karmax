@@ -1372,6 +1372,7 @@ a.ins-task-title:hover { color: var(--accent); }
 }
 .account-status { padding: 10px 0; border-top: 1px solid var(--line); }
 .form-row { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
+.form-row-head { display: flex; align-items: center; gap: 4px; }
 .form-row label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
 .form-row input, .form-row select, .form-row textarea {
   padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); outline: none;
