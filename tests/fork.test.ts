@@ -1,9 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { materializeFork, claudeCwdSlug, findProviderSession } from '../src/agent/fork.js';
+import { materializeFork, claudeCwdSlug, findProviderSession, codexSessionFiles } from '../src/agent/fork.js';
 
 /**
  * Hermetic verification of fork materialization (SPEC §10.5 / the fork-bug fix):
@@ -15,6 +15,22 @@ const tmp = (p: string) => fs.mkdtempSync(path.join(os.tmpdir(), p));
 const sid = () => crypto.randomUUID();
 
 describe('materializeFork — Claude (per config-home × cwd)', () => {
+  it('selects the most complete Claude copy even when a stale fork sorts first', () => {
+    const home = tmp('karmax-claude-copies-');
+    const session = sid();
+    try {
+      const stale = path.join(home, 'projects', 'a-fork', `${session}.jsonl`);
+      const latest = path.join(home, 'projects', 'z-original', `${session}.jsonl`);
+      fs.mkdirSync(path.dirname(stale), { recursive: true });
+      fs.mkdirSync(path.dirname(latest), { recursive: true });
+      fs.writeFileSync(stale, '{"type":"user","uuid":"1"}\n');
+      fs.writeFileSync(latest, fs.readFileSync(stale, 'utf8') + '{"type":"assistant","uuid":"2"}\n');
+      // Copying an old fork later must not make it authoritative.
+      fs.utimesSync(stale, new Date(), new Date(Date.now() + 60_000));
+      expect(findProviderSession({ provider: 'claude', session, srcHome: home })).toBe(latest);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
   it("copies the source session .jsonl into the fork's (home × world) project dir", () => {
     const srcHome = tmp('karmax-src-'), forkHome = tmp('karmax-fork-');
     const world = '/tmp/karmax-worlds/task-NEW';
@@ -196,4 +212,32 @@ describe('materializeFork — Codex (by id in the home)', () => {
       fs.rmSync(forkHome, { recursive: true, force: true });
     }
   });
+});
+
+
+it('reads only bounded metadata when following Codex history lineage', () => {
+  const home = tmp('karmax-lineage-bounded-');
+  const session = sid();
+  const dir = path.join(home, 'sessions');
+  fs.mkdirSync(dir);
+  const file = path.join(dir, `rollout-${session}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: session } }) + '\n');
+  fs.appendFileSync(file, ' '.repeat(2 * 1024 * 1024));
+  const readFile = vi.spyOn(fs, 'readFileSync');
+  try {
+    expect(codexSessionFiles({ session, forkHome: home, searchInstallation: false })).toEqual([file]);
+    // Selection validates copies once; lineage inspection must not read it again.
+    expect(readFile.mock.calls.filter(([name]) => name === file)).toHaveLength(1);
+  } finally { readFile.mockRestore(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+it('accepts large valid Codex metadata without reading the rollout body', () => {
+  const home = tmp('karmax-lineage-tools-');
+  const session = sid();
+  const dir = path.join(home, 'sessions');
+  fs.mkdirSync(dir);
+  const file = path.join(dir, `rollout-${session}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: session, instructions: 'x'.repeat(80_000) } }) + '\n');
+  try { expect(codexSessionFiles({ session, forkHome: home, searchInstallation: false })).toEqual([file]); }
+  finally { fs.rmSync(home, { recursive: true, force: true }); }
 });

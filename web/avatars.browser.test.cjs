@@ -27,6 +27,7 @@ const assert = require('node:assert/strict');
         };
         toast = (message, error) => toasts.push({ message, error: !!error });
         loadAvatars = async () => {}; renderMain = () => {};
+        window.routes = []; go = async (path) => { routes.push(path); };
         window.openEditor = (avatar) => openAvatarEditor(S.projects[0], avatar);
         window.signIn = (user) => { S.user = user; };
       `);
@@ -51,6 +52,8 @@ const assert = require('node:assert/strict');
     assert.deepEqual(created.body.callableBy, ['user:owner']);
     assert.equal(created.body.authorityMode, 'full');
     assert.deepEqual(await page.evaluate(() => toasts), [{ message: 'Avatar created', error: false }]);
+    // The new Avatar opens at its own URL.
+    assert.match((await page.evaluate(() => routes))[0], /\/avatars\/avatar_new$/);
 
     // Single-user installations identify the signed-in user by a bare id.
     await page.evaluate(() => { signIn('me'); openEditor(); });

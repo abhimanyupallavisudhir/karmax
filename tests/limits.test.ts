@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   ProviderFailure,
+  isProviderPolicyRejection,
   classifyProviderTurnError,
   classifyLimitError,
   isTransportError,
@@ -13,6 +14,21 @@ import {
 } from '../src/agent/limits.js';
 
 describe('classifyLimitError', () => {
+  it.each([
+    'organization model request rate limit exceeded',
+    'organization remote sandbox start rate limit exceeded',
+    'organization active model turn limit reached',
+    'E2B RateLimitError 429', 'npm registry HTTP 401 unauthorized', 'Disk quota exceeded',
+  ])('never parks a login for an untagged error: %s', (message) => {
+    expect(classifyProviderTurnError(new Error(message), 'claude').classification.limited).toBe(false);
+  });
+
+  it('does not turn unrelated build output into a provider safety rejection', () => {
+    expect(isProviderPolicyRejection(new Error('tests/content_policy_violation.test.ts failed'))).toBe(false);
+    expect(isProviderPolicyRejection(new Error('fixture says blocked by our safety systems'))).toBe(false);
+    expect(isProviderPolicyRejection({ error: { code: 'content_policy_violation' } })).toBe(true);
+    expect(isProviderPolicyRejection({ code: 'test_content_policy_violation_fixture' })).toBe(false);
+  });
   it('keeps safety blocks task-local even when the envelope says unauthorized', () => {
     const message = 'misalignmentPolicyViolation HTTP 401 unauthorized: This request was blocked by our safety systems. Reason: Potentially unintended activity.';
     expect(classifyLimitError(message, { providerOrigin: true })).toEqual({ limited: false });
@@ -64,6 +80,11 @@ describe('classifyLimitError', () => {
     );
     expect(c.limited).toBe(true);
     expect(c.hard).toBe(true);
+  });
+
+  it('classifies Anthropic low credit balance as hard billing exhaustion', () => {
+    expect(classifyLimitError('Your credit balance is too low to access the Anthropic API.', { providerOrigin: true }))
+      .toMatchObject({ limited: true, hard: true, kind: 'quota' });
   });
 
   it('generalizes novel provider wording by nearby state+noun phrase families', () => {
@@ -239,6 +260,10 @@ describe('resetAtFromHint', () => {
 });
 
 describe('isTransportError', () => {
+  it.each(['500-iteration loop failed', 'expected 503 rows', 'request id 529'])('does not treat arbitrary numbers as HTTP failures: %s', (message) => {
+    expect(isTransportError(message)).toBe(false);
+  });
+
   it('recognizes the suspend/stream failures seen in production', () => {
     expect(isTransportError('Claude Code returned an error result: API Error: Connection closed mid-response. The response above may be incomplete.')).toBe(true);
     expect(isTransportError('fetch failed')).toBe(true);

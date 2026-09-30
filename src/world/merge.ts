@@ -1,3 +1,4 @@
+import { conflictMarkerFiles as scanConflictMarkers } from './conflict-markers.js';
 import path from 'node:path';
 import { validGitBranch } from '../util/git-ref.js';
 import fs from 'node:fs';
@@ -5,6 +6,7 @@ import { World, WorldRepo, WorldGitIdentity, worldRepos, worldRepoTarget, orderC
 import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
 import { paths } from '../config/paths.js';
 import { withWorktreeLock } from './worktree-lock.js';
+import { serializeProjectWikiOperation } from '../wiki/repository.js';
 import { BRAND } from '../domain/brand.js';
 
 /**
@@ -19,7 +21,7 @@ export function scratchWorktreeHome(): string {
   return dir;
 }
 
-/** Per-invocation `-c` config for the profile identity (PLAN-git-config.md §4A):
+/** Per-invocation `-c` config for the profile identity (wiki plans/PLAN-git-config §4A):
  *  merge commits land in the TARGET's worktree (or a temp one), which carries no
  *  worktree-scoped profile config — inject it per command instead so those
  *  commits are attributed (and signed) exactly like the attempt's. */
@@ -36,7 +38,7 @@ export interface MergeResult {
   conflict?: string;
   /** Uncommitted paths that blocked the merge (newline-joined). Commit-vs-gitignore
    *  is a judgment call, so a dirty tree is rejected back to the task agent
-   *  instead of being blind-swept (PLAN-git-config.md §6). */
+   *  instead of being blind-swept (wiki plans/PLAN-git-config §6). */
   dirty?: string;
   landedFiles: string[];
   note?: string;
@@ -60,7 +62,12 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
   if (repos.length === 1) return finalizeMergeRepo(repos[0]!, worldRepoTarget(repos[0]!, target), world.handle.id, identity);
 
   const landedFiles: string[] = [];
+  // The reported commit is the one that landed in the world's primary repo (the
+  // one task summaries name). The last repo merged is usually the project wiki
+  // companion, whose untouched target would otherwise stand in for the task's.
+  const primary = world.handle.repo ?? repos.find((r) => r.role !== 'project-wiki')?.repo;
   let sha: string | undefined;
+  let primarySha: string | undefined;
   for (const r of repos) {
     const res = await finalizeMergeRepo(r, worldRepoTarget(r, target), world.handle.id, identity);
     landedFiles.push(...res.landedFiles.map((f) => `${r.name}/${f}`));
@@ -75,9 +82,10 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
       };
     }
     sha = res.sha;
+    if (r.repo === primary) primarySha = res.sha;
   }
   const targets = [...new Set(repos.map((repo) => worldRepoTarget(repo, target)))];
-  return { merged: true, sha, landedFiles,
+  return { merged: true, sha: primarySha ?? sha, landedFiles,
     note: targets.length === 1 ? `merged ${repos.length} repos into ${targets[0]}` : `merged ${repos.length} repos into their configured targets` };
 }
 
@@ -86,6 +94,12 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
  *  host-local checkout lands through this exact machinery (same conflict/dirty
  *  guards, same target-worktree landing) after importing its branch bundle. */
 export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: string, identity?: WorldGitIdentity): Promise<MergeResult> {
+  const land = () => finalizeMergeRepoUnlocked(worldRepo, target, worldId, identity);
+  return worldRepo.role === 'project-wiki' && worldRepo.repo
+    ? serializeProjectWikiOperation(worldRepo.repo, land) : land();
+}
+
+async function finalizeMergeRepoUnlocked(worldRepo: WorldRepo, target: string, worldId: string, identity?: WorldGitIdentity): Promise<MergeResult> {
   // `target` is task input; as a positional git argument a leading `-` would be an option.
   if (!validGitBranch(target)) throw new Error(`invalid target branch "${target}"`);
   const root = worldRepo.root;
@@ -116,7 +130,7 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
   //    vs-gitignore is a judgment call, and a blind `git add -A` here would land
   //    files generated AFTER the Review gate (test artifacts, logs) unseen.
   //    Reject with the file list so the workflow loops back to the task agent
-  //    (PLAN-git-config.md §6). One mechanical exception: a RESOLVED but
+  //    (wiki plans/PLAN-git-config §6). One mechanical exception: a RESOLVED but
   //    uncommitted merge (MERGE_HEAD present; step 0 ruled out unresolved paths)
   //    is completed on purpose — that is a forgotten `git commit`, not a
   //    judgment call — and the marker scan below still rejects anything that
@@ -149,9 +163,10 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
   // keeps the safety scan running rather than silently disabling it.
   const baseResolvable = (await git(root, ['rev-parse', '--verify', base])).code === 0;
   const changed = baseResolvable
-    ? await git(root, ['diff', '--name-only', `${base}...HEAD`])
-    : await git(root, ['ls-tree', '-r', '--name-only', 'HEAD']);
-  const landedFiles = changed.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+    ? await git(root, ['diff', '-z', '--name-only', `${base}...HEAD`])
+    : await git(root, ['ls-tree', '-rz', '--name-only', 'HEAD']);
+  if (changed.code !== 0) throw new Error(`could not list changed files: ${changed.stderr}`);
+  const landedFiles = changed.stdout.split('\0').filter(Boolean);
   const baseNote = baseResolvable ? undefined : `base "${base}" not found — forked off HEAD; scanned all files at HEAD`;
 
   // 1b. Never land conflict markers as content: scan what this attempt changed.
@@ -265,17 +280,7 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
  * mention a single marker (docs, fixtures) from tripping the guard.
  */
 async function conflictMarkerFiles(dir: string, files: string[]): Promise<string[]> {
-  if (!files.length) return [];
-  const grep = async (pattern: string): Promise<Set<string>> => {
-    const r = await git(dir, ['grep', '-l', '-E', pattern, 'HEAD', '--', ...files]);
-    return new Set(
-      r.stdout.split('\n').map((l) => l.replace(/^HEAD:/, '').trim()).filter(Boolean),
-    );
-  };
-  const open = await grep('^<{7}( |$)');
-  if (!open.size) return [];
-  const close = await grep('^>{7}( |$)');
-  return [...open].filter((f) => close.has(f));
+  return scanConflictMarkers(args => git(dir, args), 'HEAD', files);
 }
 
 /** Find the worktree path (if any) that currently has `branch` checked out. */

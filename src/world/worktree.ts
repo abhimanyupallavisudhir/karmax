@@ -1,3 +1,4 @@
+import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { missingBaseAdjustment } from './branch-fallback.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -13,6 +14,7 @@ import { expandPath } from '../util/expand.js';
 import { openLocalPty, startLocalProcess, runLocalCommand } from './local-execution.js';
 import { addCheckoutWith } from './checkout.js';
 import { materializeGitCredential } from './git-credential.js';
+import { readRegularFilePrefix } from './file-prefix.js';
 import { taskBranch } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
@@ -48,7 +50,7 @@ export class WorktreeProvider implements WorldProvider {
 
   async create(spec: WorldSpec): Promise<World> {
     fs.mkdirSync(this.home, { recursive: true });
-    const branch = spec.branch ?? taskBranch(spec.taskId);
+    const branch = spec.checkouts?.[0]?.branch ?? spec.branch ?? taskBranch(spec.taskId);
     const root = path.join(this.home, spec.taskId);
 
     // Normalize the configured sources: `repos` (multi) wins over `repo` (legacy single).
@@ -87,8 +89,8 @@ export class WorktreeProvider implements WorldProvider {
       // Single repo: the worktree IS the world root (unchanged layout).
       const resolved = resolvedSources[0]!;
       const source = spec.repositoryOrigins?.[resolved.source] ?? (resolved.managed ? resolved.source : undefined);
-      repos.push(await this.addWorktree(resolved.repo, root, repoName(resolved.source), branch,
-        this.repoSpec(spec, resolved.source), warnings, source, ephemeralPaths,
+      repos.push(await this.addWorktree(resolved.repo, root, spec.checkouts?.[0]?.name ?? repoName(resolved.source), branch,
+        { ...this.repoSpec(spec, resolved.source), ...spec.checkouts?.[0] }, warnings, source, ephemeralPaths,
         '', Boolean(spec.repositoryBranches?.[resolved.source]?.target), resolved.source));
     } else {
       // Multi-repo (or a lone repo a multi-PR task asked to nest): the world root
@@ -97,7 +99,7 @@ export class WorktreeProvider implements WorldProvider {
       if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
       fs.mkdirSync(root, { recursive: true });
       const names = uniqueNames([...(spec.scratch ? ['scratch'] : []),
-        ...resolvedSources.map((resolved) => repoName(resolved.source))]);
+        ...resolvedSources.map((resolved, index) => spec.checkouts?.[index]?.name ?? repoName(resolved.source))]);
       if (spec.scratch) {
         scratchWorkdir = path.join(root, names.shift()!);
         fs.mkdirSync(scratchWorkdir, { recursive: true });
@@ -106,8 +108,8 @@ export class WorktreeProvider implements WorldProvider {
         const name = names[i]!;
         const resolved = resolvedSources[i]!;
         const source = spec.repositoryOrigins?.[resolved.source] ?? (resolved.managed ? resolved.source : undefined);
-        repos.push(await this.addWorktree(resolved.repo, path.join(root, name), name, branch,
-          this.repoSpec(spec, resolved.source), warnings, source,
+        repos.push(await this.addWorktree(resolved.repo, path.join(root, name), name, spec.checkouts?.[i]?.branch ?? branch,
+          { ...this.repoSpec(spec, resolved.source), ...spec.checkouts?.[i] }, warnings, source,
           ephemeralPaths, name, Boolean(spec.repositoryBranches?.[resolved.source]?.target), resolved.source));
       }
     }
@@ -191,7 +193,7 @@ export class WorktreeProvider implements WorldProvider {
         fs.rmSync(wt, { recursive: true, force: true });
       }
       await git(repo, ['worktree', 'prune']);
-      if (spec.resetBranch) await git(repo, ['branch', '-D', branch]);
+      if (spec.resetBranch) await deleteForReset(repo, branch, base);
       // Reuse the branch if it already exists, else create it.
       const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
       const originBranch = spec.sourceAuthority === 'origin' && spec.branch && !spec.resetBranch
@@ -352,7 +354,7 @@ export class WorktreeProvider implements WorldProvider {
   }
 
   /**
-   * Give this worktree its git identity (PLAN-git-config.md §4A). With a profile
+   * Give this worktree its git identity (wiki plans/PLAN-git-config §4A). With a profile
    * identity, everything is WORKTREE-scoped (`extensions.worktreeConfig`): the
    * user's own checkout and sibling worlds are untouched, and two concurrent
    * worlds can commit as different accounts. Enabling the extension itself is the
@@ -439,7 +441,8 @@ class WorktreeWorld implements World {
 
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const cwd = opts.cwd ?? worldWorkingDirectory(this.handle);
-    const env = opts.env ? { ...process.env, ...opts.env } : process.env;
+    if (cmd === 'git' && opts.input === undefined) return git(cwd, args, opts);
+    const env = scrubbedEnv({ provider: 'mock', extra: opts.env });
     // STDIN (a secret fed to an in-world helper) needs a spawn-based path;
     // execFile cannot pass input. Keep the fast pexec path for the common case.
     if (opts.input !== undefined) {
@@ -464,6 +467,10 @@ class WorktreeWorld implements World {
 
   async readFileBuffer(relPath: string): Promise<Buffer> {
     return fs.promises.readFile(this.filePath(relPath));
+  }
+
+  async readFilePrefix(relPath: string, maxBytes: number): Promise<Buffer> {
+    return readRegularFilePrefix(this.filePath(relPath), maxBytes);
   }
 
   async writeFile(relPath: string, content: string): Promise<void> {
@@ -575,6 +582,23 @@ export function managedRepoPath(source: string, home = paths().worlds): string {
   const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
   const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
   return path.join(home, '.repositories', `${name}-${hash}`);
+}
+
+/**
+ * Delete a task branch so a reset world starts from its base. A branch that
+ * survives would be reused below with its old commits, so any failure other
+ * than "no such branch" stops the reset. Git refuses to delete (or force-move)
+ * a branch checked out in another worktree, and moving it anyway would rewrite
+ * that checkout under its owner, so the owner is told how to release it.
+ */
+async function deleteForReset(repo: string, branch: string, base: string): Promise<void> {
+  const deleted = await git(repo, ['branch', '-D', branch]);
+  if (deleted.code === 0 || (await git(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])).code !== 0) return;
+  const holder = /(?:checked out|used by worktree) at '([^']+)'/.exec(deleted.stderr)?.[1];
+  throw new Error(holder
+    ? `can't reset branch "${branch}" to "${base}": it is checked out at ${holder}. `
+      + `Switch that checkout off it (\`git -C ${holder} switch --detach\`), then reset again.`
+    : `can't reset branch "${branch}" to "${base}": ${deleted.stderr.trim() || `git branch -D exited ${deleted.code}`}`);
 }
 
 /** The repo's basename (its worktree subdirectory name in a multi-repo world). */

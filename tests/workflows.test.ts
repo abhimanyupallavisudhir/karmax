@@ -31,6 +31,33 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await h?.stop();
   });
 
+  it('rotates busy coordinators without dropping their queues or held leases', async () => {
+    const cases = [
+      { type: 'accountCoordinator', query: 'accounts', input: { state: {
+        accounts: [{ id: 'login', provider: 'mock', configHome: '/fixture', status: 'available', maxConcurrent: 1, inUse: 1 }],
+        queue: [{ taskId: 'waiting', turnId: 'wait', allowed: ['login'] }],
+        granted: [{ taskId: 'holder', turnId: 'held', accountId: 'login', grantedAt: Date.now() }], processed: 1000,
+      } } },
+      { type: 'mergeQueue', query: 'queue', input: { domain: 'fixture', state: {
+        domain: 'fixture', current: 'holder', queue: ['waiting'], processed: 500,
+      } } },
+    ];
+    for (const item of cases) {
+      const handle = await h.client.workflow.start(item.type, { taskQueue: TASK_QUEUE,
+        workflowId: newId('rotation'), args: [item.input] });
+      try {
+        await expect.poll(async () => (await handle.describe()).runId, { timeout: 10_000 })
+          .not.toBe(handle.firstExecutionRunId);
+        const current = await handle.query<any>(item.query);
+        if (item.type === 'accountCoordinator') {
+          expect(current.waiting).toBe(1);
+          expect(current.accounts[0].inUse).toBe(1);
+          expect(await handle.query('accountTaskLeases', 'holder')).toEqual(['held']);
+        } else expect(current).toMatchObject({ current: 'holder', queue: ['waiting'] });
+      } finally { await handle.terminate(); }
+    }
+  });
+
   it('software-dev: cancelling Setup aborts provider provisioning and settles promptly', async () => {
     const project = (await h.store.createProject('Blocked setup', { worldProvider: 'blocked-setup' as any }));
     const task = (await h.store.createTask({ projectId: project.id, title: 'Cancel setup', workflow: 'software-dev',
@@ -167,7 +194,11 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     });
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
     await new Promise((r) => setTimeout(r, 700));
-    await handle.signal('followUp', { id: 'm1', role: 'user', text: '@write injected.txt :: from a live follow-up', ts: 0 });
+    const followUp = { id: 'm1', role: 'user' as const, text: '@write injected.txt :: from a live follow-up', ts: 0 };
+    await handle.signal('followUp', followUp);
+    // The API journals every accepted follow-up; the running turn asks the
+    // workflow for it only then (LT-13).
+    await h.store.appendEvent({ taskId, type: 'conversation.message', ts: Date.now(), payload: { role: 'do', message: followUp } });
     // The follow-up is executed in the SAME turn (in-flight), so the turn reaches Review
     // with BOTH files written and no second Do turn.
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
@@ -879,3 +910,23 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await wf.terminate('test done');
   });
 });
+
+it('replays task histories recorded before the September workflow review fixes', async () => {
+  const { Worker, bundleWorkflowCode } = await import('@temporalio/worker');
+  const { temporal } = await import('@temporalio/proto');
+  const { fileURLToPath } = await import('node:url');
+  const workflowBundle = await bundleWorkflowCode({ workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)) });
+  // Software Dev was recorded from fb5d3463 with stub activities through recovery, Review and cancellation.
+  // The child-settlement pair was recorded from 253e5cc2, before WF-31: a parent
+  // whose child was held for human input and then cancelled, and the child's
+  // replaced run.
+  // The sub-task-params pair was recorded from 2e2a006a, before PL-11 let
+  // create_sub_task carry params: a parent spawning a child whose Do turn ran
+  // and raised to it, then cancelled.
+  for (const name of ['review-legacy-justDo', 'review-legacy-mergeOnly', 'review-legacy-softwareDev',
+    'child-settlement-prechange-parent-history', 'child-settlement-prechange-child-history',
+    'subtask-params-prechange-parent-history', 'subtask-params-prechange-child-history']) {
+    const history = temporal.api.history.v1.History.fromObject(JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8')));
+    await Worker.runReplayHistory({ workflowBundle }, history);
+  }
+}, 60_000);

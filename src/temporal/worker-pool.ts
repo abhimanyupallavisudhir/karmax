@@ -1,7 +1,14 @@
+import type { WorkflowBundle } from '@temporalio/worker';
 import { TemporalConn } from './config.js';
 import { ActivityDeps } from '../activities/index.js';
 import { makeWorker, WorkerHandle } from './worker.js';
 import { buildVersionedBundle, ExternalWorkflowRef } from '../packages/bundle.js';
+
+/** Let the supervisor restart the service instead of serving without a poller. */
+export function terminateOnWorkerFailure(error: unknown): void {
+  console.error('  ! Activity worker failed:', error);
+  process.kill(process.pid, 'SIGTERM');
+}
 
 /**
  * Keeps a worker running for the task queue and can **roll** it to pick up
@@ -19,11 +26,13 @@ import { buildVersionedBundle, ExternalWorkflowRef } from '../packages/bundle.js
  */
 export class WorkerManager {
   private handle?: WorkerHandle;
+  private bundle?: WorkflowBundle;
   private runPromise?: Promise<void>;
   private externals: ExternalWorkflowRef[] = [];
   private refreshing?: Promise<void>;
   private starting?: Promise<void>;
   private stopping?: Promise<void>;
+  private draining = new Set<Promise<void>>();
   private stopRequested = false;
 
   /** Why the live worker stopped, if it did (see `watch`). */
@@ -53,21 +62,23 @@ export class WorkerManager {
   }
 
   /** Start the initial worker (built-ins, plus any externals given). */
-  async start(externals: ExternalWorkflowRef[] = []): Promise<void> {
+  async start(externals: ExternalWorkflowRef[] = [], bundle?: WorkflowBundle): Promise<void> {
     if (this.stopRequested) throw new Error('worker manager is stopping');
     if (this.starting || this.handle) throw new Error('worker manager already started');
     this.starting = (async () => {
       this.externals = externals;
-      this.handle = await this.build(externals);
+      this.handle = await this.build(externals, bundle);
       this.runPromise = this.watch(this.handle, this.handle.run());
     })();
     try { await this.starting; }
     finally { this.starting = undefined; }
   }
 
-  private async build(externals: ExternalWorkflowRef[]): Promise<WorkerHandle> {
-    const opts = externals.length ? { workflowBundle: await buildVersionedBundle(externals) } : {};
-    return makeWorker(this.conn, this.deps, opts);
+  private async build(externals: ExternalWorkflowRef[], prepared?: WorkflowBundle): Promise<WorkerHandle> {
+    const workflowBundle = prepared ?? await buildVersionedBundle(externals);
+    const handle = await makeWorker(this.conn, { ...this.deps, workflowBundle: () => this.bundle ?? workflowBundle }, { workflowBundle, shutdownGraceTime: '45 minutes' });
+    this.bundle = workflowBundle;
+    return handle;
   }
 
   /**
@@ -88,7 +99,10 @@ export class WorkerManager {
       this.runPromise = nextRun;
       this.externals = externals;
       old?.shutdown(); // graceful drain: stop polling, let in-flight finish
-      await oldRun?.catch(() => {});
+      if (oldRun) {
+        this.draining.add(oldRun);
+        void oldRun.finally(() => this.draining.delete(oldRun));
+      }
     };
     this.refreshing = (this.refreshing ?? Promise.resolve()).then(run, run);
     return this.refreshing;
@@ -103,6 +117,7 @@ export class WorkerManager {
       await this.refreshing?.catch(() => {});
       this.handle?.shutdown();
       await this.runPromise?.catch(() => {});
+      await Promise.allSettled(this.draining);
     })();
     await this.stopping;
   }

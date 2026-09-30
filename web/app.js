@@ -95,7 +95,7 @@ const S = {
   approvalRequests: [], // credential decisions for the selected task
   permissionRequests: [], // exact capability elevations requested by the selected task
   approvalItems: [], // organization vault metadata used to label/bind those requests
-  liveOutput: '',
+  liveOutput: {}, // role → { text, seq, turnId, attempt }: each agent's streamed text so far
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   followupHeights: {}, // manual minimum height for each draft, preserved across background renders
   // In-flight parameter edits are deliberately manual-save. Keep their working
@@ -103,7 +103,7 @@ const S = {
   paramEditDrafts: {}, // taskId -> { saved, values, dirtyNames }
   activity: [],
   search: '', // the working query string (Linear-style tokens + free text); mirrored in the URL as ?q=
-  // Task organization (PLAN-search-views): a view IS a saved query.
+  // Task organization: a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
@@ -141,9 +141,11 @@ const S = {
 // Promise to the browser, so remember the control that originated the current
 // event; feedbackFetch() can then bind the request to that control without every
 // one of the console's mutation handlers reinventing a spinner/disabled state.
-// The origin deliberately expires at the next microtask: background refreshes
-// and auto-save requests must not make an unrelated, previously-clicked button
-// look busy.
+// The origin expires when the event's task ends (a zero-delay timeout), so
+// background refreshes and auto-save requests never make an unrelated,
+// previously-clicked button look busy. It must outlive microtasks: for real
+// input the browser runs a microtask checkpoint after every listener, i.e.
+// between this capture listener and the control's own handler.
 let interactionOrigin = null;
 let interactionOriginEpoch = 0;
 let actionProgressCount = 0;
@@ -165,6 +167,7 @@ function rememberInteractionOrigin(event) {
   // Only activation keys count; ordinary typing must never be swallowed, and a
   // paste/drop into a text field is an upload, not an action on that field —
   // marking it pending would disable the field the user is typing in.
+  if (event.type === 'keydown' && (/^(?:INPUT|TEXTAREA)$/.test(control.tagName || '') || control.isContentEditable)) return;
   if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
   if ((event.type === 'paste' || event.type === 'drop') && /^(?:INPUT|TEXTAREA)$/.test(control.tagName || '')) return;
   if (control.classList?.contains('action-pending')) {
@@ -174,18 +177,17 @@ function rememberInteractionOrigin(event) {
   }
   const epoch = ++interactionOriginEpoch;
   interactionOrigin = control;
-  queueMicrotask(() => {
-    if (interactionOriginEpoch === epoch) {
-      interactionOrigin = null;
-    }
-  });
+  setTimeout(() => {
+    if (interactionOriginEpoch === epoch) interactionOrigin = null;
+  }, 0);
 }
 
-if (typeof document !== 'undefined') {
+function installInteractionTracking() {
   ['pointerdown', 'click', 'change', 'submit', 'paste', 'drop'].forEach((type) =>
     document.addEventListener(type, rememberInteractionOrigin, true));
   document.addEventListener('keydown', rememberInteractionOrigin, true);
 }
+if (typeof document !== 'undefined') installInteractionTracking();
 
 function actionLabel(control) {
   return String(control?.getAttribute?.('aria-label') || control?.title || control?.textContent || 'Action')
@@ -287,7 +289,7 @@ function taskRecord(id) {
 // Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
 // parsed and then canonicalised to the org form.
 function slugify(s) {
-  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
+  return String(s || '').normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
 }
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectPath(p) { return p ? [p.folder, p.name].filter(Boolean).join('/') : ''; }
@@ -345,6 +347,10 @@ function syncOrganizationSwitcher() {
 // `/<org>` prefix for the current (or a given) organization; '' when none is known.
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 
+/** Tabs that belong to the selected project (the router reads them from URLs,
+ *  the rail highlights the project, the main pane shows its tab bar). One list
+ *  so they never drift apart again. */
+const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
 // Second-segment words that name an organization-level view rather than a project.
 const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
 
@@ -352,11 +358,17 @@ const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbo
 // page it names. The tasks list's whole search state (free text, filters, group,
 // sort) is the one query string in `?q=`, so it rides along as `q` on every
 // project route: a search is just a URL.
+function decodeRoutePart(value, component = false) {
+  try { return component ? decodeURIComponent(value) : decodeURI(value); }
+  catch { return value; }
+}
+
 function parseRoute(url) {
-  const [pathname, search = ''] = String(url).split('?');
+  let [pathname, search = ''] = String(url).split('?');
+  try { pathname = decodeURI(pathname); } catch {}
   const query = new URLSearchParams(search);
   const q = query.get('q') || '';
-  const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
+  const seg = pathname.replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
   if (seg[0] === 'profile') return { name: 'profile', ...(seg[1] ? { userId: seg[1] } : {}) };
@@ -366,7 +378,7 @@ function parseRoute(url) {
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
   if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', sub: seg[1] || null, legacy: true };
   if (seg[0] === 'projects' && seg[1]) {
-    const tab = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+    const tab = PROJECT_SCOPED_TABS.includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
     const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
@@ -383,13 +395,14 @@ function parseRoute(url) {
   // The inbox is the one org view with a sub-view (which kind of notification).
   if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', org, tab: 'inbox', sub: seg[2] || null };
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
-  const tab = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+  const tab = PROJECT_SCOPED_TABS.includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
   const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
+  const avatarId = tab === 'avatars' && seg[3] ? seg[3] : null;
   return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
-    ...(wikiView ? { wikiView } : {}) };
+    ...(wikiView ? { wikiView } : {}), ...(avatarId ? { avatarId } : {}) };
 }
 
 // Which branch the project wiki shows is part of the page, so it lives in the
@@ -406,6 +419,11 @@ function wikiRoute(pid, view = '', entry = '') {
   const query = kind === 'task' && value ? `?task=${encodeURIComponent(value)}`
     : kind === 'branch' && value ? `?branch=${encodeURIComponent(value)}` : '';
   return `${projectRoute(pid, 'wiki')}${query}${entry ? `#${encodeURIComponent(entry)}` : ''}`;
+}
+
+// An open Avatar: /<org>/<project>/avatars/<id>; the list without an id.
+function avatarRoute(pid, avatarId) {
+  return `${projectRoute(pid, 'avatars')}${avatarId ? `/${encodeURIComponent(avatarId)}` : ''}`;
 }
 
 function fileRouteTarget(query) {
@@ -520,7 +538,6 @@ function renderRouteLoadingPage(title, label = 'Loading…') {
 }
 
 async function applyRoute() {
-  if (S.onboardingCompletion) dismissOnboardingCompletion();
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
@@ -557,6 +574,7 @@ async function applyRoute() {
       if (organizationChanged) {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+        syncLiveWatch();
         renderOnboarding();
         refreshOnboarding();
         renderRouteLoadingPage(org.name, 'Switching organization…');
@@ -643,28 +661,43 @@ async function applyRoute() {
     // view/cursor that doesn't exist here). The incoming URL's own ?q= is applied
     // below, so a link into another project's search still lands filtered.
     S.projectId = pid;
-    S.avatarSelected = null;
+    syncLiveWatch();
     S.search = '';
     S.searchResult = null;
     S.searchPending = false;
     S.cursorId = null;
-    await loadTasks().catch(() => {});
-    await loadAvatars().catch(() => {});
-    if (!routeIsCurrent()) return;
   }
-  else if (!S.tasks?.length) {
-    await loadTasks().catch(() => {});
-    if (!routeIsCurrent()) return;
+  const incomingListQuery = r.q || '';
+  const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
+  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
+  // A project with nothing in memory to paint reads everything its page needs
+  // together: tasks, avatars, tags/views and the list's search (RQ-9).
+  const reads = [];
+  if (!sameProject || !S.tasks?.length) reads.push(loadTasks().catch(() => {}));
+  if (!sameProject || !S.avatarAvailability || S.avatarProjectId !== pid) reads.push(loadAvatars().catch(() => {}));
+  // The URL owns the open Avatar, as it owns the open task.
+  S.avatarSelected = tab === 'avatars' ? r.avatarId || null : null;
+  S.avatarAuthorizationRequests = [];
+  if (S.avatarSelected) reads.push(loadAvatarAuthorizationRequests(S.avatarSelected));
+  let organizationRead = null, listSearch = null;
+  if (!projectOrganizationLoaded) {
+    organizationRead = loadOrg().catch(() => false);
+    if (!r.taskKey && tab === 'tasks') {
+      S.search = incomingListQuery;
+      listSearch = runSearch().catch(() => {});
+    }
   }
-  if (sameProject && (!S.avatarAvailability || S.avatarProjectId !== pid)) await loadAvatars().catch(() => {});
+  await Promise.all(reads);
+  if (!routeIsCurrent()) return;
+  if (S.avatarSelected && !S.avatars.some((avatar) => avatar.id === S.avatarSelected)) {
+    toast('Avatar not found', true);
+    return go(avatarRoute(pid), { replace: true });
+  }
   // Same-project tabs are local navigation. Their complete last-painted inputs
   // are already in memory, so reveal the destination before refreshing tags,
   // views, fields, and (for the task list) the authoritative search result.
   // A changed task-list query clears the previous server result and paints a
   // labelled local preview instead of flashing unrelated rows.
-  const incomingListQuery = r.q || '';
-  const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
-  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
   if (canPaintCachedProject) {
     S.tab = tab;
     closeTaskDom();
@@ -679,12 +712,11 @@ async function applyRoute() {
     if (tab === 'activity') seedActivity();
     if (tab === 'queue') seedQueue();
   }
-  const organizationRefresh = loadOrg().catch(() => false); // tags / saved views / field registry
-  // A task page can open entirely from the loaded task record and paints its own
-  // loading state below. Do not put the metadata refresh back in front of it.
-  // First visits/cross-project routes still wait so they never render foreign tags.
-  if (!r.taskKey || !projectOrganizationLoaded) await organizationRefresh;
-  else organizationRefresh.then(() => { if (routeIsCurrent()) renderRail(); });
+  // Tags / saved views / field registry. A task page in a project whose metadata
+  // is loaded re-reads none of it, so opening or j/k-walking tasks costs only the
+  // task's own reads (UI-6); the list refreshes it when shown again. First visits
+  // and cross-project routes wait so they never render foreign tags.
+  if (!r.taskKey || !projectOrganizationLoaded) await (organizationRead || loadOrg().catch(() => false));
   if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
@@ -700,7 +732,7 @@ async function applyRoute() {
     // The list is query-driven and the URL owns the query: a pasted, bookmarked,
     // reloaded or Back-navigated link paints the same filtered/grouped/sorted view.
     S.search = incomingListQuery;
-    await runSearch().catch(() => {});
+    await (listSearch || runSearch().catch(() => {}));
     if (!routeIsCurrent()) return;
   }
   renderRail();
@@ -715,6 +747,7 @@ async function applyRoute() {
     return renderTaskPage();
   }
   S.taskFile = null;
+  if (canPaintCachedProject && tab !== 'tasks') return;
   renderMain();
   if (tab === 'activity') seedActivity();
   if (tab === 'queue') seedQueue();
@@ -781,10 +814,12 @@ function installInfoDotTips() {
 
 // Tag chips are navigation everywhere they appear. Capture before row/form click
 // handlers so a chip never opens a task or mutates its tags as a side effect.
+// A dialog owns its chips: navigating from one would leave it over the list or
+// tear it down behind its close handler.
 function installTagRouter() {
   document.addEventListener('click', (ev) => {
     const chip = ev.target.closest('[data-tag-link]');
-    if (!chip) return;
+    if (!chip || chip.closest('#modal-root')) return;
     ev.preventDefault();
     ev.stopPropagation();
     navigateToTagSection(chip.dataset.tagLink);
@@ -1294,10 +1329,10 @@ function cfLayerHtml(f, layer, agentDefault) {
     </div>
     <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
       <label class="form-row">Who confirms${audienceComboHtml('cf-audience', audience)}</label>
-      <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
+      ${policyTip('Separate people or teams with commas. Add steps for reviews in sequence.')}
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Type [[ to add context from the wiki. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review prompt ${policyTip('Sent at each review. Type [[ for wiki context. Variables: {{prompt}}, {{response}}, {{reviewInfo}}, {{changedFiles}}, {{transcript}}.')}</div>
       <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
     </div>
   </div>`;
@@ -1354,7 +1389,7 @@ function responderOf(v) {
 }
 function normResponder(route) {
   return route?.kind === 'agent'
-    ? { kind: 'agent', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null, mcpConnections: route.mcpConnections }
+    ? { kind: 'agent', avatarId: route.avatarId || '', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null, mcpConnections: route.mcpConnections }
     : { kind: 'human', audience: route?.audience?.length ? [...route.audience] : ['@creator'] };
 }
 function renderResponderField(f, own, inherited, alt) {
@@ -1372,7 +1407,7 @@ function renderResponderField(f, own, inherited, alt) {
       </div>
       <div class="cf-human rf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
         <label class="form-row">Who responds${audienceComboHtml('cf-audience rf-audience', audience)}</label>
-        <div class="task-sub">Comma-separated. Any selected person may answer this single input step.</div>
+        ${policyTip('Separate people or teams with commas. Any selected person may answer.')}
       </div>
       <div class="cf-agent rf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}
         <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Response prompt — sent whenever the task waits for input. Type [[ to add wiki context. Placeholders: {{title}}, {{prompt}}, {{question}}, {{transcript}}.</div>
@@ -1387,13 +1422,8 @@ function readResponder(box) {
     return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
   }
   const ab = box.querySelector('.agent-field');
-  const route = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
-  const model = ab.querySelector('.af-model').value.trim();
-  const effort = ab.querySelector('.af-effort').value;
-  if (model) route.model = model;
-  if (effort) route.effort = effort;
-  const resumeFrom = readResume(ab);
-  if (resumeFrom) route.resumeFrom = resumeFrom;
+  const route = { kind: 'agent', ...readAgentSpec(ab) };
+  if (route.avatarId) return { kind: 'human', audience: [`avatar:${route.avatarId}`] };
   const prompt = box.querySelector('.rf-prompt')?.value ?? '';
   const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
   if (prompt.trim() !== '' && prompt !== promptDefault) route.prompt = prompt;
@@ -2368,7 +2398,38 @@ function resetResponderField(box, attr = 'data-inherit') {
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
-async function api(path, opts = {}) {
+function api(path, opts = {}) {
+  const pending = api.pending ||= new Map();
+  const defaults = api.defaults ||= new Map();
+  const method = String(opts.method || 'GET').toUpperCase();
+  if (method !== 'GET') {
+    pending.clear(); defaults.clear();
+    return fetchApi(path, opts).finally(() => { pending.clear(); defaults.clear(); });
+  }
+  if (opts.signal) return fetchApi(path, opts);
+  const key = JSON.stringify([S.token, typeof S.user === 'object' ? S.user?.id : S.user, path, opts]);
+  // `stable` reads (settings that change only by a write) are kept until this
+  // tab's next write; `maxAge` reads (and resolved defaults) for that many ms,
+  // so one navigation's panes share a read instead of each repeating it.
+  const maxAge = opts.stable ? Infinity : opts.maxAge ?? (path.startsWith('/api/defaults/') ? 10_000 : 0);
+  const cached = defaults.get(key);
+  if (cached && Date.now() - cached.at < maxAge) return Promise.resolve(JSON.parse(cached.json));
+  defaults.delete(key);
+  if (pending.has(key)) return pending.get(key);
+  const request = fetchApi(path, opts).then(value => {
+    if (maxAge && pending.get(key) === request) {
+      if (defaults.size >= 64) defaults.delete(defaults.keys().next().value);
+      defaults.set(key, { at: Date.now(), json: JSON.stringify(value) });
+    }
+    return value;
+  }).finally(() => {
+    if (pending.get(key) === request) pending.delete(key);
+  });
+  pending.set(key, request);
+  return request;
+}
+
+async function fetchApi(path, opts = {}) {
   const res = await feedbackFetch(path, {
     ...opts,
     headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}), ...(opts.headers || {}) },
@@ -2440,7 +2501,7 @@ async function uploadConversationFile(file) {
 }
 
 function attachmentUrl(id, name) {
-  const query = new URLSearchParams({ projectId: S.projectId, token: S.token || '' });
+  const query = new URLSearchParams({ projectId: S.projectId });
   if (name) query.set('name', name);
   return `/api/attachments/${encodeURIComponent(id)}?${query}`;
 }
@@ -2622,10 +2683,18 @@ function wireMessageCopies(root = document) {
 
 // Shared with the public conversation reader; keep console callers unchanged.
 function renderMarkdown(src, opts = {}) {
-  return globalThis.TavyaMarkdown.renderMarkdown(src, opts);
+  const cache = renderMarkdown.cache ||= new Map();
+  const key = JSON.stringify([src, opts]);
+  if (cache.has(key)) return cache.get(key);
+  const html = globalThis.KarmaxMarkdown.renderMarkdown(src, opts);
+  if (key.length + html.length <= 64_000) {
+    if (cache.size >= 128) cache.delete(cache.keys().next().value);
+    cache.set(key, html);
+  }
+  return html;
 }
 function ensureMathJax() {
-  return globalThis.TavyaMarkdown.ensureMathJax();
+  return globalThis.KarmaxMarkdown.ensureMathJax();
 }
 function typesetMath(root) {
   const scope = root || document.getElementById('ck-thread');
@@ -2714,10 +2783,14 @@ function consoleRevisionChanged(current, next) {
 }
 
 async function checkConsoleRevision() {
+  if (document.hidden) return false;
   try {
     const meta = await api('/api/meta');
     if (consoleRevisionChanged(S.meta?.consoleRevision, meta.consoleRevision)) {
-      location.reload();
+      if (S.offeredConsoleRevision !== meta.consoleRevision) {
+        S.offeredConsoleRevision = meta.consoleRevision;
+        toast('Update available', false, { label: 'Reload', fn: () => location.reload() });
+      }
       return true;
     }
     applyTimingSetting(meta.timingEnabled);
@@ -2726,25 +2799,45 @@ async function checkConsoleRevision() {
   return false;
 }
 
+function resumeVisibleUpdates() {
+  if (document.hidden) return;
+  if (S.liveUpdatesStale) {
+    S.liveUpdatesStale = false;
+    resourceReviewCache.clear(); resourceInventoryCache.clear();
+    loadInbox().catch(() => {});
+    if (S.selected) { S.liveOutput = {}; refreshTask(); refreshTaskHistory(S.selected); }
+    else if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
+    else if (S.tab === 'activity') seedActivity();
+  }
+  checkConsoleRevision();
+  if (S.tab === 'installation') { refreshHostDiag(); refreshProcPanel(); }
+  if (S.onboarding?.display === 'expanded') refreshOnboarding();
+}
+
 function watchConsoleRevision() {
   if (consoleRevisionTimer) return;
   consoleRevisionTimer = setInterval(checkConsoleRevision, 60_000);
+  document.addEventListener('visibilitychange', resumeVisibleUpdates);
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
-  S.meta = S.meta || await api('/api/meta');
-  applyDocumentBrand();
-  S.launch = S.launch || await (await feedbackFetch('/api/launch')).json();
+  // Public pages need no session, and must not read one: that provisions a
+  // personal workspace and consumes the one-time git-onboarding flag. The
+  // emailed password-reset link lands signed out, so it is one of them.
   const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
-  if (legalSlug) return renderLegalPage(legalSlug);
-  if (location.pathname === '/legal') return renderLegalIndex();
-  if (location.pathname === '/pricing') return renderPricing();
-  // The emailed password-reset link lands here unauthenticated; handle it before
-  // any session/setup gating so a signed-out user can actually reset.
-  if (location.pathname === '/reset-password') {
-    return renderResetPassword(new URLSearchParams(location.search).get('token') || '');
-  }
+  const publicPage = legalSlug ? () => renderLegalPage(legalSlug)
+    : { '/legal': renderLegalIndex, '/pricing': renderPricing,
+      '/reset-password': () => renderResetPassword(new URLSearchParams(location.search).get('token') || '') }[location.pathname];
+  // Independent first reads go together; each used to wait for the one before (RQ-9).
+  const sessionRead = publicPage ? null : feedbackFetch('/api/session').then((response) => response.json());
+  sessionRead?.catch(() => {}); // awaited below
+  [S.meta, S.launch] = await Promise.all([
+    S.meta || api('/api/meta'),
+    S.launch || feedbackFetch('/api/launch').then((response) => response.json()),
+  ]);
+  applyDocumentBrand();
+  if (publicPage) return publicPage();
   // Better Auth redirects the confirmation link back here with ?verified=1 after
   // marking the address verified. Note it, strip it from the URL, and surface it
   // (a toast in-app, or a line on the sign-in card if the link was opened while
@@ -2763,7 +2856,9 @@ async function boot() {
     clean.searchParams.delete('auth_provider');
     history.replaceState({ kx: 1 }, '', `${clean.pathname}${clean.search}${clean.hash}`);
   }
-  const session = await (await feedbackFetch('/api/session')).json();
+  const session = await sessionRead;
+  // Account email (confirmation, password reset) only when the installation can send it.
+  S.emailDelivery = session.emailDelivery === true;
   S.sso = session.sso || null;
   S.google = session.google || false;
   S.github = session.github || false;
@@ -2804,18 +2899,18 @@ async function boot() {
       }
     }
   }
-  S.meta = await api('/api/meta');
   applyDocumentBrand();
   watchConsoleRevision();
-  try {
-    S.installationInfo = await api('/api/settings/installation');
-    S.installationAccess = S.installationInfo?.canManage === true;
-  } catch {
-    S.installationInfo = null;
-    S.installationAccess = false;
-  }
-  await loadOrganizations().catch(() => {});
-  try { await loadProjects(); }
+  // Independent reads run together; each used to wait for the one before it.
+  const projects = api('/api/projects');
+  projects.catch(() => {}); // awaited (and its error handled) by loadProjects below
+  const [installationInfo] = await Promise.all([
+    api('/api/settings/installation').catch(() => null),
+    loadOrganizations().catch(() => {}),
+  ]);
+  S.installationInfo = installationInfo;
+  S.installationAccess = installationInfo?.canManage === true;
+  try { await loadProjects(projects); }
   catch (e) {
     // A self-registered identity is real but intentionally starts with no
     // project grants. Give it an honest waiting room instead of a generic boot
@@ -2824,28 +2919,48 @@ async function boot() {
     throw e;
   }
   if (!S.organizationId) S.organizationId = S.defaultOrganizationId;
+  // Load for the organization and project the URL names, not the defaults the
+  // first route would switch away from at once (RQ-9, UI-8).
+  const initialRoute = parseRoute(currentPath());
+  const routeOrganization = initialRoute.org && organizationBySlug(initialRoute.org);
+  if (routeOrganization) {
+    S.organizationId = routeOrganization.id;
+    S.projectId = (initialRoute.slug && projectBySlug(initialRoute.slug, routeOrganization.id)?.id)
+      || firstProjectForOrganization(routeOrganization.id)?.id || null;
+  }
   // Account creation marks exactly one session response for Git onboarding. Only
   // replace the neutral home route (never an invitation or another deep link).
   if (session.gitOnboarding && parseRoute(currentPath()).name === 'home')
     history.replaceState({ kx: 1 }, '', profileRoute());
-  await loadCollaboration().catch(() => {});
   const projectScope = S.projectId
     ? `?projectId=${encodeURIComponent(S.projectId)}`
     : S.organizationId ? `?organizationId=${encodeURIComponent(S.organizationId)}` : '';
-  try {
-    S.contributions = await api(`/api/contributions${projectScope}`);
-    S.schema = await api(`/api/schema${projectScope}`);
-    S.modelCatalog = (await api(`/api/models${projectScope}`)).providers;
-    // The boot catalog is already scoped to the selected project's organization.
-    // Mark it as such so the first route reconciliation does not immediately fetch
-    // the same schema + model catalog again before it can paint.
-    S.catalogOrganizationId = S.organizationId;
-    if (S.organizationId) S.worldProviderConnections = await api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`).catch(() => []);
-  } catch {}
-  await refreshOnboarding();
+  loadModelCatalog(projectScope, S.organizationId);
+  await Promise.all([
+    loadCollaboration().catch(() => {}),
+    loadInbox().catch(() => {}),
+    api(`/api/contributions${projectScope}`).then((contributions) => { S.contributions = contributions; }).catch(() => {}),
+    api(`/api/schema${projectScope}`).then((schema) => {
+      S.schema = schema;
+      // The boot catalog is already scoped to the selected project's organization.
+      // Mark it as such so the first route reconciliation does not immediately
+      // fetch the same catalog again before it can paint.
+      S.catalogOrganizationId = S.organizationId;
+    }).catch(() => {}),
+    S.organizationId && api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`)
+      .then((connections) => { S.worldProviderConnections = connections; }).catch(() => { S.worldProviderConnections = []; }),
+    refreshOnboarding(),
+  ]);
   connectWs();
   renderShell();
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
+  installShellListeners();
+  await applyRoute(); // honor the initial URL (deep link / bookmark)
+}
+
+function installShellListeners() {
+  if (installShellListeners.installed) return;
+  installShellListeners.installed = true;
   bindKeys();
   installLinkRouter();
   installTagRouter();
@@ -2870,11 +2985,10 @@ async function boot() {
   document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
   document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
   window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
-  await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
 
-async function loadProjects() {
-  S.projects = await api('/api/projects');
+async function loadProjects(request = api('/api/projects')) {
+  S.projects = await request;
   if (!S.projectId) S.projectId = firstProjectForOrganization(S.organizationId)?.id || null;
   if (S.projectId) S.organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
 }
@@ -2884,18 +2998,25 @@ async function loadOrganizationRuntimeCatalog() {
   if (!organizationId || S.catalogOrganizationId === organizationId) return;
   const epoch = S.catalogLoadEpoch = (S.catalogLoadEpoch || 0) + 1;
   const query = `?organizationId=${encodeURIComponent(organizationId)}`;
+  loadModelCatalog(query, organizationId);
   try {
-    const [schema, models] = await Promise.all([
-      api(`/api/schema${query}`),
-      api(`/api/models${query}`),
-    ]);
+    const schema = await api(`/api/schema${query}`);
     if (S.catalogLoadEpoch !== epoch || S.organizationId !== organizationId) return;
     S.schema = schema;
-    S.modelCatalog = models.providers;
     S.catalogOrganizationId = organizationId;
   } catch {
     // Keep the last usable built-in catalog; task creation remains server-validated.
   }
+}
+
+/** Model pickers fall back to built-in presets, and discovery can take seconds
+ *  (the server asks each provider), so no page ever waits for this. */
+function loadModelCatalog(query, organizationId) {
+  const epoch = S.modelCatalogEpoch = (S.modelCatalogEpoch || 0) + 1;
+  return api(`/api/models${query}`).then((models) => {
+    if (S.modelCatalogEpoch !== epoch || S.organizationId !== organizationId) return;
+    S.modelCatalog = models.providers;
+  }).catch(() => {});
 }
 
 async function loadOrganizations() {
@@ -2908,24 +3029,33 @@ async function loadOrganizations() {
   if (!S.organizationId) S.organizationId = S.defaultOrganizationId;
 }
 
+// The organization's people, teams and roles. A route that switches organization
+// and the settings page it paints share one read (any write drops it); the inbox
+// spans organizations and is loaded by its own callers. A failed read keeps what
+// was known about this organization and rejects, so no page reads it as empty.
 async function loadCollaboration() {
-  const inbox = loadInbox().catch(() => {});
   const organizationId = S.organizationId;
-  if (!organizationId) return inbox;
+  if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
-  const [members, teams, users, catalog] = await Promise.all([
-    api(`/api/organizations/${organizationId}/members`).catch(() => []),
-    api(`/api/organizations/${organizationId}/teams`).catch(() => []),
-    api('/api/users').catch(() => []),
-    api(`/api/organizations/${organizationId}/roles`).catch(() => null),
-    inbox,
+  const read = path => api(path, { maxAge: 10_000 });
+  const [members, teams, users, catalog] = await Promise.allSettled([
+    read(`/api/organizations/${organizationId}/members`),
+    read(`/api/organizations/${organizationId}/teams`),
+    read('/api/users'),
+    read(`/api/organizations/${organizationId}/roles`),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
-  S.authorizationCatalog = catalog;
+  const known = S.authorizationCatalogOrganization === organizationId;
+  const value = (result, previous, empty) => result.status === 'fulfilled' ? result.value ?? empty : known ? previous : empty;
+  S.authorizationCatalog = value(catalog, S.authorizationCatalog, null);
+  S.organizationMembers = value(members, S.organizationMembers, []);
+  S.teams = value(teams, S.teams, []);
+  S.users = users.status === 'fulfilled' ? users.value || [] : S.users || [];
   S.authorizationCatalogOrganization = organizationId;
-  S.organizationMembers = members || [];
-  S.teams = teams || [];
-  S.users = users || [];
+  // The installation's user directory only fills in names the members already
+  // carry, and an organization owner may not read it (hosted): not a failure.
+  const failed = [members, teams, catalog].find((result) => result.status === 'rejected');
+  if (failed) throw failed.reason;
 }
 
 async function loadInbox() {
@@ -2945,7 +3075,10 @@ async function loadInbox() {
 }
 
 function inboxEventChanges(ev) {
-  return ev.type === 'view.updated' || ev.type.includes('escalat')
+  if (ev.type === 'view.updated') return ['done', 'failed', 'cancelled'].includes(ev.payload?.status)
+    || ['human', 'confirm', 'responder'].includes(ev.payload?.waitingFor)
+    || (S.inbox || []).some(item => item.taskId === ev.taskId);
+  return ev.type.includes('escalat')
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
       'credential.approval-requested', 'credential.approval-resolved', 'connection.requested', 'connection.resolved',
@@ -3160,14 +3293,14 @@ function syncQueryUrl() {
 }
 
 let searchDebounce = null;
-function scheduleSearch() {
+function scheduleSearch(background = false) {
   clearTimeout(searchDebounce);
   searchDebounce = setTimeout(async () => {
     syncQueryUrl();
     const search = runSearch();
-    if (S.tab === 'tasks') renderMain();
+    if (S.tab === 'tasks' && !background) renderMain();
     await search;
-    if (S.tab === 'tasks') renderMain();
+    if (S.tab === 'tasks' && !S.selected) bgRenderMain();
   }, 180);
 }
 
@@ -3185,12 +3318,12 @@ async function setQuery(q) {
   if (S.tab === 'tasks') renderMain();
 }
 
-// Leave any detail/modal surface, restore the canonical tag-grouped list, and
-// place the requested tag section at the top of the viewport.
+// Leave any detail surface, restore the canonical tag-grouped list, and place
+// the requested tag section at the top of the viewport. Dialogs are the
+// caller's to close, through their own close handlers.
 async function navigateToTagSection(tagId) {
   const tag = tagById(tagId);
   if (!tag) return;
-  $('#modal-root').innerHTML = '';
   // Section by the tag's own kind so the target section is present in the grouping.
   const q = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
   await go(projectRoute(tag.projectId, 'tasks', q));
@@ -3258,6 +3391,25 @@ const LIST_RELOAD_EVENTS = new Set([
 // view.updated already contains the compact fields shown by list rows. Apply that
 // projection locally instead of refetching every task (and re-running search) for
 // every event on the global stream.
+/** Keep the open parent's Sub-tasks panel current from its children's events;
+ * true when a visible field changed. */
+function patchSubTaskSummaryFromEvent(ev) {
+  if (ev.type !== 'view.updated' || !ev.taskId) return false;
+  const summary = (S.view?.subTaskSummaries || []).find((candidate) => candidate.id === ev.taskId);
+  if (!summary) return false;
+  const payload = ev.payload || {};
+  const previous = summary.lastView || {};
+  const next = {
+    ...previous,
+    ...(payload.stage ? { stage: payload.stage } : {}),
+    ...(payload.status ? { status: payload.status } : {}),
+    waitingFor: payload.waitingFor ? { kind: payload.waitingFor } : undefined,
+  };
+  summary.lastView = next;
+  return previous.stage !== next.stage || previous.status !== next.status
+    || previous.waitingFor?.kind !== next.waitingFor?.kind;
+}
+
 function patchTaskListFromEvent(ev) {
   if (ev.type !== 'view.updated' || !ev.taskId) return false;
   const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
@@ -3311,10 +3463,6 @@ function patchTaskListFromEvent(ev) {
     || turnKey(previous.agentTurn) !== turnKey(next.agentTurn);
 }
 
-/** Tabs that belong to the selected project (the rail highlights it, the main
- *  pane shows its tab bar). One list so the two never drift apart again. */
-const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
-
 function scheduleTaskListReload() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
@@ -3323,28 +3471,53 @@ function scheduleTaskListReload() {
 }
 
 function connectWs() {
+  if (connectWs.retryTimer) clearTimeout(connectWs.retryTimer);
+  if (S.ws) {
+    S.ws.onclose = S.ws.onmessage = S.ws.onopen = null;
+    S.ws.close();
+  }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws${S.token ? `?token=${encodeURIComponent(S.token)}` : ''}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
   S.ws = ws;
   ws.onmessage = (m) => {
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
-    S.activity.unshift(ev);
-    if (S.activity.length > 400) S.activity.pop();
-    if (S.tab === 'activity') bgRenderMain();
+    if (document.hidden) { S.liveUpdatesStale = true; return; }
+    // Streamed text chunks are the live bubble's, not activity (LT-5).
+    if (S.tab === 'activity' && ev.type !== 'agent.output' && (!ev.projectId || ev.projectId === S.projectId)) {
+      S.activity.unshift(ev);
+      if (S.activity.length > 400) S.activity.pop();
+      bgRenderMain();
+    }
     if (S.tab === 'insights' && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleInsightsRefresh();
-    const patchedList = patchTaskListFromEvent(ev);
+    const eventProject = ev.projectId || ev.payload?.projectId;
+    const currentProject = !eventProject || eventProject === S.projectId;
+    const siblingAttempt = ev.siblingAttempt || S.attemptGroup?.attempts?.some(a => a.id === ev.taskId)
+      && S.attemptGroup.principalAttemptId !== ev.taskId;
+    const patchedList = currentProject && patchTaskListFromEvent(ev);
+    if (ev.type === 'review.updated' || ev.type.startsWith('resource.')) {
+      resourceReviewCache.delete(ev.taskId); resourceInventoryCache.delete(ev.taskId);
+    }
     if (S.selected && ev.taskId === S.selected) {
-      S.taskEvents.push(ev);
-      if (S.taskEvents.length > 400) S.taskEvents.shift();
+      if (ev.type.startsWith('spend.') || ev.type.startsWith('payment.')) $('#tp-payments')?.refreshSpent?.();
+      if (ev.type !== 'agent.output') {
+        S.taskEvents.push(ev);
+        if (S.taskEvents.length > 400) S.taskEvents.shift();
+      }
       if (ev.type === 'agent.output' && ev.payload?.text) {
-        // Provider adapters emit the current complete block, not a token delta.
-        // Replacing avoids the old "H / He / Hello" cumulative transcript.
-        S.liveOutput = ev.payload.text;
-        updateLiveBubble();
+        // Adapters publish the whole text so far of the block being generated,
+        // not a token delta, so the bubble is replaced. Tool lines are timeline
+        // rows of their own and never replace it. Each agent keeps its own text.
+        if (ev.payload.source === 'assistant') {
+          noteLiveOutput(ev);
+          updateLiveBubble(ev.payload.role || 'do');
+        }
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
+        // The completed message supersedes its agent's live text; a new or
+        // failed attempt voids it, so a half message never lingers as if final.
+        if (ev.type === 'agent.activity' && supersedesLiveOutput(ev)) delete S.liveOutput[ev.payload?.role || 'do'];
         scheduleTaskPageRender();
       }
       if (S.meta?.timingEnabled && ev.timingDeliveryId && document.visibilityState === 'visible' && S.taskTab === 'checkin') {
@@ -3356,25 +3529,24 @@ function connectWs() {
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
-        S.liveOutput = '';
-        refreshTask();
+        refreshTask(ev.type);
       } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')) {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
-        refreshTask();
-      } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
+        refreshTask(ev.type);
+      } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
+    if (S.selected && ev.taskId !== S.selected && patchSubTaskSummaryFromEvent(ev)) scheduleTaskPageRender();
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
-      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask();
+      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask('attempt.sibling'); // its card, not our details
     if (patchedList) {
       // Re-evaluate only the active query: stage/status changes can alter filter
       // membership, but they do not require the expensive all-tasks endpoint.
-      if (S.tab === 'tasks' && !S.selected) scheduleSearch();
-      if ((S.tab === 'tasks' || S.tab === 'queue') && !S.selected) bgRenderMain();
-      renderRail();
-    } else if (LIST_RELOAD_EVENTS.has(ev.type)
+      if (S.tab === 'tasks' && !S.selected) scheduleSearch(true);
+      if (S.tab === 'queue' && !S.selected) bgRenderMain();
+    } else if (currentProject && !siblingAttempt && (LIST_RELOAD_EVENTS.has(ev.type)
       || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
-        && (!ev.payload?.projectId || ev.payload.projectId === S.projectId))) {
+        ))) {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
@@ -3388,11 +3560,14 @@ function connectWs() {
   ws.onopen = () => {
     wsRetryMs = 1500;
     setWsOnline(true);
+    syncLiveWatch();
     if (wsHadDropped) checkConsoleRevision();
-    if (wsHadDropped) {
+    if (wsHadDropped && document.hidden) S.liveUpdatesStale = true;
+    else if (wsHadDropped) {
       loadInbox().catch(() => {});
       refreshTasks().catch(() => {});
-      if (S.selected) { refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
+      // Events were missed: live text is rebuilt from history, never kept stale.
+      if (S.selected) { S.liveOutput = {}; refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
     }
     wsHadDropped = false;
   };
@@ -3400,9 +3575,20 @@ function connectWs() {
     wsHadDropped = true; setWsOnline(false);
     // Back off while the gateway is down (a restart, an expired session) instead
     // of hammering it from every open tab at a fixed 1.5 s.
-    setTimeout(connectWs, wsRetryMs);
+    connectWs.retryTimer = setTimeout(connectWs, wsRetryMs);
     wsRetryMs = Math.min(wsRetryMs * 2, 30_000);
   };
+}
+
+// Tell the gateway what this tab shows, so it streams agent output only for the
+// open task and only lifecycle events from other projects (RQ-16).
+function syncLiveWatch() {
+  const ws = S.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const watch = JSON.stringify({ type: 'watch', projectId: S.projectId || null, taskId: S.selected || null });
+  if (ws.sentWatch === watch) return;
+  ws.sentWatch = watch;
+  ws.send(watch);
 }
 
 let wsHadDropped = false;
@@ -3431,7 +3617,6 @@ async function refreshTasks() {
         await loadTasks();
         if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
         if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
-        renderRail();
         if (S.tab === 'queue' && !S.selected) seedQueue();
       } catch {}
     } while (taskRefreshQueued);
@@ -3450,7 +3635,7 @@ async function refreshTasks() {
 // to actually resend through.
 function verificationBanner() {
   const u = S.user && typeof S.user === 'object' ? S.user : null;
-  if (!u || u.emailVerified !== false || !u.email || S.verifyBannerDismissed) return '';
+  if (!u || u.emailVerified !== false || !u.email || !S.emailDelivery || S.verifyBannerDismissed) return '';
   return `<div class="verify-banner" id="verify-banner">
     <span>Confirm your email <b>${esc(u.email)}</b> to finish securing your account.</span>
     <button class="btn sm" id="verify-resend">Resend link</button>
@@ -3522,7 +3707,6 @@ function brandMark() {
 async function refreshOnboarding() {
   const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   const userId = S.user?.id;
-  const pageEpoch = S.routeEpoch;
   const organizationId = S.organizationId;
   if (!S.meta?.hosted || !organizationId || !S.user) {
     S.onboarding = null;
@@ -3533,7 +3717,7 @@ async function refreshOnboarding() {
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`);
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
-    acceptOnboardingStatus(status, pageEpoch);
+    acceptOnboardingStatus(status);
   } catch {
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
     // Keep the last known guide and retry even when the first request failed.
@@ -3544,12 +3728,14 @@ async function refreshOnboarding() {
   renderOnboarding();
 }
 
-// Completion feedback belongs only to the page that observed the transition.
-// It is deliberately absent from both the saved preference and browser storage.
-function acceptOnboardingStatus(status, pageEpoch) {
+// Completion feedback is a short-lived notice, deliberately absent from both
+// the saved preference and browser storage. The step that finishes setup may
+// itself navigate (a new project opens), before or after this response lands,
+// so the notice outlives navigation and leaves on its own (renderOnboarding).
+function acceptOnboardingStatus(status) {
   const previous = S.onboarding;
   if (status.complete && previous?.visible && !previous.complete
-    && previous.organizationId === status.organizationId && pageEpoch === S.routeEpoch) {
+    && previous.organizationId === status.organizationId) {
     S.onboardingCompletion = { organizationId: status.organizationId, userId: S.user?.id };
   } else if (!status.complete) {
     S.onboardingCompletion = null;
@@ -3558,6 +3744,8 @@ function acceptOnboardingStatus(status, pageEpoch) {
 }
 
 function dismissOnboardingCompletion() {
+  clearTimeout(S.onboardingCompletionTimer);
+  S.onboardingCompletionTimer = null;
   S.onboardingCompletion = null;
   renderOnboarding();
 }
@@ -3566,14 +3754,13 @@ async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
   const organizationId = S.organizationId;
   const userId = S.user?.id;
-  const pageEpoch = S.routeEpoch;
   const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`, {
       method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
     if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
-    acceptOnboardingStatus(status, pageEpoch);
+    acceptOnboardingStatus(status);
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
 }
@@ -3589,6 +3776,7 @@ function onboardingStep(number, key, title, detail, action) {
 
 function pollOnboarding() {
   clearTimeout(S.onboardingTimer);
+  if (document.hidden || ['minimized', 'closed'].includes(S.onboarding?.display)) return;
   S.onboardingTimer = setTimeout(() => {
     if (document.hidden) return pollOnboarding();
     return refreshOnboarding();
@@ -3600,10 +3788,14 @@ function renderOnboarding() {
   if (!host) return;
   const state = S.onboarding;
   const completion = S.onboardingCompletion;
+  const renderKey = JSON.stringify([state, completion, S.organizationId, S.user?.id]);
+  if (host.onboardingRenderKey === renderKey) { pollOnboarding(); return; }
+  host.onboardingRenderKey = renderKey;
   if (state?.complete && completion?.organizationId === S.organizationId
     && completion.userId === S.user?.id && S.meta?.hosted) {
     clearTimeout(S.onboardingTimer);
     S.onboardingTimer = null;
+    S.onboardingCompletionTimer ??= setTimeout(dismissOnboardingCompletion, 8_000);
     host.hidden = false;
     host.innerHTML = `<div class="onboarding-minimized onboarding-complete" role="status">
       <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
@@ -3613,6 +3805,9 @@ function renderOnboarding() {
     $('#onboarding-complete-close')?.addEventListener('click', dismissOnboardingCompletion);
     return;
   }
+  // The notice is gone some other way (sign-out, another organization, setup
+  // reopened): its timer must not cut a later notice short.
+  if (S.onboardingCompletionTimer) { clearTimeout(S.onboardingCompletionTimer); S.onboardingCompletionTimer = null; }
   if (!state?.visible || state.organizationId !== S.organizationId) {
     clearTimeout(S.onboardingTimer);
     S.onboardingTimer = null;
@@ -3655,6 +3850,9 @@ function renderOnboarding() {
     <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
+  // A step's link opens the settings that step needs, which the expanded card
+  // would then cover; tuck it into its progress pill while the person works.
+  host.querySelectorAll('.onboarding-step a[data-spa]').forEach((link) => link.addEventListener('click', () => setOnboardingDisplay('minimized')));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-close')?.addEventListener('click', () => setOnboardingDisplay('closed'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
@@ -4342,26 +4540,29 @@ function viewIdForQuery(q) {
 function viewsBar() {
   const active = viewIdForQuery(S.search);
   const builtins = BUILTIN_VIEWS
-    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
+    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
     .join('');
   const saved = S.views
     .map(
-      (v) => `<div class="view-chip ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
+      (v) => `<div class="view-chip ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
     )
     .join('');
   return `<div class="views-bar">
-    <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" tabindex="0">≡ All</div>
+    <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" role="button" tabindex="0">≡ All</div>
     ${builtins}
     ${saved}
-    <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
+    <div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">＋ Save view</div>
   </div>`;
 }
 
 // Workflow params are searchable/organizable too, via synthetic fields the server
 // resolves on demand (src/domain/search.ts — keep this list of skipped types in step
-// with what fieldByKey understands). Scalar params become `param.<name>`; agent/confirmer/responder
+// with what fieldByKey understands). Scalar params become `param.<name>`; agent
 // params expand into three model sub-fields each — `agent_<role>.agent` (provider),
 // `.model`, `.effort` — so you can filter/group/sort by the model an agent ran on.
+// The menus offer only what a task itself carries: installation/project settings
+// (scopes without 'task') and the Review/Responder routing are not task attributes.
+// Typed queries still accept every field the server understands.
 const PARAM_SCALAR_SKIP = new Set(['agent', 'confirmer', 'responder', 'prompt', 'list']);
 const PARAM_NAME_SKIP = new Set(['repos', 'prompt']);
 const AGENT_SUBFIELDS = [
@@ -4373,8 +4574,9 @@ function paramMenuFields() {
   const seen = new Map();
   for (const s of S.schema || []) {
     for (const p of s.params || []) {
-      if (PARAM_NAME_SKIP.has(p.name)) continue;
-      if (p.type === 'agent' || p.type === 'confirmer' || p.type === 'responder') {
+      if (PARAM_NAME_SKIP.has(p.name) || (p.scopes && !p.scopes.includes('task'))) continue;
+      if (p.type === 'confirmer' || p.type === 'responder') continue;
+      if (p.type === 'agent') {
         for (const { sub, label } of AGENT_SUBFIELDS) {
           const key = `agent_${p.name}.${sub}`;
           if (!seen.has(key)) seen.set(key, { key, label: `${p.label || p.name} · ${label}`, type: 'text', param: true });
@@ -4480,7 +4682,9 @@ function tasksView() {
     ? `<div class="empty"><div class="big">Search didn’t run</div>Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button></div>`
     : S.search
       ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
-      : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full task form.</div>`;
+      // Done and cancelled tasks archive themselves, so an empty default list
+      // does not mean the project has never had a task.
+      : `<div class="empty"><div class="big">No open tasks</div>Describe one above. Finished tasks move to 🗄 Archived.</div>`;
   return `
     <div class="composer">
       <div class="quick-task-field">
@@ -4539,11 +4743,14 @@ function tagGroupVisibleTasks(group, keep, seen = new Map()) {
   return seen;
 }
 
-// Small colored tag chip + priority flag shown on a task row.
-function tagChips(t) {
+// Small colored tag chip + priority flag shown on a task row. `link: false`
+// renders plain labels, for rows whose click means something else (a picker).
+function tagChips(t, link = true) {
   if (!t.tags || !t.tags.length) return '';
   return t.tags
-    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<button type="button" class="tag-chip tag-link ${tag.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`; })
+    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : '';
+      return link ? `<button type="button" class="tag-chip tag-link ${esc(tag.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`
+        : `<span class="tag-chip ${esc(tag.kind || '')}"${c}>${esc(tagPathStr(id))}</span>`; })
     .join('');
 }
 function priorityFlag(t) {
@@ -4650,7 +4857,7 @@ function taskRow(t, { showTags = true } = {}) {
   // rows retain their direct editing controls.
   if (isDraft && !archived) {
     return `
-    <div class="task-row" data-draft="${t.id}" tabindex="0">
+    <div class="task-row" data-draft="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
@@ -4671,7 +4878,7 @@ function taskRow(t, { showTags = true } = {}) {
     ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
     : `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
   return `
-    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0">
+    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
@@ -4705,7 +4912,7 @@ function pullRequestLinks(v) {
   return prs.map((pr) => {
     const state = pr.merged ? 'merged' : pr.state === 'closed' ? 'closed' : 'open';
     const label = prs.length > 1 && pr.repo ? `${pr.repo} #${pr.number}` : `PR #${pr.number}`;
-    return `<a class="pr-link ${state}" href="${esc(pr.url)}" target="_blank" rel="noopener"
+    return `<a class="pr-link ${state}" href="${esc(safeHref(pr.url))}" target="_blank" rel="noopener"
       title="${esc(pr.slug ? `${pr.slug} — ${state}` : state)}">⇱ ${esc(label)}<span class="pr-state">${state}</span></a>`;
   }).join('');
 }
@@ -4844,7 +5051,7 @@ function wireOrgControls() {
 
 // Persist the current working query as a named view (Save-view button).
 async function saveCurrentView() {
-  const name = prompt('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
+  const name = await promptText('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
   if (!name) return;
   try {
     // The API persists a structured TaskQuery, so parse the working string into one
@@ -5027,7 +5234,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
       <span class="status-dot ${status}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}</div>
-        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t)}</div>
+        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
     </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
@@ -5146,10 +5353,15 @@ function openTagsManager(initialEditId = null) {
     if (S.tab === 'tasks') renderMain();
   };
   const draw = () => {
+    const draft = [...root.querySelectorAll('.tagm-new input, .tagm-new select, .tagm-new textarea')]
+      .map(control => ({ id: control.id, value: control.value, checked: control.checked }));
+    const editDraft = root.querySelector('.tagm-edit')?.dataset.tagId === editingId
+      ? [...root.querySelectorAll('.tagm-edit input, .tagm-edit select, .tagm-edit textarea')]
+        .map(control => ({ id: control.id, value: control.value, checked: control.checked })) : [];
     const sorted = S.tags.slice().sort((a, b) => tagPathStr(a.id).localeCompare(tagPathStr(b.id)));
     const rows = S.tags.length
       ? sorted.map((t) => `<div class="tagm-row ${editingId === t.id ? 'active' : ''}">
-          <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
+          <button type="button" class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
           <span class="tagm-summary">
             <span class="pal-sub">${esc(t.kind || '—')}</span>
             ${t.description ? `<span class="tagm-description">${esc(t.description)}</span>` : ''}
@@ -5175,7 +5387,7 @@ function openTagsManager(initialEditId = null) {
       .filter((tag) => !blockedParents.has(tag.id))
       .map((tag) => `<option value="${esc(tag.id)}" ${editing?.parentId === tag.id ? 'selected' : ''}>${esc(tagPathStr(tag.id))}</option>`)
       .join('');
-    const editForm = editing ? `<div class="tagm-form tagm-edit">
+    const editForm = editing ? `<div class="tagm-form tagm-edit" data-tag-id="${esc(editing.id)}">
       <div class="tagm-form-head"><div><b>Edit tag</b><span class="pal-sub">${esc(tagPathStr(editing.id))}</span></div><button class="icon-btn" id="tagm-cancel-edit" aria-label="Close editor">✕</button></div>
       <label>Name<input id="tagm-edit-name" class="title-in" value="${esc(editing.name)}" /></label>
       <label>Parent<select id="tagm-edit-parent" class="q-sel"><option value="">No parent (top level)</option>${parentOptions}</select></label>
@@ -5198,19 +5410,32 @@ function openTagsManager(initialEditId = null) {
       </div>
       <div class="tagm-hint">Type a <b>/</b>-separated path to nest — missing parents are created automatically. <b>type</b> = kind of work (bug, feature); <b>topic</b> = area (frontend, auth); <b>flag</b> = an operational marker (no-merge).</div>
     </div></div>`;
+    for (const saved of [...draft, ...editDraft]) {
+      const control = root.querySelector('#' + saved.id);
+      if (control) { control.value = saved.value; control.checked = saved.checked; }
+    }
     const close = () => (root.innerHTML = '');
     $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') close(); });
     $('#tagm-close').addEventListener('click', close);
+    root.querySelectorAll('.tagm-row [data-tag-link]').forEach((chip) => chip.addEventListener('click', () => {
+      close();
+      navigateToTagSection(chip.dataset.tagLink);
+    }));
     const addTag = async () => {
       const name = $('#tagm-name').value.trim(); if (!name) return;
       try {
         const kind = $('#tagm-kind').value || undefined;
+        const description = $('#tagm-description').value;
         await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({
           name,
           kind,
           color: $('#tagm-use-color').checked ? $('#tagm-color').value : undefined,
-          description: $('#tagm-description').value,
+          description,
         }) });
+        if ($('#tagm-name').value.trim() === name && $('#tagm-description').value === description) {
+          $('#tagm-name').value = '';
+          $('#tagm-description').value = '';
+        }
         await refresh();
         toast(`Created tag “${name}”`);
       } catch (e) { toast(e.message, true); }
@@ -5953,7 +6178,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           <button class="btn" id="tf-draft">Save draft</button>
           <button class="btn primary" id="tf-queue">${editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
-      </footer>
+      </div>
     </div>`;
   wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
   const formKeyController = new AbortController();
@@ -6097,7 +6322,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
   wireAuthorizationEditor($('#tf-authorization'), authorizationProjects, () => autoSaveSoon());
-  // The vault credential picker (PLAN-passwords.md §6): item grants layered onto
+  // The vault credential picker (wiki plans/PLAN-passwords §6): item grants layered onto
   // the authorization package. Keep selection in form-local state so the task
   // sidebar stays one compact button; the full checkbox list lives in a modal.
   // Applying a selection dispatches a change event into the form's auto-save
@@ -6177,7 +6402,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     return {
       body, notes: $('#tf-notes')?.value ?? '',
       authorization: readAuthorizationEditor($('#tf-authorization')),
-      // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
+      // Per-task vault item grants (wiki plans/PLAN-passwords §6) — the credential picker.
       credentialGrants: inheritedVault.error ? undefined : [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
       credentialPolicies: inheritedVault.error ? undefined : vaultCredentialPolicies,
     };
@@ -6783,6 +7008,34 @@ function mergeTaskHistory(events) {
       explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
   }
   S.taskEvents = [...ordinary, ...explanations.values()].filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true);
+  // History carries each agent's latest streamed text, so a page opened
+  // mid-stream (or back from a drop) shows it until what supersedes it arrives.
+  for (const event of events) if (event.type === 'agent.output' && event.payload?.source === 'assistant' && event.payload.text) noteLiveOutput(event);
+}
+
+// An agent's live text belongs to its turn and attempt and is ordered by
+// durable seq, so a late or replayed publication never replaces a newer one.
+function noteLiveOutput(ev) {
+  const role = ev.payload.role || 'do';
+  const prior = S.liveOutput[role];
+  if (prior?.seq != null && ev.seq != null && Number(ev.seq) < Number(prior.seq)) return;
+  S.liveOutput[role] = { text: ev.payload.text, seq: ev.seq, turnId: ev.payload.turnId, attempt: ev.payload.attempt };
+}
+
+function supersedesLiveOutput(ev) {
+  return ev.payload?.kind === 'turn' || ev.payload?.kind === 'message' && ev.payload?.phase === 'completed';
+}
+
+// The text to show live for `role`, or '' once it is no longer live: the task
+// stopped, the agent's running turn is another one, or history already holds a
+// later message completion or turn boundary for that agent.
+function liveOutputFor(v, role) {
+  const live = S.liveOutput?.[role];
+  if (!live?.text || v?.status !== 'active') return '';
+  if (live.turnId && v.agentTurn?.role === role && v.agentTurn.turnId !== live.turnId) return '';
+  if (live.seq != null && (S.taskEvents || []).some((event) => event.type === 'agent.activity' && (event.payload?.role || 'do') === role
+    && event.seq != null && Number(event.seq) > Number(live.seq) && supersedesLiveOutput(event))) return '';
+  return live.text;
 }
 
 async function refreshTaskHistory(taskId) {
@@ -6807,6 +7060,43 @@ async function refreshTaskHistory(taskId) {
       if (S.taskTab === 'checkin') scheduleTaskPageRender();
     }
   }
+}
+
+// j/k walking (see openAdjacentTask) keeps the task it is heading to in
+// S.taskWalkTarget until that page opens. Opens during a walk wait this long
+// before fetching, so a further key press supersedes them.
+const TASK_WALK_SETTLE_MS = 150;
+
+// Approval decisions load for the pages that show them: a task with pending
+// decisions (dismissed ones too: the conversation keeps them, because the agent
+// still waits), or its Approvals tab (UI-6). Vault item names only label
+// credential requests, so they load only when there are some.
+function showsTaskApprovals(view) {
+  return !!(view.approvalRequests || view.pendingDecisions || S.taskTab === 'approvals');
+}
+function ensureTaskApprovals(taskId) {
+  if (S.taskApprovalsFor === taskId) return Promise.resolve();
+  const epoch = S.taskOpenEpoch;
+  const inFlight = ensureTaskApprovals.pending;
+  if (inFlight?.taskId === taskId && inFlight.epoch === epoch) return inFlight.promise;
+  const rec = taskRecord(taskId);
+  const draft = !!rec?.params?.draft;
+  const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+  const query = `taskId=${encodeURIComponent(taskId)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+  const promise = (async () => {
+    const [approvalRequests, permissionRequests, authorizationRequests] = await Promise.all([
+      draft ? [] : api(`/api/vault/requests?${query}`).catch(() => []),
+      draft ? [] : api(`/api/permission-requests?${query}`).catch(() => []),
+      api(`/api/authorization-requests?${query}`).catch(() => []),
+    ]);
+    const approvalItems = approvalRequests.length
+      ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
+    if (S.selected !== taskId || S.taskOpenEpoch !== epoch) return;
+    Object.assign(S, { approvalRequests, permissionRequests, authorizationRequests, approvalItems, taskApprovalsFor: taskId });
+    scheduleTaskPageRender();
+  })().finally(() => { if (ensureTaskApprovals.pending?.promise === promise) ensureTaskApprovals.pending = null; });
+  ensureTaskApprovals.pending = { taskId, epoch, promise };
+  return promise;
 }
 
 // A draft has nothing to show but its parameters, so its page is its form —
@@ -6838,9 +7128,19 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // (edit its parameters + triggers, see its runs, run again).
   const rec = taskRecord(taskId);
   S.selected = taskId;
+  syncLiveWatch();
   S.viewingAttempt = explicitAttempt ? taskId : null;
   S.view = null;
   renderTaskLoadingPage(rec);
+  // j/k outpaces loading: each step paints its title at once, and only the task
+  // the walk settles on is fetched (UI-6).
+  // Any other open (a click, Back, a superseded route) ends the walk.
+  const walking = S.taskWalkTarget === taskId;
+  S.taskWalkTarget = null;
+  if (walking) {
+    await new Promise((resolve) => setTimeout(resolve, TASK_WALK_SETTLE_MS));
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
+  }
   if (rec?.params?.repeatable) {
     await renderSeriesPage(rec);
     return;
@@ -6854,7 +7154,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
   // "let me merge master into this branch") bleeds into THIS page's live bubble
   // until the next event arrives — a stale cross-task render, never in the store/.jsonl.
-  S.liveOutput = '';
+  S.liveOutput = {};
   // Drop the previous task's view + per-task derived state up front. `S.view` is
   // re-fetched first below, but the siblings (sessions/widgets/paramDefaults) are
   // fetched a few awaits later — so a render firing in that gap (a WS event, a
@@ -6875,6 +7175,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.permissionRequests = [];
   S.authorizationRequests = [];
   S.approvalItems = [];
+  S.taskApprovalsFor = null;
   try {
     // Start secondary resources in parallel, but let the compact task projection
     // paint as soon as it arrives. A large event history or a slow session lookup
@@ -6890,11 +7191,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions?metadata=1`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
-      draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
-      draft ? Promise.resolve([]) : api(`/api/permission-requests?${approvalQuery}`).catch(() => []),
-      api(`/api/authorization-requests?${approvalQuery}`).catch(() => []),
-      draft ? Promise.resolve([]) : api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []),
-      taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
+      taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`, { stable: true }).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
         : Promise.resolve({ effective: DEFAULT_EXPLANATION_SETTINGS }),
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
       api(`/api/connections?${approvalQuery}`).catch(() => []),
@@ -6907,17 +7204,14 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(S.view);
     renderTaskPage();
+    if (showsTaskApprovals(S.view)) ensureTaskApprovals(taskId);
 
-    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents, connections] = await details;
+    const [events, widgets, sessions, attempts, explanationSettings, explanationEvents, connections] = await details;
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     mergeTaskHistory([...explanationEvents, ...events]);
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    S.approvalRequests = approvalRequests;
-    S.permissionRequests = permissionRequests;
-    S.authorizationRequests = authorizationRequests;
-    S.approvalItems = approvalItems;
     S.connections = connections;
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
     // A non-principal draft opened by permalink is only known once its group loads.
@@ -6940,29 +7234,46 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (S.taskTab === 'parameters') renderTaskPage();
   });
 }
-async function refreshTask() {
+async function refreshTask(reason = 'all') {
   if (!S.selected) return;
   // The series config page holds an editable form — don't live-refresh it (that
   // would clobber in-progress edits); it re-renders only on open / explicit save.
   if (taskRecord(S.selected)?.params?.repeatable) return;
+  const id = S.selected;
+  const pending = refreshTask.pending ||= new Map();
+  const existing = pending.get(id);
+  if (existing) { existing.reasons.add(reason); return existing.promise; }
+  const entry = { reasons: new Set([reason]) };
+  pending.set(id, entry);
+  entry.promise = (async () => {
+    do {
+      const reasons = new Set(entry.reasons);
+      entry.reasons.clear();
+      const full = reasons.has('all');
+      const has = (pattern) => full || [...reasons].some(value => pattern.test(value));
   try {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
-    const id = S.selected;
     const epoch = S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+    const approvals = S.taskApprovalsFor === id;
+    // Only what this refresh fetched is written back; the rest (undefined) keeps
+    // whatever landed meanwhile, e.g. the approvals ensureTaskApprovals loaded.
+    const load = (wanted, url) => wanted ? api(url).catch(() => undefined) : undefined;
     const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
-      api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
-      api(`/api/tasks/${id}/sessions?metadata=1`).catch(() => S.sessions),
-      api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
-      api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
-      api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
-      api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests),
-      api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
-      api(`/api/connections?${approvalQuery}`).catch(() => S.connections || []),
+      // Widgets are resolved against the view (the Overview's stage and changed
+      // files), so every lifecycle publication re-resolves them.
+      load(has(/view\.updated|review|stage|turn\.result/), `/api/tasks/${id}/widgets`),
+      load(has(/session|turn.result|stage/), `/api/tasks/${id}/sessions?metadata=1`),
+      load(has(/attempt|turn.result|merge.result/), `/api/tasks/${id}/attempts`),
+      load(approvals && has(/credential\.approval/), `/api/vault/requests?${approvalQuery}`),
+      load(approvals && has(/permission\.approval/), `/api/permission-requests?${approvalQuery}`),
+      load(approvals && has(/authorization\.approval/), `/api/authorization-requests?${approvalQuery}`),
+      load(approvals && has(/credential\.approval/), `/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`),
+      load(has(/^connection\./), `/api/connections?${approvalQuery}`),
     ]);
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
@@ -6973,22 +7284,31 @@ async function refreshTask() {
     }
     const becameDraft = !!view?.state?.draft && !S.view?.state?.draft;
     S.view = pendingCancellationView(view, id);
-    S.widgets = widgets;
-    S.sessions = sessions;
-    S.attemptGroup = attempts;
+    Object.assign(S, Object.fromEntries(Object.entries({ widgets, sessions, attemptGroup: attempts, approvalRequests,
+      permissionRequests, authorizationRequests, approvalItems, connections }).filter(([, value]) => value !== undefined)));
     // Moved back to a draft (stage picker) while open: its page becomes its form.
     if (becameDraft) showDraftPage(id);
-    S.approvalRequests = approvalRequests;
-    S.permissionRequests = permissionRequests;
-    S.authorizationRequests = authorizationRequests;
-    S.approvalItems = approvalItems;
-    S.connections = connections;
+    if (!approvals && showsTaskApprovals(S.view)) ensureTaskApprovals(id);
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
     // spawn a git subprocess (defaultBranch) on each one, for a value that never moved.
-  } catch {}
-  renderTaskPage();
+  } catch (error) {
+    if (error.status === 404 && S.selected === id) {
+      S.tasks = S.tasks.filter(task => task.id !== id);
+      toast('This task was deleted');
+      await closeTask();
+      return;
+    }
+  }
+  if (S.selected === id) {
+    renderTaskPage();
+    if (full && typeof document !== 'undefined') $('#tp-payments')?.refreshSpent?.();
+  }
+    } while (entry.reasons.size && S.selected === id);
+  })();
+  try { await entry.promise; }
+  finally { if (pending.get(id) === entry) pending.delete(id); }
 }
 // Close the task page by navigating back to the underlying list/queue; applyRoute()
 // then repaints the list. Kept as a navigation so the URL + history stay in sync
@@ -7004,8 +7324,10 @@ function closeTask() {
 }
 // Drop the open task's page state without navigating (called by applyRoute()).
 function closeTaskDom() {
+  S.taskWalkTarget = null;
   if (!S.selected && !S.view) return;
   S.selected = null;
+  syncLiveWatch();
   S.viewingAttempt = null;
   S.view = null;
   S.attemptGroup = null;
@@ -7014,7 +7336,7 @@ function closeTaskDom() {
   S.taskFileLoad = null;
   S.checkinSel = null;
   S.conversationFullscreen = false;
-  S.liveOutput = ''; // drop any streamed live text so it can't reappear on the next task page
+  S.liveOutput = {}; // drop any streamed live text so it can't reappear on the next task page
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next page
   if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // leaving the page kills the check-in shell
   if (reviewActionWs) { try { reviewActionWs.close(); } catch {} reviewActionWs = null; } // …and stops streaming a review action into the next page
@@ -7030,7 +7352,7 @@ function orgEditorHtml(rec) {
     const t = tagById(id); if (!t) return '';
     const color = t.color ? `style="--tag:${esc(t.color)}"` : '';
     return `<span class="tag-assignment" ${color}>
-      <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</button>
+      <button type="button" class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</button>
       <button type="button" class="tag-remove" data-untag="${esc(id)}" title="Remove ${esc(tagPathStr(id))} from this task" aria-label="Remove tag">×</button>
     </span>`;
   }).join('');
@@ -7481,7 +7803,7 @@ function renderTaskPage() {
     const projectId = rec?.projectId || S.projectId;
     wireLiveSection($('#tp-auth'), () => wireTaskAuthorization(v));
     const payments = $('#tp-payments');
-    if (!wireLiveSection(payments, () => wireTaskPayments(payments, projectId, rec?.params?.paymentPolicy, v.taskId))) payments?.refreshSpent?.();
+    wireLiveSection(payments, () => wireTaskPayments(payments, projectId, rec?.params?.paymentPolicy, v.taskId));
     wireLiveSection($('#cred-editor-task'), (el) => renderCredentialEditor(el, 'task', { projectId, taskId: v.taskId }));
   }
   wireCopyButtons();
@@ -7634,6 +7956,10 @@ function taskTabBody(v, tab) {
 }
 
 function approvalRequestsTab(v) {
+  if (S.taskApprovalsFor !== v.taskId) {
+    ensureTaskApprovals(v.taskId);
+    return '<div class="task-approvals" id="task-approval-requests"><span class="global-search-loading">Loading…</span></div>';
+  }
   const pending = [...S.approvalRequests, ...S.permissionRequests, ...(S.authorizationRequests || [])]
     .filter((request) => request.status === 'pending' && !request.dismissed).length + (S.connections || []).filter(c => ['requested', 'connecting'].includes(c.status)).length;
   return `<div class="task-approvals" id="task-approval-requests">
@@ -7672,13 +7998,13 @@ function wireTaskApprovalRequests(v) {
   const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
   wireConnectionActions(document.getElementById('task-approval-requests'), organizationId, refreshTask);
   wireCredentialRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
-    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
   });
   wirePermissionRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
-    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
   });
   wireAuthorizationRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
-    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
   });
 }
 
@@ -7934,7 +8260,7 @@ function openTerminal(taskId) {
   // which branch to land in. It is just a cwd — no second world, and the remote
   // case costs nothing extra for exactly that reason (SPEC §11.1).
   const checkout = document.getElementById('term-checkout')?.value;
-  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}`);
   term = { taskId, ws, screen: makeTermScreen(), pending: '' };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
@@ -7997,6 +8323,26 @@ function reviewActionBtn(a, i) {
   const label = `${icon} ${esc(a.label || (isPayment ? 'Resolve spend' : isRun ? 'Run' : 'Open'))}`;
   const title = isPayment ? `Payment request ${esc(a.requestId || '')}` : isRun ? esc(a.command || '') : esc(a.target || '');
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
+}
+
+function promptText(title, initial = '') {
+  return new Promise(resolve => {
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.className = 'text-prompt';
+    dialog.setAttribute('aria-label', title);
+    dialog.innerHTML = `<form method="dialog"><label class="form-row">${esc(title)}<input value="${esc(initial)}" autocomplete="off"></label>
+      <div class="inline-form" style="justify-content:flex-end"><button type="button" class="btn">Cancel</button><button class="btn primary" value="submit">Continue</button></div></form>`;
+    dialog.querySelector('[type="button"]').onclick = () => dialog.close();
+    dialog.addEventListener('keydown', event => event.stopPropagation());
+    dialog.addEventListener('close', () => {
+      const value = dialog.returnValue === 'submit' ? dialog.querySelector('input').value : null;
+      dialog.remove(); previousFocus?.focus(); resolve(value);
+    }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    dialog.querySelector('input').select();
+  });
 }
 
 /** Ask for a secret in a masked field. `window.prompt` shows the value in clear
@@ -8067,26 +8413,12 @@ function showArtifactReader(text, kind, name, blob) {
 }
 
 // Types a browser renders without running anything: opened straight from a
-// `blob:` URL. Active documents (HTML, SVG) are opened too — inside a sandboxed
-// iframe, because a `blob:` URL carries THIS page's origin and an agent-authored
-// page opened bare would execute with the console's session. Everything else
-// is downloaded.
+// `blob:` URL. Active documents (HTML, SVG) open by their own URL instead: the
+// gateway serves them under a `sandbox` policy that gives them an opaque origin,
+// while a `blob:` URL would carry THIS page's origin and policy. Everything
+// else is downloaded.
 const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
 const ACTIVE_ARTIFACT = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i;
-function openSandboxedDocument(blobUrl, title) {
-  const w = window.open('', '_blank', 'noopener=no');
-  if (!w) return false;
-  w.document.title = title;
-  const frame = w.document.createElement('iframe');
-  // No allow-same-origin: the document gets an opaque origin, so its scripts
-  // cannot read this console's storage or cookies or call its API as the user.
-  frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
-  frame.src = blobUrl;
-  frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0';
-  w.document.body.style.margin = '0';
-  w.document.body.appendChild(frame);
-  return true;
-}
 function safeHref(href) {
   return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
 }
@@ -8105,9 +8437,14 @@ async function openArtifact(url, external, target = '') {
       showArtifactReader(await blob.text(), kind, name, blob);
       return;
     }
+    if (ACTIVE_ARTIFACT.test(blob.type)) {
+      // `noopener` would hide whether a popup blocker stopped the window.
+      const opened = window.open(url, '_blank');
+      if (opened) { opened.opener = null; return; }
+    }
     const obj = URL.createObjectURL(blob);
     if (RENDERABLE_ARTIFACT.test(blob.type)) window.open(obj, '_blank', 'noopener');
-    else if (!(ACTIVE_ARTIFACT.test(blob.type) && openSandboxedDocument(obj, name))) {
+    else {
       const a = document.createElement('a');
       a.href = obj; a.download = name; a.rel = 'noopener';
       document.body.appendChild(a); a.click(); a.remove();
@@ -8152,14 +8489,14 @@ function wireReviewActions(v) {
         if (kind === 'payment') {
           toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
             r.result?.status === 'denied');
-          await refreshTask(v.taskId);
+          await refreshTask();
           return;
         }
         // kind === 'run': stream output; open follow-up URLs; offer Stop.
         if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
         if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
+        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}`);
         reviewActionWs = ws;
         let exited = false;
         ws.onmessage = (m) => {
@@ -8199,8 +8536,8 @@ function resourceReviewPlaceholder() {
 function loadResourceReview(v, force = false, inventory = false) {
   const cache = inventory ? resourceInventoryCache : resourceReviewCache;
   const cached = cache.get(v.taskId);
-  if (!force && cached && (cached.view === v || (v.updatedAt != null && cached.view.updatedAt === v.updatedAt))
-    && (cached.pending || Date.now() - cached.at < 15_000)) return cached.promise;
+  if (!force && cached && cached.view.stage === v.stage
+    && (inventory || cached.view === v || (v.updatedAt != null && cached.view.updatedAt === v.updatedAt))) return cached.promise;
   const entry = { view: v, pending: true, at: Date.now() };
   entry.promise = api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources${inventory ? '/inventory' : '?summary=metadata'}`)
     .then((result) => {
@@ -8394,9 +8731,14 @@ function subTaskState(rec) {
 }
 
 function subTasksSection(v) {
-  if (!v.subTasks?.length) return '';
-  const children = v.subTasks.map((id) => {
-    const rec = taskRecord(id);
+  // Every child the store records, not only those the current run spawned (a
+  // replaced run forgets children that had already settled). A finished child is
+  // archived out of the live list, so the parent's view carries its summary.
+  const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
+  const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])];
+  if (!ids.length) return '';
+  const children = ids.map((id) => {
+    const rec = taskRecord(id) || summaries.get(id);
     const state = subTaskState(rec);
     return { id, rec, state };
   });
@@ -8511,7 +8853,7 @@ function checkoutsSection(v) {
     const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
     const pr = c.pr
       ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
-           href="${esc(c.pr.url)}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
+           href="${esc(safeHref(c.pr.url))}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
       : '';
     return `<div class="checkout-row ${c.approved ? 'approved' : ''}">
       <span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>
@@ -8529,7 +8871,7 @@ function checkoutsSection(v) {
     <div class="card checkout-list">
       ${rows}
       ${atReview ? `<div class="task-sub" style="margin-top:6px">${pending
-        ? `${pending} of ${checkouts.length} still to review — approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm PR approves the rest and passes Review.`
+        ? `${pending} of ${checkouts.length} still to review ${policyTip('Approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm PR approves the rest and passes Review.')}`
         : 'Every branch approved. Confirm PR to pass Review.'}</div>` : ''}
     </div>`;
 }
@@ -8554,8 +8896,8 @@ function overviewTab(v) {
          ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
          ${v.reviewInfo?.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
-         ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
-         ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
+         ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
+         ${v.reviewInfo?.html ? `<iframe id="review-info-frame" data-live-key="${esc(v.taskId)}:${contentKey(v.reviewInfo.html)}" sandbox="allow-scripts" src="/api/tasks/${encodeURIComponent(v.taskId)}/review-info.html" title="Review details"></iframe>` : ''}
          ${v.stage === 'review' ? `${resourceReviewPlaceholder()}<div id="review-resource-inventory"><div class="task-sub" role="status">Inspecting ignored output…</div></div>` : ''}
        </div>`
     : '';
@@ -8709,12 +9051,10 @@ function conversationPane(v, t) {
     : S.taskHistoryError
       ? `<div class="msg system" role="alert">${esc(S.taskHistoryError)} <button class="btn sm" data-reload-history>Retry loading history</button></div>`
       : '';
-  // Only the stage's own conversation gets the #live-bubble (one per page,
-  // updated by the WS stream).
-  const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
-  const live = t.role === liveRoleFor(v) && !hasStructuredMessages
-    ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
-    : '';
+  // The open conversation's #live-bubble shows its own agent's streamed text
+  // (one per page, patched by the WS stream).
+  const liveText = liveOutputFor(v, t.role);
+  const live = `<div class="msg agent ${liveText ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(liveText)}</div>`;
   // Only subscription/CLI sessions carry a config home; API-key / stateless
   // sessions can't be forked from a terminal, so no command is shown. The session
   // id is published mid-turn (#3), so this appears WHILE the agent runs.
@@ -9356,7 +9696,7 @@ function wireCheckinSidebar(v) {
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
   $('#desktop-open')?.addEventListener('click', async () => {
-    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`); window.open(session.url, '_blank', 'noopener'); }
+    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`, { method: 'POST' }); window.open(session.url, '_blank', 'noopener'); }
     catch (error) { toast(error.message, true); }
   });
 }
@@ -9403,6 +9743,9 @@ async function downloadNativeConversation(button) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.error || `download failed (HTTP ${response.status})`);
     }
+    let notes = [];
+    try { notes = JSON.parse(decodeURIComponent(response.headers.get('x-karmax-conversation-warnings') || '[]')).map((note) => note.message); }
+    catch { /* A malformed header must not fail the download. */ }
     const href = URL.createObjectURL(await response.blob());
     const anchor = document.createElement('a');
     anchor.href = href;
@@ -9412,6 +9755,7 @@ async function downloadNativeConversation(button) {
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(href), 60_000);
     button.textContent = '✓ Downloaded';
+    if (notes.length) toast(`Converted with changes: ${notes[0]}${notes.length > 1 ? ` (+${notes.length - 1} more)` : ''}`);
     setTimeout(() => { if (button.isConnected) button.textContent = label; }, 1200);
   } catch (error) {
     button.textContent = label;
@@ -9447,45 +9791,55 @@ function localConversationHandoff(v, cwd, portable = false, preparedSessions = S
     }).join('')}</div>`;
 }
 
-async function openLocalCheckout(v) {
-  if (hostLocal()) return materializeLocalCheckout(v);
+// The Work-locally dialogs share one frame: a loading state while `load()` runs,
+// then `render(data)`'s body, with close, copy and conversation downloads wired.
+// Resolves to { host, data }, or null when the load failed or the dialog closed.
+async function localHandoffDialog({ loading, load, title = () => 'Work locally', render }) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
+  const show = (heading, body) => {
+    host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">${heading} <span class="q-spacer"></span><button class="icon-btn local-handoff-close" aria-label="Close">✕</button></div>
+    ${body}
   </div></div>`;
-  const wireClose = () => {
     host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
     host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
   };
-  wireClose();
-  let plan, preparedSessions;
-  try {
-    [plan, preparedSessions] = await Promise.all([
+  show('Work locally', `<div class="tf-loading modal-loading" role="status"><span class="global-search-loading">${loading}</span></div>`);
+  let data;
+  try { data = await load(); }
+  catch (error) { host.remove(); toast(error.message, true); return null; }
+  if (!host.isConnected) return null;
+  show(title(data), render(data));
+  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
+  })));
+  host.querySelectorAll('.native-conversation-download').forEach((button) =>
+    button.addEventListener('click', () => downloadNativeConversation(button)));
+  return { host, data };
+}
+
+async function openLocalCheckout(v) {
+  if (hostLocal()) return materializeLocalCheckout(v);
+  const opened = await localHandoffDialog({
+    loading: 'Preparing checkout instructions…',
+    load: () => Promise.all([
       api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`),
       api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`),
-    ]);
-  }
-  catch (error) { host.remove(); return toast(error.message, true); }
-  if (!host.isConnected) return;
-  const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
+    ]),
+    render: ([plan, preparedSessions]) => {
+      const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
+      return `<p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
     ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true, preparedSessions)}
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
     <p class="task-sub">${siteNameMarkup()} accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
-    <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
-  </div></div>`;
-  wireClose();
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
-  host.querySelectorAll('.native-conversation-download').forEach((button) =>
-    button.addEventListener('click', () => downloadNativeConversation(button)));
+    <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>`;
+    },
+  });
+  if (!opened) return;
+  const { host } = opened;
   $('#local-refresh', host)?.addEventListener('click', async (event) => {
     const button = event.currentTarget; const result = $('#local-refresh-result', host); button.disabled = true; result.textContent = 'Importing the pushed branch…';
     try {
@@ -9498,63 +9852,31 @@ async function openLocalCheckout(v) {
 
 async function openProjectCheckout(project) {
   if (!project?.id) return;
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
-  </div></div>`;
-  const wireClose = () => {
-    host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
-    host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  };
-  wireClose();
-  let plan;
-  try { plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`); }
-  catch (error) { host.remove(); return toast(error.message, true); }
-  if (!host.isConnected) return;
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to ${siteNameMarkup()}.</p>
+  await localHandoffDialog({
+    loading: 'Preparing checkout instructions…',
+    load: () => api(`/api/projects/${encodeURIComponent(project.id)}/checkout`),
+    render: (plan) => `<p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to ${siteNameMarkup()}.</p>
     <div class="section-h">First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
-    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
-  </div></div>`;
-  wireClose();
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
+    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>`,
+  });
 }
 
 async function materializeLocalCheckout(v) {
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Materializing a local checkout…</span></div>
-  </div></div>`;
-  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
-  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  let checkout, preparedSessions;
-  try {
-    checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
-    preparedSessions = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`);
-  } catch (error) { host.remove(); toast(error.message, true); return null; }
-  if (!host.isConnected) return null;
-  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
-    <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
+  const opened = await localHandoffDialog({
+    loading: 'Materializing a local checkout…',
+    load: async () => {
+      const checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
+      return [checkout, await api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`)];
+    },
+    title: () => 'Ready locally',
+    render: ([checkout, preparedSessions]) => `<p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
     ${localConversationHandoff(v, checkout.cwd, false, preparedSessions)}
     <div class="section-h" style="margin-top:14px">Repositories</div>
-    <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
-  </div></div>`;
-  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
-  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
-  host.querySelectorAll('.native-conversation-download').forEach((button) =>
-    button.addEventListener('click', () => downloadNativeConversation(button)));
-  return checkout;
+    <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>`,
+  });
+  return opened?.data[0] ?? null;
 }
 
 async function forkCloudSessionLocally(v, button) {
@@ -9654,7 +9976,7 @@ async function wireTaskAuthorization(v) {
   const previous = edits[v.taskId];
   let syncAuthorization = () => {};
   wireAuthorizationEditor(select, projects, () => syncAuthorization());
-  // Per-task vault grants (PLAN-passwords.md §6): prefill from the stored grant.
+  // Per-task vault grants (wiki plans/PLAN-passwords §6): prefill from the stored grant.
   const vaultGrantIds = new Set((auth0.capabilities || [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
   let vaultCredentialPolicies = JSON.parse(JSON.stringify(auth0.credentialPolicies || {}));
@@ -9803,6 +10125,14 @@ function humanWaitDetail(v) {
   return typeof v.waitingFor.detail === 'string' ? v.waitingFor.detail.trim() : '';
 }
 
+// A short fingerprint (FNV-1a) of content a live section was built from: a
+// retained review frame reloads only when its document changed.
+function contentKey(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return `${text.length.toString(36)}-${(hash >>> 0).toString(36)}`;
+}
+
 // Provider streams and workflow snapshots may normalize line endings
 // differently even though the browser renders the same prose.
 function conversationTextKey(value) {
@@ -9834,8 +10164,9 @@ function conversationInputRequest(v, entries) {
 // copy that's safe to open even while the agent is running (it never mutates the live
 // session). Claude: --resume … --fork-session; Codex: `codex fork <id>` (SPEC §10.5, #3).
 function forkCommandFor(sess, worldPath) {
-  if (sess.provider === 'codex') return `cd "${worldPath}" && CODEX_HOME="${sess.home}" codex fork ${sess.id}`;
-  if (sess.provider === 'claude') return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id} --fork-session`;
+  const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
+  if (sess.provider === 'codex') return `cd ${quote(worldPath)} && CODEX_HOME=${quote(sess.home)} codex fork ${quote(sess.id)}`;
+  if (sess.provider === 'claude') return `cd ${quote(worldPath)} && CLAUDE_CONFIG_DIR=${quote(sess.home)} claude --resume ${quote(sess.id)} --fork-session`;
   // ACP makes forking available to karmax protocol-to-protocol. Until a harness
   // documents an equivalent safe terminal command, don't manufacture one.
   return '';
@@ -10030,7 +10361,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       });
     });
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
-      const to = prompt(`Rename login ${login.account} to:`, login.account);
+      const to = await promptText(`Rename login ${login.account} to:`, login.account);
       if (!to || to === login.account) return;
       try { await api(`${organizationBase}/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); renderCredentialEditor(el, scope, opts); }
       catch (e) { toast(e.message, true); }
@@ -10777,15 +11108,18 @@ function wireFollowups(v) {
   });
 }
 
-function updateLiveBubble() {
+function updateLiveBubble(role) {
   const b = document.getElementById('live-bubble');
-  if (!b) return;
+  const thread = document.getElementById('ck-thread');
+  if (thread?.dataset?.role && thread.dataset.role !== role) return; // another agent's conversation is open
+  if (!b) { if (thread) scheduleTaskPageRender(); return; } // this conversation gains its bubble
+  const text = liveOutputFor(S.view, role);
+  if (!text) { b.classList.add('hidden'); return; }
   // Follow the stream only when the reader is already parked at the bottom; if
   // they've scrolled up to read history, hold their view fixed as text streams in.
-  const thread = document.getElementById('ck-thread');
   const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2;
   b.classList.remove('hidden');
-  b.innerHTML = `<div class="role">agent · live</div>${esc(S.liveOutput)}`;
+  b.innerHTML = `<div class="role">agent · live</div>${esc(text)}`;
   if (atBottom) b.scrollIntoView({ block: 'nearest' });
 }
 
@@ -10905,7 +11239,7 @@ function mergeQueuePanel() {
           const pos = v.mergeQueue?.position;
           const merging = !!v.state?.mergeGranted;
           const canMove = !merging && !!domain;
-          return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
+          return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel(t, merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued', merging ? null : pos))}" ${canMove ? 'draggable="true"' : ''}>
         ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
         <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued'}</span></div>
@@ -10926,7 +11260,7 @@ function mergeQueuePanel() {
         const route = participant
           ? `<span class="branch">${esc(participant.slug)}</span> → <span class="branch">${esc(participant.target)}</span>`
           : `<span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span>`;
-        return `<div class="queue-item" data-id="${t.id}" tabindex="0">
+        return `<div class="queue-item" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(queueRowLabel(t, `${authority} ${state}`))}">
           <span class="drag-handle placeholder"></span><span class="pos">⇱</span>
           <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${esc(authority)} ${esc(state)}</span></div>
             <div class="task-sub">${route}${v.landing?.detail ? ` · ${esc(v.landing.detail)}` : ''}</div></div>
@@ -10934,6 +11268,11 @@ function mergeQueuePanel() {
       }).join('')}</div>`
     : '';
   return `${internal}${provider}`;
+}
+
+// A queue row's accessible name: the task, and where it stands in the queue.
+function queueRowLabel(task, state, position) {
+  return [`${task.num != null ? `#${task.num} ` : ''}${task.title}`, state, position > 0 ? `position ${position}` : ''].filter(Boolean).join(' · ');
 }
 
 function agentQueuePanel() {
@@ -10945,7 +11284,7 @@ function agentQueuePanel() {
       const task = taskRecord(x.taskId);
       const title = x.title || task?.title || `Task ${String(x.taskId || '').slice(0, 8)}`;
       const num = task?.num != null ? `<span class="task-num">#${task.num}</span> ` : '';
-      return `<div class="queue-item ${x.active ? 'current' : ''}" data-agent-turn="${esc(x.turnId)}" data-id="${esc(x.taskId)}" tabindex="0" ${x.active ? '' : 'draggable="true"'}>
+      return `<div class="queue-item ${x.active ? 'current' : ''}" data-agent-turn="${esc(x.turnId)}" data-id="${esc(x.taskId)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel({ num: task?.num, title }, x.active ? 'active lease' : 'queued', x.active ? null : i - active.length + 1))}" ${x.active ? '' : 'draggable="true"'}>
         ${x.active ? '<span class="drag-handle placeholder"></span>' : '<span class="drag-handle" title="Drag to reorder">⠿</span>'}
         <span class="pos">${x.active ? '▶' : `#${i - active.length + 1}`}</span>
         <div style="flex:1"><div class="task-title">${num}${esc(title)} <span class="chip">${x.active ? 'active lease' : 'queued'}</span></div>
@@ -11113,7 +11452,7 @@ async function seedActivity() {
   try {
     const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
     if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
-    S.activity = activity.filter(e => e.type !== 'timing' || S.meta?.timingEnabled === true).reverse();
+    S.activity = activity.filter(e => e.type !== 'agent.output' && (e.type !== 'timing' || S.meta?.timingEnabled === true)).reverse();
     renderMain();
   } catch {}
 }
@@ -11164,7 +11503,7 @@ function hostDiagHtml(diag) {
 // Live-refresh just the host panel every 5s while Installation is open. Self-
 // terminates (no reschedule) once the tab changes or the element is gone.
 async function refreshHostDiag() {
-  if (S.tab !== 'installation' || !$('#host-diag')) return;
+  if (document.hidden || S.tab !== 'installation' || !$('#host-diag')) return;
   clearTimeout(S.hostDiagTimer);
   const epoch = S.hostDiagEpoch = (S.hostDiagEpoch || 0) + 1;
   let diag = null;
@@ -11200,9 +11539,9 @@ function procPanelHtml(sample) {
   // affordance is discoverable even on an idle instance where only protected
   // infrastructure — karmax itself + Temporal — is running).
   const LOCK = `<span class="proc-lock" title="Protected — ${siteNameMarkup()} can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
-  const killBtn = (pid, label, killable) =>
+  const killBtn = (pid, label, killable, taskId) =>
     sample.canKill === false ? '' : killable
-      ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" title="click: SIGTERM · shift-click: SIGKILL">✕ kill</button>`
+      ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" ${taskId ? `data-stop-task="${esc(taskId)}"` : ''} title="${taskId ? 'Stop task and its agent' : 'click: SIGTERM · shift-click: SIGKILL'}">✕ ${taskId ? 'stop task' : 'kill'}</button>`
       : LOCK;
   const rows = (sample.groups || [])
     .map((g) => {
@@ -11218,7 +11557,7 @@ function procPanelHtml(sample) {
         <td class="mono num">${g.procs.length}</td>
         <td class="mono num">${g.cpuPct.toFixed(1)}%</td>
         <td class="mono num">${g.rssMb >= 1024 ? (g.rssMb / 1024).toFixed(2) + 'G' : g.rssMb.toFixed(0) + 'M'}</td>
-        <td class="num">${rootKillable ? killBtn(g.key, g.label, true) : g.protected || g.kind === 'app' ? LOCK : ''}</td>
+        <td class="num">${rootKillable ? killBtn(g.key, g.label, true, g.kind === 'agent' ? g.taskId : undefined) : g.protected || g.kind === 'app' ? LOCK : ''}</td>
       </tr>`;
       const body = g.procs
         .map((r) => {
@@ -11230,7 +11569,7 @@ function procPanelHtml(sample) {
             <td class="mono num">${r.pid}<span class="proc-age"> · ${fmtDur(r.ageSec)}</span></td>
             <td class="mono num">${r.cpuPct.toFixed(1)}%</td>
             <td class="mono num">${r.rssMb >= 1024 ? (r.rssMb / 1024).toFixed(2) + 'G' : r.rssMb.toFixed(0) + 'M'}</td>
-            <td class="num">${killBtn(r.pid, r.cmd.slice(0, 60), killable)}</td>
+            <td class="num">${killBtn(r.pid, r.cmd.slice(0, 60), killable, g.kind === 'agent' && String(r.pid) === g.key ? g.taskId : undefined)}</td>
           </tr>`;
         })
         .join('');
@@ -11252,11 +11591,12 @@ function wireProcPanel(el) {
     b.addEventListener('click', async (ev) => {
       const pid = Number(b.dataset.kill);
       const signal = ev.shiftKey ? 'SIGKILL' : 'SIGTERM';
-      if (!confirm(`Send ${signal} to pid ${pid}?\n\n${b.dataset.label}`)) return;
+      const taskId = b.dataset.stopTask;
+      if (!confirm(taskId ? `Stop task ${numLabel(taskId)} and its agent?` : `Send ${signal} to pid ${pid}?\n\n${b.dataset.label}`)) return;
       b.disabled = true;
       try {
         await api('/api/processes/kill', { method: 'POST', body: JSON.stringify({ pid, signal }) });
-        toast(`${signal} sent to ${pid}`);
+        toast(taskId ? 'Task stopping' : `${signal} sent to ${pid}`);
       } catch (e) { toast(e.message, true); }
       refreshProcPanel(true);
     }),
@@ -11267,7 +11607,7 @@ function wireProcPanel(el) {
 // self-terminating pattern as refreshHostDiag. CPU% is a delta between samples,
 // so the very first paint shows 0% and settles from the second sample on.
 async function refreshProcPanel(now = false) {
-  if (S.tab !== 'installation' || !$('#proc-panel')) return;
+  if (document.hidden || S.tab !== 'installation' || !$('#proc-panel')) return;
   clearTimeout(S.procTimer);
   const epoch = S.procLoadEpoch = (S.procLoadEpoch || 0) + 1;
   let sample = null;
@@ -11363,7 +11703,7 @@ async function renderAccountStatus(organizationId = S.organizationId || 'org_per
     });
   });
   box.querySelectorAll('.acct-reset').forEach((b) => b.addEventListener('click', async () => {
-    const ans = prompt('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
+    const ans = await promptText('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
     if (!ans) return;
     const mins = Number(ans);
     const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
@@ -11476,7 +11816,7 @@ function insightTaskRow(ref, kind) {
   const meta = kind === 'shipped'
     ? `${esc(project)}${ref.at ? ` · ${esc(fmtAgo(ref.at))}` : ''}`
     : `${esc(project)}${ref.stage ? ` · ${esc(kind === 'waiting' && ref.stage === 'do' ? 'needs input' : stageLabel({ stage: ref.stage }))}` : ''}`;
-  const pr = kind === 'shipped' && ref.pr ? `<a class="ins-pr" href="${esc(ref.pr)}" target="_blank" rel="noopener" title="Open pull request">PR ↗</a>` : '';
+  const pr = kind === 'shipped' && ref.pr ? `<a class="ins-pr" href="${esc(safeHref(ref.pr))}" target="_blank" rel="noopener" title="Open pull request">PR ↗</a>` : '';
   const title = `${ref.num != null ? `<span class="ins-num">#${esc(ref.num)}</span> ` : ''}${esc(ref.title)}`;
   return `<div class="ins-task"><span class="ins-dot ${kind}" aria-hidden="true"></span>
     ${href ? `<a class="ins-task-title" data-spa href="${esc(href)}">${title}</a>` : `<span class="ins-task-title">${title}</span>`}
@@ -12055,8 +12395,8 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     const payments = box.querySelector('.task-payments');
     await wireTaskPayments(payments, projectId, undefined, undefined, organizationId);
     if (!current()) return;
-    payments.onchange = event => { if (event.target === payments) paymentDirty.add('cardIds'); else if (event.target.matches('.payment-budget')) paymentDirty.add('budget'); };
-    payments.oninput = event => { if (event.target.matches('.payment-budget')) paymentDirty.add('budget'); };
+    payments.onchange = event => { if (event.target === payments) paymentDirty.add('cardIds'); else if (event.target.matches('.payment-budget, .payment-currency')) paymentDirty.add('budget').add('currency'); };
+    payments.oninput = event => { if (event.target.matches('.payment-budget')) paymentDirty.add('budget').add('currency'); };
     box.querySelector('.resource-save').disabled = false;
     box.querySelector('.resource-reset').disabled = false;
     box.querySelector('.resource-save').onclick = async event => {
@@ -12072,7 +12412,7 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     box.querySelector('.resource-reset').onclick = async () => {
       try {
         await api(`${base}/vault`, { method: 'PUT', body: JSON.stringify({ values: {} }) });
-        const { cardIds, budget, allowance, threshold, ...rest } = await api(`${base}/payments`);
+        const { cardIds, budget, currency, allowance, threshold, ...rest } = await api(`${base}/payments`);
         await api(`${base}/payments`, { method: 'PUT', body: JSON.stringify({ values: rest }) });
         await hydrateResourceDefaults(scope, projectId, organizationId);
       } catch (error) { box.querySelector('.resource-error').textContent = error.message; }
@@ -12245,9 +12585,10 @@ function avatarDetailView(avatar) {
 }
 async function loadAvatarAuthorizationRequests(avatarId) {
   const project = projectById(S.projectId);
-  S.avatarAuthorizationRequests = avatarId && project?.organizationId
+  const requests = avatarId && project?.organizationId
     ? await api(`/api/authorization-requests?organizationId=${encodeURIComponent(project.organizationId)}&avatarId=${encodeURIComponent(avatarId)}`).catch(() => [])
     : [];
+  if (S.avatarSelected === avatarId) S.avatarAuthorizationRequests = requests; // not a page left meanwhile
 }
 // Shown wherever Avatars are managed. An Avatar acts with a person's delegated
 // authority on whatever it reads, so anything it reads can steer it.
@@ -12261,7 +12602,7 @@ function avatarsView(proj) {
   return `<div class="avatars-page"><div class="settings-header avatar-list-head"><div><h1 class="page-title">Avatars</h1><p class="settings-intro">Trusted agents with delegated authority.</p></div>${disabled ? '' : '<button class="btn primary avatar-new" type="button">+ New avatar</button>'}</div>
     ${AVATAR_RISK_NOTE}
     ${disabled ? '<div class="avatar-disabled card"><div><b>Avatars are disabled for this project.</b><p>Existing Avatars and their history remain visible, but they cannot be called.</p></div><button class="btn avatar-project-enable" type="button">Enable for project</button></div>' : ''}
-    <div class="avatar-list">${S.avatars.map((avatar) => `<button class="avatar-row" type="button" data-avatar="${esc(avatar.id)}"><span class="avatar-mark" aria-hidden="true">✦</span><span class="avatar-row-main"><b>${esc(avatar.name)}</b><span>${esc(avatar.purpose || 'User-authored autonomous principal')}</span><small>Owned by ${esc(avatarOwnerName(avatar))} · ${avatar.authorityMode === 'full' ? 'Full delegation' : 'Restricted'} · ${esc(avatarCallerSummary(avatar))}</small></span><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span><span class="avatar-chevron">›</span></button>`).join('') || (disabled ? '' : '<div class="empty avatar-empty"><span class="avatar-mark">✦</span><b>No Avatars yet</b><span>Create a trusted agent with its own instructions and delegated authority.</span><button class="btn primary avatar-new" type="button">Create your first Avatar</button></div>')}</div></div>`;
+    <div class="avatar-list">${S.avatars.map((avatar) => `<a class="avatar-row" data-spa href="${esc(avatarRoute(proj.id, avatar.id))}" data-avatar="${esc(avatar.id)}"><span class="avatar-mark" aria-hidden="true">✦</span><span class="avatar-row-main"><b>${esc(avatar.name)}</b><span>${esc(avatar.purpose || 'User-authored autonomous principal')}</span><small>Owned by ${esc(avatarOwnerName(avatar))} · ${avatar.authorityMode === 'full' ? 'Full delegation' : 'Restricted'} · ${esc(avatarCallerSummary(avatar))}</small></span><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span><span class="avatar-chevron">›</span></a>`).join('') || (disabled ? '' : '<div class="empty avatar-empty"><span class="avatar-mark">✦</span><b>No Avatars yet</b><span>Create a trusted agent with its own instructions and delegated authority.</span><button class="btn primary avatar-new" type="button">Create your first Avatar</button></div>')}</div></div>`;
 }
 
 async function openAvatarEditor(proj, avatar) {
@@ -12334,23 +12675,23 @@ async function fillAvatarEditor(overlay, close, proj, avatar) {
             target: { kind: 'avatar', avatarId: saved.id, enableAfterApproval: !avatar },
             authorization: requestedAuthorization, audience: decision.audience, reason: decision.reason,
           }) });
-          close(); await loadAvatars(); S.avatarSelected = saved.id; await loadAvatarAuthorizationRequests(saved.id); renderMain();
+          close(); await loadAvatars(); await go(avatarRoute(proj.id, saved.id));
           toast('Authorization request sent'); return;
         }
       }
-      close(); await loadAvatars(); S.avatarSelected = saved.id; renderMain(); toast(avatar ? 'Avatar saved' : 'Avatar created');
+      close(); await loadAvatars(); await go(avatarRoute(proj.id, saved.id)); toast(avatar ? 'Avatar saved' : 'Avatar created');
     } catch (error) { button.disabled = false; toast(error.message, true); }
   }); overlay.querySelector('#avatar-name').focus();
 }
 
 function wireAvatarsView(proj) {
-  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj))); document.querySelectorAll('.avatar-row').forEach((row) => row.addEventListener('click', async () => { S.avatarSelected = row.dataset.avatar; await loadAvatarAuthorizationRequests(S.avatarSelected); renderMain(); })); document.querySelector('.avatar-back')?.addEventListener('click', () => { S.avatarSelected = null; S.avatarAuthorizationRequests = []; renderMain(); });
+  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj))); document.querySelector('.avatar-back')?.addEventListener('click', () => go(avatarRoute(proj.id)));
   const avatar = S.avatars.find((item) => item.id === S.avatarSelected); document.querySelector('.avatar-edit')?.addEventListener('click', () => openAvatarEditor(proj, avatar)); document.querySelector('.avatar-start')?.addEventListener('click', () => { S.pendingAvatarId = avatar.id; openTaskForm('software-dev'); });
   document.querySelector('.avatar-toggle')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'PUT', body: JSON.stringify({ enabled: !avatar.enabled }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
-  document.querySelector('.avatar-remove')?.addEventListener('click', async () => { if (!confirm(`Remove ${avatar.name}? Its audit history will be retained.`)) return; try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'DELETE' }); S.avatarSelected = null; await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
+  document.querySelector('.avatar-remove')?.addEventListener('click', async () => { if (!confirm(`Remove ${avatar.name}? Its audit history will be retained.`)) return; try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'DELETE' }); await loadAvatars(); await go(avatarRoute(proj.id), { replace: true }); } catch (error) { toast(error.message, true); } });
   document.querySelector('.avatar-project-enable')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatar-settings`, { method: 'PUT', body: JSON.stringify({ value: 'enabled' }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
   wireAuthorizationRequestActions(document.querySelector('.avatar-authorization-requests'), proj.organizationId, async () => {
-    await Promise.all([loadAvatars(), loadAvatarAuthorizationRequests(S.avatarSelected), loadCollaboration().catch(() => {})]);
+    await Promise.all([loadAvatars(), loadAvatarAuthorizationRequests(S.avatarSelected), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
     renderMain();
   });
 }
@@ -12503,7 +12844,7 @@ async function wireWikiView(proj) {
   // already left must not replace the one they moved to.
   const generation = ++wikiGeneration;
   const current = () => generation === wikiGeneration && pane.isConnected;
-  const sel = decodeURIComponent((location.hash || '').slice(1));
+  const sel = decodeRoutePart((location.hash || '').slice(1), true);
   const key = `${info.scope}:${info.id}`;
   if (proj) {
     const select = $('#wiki-view-select');
@@ -13001,7 +13342,7 @@ function renderWikiHome(info, proj, pane, data) {
   pane.innerHTML = (data.unconditional || []).map((u) => `
     <div class="card wiki-uncond">
       <div class="wiki-uncond-head"><b>${esc(u.name)}</b>${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
-        ${data.view?.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}</div>
+        ${data.view?.writable === false || u.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}</div>
       <div class="msg-text md wiki-md">${renderMessageBody(u.body || '')}</div>
     </div>`).join('') + (data.tocText ? `
     <div class="card wiki-uncond">
@@ -13036,7 +13377,7 @@ function renderWikiPage(info, proj, pane, page) {
     <div class="card">
       <div class="msg-text md wiki-md">${renderMessageBody(wikiBody(page.content))}</div>
       ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? '<span class="task-sub">Read-only branch view</span>' : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}</div>
+      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}</div>
     </div>`;
   typesetMath(pane);
   wireWikiLocalLinks(pane, proj);
@@ -13183,9 +13524,9 @@ function settingsView(proj) {
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${profileRoute()}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files ${siteNameMarkup()} snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
+    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data ${policyTip(`Choose Data when ${siteName()} should capture and version the files; Storage only decides where the encrypted revisions live. A live S3 bucket, database or API that tasks call directly belongs under Services, with its access key under Secrets.`)}</h2><p>Files ${siteNameMarkup()} snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
     <div class="card"><div id="project-data-box">Loading…</div></div>
-    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
+    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services ${policyTip('Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
     <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
@@ -13235,15 +13576,18 @@ async function hydrateConversationSharing(scope, id) {
       <label class="form-row"><span>${scope === 'organization' ? 'Organization policy' : `Project policy · organization ${policy.organization ? 'allows' : 'disallows'} sharing`}</span><select ${policy.canManage ? '' : 'disabled'}>
         ${scope === 'organization' ? `<option value="disabled" ${!policy.enabled ? 'selected' : ''}>Disabled</option><option value="enabled" ${policy.enabled ? 'selected' : ''}>Allow developers to share</option>` : `<option value="inherit" ${policy.value === 'inherit' ? 'selected' : ''}>Use organization policy</option><option value="disabled" ${policy.value === 'disabled' ? 'selected' : ''}>Disable for this project</option>`}
       </select></label><button class="btn sm" data-save ${policy.canManage ? '' : 'disabled'}>Save</button>`;
+    const select = box.querySelector('select');
+    let saved = select.value;
     box.querySelector('[data-save]').onclick = async (event) => {
       const button = event.currentTarget;
-      button.disabled = true;
+      button.disabled = select.disabled = true;
       try {
-        const value = box.querySelector('select').value;
+        const value = select.value;
         await api(url, { method: 'PUT', body: JSON.stringify(scope === 'organization' ? { enabled: value === 'enabled' } : { value }) });
+        saved = value;
         toast('Public sharing policy saved');
-      } catch (error) { toast(error.message, true); }
-      finally { button.disabled = false; }
+      } catch (error) { select.value = saved; toast(error.message, true); }
+      finally { button.disabled = select.disabled = false; }
     };
   } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
 }
@@ -13275,9 +13619,11 @@ async function hydrateAvatarAvailability(scope, id) {
 }
 
 async function hydrateProjectSecrets(proj) {
-  const box = $('#project-secrets-box'); if (!box) return;
+  const box = $('#project-secrets-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    if (!renderIsCurrent()) return;
     box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file ? 'Applies to running tasks too.' : 'Applies to running tasks too. Processes already running keep their old environment until restarted.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
       ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
       <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
@@ -13289,35 +13635,36 @@ async function hydrateProjectSecrets(proj) {
       </details>
       <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b><span>Review names, paste once</span></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# blank values are ignored" style="width:100%"></textarea><button class="btn sm primary" id="project-secret-import">Import</button></details>`;
     box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
-      $('#project-secret-add').open = true; $('#project-secret-name').value = button.dataset.name; $('#project-secret-value').focus();
+      box.querySelector('#project-secret-add').open = true; box.querySelector('#project-secret-name').value = button.dataset.name; box.querySelector('#project-secret-value').focus();
     }));
     box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Remove this secret and its vault value?')) return;
       try { await api(`/api/projects/${proj.id}/secrets/${encodeURIComponent(button.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectSecrets(proj); }
       catch (error) { toast(error.message, true); }
     }));
-    $('#project-secret-save')?.addEventListener('click', async () => {
-      const name = $('#project-secret-name').value.trim(), value = $('#project-secret-value').value;
+    box.querySelector('#project-secret-save')?.addEventListener('click', async () => {
+      const name = box.querySelector('#project-secret-name').value.trim(), value = box.querySelector('#project-secret-value').value;
       if (!name || !value) return toast('Name and value are required', true);
       try {
         await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ name, value,
-          file: $('#project-secret-file').value.trim() || undefined }) });
+          file: box.querySelector('#project-secret-file').value.trim() || undefined }) });
         toast(`Saved ${name}`); await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
     });
-    $('#project-secret-import')?.addEventListener('click', async () => {
+    box.querySelector('#project-secret-import')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST',
-          body: JSON.stringify({ env: $('#project-secret-env').value }) });
+          body: JSON.stringify({ env: box.querySelector('#project-secret-env').value }) });
         toast(`Imported ${result.imported.length} secret${result.imported.length === 1 ? '' : 's'}`);
         await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectSecrets(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectSecrets(proj)); }
 }
 
 async function hydrateProjectData(proj) {
-  const box = $('#project-data-box'); if (!box) return;
+  const box = $('#project-data-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const [all, storageLocations] = await Promise.all([
       api(`/api/projects/${encodeURIComponent(proj.id)}/resources`),
@@ -13327,8 +13674,8 @@ async function hydrateProjectData(proj) {
     const readyStorage = storageLocations.filter((location) => location.status === 'ready');
     const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
-    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when ${siteNameMarkup()} should capture and version the files. The Storage field only decides where those encrypted revisions live. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
-      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
+    if (!renderIsCurrent()) return;
+    box.innerHTML = `      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
@@ -13360,54 +13707,55 @@ async function hydrateProjectData(proj) {
         } catch (error) { toast(error.message, true); }
       });
     });
-    $('#data-discover')?.addEventListener('click', async () => {
+    box.querySelector('#data-discover')?.addEventListener('click', async () => {
       try {
-        const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = $('#data-proposals');
+        const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = box.querySelector('#data-proposals');
         const proposals = scan.proposals.filter((proposal) => proposal.suggested.driver === 'volume@1');
         target.innerHTML = proposals.map((proposal, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span><p class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</p></div><button class="btn sm primary accept-data-proposal">Use proposal</button></div>`).join('')
           || `<div class="project-empty">Nothing looks like project data. ${siteNameMarkup()} checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>`;
         target.querySelectorAll('.accept-data-proposal').forEach((button) => button.addEventListener('click', () => {
           const proposal = proposals[Number(button.closest('[data-index]').dataset.index)];
-          $('#data-add-panel').open = true;
-          $('#data-name').value = proposal.path.split('/').pop() || 'Data';
-          $('#data-path').value = proposal.suggested.target.path;
-          $('#data-access').value = proposal.suggested.access;
-          $('#data-publish').value = proposal.suggested.publish;
-          if ($('#data-source')) $('#data-source').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
-          $('#data-name').scrollIntoView({ behavior: 'smooth', block: 'center' });
+          box.querySelector('#data-add-panel').open = true;
+          box.querySelector('#data-name').value = proposal.path.split('/').pop() || 'Data';
+          box.querySelector('#data-path').value = proposal.suggested.target.path;
+          box.querySelector('#data-access').value = proposal.suggested.access;
+          box.querySelector('#data-publish').value = proposal.suggested.publish;
+          if (box.querySelector('#data-source')) box.querySelector('#data-source').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
+          box.querySelector('#data-name').scrollIntoView({ behavior: 'smooth', block: 'center' });
         }));
       } catch (error) { toast(error.message, true); }
     });
-    $('#data-add')?.addEventListener('click', async () => {
-      const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
-      const files = [...$('#data-files').files, ...$('#data-folder').files];
-      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a local path or browser uploads, not both', true);
-      const button = $('#data-add'); button.disabled = true;
+    box.querySelector('#data-add')?.addEventListener('click', async () => {
+      const name = box.querySelector('#data-name').value.trim(); if (!name) return toast('Name is required', true);
+      const files = [...box.querySelector('#data-files').files, ...box.querySelector('#data-folder').files];
+      if (box.querySelector('#data-source')?.value.trim() && files.length) return toast('Choose a local path or browser uploads, not both', true);
+      const button = box.querySelector('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
-          name, driver: 'volume@1', target: { kind: 'path', path: $('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
-          access: $('#data-access').value, isolation: 'fork', publish: $('#data-publish').value,
-          storageLocationId: $('#data-storage')?.value || undefined,
-          sourcePath: $('#data-source')?.value.trim() || undefined,
+          name, driver: 'volume@1', target: { kind: 'path', path: box.querySelector('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
+          access: box.querySelector('#data-access').value, isolation: 'fork', publish: box.querySelector('#data-publish').value,
+          storageLocationId: box.querySelector('#data-storage')?.value || undefined,
+          sourcePath: box.querySelector('#data-source')?.value.trim() || undefined,
         }) });
         if (files.length) await uploadResourceFiles(proj.id, created.id, files,
           (done, total) => { button.textContent = `Uploading ${Math.round(done / total * 100)}%`; });
         toast('Data resource added'); await hydrateProjectData(proj);
       } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Add data'; }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectData(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectData(proj)); }
 }
 
 async function hydrateProjectServices(proj) {
-  const box = $('#project-services-box'); if (!box) return;
+  const box = $('#project-services-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const [{ services }, resources] = await Promise.all([
       api(`/api/projects/${proj.id}/services`), api(`/api/projects/${proj.id}/resources`),
     ]);
     const secrets = resources.filter((resource) => ['secret@1', 'database@1', 'service@1'].includes(resource.driver));
     const data = resources.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver) && resource.target.kind === 'path');
-    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">↗</span><div><b>A service stays live.</b> Use an external service for an API, hosted database, or S3 bucket tasks call directly. Use a per-task container for an isolated development dependency such as Postgres or Redis. Credentials belong in Secrets.</div></div>
-      ${services.map((service) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(service.name)}</b><div class="project-resource-meta"><span class="chip">${service.kind === 'per-world' ? 'private per task' : 'shared external'}</span>${service.image ? `<span class="project-resource-location"><span>Image</span><code>${esc(service.image)}</code></span>` : ''}${service.urlEnv ? `<span class="project-resource-location"><span>Connection variable</span><code>${esc(service.urlEnv)}</code></span>` : ''}</div></div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')}
+    if (!renderIsCurrent()) return;
+    box.innerHTML = `      ${services.map((service) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(service.name)}</b><div class="project-resource-meta"><span class="chip">${service.kind === 'per-world' ? 'private per task' : 'shared external'}</span>${service.image ? `<span class="project-resource-location"><span>Image</span><code>${esc(service.image)}</code></span>` : ''}${service.urlEnv ? `<span class="project-resource-location"><span>Connection variable</span><code>${esc(service.urlEnv)}</code></span>` : ''}</div></div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')}
       <div class="inline-form"><button class="btn sm" id="service-discover">Discover from Compose/devcontainer</button></div><div id="service-proposals"></div>
       <details class="settings-disclosure compact"><summary><b>Add a service manually</b></summary>
         <div class="project-form-grid">
@@ -13428,9 +13776,9 @@ async function hydrateProjectServices(proj) {
         <div class="project-form-actions"><button class="btn sm primary" id="service-save">Save service</button></div>
       </details>`;
     const syncServiceFields = () => box.querySelectorAll('[data-service-kind]').forEach((fields) => {
-      fields.hidden = fields.dataset.serviceKind !== $('#service-kind').value;
+      fields.hidden = fields.dataset.serviceKind !== box.querySelector('#service-kind').value;
     });
-    $('#service-kind')?.addEventListener('change', syncServiceFields); syncServiceFields();
+    box.querySelector('#service-kind')?.addEventListener('change', syncServiceFields); syncServiceFields();
     box.querySelectorAll('.service-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm(`Remove ${button.dataset.name}?`)) return;
       try {
@@ -13438,9 +13786,9 @@ async function hydrateProjectServices(proj) {
         await hydrateProjectServices(proj);
       } catch (error) { toast(error.message, true); }
     }));
-    $('#service-discover')?.addEventListener('click', async () => {
+    box.querySelector('#service-discover')?.addEventListener('click', async () => {
       try {
-        const { proposals } = await api(`/api/projects/${proj.id}/services/compose-import`), target = $('#service-proposals');
+        const { proposals } = await api(`/api/projects/${proj.id}/services/compose-import`), target = box.querySelector('#service-proposals');
         target.innerHTML = proposals.map((service, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(service.name)}</b> <span class="chip">${esc(service.image)}</span>${service.urlEnv ? ` <span class="chip">${esc(service.urlEnv)}</span>` : ''}</div><button class="btn sm primary service-accept">Add</button></div>`).join('')
           || '<p class="task-sub">No importable Compose services found.</p>';
         target.querySelectorAll('.service-accept').forEach((button) => button.addEventListener('click', async () => {
@@ -13450,33 +13798,35 @@ async function hydrateProjectServices(proj) {
         }));
       } catch (error) { toast(error.message, true); }
     });
-    $('#service-save')?.addEventListener('click', async () => {
-      const kind = $('#service-kind').value;
-      const name = $('#service-name').value.trim();
+    box.querySelector('#service-save')?.addEventListener('click', async () => {
+      const kind = box.querySelector('#service-kind').value;
+      const name = box.querySelector('#service-name').value.trim();
       if (!name) return toast('Service name is required', true);
-      if (kind === 'external' && !$('#service-connection').value) return toast('Choose a connection secret first', true);
+      if (kind === 'external' && !box.querySelector('#service-connection').value) return toast('Choose a connection secret first', true);
       try {
         await api(`/api/projects/${proj.id}/services`, { method: 'POST', body: JSON.stringify({
           name, kind,
-          ...(kind === 'external' ? { connectionResourceId: $('#service-connection').value } : {
-            image: $('#service-image').value.trim(), containerPort: Number($('#service-port').value) || undefined,
-            urlEnv: $('#service-url-env').value.trim() || undefined,
-            urlTemplate: $('#service-url-template').value.trim() || undefined,
-            seedResourceId: $('#service-seed').value || undefined,
-            seedContainerPath: $('#service-seed-path').value.trim() || undefined,
+          ...(kind === 'external' ? { connectionResourceId: box.querySelector('#service-connection').value } : {
+            image: box.querySelector('#service-image').value.trim(), containerPort: Number(box.querySelector('#service-port').value) || undefined,
+            urlEnv: box.querySelector('#service-url-env').value.trim() || undefined,
+            urlTemplate: box.querySelector('#service-url-template').value.trim() || undefined,
+            seedResourceId: box.querySelector('#service-seed').value || undefined,
+            seedContainerPath: box.querySelector('#service-seed-path').value.trim() || undefined,
           }),
         }) }); toast('Service saved'); await hydrateProjectServices(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectServices(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectServices(proj)); }
 }
 
 async function hydrateProjectEnvironment(proj) {
-  const box = $('#project-environment-box'); if (!box) return;
+  const box = $('#project-environment-box'); if (!box || S.projectId !== proj.id) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const { spec, digest, builds, repositories = [] } = await api(`/api/projects/${proj.id}/environment`);
     const installRepos = [...new Set([...repositories, ...Object.keys(spec?.install || {})])];
     const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div>${record.status === 'building' ? `<button class="btn sm" data-environment-recover="${esc(record.recoveryRevision)}">Recover abandoned build…</button>` : ''}</div>`;
+    if (!renderIsCurrent()) return;
     box.innerHTML = `<div class="inline-form"><button class="btn sm" id="environment-propose">Discover from repo</button><div id="environment-evidence"></div></div>
       <datalist id="environment-image-options">
         <option value="node:22-bookworm">Node.js 22 · Debian</option>
@@ -13504,7 +13854,7 @@ async function hydrateProjectEnvironment(proj) {
         : `Stop the builder or build job in ${record.provider} first, and remove its image or snapshot named “${artifact}”.`
           + (record.builderId ? ` Builder: ${record.builderId}.` : ' For older builds, locate the builder in the provider dashboard or on the build host.')
           + (record.buildHost ? ` Build host: ${record.buildHost}.` : '');
-      const note = prompt(`${cleanup}\n\nDo not recover a build still running in another gateway. Wait for provider operations to stop before removing the artifact. This action invalidates the build record; it does not stop or delete provider resources for you.\n\nAfter completing cleanup, describe what you stopped and removed to confirm recovery:`);
+      const note = await promptText(`${cleanup}\n\nDo not recover a build still running in another gateway. Wait for provider operations to stop before removing the artifact. This action invalidates the build record; it does not stop or delete provider resources for you.\n\nAfter completing cleanup, describe what you stopped and removed to confirm recovery:`);
       if (!note?.trim()) return;
       button.disabled = true;
       try {
@@ -13515,139 +13865,41 @@ async function hydrateProjectEnvironment(proj) {
         await hydrateProjectEnvironment(proj);
       } catch (error) { toast(error.message, true); button.disabled = false; }
     }));
-    $('#environment-propose')?.addEventListener('click', async () => {
+    box.querySelector('#environment-propose')?.addEventListener('click', async () => {
       try {
         const proposal = await api(`/api/projects/${proj.id}/environment/proposal`);
-        if (proposal.spec.image) $('#environment-image').value = proposal.spec.image;
+        if (proposal.spec.image) box.querySelector('#environment-image').value = proposal.spec.image;
         for (const [name, commands] of Object.entries(proposal.spec.install || {})) {
           const field = box.querySelector(`[data-environment-install="${CSS.escape(name)}"]`);
           if (field) field.value = commands.join('\n');
         }
-        if (proposal.spec.includeDocker) $('#environment-docker').checked = true;
-        $('#environment-evidence').innerHTML = proposal.evidence.length
+        if (proposal.spec.includeDocker) box.querySelector('#environment-docker').checked = true;
+        box.querySelector('#environment-evidence').innerHTML = proposal.evidence.length
           ? `<p class="task-sub">Evidence: ${proposal.evidence.map(esc).join(' · ')}</p>`
           : '<p class="task-sub">No devcontainer or recognized lockfile found.</p>';
       } catch (error) { toast(error.message, true); }
     });
-    $('#environment-save')?.addEventListener('click', async () => {
+    box.querySelector('#environment-save')?.addEventListener('click', async () => {
       try {
         await api(`/api/projects/${proj.id}/environment`, { method: 'PUT', body: JSON.stringify({
-          image: $('#environment-image').value.trim() || undefined,
-          setup: $('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
+          image: box.querySelector('#environment-image').value.trim() || undefined,
+          setup: box.querySelector('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
           install: Object.fromEntries([...box.querySelectorAll('[data-environment-install]')].map((field) =>
             [field.dataset.environmentInstall, field.value.split('\n').map((value) => value.trim()).filter(Boolean)])),
-          boot: $('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
-          includeDocker: $('#environment-docker').checked,
+          boot: box.querySelector('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
+          includeDocker: box.querySelector('#environment-docker').checked,
         }) }); toast('Environment recipe saved'); await hydrateProjectEnvironment(proj);
       } catch (error) { toast(error.message, true); }
     });
-    $('#environment-build')?.addEventListener('click', async () => {
+    box.querySelector('#environment-build')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/environment/build`, { method: 'POST', body: '{}' });
         toast(`Building for ${result.building.provider}…`); setTimeout(() => hydrateProjectEnvironment(proj), 1500);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { paneError(box, error, () => hydrateProjectEnvironment(proj)); }
+  } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectEnvironment(proj)); }
 }
 
-async function hydrateProjectResources(proj) {
-  const box = $('#project-resources'); if (!box) return;
-  try {
-    const resources = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
-    const targetLabel = (resource) => resource.target.kind === 'path' ? resource.target.path : resource.target.name;
-    box.innerHTML = `<div class="section-h">Attached resources</div>
-      <p class="task-sub">Each task gets a pinned, private view. Secrets are injected just in time; writable volumes can publish a new immutable baseline from Review.</p>
-      ${hostLocal() ? '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>' : ''}
-      <div id="project-resource-list">${resources.map((resource) => `<div class="queue-item" data-resource="${esc(resource.id)}">
-        <div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${esc(resource.driver.replace('@1', ''))}</span>
-          <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
-        <button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button>
-      </div>`).join('') || '<p class="task-sub">No resources yet. Tasks currently receive only their repositories and environment.</p>'}</div>
-      <div class="settings-divider"></div><div class="section-h">Attach a resource</div>
-      <div class="settings-grid">
-        <label class="form-row">Name<input id="resource-name" placeholder="Training data"></label>
-        <label class="form-row">Kind<select id="resource-driver"><option value="volume@1">Versioned files / model / SQLite</option><option value="secret@1">Secret</option><option value="database@1">Shared database URL</option><option value="service@1">External service credential</option></select></label>
-        <label class="form-row">World path or variable<input id="resource-target" placeholder="resources/training-data"></label>
-        <label class="form-row">Access<select id="resource-access"><option value="read">Read-only</option><option value="write">Writable private fork</option></select></label>
-        <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
-        <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
-        ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
-        <label class="form-row">Upload files<input id="resource-files" type="file" multiple></label>
-        <label class="form-row">Upload a folder<input id="resource-folder" type="file" multiple webkitdirectory></label>
-      </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
-    const driverInput = $('#resource-driver');
-    const syncDefaults = () => {
-      const name = $('#resource-name').value.trim() || 'resource';
-      const fileKind = driverInput.value === 'volume@1';
-      $('#resource-target').placeholder = fileKind ? `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : name.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
-      $('#resource-secret').disabled = fileKind;
-      $('#resource-files').disabled = !fileKind;
-      $('#resource-folder').disabled = !fileKind;
-      if ($('#resource-source-path')) $('#resource-source-path').disabled = !fileKind;
-    };
-    driverInput.addEventListener('change', syncDefaults); $('#resource-name').addEventListener('input', syncDefaults); syncDefaults();
-    $('#resource-scan')?.addEventListener('click', async () => {
-      const button = $('#resource-scan'); const results = $('#resource-scan-results');
-      button.disabled = true; button.textContent = 'Scanning…';
-      try {
-        const scan = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources/scan`);
-        results.innerHTML = scan.proposals.length ? `<div class="section-h">Suggested classifications</div>${scan.proposals.map((proposal, index) =>
-          `<div class="queue-item" data-proposal="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span>
-          <div class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</div></div><button class="btn sm resource-use-proposal">Use suggestion</button></div>`).join('')}`
-          : '<p class="task-sub">No likely resources found. You can still attach one below.</p>';
-        results.querySelectorAll('[data-proposal]').forEach((row) => row.querySelector('.resource-use-proposal').addEventListener('click', () => {
-          const proposal = scan.proposals[Number(row.dataset.proposal)];
-          $('#resource-name').value = proposal.path.split('/').pop().replace(/\.[^.]+$/, '') || proposal.kind;
-          $('#resource-driver').value = proposal.suggested.driver;
-          $('#resource-target').value = proposal.suggested.target.path || proposal.suggested.target.name;
-          $('#resource-access').value = proposal.suggested.access;
-          $('#resource-publish').value = proposal.suggested.publish;
-          if ($('#resource-source-path') && proposal.suggested.driver === 'volume@1')
-            $('#resource-source-path').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
-          $('#resource-driver').dispatchEvent(new Event('change'));
-          if (proposal.suggested.driver === 'secret@1') $('#resource-secret').focus();
-          else $('#resource-add').focus();
-        }));
-      } catch (error) { results.textContent = error.message; }
-      finally { button.disabled = false; button.textContent = 'Scan ignored project files'; }
-    });
-    $('#resource-add').addEventListener('click', async () => {
-      const button = $('#resource-add'); const name = $('#resource-name').value.trim();
-      if (!name) return toast('Resource name is required', true);
-      const driver = driverInput.value; const isFiles = driver === 'volume@1';
-      const enteredTarget = $('#resource-target').value.trim();
-      const target = isFiles ? { kind: 'path', path: enteredTarget || `resources/${name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')}` }
-        : { kind: driver === 'secret@1' ? 'environment' : 'service', name: enteredTarget || name.toUpperCase().replace(/[^A-Z0-9]+/g, '_') };
-      button.disabled = true; button.textContent = 'Attaching…';
-      try {
-        const selectedFiles = isFiles ? [...$('#resource-files').files, ...$('#resource-folder').files] : [];
-        const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({ name, driver, target,
-          access: $('#resource-access').value, isolation: driver === 'database@1' || driver === 'service@1' ? 'shared' : 'fork',
-          publish: $('#resource-publish').value, secret: $('#resource-secret').value,
-          sourcePath: $('#resource-source-path')?.value.trim() || undefined }) });
-        if (selectedFiles.length) {
-          button.textContent = 'Uploading…';
-          await uploadResourceFiles(proj.id, created.id, selectedFiles, (sent, total) => {
-            button.textContent = `Uploading ${Math.round(sent / Math.max(total, 1) * 100)}%…`;
-          });
-        }
-        toast('Resource attached'); await hydrateProjectResources(proj);
-      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Attach resource'; }
-    });
-    box.querySelectorAll('[data-resource]').forEach((row) => {
-      const resource = resources.find((candidate) => candidate.id === row.dataset.resource);
-      row.querySelector('.resource-toggle').addEventListener('click', async () => {
-        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) }); await hydrateProjectResources(proj); }
-        catch (error) { toast(error.message, true); }
-      });
-      row.querySelector('.resource-delete').addEventListener('click', async () => {
-        if (!confirm(`Remove resource “${resource.name}”? Existing task snapshots and audit history may be retained, but new tasks will no longer receive it.`)) return;
-        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectResources(proj); }
-        catch (error) { toast(error.message, true); }
-      });
-    });
-  } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
-}
 
 async function uploadResourceFiles(projectId, resourceId, files, progress) {
   const upload = await api(`/api/projects/${encodeURIComponent(projectId)}/resources/${encodeURIComponent(resourceId)}/uploads`, { method: 'POST' });
@@ -13756,11 +14008,14 @@ async function hydrateProjectAccess(proj) {
   const repositoriesAreCurrent = beginAsyncElementRender(repositoryBox);
   const renderIsCurrent = () => accessIsCurrent() && repositoriesAreCurrent();
   try {
+    // Unreadable GitHub state offers Retry; read as "not connected" it would send
+    // an organization that is connected into setup.
+    let githubLoadError = null;
     const [repositories, members, gitConnections, githubApp] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
       api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch(() => []),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch(() => ({ configured: false })),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch((error) => { githubLoadError = error; return []; }),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch((error) => { githubLoadError = error; return { configured: false }; }),
     ]);
     if (!renderIsCurrent()) return;
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
@@ -13775,7 +14030,7 @@ async function hydrateProjectAccess(proj) {
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
       <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button>${githubApp.configured && gitConnections.length && githubApp.userAuthorized ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository...</button>' : ''}</div>
-      ${!githubApp.configured ? `<div class="inline-form">${S.installationAccess
+      ${githubLoadError ? '<div id="project-github-error"></div>' : !githubApp.configured ? `<div class="inline-form">${S.installationAccess
         ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
         : '<span class="task-sub">The installation operator must set up the shared GitHub App before repositories can be connected.</span>'}</div>`
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
@@ -13785,6 +14040,7 @@ async function hydrateProjectAccess(proj) {
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
       catch (error) { toast(error.message, true); }
     }));
+    if (githubLoadError) paneError($('#project-github-error'), githubLoadError, () => hydrateProjectAccess(projectById(proj.id) || proj));
     const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
     wireRepositoryRemoves();
     $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
@@ -14817,6 +15073,25 @@ function parseExpiry(raw) {
   return { expMonth: Number(m[1]), expYear: year < 100 ? 2000 + year : year };
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
+/** Digits in `currency`'s minor unit, as amounts are stored: the payment rail's
+ *  convention (ISK has two), mirroring src/util/currency.ts. */
+function currencyDigits(currency = 'usd') {
+  const code = String(currency || 'usd').toLowerCase();
+  return ['bif', 'clp', 'djf', 'gnf', 'jpy', 'kmf', 'krw', 'mga', 'pyg', 'rwf', 'ugx', 'vnd', 'vuv', 'xaf', 'xof', 'xpf'].includes(code) ? 0
+    : ['bhd', 'jod', 'kwd', 'omr', 'tnd'].includes(code) ? 3 : 2;
+}
+function money(minor, currency = 'usd') {
+  currency = String(currency || 'usd').toLowerCase();
+  return currency === 'usd' ? usd(minor)
+    : new Intl.NumberFormat(undefined, { style: 'currency', currency, minimumFractionDigits: currencyDigits(currency),
+      maximumFractionDigits: currencyDigits(currency) }).format((minor || 0) / 10 ** currencyDigits(currency));
+}
+function toMinorUnits(value, currency = 'usd') { return Math.round(Number(value) * 10 ** currencyDigits(currency)); }
+function fromMinorUnits(minor, currency = 'usd') { const digits = currencyDigits(currency); return (minor / 10 ** digits).toFixed(digits); }
+function spendRequestRow(r) {
+  return `<div class="queue-item"><div style="flex:1"><b>${esc(money(r.amount, r.currency))}</b> ${r.merchant ? `at ${esc(r.merchant)}` : ''} <span class="chip">${esc(r.status)}</span><div class="task-sub">${esc(r.why || r.reason || '')}</div></div>
+          ${['pending_approval', 'needs_funding'].includes(r.status) ? `<button class="btn sm" data-payapprove="${r.id}">Approve / retry</button><button class="btn sm danger" data-paydeny="${r.id}">Deny</button>` : ''}</div>`;
+}
 async function wirePaymentProviders(box, organizationId, onChange) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
@@ -14945,15 +15220,16 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
-          <div class="task-sub">${usd(c.remaining ?? c.available)} of ${usd(c.cap)} left${c.merchantLock?.length ? ` · ${c.merchantLock.map(esc).join(', ')} only` : ''}</div></div>
-        ${c.provider === 'vault-card' && c.status !== 'canceled' ? `<button class="btn sm" data-fund="${c.id}" title="Match the limit you set with your bank">Raise limit</button>` : ''}
+          <div class="task-sub">${esc(money(c.remaining ?? c.available, c.currency))} of ${esc(money(c.cap, c.currency))} left${c.merchantLock?.length ? ` · ${c.merchantLock.map(esc).join(', ')} only` : ''}</div></div>
+        ${c.provider === 'vault-card' && c.status !== 'canceled' ? `<button class="btn sm" data-fund="${c.id}" data-currency="${esc(c.currency || 'usd')}" title="Match the limit you set with your bank">Raise limit</button>` : ''}
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = prompt(`Raise this card’s limit by how much (USD)? Raise it with your bank first — ${siteName()} only mirrors the figure.`);
+      const currency = b.dataset.currency || 'usd';
+      const amt = await promptText(`Raise this card’s limit by how much (${currency.toUpperCase()})? Raise it with your bank first — ${siteName()} only mirrors the figure.`);
       if (amt == null) return;
       if (!Number(amt) || Number(amt) < 0) return toast('Enter an amount greater than zero.', true);
-      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
+      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: toMinorUnits(amt, currency) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
     }));
     list.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm('Revoke this card? This cannot be undone.')) return;
@@ -15017,12 +15293,10 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
         api(`${paymentsBase}/requests`), api(`${paymentsBase}/transactions`),
       ]); } catch {}
       const pending = requests.filter((r) => ['pending_approval', 'needs_funding', 'authorized', 'consumed'].includes(r.status));
-      box.querySelector('.pay-requests').innerHTML = pending.length ? pending.map((r) =>
-        `<div class="queue-item"><div style="flex:1"><b>${usd(r.amount)}</b> ${r.merchant ? `at ${esc(r.merchant)}` : ''} <span class="chip">${esc(r.status)}</span><div class="task-sub">${esc(r.why || r.reason || '')}</div></div>
-          ${['pending_approval', 'needs_funding'].includes(r.status) ? `<button class="btn sm" data-payapprove="${r.id}">Approve / retry</button><button class="btn sm danger" data-paydeny="${r.id}">Deny</button>` : ''}</div>`).join('')
+      box.querySelector('.pay-requests').innerHTML = pending.length ? pending.map(spendRequestRow).join('')
         : '<span style="color:var(--ink-3)">No pending requests.</span>';
       box.querySelector('.pay-transactions').innerHTML = transactions.length ? transactions.slice(0, 50).map((t) =>
-        `<div class="queue-item"><div style="flex:1"><b>${usd(t.amount)}</b> ${t.merchant ? `at ${esc(t.merchant)}` : ''} <span class="chip">${esc(t.status)}</span><div class="task-sub">${esc(t.provider)} · ${new Date(t.createdAt).toLocaleString()}</div></div></div>`).join('')
+        `<div class="queue-item"><div style="flex:1"><b>${esc(money(t.amount, t.currency))}</b> ${t.merchant ? `at ${esc(t.merchant)}` : ''} <span class="chip">${esc(t.status)}</span><div class="task-sub">${esc(t.provider)} · ${new Date(t.createdAt).toLocaleString()}</div></div></div>`).join('')
         : '<span style="color:var(--ink-3)">No payment activity.</span>';
       box.querySelectorAll('[data-payapprove],[data-paydeny]').forEach((b) => b.addEventListener('click', async () => {
         const id = b.dataset.payapprove || b.dataset.paydeny;
@@ -15038,7 +15312,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   }
 }
 
-// ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
+// ── vault items + credential access requests (wiki plans/PLAN-passwords §§4–10) ──
 const VAULT_SECRET_LABELS = {
   login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)'], ['note', 'Notes']],
   'api-key': [['secret', 'API key']],
@@ -15047,7 +15321,7 @@ const VAULT_SECRET_LABELS = {
   note: [['note', 'note']],
 };
 // Short label + click-to-expand explanation for the two per-item policies.
-const POL_USE_TIP = 'Blind use = the agent fills this into a login form or gets it as an environment variable, but never sees the secret text itself. “ask” makes it request your approval each time.';
+const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment. “ask” requires approval before each use.';
 const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
 // `title` covers hover on desktop; the click handler is for touch, where there is
 // no hover. It used to call `alert()` — the only modal in a console that speaks in
@@ -15157,7 +15431,9 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <button class="btn sm" data-vreq-act="task">This task</button>
           <button class="btn sm" data-vreq-act="always">Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
-          ${policyTip(`Once: Approves one credential operation, consumed when used, not at the next agent turn.
+          ${policyTip(`Once: ${items.find((item) => item.id === request.itemId)?.type === 'passkey'
+            ? 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.'
+            : 'Approves one credential operation, consumed when used, not at the next agent turn.'}
 
 This task: Approves the operation and grants this task the credential across turns. Its policy stays unchanged, so “ask” can prompt again.
 
@@ -15198,7 +15474,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   </div>`).join('');
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
-      `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+      `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}"${request.withdrawn ? ` title="${esc(`Withdrawn: ${request.withdrawn.reason}`)}"` : ''}>${esc(request.status)}</span>
         <span class="mono">${request.capabilities.map(esc).join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.map(esc).join(', ')}` : ''}</span>
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
@@ -15535,8 +15811,7 @@ function passwordsCard() {
 }
 function vaultRequestsCard() {
   return `<div class="card" id="vault-requests-card">
-    <div class="section-h">Credential access requests</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted, its policy says to ask, or it isn't in the vault yet. Add and bind a missing item before approving. <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto. Every decision resumes the task automatically.</p>
+    <div class="section-h">Credential access requests ${policyTip("Agents ask here when a task needs a credential it wasn't granted, its policy says to ask, or it isn't in the vault yet; add and bind a missing item before approving. Once allows a single use, this task extends the task's grant, and always also sets the item's policy to auto. Every decision resumes the task.")}</div>
     <div class="vault-requests-list">Loading…</div>
   </div>`;
 }
@@ -15636,11 +15911,17 @@ async function wireVaultCards(organizationId) {
       list.querySelectorAll('[data-vi]').forEach((row) => {
         const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
         const savePolicy = async () => {
+          const controls = row.querySelectorAll('select');
+          controls.forEach(control => { control.disabled = true; });
           try {
             const updated = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
             Object.assign(item, updated.item || updated);
             toast('Policy saved');
-          } catch (e) { toast(e.message, true); }
+          } catch (e) {
+            row.querySelector('.vi-pol-use').value = item.policy?.use || 'auto';
+            row.querySelector('.vi-pol-reveal').value = item.policy?.reveal || 'ask';
+            toast(e.message, true);
+          } finally { controls.forEach(control => { control.disabled = false; }); }
         };
         row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
         row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
@@ -15851,8 +16132,7 @@ async function wireVaultCards(organizationId) {
           method: 'POST', body: JSON.stringify({ secret: JSON.stringify(connection) }),
         });
         close();
-        toast('Git-backed pass connected. ' + (result.connector?.checks || []).map(check => `${check.store}: ${check.read === 'verified' ? 'entry decrypted' : 'empty store'}, encryption ${check.encryption ? 'verified' : 'unavailable'}, push transport ${check.push ? 'reachable' : 'unavailable'}`).join('; ') + '. A real push can still be rejected by server policy.');
-        await renderConnectors();
+        await afterConnect('pass-git', result);
       } catch (error) {
         button.disabled = false;
         toast(error.message, true);
@@ -15860,19 +16140,26 @@ async function wireVaultCards(organizationId) {
     });
     overlay.querySelector('.git-pass-repo').focus();
   };
+  // The toast names only what needs attention; a new store opens its import picker.
+  const afterConnect = async (name, result) => {
+    toast([`${result.connector?.label || name} connected`,
+      ...(result.connector?.checks || []).filter((check) => !check.encryption || !check.push).map((check) => `${check.store} is read-only`)].join(' · '));
+    const conns = await renderConnectors();
+    if (result.newStore) await openImportPanel(name, conns.find((c) => c.name === name));
+  };
   const renderConnectors = async () => {
     const list = box.querySelector('.connectors-list');
-    if (!list) return;
+    if (!list) return [];
     let conns = [];
-    try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3);font-size:12px">Connectors need a credential broker.</span>'; return; }
+    try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3);font-size:12px">Connectors need a credential broker.</span>'; return []; }
     list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
       <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
         <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}${c.config?.autoSync?.enabled ? ` · ${c.config.autoSync.importNew ? 'imports new credentials automatically' : 'keeps selected credentials updated'}` : ''}${c.config?.lastAutoSync?.error ? ` · sync error: ${esc(c.config.lastAutoSync.error)}` : ''}</div></div>
-      ${c.pendingWrites?.length ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button><button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
+      ${c.pendingWrites?.length ? `${c.config?.writeBack ? `<button class="btn sm" data-conn-retry title="${esc(c.pendingWrites[0]?.error || 'Saved in the vault; waiting for the external store')}">Retry ${c.pendingWrites.length} pending</button>` : `<span class="chip" title="Write-back is off; turn it on under Import… to send these">${c.pendingWrites.length} pending</span>`}<button class="btn sm" data-conn-discard title="Stop retrying these writes; credentials stay in the vault">Dismiss</button>` : ''}
       ${c.setup === 'git-pass'
         ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>${c.available ? '<button class="btn sm" data-git-pass-check>Check connection</button>' : ''}`
         : c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
-      ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back <button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button><button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}
+      ${(c.pendingWrites || []).filter(write => !write.id).map(write => `<span>${esc(write.label)}: pending write-back ${c.config?.writeBack ? `<button class="btn sm" data-write-retry="${esc(write.itemId)}">Retry</button>` : ''}<button class="btn sm" data-write-remote="${esc(write.itemId)}">Use remote value</button></span>`).join('')}
       <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
       || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
@@ -15916,9 +16203,7 @@ async function wireVaultCards(organizationId) {
         button.disabled = true;
         try {
           const result = await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret: row.querySelector('.conn-secret').value }) });
-          const connection = result.connector;
-          toast(`${connection.label} connected`);
-          await renderConnectors();
+          await afterConnect(name, result);
         } catch (e) {
           button.disabled = false;
           toast(e.message, true);
@@ -15927,6 +16212,7 @@ async function wireVaultCards(organizationId) {
       row.querySelector('[data-git-pass-connect]')?.addEventListener('click', () => openGitPassConnect(conns.find((c) => c.name === name)));
       row.querySelector('[data-conn-import]')?.addEventListener('click', () => openImportPanel(name, conns.find((c) => c.name === name)));
     });
+    return conns;
   };
   // The full-fledged import interface (mass select by folder / all, choose the
   // import policy + write-back once for everything selected).
@@ -16122,7 +16408,7 @@ async function wireAgentMailCard(organizationId) {
   });
 }
 
-// ── installation-wide settings (safe mode, outbound email, Stripe platform) ──
+// ── installation-wide settings (outbound email, Stripe platform) ──
 // These belong to whoever runs the installation, and the console has no
 // capability model of its own, so each card asks its endpoint: a refusal (or
 // canManage:false) means the reader is a tenant here.
@@ -16141,22 +16427,6 @@ async function hydrateInstallationCard(selector, url, fill) {
   } catch { /* refused: leave the card absent */ }
 }
 
-function hydrateResilienceCard() {
-  return hydrateInstallationCard('#resilience-card', '/api/safe-mode', (card, data) => {
-    S.meta.safeMode = data.safeMode;
-    card.innerHTML = `<div class="section-h">Resilience</div>
-      <div class="switch"><input type="checkbox" id="safe-mode" ${data.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>`;
-    card.querySelector('#safe-mode').addEventListener('change', async (e) => {
-      try {
-        const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) });
-        S.meta.safeMode = r.safeMode;
-        e.target.checked = r.safeMode;
-        toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`);
-      } catch (err) { e.target.checked = S.meta.safeMode; toast(err.message, true); }
-    });
-  });
-}
-
 function outboundEmailCard() {
   return '<div class="card" id="outbound-email-card" hidden></div>';
 }
@@ -16172,14 +16442,14 @@ async function wireOutboundEmailCard() {
       <option value="smtp">SMTP server — any provider or relay</option>
     </select></div>
     <div id="oe-help" style="color:var(--ink-3);font-size:12px;margin:0 0 8px"></div>
-    <div class="form-row"><label>From address</label><input id="oe-from" placeholder="${siteNameMarkup()} &lt;noreply@yourdomain.com&gt;"></div>
+    <div class="form-row"><label for="oe-from">From address</label><input id="oe-from" placeholder="${siteNameMarkup()} &lt;noreply@yourdomain.com&gt;"></div>
     <div id="oe-smtp" style="display:none">
-      <div class="form-row"><label>SMTP host</label><input id="oe-host" placeholder="auto-detected for Gmail/Outlook/Fastmail — else e.g. smtp.yourprovider.com"></div>
+      <div class="form-row"><label for="oe-host">SMTP host</label><input id="oe-host" placeholder="auto-detected for Gmail/Outlook/Fastmail — else e.g. smtp.yourprovider.com"></div>
       <div class="inline-form" style="align-items:center">
         <input id="oe-port" placeholder="port (587, or 465 for TLS)" style="max-width:220px">
         <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2)"><input type="checkbox" id="oe-secure"> Implicit TLS (port 465)</label>
       </div>
-      <div class="form-row"><label>Username</label><input id="oe-user" placeholder="defaults to the From address"></div>
+      <div class="form-row"><label for="oe-user">Username</label><input id="oe-user" placeholder="defaults to the From address"></div>
     </div>
     <div class="form-row"><label id="oe-secret-label">API key</label><input type="password" id="oe-secret" placeholder="Resend API key (re_…)"></div>
     <div class="inline-form"><button class="btn sm" id="oe-connect">Connect</button><button class="btn sm" id="oe-test">Send test email</button></div>
@@ -16193,7 +16463,7 @@ async function wireOutboundEmailCard() {
       $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
       $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
       $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
-      const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
+      const links = (info?.links || []).map((l) => `<a href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
       helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
     };
     if (data.provider) providerSel.value = data.provider;
@@ -16221,7 +16491,7 @@ async function wireOutboundEmailCard() {
       finally { btn.disabled = false; }
     });
     $('#oe-test').addEventListener('click', async () => {
-      const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
+      const to = await promptText('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
       if (!to) return;
       const btn = $('#oe-test'); btn.disabled = true;
       try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
@@ -16564,7 +16834,7 @@ function inboxView() {
     <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
-    <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0">
+    <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.title || item.task?.title || 'Notification')}">
       <span class="status-dot ${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}" title="${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}"></span>
       <div class="task-main">
         <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(inboxTitle(item))}</div>
@@ -16606,21 +16876,22 @@ function wireInboxView() {
 
 async function markVisibleInboxRead() {
   const items = inboxItems().filter((item) => item.unread);
-  const results = await Promise.allSettled(items.map(async (item) => {
-    const saved = await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, {
-      method: 'PATCH', body: JSON.stringify({ unread: false }),
+  const groups = new Map();
+  for (const item of items) {
+    if (!groups.has(item.organizationId)) groups.set(item.organizationId, []);
+    groups.get(item.organizationId).push(item.id);
+  }
+  const savedIds = new Set();
+  await Promise.allSettled([...groups].map(async ([organizationId, ids]) => {
+    const saved = await api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`, {
+      method: 'PATCH', body: JSON.stringify({ ids }),
     });
-    if (!saved) throw new Error('Notification could not be marked read.');
+    for (const item of saved) savedIds.add(item.id);
   }));
-  items.forEach((item, index) => {
-    if (results[index].status !== 'fulfilled') return;
-    const current = S.inbox.find((candidate) => candidate.id === item.id);
-    if (current) current.unread = false;
-  });
-  // Invalidate reads started before the mutation; they may contain stale unread flags.
+  for (const item of S.inbox) if (savedIds.has(item.id)) item.unread = false;
   S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
   updateBell(); renderMain(); renderRail();
-  const failed = results.filter((result) => result.status === 'rejected');
+  const failed = items.filter(item => !savedIds.has(item.id));
   if (failed.length) throw new Error(`${failed.length} notifications could not be marked read. Try again.`);
 }
 
@@ -16780,13 +17051,7 @@ async function openInboxItem(item) {
   }
   if (item.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId); if (!project) return;
-    await go(projectRoute(project.id, 'avatars'));
-    // A cross-project navigation resets project-local selection state, so choose
-    // the Avatar only after the route has switched projects.
-    S.avatarSelected = item.subject.avatarId;
-    await loadAvatarAuthorizationRequests(item.subject.avatarId);
-    renderMain();
-    return;
+    return go(avatarRoute(project.id, item.subject.avatarId));
   }
   const project = projectById(item.task.projectId); if (!project) return;
   const tab = item.kind === 'approval-requested' ? '/approvals' : '';
@@ -16885,7 +17150,8 @@ async function hydrateProfileGithub() {
     row.querySelector('.github-use')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}/active`, { method: 'POST', body: '{}' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
     row.querySelector('.github-custom')?.addEventListener('click', () => openGitIdentityDialog({ title: 'Custom identity', profile: account.profile,
       endpoint: `/api/user/github-accounts/${account.id}/identity`, onSaved: hydrateProfileGithub }));
-    row.querySelector('.github-remove')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
+    row.querySelector('.github-remove')?.addEventListener('click', async () => {
+      if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return; try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
   });
 }
 
@@ -16938,7 +17204,7 @@ function profileView() {
             <span class="profile-row-value">${esc(email)}</span>
             ${u.emailVerified
               ? '<span class="chip success">verified</span>'
-              : '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation email</button>'}
+              : S.emailDelivery ? '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation email</button>' : ''}
             <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
               aria-expanded="false" aria-controls="profile-email-panel">Edit</button>
           </div>
@@ -17057,9 +17323,7 @@ function notificationsCard() {
   // Loudest first, the same order the inbox itself is in.
   const levels = [...URGENCY_LEVELS].reverse();
   return `<div class="card" id="notifications">
-    <div class="section-h">Notifications</div>
-    <p class="task-sub">Agents set an urgency when they need you — approvals arrive high by default. Higher
-      urgency always sorts to the top of your inbox; here you choose what else each level does.</p>
+    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive high by default. Higher urgency always sorts first in your inbox; here you choose what else each level does.')}</div>
     <div class="notify-grid">
       <div class="notify-row notify-head"><span>Urgency</span>${NOTIFY_BEHAVIOURS.map((behaviour) =>
     `<span>${behaviour.label}</span>`).join('')}<span></span></div>
@@ -17071,7 +17335,7 @@ function notificationsCard() {
       </div>`).join('')}
     </div>
     <div class="notify-sound-options"><label>Sound <select id="notify-tone">${['bell', 'chime', 'soft'].map((tone) => `<option value="${tone}" ${sound.tone === tone ? 'selected' : ''}>${tone[0].toUpperCase() + tone.slice(1)}</option>`).join('')}</select></label>
-      <label>Duration <select id="notify-duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : duration + ' seconds'}</option>`).join('')}</select></label>
+      <label>Duration <select id="notify-duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : `${duration} second${duration === 1 ? '' : 's'}`}</option>`).join('')}</select></label>
       <button class="btn sm" id="notify-preview">Preview sound</button></div>
     <p class="task-sub">Email choices apply to your account in this organization, even when the app is closed.${emailReady ? '' : ' Email delivery has not been configured by your administrator.'}</p>
     ${permissionNote}
@@ -17526,7 +17790,7 @@ function installationView() {
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
-      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
+      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-health"><div>Health<small>Load, memory, and every process ${siteNameMarkup()} runs</small></div></div>
@@ -17541,7 +17805,6 @@ function installationView() {
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
       ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users<small>View individual user profiles</small></div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
-      <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
     </div>
   </div></div>`;
 }
@@ -17687,7 +17950,9 @@ async function hydrateOrganizationSubscription(organizationId) {
   box.querySelector('.billing-reconcile')?.addEventListener('click', async () => {
     try {
       const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/reconcile`, { method: 'POST' });
-      toast(result.reconciled ? 'Billing result confirmed. You can continue.' : 'Result still uncertain. Contact billing support; no payment has been retried.', !result.reconciled);
+      toast(!result.reconciled ? 'Result still uncertain. Contact billing support; no payment has been retried.'
+        : result.applied === false ? 'Nothing was changed or charged. You can try again.'
+        : 'Billing result confirmed. You can continue.', !result.reconciled);
       await hydrateOrganizationSubscription(organizationId);
     } catch (error) { toast(error.message, true); }
   });
@@ -17723,7 +17988,6 @@ function wireInstallationSettings() {
   wirePaidLaunchCard();
   wireStripePlatformCard();
   wireOutboundEmailCard();
-  hydrateResilienceCard();
   if (hostLocal()) hydratePhoneAccess();
 }
 
@@ -17755,7 +18019,7 @@ function organizationView() {
     <div class="card"><div id="organization-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repository access and storage shared by this organization’s projects</small></div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
-    <div class="card"><div class="section-h" id="settings-storage">Data storage</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
+    <div class="card"><div class="section-h" id="settings-storage">Data storage ${policyTip(`Managed storage is intentionally bounded. Connect your own bucket for large versioned datasets; for live or frequently changing data, add the bucket as a project Service instead of copying it into ${siteName()}.`)}</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
 
     <div class="settings-section-title" id="settings-compute"><div>Where tasks run</div></div>
     <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
@@ -17874,342 +18138,396 @@ function renderOrganizationRoles() {
     try {
       await api(`/api/organizations/${S.organizationId}/roles`, { method: 'POST',
         body: JSON.stringify({ name: data.get('name'), description: data.get('description'), capabilities }) });
-      await loadCollaboration();
-      await hydrateOrganizationView();
+      await hydrateOrganizationView(['people']);
       toast('Role created');
     } catch (e) { error.textContent = e.message; button.disabled = false; }
   });
 }
 
-async function hydrateOrganizationView() {
+function setEventHandler(element, type, handler) {
+  if (element) element['on' + type] = handler;
+}
+
+// Organization settings, pane by pane: opening the page paints every pane, each
+// as soon as its own reads arrive; an action refreshes only the panes it changed,
+// so adding a team re-reads people and teams, not GitHub, compute and usage too.
+const ORGANIZATION_PANES = ['people', 'github', 'compute', 'storage', 'usage', 'identity'];
+async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
   if (!$('#org-members') || !S.organizationId) return;
   const organizationId = S.organizationId;
-  const epoch = S.organizationViewEpoch = (S.organizationViewEpoch || 0) + 1;
-  const renderIsCurrent = () => S.organizationViewEpoch === epoch
-    && S.organizationId === organizationId
-    && !!$('#org-members');
-  wireSettingsNavigation();
-  hydrateSettingsAccess({ organizationId });
-  hydrateConversationSharing('organization', organizationId);
-  hydrateAvatarAvailability('organization', organizationId);
-  hydrateOrganizationSubscription(organizationId);
-  await loadCollaboration().catch(() => {});
-  if (!renderIsCurrent()) return;
+  const epochs = S.organizationPaneEpochs ||= {};
+  const mine = Object.fromEntries(panes.map((pane) => [pane, epochs[pane] = (epochs[pane] || 0) + 1]));
+  // A newer refresh of the same pane, or leaving the page, retires this one.
+  const live = (pane) => epochs[pane] === mine[pane] && S.organizationId === organizationId && !!$('#org-members');
+  const refresh = (...only) => hydrateOrganizationView(only);
+  const reads = new Map();
+  const read = (suffix) => reads.get(suffix) || reads.set(suffix, api(`/api/organizations/${organizationId}/${suffix}`)).get(suffix);
+  if (panes === ORGANIZATION_PANES) {
+    wireSettingsNavigation();
+    hydrateSettingsAccess({ organizationId });
+    hydrateConversationSharing('organization', organizationId);
+    hydrateAvatarAvailability('organization', organizationId);
+    hydrateOrganizationSubscription(organizationId);
+    setEventHandler($('#create-organization'), 'click', createOrganization);
+    setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
+    const renameOrganization = async () => {
+      const name = $('#organization-name')?.value.trim();
+      if (!name) return toast('Organization name is required', true);
+      try {
+        await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+        await loadOrganizations();
+        toast('Organization renamed');
+        renderShell();
+        renderMain();
+      } catch (e) { toast(e.message, true); }
+    };
+    setEventHandler($('#rename-organization'), 'click', renameOrganization);
+    setEventHandler($('#organization-name'), 'keydown', (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); renameOrganization(); }
+    });
+    setEventHandler($('#delete-organization'), 'click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = await promptText(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
+  }
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
   const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name">${S.installationAccess ? `<a data-spa href="${profileRoute(id)}"><b>${esc(userName(id, embedded))}</b></a>` : `<b>${esc(userName(id, embedded))}</b>`}${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
-  const visibility = $('#organization-name-visibility');
-  if (visibility) {
-    visibility.disabled = !S.authorizationCatalog?.canCreate;
-    visibility.onchange = async () => {
-      visibility.disabled = true;
-      try {
-        const updated = await api(`/api/organizations/${organizationId}`, {
-          method: 'PATCH', body: JSON.stringify({ nameVisibility: visibility.value }),
-        });
-        const organization = organizationById(organizationId);
-        if (organization) organization.nameVisibility = updated.nameVisibility;
-        toast('Organization name visibility updated');
-      } catch (error) {
-        visibility.value = organizationById(organizationId)?.nameVisibility || 'members';
-        toast(error.message, true);
-      } finally { visibility.disabled = !S.authorizationCatalog?.canCreate; }
-    };
-  }
-  renderOrganizationRoles();
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
-  $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
-    const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
-    return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
-  }).join('') : '<span class="task-sub">No members.</span>';
-  const [entitlements, gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, usagePolicy, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
-    api(`/api/organizations/${organizationId}/entitlements`).catch(() => null),
-    api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
-    api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
-    api(`/api/organizations/${organizationId}/github/identity`).catch(() => ({ profile: null })),
-    api(`/api/organizations/${organizationId}/runner-pools`).catch(() => []),
-    api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
-    api(`/api/organizations/${organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
-    api(`/api/organizations/${organizationId}/usage`).catch(() => null),
-    api(`/api/organizations/${organizationId}/usage-policy`).catch(() => null),
-    api(`/api/organizations/${organizationId}/identity-policy`).catch(() => null),
-    api(`/api/organizations/${organizationId}/invitations`).catch(() => []),
-    Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
-    api(`/api/organizations/${organizationId}/storage`).catch(() => []),
-  ]);
-  if (!renderIsCurrent()) return;
-  $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
-  const pendingInvitations = invitations.filter((invitation) => !invitation.acceptedAt);
-  $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
-  $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
-  $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
-  const githubManageUrl = (connection) => connection.accountType === 'Organization'
-    ? `https://github.com/organizations/${encodeURIComponent(connection.accountLogin)}/settings/installations/${encodeURIComponent(connection.installationId)}`
-    : `https://github.com/settings/installations/${encodeURIComponent(connection.installationId)}`;
-  const githubSetup = !githubApp.configured
-    ? (S.installationAccess
-      ? `<a class="btn primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
-      : '<span class="task-sub">The installation operator must set up the shared GitHub App before this organization can connect repositories.</span>')
-    : `<button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${githubMark()}${gitConnections.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>${gitConnections.length ? '<button class="btn" id="org-github-custom" type="button">Custom automation identity</button>' : ''}`;
-  $('#org-github').innerHTML = `<div class="github-account-list">${gitConnections.map((connection) => {
-    const permission = connection.permissionStatus;
-    const permissionAction = permission?.ready ? '' : permission?.unavailable
-      ? '<span class="chip" style="color:var(--warn)">access unknown</span>'
-      : permission?.missingApp?.length
-        ? `<a class="btn sm primary" href="${esc(permission?.appSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Update App permissions</a>`
-        : `<a class="btn sm primary" href="${esc(permission?.installationSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Approve permissions</a>`;
-    return `<div class="github-account-row" data-connection="${esc(connection.id)}">
-    <span class="github-account-label">${githubMark()}<b>${esc(connection.accountLogin)}</b>${permission?.ready ? '' : '<span class="chip" style="color:var(--warn)">GitHub access update required</span>'}</span>
-    <span class="github-account-actions">${permissionAction}<a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
-  </div>`; }).join('')}</div>
-  <div class="github-org-actions">${githubSetup}</div>`;
-  const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
-  S.worldProviderConnections = providerConnections;
-  // The default Agent environment moved to Task defaults (below) and can be
-  // overridden per project/task. Compute keeps the runner pool + budget; the pool
-  // list is scoped to the effective environment, shown read-only here.
-  const orgEnvironment = executionPolicy.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
-  $('#org-execution').innerHTML = `<div class="settings-grid">
-    <label class="form-row">Agent environment<input value="${esc(orgEnvironment)}" disabled title="Set the default in Task defaults; override it per project or task" /></label>
-    <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
-    <label class="form-row">World experience<select id="org-execution-flavor"><option value="headless" ${(executionPolicy.environment?.flavor || 'headless') === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${executionPolicy.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
-    <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
-    <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
-    <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
-    <label class="form-row">Hibernate parked worlds after (days)<input id="org-execution-hibernate" type="number" min="1" value="${esc(Math.round((executionPolicy.hibernateAfterMs || 604800000) / 86400000))}" /></label>
-    <label class="form-row">Outbound network<select id="org-execution-network"><option value="unrestricted" ${executionPolicy.network?.unrestricted !== false ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${executionPolicy.network?.unrestricted === false ? 'selected' : ''}>Restricted allowlist</option></select></label>
-  </div>
-  <p class="task-sub">Coding agents normally need arbitrary package registries, documentation, web search, and APIs. Restricted mode is for organizations with a maintained egress policy.</p>
-  <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
-  <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
-  const providerInfo = {
-    e2b: { name: 'E2B', site: 'https://e2b.dev', keys: 'https://e2b.dev/dashboard?tab=keys' },
-    daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io',
-      note: 'Note: <a href="https://www.daytona.io/docs/en/network-limits/" target="_blank" rel="noopener noreferrer">Daytona Tiers 1–2</a> only reach package registries, Git hosts and AI APIs, not the open internet. Use E2B or Daytona Tier 3+ instead.' },
-  };
-  $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
-    const connection = connectionFor(provider); const config = connection?.config || {};
-    const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
-    const info = providerInfo[provider];
-    return `<div class="team-block provider-connection" data-provider="${provider}">
-      <div class="member-row"><b>${info.name}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
-      <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
-      ${info.note ? `<p class="provider-note">${info.note}</p>` : ''}
-      ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
-      <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
-      ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
-        : `<details class="settings-disclosure compact"><summary><b>Advanced (optional)</b></summary><p class="task-sub">An API key is enough to use Daytona’s default environment. Snapshots set their own CPU and memory; choose an image to apply task resource settings.</p><div class="settings-grid"><label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="Daytona default" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label></div></details>`}
-      </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
-  }).join('');
-  $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
-    <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select>${hostLocal() ? '<input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds">' : ''}<button class="btn sm" id="runner-create">Add pool</button></div>`;
-  $('#org-storage').innerHTML = `<div class="project-help-callout"><span class="callout-mark">i</span><div><b>Managed storage is intentionally bounded.</b> Connect your own bucket for large versioned datasets. For live or frequently changing data, add the bucket as a project Service instead of copying it into ${siteNameMarkup()}.</div></div>
-    ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
-    <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
-      <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
-      <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-tavya"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
-      <label class="form-row">Restricted prefix<input id="storage-prefix" value="tavya/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
-      <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
-      <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the ${siteNameMarkup()} vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
-  const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
-  const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
-    : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
-      : usageSync.length ? ` · synced ${fmtAgo(Math.max(...usageSync.map((item) => Number(item.at || 0))))}` : '';
-  const coverageFrom = usageSync.length ? Math.max(...usageSync.map((item) => Number(item.coverageFrom || 0))) : 0;
-  const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
-    : coverageFrom > Number(usage?.from || 0)
-      ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
-  const usageFunding = usage?.byFundingSource || {};
-  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Metered + estimated usage · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
-    <p class="task-sub">Incurred $${((usage.incurredCostMicros || 0) / 1e6).toFixed(2)} · estimated $${((usage.estimatedCostMicros || 0) / 1e6).toFixed(2)} · active managed reservations $${((usage.activeReservationsMicros || 0) / 1e6).toFixed(2)}</p>
-    <p class="task-sub">Managed $${((usageFunding.managed || 0) / 1e6).toFixed(2)} (${usage.requests?.managed || 0} model requests) · BYOK $${((usageFunding.byok || 0) / 1e6).toFixed(2)} (${usage.requests?.byok || 0} model requests) · active: ${usage.active?.agentTurns || 0} model turns, ${usage.active?.worlds || 0} worlds, ${usage.active?.executions || 0} commands</p>
-    ${usagePolicy ? `<details class="settings-disclosure compact"><summary><b>Usage guardrails</b></summary><div class="settings-grid">
-      <label class="form-row">Managed spend cap (USD/month)<input id="usage-managed-cap" type="number" min="0.01" step="0.01" value="${usagePolicy.managedSpendCapMicros == null ? '' : esc(usagePolicy.managedSpendCapMicros / 1e6)}" placeholder="Disabled" /></label>
-      <label class="form-row">Managed model providers<input id="usage-managed-providers" value="${esc((usagePolicy.managedModelProviders || []).join(', '))}" placeholder="Disabled" /></label>
-      <label class="form-row">Allowed model providers<input id="usage-allowed-providers" value="${esc((usagePolicy.allowedModelProviders || []).join(', '))}" placeholder="All connected BYOK providers" /></label>
-      <label class="form-row">Allowed models<input id="usage-allowed-models" value="${esc((usagePolicy.allowedModels || []).join(', '))}" placeholder="All models" /></label>
-      <label class="form-row">Model starts / minute<input id="usage-agent-rate" type="number" min="1" value="${esc(usagePolicy.maxAgentStartsPerMinute)}" /></label>
-      <label class="form-row">Sandbox starts / minute<input id="usage-world-rate" type="number" min="1" value="${esc(usagePolicy.maxRemoteStartsPerMinute)}" /></label>
-      <label class="form-row">Optional tighter model concurrency<input id="usage-agent-active" type="number" min="1" max="${esc(entitlements?.maxActiveAgentRuns || 1000000)}" value="${usagePolicy.maxActiveAgentTurns == null ? '' : esc(usagePolicy.maxActiveAgentTurns)}" placeholder="Plan limit: ${esc(usagePolicy.effectiveMaxActiveAgentTurns)}" /></label>
-      ${hostLocal() ? `<label class="form-row">Concurrent remote worlds<input id="usage-world-active" type="number" min="1" value="${esc(usagePolicy.maxActiveWorlds)}" /></label>`
-        : `<div class="form-row"><span>Concurrent remote worlds</span><b>Same as agent concurrency: ${esc(usagePolicy.maxActiveWorlds)}</b></div>`}
-    </div><p class="task-sub">The plan admits ${esc(entitlements?.maxActiveAgentRuns || usagePolicy.effectiveMaxActiveAgentTurns)} shared active agent runs; an owner may only set a tighter cap here. Managed model use is off until an owner sets a spend cap and explicitly enables a provider. BYOK remains separately attributed. Remote sandboxes use the organization’s own provider account.</p><button class="btn sm primary" id="usage-policy-save">Save usage guardrails</button></details>` : ''}` : 'Usage unavailable.';
-  if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
-    <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
-    <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
-    <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
-    <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
-  wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
-  $('#invite-member')?.addEventListener('click', async () => {
-    try {
-      const email = $('#invite-email').value;
-      const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) });
-      const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`;
-      $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`;
-      appendPendingInvitation(result.invitation, authorizationProjects);
-      $('#invite-email').value = '';
-    } catch (e) { toast(e.message, true); }
-  });
-  $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  $('#connect-github')?.addEventListener('click', async () => {
-    try {
-      await connectOrganizationGithub(organizationId, hydrateOrganizationView);
-    } catch (error) { toast(error.message, true); }
-  });
-  if (new URL(location.href).searchParams.get('github') === 'choose-installation') {
-    const returned = new URL(location.href);
-    returned.searchParams.delete('github');
-    history.replaceState(history.state, '', returned);
-    connectOrganizationGithub(organizationId, hydrateOrganizationView).catch(error => toast(error.message, true));
-  }
-  $('#org-github-custom')?.addEventListener('click', () => openGitIdentityDialog({
-    title: 'Custom automation identity', profile: githubIdentity.profile,
-    endpoint: `/api/organizations/${S.organizationId}/github/identity`, onSaved: hydrateOrganizationView,
-  }));
-  $('#org-github').querySelectorAll('.github-account-row').forEach((row) => {
-    row.querySelector('.github-remove')?.addEventListener('click', async () => {
-      try { await api(`/api/organizations/${S.organizationId}/git-connections/${encodeURIComponent(row.dataset.connection)}`, { method: 'DELETE' }); await hydrateOrganizationView(); }
-      catch (error) { toast(error.message, true); }
-    });
-  });
-  $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
-    const provider = row.dataset.provider;
-    row.querySelector('.provider-save')?.addEventListener('click', async () => {
-      const body = { apiKey: row.querySelector('.provider-key').value || undefined, config: provider === 'e2b'
-        ? { template: row.querySelector('.provider-template').value, desktopTemplate: row.querySelector('.provider-desktop-template').value }
-        : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
-            desktopSnapshot: row.querySelector('.provider-desktop-snapshot').value, desktopImage: row.querySelector('.provider-desktop-image').value,
-            apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
-      try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await hydrateOrganizationView(); }
-      catch (e) { toast(e.message, true); await hydrateOrganizationView(); }
-    });
-    row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); await hydrateOrganizationView(); } });
-    row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  });
-  $('#storage-connect')?.addEventListener('click', async () => {
-    try {
-      const created = await api(`/api/organizations/${organizationId}/storage`, { method: 'POST', body: JSON.stringify({
-        name: $('#storage-name').value, endpoint: $('#storage-endpoint').value, bucket: $('#storage-bucket').value,
-        region: $('#storage-region').value, prefix: $('#storage-prefix').value,
-        accessKeyId: $('#storage-access-key').value, secretAccessKey: $('#storage-secret-key').value,
-      }) });
-      await api(`/api/organizations/${organizationId}/storage/${encodeURIComponent(created.id)}/test`, { method: 'POST', body: '{}' });
-      toast('Customer storage connected'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); }
-  });
-  $('#org-storage')?.querySelectorAll('[data-storage]').forEach((row) => {
-    const id = encodeURIComponent(row.dataset.storage);
-    row.querySelector('.storage-test')?.addEventListener('click', async () => { try {
-      await api(`/api/organizations/${organizationId}/storage/${id}/test`, { method: 'POST', body: '{}' }); toast('Storage connection verified'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); await hydrateOrganizationView(); } });
-    row.querySelector('.storage-default')?.addEventListener('click', async () => { try {
-      await api(`/api/organizations/${organizationId}/storage/${id}/default`, { method: 'PUT', body: '{}' }); toast('Default storage updated'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); } });
-    row.querySelector('.storage-delete')?.addEventListener('click', async () => {
-      if (!confirm('Remove this storage connection? It is allowed only when no resource or revision uses it.')) return;
-      try { await api(`/api/organizations/${organizationId}/storage/${id}`, { method: 'DELETE' }); await hydrateOrganizationView(); }
-      catch (error) { toast(error.message, true); }
-    });
-  });
-  $('#runner-create')?.addEventListener('click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
-  $('#org-execution-pool').innerHTML = `<option value="">Organization BYOK default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-  $('#org-execution-network')?.addEventListener('change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
-  $('#org-execution-save')?.addEventListener('click', async () => {
-    const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
-    const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
-    try {
-      await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
-        runnerPoolId: $('#org-execution-pool').value || undefined,
-        environment: { flavor: $('#org-execution-flavor').value },
-        resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
-        network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
-        monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
-        hibernateAfterMs: Math.round(Number($('#org-execution-hibernate').value) * 86400000),
-      } }) }); toast('Organization execution policy saved'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); }
-  });
-  $('#usage-policy-save')?.addEventListener('click', async () => {
-    const list = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
-    const cap = $('#usage-managed-cap').value.trim();
-    const agentCap = $('#usage-agent-active').value.trim();
-    try {
-      const policy = {
-        managedSpendCapMicros: cap === '' ? null : Math.round(Number(cap) * 1e6),
-        managedModelProviders: list('#usage-managed-providers'), allowedModelProviders: list('#usage-allowed-providers'),
-        allowedModels: list('#usage-allowed-models'), maxAgentStartsPerMinute: Number($('#usage-agent-rate').value),
-        maxRemoteStartsPerMinute: Number($('#usage-world-rate').value),
-        maxActiveAgentTurns: agentCap === '' ? null : Number(agentCap),
-        ...(hostLocal() ? { maxActiveWorlds: Number($('#usage-world-active').value) } : {}),
+  const paint = {
+    async people() {
+      // The invite and new-team forms are static markup: they work while the
+      // pane's reads are still in flight, or after they failed.
+      wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
+      setEventHandler($('#invite-member'), 'click', async () => {
+        try {
+          const email = $('#invite-email').value;
+          const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) });
+          const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`;
+          $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`;
+          // Sent before the pane painted: its invitation read may predate this one.
+          if ($('#pending-invitations')) appendPendingInvitation(result.invitation, authorizationProjects);
+          else refresh('people');
+          $('#invite-email').value = '';
+        } catch (e) { toast(e.message, true); }
+      });
+      setEventHandler($('#create-team'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await refresh('people'); } catch (e) { toast(e.message, true); } });
+      const invitations = read('invitations').catch(() => []);
+      const collaborationError = await loadCollaboration().then(() => null, (error) => error);
+      if (!live('people')) return;
+      if (collaborationError) {
+        paneError($('#org-members'), collaborationError, () => refresh('people'));
+        paneError($('#org-teams'), collaborationError, () => refresh('people'));
+        return;
+      }
+      const visibility = $('#organization-name-visibility');
+      if (visibility) {
+        visibility.disabled = !S.authorizationCatalog?.canCreate;
+        visibility.onchange = async () => {
+          visibility.disabled = true;
+          try {
+            const updated = await api(`/api/organizations/${organizationId}`, {
+              method: 'PATCH', body: JSON.stringify({ nameVisibility: visibility.value }),
+            });
+            const organization = organizationById(organizationId);
+            if (organization) organization.nameVisibility = updated.nameVisibility;
+            toast('Organization name visibility updated');
+          } catch (error) {
+            visibility.value = organizationById(organizationId)?.nameVisibility || 'members';
+            toast(error.message, true);
+          } finally { visibility.disabled = !S.authorizationCatalog?.canCreate; }
+        };
+      }
+      renderOrganizationRoles();
+      $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
+        const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
+        return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
+      }).join('') : '<span class="task-sub">No members.</span>';
+      const [teamMembers, invitationList] = await Promise.all([
+        Promise.all(S.teams.map((team) => read(`teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
+        invitations,
+      ]);
+      if (!live('people')) return;
+      const pendingInvitations = invitationList.filter((invitation) => !invitation.acceptedAt);
+      $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
+      $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
+      $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
+      $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
+        const editor = row.querySelector('.authz-editor');
+        wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {
+          if (authorization.scope === 'projects' && !authorization.projectIds?.length) return;
+          try { await api(`/api/organizations/${S.organizationId}/members`, { method: 'POST', body: JSON.stringify({ userId: row.dataset.orgMember, authorization }) }); }
+          catch (e) { toast(e.message, true); await refresh('people'); }
+        });
+        row.querySelector('.org-member-remove')?.addEventListener('click', async () => { if (!confirm('Remove this member from the organization?')) return; try { await api(`/api/organizations/${S.organizationId}/members/${encodeURIComponent(row.dataset.orgMember)}`, { method: 'DELETE' }); await refresh('people'); } catch (e) { toast(e.message, true); } });
+      });
+      $('#org-teams')?.querySelectorAll('[data-team]').forEach((block) => {
+        block.querySelector('.team-member-add')?.addEventListener('click', async () => {
+          const entered = block.querySelector('.team-user')?.value.trim();
+          const member = S.organizationMembers.find((candidate) => personChoice(candidate).toLowerCase() === entered?.toLowerCase()
+            || userName(candidate.userId, candidate.user).toLowerCase() === entered?.toLowerCase()
+            || userRecord(candidate.userId, candidate.user)?.email?.toLowerCase() === entered?.toLowerCase());
+          if (!member) return toast('Choose a person in this organization', true);
+          try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members`, { method: 'POST', body: JSON.stringify({ userId: member.userId }) }); await refresh('people'); } catch (e) { toast(e.message, true); }
+        });
+        block.querySelector('.team-rename')?.addEventListener('click', () => { const form = block.querySelector('.team-rename-form'); form.hidden = false; form.querySelector('.team-name-edit').focus(); form.querySelector('.team-name-edit').select(); });
+        block.querySelector('.team-rename-cancel')?.addEventListener('click', () => { block.querySelector('.team-rename-form').hidden = true; });
+        block.querySelector('.team-rename-save')?.addEventListener('click', async () => {
+          const name = block.querySelector('.team-name-edit')?.value.trim(); if (!name) return toast('Team name is required', true);
+          try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await refresh('people'); } catch (e) { toast(e.message, true); }
+        });
+        block.querySelector('.team-name-edit')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); block.querySelector('.team-rename-save').click(); } if (event.key === 'Escape') block.querySelector('.team-rename-cancel').click(); });
+        block.querySelector('.team-delete')?.addEventListener('click', async () => {
+          const team = S.teams.find((candidate) => candidate.id === block.dataset.team);
+          if (!confirm(`Delete “${team?.name || 'this team'}”? This is only allowed when no project or workflow still uses it.`)) return;
+          try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'DELETE' }); await refresh('people'); } catch (e) { toast(e.message, true); }
+        });
+        block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await refresh('people'); } catch (e) { toast(e.message, true); } }));
+      });
+    },
+    async github() {
+      let githubLoadError = null;
+      const [gitConnections, githubApp, githubIdentity] = await Promise.all([
+        read('git-connections').catch(error => { githubLoadError = error; return []; }),
+        read('github/app').catch(error => { githubLoadError = error; return { configured: false }; }),
+        read('github/identity').catch(() => ({ profile: null })),
+      ]);
+      if (!live('github')) return;
+      const githubManageUrl = (connection) => connection.accountType === 'Organization'
+        ? `https://github.com/organizations/${encodeURIComponent(connection.accountLogin)}/settings/installations/${encodeURIComponent(connection.installationId)}`
+        : `https://github.com/settings/installations/${encodeURIComponent(connection.installationId)}`;
+      const githubSetup = !githubApp.configured
+        ? (S.installationAccess
+          ? `<a class="btn primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
+          : '<span class="task-sub">The installation operator must set up the shared GitHub App before this organization can connect repositories.</span>')
+        : `<button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${githubMark()}${gitConnections.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>${gitConnections.length ? '<button class="btn" id="org-github-custom" type="button">Custom automation identity</button>' : ''}`;
+      $('#org-github').innerHTML = `<div class="github-account-list">${gitConnections.map((connection) => {
+        const permission = connection.permissionStatus;
+        const permissionAction = permission?.ready ? '' : permission?.unavailable
+          ? '<span class="chip" style="color:var(--warn)">access unknown</span>'
+          : permission?.missingApp?.length
+            ? `<a class="btn sm primary" href="${esc(permission?.appSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Update App permissions</a>`
+            : `<a class="btn sm primary" href="${esc(permission?.installationSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Approve permissions</a>`;
+        return `<div class="github-account-row" data-connection="${esc(connection.id)}">
+        <span class="github-account-label">${githubMark()}<b>${esc(connection.accountLogin)}</b>${permission?.ready ? '' : '<span class="chip" style="color:var(--warn)">GitHub access update required</span>'}</span>
+        <span class="github-account-actions">${permissionAction}<a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
+      </div>`; }).join('')}</div>
+      <div class="github-org-actions">${githubSetup}</div>`;
+      if (githubLoadError) paneError($('#org-github'), githubLoadError, () => refresh('github'));
+      setEventHandler($('#connect-github'), 'click', async () => {
+        try {
+          await connectOrganizationGithub(organizationId, () => refresh('github'));
+        } catch (error) { toast(error.message, true); }
+      });
+      if (new URL(location.href).searchParams.get('github') === 'choose-installation') {
+        const returned = new URL(location.href);
+        returned.searchParams.delete('github');
+        history.replaceState(history.state, '', returned);
+        connectOrganizationGithub(organizationId, () => refresh('github')).catch(error => toast(error.message, true));
+      }
+      setEventHandler($('#org-github-custom'), 'click', () => openGitIdentityDialog({
+        title: 'Custom automation identity', profile: githubIdentity.profile,
+        endpoint: `/api/organizations/${S.organizationId}/github/identity`, onSaved: () => refresh('github'),
+      }));
+      $('#org-github').querySelectorAll('.github-account-row').forEach((row) => {
+        row.querySelector('.github-remove')?.addEventListener('click', async () => {
+          if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return;
+          try { await api(`/api/organizations/${S.organizationId}/git-connections/${encodeURIComponent(row.dataset.connection)}`, { method: 'DELETE' }); await refresh('github'); }
+          catch (error) { toast(error.message, true); }
+        });
+      });
+    },
+    async compute() {
+      const [runners, providerConnections, executionPolicy, usagePolicy] = await Promise.all([
+        read('runner-pools').catch(() => []),
+        read('world-providers').catch(() => []),
+        read('execution-policy').catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
+        read('usage-policy').catch(() => null),
+      ]);
+      if (!live('compute')) return;
+      const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
+      S.worldProviderConnections = providerConnections;
+      // The default Agent environment moved to Task defaults (below) and can be
+      // overridden per project/task. Compute keeps the runner pool + budget; the pool
+      // list is scoped to the effective environment, shown read-only here.
+      const orgEnvironment = executionPolicy.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
+      $('#org-execution').innerHTML = `<div class="settings-grid">
+        <label class="form-row">Agent environment<input value="${esc(orgEnvironment)}" disabled title="Set the default in Task defaults; override it per project or task" /></label>
+        <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
+        <label class="form-row">World experience<select id="org-execution-flavor"><option value="headless" ${(executionPolicy.environment?.flavor || 'headless') === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${executionPolicy.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
+        <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
+        <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
+        <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
+        <label class="form-row">Hibernate parked worlds after (days)<input id="org-execution-hibernate" type="number" min="1" value="${esc(Math.round((executionPolicy.hibernateAfterMs || 604800000) / 86400000))}" /></label>
+        <label class="form-row"><span>Outbound network ${policyTip('Coding agents normally need arbitrary package registries, documentation, web search and APIs. Restricted mode is for organizations with a maintained egress policy.')}</span><select id="org-execution-network"><option value="unrestricted" ${executionPolicy.network?.unrestricted !== false ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${executionPolicy.network?.unrestricted === false ? 'selected' : ''}>Restricted allowlist</option></select></label>
+      </div>
+      <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
+      <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
+      const providerInfo = {
+        e2b: { name: 'E2B', site: 'https://e2b.dev', keys: 'https://e2b.dev/dashboard?tab=keys' },
+        daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io',
+          note: 'Note: <a href="https://www.daytona.io/docs/en/network-limits/" target="_blank" rel="noopener noreferrer">Daytona Tiers 1–2</a> only reach package registries, Git hosts and AI APIs, not the open internet. Use E2B or Daytona Tier 3+ instead.' },
       };
-      await api(`/api/organizations/${S.organizationId}/usage-policy`, { method: 'PUT', body: JSON.stringify({ policy }) }); toast('Usage guardrails saved'); await hydrateOrganizationView();
-    } catch (error) { toast(error.message, true); }
-  });
-  $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
-  $('#save-identity')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
-  $('#rotate-scim')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
-  $('#create-organization')?.addEventListener('click', createOrganization);
-  $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
-    const editor = row.querySelector('.authz-editor');
-    wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {
-      if (authorization.scope === 'projects' && !authorization.projectIds?.length) return;
-      try { await api(`/api/organizations/${S.organizationId}/members`, { method: 'POST', body: JSON.stringify({ userId: row.dataset.orgMember, authorization }) }); }
-      catch (e) { toast(e.message, true); await hydrateOrganizationView(); }
-    });
-    row.querySelector('.org-member-remove')?.addEventListener('click', async () => { if (!confirm('Remove this member from the organization?')) return; try { await api(`/api/organizations/${S.organizationId}/members/${encodeURIComponent(row.dataset.orgMember)}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  });
-  $('#org-teams')?.querySelectorAll('[data-team]').forEach((block) => {
-    block.querySelector('.team-member-add')?.addEventListener('click', async () => {
-      const entered = block.querySelector('.team-user')?.value.trim();
-      const member = S.organizationMembers.find((candidate) => personChoice(candidate).toLowerCase() === entered?.toLowerCase()
-        || userName(candidate.userId, candidate.user).toLowerCase() === entered?.toLowerCase()
-        || userRecord(candidate.userId, candidate.user)?.email?.toLowerCase() === entered?.toLowerCase());
-      if (!member) return toast('Choose a person in this organization', true);
-      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members`, { method: 'POST', body: JSON.stringify({ userId: member.userId }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
-    });
-    block.querySelector('.team-rename')?.addEventListener('click', () => { const form = block.querySelector('.team-rename-form'); form.hidden = false; form.querySelector('.team-name-edit').focus(); form.querySelector('.team-name-edit').select(); });
-    block.querySelector('.team-rename-cancel')?.addEventListener('click', () => { block.querySelector('.team-rename-form').hidden = true; });
-    block.querySelector('.team-rename-save')?.addEventListener('click', async () => {
-      const name = block.querySelector('.team-name-edit')?.value.trim(); if (!name) return toast('Team name is required', true);
-      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
-    });
-    block.querySelector('.team-name-edit')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); block.querySelector('.team-rename-save').click(); } if (event.key === 'Escape') block.querySelector('.team-rename-cancel').click(); });
-    block.querySelector('.team-delete')?.addEventListener('click', async () => {
-      const team = S.teams.find((candidate) => candidate.id === block.dataset.team);
-      if (!confirm(`Delete “${team?.name || 'this team'}”? This is only allowed when no project or workflow still uses it.`)) return;
-      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
-    });
-    block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
-  });
-  $('#export-organization')?.addEventListener('click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
-  const renameOrganization = async () => {
-    const name = $('#organization-name')?.value.trim();
-    if (!name) return toast('Organization name is required', true);
-    try {
-      await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
-      await loadOrganizations();
-      toast('Organization renamed');
-      renderShell();
-      renderMain();
-    } catch (e) { toast(e.message, true); }
+      $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
+        const connection = connectionFor(provider); const config = connection?.config || {};
+        const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
+        const info = providerInfo[provider];
+        return `<div class="team-block provider-connection" data-provider="${provider}">
+          <div class="member-row"><b>${info.name}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
+          <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
+          ${info.note ? `<p class="provider-note">${info.note}</p>` : ''}
+          ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
+          <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
+          ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
+            : `<details class="settings-disclosure compact"><summary><b>Advanced (optional)</b></summary><p class="task-sub">An API key is enough to use Daytona’s default environment. Snapshots set their own CPU and memory; choose an image to apply task resource settings.</p><div class="settings-grid"><label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="Daytona default" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label></div></details>`}
+          </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
+      }).join('');
+      $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
+        <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select>${hostLocal() ? '<input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds">' : ''}<button class="btn sm" id="runner-create">Add pool</button></div>`;
+      $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
+        const provider = row.dataset.provider;
+        row.querySelector('.provider-save')?.addEventListener('click', async () => {
+          const body = { apiKey: row.querySelector('.provider-key').value || undefined, config: provider === 'e2b'
+            ? { template: row.querySelector('.provider-template').value, desktopTemplate: row.querySelector('.provider-desktop-template').value }
+            : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
+                desktopSnapshot: row.querySelector('.provider-desktop-snapshot').value, desktopImage: row.querySelector('.provider-desktop-image').value,
+                apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
+          // A rejected save changed nothing: keep what was typed. Once saved, the
+          // redraw shows the stored connection and any verification error.
+          try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); }
+          catch (e) { toast(e.message, true); return; }
+          try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await refresh('compute'); }
+          catch (e) { toast(e.message, true); await refresh('compute'); }
+        });
+        row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await refresh('compute'); } catch (e) { toast(e.message, true); await refresh('compute'); } });
+        row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await refresh('compute'); } catch (e) { toast(e.message, true); } });
+      });
+      setEventHandler($('#runner-create'), 'click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await refresh('compute'); } catch (e) { toast(e.message, true); } });
+      const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
+      $('#org-execution-pool').innerHTML = `<option value="">Organization BYOK default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+      setEventHandler($('#org-execution-network'), 'change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
+      setEventHandler($('#org-execution-save'), 'click', async () => {
+        const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+        const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
+        try {
+          await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
+            runnerPoolId: $('#org-execution-pool').value || undefined,
+            environment: { flavor: $('#org-execution-flavor').value },
+            resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
+            network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
+            monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
+            hibernateAfterMs: Math.round(Number($('#org-execution-hibernate').value) * 86400000),
+          } }) }); toast('Organization execution policy saved'); await refresh('compute');
+        } catch (error) { toast(error.message, true); }
+      });
+      $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await refresh('compute'); } catch (e) { toast(e.message, true); } }));
+    },
+    async storage() {
+      const storageLocations = await read('storage').catch(() => []);
+      if (!live('storage')) return;
+      $('#org-storage').innerHTML = `
+        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+        <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
+          <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
+          <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-tavya"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
+          <label class="form-row">Restricted prefix<input id="storage-prefix" value="tavya/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
+          <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
+          <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the ${siteNameMarkup()} vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
+      setEventHandler($('#storage-connect'), 'click', async () => {
+        try {
+          const created = await api(`/api/organizations/${organizationId}/storage`, { method: 'POST', body: JSON.stringify({
+            name: $('#storage-name').value, endpoint: $('#storage-endpoint').value, bucket: $('#storage-bucket').value,
+            region: $('#storage-region').value, prefix: $('#storage-prefix').value,
+            accessKeyId: $('#storage-access-key').value, secretAccessKey: $('#storage-secret-key').value,
+          }) });
+          await api(`/api/organizations/${organizationId}/storage/${encodeURIComponent(created.id)}/test`, { method: 'POST', body: '{}' });
+          toast('Customer storage connected'); await refresh('storage');
+        } catch (error) { toast(error.message, true); }
+      });
+      $('#org-storage')?.querySelectorAll('[data-storage]').forEach((row) => {
+        const id = encodeURIComponent(row.dataset.storage);
+        row.querySelector('.storage-test')?.addEventListener('click', async () => { try {
+          await api(`/api/organizations/${organizationId}/storage/${id}/test`, { method: 'POST', body: '{}' }); toast('Storage connection verified'); await refresh('storage');
+        } catch (error) { toast(error.message, true); await refresh('storage'); } });
+        row.querySelector('.storage-default')?.addEventListener('click', async () => { try {
+          await api(`/api/organizations/${organizationId}/storage/${id}/default`, { method: 'PUT', body: '{}' }); toast('Default storage updated'); await refresh('storage');
+        } catch (error) { toast(error.message, true); } });
+        row.querySelector('.storage-delete')?.addEventListener('click', async () => {
+          if (!confirm('Remove this storage connection? It is allowed only when no resource or revision uses it.')) return;
+          try { await api(`/api/organizations/${organizationId}/storage/${id}`, { method: 'DELETE' }); await refresh('storage'); }
+          catch (error) { toast(error.message, true); }
+        });
+      });
+    },
+    async usage() {
+      const [entitlements, usage, usagePolicy] = await Promise.all([
+        read('entitlements').catch(() => null),
+        read('usage').catch(() => null),
+        read('usage-policy').catch(() => null),
+      ]);
+      if (!live('usage')) return;
+      $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
+      const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
+      const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
+        : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
+          : usageSync.length ? ` · synced ${fmtAgo(Math.max(...usageSync.map((item) => Number(item.at || 0))))}` : '';
+      const coverageFrom = usageSync.length ? Math.max(...usageSync.map((item) => Number(item.coverageFrom || 0))) : 0;
+      const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
+        : coverageFrom > Number(usage?.from || 0)
+          ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
+      const usageFunding = usage?.byFundingSource || {};
+      $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Metered + estimated usage · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
+        <p class="task-sub">Incurred $${((usage.incurredCostMicros || 0) / 1e6).toFixed(2)} · estimated $${((usage.estimatedCostMicros || 0) / 1e6).toFixed(2)} · active managed reservations $${((usage.activeReservationsMicros || 0) / 1e6).toFixed(2)}</p>
+        <p class="task-sub">Managed $${((usageFunding.managed || 0) / 1e6).toFixed(2)} (${usage.requests?.managed || 0} model requests) · BYOK $${((usageFunding.byok || 0) / 1e6).toFixed(2)} (${usage.requests?.byok || 0} model requests) · active: ${usage.active?.agentTurns || 0} model turns, ${usage.active?.worlds || 0} worlds, ${usage.active?.executions || 0} commands</p>
+        ${usagePolicy ? `<details class="settings-disclosure compact"><summary><b>Usage guardrails</b> ${policyTip(`The plan admits ${entitlements?.maxActiveAgentRuns || usagePolicy.effectiveMaxActiveAgentTurns} shared active agent runs; an owner can only set a tighter cap here. Managed model use stays off until an owner sets a spend cap and enables a provider. BYOK usage is attributed separately, and remote sandboxes use the organization's own provider account.`)}</summary><div class="settings-grid">
+          <label class="form-row">Managed spend cap (USD/month)<input id="usage-managed-cap" type="number" min="0.01" step="0.01" value="${usagePolicy.managedSpendCapMicros == null ? '' : esc(usagePolicy.managedSpendCapMicros / 1e6)}" placeholder="Disabled" /></label>
+          <label class="form-row">Managed model providers<input id="usage-managed-providers" value="${esc((usagePolicy.managedModelProviders || []).join(', '))}" placeholder="Disabled" /></label>
+          <label class="form-row">Allowed model providers<input id="usage-allowed-providers" value="${esc((usagePolicy.allowedModelProviders || []).join(', '))}" placeholder="All connected BYOK providers" /></label>
+          <label class="form-row">Allowed models<input id="usage-allowed-models" value="${esc((usagePolicy.allowedModels || []).join(', '))}" placeholder="All models" /></label>
+          <label class="form-row">Model starts / minute<input id="usage-agent-rate" type="number" min="1" value="${esc(usagePolicy.maxAgentStartsPerMinute)}" /></label>
+          <label class="form-row">Sandbox starts / minute<input id="usage-world-rate" type="number" min="1" value="${esc(usagePolicy.maxRemoteStartsPerMinute)}" /></label>
+          <label class="form-row">Optional tighter model concurrency<input id="usage-agent-active" type="number" min="1" max="${esc(entitlements?.maxActiveAgentRuns || 1000000)}" value="${usagePolicy.maxActiveAgentTurns == null ? '' : esc(usagePolicy.maxActiveAgentTurns)}" placeholder="Plan limit: ${esc(usagePolicy.effectiveMaxActiveAgentTurns)}" /></label>
+          ${hostLocal() ? `<label class="form-row">Concurrent remote worlds<input id="usage-world-active" type="number" min="1" value="${esc(usagePolicy.maxActiveWorlds)}" /></label>`
+            : `<div class="form-row"><span>Concurrent remote worlds</span><b>Same as agent concurrency: ${esc(usagePolicy.maxActiveWorlds)}</b></div>`}
+        </div><button class="btn sm primary" id="usage-policy-save">Save usage guardrails</button></details>` : ''}` : 'Usage unavailable.';
+      setEventHandler($('#usage-policy-save'), 'click', async () => {
+        const list = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+        const cap = $('#usage-managed-cap').value.trim();
+        const agentCap = $('#usage-agent-active').value.trim();
+        try {
+          const policy = {
+            managedSpendCapMicros: cap === '' ? null : Math.round(Number(cap) * 1e6),
+            managedModelProviders: list('#usage-managed-providers'), allowedModelProviders: list('#usage-allowed-providers'),
+            allowedModels: list('#usage-allowed-models'), maxAgentStartsPerMinute: Number($('#usage-agent-rate').value),
+            maxRemoteStartsPerMinute: Number($('#usage-world-rate').value),
+            maxActiveAgentTurns: agentCap === '' ? null : Number(agentCap),
+            ...(hostLocal() ? { maxActiveWorlds: Number($('#usage-world-active').value) } : {}),
+          };
+          await api(`/api/organizations/${S.organizationId}/usage-policy`, { method: 'PUT', body: JSON.stringify({ policy }) }); toast('Usage guardrails saved'); await refresh('usage', 'compute');
+        } catch (error) { toast(error.message, true); }
+      });
+    },
+    async identity() {
+      const identityPolicy = await read('identity-policy').catch(() => null);
+      if (!live('identity')) return;
+      if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
+        <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
+        <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
+        <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
+        <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
+      setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
+      setEventHandler($('#rotate-scim'), 'click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
+    },
   };
-  $('#rename-organization')?.addEventListener('click', renameOrganization);
-  $('#organization-name')?.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') { event.preventDefault(); renameOrganization(); }
-  });
-  $('#delete-organization')?.addEventListener('click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = prompt(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
+  await Promise.all(panes.map((pane) => paint[pane]()));
 }
-
 async function createOrganization() {
-  const name = prompt('Organization name');
+  const name = await promptText('Organization name');
   if (!name) { syncOrganizationSwitcher(); return; }
   try {
     const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name }) });
     await loadOrganizations();
     S.organizationId = organization.id;
     S.projectId = null;
-    await loadCollaboration().catch(() => {});
+    await Promise.all([loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
     await refreshOnboarding();
     renderShell();
     await go(globalRoute('organization'));
@@ -18494,8 +18812,14 @@ async function runDeclaredAction(a) {
 }
 
 // Auto-rendered argument form for a declared action (ActionArg[] → controls).
+function createTransientOverlay() {
+  const root = document.createElement('div');
+  $('#modal-root').appendChild(root);
+  return root;
+}
+
 function openActionForm(a) {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   const control = (arg) => {
     const label = `<div class="label-row"><label>${esc(arg.label || arg.name)}${arg.required ? ' *' : ''}</label></div>`;
     if (arg.type === 'text') return `<div class="form-row">${label}<textarea data-arg="${esc(arg.name)}" rows="3">${esc(arg.default ?? '')}</textarea></div>`;
@@ -18510,7 +18834,7 @@ function openActionForm(a) {
       <button class="btn" id="act-cancel">Cancel</button>
       <button class="btn ${a.danger ? 'danger' : 'primary'}" id="act-send">${esc(a.label || a.name)}</button>
     </div></div></div>`;
-  const close = () => (root.innerHTML = '');
+  const close = () => (root.remove());
   $('#act-scrim').addEventListener('click', (e) => { if (e.target.id === 'act-scrim') close(); });
   $('#act-cancel').addEventListener('click', close);
   root.querySelector('[data-arg]')?.focus();
@@ -18575,9 +18899,12 @@ function taskOrder() {
 }
 function openAdjacentTask(delta) {
   const order = taskOrder();
-  const i = order.indexOf(S.selected);
+  // A key pressed before the previous step's page opened continues from its target.
+  const i = order.indexOf(S.taskWalkTarget || S.selected);
   const next = order[i < 0 ? 0 : i + delta];
-  if (next) { S.cursorId = next; goToTask(next); }
+  if (!next) return;
+  S.cursorId = S.taskWalkTarget = next;
+  goToTask(next);
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----
@@ -18731,11 +19058,11 @@ function assembleGlobalSearchResults(query, projects, responses, limit = 40) {
     })),
   );
   allTasks.sort((a, b) => b.score - a.score || (b.task.createdAt || 0) - (a.task.createdAt || 0));
-  return { projectHits, taskHits: allTasks.slice(0, limit), totalTasks: allTasks.length };
+  return { projectHits, taskHits: allTasks.slice(0, limit), totalTasks: (responses || []).reduce((total, row) => total + (row.result?.total ?? row.result?.tasks?.length ?? 0), 0) };
 }
 
 function openGlobalSearch() {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   root.innerHTML = `<div class="palette-scrim" id="gs-scrim"><div class="palette global-search" role="dialog" aria-modal="true" aria-labelledby="gs-title">
     <div class="global-search-head">
       <span aria-hidden="true">⌕</span>
@@ -18752,14 +19079,21 @@ function openGlobalSearch() {
   let active = 0;
   let timer = 0;
   let request = 0;
+  let controller = null;
   let state = 'prompt';
   let summary = '';
-  const close = () => { clearTimeout(timer); request++; root.innerHTML = ''; };
+  const close = () => { clearTimeout(timer); controller?.abort(); request++; root.remove(); };
 
   const draw = () => {
     if (state === 'prompt') {
       input.removeAttribute('aria-activedescendant');
       list.innerHTML = `<div class="global-search-empty"><b>Find work anywhere</b><span>Enter words, a task number, or a task filter. Results include archived work.</span></div>`;
+      return;
+    }
+    if (state === 'error') {
+      input.removeAttribute('aria-activedescendant');
+      list.innerHTML = '<div class="global-search-empty">Search unavailable. <button class="btn sm">Retry</button></div>';
+      list.querySelector('button').onclick = search;
       return;
     }
     if (state === 'loading') {
@@ -18792,15 +19126,19 @@ function openGlobalSearch() {
   const search = async () => {
     const q = input.value.trim();
     const ownRequest = ++request;
-    if (!q) { state = 'prompt'; items = []; summary = ''; active = 0; return draw(); }
+    if (q.length < 2) { state = 'prompt'; items = []; summary = ''; active = 0; return draw(); }
+    controller?.abort();
+    controller = new AbortController();
     state = 'loading';
     draw();
-    const responses = (await Promise.all(S.projects.map(async (project) => {
-      try {
-        const result = await api(`/api/projects/${encodeURIComponent(project.id)}/search?q=${encodeURIComponent(q)}`);
-        return { project, result };
-      } catch { return null; } // project discovery and task-read grants can differ
-    }))).filter(Boolean);
+    let responses;
+    try {
+      const results = await api(`/api/search?q=${encodeURIComponent(q)}`, { signal: controller.signal });
+      responses = results.map(result => ({ project: projectById(result.projectId), result })).filter(row => row.project);
+    } catch (error) {
+      if (ownRequest !== request || !root.contains(input) || error.name === 'AbortError') return;
+      state = 'error'; draw(); return;
+    }
     if (ownRequest !== request || !root.contains(input)) return;
     const found = assembleGlobalSearchResults(q, S.projects, responses);
     items = [
@@ -18824,7 +19162,7 @@ function openGlobalSearch() {
     state = 'done';
     draw();
   };
-  const schedule = () => { request++; clearTimeout(timer); timer = setTimeout(search, 160); };
+  const schedule = () => { controller?.abort(); request++; clearTimeout(timer); timer = setTimeout(search, 160); };
   const run = (i) => { const item = items[i]; if (!item) return; close(); item.run(); };
 
   input.addEventListener('input', schedule);
@@ -18849,14 +19187,14 @@ function openGlobalSearch() {
 
 // -- the ⌘K palette: fuzzy command/action invocation --------------------------
 function openPalette() {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   root.innerHTML = `<div class="palette-scrim" id="pal-scrim"><div class="palette">
     <input id="pal-in" placeholder="Type a command…" autocomplete="off" />
     <div id="pal-list"></div>
   </div></div>`;
   const input = $('#pal-in');
   const list = $('#pal-list');
-  const close = () => (root.innerHTML = '');
+  const close = () => (root.remove());
   let items = [];
   let active = 0;
   const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2 };
@@ -18900,7 +19238,7 @@ function openPalette() {
 
 // -- "?" help: the same registry, grouped — includes every workflow's commands -
 function openHelp() {
-  const root = $('#overlay-root');
+  const root = createTransientOverlay();
   const cmds = allCommands().filter((c) => c.keybinding && c.help !== false);
   const groups = [...new Set(cmds.map((c) => c.group))];
   const row = (k, title, sub) => `<div class="help-row"><span class="key">${k}</span><span>${title}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
@@ -18921,8 +19259,8 @@ function openHelp() {
       ${row('↵', 'Open the full task form with what you typed')}
       ${row(esc(fmtKeys('meta+Enter')), 'Add the task directly')}
     </div></div></div>`;
-  $('#help-close').addEventListener('click', () => (root.innerHTML = ''));
-  $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.innerHTML = ''; });
+  $('#help-close').addEventListener('click', () => (root.remove()));
+  $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.remove(); });
 }
 
 // ── login ────────────────────────────────────────────────────────────────────
@@ -19261,14 +19599,14 @@ function renderLogin() {
     <div class="brand" style="margin-bottom:18px">${brandMark()} ${siteNameMarkup()}</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
     ${S.pendingInvite ? `<p class="task-sub">You've been invited to a ${siteNameMarkup()} organization. Sign in — or <b>create an account</b> — to accept it.</p>` : ''}
-    <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
-    <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
+    <div class="form-row"><label for="email">Email</label><input type="email" id="email" autocomplete="username" /></div>
+    <div class="form-row"><label for="pw">Password</label><input type="password" id="pw" autocomplete="current-password" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
     ${googleBtn('google-btn')}
     ${githubBtn('github-btn')}
     ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
-    <div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>
+    ${S.emailDelivery ? '<div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>' : ''}
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>
   </div></div>`;
   const go = async () => {
@@ -19297,8 +19635,10 @@ function renderLogin() {
       location.href = result.url;
     } catch (error) { $('#login-err').textContent = error.message; }
   });
-  $('#signup-open').addEventListener('click', () => openPublicAuth('/signup', renderSignup));
-  $('#forgot-open').addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
+  // An invitee stays on the invitation link: boot() accepts it once the account
+  // exists, and /signup would drop its token.
+  $('#signup-open').addEventListener('click', () => S.pendingInvite ? renderSignup() : openPublicAuth('/signup', renderSignup));
+  $('#forgot-open')?.addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
@@ -19309,7 +19649,7 @@ function renderForgotPassword() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Reset password</div>
     <p class="task-sub">Enter your email and we'll send you a link to choose a new password.</p>
-    <div class="form-row"><label>Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
+    <div class="form-row"><label for="forgot-email">Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
     <button class="btn primary" id="forgot-btn" style="width:100%">Send reset link</button>
     <button class="btn" id="forgot-back" style="width:100%;margin-top:8px">Back to sign in</button>
     <div id="forgot-msg" style="font-size:12px;margin-top:8px"></div>
@@ -19341,7 +19681,7 @@ function renderForgotPassword() {
 function renderResetPassword(token) {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Choose a new password</div>
-    ${token ? `<div class="form-row"><label>New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
+    ${token ? `<div class="form-row"><label for="reset-pw">New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="reset-btn" style="width:100%">Set new password</button>`
       : `<p class="task-sub">This reset link is missing its token or has expired. Request a new one from the sign-in page.</p>`}
     <button class="btn" id="reset-back" style="width:100%;margin-top:8px">Back to sign in</button>
@@ -19380,9 +19720,9 @@ function renderSignup() {
     ${S.pendingInvite
       ? '<p class="task-sub">Accepting an invitation — <b>use the email address it was sent to</b>, or the invite won\'t match.</p>'
       : '<p class="task-sub">You\'ll start in your own personal workspace, ready to create a project. You can be invited into other organizations too.</p>'}
-    <div class="form-row"><label>Name</label><input id="signup-name" autocomplete="name" /></div>
-    <div class="form-row"><label>Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
-    <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
+    <div class="form-row"><label for="signup-name">Name</label><input id="signup-name" autocomplete="name" /></div>
+    <div class="form-row"><label for="signup-email">Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
+    <div class="form-row"><label for="signup-pw">Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
     ${policyAcceptanceMarkup('signup', 'signup-policy-acceptance')}
     <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
     ${googleBtn('signup-google-btn')}
@@ -19430,7 +19770,7 @@ function renderSignup() {
   $('#signup-btn').addEventListener('click', go);
   wireSocialBtn('signup-google-btn', 'google', '#signup-err', true);
   wireSocialBtn('signup-github-btn', 'github', '#signup-err', true);
-  $('#signup-back').addEventListener('click', () => openPublicAuth('/login', renderLogin));
+  $('#signup-back').addEventListener('click', () => S.pendingInvite ? renderLogin() : openPublicAuth('/login', renderLogin));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
@@ -19471,8 +19811,8 @@ function renderAccessPending() {
   </div></div>`;
   $('#pending-retry').addEventListener('click', () => boot());
   $('#pending-workspace').addEventListener('click', async () => {
-    const organizationName = prompt('Organization name'); if (!organizationName) return;
-    const projectName = prompt('First project name', 'My project'); if (!projectName) return;
+    const organizationName = await promptText('Organization name'); if (!organizationName) return;
+    const projectName = await promptText('First project name', 'My project'); if (!projectName) return;
     try {
       const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name: organizationName }) });
       await api(`/api/organizations/${organization.id}/projects`, { method: 'POST', body: JSON.stringify({ name: projectName, config: {} }) });
@@ -19489,9 +19829,9 @@ function renderSetup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Set up ${siteNameMarkup()}</div>
     <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
-    <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
-    <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>
-    <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="setup-pw" autocomplete="new-password" /></div>
+    <div class="form-row"><label for="setup-name">Name</label><input id="setup-name" autocomplete="name" /></div>
+    <div class="form-row"><label for="setup-email">Email</label><input type="email" id="setup-email" autocomplete="username" /></div>
+    <div class="form-row"><label for="setup-pw">Password (10+ characters)</label><input type="password" id="setup-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="setup-btn" style="width:100%">Create administrator</button>
     <div id="setup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
@@ -19848,7 +20188,7 @@ async function finishMcpCallback() {
   const key = `mcp-oauth:${state}`; let pending;
   try { pending = JSON.parse(sessionStorage.getItem(key) || 'null'); } catch {}
   history.replaceState({}, '', '/mcp-callback');
-  document.querySelector('#app').innerHTML = '<main class="mcp-callback"><h1>Connecting your tools…</h1><p role="status"></p><a href="/">Return to Tavya</a></main>';
+  document.querySelector('#app').innerHTML = `<main class="mcp-callback"><h1>Connecting your tools…</h1><p role="status"></p><a href="/">Return to ${siteNameMarkup()}</a></main>`;
   const status = document.querySelector('.mcp-callback p');
   try {
     if (!pending) throw new Error('Connection session expired. Return to settings and connect again.');
@@ -19876,7 +20216,8 @@ function taskPaymentsHtml(id, liveKey) {
       <button class="payment-caret" type="button" aria-label="Choose cards" disabled>▾</button></div>
       <div class="mcp-menu" hidden><div class="mcp-options" id="${id}-options" role="listbox" aria-multiselectable="true" aria-label="Cards"></div></div>
     </div>
-    <div class="payment-budget-row"><label for="${id}-budget" title="Payments above this task’s total budget ask for approval. Leave blank for no budget limit.">Budget (USD)</label>
+    <div class="payment-budget-row"><label for="${id}-budget" title="Payments above this task’s total budget ask for approval. Leave blank for no budget limit.">Budget <span class="payment-currency-code">(USD)</span></label>
+      <select class="payment-currency" aria-label="Budget currency" title="Only payments in this currency count toward the budget; others ask for approval." hidden disabled><option value="usd">USD</option></select>
       <input id="${id}-budget" class="payment-budget" type="number" min="0" step="0.01" placeholder="Unlimited" disabled>
       ${live ? '<span class="payment-spent" role="status" title="Includes payments reserved for checkout">Loading spent…</span>' : ''}</div>
     ${live ? '<button class="btn sm payment-save" type="button" disabled>Save payments</button>' : ''}
@@ -19886,10 +20227,11 @@ function taskPaymentsHtml(id, liveKey) {
 function readTaskPayments(box) {
   if (!box?.dataset.policy) return undefined;
   const budget = box.querySelector('.payment-budget');
-  if (!budget.checkValidity()) throw new Error('Enter a non-negative budget in USD');
-  const cents = budget.value === '' ? null : Math.round(Number(budget.value) * 100);
-  if (cents !== null && !Number.isSafeInteger(cents)) throw new Error('Enter a valid budget in USD');
-  return { cardIds: JSON.parse(box.dataset.policy).cardIds, budget: cents };
+  if (!budget.checkValidity()) throw new Error('Enter a non-negative budget');
+  const currency = box.querySelector('.payment-currency').value;
+  const minor = budget.value === '' ? null : toMinorUnits(budget.value, currency);
+  if (minor !== null && !Number.isSafeInteger(minor)) throw new Error('Enter a valid budget');
+  return { cardIds: JSON.parse(box.dataset.policy).cardIds, budget: minor, currency };
 }
 async function wireTaskPayments(box, projectId, initial, taskId, organizationId) {
   if (!box) return;
@@ -19897,6 +20239,7 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
   const query = projectId ? `projectId=${encodeURIComponent(projectId)}` : `organizationId=${encodeURIComponent(organizationId)}`;
   const input = box.querySelector('.payment-search'), menu = box.querySelector('.mcp-menu'), options = box.querySelector('.mcp-options');
   const budget = box.querySelector('.payment-budget'), save = box.querySelector('.payment-save');
+  const currency = box.querySelector('.payment-currency');
   try {
     const [cards0, org, project, live] = await Promise.all([
       api(`/api/cards?${query}`).catch(error => { if (taskId) return []; throw error; }),
@@ -19906,18 +20249,32 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
     ]);
     if (!box.isConnected) return;
     let cards = (cards0.length ? cards0 : live?.cards || []).filter(c => c.status !== 'canceled' && c.status !== 'inactive');
-    const inherited = { cardIds: project.cardIds ?? org.cardIds,
-      budget: Object.hasOwn(project, 'budget') ? project.budget : project.allowance ?? (Object.hasOwn(org, 'budget') ? org.budget : org.allowance ?? 0) };
+    // A budget's currency comes from the layer that set it (see resolvePaymentPolicy).
+    const layer = Object.hasOwn(project, 'budget') || project.allowance != null ? project : org;
+    const inheritedCards = project.cardIds ?? org.cardIds;
+    // A budget saved before budgets had a currency is in the one its cards share.
+    const shared = [...new Set(cards.filter(c => !inheritedCards || inheritedCards.includes(c.id)).map(c => (c.currency || 'usd').toLowerCase()))];
+    const inherited = { cardIds: inheritedCards, budget: Object.hasOwn(layer, 'budget') ? layer.budget : layer.allowance ?? 0,
+      currency: layer.currency || (shared.length === 1 ? shared[0] : 'usd') };
     const policy = (taskId && S.paymentEdits?.[taskId]) || live || initial || inherited;
     let selected = new Set(policy.cardIds ?? cards.map(c => c.id)), active = -1;
-    budget.value = policy.budget == null ? '' : (policy.budget / 100).toFixed(2);
-    input.disabled = budget.disabled = box.querySelector('.payment-caret').disabled = false;
+    const codes = [...new Set([policy.currency || inherited.currency, ...cards.map(c => c.currency || 'usd')].map(c => c.toLowerCase()))];
+    budget.value = policy.budget == null ? '' : fromMinorUnits(policy.budget, codes[0]);
+    currency.innerHTML = codes.map(c => `<option value="${esc(c)}">${esc(c.toUpperCase())}</option>`).join('');
+    currency.value = codes[0];
+    // Whole yen, cents, or thousandths of a dinar.
+    const step = () => { const digits = currencyDigits(currency.value); budget.step = digits ? (1 / 10 ** digits).toFixed(digits) : '1'; };
+    step();
+    currency.addEventListener('change', step);
+    currency.hidden = codes.length < 2;
+    box.querySelector('.payment-currency-code').textContent = codes.length < 2 ? `(${codes[0].toUpperCase()})` : '';
+    input.disabled = budget.disabled = currency.disabled = box.querySelector('.payment-caret').disabled = false;
     input.placeholder = 'Choose cards…';
     if (live) {
-      box.querySelector('.payment-spent').textContent = `${usd(live.spent)} spent`;
+      box.querySelector('.payment-spent').textContent = `${money(live.spent, live.currency)} spent`;
       // A retained section still follows spending recorded while it is open.
       box.refreshSpent = () => api(`/api/tasks/${encodeURIComponent(taskId)}/payments`)
-        .then(({ spent }) => { box.querySelector('.payment-spent').textContent = `${usd(spent)} spent`; }).catch(() => {});
+        .then(({ spent, currency }) => { box.querySelector('.payment-spent').textContent = `${money(spent, currency)} spent`; }).catch(() => {});
     }
     function expand(open) { menu.hidden = !open; input.setAttribute('aria-expanded', String(open)); active = -1; input.removeAttribute('aria-activedescendant'); }
     function paint() {
@@ -19953,6 +20310,7 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
       if (event.key === 'Enter' && !menu.hidden) { event.preventDefault(); rows[active]?.click(); }
     };
     budget.addEventListener('input', () => { if (taskId && budget.checkValidity()) { (S.paymentEdits ||= {})[taskId] = readTaskPayments(box); save.disabled = false; } });
+    currency.addEventListener('change', () => { if (taskId && budget.checkValidity()) { (S.paymentEdits ||= {})[taskId] = readTaskPayments(box); save.disabled = false; } });
     paint();
     if (live && !live.canEdit) {
       box.querySelectorAll('input, button').forEach(control => { control.disabled = true; });
@@ -19967,7 +20325,7 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
           const policy = readTaskPayments(box);
           const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/payments`, { method: 'PUT', body: JSON.stringify(policy) });
           delete S.paymentEdits?.[taskId];
-          box.querySelector('.payment-spent').textContent = `${usd(result.spent)} spent`;
+          box.querySelector('.payment-spent').textContent = `${money(result.spent, result.currency)} spent`;
           // The box already shows what was saved; don't repaint it for that.
           const rec = taskRecord(taskId);
           if (rec) rec.params = { ...rec.params, paymentPolicy: policy };

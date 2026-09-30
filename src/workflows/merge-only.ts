@@ -8,6 +8,7 @@ import {
   setHandler,
   condition,
   workflowInfo,
+  patched,
   ApplicationFailure,
   isCancellation,
   log,
@@ -343,15 +344,21 @@ async function mergeOnlyImpl(
     stage = 'cancelled';
     status = 'cancelled';
     await publish();
-    if (world) {
-      const remoteWorld = releaseWorldOnCompletion(world);
-      await core.destroyWorld(world as any);
-      if (remoteWorld) {
-        world = undefined;
-        await publish();
-      }
-    }
+    await releaseWorld();
     return { stage };
+  }
+
+  /** Destroy the world once; a released remote world leaves the view. */
+  let worldReleased = false;
+  async function releaseWorld(): Promise<void> {
+    if (!world || worldReleased) return;
+    worldReleased = true;
+    const remoteWorld = releaseWorldOnCompletion(world);
+    await core.destroyWorld(world as any);
+    if (remoteWorld) {
+      world = undefined;
+      await publish();
+    }
   }
 
   setHandler(viewQuery, view);
@@ -378,6 +385,12 @@ async function mergeOnlyImpl(
   // Open a world on the EXISTING branch under review.
   const worldKind = input.project.worldProvider ?? 'worktree';
   world = (await createTaskWorld(core, { taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repo: input.project.repos?.[0], base: target, branch: input.branch, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
+  // A failure from here on releases the world as the done and cancelled exits
+  // do: left allocated, a cloud sandbox stays billed until the hibernation sweep.
+  // The branch under review holds the work; the world is only its checkout.
+  // Recorded failures emitted no release, so they replay without one.
+  let result: Awaited<ReturnType<typeof long.finalizeMergeActivity>> | undefined;
+  try {
   if (leaser) await leaser.init();
 
   // Workflow-repo edits must pass tests + replay-compat before they can merge.
@@ -442,6 +455,7 @@ async function mergeOnlyImpl(
         }
       } else {
         // A human layer: one Approve click passes ONE layer.
+        if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
         waitingFor = { kind: 'human', audience: layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
         await condition(() => confirmed || cancelled || confirmEpoch !== epoch);
@@ -452,13 +466,20 @@ async function mergeOnlyImpl(
       }
     }
     if (!cancelled && !leftToHuman) confirmed = true;
-    if (leftToHuman) waitingFor = { kind: 'human', audience: ['@creator'] };
+    if (leftToHuman) {
+      if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
+      waitingFor = { kind: 'human', audience: ['@creator'] };
+    }
   }
   // The gate has played (or was blocked by failing checks); the route is load-bearing
   // no longer, so it freezes here rather than at queue time (SPEC §4.5/§5.5).
   confirmConsumed = true;
   await publish();
-  await condition(() => confirmed || cancelled);
+  if (patched('merge-only-enforce-failed-checks-v1')) {
+    await condition(() => cancelled || (confirmed && mayConfirm));
+  } else {
+    await condition(() => confirmed || cancelled);
+  }
   waitingFor = undefined;
   if (cancelled || (input.workflowEdit && !checks?.passed && !confirmed)) return await finishCancelled();
 
@@ -501,7 +522,6 @@ async function mergeOnlyImpl(
     : [`${world!.repos?.[0]?.localPath ?? world!.repo ?? input.projectId}:${target}`];
   const held: string[] = [];
   let acquireCancelled = false;
-  let result: Awaited<ReturnType<typeof long.finalizeMergeActivity>> | undefined;
   // Every acquired slot MUST be released — including when the merge (which runs
   // with `maximumAttempts: 1`) throws. The old bare `releaseMerge` statement after
   // `finalizeMergeActivity` was skipped entirely on a throw, so the domain stayed
@@ -568,10 +588,15 @@ async function mergeOnlyImpl(
     status = 'failed';
     reviewInfo = { ...reviewInfo, summary: `Merge failed: ${result?.dirty ? `uncommitted changes in the worktree:\n${result.dirty}` : (result?.conflict ?? result?.note)}` };
     await publish();
+    if (patched('merge-only-failure-releases-world-v1')) await releaseWorld();
     return { stage };
   }
+  } catch (err) {
+    if (!isCancellation(err) && world && patched('merge-only-failure-releases-world-v1')) await releaseWorld();
+    throw err;
+  }
   pointOfNoReturnPassed = true;
-  // Remote policy 'push'/'pr' (PLAN-git-config.md §5): best-effort push of the
+  // Remote policy 'push'/'pr' (wiki plans/PLAN-git-config §5): best-effort push of the
   // landed target — the merge is the deliverable, a failed push is not fatal.
   if (remotePolicyOf(input.project) !== 'none') {
     const pushed = await core.pushTarget(world as any, target).catch(() => undefined);
@@ -585,11 +610,6 @@ async function mergeOnlyImpl(
   status = 'done';
   reviewInfo = { ...reviewInfo, summary: `Merged into ${target} as ${result.sha?.slice(0, 8)}.` };
   await publish();
-  const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
-  await core.destroyWorld(world as any);
-  if (remoteWorld) {
-    world = undefined;
-    await publish();
-  }
+  await releaseWorld();
   return { stage, sha: result.sha };
 }

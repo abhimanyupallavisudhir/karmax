@@ -1,4 +1,6 @@
+import { openLocalPty } from '../src/world/local-execution.js';
 import { it, expect } from 'vitest';
+
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,6 +26,7 @@ function diskWorld(root: string): World {
     fs.writeFileSync(dest, content);
   };
   return {
+    openPty: (spec: any) => openLocalPty(root, spec),
     handle: { root },
     readFile: async (file: string) => fs.readFileSync(path.join(root, file), 'utf8'),
     readFileBuffer: async (file: string) => fs.readFileSync(path.join(root, file)),
@@ -37,6 +40,17 @@ function diskWorld(root: string): World {
       return { code: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
     },
   } as unknown as World;
+}
+
+/** Codex appends its rollout asynchronously after turn/completed; production
+ * exports only after the process has exited, so wait for the text here. */
+async function flushedRollout(home: string, thread: string, marker: string): Promise<void> {
+  for (const deadline = Date.now() + 15_000; Date.now() < deadline; await new Promise(r => setTimeout(r, 50))) {
+    const sessions = path.join(home, 'sessions');
+    const file = fs.existsSync(sessions) ? rollouts(home).find((candidate) => candidate.endsWith(`${thread}.jsonl`)) : undefined;
+    if (file && fs.readFileSync(file, 'utf8').includes(marker)) return;
+  }
+  throw new Error(`Codex never flushed ${marker} to thread ${thread}`);
 }
 
 function rollouts(home: string): string[] {
@@ -105,8 +119,9 @@ it.each(['live source', 'deleted source', 'disconnected login'])('forks and resu
       root = (await client.request('thread/start', { cwd: source.handle.root, dynamicTools: codexDynamicTools(true),
         approvalPolicy: 'never', sandbox: 'danger-full-access' })).thread.id;
       await turn(client, root, 'inherited-root-marker');
+      await flushedRollout(sourceHome.absolute, root, 'inherited-root-marker');
       // The host cache is now one completed turn behind the live source.
-      await syncRemoteAgentHome(source, 'codex', sourceHome, host);
+      await syncRemoteAgentHome(source, 'codex', sourceHome, host, root);
       await turn(client, root, 'newest-source-marker');
     });
     const stale = rollouts(host).find((file) => file.endsWith(`${root}.jsonl`))!;
@@ -177,7 +192,7 @@ it.each(['live source', 'deleted source', 'disconnected login'])('forks and resu
           approvalPolicy: 'never', sandbox: 'danger-full-access' });
         await turn(client, child, `resumed-${generation}-marker`);
       });
-      await syncRemoteAgentHome(destination, 'codex', home, host);
+      await syncRemoteAgentHome(destination, 'codex', home, host, child);
       from = destination;
       parent = child;
     }

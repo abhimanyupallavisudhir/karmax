@@ -25,12 +25,14 @@ export interface ResolveContext {
  */
 export class CredentialBroker {
   private auditLog: AuditEntry[] = [];
+  private auditNext = 0;
+  private static readonly AUDIT_LIMIT = 1000;
 
   constructor(private vault: Vault) {}
 
   /** Write back a (possibly newly created) secret under a handle. */
-  registerHandle(handle: string, secret: string) {
-    return this.vault.put(handle, secret);
+  registerHandle(handle: string, secret: string, options?: { history?: boolean }) {
+    return this.vault.put(handle, secret, options);
   }
 
   /** Initialize a shared encryption key without rotating a concurrent creator's key. */
@@ -80,10 +82,14 @@ export class CredentialBroker {
   }
 
   private audit(e: AuditEntry) {
-    this.auditLog.push(e);
+    if (this.auditLog.length < CredentialBroker.AUDIT_LIMIT) this.auditLog.push(e);
+    else this.auditLog[this.auditNext] = e;
+    this.auditNext = (this.auditNext + 1) % CredentialBroker.AUDIT_LIMIT;
   }
 
   audit_log(): AuditEntry[] {
-    return [...this.auditLog];
+    return this.auditLog.length < CredentialBroker.AUDIT_LIMIT
+      ? [...this.auditLog]
+      : [...this.auditLog.slice(this.auditNext), ...this.auditLog.slice(0, this.auditNext)];
   }
 }

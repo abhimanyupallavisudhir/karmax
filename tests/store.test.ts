@@ -1,15 +1,235 @@
 import * as __asyncCollections from '../src/util/async-collections.js';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { Store, isReviewRequestEvent, deleteRows } from '../src/store/db.js';
+import { storeBackends } from './helpers/store-backends.js';
 
-describe('Store', () => {
+describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
   let store: Store;
   beforeEach(async () => {
-    store = (await Store.create(':memory:'));
+    store = (await open());
+  });
+
+  // A parent's Sub-tasks panel reads its children from here: a finished child is
+  // archived out of the live task list and a replaced parent run forgets settled
+  // children, so neither may be missing or fall back to "setup" (task #367).
+  it('summarizes every child of a parent with its list fields, archived ones included', async () => {
+    const project = await store.createProject('Children');
+    const make = (title: string, parentTaskId?: string) => store.createTask({ projectId: project.id, title, workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: title }, ...(parentTaskId ? { parentTaskId } : {}) });
+    const parent = await make('Parent');
+    const first = await make('First', parent.id);
+    const second = await make('Second', parent.id);
+    await make('Unrelated');
+    const view = (status: string, stage: string) => ({ taskId: first.id, title: 'First', workflow: 'software-dev', stage, status,
+      messages: [{ id: 'm', role: 'user', text: 'x'.repeat(10_000), ts: 1 }], actions: [], updatedAt: 1 }) as any;
+    await store.saveView(first.id, view('done', 'done'));
+    await store.saveView(second.id, { ...view('waiting', 'review'), taskId: second.id, title: 'Second', waitingFor: { kind: 'parent', detail: 'Review me' } });
+    expect((await store.getTask(first.id))?.params.archived).toBe(true);
+    const summaries = await store.childTaskSummaries(parent.id);
+    expect(summaries.map((summary) => summary.id)).toEqual([first.id, second.id]);
+    expect(summaries[0]).toMatchObject({ num: first.num, title: 'First', workflow: 'software-dev', lastView: { stage: 'done', status: 'done' } });
+    expect(summaries[1]!.lastView).toMatchObject({ stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' } });
+    expect(JSON.stringify(summaries)).not.toContain('x'.repeat(100));
+    expect(await store.childTaskSummaries(first.id)).toEqual([]);
+  });
+
+  // Ids only carry millisecond time plus random bytes, so children created in
+  // the same millisecond must keep their insertion order rather than id order.
+  it('lists children created in the same millisecond in creation order', async () => {
+    const project = await store.createProject('Same millisecond');
+    const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'p' } });
+    vi.spyOn(Date, 'now').mockReturnValue(1_790_000_000_000);
+    const children = [];
+    for (let i = 0; i < 8; i++)
+      children.push(await store.createTask({ projectId: project.id, title: `Child ${i}`, workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: `c${i}` }, parentTaskId: parent.id }));
+    vi.restoreAllMocks();
+    expect((await store.childTaskSummaries(parent.id)).map((summary) => summary.id)).toEqual(children.map((child) => child.id));
+  });
+
+  it('finds a merged result without loading the task event history', async () => {
+    const project = await store.createProject('Merge');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.appendEvent({ taskId: task.id, type: 'merge.result', ts: 1, payload: { merged: false } });
+    expect(await store.hasMergedTaskEvent(task.id)).toBe(false);
+    await store.appendEvent({ taskId: task.id, type: 'merge.result', ts: 2, payload: { merged: true } });
+    expect(await store.hasMergedTaskEvent(task.id)).toBe(true);
+  });
+
+  it('deduplicates GitHub PR observations and expires them after a month', async () => {
+    expect(await store.claimGithubPrObservation('digest', 1000)).toBe(true);
+    expect(await store.claimGithubPrObservation('digest', 1001)).toBe(false);
+    expect((await store.retentionSweep(1000 + 31 * 86400_000)).githubPrObservations).toBe(1);
+    expect(await store.claimGithubPrObservation('digest', 1000 + 31 * 86400_000)).toBe(true);
+  });
+
+  it('removes project admission reservations with the project', async () => {
+    const project = await store.createProject('Reservations');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.db.prepare(`INSERT INTO usage_admissions
+      (id, organizationId, projectId, taskId, kind, provider, fundingSource, state, createdAt)
+      VALUES (?, ?, ?, ?, 'agent', 'mock', 'byok', 'active', 1)`)
+      .run('reservation', project.organizationId, project.id, task.id);
+    await store.deleteProject(project.id);
+    expect(await store.db.prepare('SELECT id FROM usage_admissions WHERE projectId=?').all(project.id)).toEqual([]);
+  });
+
+  it('removes a task\'s resource checkpoint pointers with the task and the project', async () => {
+    const project = await store.createProject('Resource pointers');
+    const kept = await store.createTask({ projectId: project.id, title: 'Kept', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    const gone = await store.createTask({ projectId: project.id, title: 'Gone', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.kvSet(`resource-checkpoint:${kept.id}:attachment`, '{}');
+    await store.kvSet(`resource-checkpoint:${gone.id}:attachment`, '{}');
+    await store.deleteTask(gone.id);
+    expect(await store.kvGet(`resource-checkpoint:${gone.id}:attachment`)).toBeUndefined();
+    expect(await store.kvGet(`resource-checkpoint:${kept.id}:attachment`)).toBe('{}');
+    await store.deleteProject(project.id);
+    expect(await store.kvGet(`resource-checkpoint:${kept.id}:attachment`)).toBeUndefined();
+  });
+
+  it('exports personal data without holding a database write transaction', async () => {
+    vi.spyOn(store, 'getSettings').mockImplementation(async () => {
+      expect(store.db.inTransaction()).toBe(false);
+      return undefined;
+    });
+    await store.exportUserData('no-records');
+  });
+
+  it('looks up literal kv prefixes through the primary-key range', async () => {
+    await store.kvSet('case:A', 'one');
+    await store.kvSet('case:a', 'two');
+    await store.kvSet('case%literal', 'three');
+    const prepare = vi.spyOn(store.db, 'prepare');
+    expect(await store.kvEntries('case:A')).toEqual([{ key: 'case:A', value: 'one' }]);
+    expect(await store.kvEntries('case%')).toEqual([{ key: 'case%literal', value: 'three' }]);
+    expect(prepare.mock.calls.some(([sql]) => /FROM kv WHERE k(?: COLLATE "C")? >= \? AND k(?: COLLATE "C")? < \?/.test(sql))).toBe(true);
+  });
+
+  it.skipIf(name !== 'SQLite')('indexes event type with task id for inbox and approval scans', async () => {
+    const indexes = await store.db.prepare('PRAGMA index_list(events)').all() as Array<{ name: string }>;
+    expect(indexes.map((row) => row.name)).toContain('idx_events_type');
+  });
+
+  it('does not rescan completed row migrations on each boot', async () => {
+    const queries: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+    await (store as any).migrateData();
+    expect(queries.some((sql) => /SELECT id, config FROM projects|SELECT k, v FROM kv WHERE k LIKE 'vault:items/.test(sql))).toBe(false);
+  });
+
+  it.skipIf(name !== 'SQLite')('expires old events and audit entries while retaining recent history', async () => {
+    expect(((await store.db.prepare('PRAGMA synchronous').get()) as { synchronous: number }).synchronous).toBe(1);
+    const now = Date.UTC(2026, 8, 26);
+    const project = await store.createProject('Retention');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 91 * 86400_000, payload: { text: 'old' } });
+    await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 1 * 86400_000, payload: { text: 'new' } });
+    await store.appendAudit({ principalId: 'user:a', action: 'old', ts: now - 366 * 86400_000 });
+    await store.appendAudit({ principalId: 'user:a', action: 'new', ts: now - 1 * 86400_000 });
+    const swept = await store.retentionSweep(now);
+    expect(swept.events).toBe(1);
+    expect(swept.auditEntries).toBe(1);
+    expect((await store.eventsSince(task.id, 0)).map((event) => event.payload.text)).toEqual(['new']);
+    expect((await store.db.prepare('SELECT action FROM audit_log ORDER BY seq').all())).toEqual([{ action: 'new' }]);
+  });
+
+  it('retains old unresolved approval requests until their resolution is recorded', async () => {
+    const now = Date.UTC(2026, 8, 26);
+    const project = await store.createProject('Approvals');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.appendEvent({ taskId: task.id, type: 'permission.approval-requested',
+      ts: now - 91 * 86400_000, payload: { requestId: 'ask' } });
+    expect((await store.retentionSweep(now)).events).toBe(0);
+    await store.appendEvent({ taskId: task.id, type: 'permission.approval-resolved',
+      ts: now, payload: { requestId: 'ask' } });
+    expect((await store.retentionSweep(now)).events).toBe(1);
+  });
+
+  it('revokes project-scoped tokens through indexed project membership', async () => {
+    const project = await store.createProject('Tokens');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.putScopedToken('by-project', 'one', { principal: 'user:a', projectId: project.id }, Date.now() + 1000);
+    await store.putScopedToken('by-task', 'two', { principal: 'user:b', taskId: task.id }, Date.now() + 1000);
+    await store.putScopedToken('other', 'three', { principal: 'user:c', projectIds: ['unrelated'] }, Date.now() + 1000);
+    const queries: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+    expect(await store.revokeScopedTokens({ projectId: project.id })).toBe(2);
+    expect((await store.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE revokedAt IS NULL').all()))
+      .toEqual([{ tokenHash: 'other' }]);
+    expect(queries.some((sql) => sql.includes('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL'))).toBe(false);
+  });
+
+  it('deprovisions a member without reading every live token body', async () => {
+    const org = await store.createOrganization({ name: 'Tokens', ownerUserId: 'owner' });
+    await store.setOrganizationMembership(org.id, 'member', 'member');
+    await store.putScopedToken('member-token', 'one', { principal: 'user:member', organizationId: org.id }, Date.now() + 60_000);
+    await store.putScopedToken('owner-token', 'two', { principal: 'user:owner', organizationId: org.id }, Date.now() + 60_000);
+    const queries: string[] = [];
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+    await store.deprovisionOrganizationUser(org.id, 'member');
+    expect((await store.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE revokedAt IS NULL').all()))
+      .toEqual([{ tokenHash: 'owner-token' }]);
+    expect(queries.some((sql) => sql.includes('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL'))).toBe(false);
+  });
+
+  it.skipIf(name !== 'SQLite')('backfills indexed scopes on legacy durable tokens', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-token-scope-'));
+    const file = path.join(dir, 'store.db');
+    const legacy = new DatabaseSync(file);
+    legacy.exec(`CREATE TABLE scoped_tokens (tokenHash TEXT PRIMARY KEY, tokenId TEXT NOT NULL UNIQUE,
+      json TEXT NOT NULL, expiresAt INTEGER NOT NULL, revokedAt INTEGER)`);
+    legacy.prepare('INSERT INTO scoped_tokens VALUES (?,?,?,?,NULL)')
+      .run('old-token', 'old-id', JSON.stringify({ principal: 'user:old', projectIds: ['project-old'] }), Date.now() + 60_000);
+    legacy.close();
+    const migrated = await Store.create(file);
+    try {
+      expect(await migrated.revokeScopedTokens({ projectId: 'project-old' })).toBe(1);
+    } finally { await migrated.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('deletes a task\'s kv rows through the primary-key range (PS-8)', async () => {
+    const project = (await store.createProject('Prefix deletes'));
+    const task = (await store.createTask({ projectId: project.id, title: 'Doomed', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'x' } }));
+    const kept = (await store.createTask({ projectId: project.id, title: 'Kept', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'x' } }));
+    for (const id of [task.id, kept.id]) {
+      await store.kvSet(`turnsession:${id}#1`, 'x');
+      await store.kvSet(`conversation-share-index:${id}:s`, `share-${id}`);
+      await store.kvSet(`conversation-share:share-${id}`, 'y');
+    }
+    const prepare = vi.spyOn(store.db, 'prepare');
+    await store.deleteTask(task.id);
+    await store.clearTurnCheckpoints(kept.id);
+    const sql = prepare.mock.calls.map(([statement]) => String(statement));
+    prepare.mockRestore();
+    expect(sql.filter((statement) => /FROM kv WHERE substr\(k/.test(statement))).toEqual([]);
+    expect(sql.some((statement) => /FROM kv WHERE k(?: COLLATE "C")? >= \? AND k(?: COLLATE "C")? < \?/.test(statement))).toBe(true);
+    expect(await store.kvGet(`turnsession:${task.id}#1`)).toBeUndefined();
+    expect(await store.kvGet(`conversation-share:share-${task.id}`)).toBeUndefined();
+    expect(await store.kvGet(`turnsession:${kept.id}#1`)).toBeUndefined();
+    expect(await store.kvGet(`conversation-share:share-${kept.id}`)).toBe('y');
+  });
+
+  it.skipIf(name !== 'SQLite')('repairs unclassified usage at each boot through an index of only those rows (PS-5)', async () => {
+    const insert = (id: string, costMicros: number) => store.db.prepare(`INSERT INTO usage_events
+      (id, organizationId, provider, kind, quantity, unit, costMicros, startedAt, endedAt, costClassification)
+      VALUES (?, 'org_personal', 'anthropic', 'model.tokens', 1, 'token', ?, 0, 1, 'none')`).run(id, costMicros);
+    for (let i = 0; i < 50; i++) await insert(`classified-${i}`, 0);
+    // A rollback to a release without the column writes unclassified rows again.
+    await insert('unclassified', 5);
+    const plan = await store.db.prepare(`EXPLAIN QUERY PLAN UPDATE usage_events SET costClassification='incurred'
+      WHERE costMicros>0 AND costClassification='none'`).all() as Array<{ detail: string }>;
+    expect(plan.map((row) => row.detail).join(' ')).toContain('idx_usage_unclassified');
+    await (store as any).migrate();
+    expect(await store.db.prepare("SELECT costClassification FROM usage_events WHERE id='unclassified'").get()).toEqual({ costClassification: 'incurred' });
+    expect(await store.db.prepare("SELECT count(*) AS n FROM usage_events WHERE costClassification='none'").get()).toEqual({ n: 50 });
   });
 
   it('patches task fields without replacing unrelated metadata or merging revoked grants', async () => {
@@ -23,7 +243,7 @@ describe('Store', () => {
       base: 'main', _authorization: { capabilities: ['new'] }, nullable: null });
   });
 
-  it('defaults and migrates hosted projects to PR delivery while rejecting new local-only writes', async () => {
+  it.skipIf(name !== 'SQLite')('defaults and migrates hosted projects to PR delivery while rejecting new local-only writes', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-hosted-remote-'));
     const dbPath = path.join(dir, 'karmax.db');
     const previous = process.env.KARMAX_DEPLOYMENT;
@@ -52,7 +272,7 @@ describe('Store', () => {
     }
   });
 
-  it('removes legacy E2B lease estimates while preserving reconciled executions', async () => {
+  it.skipIf(name !== 'SQLite')('removes legacy E2B lease estimates while preserving reconciled executions', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-e2b-usage-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = (await Store.create(dbPath));
@@ -62,6 +282,7 @@ describe('Store', () => {
     (await legacy.recordUsage({ id: 'provider-execution', organizationId: 'org_personal', provider: 'e2b',
       kind: 'world.active', quantity: 300, unit: 'second', costMicros: 9_075,
       startedAt: 1, endedAt: 2, metadata: { source: 'provider-lifecycle', executionId: 'execution-1' } }));
+    (await legacy.kvDelete('migration:data-2026-09-26')); // Simulate a pre-migration database.
     (await legacy.close());
 
     const migrated = (await Store.create(dbPath));
@@ -87,7 +308,7 @@ describe('Store', () => {
     expect((await store.usageSummary('org_personal', boundary, boundary + 10_000)).costMicros).toBe(50);
   });
 
-  it('migrates away legacy turn caps on role-default profiles (task 1a)', async () => {
+  it.skipIf(name !== 'SQLite')('preserves configured turn caps when migrating role-default profiles', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     // an older build persisted a role default with maxTurns
@@ -95,16 +316,17 @@ describe('Store', () => {
     (await s1.upsertProfile({ id: 'do-default', name: 'Do', role: 'do', provider: 'claude',
       capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'], maxTurns: 24 } as any));
     (await s1.upsertProfile({ id: 'custom-big', name: 'Big', role: 'do', provider: 'claude', capabilities: [], maxTurns: 99 } as any));
+    (await s1.kvDelete('migration:data-2026-09-26'));
     // reopening runs migrateData
     const s2 = (await Store.create(dbPath));
-    expect((await s2.getProfile('do-default'))!.maxTurns).toBeUndefined(); // legacy cap stripped
+    expect((await s2.getProfile('do-default'))!.maxTurns).toBe(24); // explicit cap preserved
     expect((await s2.getProfile('do-default'))!.capabilities).toEqual(expect.arrayContaining(['task:git:publish', 'task:git:import']));
     expect((await s2.getProfile('do-default'))!.capabilities).not.toContain('task:world:read');
     expect((await s2.getProfile('custom-big'))!.maxTurns).toBe(99); // non-default profiles untouched
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('backfills folder-as-domain metadata on legacy pass-connector vault items', async () => {
+  it.skipIf(name !== 'SQLite')('backfills folder-as-domain metadata on legacy pass-connector vault items', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-domain-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s1 = (await Store.create(dbPath));
@@ -124,6 +346,7 @@ describe('Store', () => {
       item({ id: 'vi_d', label: 'Conduit', domains: ['demo.realworld.show'],
         provenance: { source: 'task:task_x', taskId: 'task_x', at: 1 } }),
     ])));
+    (await s1.kvDelete('migration:data-2026-09-26'));
     // reopening runs migrateData
     const s2 = (await Store.create(dbPath));
     const byId: Record<string, any> = Object.fromEntries(
@@ -138,7 +361,7 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('migrates expanded legacy project infrastructure defaults back to organization inheritance', async () => {
+  it.skipIf(name !== 'SQLite')('migrates expanded legacy project infrastructure defaults back to organization inheritance', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-policy-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = {
@@ -152,6 +375,7 @@ describe('Store', () => {
     const intentional = (await s1.createProject('Intentional restriction', {
       ...legacy, network: { unrestricted: false, allowDomains: ['internal.example'], allowCidrs: [] },
     } as any));
+    (await s1.kvDelete('migration:data-2026-09-26'));
     (await s1.close());
 
     const s2 = (await Store.create(dbPath));
@@ -166,7 +390,7 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('adds tag descriptions to an existing tag catalogue', async () => {
+  it.skipIf(name !== 'SQLite')('adds tag descriptions to an existing tag catalogue', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-tag-description-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = (await Store.create(dbPath));
@@ -184,7 +408,7 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('backfills kind-less tags to topic on an existing catalogue', async () => {
+  it.skipIf(name !== 'SQLite')('backfills kind-less tags to topic on an existing catalogue', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-tag-kind-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = (await Store.create(dbPath));
@@ -194,6 +418,7 @@ describe('Store', () => {
     const flagged = (await legacy.createTag({ projectId: project.id, name: 'no-merge', kind: 'flag' }));
     // An older build (and `tag_task` before this change) left `kind` NULL.
     (await legacy.db.prepare('UPDATE tags SET kind = NULL WHERE id = ?').run(bare.id));
+    (await legacy.kvDelete('migration:data-2026-09-26'));
     (await legacy.close());
 
     const migrated = (await Store.create(dbPath));
@@ -214,6 +439,25 @@ describe('Store', () => {
     expect((await store.createTag({ projectId: p.id, name: 'no-merge', kind: 'flag' })).kind).toBe('flag');
     // Reusing an existing tag without naming a kind must not reclassify it.
     expect((await store.createTag({ projectId: p.id, name: 'bug' })).kind).toBe('type');
+  });
+
+  it('keeps distinct non-ASCII project names routable (UI-15)', async () => {
+    const first = await store.createProject('日本語');
+    const second = await store.createProject('中文');
+    expect(first.name).toBe('日本語');
+    expect(second.name).toBe('中文');
+  });
+
+  it('rejects invalid tag kinds on creation and updates (UI-1)', async () => {
+    const project = await store.createProject('Tags');
+    const tag = await store.createTag({ projectId: project.id, name: 'valid', kind: 'type' });
+    for (const kind of ['\" onclick=\"alert(1)', 'unknown', '', 123, {}]) {
+      await expect(store.createTag({ projectId: project.id, name: 'parent/child', kind: kind as any })).rejects.toThrow(/tag kind/i);
+      await expect(store.updateTag(tag.id, { kind: kind as any })).rejects.toThrow(/tag kind/i);
+    }
+    expect((await store.listTags(project.id)).length).toBe(1);
+    expect((await store.getTag(tag.id))?.kind).toBe('type');
+    expect((await store.updateTag(tag.id, { kind: null }))?.kind).toBeUndefined();
   });
 
   it('applies a path tag kind to its ancestors, not just the leaf', async () => {
@@ -336,7 +580,7 @@ describe('Store', () => {
     await expect((async () => (await store.projectFolderProjects(sibling.id, 'Work/Customers')))()).rejects.toThrow(/does not belong/i);
   });
 
-  it('keeps creation order for projects that predate the sidebar ordering column', async () => {
+  it.skipIf(name !== 'SQLite')('keeps creation order for projects that predate the sidebar ordering column', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-ord-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const legacy = (await Store.create(dbPath));
@@ -385,7 +629,7 @@ describe('Store', () => {
   });
 
   it('keeps organization names unique across organizations and users', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     store.connectUserNames(() => [{ id: 'alice', name: 'Alice' }]);
     const acme = (await store.createOrganization({ name: 'Acme' }));
 
@@ -395,7 +639,7 @@ describe('Store', () => {
     expect((await store.createOrganization({ name: 'Alice', kind: 'personal', ownerUserId: 'alice' })).name).toBe('Alice');
   });
 
-  it('disambiguates organization names that predate the unique-name index', async () => {
+  it.skipIf(name !== 'SQLite')('disambiguates organization names that predate the unique-name index', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-org-name-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     try {
@@ -470,7 +714,7 @@ describe('Store', () => {
     expect((await store.getTask(second.id))!.params.confirm).toEqual({ mode: 'human' }); // mirrored onto every attempt
   });
 
-  it('does not turn persisted attempts into top-level tasks on restart', async () => {
+  it.skipIf(name !== 'SQLite')('does not turn persisted attempts into top-level tasks on restart', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-attempt-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s1 = (await Store.create(dbPath));
@@ -561,7 +805,7 @@ describe('Store', () => {
     expect((await store.getTaskByNum(p.id, 1))!.id).toBe(first.id);
   });
 
-  it('backfills per-project task numbers for rows created before the column existed', async () => {
+  it.skipIf(name !== 'SQLite')('backfills per-project task numbers for rows created before the column existed', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-num-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s1 = (await Store.create(dbPath));
@@ -605,7 +849,7 @@ describe('Store', () => {
     expect((await store.getTask(t.id))!.notes).toBeUndefined(); // empty clears
   });
 
-  it('adds the notes column to a pre-existing database on reopen', async () => {
+  it.skipIf(name !== 'SQLite')('adds the notes column to a pre-existing database on reopen', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-notes-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s1 = (await Store.create(dbPath));
@@ -802,7 +1046,7 @@ describe('Store', () => {
     expect((await store.listProfiles())).toHaveLength(1);
   });
 
-  it('opens with a busy timeout so lock collisions wait instead of failing', async () => {
+  it.skipIf(name !== 'SQLite')('opens with a busy timeout so lock collisions wait instead of failing', async () => {
     expect(((await store.db.prepare('PRAGMA busy_timeout').get()) as any).timeout).toBe(5000);
   });
 
@@ -940,12 +1184,13 @@ describe('Store', () => {
     // used to make deleteProject a hard error for a large project.
     const ids = Array.from({ length: 40_000 }, (_, i) => `t_${i}`);
     (await store.db.prepare("INSERT INTO task_tags (taskId, tagId) VALUES ('t_5', 'tag_x')").run());
-    expect(() => deleteRows(store.db as any, 'task_tags', 'taskId', ids)).not.toThrow();
+    (await store.db.prepare("INSERT INTO task_tags (taskId, tagId) VALUES ('t_39999', 'tag_x')").run());
+    await expect(deleteRows(store.db as any, 'task_tags', 'taskId', ids)).resolves.toBeUndefined();
     expect(Number(((await store.db.prepare('SELECT COUNT(*) n FROM task_tags').get()) as any).n)).toBe(0);
     expect(project.id).toBeTruthy();
   });
 
-  it('a write waits out another process holding the write lock (no "database is locked")', async () => {
+  it.skipIf(name !== 'SQLite')('a write waits out another process holding the write lock (no "database is locked")', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-lock-'));
     const dbPath = path.join(dir, 'karmax.db');
     const s = (await Store.create(dbPath));
@@ -971,4 +1216,23 @@ describe('Store', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+// Continue-as-new hands a task's run pin to the next run only while no
+// replacement has claimed it (WF-3, WF-4).
+it('swaps a task run pin only from its current value', async () => {
+  const store = await Store.create(':memory:');
+  try {
+    const project = await store.createProject('Pins');
+    const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'p', _workflowRunId: 'run-1' } });
+    expect(await store.swapTaskRun(task.id, 'run-0', '')).toBe(false);
+    expect(await store.swapTaskRun(task.id, 'run-1', '')).toBe(true);
+    expect(await store.swapTaskRun(task.id, '', 'run-2')).toBe(true);
+    expect(await store.swapTaskRun(task.id, '', 'run-3')).toBe(false);
+    expect((await store.taskMetadata(task.id))?.params).toMatchObject({ prompt: 'p', _workflowRunId: 'run-2' });
+    const unpinned = await store.createTask({ projectId: project.id, title: 'U', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'p' } });
+    expect(await store.swapTaskRun(unpinned.id, '', 'run-9')).toBe(true);
+  } finally { await store.close(); }
 });

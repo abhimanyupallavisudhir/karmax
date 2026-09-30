@@ -4,8 +4,6 @@ import path from 'node:path';
 import fs from 'node:fs';
 import WebSocket from 'ws';
 import { bootHarness, Harness } from './helpers/harness.js';
-import { TASK_QUEUE } from '../src/temporal/config.js';
-import { newId } from '../src/util/id.js';
 import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, isFullyAuthed, capturedToken, tokenToInject } from '../src/autonomy/config-homes.js';
 import { LoginManager, defaultLoginCommand, parseLoginPrompt } from '../src/autonomy/login.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
@@ -55,6 +53,8 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(chrome.command).toBe(process.execPath);
     expect(chrome.args[0]).toMatch(/chrome-cdp-launcher\.mjs$/);
     expect(chrome.env).toMatchObject({ KARMAX_CDP_MCP_VERSION: '1.6.0' });
+    // Fills find the task's own browser by its agent's custody marker (AU-14).
+    expect(chrome.forwardEnv).toEqual(['KARMAX_CUSTODY_CHAIN']);
     expect(servers['karmax']).toEqual({ command: 'node', args: ['mcp.js'] });
     expect(mcpServerMap({ browser: 'none' })).toEqual({});
   });
@@ -107,6 +107,7 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(toml.match(/^\[mcp_servers\.karmax\.env]$/gm)).toHaveLength(1);
     expect(toml).not.toContain('[mcp_servers.playwright]');
     expect(toml).toContain('chrome-cdp-launcher.mjs'); // chrome-devtools runs through the CDP-port launcher
+    expect(toml).toContain('env_vars = ["KARMAX_CUSTODY_CHAIN"]');
     expect(toml).toContain('model = "custom"');
     expect(toml).toContain('[mcp_servers.keep]');
     fs.rmSync(dir, { recursive: true, force: true });
@@ -285,6 +286,24 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('captures a device URL still in the pipe when the login process exits', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-late-'));
+    const homes = new ConfigHomeManager(dir);
+    // 'exit' can precede the child's last output (a busy event loop, or a helper
+    // that still holds the pipe); only 'close' means the output is complete.
+    const login = new LoginManager(homes, () => ({
+      cmd: 'bash',
+      args: ['-c', '(sleep 0.3; echo "Visit https://example.com/late?code=LATE") & exit 0'],
+      env: {} as Record<string, string>,
+    }));
+    try {
+      const r = await login.connect('claude', 'work', { urlTimeoutMs: 4000 });
+      expect(r).toMatchObject({ status: 'awaiting_oauth', loginUrl: 'https://example.com/late?code=LATE' });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('uses OpenCode auth selectors and preserves a device verification code', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-oc-'));
     const homes = new ConfigHomeManager(dir);
@@ -360,13 +379,13 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
       args: [],
       env: { ...process.env } as Record<string, string>,
     }));
-    const started = Date.now();
-    const result = await login.connect('claude', 'work', { urlTimeoutMs: 10_000 });
+    // A day-long URL wait cannot elapse inside the test, so the answer can only
+    // come from the spawn failure itself; waiting for the URL would time out.
+    const result = await login.connect('claude', 'work', { urlTimeoutMs: 24 * 60 * 60_000 });
     expect(result).toEqual(expect.objectContaining({
       status: 'failed',
       detail: expect.stringMatching(/^could not launch karmax-missing-login-.*ENOENT/),
     }));
-    expect(Date.now() - started).toBeLessThan(2_000);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -531,6 +550,19 @@ describe('remote access plan (SPEC §12)', () => {
       canDisable: false,
     });
     expect((await controller.status()).fallbackCommands).toBeUndefined();
+  });
+  it.each([
+    'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:41730',
+    JSON.stringify({ Web: { 'host.example.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:41730' } } } } }),
+  ])('does not disable a route whose port merely starts with the gateway port', async serve => {
+    const calls: string[][] = [];
+    const controller = new RemoteAccessController({ port: () => 4173, run: async args => {
+      calls.push(args);
+      return { stdout: args[0] === 'status'
+        ? JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }) : serve, stderr: '' };
+    } });
+    expect(await controller.disable()).toMatchObject({ state: 'conflict', canDisable: false });
+    expect(calls).not.toContainEqual(['serve', 'off']);
   });
   it('turns Linux Serve permission errors into a one-time setup action', async () => {
     const denied = Object.assign(new Error('command failed'), {
@@ -807,139 +839,6 @@ describe('remote access plan (SPEC §12)', () => {
     releaseUp();
     await expect.poll(async () => (await controller.setupStatus()).state).toBe('ready');
     expect(calls.some((args) => args[0] === 'down')).toBe(false);
-  });
-});
-
-describe('budget coordinator (virtual-card lease, SPEC §7.6)', () => {
-  let h: Harness;
-  beforeAll(async () => {
-    h = await bootHarness('mock');
-  }, 60_000);
-  afterAll(async () => {
-    await h?.stop();
-  });
-
-  it('grants under threshold, holds over threshold for approval, declines over cap', async () => {
-    const grantee = newId('task');
-    const ping = await h.client.workflow.start('pingWorkflow', { taskQueue: TASK_QUEUE, workflowId: grantee, args: ['x'] });
-    const coord = await h.client.workflow.start('budgetCoordinator', {
-      taskQueue: TASK_QUEUE,
-      workflowId: 'budget-coordinator-test',
-      args: [{ state: { scopes: {}, defaultCap: 1000, threshold: 300, pending: [], processed: 0 } }],
-    });
-    const budget = () => coord.query('budget') as Promise<any>;
-
-    await coord.signal('requestSpend', { reqId: 'r1', taskId: grantee, scope: 'profA', amount: 100 });
-    await expect.poll(async () => (await budget()).scopes.profA?.spent, { timeout: 8000 }).toBe(100);
-
-    // above threshold → held as pending, not spent
-    await coord.signal('requestSpend', { reqId: 'r2', taskId: grantee, scope: 'profA', amount: 500 });
-    await expect.poll(async () => (await budget()).pending.length, { timeout: 8000 }).toBe(1);
-    expect((await budget()).scopes.profA.spent).toBe(100);
-
-    // approve at the review gate → now spent
-    await coord.signal('approveSpend', { reqId: 'r2' });
-    await expect.poll(async () => (await budget()).scopes.profA.spent, { timeout: 8000 }).toBe(600);
-
-    // over cap → declined (spent unchanged)
-    await coord.signal('requestSpend', { reqId: 'r3', taskId: grantee, scope: 'profA', amount: 9999 });
-    await new Promise((r) => setTimeout(r, 800));
-    expect((await budget()).scopes.profA.spent).toBe(600);
-
-    await ping.signal('finish');
-    await ping.result();
-    await coord.terminate('done');
-  });
-
-  it('re-checks the hard cap at approval time so stacked approvals cannot overspend', async () => {
-    const grantee = newId('task');
-    const ping = await h.client.workflow.start('pingWorkflow', { taskQueue: TASK_QUEUE, workflowId: grantee, args: ['x'] });
-    const coord = await h.client.workflow.start('budgetCoordinator', {
-      taskQueue: TASK_QUEUE,
-      workflowId: newId('budget-coord'),
-      args: [{ state: { scopes: {}, defaultCap: 1000, threshold: 300, pending: [], processed: 0 } }],
-    });
-    const budget = () => coord.query('budget') as Promise<any>;
-
-    // Two over-threshold requests both pass the request-time cap check (spent is
-    // still 0 when each arrives), so both are parked pending.
-    await coord.signal('requestSpend', { reqId: 'a', taskId: grantee, scope: 'profA', amount: 600 });
-    await coord.signal('requestSpend', { reqId: 'b', taskId: grantee, scope: 'profA', amount: 600 });
-    await expect.poll(async () => (await budget()).pending.length, { timeout: 8000 }).toBe(2);
-
-    // Approving both would total 1200 > 1000. The first commits; the second must
-    // be declined at approval rather than pushing spent past the cap.
-    await coord.signal('approveSpend', { reqId: 'a' });
-    await expect.poll(async () => (await budget()).scopes.profA.spent, { timeout: 8000 }).toBe(600);
-    await coord.signal('approveSpend', { reqId: 'b' });
-    await new Promise((r) => setTimeout(r, 800));
-    expect((await budget()).scopes.profA.spent).toBe(600); // NOT 1200
-
-    await ping.signal('finish');
-    await ping.result();
-    await coord.terminate('done');
-  });
-
-  it('refuses a redelivered requestSpend whose reqId was already settled (no double spend)', async () => {
-    const grantee = newId('task');
-    const ping = await h.client.workflow.start('pingWorkflow', { taskQueue: TASK_QUEUE, workflowId: grantee, args: ['x'] });
-    const coord = await h.client.workflow.start('budgetCoordinator', {
-      taskQueue: TASK_QUEUE,
-      workflowId: newId('budget-coord'),
-      args: [{ state: { scopes: {}, defaultCap: 5000, threshold: 300, pending: [], processed: 0 } }],
-    });
-    const budget = () => coord.query('budget') as Promise<any>;
-
-    // Charged once, drained out of the queue.
-    await coord.signal('requestSpend', { reqId: 'dup', taskId: grantee, scope: 'profA', amount: 100 });
-    await expect.poll(async () => (await budget()).scopes.profA?.spent, { timeout: 8000 }).toBe(100);
-
-    // Temporal delivers signals AT LEAST once. The same request arriving again
-    // after it was drained must not be charged a second time — that is precisely
-    // the double spend the reqId dedupe exists to prevent.
-    await coord.signal('requestSpend', { reqId: 'dup', taskId: grantee, scope: 'profA', amount: 100 });
-    await new Promise((r) => setTimeout(r, 1200));
-    expect((await budget()).scopes.profA.spent).toBe(100); // NOT 200
-
-    // The same holds for a request settled at the review gate: once approved and
-    // charged, a redelivery must not re-open it as pending nor charge again.
-    await coord.signal('requestSpend', { reqId: 'gate', taskId: grantee, scope: 'profA', amount: 500 });
-    await expect.poll(async () => (await budget()).pending.length, { timeout: 8000 }).toBe(1);
-    await coord.signal('approveSpend', { reqId: 'gate' });
-    await expect.poll(async () => (await budget()).scopes.profA.spent, { timeout: 8000 }).toBe(600);
-    await coord.signal('requestSpend', { reqId: 'gate', taskId: grantee, scope: 'profA', amount: 500 });
-    await new Promise((r) => setTimeout(r, 1200));
-    const view = await budget();
-    expect(view.scopes.profA.spent).toBe(600); // NOT 1100
-    expect(view.pending.length).toBe(0);
-
-    await ping.signal('finish');
-    await ping.result();
-    await coord.terminate('done');
-  });
-
-  it('carries settled reqIds across a rotation, so dedupe survives continue-as-new', async () => {
-    const grantee = newId('task');
-    const ping = await h.client.workflow.start('pingWorkflow', { taskQueue: TASK_QUEUE, workflowId: grantee, args: ['x'] });
-    // The state a rotating coordinator hands to its successor. If `settled` is not
-    // part of that carried state the dedupe evaporates exactly when the singleton
-    // continue-as-news, and the redelivery lands on a fresh, forgetful instance.
-    const coord = await h.client.workflow.start('budgetCoordinator', {
-      taskQueue: TASK_QUEUE,
-      workflowId: newId('budget-coord'),
-      args: [{ state: { scopes: { profA: { cap: 5000, spent: 100 } }, defaultCap: 5000, threshold: 300,
-        pending: [], processed: 0, settled: ['carried'] } }],
-    });
-    const budget = () => coord.query('budget') as Promise<any>;
-    await expect.poll(async () => (await budget()).scopes.profA?.spent, { timeout: 8000 }).toBe(100);
-
-    await coord.signal('requestSpend', { reqId: 'carried', taskId: grantee, scope: 'profA', amount: 100 });
-    await new Promise((r) => setTimeout(r, 1200));
-    expect((await budget()).scopes.profA.spent).toBe(100); // NOT 200
-
-    await ping.signal('finish');
-    await ping.result();
-    await coord.terminate('done');
   });
 });
 

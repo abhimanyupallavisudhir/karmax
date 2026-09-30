@@ -1,11 +1,59 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
+import { storeBackends } from './helpers/store-backends.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher } from '../src/collaboration/delivery.js';
 
-describe('organization and collaboration domain', () => {
+describe.each(storeBackends)('organization and collaboration domain ($name)', ({ open }) => {
+  it('delivers task headers without hydrating full conversations', async () => {
+    const store = await open();
+    try {
+      const org = await store.createOrganization({ name: 'Delivery', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      const task = await store.createTask({ projectId: project.id, title: 'Approval', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.appendEvent({ taskId: task.id, type: 'credential.approval-requested', ts: Date.now(), payload: {} });
+      const getTask = vi.spyOn(store, 'getTask');
+      const delivered: string[] = [];
+      const dispatcher = new DeliveryDispatcher(store, { browser: { deliver: async ({ task }) => {
+        if (task) delivered.push(task.title);
+      } } });
+      await dispatcher.drain();
+      expect(delivered).toEqual(['Approval']);
+      expect(getTask).not.toHaveBeenCalled();
+    } finally { await store.close(); }
+  });
+
+  it('does not treat a longer team route as a reference to its prefix', async () => {
+    const store = await open();
+    try {
+      const org = await store.createOrganization({ name: 'Teams', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      const dev = await store.createTeam({ organizationId: org.id, name: 'Dev' });
+      const developers = await store.createTeam({ organizationId: org.id, name: 'Developers' });
+      await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture', responder: { kind: 'human', audience: ['@team:developers'] } } });
+      await store.deleteTeam(dev.id);
+      expect(await store.getTeam(dev.id)).toBeUndefined();
+      await expect(store.deleteTeam(developers.id)).rejects.toThrow(/still used/);
+    } finally { await store.close(); }
+  });
+
+  it('delivers simultaneous authorization asks even when request hashes collide', async () => {
+    const store = await open();
+    try {
+      const org = await store.createOrganization({ name: 'Approvals', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      for (const [avatarId, requestId] of [['avatar-a', 'Aa'], ['avatar-b', 'BB']] as const)
+        await store.addAuthorizationInbox(org.id, ['owner'],
+          { kind: 'avatar-authorization', avatarId, projectId: project.id, requestId }, 1000);
+      const inbox = await store.listInbox('owner', org.id);
+      expect(inbox.map((row) => row.subject?.kind === 'avatar-authorization' ? row.subject.requestId : undefined).sort()).toEqual(['Aa', 'BB']);
+    } finally { await store.close(); }
+  });
+
   it('routes email by urgency for task and resource asks, retaining legacy defaults', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const org = (await store.createOrganization({ name: 'Email', ownerUserId: 'owner' }));
     const project = (await store.createProject('App', {}, org.id));
     (await store.setDeliveryPreferences({ userId: 'owner', organizationId: org.id,
@@ -32,7 +80,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('migrates installation records into a personal organization', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const personal = (await store.getOrganization('org_personal'));
     expect(personal).toMatchObject({ slug: 'personal', kind: 'personal' });
     const project = (await store.createProject('Existing shape'));
@@ -40,7 +88,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('migrates generated personal-workspace labels to registered user names atomically', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const users = [
       { id: 'alice', name: 'Alice Example' },
       { id: 'bob', name: 'Bob' },
@@ -59,7 +107,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('rolls back all personal-workspace renames when the new namespace has a collision', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     (await store.claimPersonalOrganization('alice'));
     (await store.renameOrganization('org_personal', "Alice's workspace"));
     (await store.createOrganization({ name: 'Alice' }));
@@ -70,7 +118,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('migrates legacy user-organization name collisions without changing organization identity', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const user = { id: 'alice', name: 'alice@example.com' };
     const organization = (await store.createOrganization({ name: user.name, ownerUserId: user.id }));
     const project = (await store.createProject('Legacy project', {}, organization.id));
@@ -89,7 +137,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('keeps a per-user default organization initialized to the owned personal workspace', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const personal = (await store.createOrganization({ name: "Alice's workspace", kind: 'personal', ownerUserId: 'alice' }));
     const team = (await store.createOrganization({ name: 'Newest team', ownerUserId: 'team-owner' }));
     (await store.setOrganizationMembership(team.id, 'alice', 'member'));
@@ -105,7 +153,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('keeps membership, teams, repositories, and project access inside one organization', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const acme = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
     const other = (await store.createOrganization({ name: 'Other', ownerUserId: 'outsider' }));
     (await store.setOrganizationMembership(acme.id, 'developer', 'member'));
@@ -146,7 +194,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('keeps self-hosted repository sources at project scope instead of per workflow', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const organization = (await store.createOrganization({ name: 'Local', ownerUserId: 'owner' }));
     const project = (await store.createProject('App', {}, organization.id));
     (await store.setSettings(project.id, 'software-dev', { repos: ['/old'], remote: 'none' }));
@@ -161,7 +209,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('stores immutable responsibility, auto-subscribes participants, and resolves a per-user inbox', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const organization = (await store.createOrganization({ name: 'Team', ownerUserId: 'owner' }));
     (await store.setOrganizationMembership(organization.id, 'developer', 'member'));
     (await store.setOrganizationMembership(organization.id, 'reviewer', 'member'));
@@ -203,7 +251,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('stores only an invitation hash and enforces email, expiry, and single use', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const organization = (await store.createOrganization({ name: 'Invite test', ownerUserId: 'owner' }));
     const project = (await store.createProject('App', {}, organization.id));
     const { token } = (await store.createOrganizationInvitation({ organizationId: organization.id,
@@ -220,7 +268,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('binds GitHub installation state to an organization member and consumes it once', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const organization = (await store.createOrganization({ name: 'GitHub', ownerUserId: 'owner' }));
     const state = (await store.createGithubInstallState(organization.id, 'owner'));
     const row = (await store.db.prepare('SELECT tokenHash FROM github_install_states').get()) as any;
@@ -242,7 +290,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('enforces explicit all/quorum confirmation policies idempotently', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const organization = (await store.createOrganization({ name: 'Review', ownerUserId: 'owner' }));
     for (const userId of ['a', 'b', 'outsider']) (await store.setOrganizationMembership(organization.id, userId, 'member'));
     const project = (await store.createProject('Review', {}, organization.id));
@@ -258,7 +306,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('routes each human workflow gate to its declared people', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const organization = (await store.createOrganization({ name: 'Routing', ownerUserId: 'owner' }));
     for (const userId of ['developer', 'designer', 'outsider'])
       (await store.setOrganizationMembership(organization.id, userId, 'member'));
@@ -302,7 +350,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('exports a complete redacted tenant and deletes it atomically', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const organization = (await store.createOrganization({ name: 'Delete me', ownerUserId: 'owner' }));
     const project = (await store.createProject('Product', {}, organization.id));
     const task = (await store.createTask({ projectId: project.id, title: 'Private task', workflow: 'just-do',
@@ -347,7 +395,7 @@ describe('organization and collaboration domain', () => {
   });
 
   it('deletes every project-scoped durable record and revokes its credentials', async () => {
-    const store = (await Store.create(':memory:'));
+    const store = (await open());
     const organization = (await store.createOrganization({ name: 'Lifecycle', ownerUserId: 'owner' }));
     const project = (await store.createProject('Disposable', { worldProvider: 'e2b' }, organization.id));
     const task = (await store.createTask({ projectId: project.id, title: 'Delete all of me', workflow: 'just-do',

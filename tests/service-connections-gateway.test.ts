@@ -54,7 +54,7 @@ describe('connection gateway flow', () => {
     const gateway = (await Gateway.create({ store, tokens, api, client, worlds, broker, serviceConnections: service,
       bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(),
       taskQueue: 'test', staticDir: home, agentInfo: { provider: 'mock', reason: 'test' },
-      identity: { connectOrganizationNames: () => {}, listUsers: () => [], session: async (headers: Headers) => {
+      identity: { sessionActive: async (id: string, userId: string) => id === userId, connectOrganizationNames: () => {}, listUsers: () => [], session: async (headers: Headers) => {
         const user = headers.get('cookie')?.split('=')[1];
         return user ? { user: { id: user, name: user, email: `${user}@test.invalid` }, session: { id: user } } : undefined;
       } } as any,
@@ -114,18 +114,18 @@ describe('connection gateway flow', () => {
     for (const secret of ['exact-account', 'private-session', 'secret-api-key', '/link/private']) expect(exposed).not.toContain(secret);
   });
   it('pushes settings to existing sockets and hides timing events while off', async () => {
-    // Rows the previous test recorded while timing was on may legitimately reach
-    // this socket; only events recorded while timing is off must stay hidden.
+    // Events recorded while timing is on reach a live socket; only events
+    // recorded while it is off must stay hidden. The "on" event is recorded once
+    // the socket is live: one recorded before it connects may or may not be
+    // replayed, and asserting it was is what made this test flaky.
     const ws = new WebSocket(base.replace('http:', 'ws:') + '/ws', {headers:{cookie:'test-user=alice'}});
     const messages: any[] = [];
     ws.on('message',data=>messages.push(JSON.parse(String(data))));
     const timing = (name: string) => messages.some(e=>e.type==='timing' && e.payload?.name===name);
     try {
       await vi.waitFor(()=>expect(messages.some(e=>e.type==='timing.setting' && e.enabled===true)).toBe(true));
-      // The socket subscribes to the fan-out as it sends that setting. A row recorded
-      // earlier could be drained before it subscribed, so record this one now.
       (await store.appendEvent({taskId,type:'timing',ts:Date.now(),payload:{name:'recorded-while-on'}}));
-      await vi.waitFor(()=>expect(timing('recorded-while-on')).toBe(true));
+      await vi.waitFor(()=>expect(timing('recorded-while-on')).toBe(true), {timeout:3000});
       (await store.setSettings('global','timing',{enabled:false}));
       await vi.waitFor(()=>expect(messages.some(e=>e.type==='timing.setting' && e.enabled===false)).toBe(true), {timeout:3000});
       (await store.appendEvent({taskId,type:'timing',ts:Date.now(),payload:{name:'hidden'}}));

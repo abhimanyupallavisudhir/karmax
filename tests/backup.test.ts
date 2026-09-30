@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/store/db.js';
-import { createBackup, restoreBackup } from '../src/ops/backup.js';
+import { createBackup, restoreBackup, verifyBackup, recordRestores, signChecksums, verifyDeploymentBackup } from '../src/ops/backup.js';
+import { localSigningFingerprint } from '../src/ops/backup-signing.js';
+import crypto from 'node:crypto';
 import { Vault } from '../src/autonomy/vault.js';
 
 const roots: string[] = [];
@@ -27,18 +30,20 @@ describe('control-plane backup', () => {
         await vault.put(handle, secret);
       } finally { await store.close(); }
 
-      const { directory } = await createBackup({ home: original, destination: path.join(root, 'snapshot'),
+      const { directory, signedBy } = await createBackup({ home: original, destination: path.join(root, 'snapshot'),
         externalTemporal: true });
       // Prove recovery uses the snapshot, not the source's current state.
       await vault.put(handle, 'changed-after-backup');
-      await restoreBackup(directory, { home: recovered });
+      // Another host trusts the signing key by the fingerprint kept off-host.
+      await restoreBackup(directory, { home: recovered, trustKeys: [signedBy] });
       const restored = await Store.create(path.join(recovered, 'state', 'karmax.db'));
       try {
         const restoredHandle = await restored.kvGet('recovery-handle');
         expect(restoredHandle).toBe(handle);
         expect(new Vault(path.join(recovered, 'vault')).reveal(restoredHandle!)).toBe(secret);
         expect(vault.reveal(handle)).toBe('changed-after-backup');
-        expect(fs.readFileSync(path.join(recovered, 'vault', 'secrets.json'), 'utf8')).not.toContain(secret);
+        for (const file of fs.readdirSync(path.join(recovered, 'vault'), { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile()))
+          expect(fs.readFileSync(path.join(file.parentPath, file.name), 'utf8')).not.toContain(secret);
       } finally { await restored.close(); }
     } finally { vi.unstubAllEnvs(); }
   });
@@ -195,8 +200,18 @@ describe('control-plane backup', () => {
     await expect(createBackup({ home, destination: path.join(root, 's'), externalTemporal: true }))
       .rejects.toThrow(/npm run backup -- --allow-running/);
 
-    const cli = fs.readFileSync(new URL('../src/scripts/backup.ts', import.meta.url), 'utf8');
-    expect(cli).toContain("'--allow-running'");
+    // Run that command: it takes the backup and says what it traded away.
+    const cli = (...args: string[]) => spawnSync(process.execPath, ['--import', 'tsx', 'src/scripts/backup.ts', ...args],
+      { encoding: 'utf8', env: { ...process.env, KARMAX_HOME: home, KARMAX_TEMPORAL_ADDRESS: 'temporal.invalid:7233' } });
+    const taken = cli('--allow-running', path.join(root, 'cli'));
+    expect(taken.status, taken.stderr).toBe(0);
+    expect(taken.stdout).toContain(`backup complete: ${path.join(root, 'cli')}`);
+    expect(taken.stdout).toMatch(/not point-in-time consistent/);
+    expect(JSON.parse(fs.readFileSync(path.join(root, 'cli', 'manifest.json'), 'utf8'))).toMatchObject({ temporal: 'external', secretsIncluded: true });
+    const refused = cli('--allow-runing', path.join(root, 'typo'));
+    expect(refused.status).not.toBe(0);
+    expect(refused.stderr).toContain('unknown option --allow-runing');
+    expect(fs.existsSync(path.join(root, 'typo'))).toBe(false);
   });
 
   it('rejects a backup whose payload changed', async () => {
@@ -266,7 +281,7 @@ describe('control-plane backup', () => {
     // only workflow excludeSecrets is for.
     const fresh = path.join(root, 'fresh');
     fs.mkdirSync(fresh, { recursive: true });
-    await expect(restoreBackup(path.join(root, 'b'), { home: fresh })).resolves.toBeTruthy();
+    await expect(restoreBackup(path.join(root, 'b'), { home: fresh, trustKeys: [without.signedBy] })).resolves.toBeTruthy();
     expect(fs.readFileSync(path.join(fresh, 'vault', 'vault.json'), 'utf8')).toBe('ciphertext');
     expect(fs.existsSync(path.join(fresh, 'vault', 'vault.key'))).toBe(false);
   });
@@ -289,12 +304,14 @@ describe('control-plane backup', () => {
     const destination = path.join(root, 'snapshot');
     await createBackup({ home, destination, externalTemporal: true });
 
-    // Age the manifest back to what a pre-`secretsIncluded` karmax wrote: same
-    // version, same file list (the manifest itself is not hashed), field absent.
+    // Age the manifest back to what a pre-`secretsIncluded` karmax wrote: an
+    // unsigned version 1, same file list, field absent.
     const manifestFile = path.join(destination, 'manifest.json');
     const aged = JSON.parse(fs.readFileSync(manifestFile, 'utf8')) as Record<string, unknown>;
     delete aged.secretsIncluded;
+    aged.version = 1;
     fs.writeFileSync(manifestFile, `${JSON.stringify(aged, null, 2)}\n`);
+    fs.rmSync(path.join(destination, 'manifest.sig'));
 
     // A different host, with its own established (and different) key material.
     const target = path.join(root, 'target');
@@ -302,7 +319,7 @@ describe('control-plane backup', () => {
     fs.mkdirSync(path.join(target, 'state'), { recursive: true });
     fs.writeFileSync(path.join(target, 'vault', 'vault.key'), 'TARGET-KEY');
     fs.writeFileSync(path.join(target, 'state', 'auth.db.secret'), 'TARGET-AUTH');
-    await restoreBackup(destination, { home: target });
+    await restoreBackup(destination, { home: target, acceptUnsignedV1: true });
 
     // The payload's own key must survive the restore, matched to its own ciphertext.
     expect(fs.readFileSync(path.join(target, 'vault', 'vault.json'), 'utf8')).toBe('source-ciphertext');
@@ -331,7 +348,7 @@ describe('control-plane backup', () => {
     fs.mkdirSync(path.join(target, 'state'), { recursive: true });
     fs.writeFileSync(path.join(target, 'vault', 'vault.key'), 'TARGET-KEY');
     fs.writeFileSync(path.join(target, 'state', 'auth.db.secret'), 'TARGET-AUTH');
-    await restoreBackup(path.join(root, 'snapshot'), { home: target });
+    await restoreBackup(path.join(root, 'snapshot'), { home: target, trustKeys: [made.signedBy] });
     expect(fs.readFileSync(path.join(target, 'vault', 'vault.json'), 'utf8')).toBe('env-keyed-ciphertext');
     expect(fs.existsSync(path.join(target, 'vault', 'vault.key'))).toBe(false);
     expect(fs.existsSync(path.join(target, 'state', 'auth.db.secret'))).toBe(false);
@@ -351,4 +368,373 @@ describe('control-plane backup', () => {
     expect(made.directory.startsWith(path.join(home, 'backups'))).toBe(true);
     expect(fs.existsSync(path.join(made.directory, 'manifest.json'))).toBe(true);
   });
+
+  it('also withholds the plaintext secrets that live outside the vault', async () => {
+    const { root, home } = makeHome('karmax-backup-plaintext-');
+    write(home, 'state/git-profiles/work/id_ed25519', 'PRIVATE KEY');
+    write(home, 'state/vault-items/items.json', '{"token":"plain"}');
+    write(home, 'config-homes/claude-personal/.credentials.json', '{"oauth":"token"}');
+    write(home, 'state/settings.json', '{"theme":"dark"}');
+    const { manifest } = await createBackup({ home, destination: path.join(root, 'b'), externalTemporal: true, excludeSecrets: true });
+    expect(manifest.files.map((file) => file.path)).toEqual(['state/settings.json']);
+  });
+
+  it('embeds Temporal and local objects unless they are external', async () => {
+    const { root, home } = makeHome('karmax-backup-components-');
+    const temporal = await Store.create(path.join(home, 'temporal', 'temporal.db'));
+    await temporal.kvSet('history', 'embedded');
+    await temporal.close();
+    write(home, 'objects/checkpoints/a.bin', 'checkpoint');
+
+    const embedded = await createBackup({ home, destination: path.join(root, 'embedded') });
+    expect(embedded.manifest).toMatchObject({ temporal: 'embedded', objectStore: 'local' });
+    expect(embedded.manifest.files.map((file) => file.path)).toEqual(expect.arrayContaining(['objects/checkpoints/a.bin', 'temporal/temporal.db']));
+    const copy = await Store.create(path.join(root, 'embedded', 'payload', 'temporal', 'temporal.db'));
+    expect(await copy.kvGet('history')).toBe('embedded');
+    await copy.close();
+
+    const external = await createBackup({ home, destination: path.join(root, 'external'), externalTemporal: true, externalObjectStore: true });
+    expect(external.manifest).toMatchObject({ temporal: 'external', objectStore: 'external' });
+    expect(fs.existsSync(path.join(root, 'external', 'payload', 'temporal'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'external', 'payload', 'objects'))).toBe(false);
+    // Restoring it leaves this home's own Temporal and objects in place.
+    write(home, 'objects/checkpoints/b.bin', 'newer');
+    await restoreBackup(path.join(root, 'external'), { home });
+    expect(fs.readFileSync(path.join(home, 'objects', 'checkpoints', 'b.bin'), 'utf8')).toBe('newer');
+    expect(fs.existsSync(path.join(home, 'temporal', 'temporal.db'))).toBe(true);
+  });
+
+  it('refuses a destination that would replace the home or sit in a task world', async () => {
+    const { home } = makeHome('karmax-backup-destination-');
+    fs.mkdirSync(path.join(home, 'worlds', 'task-1'), { recursive: true });
+    for (const destination of [home, `${home}/`, path.join(home, 'worlds', 'task-1', 'backup')])
+      await expect(createBackup({ home, destination, externalTemporal: true })).rejects.toThrow(/must not replace KARMAX_HOME or live inside a task world/);
+    expect(fs.readdirSync(path.join(home, 'worlds', 'task-1'))).toEqual([]);
+    // An existing directory is never reused: two backups would interleave.
+    fs.mkdirSync(path.join(home, 'taken'));
+    await expect(createBackup({ home, destination: path.join(home, 'taken'), externalTemporal: true })).rejects.toThrow(/EEXIST/);
+  });
+
+  it.each([
+    ['another format', (m: any) => { m.format = 'tarball'; }, 'unsupported or invalid tavya backup manifest'],
+    ['a newer version', (m: any) => { m.version = 2; }, 'unsupported or invalid tavya backup manifest'],
+    ['no file list', (m: any) => { delete m.files; }, 'unsupported or invalid tavya backup manifest'],
+    ['a path escaping the payload', (m: any) => { m.files[0].path = '../manifest.json'; }, 'backup path escapes payload: ../manifest.json'],
+    ['an absolute path', (m: any) => { m.files[0].path = '/etc/passwd'; }, 'invalid backup path: /etc/passwd'],
+    ['a backslash path', (m: any) => { m.files[0].path = 'vault\\\\value'; }, 'invalid backup path'],
+    ['a wrong size', (m: any) => { m.files[0].bytes += 1; }, 'backup integrity check failed: vault/value'],
+    ['a file that is missing', (m: any) => { m.files.push({ path: 'vault/gone', bytes: 0, sha256: '' }); }, 'backup integrity check failed: vault/gone'],
+  ])('will not restore a manifest with %s', async (_name, edit, error) => {
+    const { root, home } = makeHome('karmax-backup-manifest-');
+    write(home, 'vault/value', 'original');
+    const destination = path.join(root, 'snapshot');
+    await createBackup({ home, destination, externalTemporal: true });
+    const manifestFile = path.join(destination, 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    edit(manifest);
+    fs.writeFileSync(manifestFile, JSON.stringify(manifest));
+    // An edited manifest no longer matches its signature; accepted unsigned,
+    // it is still checked for everything below.
+    fs.rmSync(path.join(destination, 'manifest.sig'));
+    write(home, 'vault/value', 'live');
+    expect(() => verifyBackup(destination, { home, acceptUnsignedV1: true })).toThrow(error);
+    await expect(restoreBackup(destination, { home, acceptUnsignedV1: true })).rejects.toThrow(error);
+    expect(fs.readFileSync(path.join(home, 'vault', 'value'), 'utf8')).toBe('live');
+  });
+
+  it('refuses to restore under a live app, and offers no way to force it', async () => {
+    const { root, home } = makeHome('karmax-restore-live-');
+    write(home, 'vault/value', 'backed-up');
+    await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    write(home, 'vault/value', 'live');
+    write(home, `state/instances/${process.ppid}.pid`, JSON.stringify({ pid: process.ppid, home }));
+    const error = await restoreBackup(path.join(root, 'snapshot'), { home }).catch((e: Error) => e);
+    expect((error as Error).message).toBe(`stop tavya before restore (live app pids: ${process.ppid})`);
+    expect(fs.readFileSync(path.join(home, 'vault', 'value'), 'utf8')).toBe('live');
+  });
+
+  it('puts every component back when the swap fails partway', async () => {
+    const { root, home } = makeHome('karmax-restore-rollback-');
+    write(home, 'vault/value', 'backed-up vault');
+    write(home, 'content/page.md', 'backed-up content');
+    write(home, 'objects/blob', 'backed-up object');
+    await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    write(home, 'vault/value', 'live vault');
+    write(home, 'content/page.md', 'live content');
+    write(home, 'objects/blob', 'live object');
+    const rename = fs.renameSync;
+    // vault and content have been swapped in by the time objects fails.
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(to) === path.join(home, 'objects') && String(from).includes('.restore-stage-')) throw new Error('EXDEV: simulated');
+      return rename(from, to);
+    });
+    try {
+      await expect(restoreBackup(path.join(root, 'snapshot'), { home })).rejects.toThrow('EXDEV: simulated');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readFileSync(path.join(home, 'vault', 'value'), 'utf8')).toBe('live vault');
+    expect(fs.readFileSync(path.join(home, 'content', 'page.md'), 'utf8')).toBe('live content');
+    expect(fs.readFileSync(path.join(home, 'objects', 'blob'), 'utf8')).toBe('live object');
+    expect(fs.readdirSync(home).filter((name) => name.startsWith('.restore-'))).toEqual([]);
+  });
+
+  it.runIf(fs.existsSync('/proc/self/cmdline'))('stops the embedded Temporal server first, but never a stranger with its recycled pid', async () => {
+    const { root, home } = makeHome('karmax-restore-temporal-');
+    write(home, 'vault/value', 'backed-up');
+    await createBackup({ home, destination: path.join(root, 'snapshot') });
+    const idle = (...argv: string[]) => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', ...argv], { stdio: 'ignore' });
+    const exited = (child: ChildProcess) => new Promise<NodeJS.Signals | null>((resolve) => child.once('exit', (_code, signal) => resolve(signal)));
+    const temporal = idle('temporal', 'server', 'start-dev');
+    const stranger = idle('an-unrelated-process');
+    try {
+      const temporalExit = exited(temporal);
+      write(home, 'temporal/dev-server.json', JSON.stringify({ pid: temporal.pid }));
+      await restoreBackup(path.join(root, 'snapshot'), { home });
+      expect(await temporalExit).toBe('SIGTERM');
+
+      write(home, 'temporal/dev-server.json', JSON.stringify({ pid: stranger.pid }));
+      await restoreBackup(path.join(root, 'snapshot'), { home });
+      expect(stranger.exitCode).toBeNull();
+      expect(stranger.signalCode).toBeNull();
+      expect(() => process.kill(stranger.pid!, 0)).not.toThrow();
+    } finally {
+      temporal.kill('SIGKILL');
+      stranger.kill('SIGKILL');
+    }
+  });
 });
+
+// DB-10: anyone who can write a backup could rewrite its payload and its
+// hashes together. Manifests are signed by a key that never leaves the
+// installation, trusted elsewhere only by its fingerprint, and a backup from
+// before signing is restored only on the operator's explicit, audited word.
+describe('signed backups (DB-10)', () => {
+  async function signedBackup(label: string) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `kx-backup-${label}-`));
+    roots.push(root);
+    const home = path.join(root, 'home');
+    fs.mkdirSync(path.join(home, 'vault'), { recursive: true });
+    fs.mkdirSync(path.join(home, 'state'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'vault', 'vault.json'), 'ciphertext');
+    fs.writeFileSync(path.join(home, 'state', 'auth.db.secret'), 'AUTH');
+    const made = await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    return { root, home, ...made };
+  }
+  const rewrite = (directory: string, change: (manifest: any) => void) => {
+    const file = path.join(directory, 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+    change(manifest);
+    fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
+  };
+  const sha256 = (file: string) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  /** Add a payload file and list it, as someone who can write the backup could. */
+  const plant = (directory: string, relative: string, value: string) => {
+    const file = path.join(directory, 'payload', relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, value);
+    rewrite(directory, (m) => { m.files.push({ path: relative, bytes: value.length, sha256: sha256(file) }); });
+    fs.rmSync(path.join(directory, 'manifest.sig'));
+  };
+
+  it('signs a version-1 manifest with a key kept outside everything backed up', async () => {
+    const b = await signedBackup('signed');
+    // The previous release's restore reads version 1; the signature sits beside it.
+    expect(b.manifest.version).toBe(1);
+    expect(fs.existsSync(path.join(b.directory, 'manifest.sig'))).toBe(true);
+    expect(b.signedBy).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/);
+    expect(localSigningFingerprint(b.home)).toBe(b.signedBy);
+    expect(fs.statSync(path.join(b.home, 'backup-signing.key')).mode & 0o777).toBe(0o600);
+    expect(fs.existsSync(path.join(b.home, 'state', 'backup-signing.key'))).toBe(false);
+    expect(b.manifest.files.map((f) => f.path).some((f) => f.includes('backup-signing'))).toBe(false);
+    await restoreBackup(b.directory, { home: b.home });
+    expect(localSigningFingerprint(b.home)).toBe(b.signedBy);
+    expect((await createBackup({ home: b.home, destination: path.join(b.root, 'again'), externalTemporal: true })).signedBy).toBe(b.signedBy);
+  });
+
+  it('refuses a rehashed payload, a stripped signature and an untrusted signer', async () => {
+    const b = await signedBackup('tamper');
+    const fresh = path.join(b.root, 'fresh');
+    // Changing a file and its hash together is what signing is for.
+    const value = path.join(b.directory, 'payload', 'vault', 'vault.json');
+    fs.writeFileSync(value, 'attacker');
+    rewrite(b.directory, (m) => { const entry = m.files.find((f: any) => f.path === 'vault/vault.json'); entry.sha256 = sha256(value); entry.bytes = 8; });
+    await expect(restoreBackup(b.directory, { home: b.home })).rejects.toThrow(/does not match its contents/);
+    // …or re-signing it with another key.
+    const attacker = await signedBackup('attacker');
+    fs.copyFileSync(path.join(attacker.directory, 'manifest.sig'), path.join(b.directory, 'manifest.sig'));
+    await expect(restoreBackup(b.directory, { home: b.home })).rejects.toThrow(/does not match its contents/);
+    // Stripping the signature leaves an unsigned backup, which needs the operator's word.
+    fs.rmSync(path.join(b.directory, 'manifest.sig'));
+    await expect(restoreBackup(b.directory, { home: b.home })).rejects.toThrow(/unsigned.*--accept-unsigned-v1/);
+    expect(fs.readFileSync(path.join(b.home, 'vault', 'vault.json'), 'utf8')).toBe('ciphertext');
+
+    // A genuine backup on a host without the key: trusted only by fingerprint.
+    const genuine = await signedBackup('genuine');
+    expect(() => verifyBackup(genuine.directory, { home: fresh })).toThrow(new RegExp(`signed by ${genuine.signedBy.replace(/[+/]/g, '\\$&')}.*--trust-key`));
+    expect(() => verifyBackup(genuine.directory, { home: fresh, trustKeys: [attacker.signedBy] })).toThrow(/does not trust/);
+    expect(verifyBackup(genuine.directory, { home: fresh, trustKeys: [genuine.signedBy] }).version).toBe(1);
+    vi.stubEnv('KARMAX_BACKUP_TRUSTED_KEYS', `${attacker.signedBy}, ${genuine.signedBy}`);
+    try { expect(verifyBackup(genuine.directory, { home: fresh }).version).toBe(1); } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('trusts a named key even when this host\'s own key is unreadable', async () => {
+    const genuine = await signedBackup('named');
+    const other = await signedBackup('broken-key');
+    fs.writeFileSync(path.join(other.home, 'backup-signing.key'), 'not a key');
+    expect(verifyBackup(genuine.directory, { home: other.home, trustKeys: [genuine.signedBy] }).version).toBe(1);
+  });
+
+  it('restores a backup from before signing only when explicitly accepted, and audits every restore', async () => {
+    const b = await signedBackup('legacy');
+    fs.rmSync(path.join(b.directory, 'manifest.sig'));
+    fs.writeFileSync(path.join(b.home, 'vault', 'vault.json'), 'newer');
+    await expect(restoreBackup(b.directory, { home: b.home })).rejects.toThrow(/unsigned.*--accept-unsigned-v1/);
+    expect(fs.readFileSync(path.join(b.home, 'vault', 'vault.json'), 'utf8')).toBe('newer');
+    await restoreBackup(b.directory, { home: b.home, acceptUnsignedV1: true });
+    expect(fs.readFileSync(path.join(b.home, 'vault', 'vault.json'), 'utf8')).toBe('ciphertext');
+
+    const signed = await signedBackup('audited');
+    await restoreBackup(signed.directory, { home: b.home, trustKeys: [signed.signedBy] });
+    const audit: any[] = [];
+    await recordRestores({ appendAudit: (entry) => { audit.push(entry); } }, b.home);
+    expect(audit).toEqual([
+      expect.objectContaining({ principalId: 'system:restore', action: 'backup.restored.unsigned',
+        detail: expect.objectContaining({ manifestVersion: 1, signedBy: null, acceptedUnsigned: true, backupCreatedAt: b.manifest.createdAt }) }),
+      expect.objectContaining({ action: 'backup.restored', detail: expect.objectContaining({ signedBy: signed.signedBy, acceptedUnsigned: false }) }),
+    ]);
+    // Recorded once: the next boot appends nothing more.
+    await recordRestores({ appendAudit: (entry) => { audit.push(entry); } }, b.home);
+    expect(audit).toHaveLength(2);
+  });
+
+  it('refuses a backup that carries a signing key or restore records', async () => {
+    // Accepted unsigned, a backup must still not install its own trust anchor
+    // on a fresh host, nor forge entries for the next boot's audit log.
+    for (const planted of ['state/backup-signing.key', 'state/restore-audit/forged.json']) {
+      const b = await signedBackup('anchor');
+      plant(b.directory, planted, 'planted');
+      const fresh = path.join(b.root, 'fresh');
+      await expect(restoreBackup(b.directory, { home: fresh, acceptUnsignedV1: true })).rejects.toThrow(/never carries/);
+      expect(fs.existsSync(path.join(fresh, 'backup-signing.key'))).toBe(false);
+      expect(fs.existsSync(path.join(fresh, 'state'))).toBe(false);
+    }
+  });
+
+  it('restores only the bytes it verified', async () => {
+    for (const swap of ['replace', 'symlink'] as const) {
+      const b = await signedBackup(`toctou-${swap}`);
+      const value = path.join(b.directory, 'payload', 'vault', 'vault.json');
+      fs.writeFileSync(path.join(b.home, 'vault', 'vault.json'), 'live');
+      // Change the payload the moment the restore starts copying it, after
+      // the signature was checked.
+      const copy = fs.cpSync;
+      const spy = vi.spyOn(fs, 'cpSync').mockImplementation((...args: Parameters<typeof fs.cpSync>) => {
+        spy.mockRestore();
+        fs.rmSync(value);
+        if (swap === 'replace') fs.writeFileSync(value, 'attacker');
+        else fs.symlinkSync('/etc/hostname', value);
+        return copy(...args);
+      });
+      try {
+        await expect(restoreBackup(b.directory, { home: b.home })).rejects.toThrow(/integrity check failed|symbolic link/);
+      } finally { spy.mockRestore(); }
+      expect(fs.readFileSync(path.join(b.home, 'vault', 'vault.json'), 'utf8')).toBe('live');
+      expect(fs.readdirSync(b.home).filter((name) => name.startsWith('.restore-'))).toEqual([]);
+    }
+  });
+
+  it('publishes signatures under an unpredictable temporary name', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-backup-temp-'));
+    roots.push(root);
+    const home = path.join(root, 'home');
+    fs.mkdirSync(path.join(home, 'state'), { recursive: true });
+    const writes = vi.spyOn(fs, 'writeFileSync');
+    await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    const temporaries = writes.mock.calls.map(([file]) => String(file)).filter((file) => file.endsWith('.tmp'));
+    expect(temporaries.length).toBeGreaterThan(0);
+    for (const file of temporaries) expect(file).not.toMatch(new RegExp(`\\.${process.pid}\\.tmp$`));
+  });
+});
+
+// deploy/karmax backups: SHA256SUMS covers the PostgreSQL dumps, the
+// deployment secrets and the control-plane manifest, so the two signatures
+// vouch for one backup, not two that were paired afterwards.
+describe('signed deployment backups (DB-10)', () => {
+  async function deploymentBackup(label: string, home?: string) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `kx-deploy-backup-${label}-`));
+    roots.push(root);
+    home ??= path.join(root, 'home');
+    fs.mkdirSync(path.join(home, 'state'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'state', 'auth.db.secret'), 'AUTH');
+    const directory = path.join(root, 'backup');
+    const made = await createBackup({ home, destination: path.join(directory, 'control-plane'), externalTemporal: true });
+    fs.writeFileSync(path.join(directory, 'karmax.dump'), `dump-${label}`);
+    const sums = ['karmax.dump', 'control-plane/manifest.json'].map((file) =>
+      `${crypto.createHash('sha256').update(fs.readFileSync(path.join(directory, file))).digest('hex')}  ${file}`).join('\n') + '\n';
+    fs.writeFileSync(path.join(directory, 'SHA256SUMS'), sums);
+    fs.writeFileSync(path.join(directory, 'SHA256SUMS.sig'), signChecksums(Buffer.from(sums), home));
+    return { root, home, directory, signedBy: made.signedBy };
+  }
+
+  it('verifies both signatures and every listed file', async () => {
+    const b = await deploymentBackup('whole');
+    expect(verifyDeploymentBackup(b.directory, { home: b.home }).signedBy).toBe(b.signedBy);
+    fs.appendFileSync(path.join(b.directory, 'karmax.dump'), 'tampered');
+    expect(() => verifyDeploymentBackup(b.directory, { home: b.home })).toThrow(/checksum.*karmax\.dump/);
+  });
+
+  it('refuses dumps paired with another backup\'s control plane', async () => {
+    const a = await deploymentBackup('a');
+    const b = await deploymentBackup('b', a.home);
+    fs.rmSync(path.join(a.directory, 'control-plane'), { recursive: true });
+    fs.cpSync(path.join(b.directory, 'control-plane'), path.join(a.directory, 'control-plane'), { recursive: true });
+    expect(() => verifyDeploymentBackup(a.directory, { home: a.home })).toThrow(/checksum.*control-plane\/manifest\.json/);
+  });
+
+  it('requires the checksums to cover the manifest', async () => {
+    const b = await deploymentBackup('uncovered');
+    const sums = fs.readFileSync(path.join(b.directory, 'SHA256SUMS'), 'utf8').split('\n').filter((line) => !line.includes('manifest.json')).join('\n');
+    fs.writeFileSync(path.join(b.directory, 'SHA256SUMS'), sums);
+    fs.writeFileSync(path.join(b.directory, 'SHA256SUMS.sig'), signChecksums(Buffer.from(sums), b.home));
+    expect(() => verifyDeploymentBackup(b.directory, { home: b.home })).toThrow(/do not cover control-plane\/manifest\.json/);
+  });
+
+  it('accepts unsigned checksums only beside an unsigned manifest', async () => {
+    const b = await deploymentBackup('unsigned');
+    fs.rmSync(path.join(b.directory, 'SHA256SUMS.sig'));
+    expect(() => verifyDeploymentBackup(b.directory, { home: b.home, acceptUnsignedV1: true })).toThrow(/manifest is signed/);
+    fs.rmSync(path.join(b.directory, 'control-plane', 'manifest.sig'));
+    expect(() => verifyDeploymentBackup(b.directory, { home: b.home })).toThrow(/unsigned.*--accept-unsigned-v1/);
+    expect(verifyDeploymentBackup(b.directory, { home: b.home, acceptUnsignedV1: true }).signedBy).toBeUndefined();
+  });
+
+  // Every snapshot the previous release's updater took has neither checksums
+  // nor signatures; after the upgrade they must still restore on the
+  // operator's word, or no pre-upgrade restore point is usable.
+  it('restores a backup from before checksums only on the operator\'s word', async () => {
+    const b = await deploymentBackup('legacy');
+    for (const file of ['SHA256SUMS', 'SHA256SUMS.sig', 'control-plane/manifest.sig']) fs.rmSync(path.join(b.directory, file));
+    expect(() => verifyDeploymentBackup(b.directory, { home: b.home })).toThrow(/no checksums.*--accept-unsigned-v1/);
+    expect(verifyDeploymentBackup(b.directory, { home: b.home, acceptUnsignedV1: true }).signedBy).toBeUndefined();
+    // Its control plane is still checked against its own manifest.
+    fs.appendFileSync(path.join(b.directory, 'control-plane', 'manifest.json'), ' ');
+    const manifest = JSON.parse(fs.readFileSync(path.join(b.directory, 'control-plane', 'manifest.json'), 'utf8'));
+    const file = path.join(b.directory, 'control-plane', 'payload', manifest.files[0].path);
+    fs.appendFileSync(file, 'tampered');
+    expect(() => verifyDeploymentBackup(b.directory, { home: b.home, acceptUnsignedV1: true })).toThrow(/integrity check failed/);
+  });
+});
+
+function makeHome(prefix: string): { root: string; home: string } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  roots.push(root);
+  const home = path.join(root, 'home');
+  fs.mkdirSync(home, { recursive: true });
+  return { root, home };
+}
+
+function write(home: string, relative: string, contents: string): void {
+  fs.mkdirSync(path.dirname(path.join(home, relative)), { recursive: true });
+  fs.writeFileSync(path.join(home, relative), contents);
+}

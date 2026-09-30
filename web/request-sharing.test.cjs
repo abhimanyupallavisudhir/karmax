@@ -1,0 +1,57 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const src = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
+const fn = (name) => { const start = src.search(new RegExp(`^(?:async )?function ${name}\\(`, 'm')); return src.slice(start, src.indexOf('\n}', start) + 2); };
+test('RQ-4: share pending identical reads, invalidate on mutations, and retry failures', async () => {
+  const pending = [];
+  const ctx = vm.createContext({ S: { token: 'a' }, Map, feedbackFetch: (path, opts) => new Promise((resolve, reject) => pending.push({ path, opts, resolve, reject })), fetchApi: (path, opts) => new Promise((resolve, reject) => pending.push({ path, opts, resolve, reject })) });
+  vm.runInContext(fn('api'), ctx);
+  const a = ctx.api('/read'), b = ctx.api('/read'); assert.equal(pending.length, 1);
+  pending[0].resolve({ value: 1 }); await Promise.all([a,b]);
+  const c = ctx.api('/read'); assert.equal(pending.length, 2); pending[1].resolve({}); await c;
+  const old = ctx.api('/read');
+  const write = ctx.api('/write', { method: 'POST' });
+  const fresh = ctx.api('/read'); assert.equal(pending.length, 5);
+  pending[2].resolve({}); pending[3].resolve({}); pending[4].resolve({}); await Promise.all([old,write,fresh]);
+  const failed = ctx.api('/fail'); pending[5].reject(new Error('offline')); await assert.rejects(failed);
+  const retry = ctx.api('/fail'); assert.equal(pending.length, 7); pending[6].resolve({}); await retry;
+});
+test('RQ-4/UI-8: defaults share settled reads and invalidate on writes', async () => {
+  let reads = 0;
+  const ctx = vm.createContext({ S: { token: 'a' }, fetchApi: async () => ({ value: ++reads }) });
+  vm.runInContext(fn('api'), ctx);
+  await ctx.api('/api/defaults/p/software-dev');
+  await ctx.api('/api/defaults/p/software-dev');
+  assert.equal(reads, 1);
+  await ctx.api('/api/settings', { method: 'PUT' });
+  await ctx.api('/api/defaults/p/software-dev');
+  assert.equal(reads, 3);
+  ctx.S.token = 'b';
+  await ctx.api('/api/defaults/p/software-dev');
+  assert.equal(reads, 4);
+});
+test('RQ-4: a default read superseded by a mutation cannot refill the cache', async () => {
+  const pending = [];
+  const ctx = vm.createContext({ S: {}, fetchApi: path => new Promise(resolve => pending.push({ path, resolve })) });
+  vm.runInContext(fn('api'), ctx);
+  const old = ctx.api('/api/defaults/p/workflow');
+  const write = ctx.api('/api/settings', { method: 'PUT' });
+  pending[1].resolve({}); await write;
+  pending[0].resolve({ stale: true }); await old;
+  const fresh = ctx.api('/api/defaults/p/workflow');
+  assert.equal(pending.length, 3);
+  pending[2].resolve({ fresh: true }); await fresh;
+  const cached = await ctx.api('/api/defaults/p/workflow'); cached.fresh = false;
+  assert.equal((await ctx.api('/api/defaults/p/workflow')).fresh, true);
+});
+test('RQ-4/UI-22: cookie-authenticated users never share cached defaults', async () => {
+  let reads = 0;
+  const ctx = vm.createContext({ S: { token: null, user: { id: 'first' } }, fetchApi: async () => ({ value: ++reads }) });
+  vm.runInContext(fn('api'), ctx);
+  await ctx.api('/api/defaults/p/software-dev');
+  ctx.S.user = { id: 'second' };
+  await ctx.api('/api/defaults/p/software-dev');
+  assert.equal(reads, 2);
+});

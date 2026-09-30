@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import readline from 'node:readline';
 const mode = process.env.FIXTURE_MODE || 'normal';
+if (mode === 'stubborn') process.on('SIGTERM', () => {});
 if (process.env.FIXTURE_PID_FILE) fs.writeFileSync(process.env.FIXTURE_PID_FILE, String(process.pid));
 const send = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
 const tool = { name: 'echo', description: 'Fixture echo', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } };

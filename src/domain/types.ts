@@ -276,6 +276,9 @@ export interface WorldCheckpoint {
      * this and recover it from the durable world handle or project config. */
     source?: string;
     checkoutPath: string;
+    localPath?: string;
+    sourceAuthority?: 'project' | 'origin';
+    gitIdentity?: { name: string; email: string };
     baseSha: string;
     branch: string;
     headSha?: string;
@@ -540,10 +543,10 @@ export interface ProjectConfig {
   /** @deprecated Self-hosted compatibility/import path. Project resources and
    * credential injection are the durable/hosted model (SPEC §11.4). */
   copyGlobs?: string[];
-  /** @deprecated Superseded by `remote: 'pr'` (PLAN-git-config.md §5); still honored. */
+  /** @deprecated Superseded by `remote: 'pr'` (wiki plans/PLAN-git-config §5); still honored. */
   openGithubPr?: boolean;
   /**
-   * Remote policy (PLAN-git-config.md §5): what leaves the machine, and when.
+   * Remote policy (wiki plans/PLAN-git-config §5): what leaves the machine, and when.
    * 'none' (self-hosted/local default) — merges are local. 'push' — the target
    * branch is pushed after a merge lands. 'pr' — the task branch is pushed and a
    * GitHub PR opened at the PR stage, and the target pushed after merge. Hosted
@@ -809,7 +812,7 @@ export interface OrganizationUsagePolicy {
   maxActiveWorlds: number;
 }
 
-// ─── Git & GitHub configuration (PLAN-git-config.md) ────────────────────────
+// ─── Git & GitHub configuration (wiki plans/PLAN-git-config) ────────────────
 
 export type RemotePolicy = 'none' | 'push' | 'pr';
 export type LandingAuthority = 'auto' | 'external' | 'karmax';
@@ -881,6 +884,8 @@ export interface GithubLandingParticipant {
 }
 
 export interface GitHubMergeAuthorization {
+  /** Readiness identity for idle polling, including checks and target movement. */
+  observationKey?: string;
   status: 'planned' | 'candidate-ready' | 'merged' | 'queued' | 'waiting' | 'retryable-error' | 'needs-human' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
   prs: TaskPullRequest[];
   /** GitHub user whose token performed or queued the merge. */
@@ -1107,7 +1112,7 @@ export interface TaskParams {
   [k: string]: unknown;
 }
 
-// ─── Task organization: tags, search queries, saved views (PLAN-search-views) ─
+// ─── Task organization: tags, search queries, saved views ─────────────────────
 // A view IS a saved query (the Linear/Jira model): every list surface is the result
 // of evaluating a `TaskQuery` (filter + full-text + sort + group). The searchable-field
 // registry in `src/domain/search.ts` is the single source of truth that the query
@@ -1216,7 +1221,7 @@ export interface StageTransition {
 
 /**
  * A reference to a user-attached image, stored content-addressed on disk under
- * `$KARMAX_HOME/attachments/<id>` (SPEC — image prompts; PLAN_IMAGE_PROMPTS.md).
+ * `$KARMAX_HOME/attachments/<id>` (SPEC — image prompts; wiki plans/PLAN_IMAGE_PROMPTS).
  * Deliberately carries NO bytes: only this lightweight handle flows through
  * Temporal workflow input/signals/history. Bytes are resolved back to base64
  * (Claude/OpenAI APIs) or temp files (Codex CLI) at the activity boundary.
@@ -1514,6 +1519,15 @@ export interface DeclaredAction {
 }
 
 /** The typed projection of a task's state + allowed actions the UI renders. */
+/** A sub-task as its parent's Sub-tasks panel shows it. */
+export interface ChildTaskSummary {
+  id: string;
+  num?: number;
+  title: string;
+  workflow: string;
+  lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed'> & { state?: { draft?: boolean } };
+}
+
 export interface TaskView {
   taskId: string;
   /**
@@ -1534,6 +1548,9 @@ export interface TaskView {
   /** Pending credential decisions projected by the gateway. The vault remains
    * the source of truth; workflows do not persist or replay this host state. */
   approvalRequests?: number;
+  /** Every pending decision, including those dismissed from the inbox: dismissal
+   * silences the notification, but the agent still waits on the decision. */
+  pendingDecisions?: number;
   /**
    * Free-form human notes (cosmetic, UI-only — never sent to any agent). Mirrored
    * onto the view from the task record so the UI can show/edit them at any stage,
@@ -1585,6 +1602,9 @@ export interface TaskView {
   /** Separate proposal authorization and exact integration validation. */
   landing?: TaskLandingState;
   subTasks?: string[];
+  /** Every child the store records, with its list fields: finished children are
+   *  archived out of the live task list, and a replaced run forgets settled ones. */
+  subTaskSummaries?: ChildTaskSummary[];
   parentTaskId?: string;
   error?: string;
   /**
@@ -1745,6 +1765,53 @@ export interface TaskRecoveryCheckpoint {
   /** The preserved intent-authorized proposal changed in Do and needs an
    * automatic integration review before provider re-admission. */
   repairValidationPending?: boolean;
+  /** Set when the run continued as new to bound its history. */
+  continued?: TaskContinuation;
+}
+
+/** What a software-dev run that continued as new at the top of Do carries
+ * besides the checkpoint: the in-flight state a replacement would rebuild or
+ * drop, so the next run resumes exactly where this one stopped. Transcripts
+ * are by reference: together they may exceed Temporal's 2 MB payload limit. */
+export interface TaskContinuation {
+  /** The acknowledged view publication that holds every visible transcript. */
+  conversation: string;
+  /** The Merge transcript when the view hides it (explicit PR cycles). */
+  mergeMessages?: Message[];
+  /** The run held the task's run pin, which the next run takes over. */
+  runPinned: boolean;
+  /** Keeps `TaskView.updatedAt` increasing across runs. */
+  updatedAtBase: number;
+  goalMode: boolean;
+  confirmLayers: ConfirmLayer[];
+  subTasks: {
+    ids: string[];
+    outstanding: string[];
+    awaitingResponse: string[];
+    raises: ChildRaise[];
+    settled: { childTaskId: string; stage: string; detail?: string }[];
+  };
+  collaborations: { pending: string[]; settled: string[] };
+  consumed: string[];
+  checkoutHeads: Record<string, string>;
+  accountPool: number;
+  flags: {
+    targetLocked: boolean;
+    pointOfNoReturnPassed: boolean;
+    branchPreparedForPr: boolean;
+    forceHumanRepairReview: boolean;
+    providerQueueAccepted: boolean;
+    prRequested: boolean;
+    confirmed: boolean;
+    retryRequested: boolean;
+    manualEscalationRequested: boolean;
+    resourcesApplied: boolean;
+  };
+  manualPrConfirmer?: string;
+  escalationAction?: 'openPr' | 'confirm';
+  error?: string;
+  counters: { responderRounds: number; subtaskNags: number; subagentNudges: number; shellNudges: number;
+    landingWatchSequence: number; resourceReviewSequence: number };
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────
@@ -1780,6 +1847,14 @@ export type SubTaskAction = 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cance
 export interface ParentResponse {
   action: SubTaskAction;
   text?: string;
+}
+
+/** A child the Do agent asked for in a turn (`create_sub_task`, SPEC §5.3). `params`
+ *  are the child's own task-form values (PL-11), validated when the tool ran. */
+export interface SubTaskRequest {
+  title: string;
+  prompt: string;
+  params?: Record<string, AgentSpec>;
 }
 
 /** A parent-agent response emitted in a turn. `childTaskId` omitted ⇒ all children

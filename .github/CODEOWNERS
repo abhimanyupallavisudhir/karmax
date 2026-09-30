@@ -1,0 +1,18 @@
+# Code that runs with production's or the live suites' secrets, or decides
+# what production installs or how it seals the vault: workflows and the
+# actions they use, deployment, the dependency manifests, and the key
+# handling. This file is listed too, so the rule cannot be edited away.
+#
+# Nothing is enforced yet. Pull requests are opened as the owner account and
+# GitHub does not let an author approve their own, so requiring code owner
+# review needs a second reviewer identity (a team or a reviewer account)
+# listed here first; turning it on with only the owner blocks every change.
+/.github/workflows/ @abhimanyupallavisudhir
+/.github/actions/ @abhimanyupallavisudhir
+/deploy/ @abhimanyupallavisudhir
+/package.json @abhimanyupallavisudhir
+/package-lock.json @abhimanyupallavisudhir
+/src/autonomy/vault.ts @abhimanyupallavisudhir
+/src/world/reference-keys.ts @abhimanyupallavisudhir
+/src/config/deployment.ts @abhimanyupallavisudhir
+/.github/CODEOWNERS @abhimanyupallavisudhir

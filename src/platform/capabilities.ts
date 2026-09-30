@@ -25,7 +25,7 @@ export const CAPABILITIES = [
   'project:settings:read', 'project:settings:write',
   'project:transfer-out', 'project:transfer-in',
   'project:resource:shared-write',
-  'organization:read', 'organization:create', 'organization:edit',
+  'organization:read', 'organization:create', 'organization:edit', 'organization:wiki:write',
   'organization:member:read', 'organization:member:write',
   'team:read', 'team:write', 'repository:read', 'repository:write',
   'github:actions:read', 'github:actions:write',
@@ -34,7 +34,7 @@ export const CAPABILITIES = [
   'profile:read', 'profile:write', 'skill:write',
   'diagnostic:read', 'process:read', 'process:kill',
   'credential:read', 'credential:write', 'connection:use', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
-  'settings:read', 'settings:write', 'safe-mode:write', 'subscription:gift',
+  'settings:read', 'settings:write', 'subscription:gift',
   'authorization:read', 'authorization:write', 'user:read', 'user:write',
   // Workflow decisions are discoverable capabilities too. Authorization selects
   // them; workflow state determines when the corresponding action is valid.
@@ -42,6 +42,10 @@ export const CAPABILITIES = [
 ] as const;
 
 export type KnownCapability = (typeof CAPABILITIES)[number];
+
+/** The refusal the gateway and the API both give without `organization:wiki:write`. */
+export const ORGANIZATION_WIKI_WRITE_DENIED =
+  'Editing the organization wiki needs Project maintainer or higher, granted for the whole organization (organization:wiki:write).';
 
 /** Ordinary developer operations shared by every role that works in a task
  * world. Workflow-internal decisions are added by concrete role declarations. */
@@ -64,14 +68,16 @@ export const OWN_TASK_CAPABILITIES = new Set<Capability>([
   'task:review:write', 'task:review:execute',
 ]);
 
-/** Child tasks inherit working authority, capped by the parent. Keep legacy
- * spellings for durable workflows whose grants predate namespaced capabilities. */
-export const CHILD_TASK_CAPABILITIES: Capability[] = [
+/** What a child task may inherit from its parent's grant (SPEC §8.2): the whole
+ * catalogue and its parameterised families except merge authority, which a
+ * child receives only for its parent's own branch. Attenuating this ceiling by
+ * the parent's grant copies that grant, expanding any wildcard into explicit
+ * capabilities so `*` can never smuggle `merge-into:*` through. Legacy
+ * spellings keep grants that predate namespaced capabilities delegable. */
+export const CHILD_TASK_CEILING: Capability[] = [
+  ...CAPABILITIES.filter((cap) => !cap.startsWith('merge-into:')),
+  'use-credential:*',
   'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
-  'task:create', 'task:manage-own', 'task:review:write', 'task:signal', 'skill:write',
-  'diagnostic:read', 'process:read',
-  'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
-  'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
 ];
 
 export interface CapabilityDefinition {
@@ -116,6 +122,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['organization:read', 'View organizations', 'Discover organizations in which the principal is a member.'],
       ['organization:create', 'Create organizations', 'Create a new tenant boundary.'],
       ['organization:edit', 'Edit organizations', 'Change organization settings and lifecycle.'],
+      ['organization:wiki:write', 'Edit organization wiki', 'Create, change, and delete organization wiki pages, which every task in the organization sees. Takes effect only through an organization-wide grant.'],
       ['organization:member:read', 'View members', 'View organization membership, invitations, and teams.'],
       ['organization:member:write', 'Manage members', 'Invite, remove, and change organization members.'],
       ['team:read', 'View teams', 'View organization and project teams.'],
@@ -188,7 +195,6 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['settings:read', 'View global settings', 'Read global workflow and platform defaults.'],
       ['settings:write', 'Edit global settings', 'Change global workflow and platform defaults.'],
       ['subscription:gift', 'Gift subscriptions', 'Grant or remove complimentary organization plans.'],
-      ['safe-mode:write', 'Control safe mode', 'Enable or disable safe mode.'],
       ['authorization:read', 'View authorization', 'Read profiles, grants, defaults, and the audit log.'],
       ['authorization:write', 'Manage authorization', 'Change profiles, grants, and authorization defaults.'],
       ['user:read', 'View user accounts', 'List human accounts and their access grants.'],
@@ -284,7 +290,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   check_agent_mail: 'credential:read', enroll_passkey: 'credential:read',
   use_passkey: 'credential:read', save_passkey: 'vault:store',
   list_payments: 'payment:read', manage_payments: 'payment:write',
-  set_safe_mode: 'safe-mode:write', list_users: 'user:read', manage_users: 'user:write',
+  list_users: 'user:read', manage_users: 'user:write',
   list_authorization: 'authorization:read', manage_authorization: 'authorization:write',
 };
 

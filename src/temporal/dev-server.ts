@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import { Connection } from '@temporalio/client';
 import { findFreePortFrom, findFreePorts, isPortFree, waitForPort } from '../util/ports.js';
 import { withTimeout } from '../util/timeout.js';
-import { trackProcess } from '../util/processes.js';
+import { trackProcess, processArgv, processStartTick } from '../util/processes.js';
 import { CUSTODY_ENV } from '../agent/custody.js';
 
 const execFileP = promisify(execFileCb);
@@ -46,13 +46,14 @@ export interface DevServerOptions {
 }
 
 /** What we persist so a later boot/reload can find and reuse the running server. */
-interface ServerRecord {
+export interface ServerRecord {
   pid: number;
   address: string;
   uiUrl: string;
   namespace: string;
   /** Transient systemd user unit hosting the server, when systemd-run was usable. */
   unit?: string;
+  startTick?: string;
 }
 
 interface EphemeralServerRecord {
@@ -95,7 +96,7 @@ function pidAlive(pid: number): boolean {
 }
 
 /** Reap test-only Temporal children whose owning Node test process is gone. The
- * record includes the random gRPC port and we verify it against /proc before
+ * record includes the random gRPC port and we verify its command line before
  * signalling, so a recycled pid or the shared production server is never hit. */
 export function reapOrphanedEphemeralServers(): number {
   let reaped = 0;
@@ -119,13 +120,9 @@ export function reapOrphanedEphemeralServers(): number {
       try { fs.rmSync(full, { force: true }); } catch {}
       continue;
     }
-    let cmdline = '';
-    try {
-      cmdline = fs.readFileSync(`/proc/${rec.pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
-    } catch {
-      // Without a verifiable command line, fail closed and leave the process alone.
-      continue;
-    }
+    // Without a verifiable command line, fail closed and leave the process alone.
+    const cmdline = processArgv(rec.pid)?.join(' ');
+    if (!cmdline) continue;
     if (!cmdline.includes('temporal server start-dev') || !cmdline.includes('--headless') || !cmdline.includes(`--port ${rec.grpcPort}`)) continue;
     try {
       process.kill(rec.pid, 'SIGKILL');
@@ -143,17 +140,72 @@ export function reapOrphanedEphemeralServers(): number {
  * A TCP probe isn't enough — we hit a persistence-backed RPC (describeNamespace)
  * so a jammed SQLite backend reads as unhealthy and gets replaced, not reused.
  */
+export function createServerHealthProbe(address: string, namespace: string) {
+  let stopped = false;
+  let connection: Connection | undefined;
+  let connecting: Promise<Connection | undefined> | undefined;
+  return {
+    async check(): Promise<boolean> {
+      if (stopped) return false;
+      try {
+        connecting ??= Connection.connect({ address, connectTimeout: HEALTH_TIMEOUT_MS }).then(async conn => {
+          if (stopped) { await conn.close().catch(() => {}); return undefined; }
+          connection = conn;
+          return conn;
+        }).catch(error => { connecting = undefined; throw error; });
+        const conn = await withTimeout(connecting, HEALTH_TIMEOUT_MS);
+        if (!conn || stopped) return false;
+        await withTimeout(conn.workflowService.describeNamespace({ namespace }), HEALTH_TIMEOUT_MS);
+        return !stopped;
+      } catch {
+        return false;
+      }
+    },
+    async close(): Promise<void> {
+      stopped = true;
+      const conn = connection;
+      connection = undefined;
+      if (conn) await conn.close().catch(() => {});
+    },
+  };
+}
+
 async function serverHealthy(address: string, namespace: string): Promise<boolean> {
-  let conn: Connection | undefined;
+  const probe = createServerHealthProbe(address, namespace);
+  try { return await probe.check(); }
+  finally { await probe.close(); }
+}
+
+export function matchesRecordedTemporalProcess(
+  record: Pick<ServerRecord, 'pid' | 'address' | 'startTick'>,
+  process: { startTick?: string; argv: string[] },
+  dbFilename: string,
+): boolean {
+  if (!Number.isInteger(record.pid) || record.pid <= 1) return false;
+  if (record.startTick && record.startTick !== process.startTick) return false;
+  const [binary, command, subcommand] = process.argv;
+  if (!binary || path.basename(binary) !== 'temporal' || command !== 'server' || subcommand !== 'start-dev') return false;
+  const option = (name: string) => {
+    const indexes = process.argv.flatMap((arg, index) => arg === name ? [index] : []);
+    return indexes.length === 1 ? process.argv[indexes[0]! + 1] : undefined;
+  };
+  return option('--port') === record.address.split(':').at(-1)
+    && option('--db-filename') === dbFilename;
+}
+
+/** Refuse to signal an unverifiable/recycled pid, including during reset. */
+export async function stopRecordedDevServer(record: ServerRecord, dbFilename: string): Promise<boolean> {
+  if (!Number.isInteger(record.pid) || record.pid <= 1) return false;
+  if (!pidAlive(record.pid)) return true;
   try {
-    conn = await withTimeout(Connection.connect({ address, connectTimeout: HEALTH_TIMEOUT_MS }), HEALTH_TIMEOUT_MS);
-    await withTimeout(conn.workflowService.describeNamespace({ namespace }), HEALTH_TIMEOUT_MS);
+    const argv = processArgv(record.pid, [dbFilename]);
+    if (!argv || !matchesRecordedTemporalProcess(record, { argv, startTick: processStartTick(record.pid) }, dbFilename)) return false;
+    if (record.unit && (await unitMainPid(record.unit)) !== record.pid) return false;
+    // Recheck after the asynchronous unit lookup before sending the signal.
+    if (record.startTick && processStartTick(record.pid) !== record.startTick) return false;
+    await killPid(record.pid);
     return true;
-  } catch {
-    return false;
-  } finally {
-    if (conn) await conn.close().catch(() => {});
-  }
+  } catch { return false; }
 }
 
 async function killPid(pid: number, timeoutMs = 5000): Promise<void> {
@@ -367,7 +419,8 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
         // Adopt it into a unit by replacing it at the same address — boot is the
         // safe moment (our workers aren't polling yet; other instances' pollers
         // ride through a same-address respawn).
-        await killPid(existing.pid);
+        if (!await stopRecordedDevServer(existing, opts.dbFilename!))
+          throw new Error('Cannot verify the recorded Temporal process; refusing to replace it');
         try {
           fs.rmSync(rec);
         } catch {
@@ -381,7 +434,8 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
       // the SQLite file is released before we start a replacement. When the record
       // names a unit, verify the pid still belongs to it — a dead server's pid can
       // be recycled by an unrelated process we must not SIGKILL.
-      if (!existing.unit || (await unitMainPid(existing.unit)) === existing.pid) await killPid(existing.pid);
+      if (!await stopRecordedDevServer(existing, opts.dbFilename!))
+        throw new Error('Cannot verify the recorded Temporal process; refusing to replace it');
     }
     try {
       fs.rmSync(rec);
@@ -482,7 +536,7 @@ async function spawnPersistent(
     pid = child.pid!;
   }
 
-  const record: ServerRecord = { pid, address, uiUrl, namespace, ...(unit ? { unit } : {}) };
+  const record: ServerRecord = { pid, address, uiUrl, namespace, startTick: processStartTick(pid), ...(unit ? { unit } : {}) };
   try {
     fs.writeFileSync(rec, JSON.stringify(record));
   } catch {
@@ -626,6 +680,7 @@ export function watchDevServer(
   const grpcPort = Number(server.address.split(':')[1]);
   const uiPort = server.uiUrl ? Number(new URL(server.uiUrl).port) : undefined;
 
+  const health = createServerHealthProbe(server.address, server.namespace);
   let stopped = false;
   let fails = 0;
   let timer: NodeJS.Timeout | undefined;
@@ -637,14 +692,15 @@ export function watchDevServer(
     }
     try {
       // Re-check under the lock: another instance may have just fixed it.
-      if (await serverHealthy(server.address, server.namespace)) {
+      if (await health.check()) {
         fails = 0;
         return;
       }
       const existing = readRecord(rec);
       if (existing && pidAlive(existing.pid)) {
         // Alive-but-wedged: release its SQLite lock (unit check as in startDevServer).
-        if (!existing.unit || (await unitMainPid(existing.unit)) === existing.pid) await killPid(existing.pid);
+        if (!await stopRecordedDevServer(existing, opts.dbFilename!))
+          throw new Error('Cannot verify the recorded Temporal process; refusing to replace it');
       }
       let lastErr: unknown;
       for (let i = 1; i <= RESPAWN_ATTEMPTS && !stopped; i++) {
@@ -680,7 +736,7 @@ export function watchDevServer(
   };
   const tick = async () => {
     if (stopped) return;
-    const healthy = await serverHealthy(server.address, server.namespace);
+    const healthy = await health.check();
     if (stopped) return;
     if (healthy) {
       fails = 0;
@@ -698,6 +754,7 @@ export function watchDevServer(
   return {
     stop() {
       stopped = true;
+      void health.close();
       if (timer) clearTimeout(timer);
     },
   };

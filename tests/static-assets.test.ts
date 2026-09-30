@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { staticAssetHeaders, staticAssetRevision } from '../src/gateway/server.js';
+import { staticAssetHeaders, staticAssetRevision } from '../src/gateway/static-assets.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -14,6 +14,7 @@ describe('console static assets', () => {
     expect(staticAssetHeaders('/srv/krmax/web/app.js')).toEqual({
       'content-type': 'text/javascript; charset=utf-8',
       'cache-control': 'no-cache',
+      'x-content-type-options': 'nosniff',
     });
   });
 

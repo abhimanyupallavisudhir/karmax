@@ -1,3 +1,4 @@
+import { WorldReferenceKeys, unreadableReferenceWarning } from '../world/reference-keys.js';
 import type { Client } from '@temporalio/client';
 import type { Store } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
@@ -41,10 +42,23 @@ export async function createExecutionServices(input: {
   const tokens = new TokenAuthority(store);
   const providerConnections = new WorldProviderConnectionService(store, broker);
   if (bootstrap) await providerConnections.importEnvironment();
+  const referenceKeys = await WorldReferenceKeys.create(broker, bootstrap);
   worlds.register(new E2BWorldProvider(undefined, undefined, undefined,
-    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind))));
+    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), undefined, referenceKeys));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
-    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind))));
+    async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), undefined, undefined, referenceKeys));
+  if (bootstrap) {
+    const unreadable: (string | undefined)[] = [];
+    for (const state of ['ready', 'parked', 'hibernated', 'degraded'] as const) {
+      for (const { handle } of await store.listWorldInstances(state)) {
+        if (!['e2b', 'daytona'].includes(handle.kind)) continue;
+        try { await worlds.get(handle.kind).status?.(handle as import('../world/types.js').WorldHandle); }
+        catch { unreadable.push(handle.sealedProviderRef); }
+      }
+    }
+    const warning = unreadableReferenceWarning(unreadable);
+    if (warning) console.warn(warning);
+  }
   const objectStore = process.env.KARMAX_OBJECT_STORE === 's3'
     ? new S3ObjectStore({
         endpoint: requiredEnv('KARMAX_S3_ENDPOINT'), bucket: requiredEnv('KARMAX_S3_BUCKET'),

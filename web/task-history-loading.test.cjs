@@ -20,6 +20,7 @@ async function main() {
   const view = { taskId: 'task', messages: [{ role: 'user', text: 'review' }] };
   const event = { seq: 10, type: 'agent.activity', payload: { role: 'do', kind: 'message', title: 'Findings' } };
   const c = vm.createContext({
+    document: { hidden: false }, resourceReviewCache: new Map(), resourceInventoryCache: new Map(),
     S: { tasks: [], organizationId: 'org' }, term: null,
     DEFAULT_EXPLANATION_SETTINGS: {},
     taskRecord: () => ({ projectId: 'project', params: {} }),
@@ -28,7 +29,7 @@ async function main() {
     renderTaskPage: () => { if (c.S.view) paints.push(c.S.taskEvents.length); },
     pendingCancellationView: v => v, defaultTaskTab: () => 'checkin',
     scheduleTaskPageRender: () => c.renderTaskPage(),
-    loadParamDefaults: async () => ({}), toast: message => { throw new Error(message); },
+    loadParamDefaults: async () => ({}), syncLiveWatch: () => {}, toast: message => { throw new Error(message); },
     api: async url => {
       if (url.endsWith('/events?since=0&limit=300')) return history.promise;
       if (url.split('?')[0].endsWith('/sessions')) return sessions.promise;
@@ -37,7 +38,7 @@ async function main() {
       return [];
     },
   });
-  vm.runInContext(['mergeTaskHistory', 'refreshTaskHistory', 'showDraftPage', 'openTask'].map(extract).join('\n'), c);
+  vm.runInContext(['mergeTaskHistory', 'refreshTaskHistory', 'showsTaskApprovals', 'showDraftPage', 'openTask'].map(extract).join('\n'), c);
   let opened = false;
   const opening = c.openTask('task', 'checkin').then(() => { opened = true; });
   await tick();

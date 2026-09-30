@@ -21,9 +21,15 @@ permissions:
 jobs:
   deploy:
     name: deploy to production
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.head_branch == github.event.repository.default_branch
+      ) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     environment: production
     # GitHub retains the running deployment and coalesces pending requests to the
     # newest validated master SHA. That is sufficient because every newer SHA
@@ -33,6 +39,7 @@ jobs:
       cancel-in-progress: false
     env:
       DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha }}
+      RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Deploy the validated revision over SSH
         env:
@@ -44,6 +51,7 @@ jobs:
             ''|*[!0-9a-fA-F]*) echo "invalid deployment SHA: $DEPLOY_SHA" >&2; exit 1 ;;
           esac
           [ "${#DEPLOY_SHA}" -eq 40 ] || { echo "deployment SHA must be 40 hexadecimal characters" >&2; exit 1; }
+          case "$RUN_KEY" in ''|*[!0-9-]*) echo 'invalid deployment run key' >&2; exit 1;; esac
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
@@ -56,11 +64,33 @@ jobs:
             # Execute the updater implementation from the exact validated SHA.
             # This lets a new revision repair a bug in an older updater before
             # that bug can block the revision from checking itself out.
-            git fetch --prune origin master
+            git fetch --prune origin '+refs/heads/master:refs/remotes/origin/master'
+            # Validate here: code loaded from the candidate cannot validate itself.
+            git merge-base --is-ancestor '$DEPLOY_SHA' refs/remotes/origin/master || {
+              echo 'deployment SHA is not on master' >&2; exit 1;
+            }
             git show '$DEPLOY_SHA:deploy/karmax' > ./deploy/.karmax-update
-            chmod 700 ./deploy/.karmax-update
-            trap 'rm -f ./deploy/.karmax-update' EXIT
-            ./deploy/.karmax-update update '$DEPLOY_SHA'
-            find deploy/backups -mindepth 1 -maxdepth 1 -type d -mtime +14 \\
-              -exec rm -rf {} + 2>/dev/null || true
+            git show '$DEPLOY_SHA:deploy/update-runner.sh' > ./deploy/.karmax-runner
+            chmod 700 ./deploy/.karmax-update ./deploy/.karmax-runner
+            trap 'rm -f ./deploy/.karmax-update ./deploy/.karmax-runner' EXIT
+            ./deploy/.karmax-runner start '$DEPLOY_SHA' '$RUN_KEY' ./deploy/.karmax-update
           "
+          for attempt in $(seq 1 180); do
+            state=$(ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=30 "$TARGET" \
+              "cat '/opt/karmax/deploy/.updates/$RUN_KEY/status'") || { sleep 10; continue; }
+            case "$state" in
+              success)
+                ssh -o StrictHostKeyChecking=yes "$TARGET" \
+                  "tail -n 100 '/opt/karmax/deploy/.updates/$RUN_KEY/log'"
+                exit 0 ;;
+              failed:*)
+                ssh -o StrictHostKeyChecking=yes "$TARGET" \
+                  "tail -n 100 '/opt/karmax/deploy/.updates/$RUN_KEY/log'" || true
+                echo "deployment failed: $state" >&2
+                exit 1 ;;
+              running) sleep 10 ;;
+              *) echo "invalid deployment status: $state" >&2; exit 1 ;;
+            esac
+          done
+          echo "deployment is still running after $attempt polls; inspect its durable log and status" >&2
+          exit 1

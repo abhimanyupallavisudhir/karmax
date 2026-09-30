@@ -157,6 +157,7 @@ export function apiKeyEnv(provider: string): string {
     case 'deepseek':
       return 'DEEPSEEK_API_KEY';
     default:
-      return `${provider.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()}_API_KEY`;
+      // A model prefix is user input, not authority to read arbitrary host keys.
+      return '';
   }
 }

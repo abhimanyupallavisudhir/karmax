@@ -31,7 +31,8 @@ describe('manual TOTP entry', () => {
     expect(app).toContain('10 * 1024 * 1024');
     expect(css).toContain('.totp-qr-preview');
     expect(css).toContain('.totp-secret-control.has-qr');
-    expect(html.indexOf('/vendor/qr-scanner.legacy.min.js')).toBeLessThan(html.indexOf('/totp-qr.js'));
+    expect(html).not.toContain('/vendor/qr-scanner.legacy.min.js');
+    expect(qrSource).toContain('script.src = \'/vendor/qr-scanner.legacy.min.js\'');
     expect(html.indexOf('/totp-qr.js')).toBeLessThan(html.indexOf('/app.js'));
   });
 });

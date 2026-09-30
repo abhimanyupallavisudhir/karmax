@@ -24,6 +24,9 @@ it('shares audience policy across sync and async reads and caches membership rea
   expect(page.tasks).toEqual(synchronous);
   expect(reads.mock.calls.filter(([sql]) => sql.includes('FROM team_memberships'))).toHaveLength(1);
   expect(page.tasks[0]?.reviewers).toEqual(['reviewer']);
+  reads.mockClear();
+  expect((await store.listTaskAttempts(project.id)).map((task) => task.reviewers)).toEqual(tasks.map(() => ['reviewer']));
+  expect(reads.mock.calls.filter(([sql]) => sql.includes('FROM team_memberships'))).toHaveLength(1);
   (await store.removeTeamMembership(team.id, 'reviewer'));
   expect((await store.taskSummaryPage(project.id)).tasks[0]?.reviewers).toEqual((await store.getTask(tasks[0]!.id))?.reviewers);
   expect((await store.taskSummaryPage(project.id)).tasks[0]?.reviewers).not.toContain('reviewer');
@@ -79,7 +82,7 @@ it('queries the replacement run if it changes while the async snapshot is loadin
   const snapshot = store.taskSnapshotAsync.bind(store);
   vi.spyOn(store, 'taskSnapshotAsync').mockImplementation(async id => {
     const result = await snapshot(id);
-    (await store.updateTaskParams(task.id, { ...task.params, _workflowRunId: 'replacement-run' }));
+    (await store.patchTaskParams(task.id, { _workflowRunId: 'replacement-run' }));
     return result;
   });
   await api.getTaskView(token, task.id, { live: true });

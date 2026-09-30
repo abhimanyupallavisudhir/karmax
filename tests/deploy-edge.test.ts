@@ -4,9 +4,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 
 const deployDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'deploy');
 const read = (name: string) => fs.readFileSync(path.join(deployDir, name), 'utf8');
+
+it('bounds container memory and log growth in both deployment profiles', () => {
+  for (const file of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    const compose = parse(read(file)) as { services: Record<string, { mem_limit?: string; logging?: { options?: Record<string, string> } }> };
+    for (const [name, service] of Object.entries(compose.services)) {
+      expect(service.mem_limit, `${file}: ${name}`).toBeDefined();
+      expect(service.logging?.options?.['max-size'], `${file}: ${name}`).toBeDefined();
+      expect(service.logging?.options?.['max-file'], `${file}: ${name}`).toBeDefined();
+    }
+  }
+});
 
 /**
  * Run `deploy/karmax`'s `configure()` against a throwaway deployment directory.
@@ -17,14 +29,23 @@ const read = (name: string) => fs.readFileSync(path.join(deployDir, name), 'utf8
  */
 function runConfigure(seed: string | undefined, domain = 'krmax.example.com'): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deploy-'));
-  if (seed !== undefined) fs.writeFileSync(path.join(dir, '.turnkey.env'), seed);
-  execFileSync('sh', ['-c',
-    `. "${path.join(deployDir, 'karmax')}" >/dev/null 2>&1 || true\n`
-    + `DEPLOY_DIR="${dir}"; ENV_FILE="${dir}/.turnkey.env"; SECRETS_DIR="${dir}/.secrets"\n`
-    + `configure "${domain}"`,
-  ], { encoding: 'utf8' });
-  return fs.readFileSync(path.join(dir, '.turnkey.env'), 'utf8');
+  try {
+    if (seed !== undefined) fs.writeFileSync(path.join(dir, '.turnkey.env'), seed);
+    execFileSync('sh', ['-c',
+      `. "${path.join(deployDir, 'karmax')}" >/dev/null 2>&1 || true\n`
+      + `DEPLOY_DIR="${dir}"; ENV_FILE="${dir}/.turnkey.env"; SECRETS_DIR="${dir}/.secrets"\n`
+      + `configure "${domain}"`,
+    ], { encoding: 'utf8' });
+    return fs.readFileSync(path.join(dir, '.turnkey.env'), 'utf8');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
+
+it('removes temporary deployment configuration fixtures', () => {
+  const fixtureDirs = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('karmax-deploy-')).sort();
+  const before = fixtureDirs();
+  runConfigure(undefined);
+  expect(fixtureDirs()).toEqual(before);
+});
 
 /** The `path` patterns of every rate-limit zone declared in the Caddyfile. */
 function zonePaths(caddyfile: string): string[] {
@@ -163,10 +184,18 @@ describe('compose forwards optional identity providers', () => {
   }
 });
 
+it('forwards optional Stripe Issuing settings in both deployment profiles', () => {
+  for (const file of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    const app = read(file).split('\n  app:')[1]?.split('\n  caddy:')[0] ?? '';
+    for (const name of ['STRIPE_CLIENT_ID', 'STRIPE_WEBHOOK_SECRET'])
+      expect(app, `${file}: ${name}`).toMatch(new RegExp(`^\\s+${name}:`, 'm'));
+  }
+});
+
 describe('compose provisions the PostgreSQL application database', () => {
   it('turnkey creates and connects the separate karmax database', () => {
     expect(read('temporal/setup-postgres.sh')).toContain('--db karmax create');
-    expect(read('compose.turnkey.yml')).toMatch(/KARMAX_DATABASE_URL:\s+postgres:\/\/[^\n]+\/karmax/);
+    expect(read('compose.turnkey.yml')).toContain('KARMAX_DATABASE_URL_FILE: /run/karmax-database/database_url');
   });
 
   it('managed hosting mounts the database URL as a secret', () => {
@@ -230,4 +259,15 @@ describe('deploy/karmax preserves operator settings across a re-run', () => {
     expect(result).toContain('KARMAX_PREVIEW_DOMAIN=preview.krmax.example.com');
     expect(result).toMatch(/^POSTGRES_PASSWORD=.+$/m);
   });
+});
+
+it('gives app responses without a policy a locked-down default on the console origin only', () => {
+  const caddyfile = read('Caddyfile');
+  const site = (name: string) => caddyfile.slice(caddyfile.indexOf(`${name} {`), caddyfile.indexOf('\n}\n', caddyfile.indexOf(`${name} {`)));
+  // `?` sets the header only when the upstream response has none, so the
+  // console's, public pages' and agent content's own policies stay in force.
+  expect(site('{$KARMAX_DOMAIN}')).toContain(`header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"`);
+  const security = caddyfile.slice(caddyfile.indexOf('(karmax_security) {'), caddyfile.indexOf('\n}\n', caddyfile.indexOf('(karmax_security) {')));
+  expect(security).not.toMatch(/Content-Security-Policy/i);
+  expect(site('https://')).not.toMatch(/Content-Security-Policy/i);
 });

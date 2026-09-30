@@ -41,6 +41,8 @@ it('serves token-only checkout, verifies raw HTTP webhooks, and keeps payment co
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'],
     executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined });
   try {
+    const checkoutResponse = await fetch(`${server.url}/billing/checkout`);
+    expect(checkoutResponse.headers.get('content-security-policy')).toContain("script-src 'self' https://cdn.paddle.com");
     const configResponse = await fetch(`${server.url}/api/subscriptions/paddle/checkout-config`);
     expect(configResponse.headers.get('cache-control')).toBe('no-store');
     expect(await configResponse.json()).toEqual({ environment: 'sandbox', clientToken: 'test_public' });
@@ -68,6 +70,16 @@ it('serves token-only checkout, verifies raw HTTP webhooks, and keeps payment co
     });
     expect(await page.locator('#checkout-status').innerText()).toContain('Payment received');
     expect(await page.locator('#checkout-retry').isHidden()).toBe(true);
+    await page.goto(`${server.url}/billing/checkout?_ptxn=txn_${'a'.repeat(26)}&success=https://attacker.test/`);
+    await page.getByText('Test checkout — no real payment.').waitFor();
+    await page.evaluate(() => (globalThis as any).paddleOptions.eventCallback({ name: 'checkout.completed' }));
+    expect(new URL(page.url()).origin).toBe(server.url);
+    expect(await page.locator('#checkout-status').innerText()).toContain('Payment received');
+    await page.route('**/checkout-return', route => route.fulfill({ contentType: 'text/html', body: '<p>Returned</p>' }));
+    await page.goto(`${server.url}/billing/checkout?_ptxn=txn_${'a'.repeat(26)}&success=${encodeURIComponent(server.url + '/checkout-return')}`);
+    await page.getByText('Test checkout — no real payment.').waitFor();
+    await page.evaluate(() => (globalThis as any).paddleOptions.eventCallback({ name: 'checkout.completed' }));
+    await page.waitForURL('**/checkout-return');
     await page.goto(`${server.url}/billing/checkout?_ptxn=invalid`);
     await page.getByText('Start checkout from your organization’s Plan & billing settings.').waitFor();
     expect(errors).toEqual([]);

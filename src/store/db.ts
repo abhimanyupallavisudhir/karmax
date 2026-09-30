@@ -1,3 +1,4 @@
+import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { humanAudience, reviewAudience, runAudience, runAudienceAsync } from './task-audience.js';
@@ -10,6 +11,7 @@ import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
+import { watchAuthorityWrites } from './authorization-epoch.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { importSqliteDatabase, type SqliteImportResult } from './postgres-migration.js';
 import { passEntryMetadata } from '../autonomy/pass-path.js';
@@ -21,6 +23,7 @@ import {
   TaskParams,
   AgentProfile,
   TaskView,
+  ChildTaskSummary,
   ReviewInfo,
   KarmaxEvent,
   Tag,
@@ -76,6 +79,9 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
+import { paymentMerchantMatches } from '../util/payment-merchant.js';
+import { PermissionRequests } from '../platform/permission-requests.js';
+import { withPullRequestStates } from '../integrations/github-pr.js';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -98,6 +104,34 @@ export interface CollaborationRequest {
 }
 
 /**
+ * Where a workflow publication sits in its task's history (WF-27): the
+ * publishing run, the view's `updatedAt` (that run's history length, so
+ * monotonic within the run) and the conversation revision it references.
+ */
+export interface ViewPublicationOrder {
+  runId: string;
+  seq: number;
+  revision?: number;
+}
+
+/** Conversation references are `${runId}:${revision}` (conversationPublisher):
+ * does `stored` hold the same run's conversation at `reference`'s revision or later? */
+function conversationSupersedes(stored: string, reference: string): boolean {
+  const revision = (value: string) => {
+    const at = value.lastIndexOf(':');
+    const n = Number(value.slice(at + 1));
+    return at > 0 && /^\d+$/.test(value.slice(at + 1)) && Number.isSafeInteger(n) ? { run: value.slice(0, at), n } : undefined;
+  };
+  const a = revision(stored), b = revision(reference);
+  return Boolean(a && b && a.run === b.run && a.n >= b.n);
+}
+
+/** A task's accepted publication position plus the runs it has moved past. */
+interface ViewOrderState { runId: string; seq: number; revision: number; retired: string[] }
+/** Runs a task replaces are few; remember enough to outlast a straggler. */
+const RETIRED_VIEW_RUNS = 16;
+
+/**
  * Terminal statuses that auto-archive a task when it first reaches one (see
  * `Store.saveView`). Only fully-resolved outcomes — a failed task stays visible
  * because it usually needs attention.
@@ -118,6 +152,13 @@ const AUTO_ARCHIVE_STATUS = new Set<string>(['done', 'cancelled']);
 const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
 
 /**
+ * Statuses that withdraw a task's pending permission requests (PL-10). Not
+ * `failed`, for the reason above: reconcile fails every task a crash stopped, and
+ * recovery resumes them still waiting on their requests.
+ */
+const WITHDRAW_REQUESTS_STATUS = new Set<string>(['done', 'cancelled']);
+
+/**
  * Does an event type mean "a human is being asked to review this"? Such events
  * are routed to the review audience as an ACTIONABLE inbox item.
  *
@@ -131,7 +172,7 @@ const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
  * `github.pr.review` and `preview.requested` do not.
  */
 export const isReviewRequestEvent = (type: string): boolean =>
-  /(^|-)review-requested$/.test(type.replace(/[._]/g, '-'));
+  !type.startsWith('github.') && /(^|-)review-requested$/.test(type.replace(/[._]/g, '-'));
 
 /**
  * The metadata index. Temporal holds the authoritative live workflow state;
@@ -161,14 +202,14 @@ export class Store {
 
     this.hosted = options.hosted === true;
     if (dbPath !== ':memory:' && !isPostgresTarget(dbPath)) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    this.db = openSqlDatabase(dbPath);
+    this.db = watchAuthorityWrites(openSqlDatabase(dbPath));
     // busy_timeout first: waiting (up to 5s) on a locked database beats failing
     // the caller outright. tsx-watch restarts overlap the outgoing and incoming
     // app for a few seconds, and the newcomer's boot writes (migrations,
     // credential registration) must not instantly kill a long agent turn's
     // event append with "database is locked" (that error cost a merge-agent
     // turn mid-conflict-resolution — the 05f9802 postmortem).
-    (await this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;'));
+    (await this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;'));
     (await this.migrate());
     (await this.migrateData());
     (await this.migrateConversations());
@@ -213,13 +254,12 @@ export class Store {
     });
   }
 
-  /** One-time data migrations (idempotent; run every boot). */
-  private async migrateData() {
+  /** One-time data migrations. Legacy imports explicitly rerun them after copying rows. */
+  private async migrateData(force = false) {
     return this.db.transaction(async () => {
-
-    // Notifications whose ask was already answered — the backlog older builds
-    // never removed, and a net for any closing event this install missed.
-    (await this.pruneStaleInbox());
+    const marker = process.env.KARMAX_DEPLOYMENT === 'hosted'
+      ? 'migration:data-2026-09-26:hosted' : 'migration:data-2026-09-26';
+    if (!force && await this.kvGet(marker)) return;
 
     // Early organization-policy builds expanded their infrastructure defaults
     // into every project. Those records accidentally became permanent project
@@ -282,9 +322,7 @@ export class Store {
       }
     }
 
-    // Turn caps are now optional (unlimited by default). Strip the legacy caps
-    // that older builds seeded onto the role-default profiles so existing installs
-    // match the new "no limit unless you set one" behavior.
+    // Migrate role-default capabilities while preserving user-configured turn caps.
     const rows = (await this.db.prepare("SELECT id, json FROM profiles WHERE id LIKE '%-default'").all()) as any[];
     for (const r of rows) {
       let p: any;
@@ -308,10 +346,6 @@ export class Store {
       if (Array.isArray(p.capabilities) && p.capabilities.includes('task:world:read')) {
         p.capabilities = [...new Set(p.capabilities.filter((capability: string) => capability !== 'task:world:read')
           .concat(['task:git:publish', 'task:git:import']))];
-        profileChanged = true;
-      }
-      if (p.maxTurns !== undefined) {
-        delete p.maxTurns;
         profileChanged = true;
       }
       // Only write when something actually changed: an unconditional UPDATE
@@ -362,6 +396,7 @@ export class Store {
     (await this.db.prepare(`DELETE FROM usage_events WHERE provider='e2b' AND kind='world.active'
       AND (metadata IS NULL OR json_extract(metadata, '$.source') IS NULL
         OR json_extract(metadata, '$.source') != 'provider-lifecycle')`).run());
+    (await this.kvSet(marker, '1'));
   
     });
   }
@@ -382,7 +417,7 @@ export class Store {
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, listId TEXT NOT NULL,
         title TEXT NOT NULL, workflow TEXT NOT NULL, workflowVersion TEXT NOT NULL,
         params TEXT NOT NULL, createdAt INTEGER NOT NULL, ord INTEGER NOT NULL,
-        parentTaskId TEXT, lastView TEXT, createdBy TEXT, assignee TEXT,
+        parentTaskId TEXT, lastView TEXT, completedAt INTEGER, createdBy TEXT, assignee TEXT,
         delegate TEXT, confirmationPolicy TEXT
       );
       CREATE TABLE IF NOT EXISTS organizations (
@@ -475,10 +510,13 @@ export class Store {
       CREATE TABLE IF NOT EXISTS github_webhook_deliveries (
         deliveryId TEXT PRIMARY KEY, event TEXT NOT NULL, receivedAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS github_pr_observations (
+        digest TEXT PRIMARY KEY, createdAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS github_install_states (
         tokenHash TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT NOT NULL,
         createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, usedAt INTEGER,
-        returnTo TEXT, githubAccountId TEXT, githubLogin TEXT, selectAccount INTEGER
+        returnTo TEXT, githubAccountId TEXT, githubLogin TEXT, selectAccount INTEGER, purpose TEXT
       );
       CREATE TABLE IF NOT EXISTS world_instances (
         worldId TEXT NOT NULL, generation INTEGER NOT NULL, handle TEXT NOT NULL,
@@ -614,8 +652,12 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS scoped_tokens (
         tokenHash TEXT PRIMARY KEY, tokenId TEXT NOT NULL UNIQUE, json TEXT NOT NULL,
-        expiresAt INTEGER NOT NULL, revokedAt INTEGER
+        expiresAt INTEGER NOT NULL, revokedAt INTEGER, principal TEXT, organizationId TEXT
       );
+      CREATE TABLE IF NOT EXISTS scoped_token_projects (
+        tokenHash TEXT NOT NULL, projectId TEXT NOT NULL, PRIMARY KEY(tokenHash, projectId)
+      );
+      CREATE INDEX IF NOT EXISTS idx_scoped_token_projects_project ON scoped_token_projects(projectId, tokenHash);
       CREATE TABLE IF NOT EXISTS human_delegations (
         id TEXT PRIMARY KEY,
         json TEXT NOT NULL,
@@ -765,12 +807,14 @@ export class Store {
         PRIMARY KEY(attachmentId, projectId)
       );
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
+      CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parentTaskId);
       CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_memberships(userId, organizationId);
       CREATE INDEX IF NOT EXISTS idx_project_members_principal ON project_memberships(principalKey, projectId);
       CREATE INDEX IF NOT EXISTS idx_inbox_user ON inbox(userId, unread, createdAt DESC);
       CREATE INDEX IF NOT EXISTS idx_inbox_task ON inbox(taskId, kind);
       CREATE INDEX IF NOT EXISTS idx_repositories_org ON repositories(organizationId, owner, name);
       CREATE INDEX IF NOT EXISTS idx_github_install_states_expiry ON github_install_states(expiresAt, usedAt);
+      CREATE INDEX IF NOT EXISTS idx_github_pr_observations_created ON github_pr_observations(createdAt);
       CREATE INDEX IF NOT EXISTS idx_scoped_tokens_expiry ON scoped_tokens(expiresAt);
       CREATE INDEX IF NOT EXISTS idx_human_delegations_expiry ON human_delegations(expiresAt);
       CREATE INDEX IF NOT EXISTS idx_world_instances_current ON world_instances(worldId, generation DESC);
@@ -792,6 +836,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
       CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(state, nextAt);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
+      CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, taskId);
+      CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts, seq);
       CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts, seq);
       CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
       CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);
@@ -802,6 +848,13 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_subscription_billing_requests_org
         ON subscription_billing_requests(organizationId, createdAt);
     `));
+    if (this.db.dialect === 'postgres')
+      await this.db.exec('CREATE INDEX IF NOT EXISTS idx_kv_key_c ON kv (k COLLATE "C")');
+    if (!(await this.kvGet('migration:github-pr-observations'))) {
+      await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
+        .run('github:pr-observation:v1:', 'github:pr-observation:v1;');
+      await this.kvSet('migration:github-pr-observations', '1');
+    }
     // An installation belongs to a GitHub account, which may serve multiple
     // Tavya organizations. Rebuild the old inline UNIQUE constraint atomically;
     // IDs stay intact so repository links and cached credential handles survive.
@@ -850,6 +903,34 @@ export class Store {
     const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
+    const scopedTokenCols = await this.db.prepare('PRAGMA table_info(scoped_tokens)').all() as Array<{ name: string }>;
+    if (!scopedTokenCols.some((column) => column.name === 'principal'))
+      (await this.db.exec('ALTER TABLE scoped_tokens ADD COLUMN principal TEXT'));
+    if (!scopedTokenCols.some((column) => column.name === 'organizationId'))
+      (await this.db.exec('ALTER TABLE scoped_tokens ADD COLUMN organizationId TEXT'));
+    (await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_scoped_tokens_principal ON scoped_tokens(principal, revokedAt);
+      CREATE INDEX IF NOT EXISTS idx_scoped_tokens_organization ON scoped_tokens(organizationId, revokedAt)`));
+    for (const row of await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE principal IS NULL').all() as Array<{ tokenHash: string; json: string }>) {
+      let record: Record<string, unknown>;
+      try { record = JSON.parse(row.json); } catch { continue; }
+      (await this.db.prepare('UPDATE scoped_tokens SET principal=?, organizationId=? WHERE tokenHash=?')
+        .run(typeof record.principal === 'string' ? record.principal : '',
+          typeof record.organizationId === 'string' ? record.organizationId : null, row.tokenHash));
+      for (const projectId of await this.scopedTokenProjectIds(record))
+        (await this.db.prepare('INSERT OR IGNORE INTO scoped_token_projects(tokenHash,projectId) VALUES (?,?)')
+          .run(row.tokenHash, projectId));
+    }
+    if (!cols.some((c) => c.name === 'completedAt')) {
+      (await this.db.exec('ALTER TABLE tasks ADD COLUMN completedAt INTEGER'));
+      (await this.db.exec(`UPDATE tasks SET completedAt=(SELECT MIN(e.ts) FROM events e
+        WHERE e.taskId=tasks.id AND e.type='view.updated'
+          AND json_extract(e.payload, '$.status')='done')
+        WHERE EXISTS (SELECT 1 FROM events e WHERE e.taskId=tasks.id
+          AND e.type='view.updated' AND json_extract(e.payload, '$.status')='done');
+        UPDATE tasks SET completedAt=CAST(json_extract(lastView, '$.updatedAt') AS BIGINT)
+        WHERE completedAt IS NULL AND json_extract(lastView, '$.status')='done'`));
+    }
+    (await this.db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_completed_at ON tasks(completedAt, projectId)'));
     const projectCols = (await this.db.prepare('PRAGMA table_info(projects)').all()) as any[];
     const cardCols = (await this.db.prepare('PRAGMA table_info(cards)').all()) as { name: string }[];
     if (!cardCols.some((c) => c.name === 'externalId')) (await this.db.exec('ALTER TABLE cards ADD COLUMN externalId TEXT'));
@@ -889,6 +970,10 @@ export class Store {
       (await this.db.exec("ALTER TABLE usage_events ADD COLUMN fundingSource TEXT NOT NULL DEFAULT 'customer'"));
     if (!usageCols.some((c) => c.name === 'costClassification'))
       (await this.db.exec("ALTER TABLE usage_events ADD COLUMN costClassification TEXT NOT NULL DEFAULT 'none'"));
+    // Self-healing on every boot (a rollback can write unclassified rows again),
+    // but served by a partial index that holds only the rows still to repair,
+    // so it no longer scans the whole usage ledger at each start (PS-5).
+    (await this.db.exec("CREATE INDEX IF NOT EXISTS idx_usage_unclassified ON usage_events(id) WHERE costMicros>0 AND costClassification='none'"));
     (await this.db.exec("UPDATE usage_events SET costClassification='incurred' WHERE costMicros>0 AND costClassification='none'"));
     const usageAdmissionCols = (await this.db.prepare('PRAGMA table_info(usage_admissions)').all()) as { name: string }[];
     if (!usageAdmissionCols.some((c) => c.name === 'reservedCostMicros'))
@@ -902,6 +987,8 @@ export class Store {
       (await this.db.exec('ALTER TABLE github_install_states ADD COLUMN githubLogin TEXT'));
     if (!githubStateCols.some((c) => c.name === 'selectAccount'))
       (await this.db.exec('ALTER TABLE github_install_states ADD COLUMN selectAccount INTEGER'));
+    if (!githubStateCols.some((c) => c.name === 'purpose'))
+      (await this.db.exec('ALTER TABLE github_install_states ADD COLUMN purpose TEXT'));
     const wikiVersionCols = (await this.db.prepare('PRAGMA table_info(organization_wiki_versions)').all()) as any[];
     if (!wikiVersionCols.some((c) => c.name === 'previousPath'))
       (await this.db.exec('ALTER TABLE organization_wiki_versions ADD COLUMN previousPath TEXT'));
@@ -1095,6 +1182,24 @@ export class Store {
     return ((await this.db.prepare('SELECT * FROM projects ORDER BY ord, createdAt').all()) as any[]).map(
       rowToProject,
     );
+  }
+
+  /** Projects a user's grants or memberships reach, directly or through a team
+   *  or organization. Candidates only: authorization still decides each one. */
+  async listProjectsReachableBy(userId: string): Promise<Project[]> {
+    return (await this.readRows<any>(`SELECT p.* FROM projects p WHERE EXISTS (SELECT 1 FROM principal_grants g
+        WHERE g.principalId=? AND (g.scopeKey='global' OR g.scopeKey='project:' || p.id
+          OR g.scopeKey='organization:' || COALESCE(p.organizationId, 'org_personal')))
+      OR EXISTS (SELECT 1 FROM project_memberships m WHERE m.projectId=p.id AND (m.principalKey=?
+        OR m.principalKey IN (SELECT 'team:' || teamId FROM team_memberships WHERE userId=?)
+        OR m.principalKey IN (SELECT 'organization:' || organizationId FROM organization_memberships WHERE userId=?)))
+      ORDER BY p.ord, p.createdAt`, [`user:${userId}`, `user:${userId}`, userId, userId])).map(rowToProject);
+  }
+
+  /** One organization's projects, without reading any other tenant's rows. */
+  async listOrganizationProjects(organizationId: string): Promise<Project[]> {
+    return (await this.readRows<any>(`SELECT * FROM projects WHERE COALESCE(organizationId, 'org_personal')=?
+      ORDER BY ord, createdAt`, [organizationId])).map(rowToProject);
   }
 
   async renameProject(id: string, name: string): Promise<Project> {
@@ -1473,6 +1578,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM world_leases WHERE projectId=?').run(id));
+      (await this.db.prepare('DELETE FROM usage_admissions WHERE projectId=?').run(id));
       (await this.db.prepare('UPDATE usage_events SET projectId=NULL, taskId=NULL, worldId=NULL, metadata=NULL WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM settings WHERE scopeKey IN (?, ?)').run(id, `quick:${id}`));
       (await this.db.prepare('DELETE FROM cards WHERE scopeId=?').run(id));
@@ -1622,9 +1728,15 @@ export class Store {
     return value;
   }
 
-  async createOrganization(input: { name: string; slug?: string; kind?: Organization['kind']; ownerUserId?: string }): Promise<Organization> {
+  async createOrganization(input: { name: string; slug?: string; kind?: Organization['kind']; ownerUserId?: string; maxOwned?: number }): Promise<Organization> {
     return this.db.transaction(async () => {
 
+    if (input.ownerUserId && input.maxOwned != null) {
+      const count = (await this.db.prepare("SELECT COUNT(*) AS n FROM organization_memberships WHERE userId=? AND role='owner'")
+        .get(input.ownerUserId)) as { n: number };
+      if (Number(count.n) >= input.maxOwned)
+        throw Object.assign(new Error('organization limit reached'), { status: 429 });
+    }
     assertRoutableName('organization', input.name, input.slug);
     const name = (await this.assertOrganizationNameAvailable(input.name,
       input.kind === 'personal' ? { allowUserId: input.ownerUserId } : undefined));
@@ -1889,8 +2001,6 @@ export class Store {
    * their tasks and notifications, and their own authorization history. It must
    * never become a shortcut for downloading every organization they belong to. */
   async exportUserData(userId: string, email?: string): Promise<Record<string, unknown>> {
-    return this.db.transaction(async () => {
-
     const includeTiming = (await this.getSettings('global', 'timing'))?.enabled === true;
     const principalId = `user:${userId}`;
     const memberships = (await selectRows(this.db, 'organization_memberships', 'userId=?', [userId]));
@@ -2011,8 +2121,6 @@ export class Store {
         auditLog,
       },
     };
-  
-    });
   }
 
   async projectResources(projectId: string): Promise<{ worlds: WorldHandleRef[]; objectKeys: string[];
@@ -2378,9 +2486,8 @@ export class Store {
       for (const projectId of projectIds)
         (await this.db.prepare('DELETE FROM principal_grants WHERE principalId=? AND scopeKey=?').run(`user:${userId}`, `project:${projectId}`));
       (await this.db.prepare('DELETE FROM principal_grants WHERE principalId=? AND scopeKey=?').run(`user:${userId}`, `organization:${organizationId}`));
-      for (const row of (await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL').all()) as any[]) {
-        try { if (JSON.parse(row.json).principal === `user:${userId}`) (await this.revokeScopedToken({ tokenHash: row.tokenHash })); } catch {}
-      }
+      (await this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE principal=? AND revokedAt IS NULL')
+        .run(Date.now(), `user:${userId}`));
       (await this.revokeHumanDelegations({ humanUserId: userId }));
       (await this.db.exec('COMMIT'));
     } catch (error) {
@@ -2461,7 +2568,7 @@ export class Store {
     // creation idempotent and prevent double-click/network retries from drawing
     // the same team twice.
     const existing = (await this.db.prepare(`SELECT * FROM teams WHERE organizationId=?
-      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      AND ((projectId IS NULL AND CAST(? AS TEXT) IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
       .get(organization.id, input.projectId ?? null, input.projectId ?? null, slug)) as any;
     if (existing) return rowToTeam(existing);
     const team: Team = { id: newId('team'), organizationId: organization.id, projectId: input.projectId,
@@ -2503,10 +2610,10 @@ export class Store {
     if (!name) throw new Error('team name is required');
     const slug = slugify(name);
     const conflict = (await this.db.prepare(`SELECT id FROM teams WHERE organizationId=? AND id<>?
-      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      AND ((projectId IS NULL AND CAST(? AS TEXT) IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
       .get(team.organizationId, team.id, team.projectId ?? null, team.projectId ?? null, slug)) as any;
     const aliasConflict = (await this.db.prepare(`SELECT teamId FROM team_aliases WHERE organizationId=? AND teamId<>?
-      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      AND ((projectId IS NULL AND CAST(? AS TEXT) IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
       .get(team.organizationId, team.id, team.projectId ?? null, team.projectId ?? null, slug)) as any;
     if (conflict || aliasConflict) throw new Error(`a team already uses @team:${slug}`);
     (await this.db.exec('BEGIN IMMEDIATE'));
@@ -2533,6 +2640,15 @@ export class Store {
     const selectors = [`team:${team.id}`, `@team:${team.slug}`,
       ...((await this.db.prepare('SELECT slug FROM team_aliases WHERE teamId=?').all(team.id)) as any[])
         .map((row) => `@team:${String(row.slug)}`)];
+    const mentionsTeam = (json: string | null): boolean => {
+      if (!json) return false;
+      const contains = (value: unknown): boolean => typeof value === 'string'
+        ? selectors.includes(value)
+        : Array.isArray(value) ? value.some(contains)
+          : value !== null && typeof value === 'object' && Object.values(value).some(contains);
+      try { return contains(JSON.parse(json)); }
+      catch { return selectors.some((selector) => json.includes(selector)); }
+    };
     const projectUse = (await this.db.prepare('SELECT COUNT(*) count FROM project_memberships WHERE principalKey=?')
       .get(`team:${team.id}`)) as any;
     const projectIds = ((await this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(team.organizationId)) as any[])
@@ -2540,12 +2656,12 @@ export class Store {
     const settingScopes = new Set([`organization:${team.organizationId}`, `quick:organization:${team.organizationId}`,
       ...projectIds, ...projectIds.map((projectId) => `quick:${projectId}`)]);
     const settingUse = ((await this.db.prepare('SELECT scopeKey, json FROM settings').all()) as any[])
-      .some((row) => settingScopes.has(String(row.scopeKey)) && selectors.some((selector) => String(row.json).includes(selector)));
+      .some((row) => settingScopes.has(String(row.scopeKey)) && mentionsTeam(String(row.json)));
     const unfinishedUse = ((await this.db.prepare(`SELECT params, lastView FROM tasks t JOIN projects p ON p.id=t.projectId
       WHERE p.organizationId=?`).all(team.organizationId)) as any[]).some((row) => {
         let done = false;
         try { done = ['done', 'failed', 'cancelled'].includes(String(JSON.parse(row.lastView ?? '{}').status)); } catch {}
-        return !done && selectors.some((selector) => String(row.params).includes(selector) || String(row.lastView).includes(selector));
+        return !done && (mentionsTeam(row.params) || mentionsTeam(row.lastView));
       });
     if (Number(projectUse?.count ?? 0) || settingUse || unfinishedUse)
       throw new Error('This team is still used by project access or a workflow route. Remove those references before deleting it.');
@@ -2710,10 +2826,15 @@ export class Store {
     return this.db.transaction(async () => {
 
     if (!/^git@github\.com:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/.test(input.sshUrl)) throw new Error('repository must use a GitHub SSH URL');
-    const existing = (await this.db.prepare('SELECT id, createdAt FROM repositories WHERE organizationId=? AND provider=? AND owner=? AND name=?')
+    const byProvider = input.providerId ? await this.db.prepare(
+      'SELECT id, createdAt FROM repositories WHERE organizationId=? AND provider=? AND providerId=?')
+      .get(input.organizationId, input.provider, input.providerId) as any : undefined;
+    const existing = byProvider ?? (await this.db.prepare('SELECT id, createdAt FROM repositories WHERE organizationId=? AND provider=? AND owner=? AND name=?')
       .get(input.organizationId, input.provider, input.owner, input.name)) as any;
+    if (byProvider) await this.db.prepare('UPDATE repositories SET owner=?, name=? WHERE id=?')
+      .run(input.owner, input.name, byProvider.id);
     const now = Date.now();
-    const repository: Repository = { ...input, id: input.id ?? existing?.id ?? newId('repo'), createdAt: existing?.createdAt ?? now, updatedAt: now };
+    const repository: Repository = { ...input, id: existing?.id ?? input.id ?? newId('repo'), createdAt: existing?.createdAt ?? now, updatedAt: now };
     (await this.db.prepare(`INSERT INTO repositories (id, organizationId, provider, providerId, owner, name, sshUrl, defaultBranch, private, gitConnectionId, createdAt, updatedAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(organizationId, provider, owner, name) DO UPDATE SET
       providerId=excluded.providerId, sshUrl=excluded.sshUrl, defaultBranch=excluded.defaultBranch,
@@ -2800,9 +2921,12 @@ export class Store {
   /** One-time, user-bound state for GitHub's browser installation callback.
    * Only its SHA-256 digest is durable, so a database read cannot mint a valid
    * callback. The state is consumed atomically before any GitHub API call. */
+  /** A one-use token binding a GitHub redirect to the karmax user who started it.
+   *  `purpose: 'manifest'` marks the App-creation flow, the only one whose
+   *  callback may configure the installation-wide App (see the gateway). */
   async createGithubInstallState(organizationId: string, userId: string,
     options: number | { ttlMs?: number; returnTo?: 'profile' | 'installation'; githubAccountId?: string;
-      githubLogin?: string; selectAccount?: boolean } = {}): Promise<string> {
+      githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest' } = {}): Promise<string> {
     return this.db.transaction(async () => {
 
     if (!(await this.organizationMembership(organizationId, userId))) throw new Error('user is not an organization member');
@@ -2813,26 +2937,27 @@ export class Store {
     const githubAccountId = typeof options === 'object' ? options.githubAccountId?.trim() : undefined;
     const githubLogin = typeof options === 'object' ? options.githubLogin?.trim() : undefined;
     const selectAccount = typeof options === 'object' && options.selectAccount;
+    const purpose = typeof options === 'object' && options.purpose === 'manifest' ? 'manifest' : null;
     (await this.db.prepare('DELETE FROM github_install_states WHERE expiresAt<=? OR usedAt IS NOT NULL').run(now));
     (await this.db.prepare(`INSERT INTO github_install_states
-      (tokenHash, organizationId, userId, createdAt, expiresAt, usedAt, returnTo, githubAccountId, githubLogin, selectAccount)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`)
+      (tokenHash, organizationId, userId, createdAt, expiresAt, usedAt, returnTo, githubAccountId, githubLogin, selectAccount, purpose)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`)
       .run(sha256(state), organizationId, userId, now, now + Math.max(60_000, ttlMs), returnTo ?? null,
-        githubAccountId ?? null, githubLogin ?? null, selectAccount ? 1 : 0));
+        githubAccountId ?? null, githubLogin ?? null, selectAccount ? 1 : 0, purpose));
     return state;
   
     });
   }
 
   async consumeGithubInstallState(state: string, userId: string): Promise<{ organizationId: string; returnTo?: 'profile' | 'installation';
-    githubAccountId?: string; githubLogin?: string; selectAccount?: boolean } | undefined> {
+    githubAccountId?: string; githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest' } | undefined> {
     return this.db.transaction(async () => {
 
     const hash = sha256(state);
     const now = Date.now();
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      const row = (await this.db.prepare(`SELECT organizationId, userId, returnTo, githubAccountId, githubLogin, selectAccount FROM github_install_states
+      const row = (await this.db.prepare(`SELECT organizationId, userId, returnTo, githubAccountId, githubLogin, selectAccount, purpose FROM github_install_states
         WHERE tokenHash=? AND usedAt IS NULL AND expiresAt>?`).get(hash, now)) as any;
       if (!row || row.userId !== userId) {
         (await this.db.exec('ROLLBACK'));
@@ -2847,6 +2972,7 @@ export class Store {
         ...(row.githubAccountId ? { githubAccountId: String(row.githubAccountId) } : {}),
         ...(row.githubLogin ? { githubLogin: String(row.githubLogin) } : {}),
         ...(row.selectAccount ? { selectAccount: true } : {}),
+        ...(row.purpose === 'manifest' ? { purpose: 'manifest' as const } : {}),
       };
     } catch (error) {
       (await this.db.exec('ROLLBACK'));
@@ -3080,6 +3206,8 @@ export class Store {
 
   async createTask(input: {
     projectId: string;
+    /** Stable activity identity for retry-safe child creation. */
+    idempotencyKey?: string;
     listId?: string;
     title: string;
     workflow: string;
@@ -3096,6 +3224,19 @@ export class Store {
     confirmer?: unknown;
   }): Promise<TaskRecord> {
     return this.db.transaction(async () => {
+
+    const creationKey = input.idempotencyKey ? `task-create:${input.idempotencyKey}` : undefined;
+    if (creationKey) {
+      // The no-op conflict update serializes concurrent retries on PostgreSQL too.
+      await this.db.prepare("INSERT INTO kv (k, v) VALUES (?, '') ON CONFLICT(k) DO UPDATE SET v = kv.v").run(creationKey);
+      const priorId = await this.kvGet(creationKey);
+      if (priorId) {
+        const prior = await this.getTask(priorId);
+        if (!prior || prior.projectId !== input.projectId || prior.parentTaskId !== input.parentTaskId)
+          throw new Error('task creation retry no longer matches its recorded child');
+        return prior;
+      }
+    }
 
     for (const principal of [input.createdBy, input.assignee, input.delegate])
       if (principal?.kind === 'user' && await this.kvGet(`account-closed:${principal.userId}`)) throw new Error('account is closed');
@@ -3184,6 +3325,7 @@ export class Store {
       (await this.db.prepare('INSERT INTO task_intents (id, principalAttemptId, confirmer, createdAt) VALUES (?, ?, ?, ?)')
         .run(intentId, id, input.confirmer === undefined ? null : JSON.stringify(input.confirmer), t.createdAt));
     }
+    if (creationKey) await this.kvSet(creationKey, t.id);
     return t;
   
     });
@@ -3333,8 +3475,8 @@ export class Store {
 
   /** Project default is read at Review time, including for already-running tasks. */
   async otherAttemptsDefault(taskId: string): Promise<'ask' | 'keep' | 'cancel'> {
-    const task = (await this.getTask(taskId));
-    const value = task && (await this.getSettings(task.projectId, '__common__'))?.otherAttempts;
+    const projectId = await this.taskProjectIdAsync(taskId);
+    const value = projectId && (await this.getSettings(projectId, '__common__'))?.otherAttempts;
     return value === 'keep' || value === 'cancel' ? value : 'ask';
   }
 
@@ -3495,6 +3637,13 @@ export class Store {
     return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
   }
 
+  /** Poll task liveness without loading its conversation or subscriber graph. */
+  async taskExecutionState(id: string): Promise<{ status?: string; agentTurn: boolean } | undefined> {
+    const row = await this.db.prepare(`SELECT json_extract(lastView, '$.status') AS status,
+      json_extract(lastView, '$.agentTurn') IS NOT NULL AS agentTurn FROM tasks WHERE id = ?`).get(id) as any;
+    return row ? { status: row.status ?? undefined, agentTurn: Boolean(row.agentTurn) } : undefined;
+  }
+
   async getTask(id: string): Promise<TaskRecord | undefined> {
     const r = (await this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id = ?`).get(id)) as any;
@@ -3505,6 +3654,31 @@ export class Store {
     t.subscribers = (await this.subscribersFor(id));
     if (t.confirmationPolicy) t.reviewers = (await this.reviewAudience(t));
     return t;
+  }
+
+  /** Each child's list fields, archived children included, for its parent's
+   * Sub-tasks panel (`TaskView.subTaskSummaries`). */
+  async childTaskSummaries(parentTaskId: string): Promise<ChildTaskSummary[]> {
+    const rows = await this.readRows<{ id: string; num: number | null; title: string; workflow: string; lastView: string | null }>(
+      // Children spawned in one turn share a millisecond and ids end in random
+      // bytes; `ord` is the list position allocated at insert on both databases.
+      'SELECT id, num, title, workflow, lastView FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, ord, rowid', [parentTaskId]);
+    return rows.map((row) => {
+      const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
+      return {
+        id: row.id,
+        ...(row.num != null ? { num: row.num } : {}),
+        title: row.title,
+        workflow: row.workflow,
+        ...(view ? { lastView: {
+          stage: view.stage,
+          status: view.status,
+          ...(view.waitingFor ? { waitingFor: view.waitingFor } : {}),
+          ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
+          ...(view.state?.draft ? { state: { draft: true } } : {}),
+        } } : {}),
+      };
+    });
   }
 
   /** Resolve a task by its per-project sequential number (SPEC §10.6). */
@@ -3532,6 +3706,20 @@ export class Store {
     return (await this.attachTags(projectId, tasks));
   }
 
+  /** Reconciliation needs every live attempt, but neither tags nor full conversations. */
+  async listReconciliationCandidates(projectId: string): Promise<TaskRecord[]> {
+    const rows = await this.db.prepare(`SELECT id, num, projectId, listId, title, workflow,
+      executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId,
+      createdBy, assignee, delegate, confirmationPolicy, intentId, attemptNumber,
+      notes, lastView FROM tasks WHERE projectId=?
+      AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('done', 'failed', 'cancelled')
+      AND COALESCE(LOWER(CAST(json_extract(params, '$.draft') AS TEXT)), '') NOT IN ('true', '1')
+      AND COALESCE(json_extract(params, '$.triggerState'), '') <> 'armed'
+      AND COALESCE(LOWER(CAST(json_extract(params, '$.repeatable') AS TEXT)), '') NOT IN ('true', '1')
+      ORDER BY ord, createdAt`).all(projectId) as any[];
+    return rows.map(rowToTask);
+  }
+
   /** Tasks currently armed on a trigger (stored-not-started), across all projects.
    *  The durable source of truth the dispatcher re-arms from on boot (SPEC §3.3).
    *
@@ -3554,6 +3742,18 @@ export class Store {
     return ((await this.db.prepare(`SELECT * FROM tasks
       WHERE json_extract(params, '$.runOf') = ? ORDER BY createdAt DESC`).all(seriesId)) as any[])
       .map(rowToTask);
+  }
+
+  /** The status of some of a parent's children, without their conversations. */
+  async childTaskStates(parentTaskId: string, childTaskIds: string[]): Promise<
+    { id: string; status?: string; stage?: string; lifecycleReplacement: boolean }[]> {
+    if (!childTaskIds.length) return [];
+    const rows = (await this.db.prepare(`SELECT id, json_extract(lastView, '$.status') status,
+        json_extract(lastView, '$.stage') stage, json_extract(lastView, '$.state.lifecycleReplacement') replaced
+      FROM tasks WHERE parentTaskId = ? AND id IN (${childTaskIds.map(() => '?').join(', ')})`)
+      .all(parentTaskId, ...childTaskIds)) as { id: string; status?: string | null; stage?: string | null; replaced?: unknown }[];
+    return rows.map((row) => ({ id: row.id, status: row.status ?? undefined, stage: row.stage ?? undefined,
+      lifecycleReplacement: row.replaced === true || row.replaced === 1 || row.replaced === 'true' }));
   }
 
   async childTasks(parentTaskId: string): Promise<TaskRecord[]> {
@@ -3580,9 +3780,10 @@ export class Store {
       JOIN tasks t ON t.id=s.taskId WHERE t.projectId=? ORDER BY s.createdAt`).all(projectId)) as any[];
     const bySubscriber = new Map<string, PrincipalRef[]>();
     for (const r of subscribers) (bySubscriber.get(r.taskId) ?? bySubscriber.set(r.taskId, []).get(r.taskId)!).push(JSON.parse(r.principal));
+    const readAudience = this.audienceReader();
     for (const t of tasks) {
       t.subscribers = bySubscriber.get(t.id) ?? [];
-      if (t.confirmationPolicy) t.reviewers = (await this.reviewAudience(t));
+      if (t.confirmationPolicy) t.reviewers = await runAudienceAsync(reviewAudience(t), readAudience);
     }
     return tasks;
   }
@@ -3607,8 +3808,98 @@ export class Store {
     return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
   }
 
-  async saveView(taskId: string, view: TaskView, conversationReference?: string) {
+  /**
+   * Would this publication be older than one the task has already saved? A
+   * run's later publication supersedes its earlier ones, and a run's successor
+   * supersedes all of it: once a new run has published, only a straggler of the
+   * old run can still arrive. Equal positions are the same publication retried,
+   * or siblings of one workflow task, and are admitted.
+   */
+  async viewPublicationStale(taskId: string, order: ViewPublicationOrder): Promise<boolean> {
+    const raw = (await this.kvGet(`view-order:${taskId}`));
+    const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
+    if (!state) return false;
+    if (state.retired.includes(order.runId)) return true;
+    return state.runId === order.runId
+      && (order.seq < state.seq || (order.seq === state.seq && (order.revision ?? -1) < state.revision));
+  }
+
+  /** Stop admitting publications from a run the platform stopped itself (a
+   * manual Done): no successor run will publish to retire it. */
+  async retireViewRun(taskId: string, runId: string): Promise<void> {
     return this.db.transaction(async () => {
+      const raw = (await this.kvGet(`view-order:${taskId}`));
+      const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
+      if (state?.retired.includes(runId)) return;
+      const retired = [...(state?.retired ?? []), runId].slice(-RETIRED_VIEW_RUNS);
+      (await this.kvSet(`view-order:${taskId}`, JSON.stringify({ runId: state?.runId ?? '', seq: state?.seq ?? 0,
+        revision: state?.revision ?? -1, retired })));
+    });
+  }
+
+  private async admitViewPublication(taskId: string, order: ViewPublicationOrder): Promise<boolean> {
+    if ((await this.viewPublicationStale(taskId, order))) return false;
+    const raw = (await this.kvGet(`view-order:${taskId}`));
+    const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
+    const retired = state && state.runId && state.runId !== order.runId && !state.retired.includes(state.runId)
+      ? [...state.retired, state.runId].slice(-RETIRED_VIEW_RUNS) : state?.retired ?? [];
+    (await this.kvSet(`view-order:${taskId}`, JSON.stringify({ runId: order.runId, seq: order.seq,
+      revision: order.revision ?? -1, retired } satisfies ViewOrderState)));
+    return true;
+  }
+
+  /**
+   * DB-2: keeping each superseded full copy of a conversation until the task
+   * settled grew kv with the square of a long conversation's length. Once the
+   * task row holds `reference`, drop the snapshots nothing can read again:
+   * older ones of its run and those of runs a newer run has replaced, except
+   * what the run `retain`s (delta bases, turn transcripts and publications in
+   * flight, each read again on a retry). A newer snapshot of the run may be a
+   * concurrent publication's and is left alone.
+   */
+  private async dropSupersededSnapshots(taskId: string, reference: string, retain: string[]): Promise<void> {
+    const position = (candidate: string) => {
+      const split = candidate.lastIndexOf(':');
+      const revision = Number(candidate.slice(split + 1));
+      return split > 0 && Number.isSafeInteger(revision) ? { runId: candidate.slice(0, split), revision } : undefined;
+    };
+    const own = position(reference);
+    const raw = (await this.kvGet(`view-order:${taskId}`));
+    const retired = new Set(raw ? (JSON.parse(raw) as ViewOrderState).retired : []);
+    const prefix = `view-conversation:${taskId}:`;
+    const keys = (await this.db.prepare(`SELECT k FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
+      .all(prefix, `view-conversation:${taskId};`)) as Array<{ k: string }>;
+    for (const { k } of keys) {
+      const candidate = k.slice(prefix.length);
+      const held = position(candidate);
+      if (candidate === reference || retain.includes(candidate) || !held) continue;
+      if ((held.runId === own?.runId && held.revision < own.revision) || retired.has(held.runId))
+        (await this.db.prepare('DELETE FROM kv WHERE k=?').run(k));
+    }
+  }
+
+  /** PL-10: a finished task's pending permission requests are withdrawn, and
+   * their withdrawal discharges the recipients' inbox like a decision would. */
+  private async withdrawPermissionRequests(projectId: string, taskId: string, status: string): Promise<void> {
+    const organizationId = (await this.getProject(projectId))?.organizationId ?? 'org_personal';
+    const reason = `task ${status}`;
+    for (const request of (await new PermissionRequests(this, organizationId).withdrawForTask(taskId, reason)))
+      (await this.appendEvent({ taskId, type: 'permission.approval-resolved', ts: Date.now(),
+        payload: { requestId: request.id, action: 'withdraw', reason } }));
+  }
+
+  /** Does the task's stored conversation make `reference`'s snapshot unnecessary
+   * (the same run, at the same or a later revision)? */
+  async conversationSupersedesReference(taskId: string, reference: string): Promise<boolean> {
+    const current = (await this.db.prepare('SELECT conversationRef FROM tasks WHERE id=?').get(taskId)) as { conversationRef?: string | null } | undefined;
+    return Boolean(current?.conversationRef && conversationSupersedes(current.conversationRef, reference));
+  }
+
+  /** Returns false, and changes nothing, for a publication `order` shows is stale. */
+  async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder,
+    retain?: string[]): Promise<boolean> {
+    return this.db.transaction(async () => {
+    if (order && !(await this.admitViewPublication(taskId, order))) return false;
 
     const pending = (await this.kvGet(`pending-review:${taskId}`));
     if (pending && Object.entries(JSON.parse(pending)).every(([key, value]) =>
@@ -3626,20 +3917,39 @@ export class Store {
     // already done/cancelled) so a later view re-save can't override a user who
     // deliberately un-archived a finished task.
     const prev = (await this.taskMetadata(taskId));
+    view = withPullRequestStates(view, prev?.lastView, { mergedOnly: true });
     const { messages, transcripts, ...status } = view;
     if (conversationReference) {
       const key = `view-conversation:${taskId}:${conversationReference}`;
-      if (!(await this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(key))) throw new Error('Conversation publication snapshot is missing');
       const current = (await this.db.prepare('SELECT conversationRef FROM tasks WHERE id=?').get(taskId)) as any;
-      if (current?.conversationRef === conversationReference) {
+      // Within one run the conversation follows revisions while the status
+      // follows the workflow's order: two publishers of a run (an update handler
+      // and the main loop) can keep referring to an older revision after a newer
+      // one replaced it. Such a frame updates the status and keeps the newer
+      // conversation, and never needs the snapshot it names (DB-2 dropped it).
+      if (current?.conversationRef && conversationSupersedes(current.conversationRef, conversationReference)) {
+        (await this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId));
+      } else if (!(await this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(key))) {
+        throw new Error('Conversation publication snapshot is missing');
+      } else if (current?.conversationRef === conversationReference) {
         (await this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId));
       } else {
         (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=(SELECT v FROM kv WHERE k=?), conversationRef=? WHERE id=?')
           .run(JSON.stringify(status), key, conversationReference, taskId));
+        (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
+        // Only a publisher that says what it still reads may drop snapshots:
+        // one the previous release scheduled before a deploy says nothing, and
+        // the run's next delta or turn may build on what it would drop.
+        if (retain) (await this.dropSupersededSnapshots(taskId, conversationReference, retain));
       }
+    } else if (messages === undefined && transcripts === undefined) {
+      // A status-only view (reconcile and lifecycle repairs read `lastView`
+      // without the conversation column) must never erase the stored transcript.
+      (await this.db.prepare('UPDATE tasks SET lastView=? WHERE id=?').run(JSON.stringify(status), taskId));
     } else {
       (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=?, conversationRef=NULL WHERE id=?')
         .run(JSON.stringify(status), JSON.stringify({ messages, transcripts }), taskId));
+      (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
     }
     if (view.stage === 'review' && view.status === 'waiting'
       && (prev?.lastView?.stage !== 'review' || prev.lastView.status !== 'waiting') && prev?.confirmationPolicy) {
@@ -3661,7 +3971,16 @@ export class Store {
     // an already-finished task is not a repeated delete over the same rows.
     const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
     if (settledNow) (await this.pruneAgentOutput(taskId));
-  
+    if (['done', 'cancelled', 'failed'].includes(view.status)) (await this.retireTaskSpendRequests(taskId, view.status));
+    if (prev && WITHDRAW_REQUESTS_STATUS.has(view.status) && !WITHDRAW_REQUESTS_STATUS.has(prev.lastView?.status ?? ''))
+      (await this.withdrawPermissionRequests(prev.projectId, taskId, view.status));
+    // `retentionSweep` measures its window from here: a workflow's `updatedAt`
+    // is its history length, not a time. Resuming the task restarts the clock.
+    if (['done', 'cancelled', 'failed'].includes(view.status))
+      (await this.db.prepare('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)').run(`retention:settled:${taskId}`, String(Date.now())));
+    else (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:settled:${taskId}`));
+    return true;
+
     });
   }
 
@@ -3673,11 +3992,19 @@ export class Store {
     });
   }
 
+  /** Replace a task's params, except its run pin: `params` is usually an
+   * earlier read, and only a start, recovery or continue-as-new moves the pin
+   * (patchTaskParams / swapTaskRun). Putting back a closed run's id would
+   * send every later signal, query and lifecycle action to that closed run. */
   async updateTaskParams(taskId: string, params: TaskParams) {
     return this.db.transaction(async () => {
 
     await this.trackTaskCredentialSelections(taskId, params);
-    (await this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId));
+    const { _workflowRunId: _read, ...rest } = params as Record<string, unknown>;
+    const pinned = ((await this.db.prepare(`SELECT json_extract(params, '$._workflowRunId') runId FROM tasks WHERE id = ?`)
+      .get(taskId)) as { runId?: unknown } | undefined)?.runId;
+    (await this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?')
+      .run(JSON.stringify(typeof pinned === 'string' ? { ...rest, _workflowRunId: pinned } : rest), taskId));
   
     });
   }
@@ -3699,6 +4026,15 @@ export class Store {
     }
   
     });
+  }
+
+  /** Moves the task's pinned workflow run from `from` to `to` ('' is unpinned)
+   * only while it is still `from`: continue-as-new hands the pin to the next
+   * run without overwriting a replacement that claimed the task meanwhile. */
+  async swapTaskRun(taskId: string, from: string, to: string): Promise<boolean> {
+    return Number((await this.db.prepare(`UPDATE tasks SET params = json_set(params, '$._workflowRunId', json(?))
+      WHERE id = ? AND COALESCE(json_extract(params, '$._workflowRunId'), '') = ?`)
+      .run(JSON.stringify(to), taskId, from)).changes) > 0;
   }
 
   /** Called inside the task write's transaction. Lock on PostgreSQL so two
@@ -4048,6 +4384,15 @@ export class Store {
     return out;
   }
 
+  async markInboxMany(userId: string, organizationId: string, ids: string[]): Promise<InboxItem[]> {
+    if (!ids.length) return [];
+    if (ids.length > 500) throw new Error('Too many inbox items');
+    const rows = await this.db.prepare(`UPDATE inbox SET unread=0, readAt=?
+      WHERE userId=? AND organizationId=? AND id IN (${ids.map(() => '?').join(',')}) RETURNING *`)
+      .all(Date.now(), userId, organizationId, ...ids);
+    return rows.map(rowToInbox);
+  }
+
   async markInbox(userId: string, id: string, unread: boolean): Promise<InboxItem | undefined> {
     return this.db.transaction(async () => {
 
@@ -4070,8 +4415,11 @@ export class Store {
   ): Promise<void> {
     return this.db.transaction(async () => {
 
-    const requestOffset = [...subject.requestId].reduce((sum, char) => (sum * 31 + char.charCodeAt(0)) % 997, 0);
-    const eventSeq = createdAt * 1000 + requestOffset;
+    // Synthetic inbox events use negative, transaction-allocated sequence
+    // numbers; real event sequences are positive. Hashing request ids can
+    // collide for different simultaneous asks to the same user.
+    const eventSeq = Number(await this.kvGet('inbox:next-synthetic-seq') ?? '0') - 1;
+    await this.kvSet('inbox:next-synthetic-seq', String(eventSeq));
     for (const userId of new Set(userIds)) {
       (await this.deleteInbox("userId=? AND taskId=? AND kind='approval-requested'", [userId, `avatar:${subject.avatarId}`]));
       const item: InboxItem = {
@@ -4479,6 +4827,7 @@ export class Store {
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
     assertTagColor(input.color);
+    assertTagKind(input.kind);
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
     // level under the previous, so the UI never needs a parent picker — the user just
     // types the path. `color`/`description` apply to the leaf; `kind` applies to the
@@ -4556,6 +4905,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     assertTagColor(patch.color);
+    assertTagKind(patch.kind);
     const cur = (await this.getTag(id));
     if (!cur) return undefined;
     const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;
@@ -4645,7 +4995,7 @@ export class Store {
     });
   }
 
-  // ─── Saved views (a view is a saved query — PLAN-search-views) ───────────────
+  // ─── Saved views (a view is a saved query) ────────────────────────────────────
 
   async listViews(projectId: string): Promise<SavedView[]> {
     return (
@@ -5006,31 +5356,28 @@ export class Store {
     return this.db.transaction(async () => {
 
     const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
-    const prefix = this.db.prepare('DELETE FROM kv WHERE substr(k, 1, length(?))=?');
     for (const projectId of projectIds) {
-      const recoveryPrefix = `environment-build-recovery:${projectId}:`;
-      await prefix.run(recoveryPrefix, recoveryPrefix);
+      await this.kvDeletePrefix(`environment-build-recovery:${projectId}:`);
       await exact.run(`project-transfer-current:${projectId}`);
       await exact.run(`project-transfer-lock:${projectId}`);
       (await exact.run(`authz:default:project:${projectId}`));
       (await exact.run(`credpolicy:project:${projectId}`));
       (await exact.run(`avatars:project:${projectId}`));
       (await exact.run(`conversation-sharing:project:${projectId}`));
-      const workflowPrefix = `wfpin:${projectId}:`;
-      (await prefix.run(workflowPrefix, workflowPrefix));
+      await this.kvDeletePrefix(`wfpin:${projectId}:`);
     }
     for (const taskId of taskIds) {
       await exact.run(`project-transfer-history:${taskId}`);
       const sharePrefix = `conversation-share-index:${taskId}:`;
-      const shares = (await this.db.prepare('SELECT v FROM kv WHERE substr(k, 1, length(?))=?').all(sharePrefix, sharePrefix)) as Array<{ v: string }>;
-      for (const share of shares) (await exact.run(`conversation-share:${share.v}`));
-      (await prefix.run(sharePrefix, sharePrefix));
+      for (const share of (await this.kvEntries(sharePrefix))) (await exact.run(`conversation-share:${share.value}`));
+      await this.kvDeletePrefix(sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
-        `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`]) (await exact.run(key));
+        `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`,
+        `retention:settled:${taskId}`, `retention:view:${taskId}`, `view-order:${taskId}`]) (await exact.run(key));
       // Turn ids are `<task>#n` (older runs) or `<task>:<run>#n`; both carry the
       // turn's session checkpoint and journal.
-      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`,
-        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`]) (await prefix.run(value, value));
+      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
+        `view-conversation:${taskId}:`, `view-publication-fence:${taskId}:`, `resource-checkpoint:${taskId}:`]) await this.kvDeletePrefix(value);
     }
   
     });
@@ -5044,6 +5391,12 @@ export class Store {
     const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
     for (const taskId of taskIds) (await exact.run(`permission:grant:${taskId}`));
     if (!organizationId) return;
+    for (const taskId of taskIds) {
+      const prefix = `permission:request:${organizationId}:${taskId}:`;
+      for (const { key } of (await this.kvEntries(prefix))) (await exact.run(`permission:deciding:${key.slice(prefix.length)}`));
+      (await this.kvDeletePrefix(prefix));
+    }
+    // An organization whose requests predate per-request rows (PL-8).
     const key = `permission:requests:${organizationId}`;
     const raw = (await this.kvGet(key));
     if (!raw) return;
@@ -5052,6 +5405,7 @@ export class Store {
       const requests = JSON.parse(raw);
       if (!Array.isArray(requests)) return;
       const remaining = requests.filter((request) => !removed.has(String(request?.taskId ?? '')));
+      for (const request of requests) if (removed.has(String(request?.taskId ?? ''))) (await exact.run(`permission:deciding:${request?.id}`));
       if (remaining.length) (await this.kvSet(key, JSON.stringify(remaining)));
       else (await exact.run(key));
     } catch {
@@ -5243,6 +5597,8 @@ export class Store {
         .prepare('INSERT INTO events (taskId, type, ts, payload, origin) VALUES (?, ?, ?, ?, ?)')
         .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload), PROCESS_EVENT_ORIGIN));
       const seq = Number(info.lastInsertRowid);
+      if (ev.type === 'view.updated' && ev.payload.status === 'done')
+        (await this.db.prepare('UPDATE tasks SET completedAt=? WHERE id=? AND completedAt IS NULL').run(ev.ts, ev.taskId));
       (await this.materializeInbox(seq, ev));
       if (!nested) (await this.db.exec('COMMIT'));
       return seq;
@@ -5254,27 +5610,69 @@ export class Store {
     });
   }
 
+  /** Streamed text is the whole text so far of the block being generated, so an
+   *  agent's publication supersedes its previous one. Keeping only the latest
+   *  makes a streamed message O(its length) in one row per agent (#396 review
+   *  item 2); the new row still gets a fresh seq for incremental readers. */
+  async appendLiveOutput(ev: KarmaxEvent): Promise<number> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare(`DELETE FROM events WHERE type = 'agent.output' AND taskId = ?
+        AND json_extract(payload, '$.source') = 'assistant' AND json_extract(payload, '$.role') = ?`)
+        .run(ev.taskId, String((ev.payload as { role?: unknown }).role ?? '')));
+      return this.appendEvent(ev);
+    });
+  }
+
+  /** Append only while the task exists, atomically with that check, so work
+   *  that outlives an undone creation leaves no orphan event. */
+  async appendEventIfTaskExists(ev: KarmaxEvent): Promise<number | undefined> {
+    return this.db.transaction(async () => {
+      if (!(await this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(ev.taskId))) return undefined;
+      return this.appendEvent(ev);
+    });
+  }
+
   async eventsSince(taskId: string, seq: number, limit?: number, excludeTiming = false): Promise<(KarmaxEvent & { seq: number })[]> {
     // Initial task-page loads ask for the newest bounded window. Do the bound in
     // SQLite: materializing every historical event and slicing in JS is precisely
     // the allocation spike this API is meant to avoid. Incremental consumers omit
     // `limit` and retain the original "everything after cursor" contract.
     if (limit && limit > 0) {
+      // Streamed text never counts against the bound; each agent's latest
+      // partial rides along so a page opened mid-stream still shows it.
       const rows = (await this.db
-        .prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
+        .prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? AND type != 'agent.output' ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
         .all(taskId, seq, limit)) as any[];
-      rows.reverse();
+      rows.push(...(await this.db.prepare(`SELECT * FROM events WHERE seq IN (SELECT MAX(seq) FROM events
+        WHERE type = 'agent.output' AND taskId = ? AND seq > ? AND json_extract(payload, '$.source') = 'assistant'
+        GROUP BY json_extract(payload, '$.role'))`).all(taskId, seq)) as any[]);
+      rows.sort((a, b) => Number(a.seq) - Number(b.seq));
       return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
     }
     return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq`).all(taskId, seq)) as any[])
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
+  async hasMergedTaskEvent(taskId: string): Promise<boolean> {
+    return !!(await this.db.prepare(`SELECT 1 FROM events WHERE taskId=? AND type='merge.result'
+      AND LOWER(CAST(json_extract(payload, '$.merged') AS TEXT)) IN ('true', '1') LIMIT 1`).get(taskId));
+  }
+
   /** Sparse durable annotations should not disappear merely because a task has
    *  more live activity rows than the UI's bounded event window. */
-  async eventsOfType(taskId: string, type: string): Promise<(KarmaxEvent & { seq: number })[]> {
-    return ((await this.db.prepare('SELECT * FROM events WHERE taskId = ? AND type = ? ORDER BY seq').all(taskId, type)) as any[])
+  async eventsOfType(taskId: string, type: string | readonly string[], afterSeq = 0): Promise<(KarmaxEvent & { seq: number })[]> {
+    const types = typeof type === 'string' ? [type] : [...type];
+    return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND type IN (${types.map(() => '?').join(', ')}) AND seq > ? ORDER BY seq`)
+      .all(taskId, ...types, afterSeq)) as any[])
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  }
+
+  /** Read only the sparse evidence a consumer needs, preserving revocation order. */
+  async eventsOfTypes(taskId: string, types: string[]): Promise<(KarmaxEvent & { seq: number })[]> {
+    if (!types.length) return [];
+    return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND type IN (${types.map(() => '?').join(',')}) ORDER BY seq`)
+      .all(taskId, ...types)) as any[])
+      .map(r => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
   async eventBySeq(taskId: string, seq: number): Promise<(KarmaxEvent & { seq: number }) | undefined> {
@@ -5292,9 +5690,10 @@ export class Store {
     // materialize the ENTIRE append-only table before slicing — the events table
     // is the largest in the DB, so that is the dominant read-path allocation.
     // Grab the newest N (DESC + LIMIT), then return ascending as before.
+    // The bounded window is the Activity feed's, which never shows streamed text.
     if (limit && limit > 0) {
       const rows = (await this.db
-        .prepare(`SELECT * FROM events WHERE seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
+        .prepare(`SELECT * FROM events WHERE seq > ? AND type != 'agent.output' ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
         .all(seq, limit)) as any[];
       rows.reverse();
       return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
@@ -5329,13 +5728,20 @@ export class Store {
 
   /** Event routing needs ownership, never a conversation or reviewer expansion. */
   async taskProjectIds(taskIds: readonly string[]): Promise<Map<string, string>> {
-    const result = new Map<string, string>();
+    return new Map([...(await this.taskEventRoutes(taskIds))].map(([id, route]) => [id, route.projectId]));
+  }
+
+  /** Each task's project, and whether it is an attempt other than its intent's
+   *  principal: task lists show only principals, so live events say so (RQ-3). */
+  async taskEventRoutes(taskIds: readonly string[]): Promise<Map<string, { projectId: string; siblingAttempt: boolean }>> {
+    const result = new Map<string, { projectId: string; siblingAttempt: boolean }>();
     const ids = [...new Set(taskIds)];
     for (let offset = 0; offset < ids.length; offset += 500) {
       const batch = ids.slice(offset, offset + 500);
-      const rows = await this.readRows<{ id: string; projectId: string }>(
-        `SELECT id, projectId FROM tasks WHERE id IN (${batch.map(() => '?').join(',')})`, batch);
-      for (const row of rows) result.set(row.id, row.projectId);
+      const rows = await this.readRows<{ id: string; projectId: string; principalAttemptId: string | null }>(
+        `SELECT t.id, t.projectId, i.principalAttemptId FROM tasks t LEFT JOIN task_intents i ON i.id=t.intentId
+         WHERE t.id IN (${batch.map(() => '?').join(',')})`, batch);
+      for (const row of rows) result.set(row.id, { projectId: row.projectId, siblingAttempt: !!row.principalAttemptId && row.principalAttemptId !== row.id });
     }
     return result;
   }
@@ -5383,7 +5789,7 @@ export class Store {
     if (scopeKey === 'global' && workflow === 'timing') values = { ...values, revision: crypto.randomUUID() };
     if (workflow === 'payments') {
       if (values.budget !== undefined && values.budget !== null && (!Number.isSafeInteger(values.budget) || Number(values.budget) < 0))
-        throw new Error('Budget must be a non-negative amount in cents');
+        throw new Error('Budget must be a non-negative whole amount in the smallest unit of its currency');
       if (values.cardIds !== undefined) {
         const project = (await this.getProject(scopeKey));
         const org = project?.organizationId ?? (scopeKey.startsWith('organization:') ? scopeKey.slice(13) : 'org_personal');
@@ -5947,7 +6353,39 @@ export class Store {
     });
   }
 
+  async pruneWorldCheckpoints(worldId: string): Promise<void> {
+    await this.db.transaction(async () => {
+      const rows = await this.db.prepare('SELECT manifest FROM world_checkpoints WHERE worldId=? ORDER BY createdAt DESC, id DESC').all(worldId) as any[];
+      const checkpoints = rows.map(row => JSON.parse(row.manifest) as WorldCheckpoint);
+      const pinned = new Set((await this.kvEntries('fork-checkpoint:')).map(row => row.value));
+      for (const row of await this.db.prepare('SELECT handle FROM world_instances WHERE worldId=?').all(worldId) as any[]) {
+        const handle = JSON.parse(row.handle) as WorldHandleRef;
+        if (handle.checkpointId) pinned.add(handle.checkpointId);
+      }
+      for (const checkpoint of checkpoints.slice(2)) {
+        if (pinned.has(checkpoint.id)) continue;
+        if (checkpoint.filesystemDelta) await this.kvSet(`checkpoint-gc:${checkpoint.id}`,
+          JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta.objectKey }));
+      }
+    });
+  }
+
+  async pinWorldCheckpointForFork(taskId: string, checkpointId: string): Promise<void> {
+    await this.db.transaction(async () => {
+      if (!(await this.getWorldCheckpoint(checkpointId))) throw new Error('fork checkpoint is no longer available');
+      await this.kvSet(`fork-checkpoint:${taskId}`, checkpointId);
+    });
+  }
+
+  async completeCheckpointDeletion(checkpointId: string): Promise<void> {
+    await this.db.transaction(async () => {
+      await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpointId);
+      await this.kvDelete(`checkpoint-gc:${checkpointId}`);
+    });
+  }
+
   async getWorldCheckpoint(id: string): Promise<WorldCheckpoint | undefined> {
+    if (await this.kvGet(`checkpoint-gc:${id}`)) return undefined;
     const r = (await this.db.prepare('SELECT manifest FROM world_checkpoints WHERE id=?').get(id)) as any;
     return r ? JSON.parse(r.manifest) : undefined;
   }
@@ -6083,8 +6521,8 @@ export class Store {
     const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
     const hostedCustomerWorld = remote && this.hosted && pool.mode === 'customer';
     const project = (await this.getProject(input.projectId));
-    const task = (await this.getTask(input.taskId));
-    if (!project || project.organizationId !== input.organizationId || !task || task.projectId !== project.id)
+    const taskProjectId = await this.taskProjectIdAsync(input.taskId);
+    if (!project || project.organizationId !== input.organizationId || taskProjectId !== project.id)
       throw new Error('runner admission attribution does not match the organization project and task');
     const resources = { cpu: Math.max(1, input.cpu ?? 2), memoryMb: Math.max(128, input.memoryMb ?? 2048), gpu: Math.max(0, input.gpu ?? 0) };
     if (!hostedCustomerWorld && (resources.cpu > pool.capacity.cpu || resources.memoryMb > pool.capacity.memoryMb || resources.gpu > pool.capacity.gpu
@@ -6119,7 +6557,7 @@ export class Store {
         const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
             AND p.provider NOT IN ('worktree','container','memory')`).get(input.organizationId, now - 60_000)) as any).n);
-        if (recent >= policy.maxRemoteStartsPerMinute) throw new Error('organization remote sandbox start rate limit exceeded');
+        if (recent >= policy.maxRemoteStartsPerMinute) throw new AdmissionBackpressureError('organization remote sandbox start rate limit exceeded');
       }
       (await this.db.prepare(`INSERT INTO world_leases (id, runnerPoolId, organizationId, projectId, taskId, worldId,
         cpu, memoryMb, gpu, priority, state, createdAt, acquiredAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -6289,6 +6727,22 @@ export class Store {
     return row?.projectId;
   }
 
+  /** World admission priority, likewise without the transcript (RT-14). */
+  async taskPriority(taskId: string): Promise<number> {
+    const [row] = await this.readRows<{ priority: unknown }>("SELECT json_extract(params, '$.priority') AS priority FROM tasks WHERE id=?", [taskId]);
+    return Number(row?.priority ?? 0);
+  }
+
+  /** An attempt group's size and commitment, without hydrating its attempts (RT-14). */
+  async attemptSummary(taskOrIntentId: string): Promise<{ attempts: number; committedAttemptId?: string; otherAttempts?: 'keep' | 'cancel' } | undefined> {
+    const [row] = await this.readRows<{ id: string; committedAttemptId: string | null; attempts: number }>(`SELECT i.id, i.committedAttemptId,
+      (SELECT COUNT(*) FROM tasks a WHERE a.intentId=i.id) AS attempts FROM task_intents i
+      WHERE i.id=COALESCE((SELECT intentId FROM tasks WHERE id=?), ?)`, [taskOrIntentId, taskOrIntentId]);
+    if (!row) return undefined;
+    return { attempts: Number(row.attempts), ...(row.committedAttemptId ? { committedAttemptId: row.committedAttemptId,
+      otherAttempts: (await this.kvGet(`attempt-policy:${row.id}`)) === 'keep' ? 'keep' as const : 'cancel' as const } : {}) };
+  }
+
   async projectOrganizationAsync(projectId: string): Promise<string | undefined> {
     const [row] = await this.readRows<{ organizationId: string | null }>('SELECT organizationId FROM projects WHERE id=?', [projectId]);
     return row ? row.organizationId ?? 'org_personal' : undefined;
@@ -6331,13 +6785,13 @@ export class Store {
 
   async admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
     provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
-    reservedCostMicros?: number; now?: number }): Promise<{ reused: boolean }> {
+    reservedCostMicros?: number; now?: number; retryOf?: string | string[] }): Promise<{ reused: boolean }> {
     return this.db.transaction(async () => {
 
     const now = input.now ?? Date.now();
     const project = (await this.getProject(input.projectId));
-    const task = (await this.getTask(input.taskId));
-    if (!project || project.organizationId !== input.organizationId || !task || task.projectId !== project.id)
+    const taskProjectId = await this.taskProjectIdAsync(input.taskId);
+    if (!project || project.organizationId !== input.organizationId || taskProjectId !== project.id)
       throw new Error('usage attribution does not match the organization project and task');
     const entitlements = (await this.organizationEntitlements(input.organizationId));
     if (!entitlements.agentRunAdmissionAllowed) {
@@ -6361,12 +6815,25 @@ export class Store {
     }
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
+      for (const priorId of input.retryOf ? [input.retryOf].flat() : []) {
+        const previous = (await this.db.prepare('SELECT * FROM usage_admissions WHERE id=?').get(priorId)) as any;
+        if (previous) {
+          if (previous.organizationId !== input.organizationId || previous.projectId !== input.projectId
+            || previous.taskId !== input.taskId || previous.provider !== input.provider)
+            throw new Error('usage admission retry key belongs to different attributed work');
+          if (previous.state === 'completed')
+            throw new Error('this model turn was already completed; refusing duplicate provider admission');
+          await this.db.prepare("UPDATE usage_admissions SET state='released', releasedAt=? WHERE id=? AND state='active'")
+            .run(now, priorId);
+        }
+      }
       const assertManagedCapacity = async () => {
         if (input.fundingSource !== 'managed') return;
         const month = monthWindow(now);
         const spent = (await this.usageSummary(input.organizationId, month.from, month.to)).byFundingSource.managed ?? 0;
         const reserved = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n FROM usage_admissions
-          WHERE organizationId=? AND fundingSource='managed' AND state='active'`).get(input.organizationId)) as any).n);
+          WHERE organizationId=? AND fundingSource='managed' AND state='active'
+            AND NOT EXISTS (SELECT 1 FROM usage_events WHERE id='usage:cost:' || usage_admissions.id)`).get(input.organizationId)) as any).n);
         if (spent + reserved + input.reservedCostMicros! > policy.managedSpendCapMicros!)
           throw new Error('organization managed spend cap is exhausted');
       };
@@ -6385,7 +6852,7 @@ export class Store {
           (await assertManagedCapacity());
           const active = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
             WHERE organizationId=? AND kind='agent' AND state='active'`).get(input.organizationId)) as any).n);
-          if (active >= policy.effectiveMaxActiveAgentTurns) throw new Error('organization active model turn limit reached');
+          if (active >= policy.effectiveMaxActiveAgentTurns) throw new AdmissionBackpressureError('organization active model turn limit reached');
           (await this.db.prepare("UPDATE usage_admissions SET state='active', releasedAt=NULL WHERE id=?").run(input.id));
           (await this.db.exec('COMMIT'));
           return { reused: true };
@@ -6397,10 +6864,10 @@ export class Store {
       const minute = now - 60_000;
       const recent = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
         WHERE organizationId=? AND kind='agent' AND createdAt>=?`).get(input.organizationId, minute)) as any).n);
-      if (recent >= policy.maxAgentStartsPerMinute) throw new Error('organization model request rate limit exceeded');
+      if (recent >= policy.maxAgentStartsPerMinute) throw new AdmissionBackpressureError('organization model request rate limit exceeded');
       const active = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
         WHERE organizationId=? AND kind='agent' AND state='active'`).get(input.organizationId)) as any).n);
-      if (active >= policy.effectiveMaxActiveAgentTurns) throw new Error('organization active model turn limit reached');
+      if (active >= policy.effectiveMaxActiveAgentTurns) throw new AdmissionBackpressureError('organization active model turn limit reached');
       (await this.db.prepare(`INSERT INTO usage_admissions (id, organizationId, projectId, taskId, kind, provider, model,
         fundingSource, state, reservedCostMicros, createdAt) VALUES (?, ?, ?, ?, 'agent', ?, ?, ?, 'active', ?, ?)`)
         .run(input.id, input.organizationId, input.projectId, input.taskId, input.provider, input.model ?? null,
@@ -6415,14 +6882,24 @@ export class Store {
     });
   }
 
-  async finishUsageAdmission(id: string, completed: boolean, now = Date.now(),
+  /** Undefined completion checkpoints an in-flight cost estimate without releasing
+   * concurrency. Replace only estimates, so repeated finalization is idempotent. */
+  async finishUsageAdmission(id: string, completed: boolean | undefined, now = Date.now(),
     events: Array<Omit<UsageEvent, 'id'> & { id?: string }> = []): Promise<void> {
     return this.db.transaction(async () => {
 
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      for (const event of events) (await this.recordUsage(event));
-      (await this.db.prepare(`UPDATE usage_admissions SET state=?, releasedAt=? WHERE id=? AND state='active'`)
+      for (const event of events) {
+        await this.recordUsage(event);
+        if (event.id === `usage:cost:${id}` && event.kind === 'agent.cost') {
+          await this.db.prepare(`UPDATE usage_events SET costMicros=?, costClassification=?, metadata=?
+            WHERE id=? AND organizationId=? AND kind='agent.cost' AND costClassification='estimated'`)
+            .run(event.costMicros, event.costClassification ?? 'estimated', JSON.stringify(event.metadata ?? {}),
+              event.id, event.organizationId);
+        }
+      }
+      if (completed !== undefined) (await this.db.prepare(`UPDATE usage_admissions SET state=?, releasedAt=? WHERE id=? AND state='active'`)
         .run(completed ? 'completed' : 'released', now, id));
       (await this.db.exec('COMMIT'));
     } catch (error) {
@@ -6485,7 +6962,8 @@ export class Store {
       executions: Number(((await this.db.prepare(`SELECT COUNT(*) n FROM executions WHERE organizationId=?${scope} AND state IN ('starting','running','stop-requested')`).get(...args)) as any).n),
     };
     const activeReservationsMicros = Number(((await this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n
-      FROM usage_admissions WHERE organizationId=?${scope} AND fundingSource='managed' AND state='active'`)
+      FROM usage_admissions WHERE organizationId=?${scope} AND fundingSource='managed' AND state='active'
+        AND NOT EXISTS (SELECT 1 FROM usage_events WHERE id='usage:cost:' || usage_admissions.id)`)
       .get(...args)) as any).n);
     return { costMicros, incurredCostMicros: byCostClassification.incurred ?? 0,
       estimatedCostMicros: byCostClassification.estimated ?? 0, activeReservationsMicros,
@@ -6504,10 +6982,9 @@ export class Store {
       metadata: string | null; startedAt: number }>;
     cardSpend: Array<{ amount: number; currency: string; createdAt: number }>;
   }> {
-    const completions = (await this.db.prepare(`SELECT e.taskId AS taskId, MIN(e.ts) AS doneAt FROM events e
-      JOIN tasks t ON t.id=e.taskId JOIN projects p ON p.id=t.projectId
-      WHERE COALESCE(p.organizationId, 'org_personal')=? AND e.type='view.updated' AND e.payload LIKE ?
-      GROUP BY e.taskId HAVING MIN(e.ts)>=?`).all(organizationId, '%"status":"done"%', from)) as any[];
+    const completions = (await this.db.prepare(`SELECT t.id AS taskId, t.completedAt AS doneAt FROM tasks t
+      JOIN projects p ON p.id=t.projectId WHERE COALESCE(p.organizationId, 'org_personal')=?
+        AND t.completedAt>=?`).all(organizationId, from)) as any[];
     const admissions = (await this.db.prepare(`SELECT id, taskId, projectId, provider, model, state, createdAt, releasedAt
       FROM usage_admissions WHERE organizationId=? AND kind='agent' AND createdAt>=?`).all(organizationId, from)) as any[];
     const tokens = (await this.db.prepare(`SELECT id, taskId, projectId, provider, quantity, metadata, startedAt
@@ -6878,12 +7355,12 @@ export class Store {
   
     });
   }
-  async consumePaymentOAuthState(state: string): Promise<any> {
+  async consumePaymentOAuthState(state: string, userId?: string): Promise<any> {
     return this.db.transaction(async () => {
 
     const hash = sha256(state);
     const row = (await this.db.prepare('SELECT * FROM payment_oauth_states WHERE stateHash=?').get(hash)) as any;
-    if (!row || row.usedAt || row.expiresAt <= Date.now()) return undefined;
+    if (!row || !userId || row.userId !== userId || row.usedAt || row.expiresAt <= Date.now()) return undefined;
     const result = (await this.db.prepare('UPDATE payment_oauth_states SET usedAt=? WHERE stateHash=? AND usedAt IS NULL')
       .run(Date.now(), hash));
     return Number(result.changes) === 1 ? row : undefined;
@@ -6921,11 +7398,13 @@ export class Store {
   async getPaymentSpendRequest(id: string): Promise<any> {
     return (await this.db.prepare('SELECT * FROM payment_spend_requests WHERE id=?').get(id)) as any;
   }
-  async setPaymentSpendRequestCard(id: string, cardId: string): Promise<void> {
+  /** Assign the card an approval chose, with its currency (AU-36). */
+  async setPaymentSpendRequestCard(id: string, cardId: string, currency?: string): Promise<void> {
     return this.db.transaction(async () => {
 
-    (await this.db.prepare('UPDATE payment_spend_requests SET cardId=?, updatedAt=? WHERE id=?')
-      .run(cardId, Date.now(), id));
+    (await (currency
+      ? this.db.prepare('UPDATE payment_spend_requests SET cardId=?, currency=?, updatedAt=? WHERE id=?').run(cardId, currency, Date.now(), id)
+      : this.db.prepare('UPDATE payment_spend_requests SET cardId=?, updatedAt=? WHERE id=?').run(cardId, Date.now(), id)));
   
     });
   }
@@ -6966,13 +7445,40 @@ export class Store {
   
     });
   }
-  async paymentSpent(taskId: string): Promise<number> {
+  async paymentBudgetFamily(taskId: string): Promise<{ taskIds: string[]; ancestorIds: string[] }> {
+    const projectId = await this.taskProjectIdAsync(taskId);
+    const organizationId = projectId ? await this.projectOrganizationAsync(projectId) : undefined;
+    if (!organizationId) return { taskIds: [taskId], ancestorIds: [] };
+    const rows = await this.db.prepare(`SELECT t.id, t.parentTaskId, t.createdBy FROM tasks t
+      JOIN projects p ON p.id=t.projectId WHERE p.organizationId=?`).all(organizationId) as any[];
+    const parents = new Map<string, string | undefined>(rows.map(row => {
+      const creator = row.createdBy ? JSON.parse(row.createdBy) : undefined;
+      return [row.id, row.parentTaskId ?? (creator?.kind === 'task-agent' ? creator.taskId : undefined)];
+    }));
+    const ancestors = (id: string) => {
+      const seen = new Set<string>([id]);
+      let parent = parents.get(id);
+      while (parent && parents.has(parent) && !seen.has(parent)) {
+        seen.add(parent);
+        parent = parents.get(parent);
+      }
+      return [...seen];
+    };
+    const lineage = ancestors(taskId);
+    const root = lineage[lineage.length - 1]!;
+    return { taskIds: rows.filter(row => ancestors(row.id).includes(root)).map(row => row.id), ancestorIds: lineage.slice(1) };
+  }
+
+  /** Minor units spent or reserved; pass `currency` to count one currency only (AU-36). */
+  async paymentSpent(taskId: string, family = false, currency?: string): Promise<number> {
     return this.db.transaction(async () => {
 
     (await this.expirePaymentSpendRequests());
+    const ids = family ? (await this.paymentBudgetFamily(taskId)).taskIds : [taskId];
     const row = (await this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
-      WHERE taskId=? AND (status IN ('authorizing','consumed','settled')
-        OR (status='authorized' AND expiresAt>?))`).get(taskId, Date.now())) as any;
+      WHERE taskId IN (${ids.map(() => '?').join(',')}) AND (status IN ('authorizing','consumed','settled')
+        OR (status='authorized' AND expiresAt>?))${currency ? ' AND LOWER(currency)=?' : ''}`)
+      .get(...ids, Date.now(), ...(currency ? [currency] : []))) as any;
     return Number(row?.amount ?? 0);
   
     });
@@ -6988,28 +7494,54 @@ export class Store {
   
     });
   }
-  async findPaymentAuthorization(cardId: string, amount: number, merchant?: string): Promise<any> {
+  async findPaymentAuthorization(cardId: string, amount: number, merchant: { name?: string; url?: string } = {}): Promise<any> {
     return this.db.transaction(async () => {
 
     (await this.expirePaymentSpendRequests());
     const rows = (await this.db.prepare(`SELECT * FROM payment_spend_requests
       WHERE cardId=? AND status='authorized' AND amount>=? AND expiresAt>?
       ORDER BY CASE WHEN amount=? THEN 0 ELSE 1 END, createdAt`).all(cardId, amount, Date.now(), amount)) as any[];
-    const normalized = normalizePaymentMerchant(merchant);
-    return rows.find((row) => {
-      const expected = normalizePaymentMerchant(row.merchant);
-      return !expected || !normalized || normalized.includes(expected) || expected.includes(normalized);
+    return rows.find((row) => paymentMerchantMatches(row.merchant, merchant));
+  
     });
+  }
+  /** A task that has ended no longer wants what it asked a human to approve
+   * (AU-35): its waiting requests are denied rather than left actionable. */
+  async retireTaskSpendRequests(taskId: string, status: string): Promise<number> {
+    return this.db.transaction(async () => {
+
+    const waiting = await this.db.prepare(`SELECT id, projectId, cardId, amount, status FROM payment_spend_requests
+      WHERE taskId=? AND status IN ('pending_approval', 'needs_funding')`).all(taskId) as Array<{
+        id: string; projectId: string; cardId: string | null; amount: number; status: string }>;
+    const now = Date.now();
+    for (const request of waiting) {
+      await this.db.prepare(`UPDATE payment_spend_requests SET status='denied', reason=?, resolvedBy='system:payments', updatedAt=?
+        WHERE id=? AND status=?`).run(`task ${status} before approval`, now, request.id, request.status);
+      await this.appendAudit({ ts: now, principalId: 'system:payments', action: 'payment.request.retired',
+        scopeKey: `project:${request.projectId}`, detail: { requestId: request.id, taskId, cardId: request.cardId,
+          amount: request.amount, previousStatus: request.status, taskStatus: status } });
+    }
+    return waiting.length;
   
     });
   }
   async expirePaymentSpendRequests(now = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
 
-    return Number((await this.db.prepare(`UPDATE payment_spend_requests
-      SET status='expired', reason='request expired', updatedAt=?
-      WHERE expiresAt<=? AND status='authorized'`)
-      .run(now, now)).changes);
+    const expired = await this.db.prepare(`SELECT id, projectId, taskId, cardId, amount, status
+      FROM payment_spend_requests WHERE expiresAt<=? AND status IN ('authorized', 'authorizing')`).all(now) as any[];
+    let released = 0;
+    for (const request of expired) {
+      const result = await this.db.prepare(`UPDATE payment_spend_requests
+        SET status='expired', reason='request expired', updatedAt=?
+        WHERE id=? AND expiresAt<=? AND status=?`).run(now, request.id, now, request.status);
+      if (!Number(result.changes)) continue;
+      released++;
+      await this.appendAudit({ ts: now, principalId: 'system:payments', action: 'payment.reservation.expired',
+        scopeKey: `project:${request.projectId}`, detail: { requestId: request.id, taskId: request.taskId,
+          cardId: request.cardId, amount: request.amount, previousStatus: request.status } });
+    }
+    return released;
   
     });
   }
@@ -7083,14 +7615,32 @@ export class Store {
 
   // ─── KV (misc small state) ───────────────────────────────────────────────────
 
+  private async scopedTokenProjectIds(record: Record<string, unknown>): Promise<string[]> {
+    const ids = new Set<string>();
+    if (typeof record.projectId === 'string') ids.add(record.projectId);
+    if (Array.isArray(record.projectIds))
+      for (const id of record.projectIds) if (typeof id === 'string') ids.add(id);
+    if (typeof record.taskId === 'string') {
+      const task = await this.db.prepare('SELECT projectId FROM tasks WHERE id=?').get(record.taskId) as { projectId: string } | undefined;
+      if (task) ids.add(task.projectId);
+    }
+    return [...ids];
+  }
+
   /** The raw bearer never enters SQLite; replicas verify its SHA-256 digest. */
   async putScopedToken(tokenHash: string, tokenId: string, record: Record<string, unknown>, expiresAt: number): Promise<void> {
     return this.db.transaction(async () => {
 
-    (await this.db.prepare(`INSERT INTO scoped_tokens (tokenHash, tokenId, json, expiresAt, revokedAt)
-      VALUES (?, ?, ?, ?, NULL) ON CONFLICT(tokenHash) DO UPDATE SET
-      tokenId=excluded.tokenId, json=excluded.json, expiresAt=excluded.expiresAt, revokedAt=NULL`)
-      .run(tokenHash, tokenId, JSON.stringify(record), expiresAt));
+    (await this.db.prepare(`INSERT INTO scoped_tokens (tokenHash, tokenId, json, expiresAt, revokedAt, principal, organizationId)
+      VALUES (?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(tokenHash) DO UPDATE SET
+      tokenId=excluded.tokenId, json=excluded.json, expiresAt=excluded.expiresAt, revokedAt=NULL,
+      principal=excluded.principal, organizationId=excluded.organizationId`)
+      .run(tokenHash, tokenId, JSON.stringify(record), expiresAt,
+        typeof record.principal === 'string' ? record.principal : '',
+        typeof record.organizationId === 'string' ? record.organizationId : null));
+    (await this.db.prepare('DELETE FROM scoped_token_projects WHERE tokenHash=?').run(tokenHash));
+    for (const projectId of await this.scopedTokenProjectIds(record))
+      (await this.db.prepare('INSERT INTO scoped_token_projects(tokenHash,projectId) VALUES (?,?)').run(tokenHash, projectId));
   
     });
   }
@@ -7170,23 +7720,18 @@ export class Store {
     });
   }
 
-  /** Revoke durable credentials whose serialized scope names a resource being
-   * deleted. Parsing keeps this compatible with pre-JSON1 SQLite builds and
-   * with historical token records that omitted newer scope fields. */
+  /** Revoke credentials by indexed scope rather than parsing every live token. */
   async revokeScopedTokens(scope: { projectId?: string; organizationId?: string }): Promise<number> {
     return this.db.transaction(async () => {
-
-    const update = this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE tokenHash=? AND revokedAt IS NULL');
     const now = Date.now();
     let revoked = 0;
-    for (const row of (await this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL').all()) as any[]) {
-      let record: { projectId?: string; projectIds?: string[]; organizationId?: string; taskId?: string };
-      try { record = JSON.parse(row.json); } catch { continue; }
-        if ((scope.projectId && (record.projectId === scope.projectId || record.projectIds?.includes(scope.projectId)
-          || (record.taskId && (await this.taskProjectIdAsync(record.taskId)) === scope.projectId)))
-          || (scope.organizationId && record.organizationId === scope.organizationId))
-          revoked += Number((await update.run(now, row.tokenHash)).changes);
-    }
+    if (scope.projectId)
+      revoked += Number((await this.db.prepare(`UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL
+        AND tokenHash IN (SELECT tokenHash FROM scoped_token_projects WHERE projectId=?)`)
+        .run(now, scope.projectId)).changes);
+    if (scope.organizationId)
+      revoked += Number((await this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL AND organizationId=?')
+        .run(now, scope.organizationId)).changes);
     return revoked;
   
     });
@@ -7194,7 +7739,8 @@ export class Store {
 
   async purgeScopedTokens(now = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
-
+    (await this.db.prepare(`DELETE FROM scoped_token_projects WHERE tokenHash IN
+      (SELECT tokenHash FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL)`).run(now));
     return Number((await this.db.prepare('DELETE FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now)).changes);
   
     });
@@ -7224,6 +7770,16 @@ export class Store {
     });
   }
 
+  async claimGithubPrObservation(digest: string, now = Date.now()): Promise<boolean> {
+    return this.db.transaction(async () => Number((await this.db.prepare(
+      'INSERT OR IGNORE INTO github_pr_observations(digest,createdAt) VALUES (?,?)')
+      .run(digest, now)).changes) === 1);
+  }
+
+  private kvRangeKey(): string {
+    return this.db.dialect === 'postgres' ? 'k COLLATE "C"' : 'k';
+  }
+
   /**
    * The periodic retention sweep. Every sweep here is idempotent and bounded, so
    * a caller can run it on any interval (hourly is plenty).
@@ -7239,15 +7795,94 @@ export class Store {
    * Scheduled hourly (and once at boot) by `src/main.ts`, next to the orphan sweep.
    */
   async retentionSweep(now = Date.now()): Promise<{ scopedTokens: number; humanDelegations: number; githubDeliveries: number;
-    subscriptionRequests: number }> {
+    githubPrObservations: number; subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number;
+    permissionRequests: number; events: number; auditEntries: number }> {
     return this.db.transaction(async () => {
+
+    // Keep immutable snapshots through a retry window. A late activity retry can
+    // still refer to an older revision while the workflow is live; settled tasks
+    // older than a week no longer need those superseded copies.
+    let viewSnapshots = 0, publicationFences = 0, turnSessions = 0;
+    // Tasks that settled before settle times were recorded start their window now.
+    (await this.db.prepare(`INSERT OR IGNORE INTO kv(k,v) SELECT 'retention:settled:' || id, ? FROM tasks
+      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
+        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id)`).run(String(now)));
+    // Marker '2' also covers turn checkpoints in every key form (RT-30a), so
+    // tasks the earlier sweep marked '1' are swept once more.
+    const settled = await this.db.prepare(`SELECT tasks.id, tasks.conversationRef,
+        json_extract(tasks.params, '$._workflowRunId') runId FROM tasks
+      JOIN kv settle ON settle.k='retention:settled:' || tasks.id
+      WHERE json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')
+        -- PostgreSQL may filter every kv row before the join narrows them, and
+        -- one non-numeric value ("developer") aborted the whole sweep. A CASE
+        -- is evaluated in order, so only settle times are ever cast.
+        AND CASE WHEN settle.k LIKE 'retention:settled:%' THEN CAST(settle.v AS BIGINT) END < ?
+        AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id AND v='2')`)
+      .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null; runId: string | null }>;
+    for (const task of settled) {
+      const snapshotPrefix = `view-conversation:${task.id}:`;
+      viewSnapshots += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<? AND k<>?`)
+        .run(snapshotPrefix, `view-conversation:${task.id};`, `${snapshotPrefix}${task.conversationRef ?? ''}`)).changes);
+      const fencePrefix = `view-publication-fence:${task.id}:`;
+      // Legacy turn ids are keyed by run, not task: the runs this task published
+      // from are named in its fences, and its last run in its params.
+      const runs = new Set((await this.kvEntries(fencePrefix)).map(({ key }) => key.slice(fencePrefix.length).split(':')[0]!));
+      if (typeof task.runId === 'string' && task.runId) runs.add(task.runId);
+      publicationFences += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
+        .run(fencePrefix, `view-publication-fence:${task.id};`)).changes);
+      // The same checkpoints a terminal publication clears (`clearTurnCheckpoints`),
+      // for tasks that settled before it did.
+      for (const prefix of [`turnsession:${task.id}#`, `turnsession:${task.id}:`, `turnresult:${task.id}:`,
+        `task-create:${task.id}:`,
+        ...[...runs].filter(Boolean).flatMap((run) => [`turnsession:legacy:${run}:`])])
+        turnSessions += (await this.kvDeletePrefix(prefix));
+      (await this.db.prepare('INSERT INTO kv(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v = excluded.v')
+        .run(`retention:view:${task.id}`, '2'));
+    }
+
+    // Decided permission requests outlive their decision events by nothing: both
+    // go after the event window. Pending ones stay until decided or withdrawn.
+    let permissionRequests = 0;
+    const pendingTasks = new Map<string, string>();
+    for (const { key, value } of (await this.kvEntries('permission:request:'))) {
+      let request: { status?: string; taskId?: string; projectId?: string; createdAt?: number; resolution?: { at?: number }; withdrawn?: { at?: number } };
+      try { request = JSON.parse(value); } catch { continue; }
+      if (request.status === 'pending' && request.taskId && request.projectId) pendingTasks.set(request.taskId, request.projectId);
+      const decidedAt = request.resolution?.at ?? request.withdrawn?.at ?? request.createdAt;
+      if (request.status === 'pending' || !(Number(decidedAt) < now - 90 * 86400_000)) continue;
+      (await this.db.prepare('DELETE FROM kv WHERE k=?').run(key));
+      permissionRequests++;
+    }
+    // Tasks that finished before finishing withdrew their requests (#400).
+    for (const [taskId, projectId] of pendingTasks) {
+      const row = (await this.db.prepare("SELECT json_extract(lastView, '$.status') status FROM tasks WHERE id=?").get(taskId)) as { status?: string } | undefined;
+      if (WITHDRAW_REQUESTS_STATUS.has(row?.status ?? '')) (await this.withdrawPermissionRequests(projectId, taskId, String(row!.status)));
+    }
 
     return {
       scopedTokens: (await this.purgeScopedTokens(now)),
       humanDelegations: (await this.purgeHumanDelegations(now)),
       githubDeliveries: (await this.purgeGithubDeliveries(Store.GITHUB_DELIVERY_RETENTION_MS, now)),
+      githubPrObservations: Number((await this.db.prepare(`DELETE FROM github_pr_observations WHERE digest IN
+        (SELECT digest FROM github_pr_observations WHERE createdAt<? ORDER BY createdAt LIMIT 10000)`)
+        .run(now - 30 * 86400_000)).changes),
       subscriptionRequests: Number((await this.db.prepare(`DELETE FROM subscription_billing_requests
         WHERE createdAt<? AND responseJson IS NOT NULL`).run(now - 30 * 24 * 60 * 60 * 1000)).changes),
+      viewSnapshots, publicationFences, turnSessions, permissionRequests,
+      events: Number((await this.db.prepare(`DELETE FROM events WHERE seq IN
+        (SELECT e.seq FROM events e WHERE e.ts<?
+          AND (e.type NOT IN ('credential.approval-requested', 'permission.approval-requested',
+            'authorization.approval-requested', 'connection.requested')
+            OR EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
+              AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved',
+                'authorization.approval-resolved', 'connection.resolved',
+                'permission.approval-dismissed', 'authorization.approval-dismissed')
+              AND json_extract(r.payload, '$.requestId')=json_extract(e.payload, '$.requestId')))
+          ORDER BY e.ts, e.seq LIMIT 10000)`)
+        .run(now - 90 * 86400_000)).changes),
+      auditEntries: Number((await this.db.prepare(`DELETE FROM audit_log WHERE seq IN
+        (SELECT seq FROM audit_log WHERE ts<? ORDER BY ts, seq LIMIT 10000)`)
+        .run(now - 365 * 86400_000)).changes),
     };
   
     });
@@ -7310,9 +7945,44 @@ export class Store {
     });
   }
 
+  /** The first key after every key that starts with `prefix`, so a prefix
+   * becomes a primary-key range (undefined when no such key exists). */
+  private kvPrefixEnd(prefix: string): string | undefined {
+    const chars = Array.from(prefix);
+    for (let i = chars.length - 1; i >= 0; i--) {
+      const codePoint = chars[i]!.codePointAt(0)!;
+      if (codePoint < 0x10ffff) return chars.slice(0, i).join('') + String.fromCodePoint(codePoint + 1);
+    }
+    return undefined;
+  }
+
+  /** Delete every key starting with `prefix` through the primary-key range; the
+   * literal prefix check keeps exact semantics under any collation (PS-8). */
+  private async kvDeletePrefix(prefix: string): Promise<number> {
+    const key = this.kvRangeKey();
+    const end = this.kvPrefixEnd(prefix);
+    return Number((end
+      ? await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND ${key} < ? AND substr(k, 1, length(?))=?`).run(prefix, end, prefix, prefix)
+      : await this.db.prepare(`DELETE FROM kv WHERE ${key} >= ? AND substr(k, 1, length(?))=?`).run(prefix, prefix, prefix)).changes);
+  }
+
   async kvEntries(prefix: string): Promise<Array<{ key: string; value: string }>> {
-    return ((await this.db.prepare('SELECT k, v FROM kv WHERE k LIKE ? ORDER BY k').all(`${prefix}%`)) as any[])
+    const end = this.kvPrefixEnd(prefix);
+    const key = this.kvRangeKey();
+    const rows = prefix
+      ? end
+        ? await this.db.prepare(`SELECT k, v FROM kv WHERE ${key} >= ? AND ${key} < ? ORDER BY ${key}`).all(prefix, end)
+        : await this.db.prepare(`SELECT k, v FROM kv WHERE ${key} >= ? ORDER BY ${key}`).all(prefix)
+      : await this.db.prepare('SELECT k, v FROM kv ORDER BY k').all();
+    return (rows as any[]).filter((row) => String(row.k).startsWith(prefix))
       .map((row) => ({ key: String(row.k), value: String(row.v) }));
+  }
+
+  async clearTurnCheckpoints(taskId: string, runId?: string): Promise<void> {
+    await this.db.transaction(async () => {
+      for (const prefix of [`turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
+        ...(runId ? [`turnsession:legacy:${runId}:`] : [])]) await this.kvDeletePrefix(prefix);
+    });
   }
 
   async kvDelete(k: string): Promise<void> {
@@ -7369,7 +8039,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     (await this.migrate());
-    (await this.migrateData());
+    (await this.migrateData(true));
     (await this.migrateConversations());
   
     });
@@ -7447,10 +8117,6 @@ function cardRow(r: any) {
     last4: r.last4 ?? undefined,
     createdAt: r.createdAt,
   };
-}
-
-function normalizePaymentMerchant(value: unknown): string {
-  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 function resourceAttachmentRow(row: any): ResourceAttachment {
@@ -7544,7 +8210,7 @@ function parseJsonOptional<T>(value: unknown): T | undefined {
 }
 
 export function slugify(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'workspace';
+  return value.trim().normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, '-').replace(/^-|-$/g, '').slice(0, 48) || 'workspace';
 }
 
 async function uniqueSlug(value: string, used: (candidate: string) => boolean | Promise<boolean>): Promise<string> {
@@ -7860,6 +8526,11 @@ function rowToTask(r: any): TaskRecord {
 
 /** A tag colour is rendered into an inline `style` custom property; only a
  *  hex literal is accepted so it can never carry a CSS declaration. */
+function assertTagKind(kind: unknown): void {
+  if (kind == null) return;
+  if (kind !== 'type' && kind !== 'topic' && kind !== 'flag') throw new Error('tag kind must be type, topic, or flag');
+}
+
 function assertTagColor(color: string | null | undefined): void {
   if (color == null || color === '') return;
   if (!/^#[0-9a-fA-F]{3,8}$/.test(color)) throw new Error('tag color must be a hex colour like #4a90d9');

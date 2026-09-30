@@ -56,6 +56,61 @@ function redactString(text: string): string {
 }
 
 /**
+ * The exact values karmax delivered to one turn — its platform token, model
+ * credential, project and vault secrets. Key-based redaction above cannot see
+ * `echo $DATABASE_URL` or a `.env` printed in full, so wherever the turn's
+ * text is archived (live output, activity items, the final answer) these
+ * values are replaced outright. Short values are skipped: scrubbing "1" or
+ * "true" would mangle ordinary text and protect nothing.
+ */
+export class SecretScrubber {
+  private values: string[] = [];
+
+  add(...values: Array<string | undefined>): void {
+    const next = new Set(this.values);
+    for (const value of values) {
+      if (!value || value.length < 8) continue;
+      next.add(value);
+      // The same value inside JSON (a tool result, an activity payload).
+      const escaped = JSON.stringify(value).slice(1, -1);
+      if (escaped !== value) next.add(escaped);
+    }
+    this.values = [...next].sort((a, b) => b.length - a.length);
+  }
+
+  scrub(text: string): string;
+  scrub(text: string | undefined): string | undefined;
+  scrub(text: string | undefined): string | undefined {
+    if (!text) return text;
+    for (const value of this.values) if (text.includes(value)) text = text.split(value).join('[redacted]');
+    return text;
+  }
+
+  /** `scrub` for the text so far of a block still being generated. A cut can
+   * fall inside a value, which then cannot match whole, so a tail that begins
+   * one (at least PARTIAL_SECRET_CHARS of it) is held back until more text
+   * arrives and the whole value can be replaced. */
+  scrubPartial(text: string): string {
+    let end = text.length;
+    for (let held = true; held;) {
+      held = false;
+      for (const value of this.values) {
+        for (let length = Math.min(value.length - 1, end); length >= Math.min(PARTIAL_SECRET_CHARS, value.length); length--) {
+          if (!text.startsWith(value.slice(0, length), end - length)) continue;
+          end -= length;
+          held = true;
+          break;
+        }
+      }
+    }
+    return this.scrub(text.slice(0, end));
+  }
+}
+
+/** The shortest start of a secret a live publication may not end with. */
+const PARTIAL_SECRET_CHARS = 4;
+
+/**
  * Tools whose arguments OR results carry plaintext secrets end-to-end. Their
  * `detail` is suppressed outright rather than trusted to key-based redaction:
  * a *correctly approved* reveal must not be durably archived where the item's
@@ -64,6 +119,8 @@ function redactString(text: string): string {
  * denylist can see through. The tool NAME is the one thing every rail agrees on.
  */
 export const SECRET_TOOL_NAMES = new Set([
+  // Generic requests can return mail bodies or secret-bearing connector data.
+  'platform_request',
   'get_credential',
   'check_agent_mail',
   'use_passkey',

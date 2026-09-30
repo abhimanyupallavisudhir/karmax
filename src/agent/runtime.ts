@@ -1,16 +1,34 @@
 import { currentTiming } from '../timing/index.js';
-import { AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
+import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
-import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
+import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import { jobStatuses } from '../world/jobs.js';
 import { BRAND } from '../domain/brand.js';
+import { formatMinorUnits } from '../util/currency.js';
 
-const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
+/** An amount in minor units of `currency`, as the approver reads it: 1250 JPY, 12.500 KWD. */
+const money = (minor: number | undefined, currency = 'usd') => `${formatMinorUnits(minor ?? 0, currency)} ${currency.toUpperCase()}`;
+
+/** The Review note for a spend that was not granted (SPEC §7.6). */
+export function spendReviewSummary(outcome: { status: string; reason?: string; shortfall?: number; currency?: string; cardId?: string },
+  args: { amount: number; merchant?: string; why?: string }): string {
+  const at = args.merchant ? ` at ${args.merchant}` : '';
+  if (outcome.status === 'needs_funding' && !outcome.cardId)
+    return `Choose a card for this task to pay ${money(args.amount, outcome.currency)}${at}. ${args.why ?? ''}`;
+  return outcome.status === 'needs_funding'
+    ? `Funding needed: add ${money(outcome.shortfall ?? args.amount, outcome.currency)} to the card to pay ${money(args.amount, outcome.currency)}${at}. ${args.why ?? ''}`
+    : outcome.status === 'needs_approval'
+      ? `Approval needed to spend ${money(args.amount, outcome.currency)}${at} (${outcome.reason}). ${args.why ?? ''}`
+      : `Spend denied: ${outcome.reason}.`;
+}
 
 /** What a turn's tools recorded for the workflow to act on after the turn, plus
  * how many workflow messages reached the agent mid-turn. Saved as each happens,
  * so a retried activity attempt (worker restart, lost heartbeat) keeps every
- * outcome of the attempt it replaces instead of silently dropping them. */
+ * outcome of the attempt it replaces instead of silently dropping them. The
+ * tools told the agent these were done, and a resumed agent does not repeat
+ * them: task #367 lost two sub-tasks before spawns were kept here. */
 export interface TurnJournal {
   completed?: boolean;
   openPrRequested?: boolean;
@@ -21,7 +39,7 @@ export interface TurnJournal {
   waitForSubtasks?: boolean;
   wait?: AgentWait;
   jobsStarted?: string[];
-  subTasks?: { title: string; prompt: string }[];
+  subTasks?: SubTaskRequest[];
   subTaskResponses?: SubTaskResponse[];
   skills?: { name: string; content: string }[];
   worldHandle?: import('../world/types.js').WorldHandle;
@@ -32,11 +50,14 @@ export interface TurnJournal {
 export interface RunTurnDeps {
   adapters: Map<Provider, AgentAdapter>;
   /** Stream incremental output to the task's live event log. */
-  onEmit?: (text: string, source?: 'assistant' | 'tool') => void;
+  onEmit?: (text: string, source?: 'assistant' | 'tool') => void | Promise<void>;
   /** Persist attachments before acknowledging the tool, including turns stopped by escalation. */
   onReviewInfo?: (info: ReviewInfo, supplied: ReviewInfo) => void | Promise<void>;
   /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
   onActivity?: (activity: AgentActivity) => void | Promise<void>;
+  /** Validate and normalize create_sub_task `params` (PL-11). A refusal throws,
+   *  so the agent gets a tool error and nothing is queued. */
+  subTaskParams?: (params: unknown) => Promise<SubTaskRequest['params']>;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
   budget?: {
     request(ctx: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -50,13 +71,16 @@ export interface RunTurnDeps {
     }>;
   };
   spendCtx?: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] };
-  onSpend?: (req: any, outcome: any) => void;
+  onSpend?: (req: any, outcome: any) => void | Promise<void>;
   /** Cancellation propagated from the workflow (SPEC §5.6 mid-turn cancel). */
   signal?: AbortSignal;
   heartbeat?: () => void;
   /** Publish the provider session id the moment it's known (mid-turn), for the live
    *  "fork this agent" command in the drawer (RESOLVE-PLAN #3). */
-  onSession?: (session: string) => void;
+  onSession?: (session: string) => void | Promise<void>;
+  /** Preserve billable provider usage before cancellation or observer delivery can fail. */
+  onProviderResult?: (turn: AdapterTurn) => void;
+  onProviderStart?: () => Promise<void>;
   /** Pull follow-up messages queued in the workflow at/after `fromIndex` so a
    *  streaming adapter can inject them into the live session mid-turn (SPEC §5.6). */
   pullFollowUps?: (fromIndex: number) => Promise<import('../domain/types.js').Message[]>;
@@ -69,7 +93,6 @@ export interface RunTurnDeps {
   platformRequest?: (method: string, path: string, body?: unknown) => Promise<unknown>;
   fillPaymentCard?: (args: {
     requestId: string;
-    cdpUrl: string;
     selectors: import('../autonomy/card-fill.js').CardFillSelectors;
   }) => Promise<{ filled: true; origin: string }>;
 }
@@ -99,6 +122,47 @@ function pollSecretEnv(live: Record<string, string>, pull: () => Promise<Record<
   }, SECRET_ENV_POLL_MS);
   timer.unref?.();
   return () => clearInterval(timer);
+}
+
+/** Streaming adapters re-emit the growing text of the block being generated,
+ * token by token. Publish the first chunk at once, then at most one update per
+ * window carrying the latest text, so a fast stream cannot flood the event log
+ * and every open console (LT-5). Tool lines are discrete and go out at once. */
+export const OUTPUT_PUBLISH_INTERVAL_MS = 150;
+
+function coalescedOutput(publish: (text: string, source?: 'assistant' | 'tool') => void) {
+  let lastAt = -Infinity;
+  let pending: { text: string; source?: 'assistant' | 'tool' } | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let closed = false;
+  const send = (next: { text: string; source?: 'assistant' | 'tool' }) => {
+    pending = undefined;
+    lastAt = Date.now();
+    publish(next.text, next.source);
+  };
+  const flush = () => {
+    if (timer) { clearTimeout(timer); timer = undefined; }
+    if (pending) send(pending);
+  };
+  return {
+    emit(text: string, source?: 'assistant' | 'tool') {
+      // A late SDK or notification callback must not publish into an ended turn.
+      if (closed) return;
+      if (source !== 'assistant') { flush(); send({ text, source }); return; }
+      pending = { text, source };
+      const wait = lastAt + OUTPUT_PUBLISH_INTERVAL_MS - Date.now();
+      if (wait <= 0 && !timer) send(pending);
+      else timer ??= setTimeout(flush, wait);
+    },
+    /** Before anything that must follow the text (the item completing it, the turn's end). */
+    flush,
+    /** A failed, cancelled or ended turn publishes nothing more. */
+    discard() {
+      closed = true;
+      if (timer) { clearTimeout(timer); timer = undefined; }
+      pending = undefined;
+    },
+  };
 }
 
 export const KARMAX_RUNTIME_PROTOCOL = 1 as const;
@@ -140,9 +204,14 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let waitForSubtasks = restored.waitForSubtasks ?? false;
   let wait: AgentWait | undefined = restored.wait;
   const jobsStarted: string[] = [...(restored.jobsStarted ?? [])];
-  const subTasks: { title: string; prompt: string }[] = [...(restored.subTasks ?? [])];
+  const subTasks: SubTaskRequest[] = [...(restored.subTasks ?? [])];
   const subTaskResponses: SubTaskResponse[] = [...(restored.subTaskResponses ?? [])];
   const skills: { name: string; content: string }[] = [...(restored.skills ?? [])];
+  // A resumed agent may ask for the same spawn or answer again; deliver it once.
+  const addOnce = <T>(list: T[], item: T) => {
+    const key = JSON.stringify(item);
+    if (!list.some(existing => JSON.stringify(existing) === key)) list.push(item);
+  };
   // Set only if the agent partitioned its change across another branch this turn.
   let worldHandle: import('../world/types.js').WorldHandle | undefined = restored.worldHandle;
   let delivered = restored.delivered;
@@ -171,6 +240,29 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   const liveSecretEnv = deps.pullSecretEnv ? { ...input.secretEnv } : undefined;
   if (liveSecretEnv) input = { ...input, secretEnv: liveSecretEnv };
   const secretEnvListeners = new Set<() => void | Promise<void>>();
+
+  // SDK event handlers may ignore returned promises. Catch at the boundary and
+  // drain before finishing, so persistence failures belong to this turn rather
+  // than becoming unhandled rejections in the shared worker.
+  const observers = new Set<Promise<void>>();
+  let observerFailed = false;
+  let observerError: unknown;
+  const observe = (callback: () => void | Promise<void>): Promise<void> => {
+    const pending = (async () => { await callback(); })().catch(error => {
+      if (!observerFailed) { observerFailed = true; observerError = error; }
+    });
+    observers.add(pending);
+    void pending.then(() => observers.delete(pending));
+    return pending;
+  };
+  const drainObservers = async () => {
+    while (observers.size) await Promise.all(observers);
+  };
+  const output = coalescedOutput((text, source) => { observe(async () => {
+    const observed = text.trim() ? outputObserved() : undefined;
+    const firstText = source === 'assistant' && text.trim() ? trace?.markOnce('first.text') : undefined;
+    await Promise.all([deps.onEmit?.(text, source), observed, firstText]);
+  }); });
 
   const ctx: PlatformToolContext = {
     openPr() {
@@ -202,9 +294,11 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       // Providers can dispatch tools concurrently. Serialize accumulation with
       // publication so an overlapping call cannot overwrite another's actions.
       const publication = reviewPublication.then(async () => {
-        const actions = info.actions ? [...(reviewInfo?.actions ?? []), ...info.actions] : reviewInfo?.actions;
-        const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
+        const call = validateReviewInfoCall(info);
+        const actions = call.actions ? [...(reviewInfo?.actions ?? []), ...call.actions] : reviewInfo?.actions;
+        const supplied = Object.fromEntries(Object.entries(call).filter(([, value]) => value !== undefined));
         const nextReviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
+        assertReviewInfoTotal(nextReviewInfo);
         await deps.onReviewInfo?.(nextReviewInfo, info);
         reviewInfo = nextReviewInfo;
         await journal();
@@ -213,12 +307,15 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       reviewPublication = publication.catch(() => {});
       await publication;
     },
-    createSubTask(t) {
-      subTasks.push(t);
+    async createSubTask(t) {
+      // Unvalidated params never reach a child: without a validator, refuse them.
+      if (t.params !== undefined && !deps.subTaskParams) throw new Error('sub-task params are unavailable in this turn');
+      const params = t.params === undefined ? undefined : (await deps.subTaskParams!(t.params));
+      addOnce(subTasks, { title: t.title, prompt: t.prompt, ...(params ? { params } : {}) });
       return journal();
     },
     respondToSubTask(r) {
-      subTaskResponses.push(r);
+      addOnce(subTaskResponses, r);
       return journal();
     },
     raiseToParent(r) {
@@ -271,15 +368,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     async requestSpend(args) {
       if (!deps.budget || !deps.spendCtx) return { status: 'denied', reason: 'payments not configured' };
       const outcome = await deps.budget.request(deps.spendCtx, args);
-      deps.onSpend?.(args, outcome);
+      await deps.onSpend?.(args, outcome);
       // surface a pending spend at the Review gate so the human can fund/approve
       if (outcome.status !== 'granted') {
-        const note =
-          outcome.status === 'needs_funding'
-            ? `Funding needed: add ${fmt(outcome.shortfall ?? args.amount)} to the card to pay ${fmt(args.amount)}${args.merchant ? ' at ' + args.merchant : ''}. ${args.why ?? ''}`
-            : outcome.status === 'needs_approval'
-              ? `Approval needed to spend ${fmt(args.amount)}${args.merchant ? ' at ' + args.merchant : ''} (${outcome.reason}). ${args.why ?? ''}`
-              : `Spend denied: ${outcome.reason}.`;
+        const note = spendReviewSummary(outcome, args);
         const actions = outcome.requestId && (outcome.status === 'needs_approval' || outcome.status === 'needs_funding')
           ? [
               { kind: 'payment' as const, label: outcome.status === 'needs_funding' ? 'Retry after funding' : 'Approve spend',
@@ -301,13 +393,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       return deps.platformRequest(method, path, body);
     },
     fillPaymentCard: deps.fillPaymentCard,
-    async emit(text, source) {
-      const output = text.trim() ? outputObserved() : undefined;
-      const firstText = source === 'assistant' && text.trim() ? trace?.markOnce('first.text') : undefined;
-      deps.onEmit?.(text, source);
-      await Promise.all([output, firstText]);
-    },
-    async emitActivity(activity) {
+    emit(text, source) { output.emit(text, source); },
+    emitActivity(activity) { output.flush(); return observe(async () => {
       const output = outputObserved();
       const firstText = activity.kind === 'message' && activity.title?.trim() ? trace?.markOnce('first.text') : undefined;
       await Promise.all([deps.onActivity?.(activity), output, firstText]);
@@ -319,9 +406,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
           observedTools.delete(activity.id);
         }
       }
-
-    },
-    onSession: deps.onSession,
+    }); },
+    onSession: deps.onSession ? session => observe(() => deps.onSession!(session)) : undefined,
     signal: deps.signal,
     heartbeat: deps.heartbeat,
     ...(liveSecretEnv ? { onSecretEnvChange(listener: () => void | Promise<void>) {
@@ -335,24 +421,17 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     } : undefined,
   };
 
-  // Liveness + cancellation delivery: beat every second for the turn's whole
-  // duration. Adapters also heartbeat on activity, but only this interval
-  // guarantees a long silent stretch — a big tool run, a slow first token — can't
-  // delay cancellation. The Worker caps heartbeat throttling at the same interval.
-  const hb = deps.heartbeat
-    ? setInterval(() => {
-        try {
-          deps.heartbeat!();
-        } catch {
-          /* never let a heartbeat failure kill the turn */
-        }
-      }, 1_000)
-    : undefined;
   const secretPoll = liveSecretEnv ? pollSecretEnv(liveSecretEnv, deps.pullSecretEnv!, secretEnvListeners) : undefined;
-  let turn;
-  deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' });
+  let turn: AdapterTurn;
   try {
+    await observe(() => deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' }));
+    if (observerFailed) throw observerError;
+    await deps.onProviderStart?.();
     turn = await adapter.runTurn(input, ctx);
+    deps.onProviderResult?.(turn);
+    if (!deps.signal?.aborted) output.flush();
+    await drainObservers();
+    if (observerFailed) throw observerError;
     // An adapter may deliberately swallow its provider's AbortError so it can clean
     // up and return partial output (Claude SDK, Codex app-server/CLI). That partial
     // result is NOT a completed turn when the enclosing activity was cancelled. In
@@ -371,25 +450,28 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       throw new Error('agent provider ended without a verified successful terminal event');
     }
     (await trace?.mark('provider.completed', turn.usage));
-    deps.onActivity?.({
+    await observe(() => deps.onActivity?.({
       id: 'turn',
       kind: 'turn',
       phase: 'completed',
       title: 'Agent finished',
       ...(turn.termination.reason ? { detail: turn.termination.reason } : {}),
-    });
+    }));
+    if (observerFailed) throw observerError;
   } catch (error) {
-    deps.onActivity?.({
+    output.discard();
+    await observe(() => deps.onActivity?.({
       id: 'turn',
       kind: 'turn',
       phase: 'failed',
       title: 'Agent turn failed',
       detail: error instanceof Error ? error.message.slice(0, 1200) : String(error).slice(0, 1200),
-    });
+    }));
     throw error;
   } finally {
-    if (hb) clearInterval(hb);
+    output.discard();
     secretPoll?.();
+    await drainObservers();
   }
 
   // Jobs this turn started and left running without pausing for them: report

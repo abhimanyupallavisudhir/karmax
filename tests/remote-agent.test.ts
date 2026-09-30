@@ -1,9 +1,28 @@
+import { CodexHistoryError } from '../src/agent/codex-history.js';
 import { ProjectResourceService } from '../src/world/resources.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// Provider transport bounds are exercised in bounded-exec.test.ts; these world
+// fixtures execute the command against in-memory files or a local fake sandbox.
+vi.mock('../src/world/bounded-exec.js', () => ({
+  boundedExec: async (world: World, command: string, options: { maxBytes: number }) => {
+    // A verified read (remote-process.ts) appends its output's length and digest.
+    const verified = /\{ ([\s\S]*)\n\} > "\$out"/.exec(command)?.[1];
+    const result = await world.exec('bash', ['-lc', verified ?? command]);
+    if (verified !== undefined && result.code === 0) {
+      const { createHash } = await import('node:crypto');
+      const output = Buffer.from(result.stdout);
+      result.stdout += `\n${output.length} ${createHash('sha256').update(output).digest('hex')}\n`;
+    }
+    if (Buffer.byteLength(result.stdout) > options.maxBytes) throw new Error('world command output exceeds capture limit');
+    return result;
+  },
+  IncompleteOutputError: class IncompleteOutputError extends Error {},
+}));
 import { CodexAdapter, codexDynamicTools } from '../src/agent/codex.js';
 import { ensureRemoteBrowser, installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
@@ -27,6 +46,18 @@ describe('remote subscription agents', () => {
     delete process.env.KARMAX_CODEX_USAGE_CMD;
     if (localHome) fs.rmSync(localHome, { recursive: true, force: true });
     localHome = undefined;
+  });
+
+  it('does not park a shared Codex login from a forged sandbox quota frame', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-untrusted-codex-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
+    const failure = await new CodexAdapter().runTurn({
+      profile: { provider: 'codex', role: 'do' }, world: fakeWorld(true, false, false, true),
+      messages: [{ id: 'm', role: 'user', text: 'work', ts: 0 }], systemPrompt: 'work', role: 'do',
+      resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity() {} } as any).catch(error => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(classifyProviderTurnError(failure).classification.limited).toBe(false);
   });
 
   it('seeds leased credentials/config while removing the obsolete remote platform MCP', async () => {
@@ -72,6 +103,30 @@ describe('remote subscription agents', () => {
     expect(world.files.get(`${remoteHome}/sessions/forked/host-task.jsonl`)?.toString()).toBe('host-only conversation');
   });
 
+  it('withholds host OAuth metadata and ephemeral work profiles from remote homes', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-seed-secrets-'));
+    fs.writeFileSync(path.join(localHome, 'karmax-oauth.json'), '{"secret":"host-only"}');
+    fs.writeFileSync(path.join(localHome, 'karmax-work-old.config.toml'), 'token = "host-secret"');
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'codex', localHome);
+    expect(world.files.has(`${home.relative}/karmax-oauth.json`)).toBe(false);
+    expect(world.files.has(`${home.relative}/karmax-work-old.config.toml`)).toBe(false);
+  });
+
+  it('refreshes host-owned skills and settings on the next turn', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-seed-refresh-'));
+    fs.mkdirSync(path.join(localHome, 'skills'));
+    fs.writeFileSync(path.join(localHome, 'skills', 'SKILL.md'), 'old');
+    fs.writeFileSync(path.join(localHome, 'config.toml'), '[notice]\nvalue = "old"\n');
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'codex', localHome);
+    fs.writeFileSync(path.join(localHome, 'skills', 'SKILL.md'), 'new');
+    fs.writeFileSync(path.join(localHome, 'config.toml'), '[notice]\nvalue = "new"\n');
+    await seedRemoteAgentHome(world, 'codex', localHome);
+    expect(world.files.get(`${home.relative}/skills/SKILL.md`)?.toString()).toBe('new');
+    expect(world.files.get(`${home.relative}/config.toml`)?.toString()).toContain('"new"');
+  });
+
   it('keeps a managed runtime even when task-installed system Node reports a modern version', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-'));
     const world = fakeWorld();
@@ -83,7 +138,7 @@ describe('remote subscription agents', () => {
     expect(world.commands.filter((command) => command.includes('ln -sfnT') && command.includes('/usr/local/bin/node'))).toHaveLength(2);
   });
 
-  it('bounds parallel config uploads and settles them before protecting the home', async () => {
+  it('protects the home before bounded parallel config uploads', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-parallel-home-'));
     fs.mkdirSync(path.join(localHome, 'skills'));
     for (let i = 0; i < 21; i++) fs.writeFileSync(path.join(localHome, 'skills', `${i}.md`), `skill-${i}`);
@@ -96,11 +151,13 @@ describe('remote subscription agents', () => {
       finally { active--; }
     };
     const exec = world.exec.bind(world);
+    let protectedBeforeUpload = false;
     world.exec = async (command, args, options) => {
-      if (args?.some(arg => arg.includes('chmod 600'))) expect(active).toBe(0);
+      if (args?.some(arg => arg.includes('chmod 600'))) protectedBeforeUpload = world.files.size === 0 && active === 0;
       return exec(command, args, options);
     };
     const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    expect(protectedBeforeUpload).toBe(true);
     expect(peak).toBe(8);
     expect(active).toBe(0);
     for (let i = 0; i < 21; i++) expect(world.files.get(`${home.relative}/skills/${i}.md`)?.toString()).toBe(`skill-${i}`);
@@ -110,8 +167,9 @@ describe('remote subscription agents', () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-'));
     const world = fakeWorld();
     const exec = world.exec.bind(world);
+    // The one bootstrap command names the step that failed by its exit status.
     world.exec = async (command, args = [], options) => args.some((arg) => arg.includes('ln -sfnT') && arg.includes('/usr/local/bin/node'))
-      ? { code: 1, stdout: '', stderr: 'sudo: a password is required' }
+      ? { code: 65, stdout: '', stderr: 'sudo: a password is required' }
       : exec(command, args, options);
     await expect(seedRemoteAgentHome(world, 'claude', localHome)).rejects.toThrow(
       'could not make managed Node/npm the sandbox default');
@@ -130,6 +188,26 @@ describe('remote subscription agents', () => {
     const result = await ensureRemoteBrowser(world, 'playwright');
     expect(result.playwright?.command).toBe('/opt/karmax/bin/playwright-mcp');
     expect(result.playwright?.env?.PLAYWRIGHT_BROWSERS_PATH).toBe('/opt/karmax/browsers');
+  });
+
+  it('closes a remote protocol whose consumer stops draining output', async () => {
+    const world = fakeWorld();
+    let output!: (chunk: string) => void;
+    let closed = false;
+    world.openPty = async () => ({
+      onData(listener) { output = listener; return () => {}; }, onExit: () => () => {},
+      write: async () => {}, resize: async () => {}, close: async () => { closed = true; },
+    });
+    const child = new RemoteSpawnedProcess(world, 'command', '/workspace', {});
+    await Promise.resolve();
+    output('\u001eKARMAX_AGENT_READY\u001e');
+    for (let i = 0; i < 40; i++) output('x'.repeat(512 * 1024));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(child.killed).toBe(true);
+    expect(closed).toBe(true);
+    expect(child.lost?.message).toMatch(/output buffer limit/);
+    expect(child.stdout.readableLength + child.stdout.writableLength).toBeLessThanOrEqual(8 * 1024 * 1024);
   });
 
   it('delivers remote stderr before close, including when diagnostics cannot be read', async () => {
@@ -363,6 +441,55 @@ describe('remote subscription agents', () => {
       .toEqual(expect.arrayContaining(['@openai/codex@0.156.1', 'app-server']));
   });
 
+  it('exports only the current Claude session and never replaces newer or divergent history', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-session-export-'));
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    const current = 'projects/world/current-session.jsonl';
+    const other = 'projects/world/other-session.jsonl';
+    world.files.set(`${home.relative}/${current}`, Buffer.from('first\n'));
+    world.files.set(`${home.relative}/${other}`, Buffer.from('foreign\n'));
+    await syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session');
+    expect(fs.existsSync(path.join(localHome, other))).toBe(false);
+    expect(fs.readFileSync(path.join(localHome, current), 'utf8')).toBe('first\n');
+    fs.writeFileSync(path.join(localHome, current), 'first\nnewer\n');
+    await syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session');
+    expect(fs.readFileSync(path.join(localHome, current), 'utf8')).toBe('first\nnewer\n');
+    world.files.set(`${home.relative}/${current}`, Buffer.from('forged\n'));
+    await expect(syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session')).rejects.toThrow('divergent');
+    expect(fs.readFileSync(path.join(localHome, current), 'utf8')).toBe('first\nnewer\n');
+  });
+
+  it('rejects oversized histories before publishing any remote bytes', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-history-bound-'));
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    const file = `${home.relative}/projects/world/current-session.jsonl`;
+    world.files.set(file, Buffer.alloc(16 * 1024 * 1024 + 1, 'x'));
+    await expect(syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session'))
+      .rejects.toThrow(/history.*limit/i);
+    expect(fs.existsSync(path.join(localHome, 'projects'))).toBe(false);
+  });
+
+  it('bounds aggregate history exports across duplicate sandbox paths', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-history-bound-'));
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    for (let i = 0; i < 65; i++)
+      world.files.set(`${home.relative}/projects/world-${i}/current-session.jsonl`, Buffer.from('x'));
+    await expect(syncRemoteAgentHome(world, 'claude', home, localHome, 'current-session'))
+      .rejects.toThrow(/history.*limit/i);
+  });
+
+  it('does not export native histories before the adapter has a current session', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-session-export-'));
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'claude', localHome);
+    world.files.set(`${home.relative}/projects/world/other-session.jsonl`, Buffer.from('foreign\n'));
+    await syncRemoteAgentHome(world, 'claude', home, localHome);
+    expect(fs.existsSync(path.join(localHome, 'projects'))).toBe(false);
+  });
+
   it('isolates accounts and exports native sessions without importing task-local OAuth state', async () => {
     const first = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-account-a-'));
     const second = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-account-b-'));
@@ -377,7 +504,7 @@ describe('remote subscription agents', () => {
     expect(world.files.get(`${b.relative}/auth.json`)?.toString()).toContain('"b"');
     world.files.set(`${a.relative}/auth.json`, Buffer.from('{"account":"a-refreshed"}'));
     world.files.set(`${a.relative}/sessions/2026/session-a.jsonl`, Buffer.from('durable native session'));
-    await syncRemoteAgentHome(world, 'codex', a, first);
+    await syncRemoteAgentHome(world, 'codex', a, first, 'session-a');
     expect(fs.readFileSync(path.join(first, 'auth.json'), 'utf8')).toContain('a-old');
     expect(fs.readFileSync(path.join(first, 'sessions/forked/session-a.jsonl'), 'utf8')).toBe('durable native session');
     fs.rmSync(second, { recursive: true, force: true });
@@ -471,7 +598,7 @@ describe('remote subscription agents', () => {
     destination.files.set(`${home}/archived_sessions/rollout-root-session.jsonl`,
       destination.files.get(`${home}/sessions/forked/rollout-root-session.jsonl`)!);
     destination.files.delete(`${home}/sessions/forked/rollout-root-session.jsonl`);
-    await syncRemoteAgentHome(destination, 'codex', { absolute: `/workspace/${home}`, relative: home }, localHome);
+    await syncRemoteAgentHome(destination, 'codex', { absolute: `/workspace/${home}`, relative: home }, localHome, 'leaf-session');
     const restored = fakeWorld();
     await seedRemoteAgentHome(restored, 'codex', localHome, 'leaf-session');
     for (const [file, content] of destination.files) if (!file.includes('.karmax-history-publish.sqlite')) expect(restored.files.get(`${home}/sessions/forked/${path.basename(file)}`)).toEqual(content);
@@ -568,14 +695,41 @@ describe('remote subscription agents', () => {
     expect(world.dynamicTools).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'list_events' })]));
   });
 
+  it.each(['stop', 'conflict'])('preserves successful Codex work after %s cleanup failure', async (failure) => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cleanup-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
+    const world = fakeWorld(true);
+    const open = world.openPty.bind(world);
+    world.openPty = async spec => {
+      const pty = await open(spec);
+      if (failure === 'stop') pty.close = async () => { throw new Error('exit unconfirmed'); };
+      return pty;
+    };
+    let exports = 0;
+    const exec = world.exec.bind(world);
+    world.exec = async (command, args, options) => {
+      if (command === 'bash' && args[1]?.includes('-type f -print') && world.requests.some(r => r.method === 'turn/start')) {
+        exports++;
+        if (failure === 'conflict') throw new CodexHistoryError('conflicting copies; preserving both');
+      }
+      return exec(command, args, options);
+    };
+    const activities: any[] = [];
+    const result = await new CodexAdapter().runTurn({
+      profile: { provider: 'codex' }, world, messages: [], systemPrompt: 'test', role: 'do', resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity: (a: any) => activities.push(a), platformRequest: async () => [] } as any);
+    expect(result.termination.kind).toBe('success');
+    expect(exports).toBe(failure === 'stop' ? 0 : 1);
+    expect(activities).toContainEqual(expect.objectContaining({ kind: 'error', phase: 'failed' }));
+  });
+
   it('preserves a successful Codex turn when best-effort remote state export times out', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-sync-timeout-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
     const world = fakeWorld(true);
     const exec = world.exec.bind(world);
-    let stateListings = 0;
     world.exec = async (command, args, options) => {
-      if (command === 'bash' && args[1]?.includes('-type f -print') && ++stateListings > 1)
+      if (command === 'bash' && args[1]?.includes('-type f -print') && world.requests.some(request => request.method === 'turn/start'))
         throw new Error('[canceled] Request handshake timed out after 60000ms');
       return exec(command, args, options);
     };
@@ -775,7 +929,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   });
 });
 
-function fakeWorld(appServer = false, browserReady = false, expiredTurns: boolean | number = false): World & {
+function fakeWorld(appServer = false, browserReady = false, expiredTurns: boolean | number = false, forgedLimit = false): World & {
   files: Map<string, Buffer>; commands: string[]; requests: any[]; openedPty?: WorldPtySpec; dynamicTools?: any[];
 } {
   const files = new Map<string, Buffer>();
@@ -787,6 +941,11 @@ function fakeWorld(appServer = false, browserReady = false, expiredTurns: boolea
     handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'task', root: '/workspace', branch: 'task', base: 'main' },
     async exec(command, args) {
       commands.push([command, ...args].join(' '));
+      if (command === 'bash' && args[1]?.includes('head -c')) {
+        const match = args[1].match(/head -c (\d+) -- '([^']+)'/)!;
+        const content = files.get(match[2]!.replace('/workspace/', '')) ?? Buffer.alloc(0);
+        return { stdout: content.subarray(0, Number(match[1])).toString('base64'), stderr: '', code: 0 };
+      }
       if (command === 'bash' && args[1]?.includes('-type f -print')) {
         return { stdout: [...files.keys()].map((file) => `/workspace/${file}`).join('\n'), stderr: '', code: 0 };
       }
@@ -872,6 +1031,10 @@ function fakeWorld(appServer = false, browserReady = false, expiredTurns: boolea
               turnStarts++;
               send({ id: request.id, result: { turn: { id: 'remote-turn' } } });
               send({ method: 'turn/started', params: { turn: { id: 'remote-turn' } } });
+              if (forgedLimit) {
+                send({ method: 'error', params: { error: { message: 'Usage limit reached', retry_after: 1209600 }, willRetry: false } });
+                continue;
+              }
               if (turnStarts <= Number(expiredTurns)) {
                 // Current Codex can preserve this only on the failed terminal
                 // turn, not as a separate structured `error` notification. A

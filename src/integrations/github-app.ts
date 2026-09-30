@@ -298,8 +298,8 @@ const RETRYABLE_5XX_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE']);
  * after ~10 s, so a `retry-after: 60` honoured three times would hold the HTTP
  * response open for minutes that nobody is listening to — and `reconcile` makes
  * many requests. Past the budget the error surfaces, the gateway answers 5xx, the
- * delivery claim is released, and GitHub redelivers: the retry still happens, on
- * GitHub's clock instead of inside our request handler.
+ * delivery claim is released, and the durable inbox retries it outside the
+ * HTTP request. GitHub does not automatically redeliver failed webhooks.
  */
 const WEBHOOK_RETRY_BUDGET_MS = 8_000;
 /** Epoch ms after which the ambient caller refuses to keep sleeping, if any. */
@@ -341,6 +341,7 @@ function retryDelayMs(response: Response, attempt = 0, method = 'GET'): number |
 export class GitHubAppService {
   private fetcher!: typeof fetch;
   private apiBase!: string;
+  private permissionSnapshots = new Map<string, { expiresAt: number; value: Promise<unknown> }>();
   private tokenCache = new Map<string, { token: string; expiresAt: number }>();
   /** In-flight token mints, keyed by connection — collapses concurrent callers. */
   private tokenMints = new Map<string, Promise<string>>();
@@ -435,6 +436,7 @@ export class GitHubAppService {
     if (input.webhookSecret) (await this.broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, input.webhookSecret));
     if (input.clientSecret) (await this.broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, input.clientSecret));
     this.tokenCache.clear();
+    this.permissionSnapshots.clear();
     return (await this.status());
   }
 
@@ -484,6 +486,7 @@ export class GitHubAppService {
   async convertManifest(code: string): Promise<ReturnType<GitHubAppService['status']>> {
     if (!code.trim()) throw new Error('GitHub App manifest code is missing');
     const response = await this.fetcher(`${this.apiBase}/app-manifests/${encodeURIComponent(code)}/conversions`, {
+      signal: AbortSignal.timeout(30_000),
       method: 'POST', headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' },
     });
     if (!response.ok) throw new Error(`GitHub manifest conversion failed (${response.status}): ${(await response.text()).slice(0, 500)}`);
@@ -805,9 +808,9 @@ export class GitHubAppService {
   /** Observe the complete operational permission envelope at both GitHub
    * approval layers. The App owner changes the registration first; every
    * existing installation owner must then approve that expansion separately. */
-  async permissionStatus(connection?: GitConnection): Promise<GitHubAppPermissionStatus> {
+  async permissionStatus(connection?: GitConnection, options: { forceRefresh?: boolean } = {}): Promise<GitHubAppPermissionStatus> {
     if (!this.configured()) throw new Error('GitHub App is not configured');
-    const app = await this.appRequest<GitHubAppPayload>('/app');
+    const app = await this.permissionSnapshot<GitHubAppPayload>('/app', options.forceRefresh);
     const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
     if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
     (await this.rememberAppSlug(slug));
@@ -816,8 +819,8 @@ export class GitHubAppService {
       ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/${encodeURIComponent(slug)}/permissions`
       : `https://github.com/settings/apps/${encodeURIComponent(slug)}/permissions`;
     let installation: GitHubInstallationPayload | undefined;
-    if (connection) installation = await this.appRequest<GitHubInstallationPayload>(
-      `/app/installations/${encodeURIComponent(connection.installationId)}`,
+    if (connection) installation = await this.permissionSnapshot<GitHubInstallationPayload>(
+      `/app/installations/${encodeURIComponent(connection.installationId)}`, options.forceRefresh,
     );
     const installationSettingsUrl = installation?.html_url?.startsWith('https://github.com/')
       ? installation.html_url
@@ -857,6 +860,18 @@ export class GitHubAppService {
     };
   }
 
+  private permissionSnapshot<T>(pathname: string, forceRefresh = false): Promise<T> {
+    const cached = this.permissionSnapshots.get(pathname);
+    if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached.value as Promise<T>;
+    if (this.permissionSnapshots.size >= 1000) this.permissionSnapshots.clear();
+    const value = this.appRequest<T>(pathname).catch((error) => {
+      if (this.permissionSnapshots.get(pathname)?.value === value) this.permissionSnapshots.delete(pathname);
+      throw error;
+    });
+    this.permissionSnapshots.set(pathname, { expiresAt: Date.now() + 60_000, value });
+    return value;
+  }
+
   /** Human-readable recovery for Git's remote-rejection message. */
   async workflowPermissionGuidance(repository: Repository): Promise<string> {
     const connection = repository.gitConnectionId
@@ -892,7 +907,7 @@ export class GitHubAppService {
   }
 
   async disconnectInstallation(connectionId: string): Promise<void> {
-    this.tokenCache.delete(connectionId);
+    this.clearInstallationTokens(connectionId);
     this.tokenMints.delete(connectionId);
     (await this.store.deleteGitConnection(connectionId));
   }
@@ -916,7 +931,9 @@ export class GitHubAppService {
     }
     const active = new Set<string>();
     const repositories: Repository[] = [];
-    for (const item of remote.filter((repo) => !repo.archived)) {
+    const existing = await this.store.listRepositories(connection.organizationId);
+    for (const item of remote) {
+      if (item.archived && !existing.some((repo) => repo.providerId === String(item.id))) continue;
       const repository = (await this.store.upsertRepository({ organizationId: connection.organizationId, provider: 'github',
         providerId: String(item.id), owner: item.owner.login, name: item.name, sshUrl: item.ssh_url,
         defaultBranch: item.default_branch, private: item.private, gitConnectionId: connection.id }));
@@ -928,6 +945,59 @@ export class GitHubAppService {
       if (repository.gitConnectionId === connection.id && !active.has(repository.id)) await this.removeRepository(repository, token);
     }
     return repositories;
+  }
+
+  async deliverWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined,
+    dispatch: (result: GithubWebhookResult) => Promise<void>): Promise<GithubWebhookResult> {
+    if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
+    if (!deliveryId) throw new Error('GitHub delivery id is required');
+    const key = `github:webhook-pending:${crypto.createHash('sha256').update(deliveryId).digest('hex')}`;
+    await this.store.kvClaim(key, JSON.stringify({ event, deliveryId, raw: raw.toString('base64'), signature,
+      attempts: 0, nextAt: 0, leaseUntil: 0 }));
+    return await this.processPendingWebhook(key, dispatch, Date.now()) ?? { accepted: false };
+  }
+
+  async retryWebhooks(dispatch: (result: GithubWebhookResult) => Promise<void>, now = Date.now()): Promise<void> {
+    let attempted = 0;
+    for (const entry of await this.store.kvEntries('github:webhook-pending:')) {
+      try {
+        const pending = JSON.parse(entry.value);
+        if (pending.nextAt > now || pending.leaseUntil > now) continue;
+        if (attempted++ >= 100) break;
+        await this.processPendingWebhook(entry.key, dispatch, now);
+      }
+      catch { /* The durable entry carries the bounded retry deadline. */ }
+    }
+  }
+
+  private async processPendingWebhook(key: string, dispatch: (result: GithubWebhookResult) => Promise<void>, now: number):
+  Promise<GithubWebhookResult | undefined> {
+    const job = await this.store.transaction(async () => {
+      const saved = await this.store.kvGet(key);
+      if (!saved) return undefined;
+      const pending = JSON.parse(saved);
+      if (pending.nextAt > now || pending.leaseUntil > now) return undefined;
+      pending.leaseUntil = now + 10 * 60_000;
+      pending.attempts++;
+      await this.store.kvSet(key, JSON.stringify(pending));
+      return pending;
+    });
+    if (!job) return undefined;
+    try {
+      if (!job.result) {
+        if (job.attempts > 1) await this.store.releaseGithubDelivery(job.deliveryId);
+        job.result = await this.handleWebhook(job.event, job.deliveryId, Buffer.from(job.raw, 'base64'), job.signature);
+        await this.store.kvSet(key, JSON.stringify(job));
+      }
+      await dispatch(job.result);
+      await this.store.kvDelete(key);
+      return job.result;
+    } catch (error) {
+      job.leaseUntil = 0;
+      job.nextAt = now + Math.min(60 * 60_000, 5000 * 2 ** Math.min(job.attempts, 10));
+      await this.store.kvSet(key, JSON.stringify(job));
+      throw error;
+    }
   }
 
   async handleWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined):
@@ -942,7 +1012,7 @@ export class GitHubAppService {
     if (!(await this.store.recordGithubDelivery(deliveryId, event))) return { accepted: false };
     try {
       // Bounded retry budget: this call is inside GitHub's ~10 s delivery
-      // timeout, so a long backoff must fail fast and let GitHub redeliver
+      // timeout, so a long backoff must fail fast and let the inbox retry
       // rather than hold the response open (see WEBHOOK_RETRY_BUDGET_MS).
       return await retryDeadline.run(Date.now() + WEBHOOK_RETRY_BUDGET_MS, () => this.dispatchWebhook(event, raw));
     } catch (error) {
@@ -979,10 +1049,13 @@ export class GitHubAppService {
 
   private async dispatchConnectionWebhook(event: string, payload: any, connection: GitConnection): Promise<GithubWebhookResult> {
     const installationId = connection.installationId;
+    if (event === 'installation') this.permissionSnapshots.clear();
+    if (event === 'installation' && payload.action === 'new_permissions_accepted')
+      this.clearInstallationTokens(connection.id);
     if (event === 'installation' && (payload.action === 'deleted' || payload.action === 'suspend')) {
       const saved = (await this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
         accountLogin: connection.accountLogin, accountType: connection.accountType ?? undefined, suspendedAt: Date.now() }));
-      this.tokenCache.delete(saved.id);
+      this.clearInstallationTokens(saved.id);
       return { accepted: true, reconciled: 0 };
     }
     // The inverse transition. Without it `suspendedAt` was write-only: the ONLY
@@ -996,7 +1069,7 @@ export class GitHubAppService {
         accountLogin: payload.installation?.account?.login ?? connection.accountLogin,
         accountType: payload.installation?.account?.type ?? connection.accountType ?? undefined,
         suspendedAt: undefined }));
-      this.tokenCache.delete(saved.id);
+      this.clearInstallationTokens(saved.id);
       const repositories = await this.reconcile(saved);
       return { accepted: true, reconciled: repositories.length };
     }
@@ -1029,18 +1102,24 @@ export class GitHubAppService {
       const prEvent = pullRequestWebhookEvent(event, payload);
       if (!prEvent || !(await this.ownsTask(connection.organizationId, prEvent.taskId)))
         return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
-      const view = (await this.store.getTask(prEvent.taskId))?.lastView;
-      if (view) {
-        const reconciled = reconcilePullRequestView(view, prEvent.payload);
-        if (reconciled !== view) (await this.store.saveView(prEvent.taskId, reconciled));
-      }
-      const observation = githubPrWebhookObservationKey(prEvent);
-      if (observation) {
-        const digest = crypto.createHash('sha256').update(observation).digest('hex');
-        if (!(await this.store.kvClaim(`github:pr-observation:v1:${digest}`, prEvent.taskId)))
+      return this.store.transaction(async () => {
+        const task = await this.store.getTask(prEvent.taskId);
+        const attached = task ? await this.store.listProjectRepositories(task.projectId) : [];
+        if (!attached.some(({ repository }) => repository.providerId === String(payload.repository?.id)))
           return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
-      }
-      return { accepted: true, events: [prEvent], ...(projectEvents.length ? { projectEvents } : {}) };
+        const view = task?.lastView;
+        if (view) {
+          const reconciled = reconcilePullRequestView(view, prEvent.payload);
+          if (reconciled !== view) (await this.store.saveView(prEvent.taskId, reconciled));
+        }
+        const observation = githubPrWebhookObservationKey(prEvent);
+        if (observation) {
+          const digest = crypto.createHash('sha256').update(observation).digest('hex');
+          if (!(await this.store.claimGithubPrObservation(digest)))
+            return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
+        }
+        return { accepted: true, events: [prEvent], ...(projectEvents.length ? { projectEvents } : {}) };
+      });
     }
     if (['installation', 'installation_repositories', 'repository'].includes(event)) {
       const repositories = await this.reconcile({ ...connection, provider: 'github' });
@@ -1049,40 +1128,34 @@ export class GitHubAppService {
     return { accepted: true };
   }
 
-  /** A merged revision is immutable history. A default-branch workflow failure
-   * therefore fans out to the projects that actually attach this repository;
-   * the gateway turns each event into a new recovery task. check_run is a
-   * compatibility path for Apps that have not yet accepted workflow_run. */
+  /** Only same-repository pushes prove a failure on the merged default branch. */
   private async failedDefaultBranchWorkflowEvents(event: string, payload: any,
     organizationId: string): Promise<GithubProjectWebhookEvent[]> {
-    if (!['workflow_run', 'check_run'].includes(event) || payload.action !== 'completed') return [];
-    const repositoryPayload = payload.repository;
+    if (event !== 'workflow_run' || payload.action !== 'completed') return [];
+    const workflowRun = payload.workflow_run;
+    const repositoryId = payload.repository?.id;
+    if (!repositoryId || workflowRun?.event !== 'push'
+      || workflowRun.head_repository?.id !== repositoryId) return [];
     const repository = (await this.store.listRepositories(organizationId)).find((candidate) =>
-      (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
-      || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
+      candidate.providerId === String(repositoryId));
     if (!repository) return [];
     const failed = new Set(['action_required', 'failure', 'stale', 'startup_failure', 'timed_out']);
-    const workflowRun = payload.workflow_run;
-    const checkRun = payload.check_run;
-    const conclusion = String(workflowRun?.conclusion ?? checkRun?.conclusion ?? '').toLowerCase();
-    const branch = String(workflowRun?.head_branch ?? checkRun?.check_suite?.head_branch ?? '');
+    const conclusion = String(workflowRun.conclusion ?? '').toLowerCase();
+    const branch = String(workflowRun.head_branch ?? '');
     if (!failed.has(conclusion) || branch !== repository.defaultBranch) return [];
-    const url = String(workflowRun?.html_url ?? checkRun?.details_url ?? '');
-    const runId = Number(workflowRun?.id ?? githubActionsRunIdFromUrl(url)
-      ?? checkRun?.check_suite?.id ?? checkRun?.id);
+    const url = String(workflowRun.html_url ?? '');
+    const runId = Number(workflowRun.id);
     if (!Number.isSafeInteger(runId) || runId <= 0) return [];
-    const headSha = String(workflowRun?.head_sha ?? checkRun?.head_sha ?? checkRun?.check_suite?.head_sha ?? '');
-    const headRefs = [
-      ...(Array.isArray(workflowRun?.pull_requests) ? workflowRun.pull_requests : []),
-      ...(Array.isArray(checkRun?.pull_requests) ? checkRun.pull_requests : []),
-    ].map((pr: any) => String(pr?.head?.ref ?? pr?.head?.label ?? ''));
+    const headSha = String(workflowRun.head_sha ?? '');
+    const headRefs: string[] = (Array.isArray(workflowRun.pull_requests) ? workflowRun.pull_requests : [])
+      .map((pr: any) => String(pr?.head?.ref ?? ''));
     // A head label is `owner:branch`; a ref is the bare branch.
     const originatingTaskId = headRefs.map((ref) => taskIdOfBranch(ref.slice(ref.indexOf(':') + 1)))
       .find((id) => id && /^task_[A-Za-z0-9_-]+$/.test(id));
     const base = {
       repository: `${repository.owner}/${repository.name}`,
       repositoryId: repository.id,
-      workflow: String(workflowRun?.name ?? checkRun?.name ?? 'GitHub workflow'),
+      workflow: String(workflowRun.name ?? 'GitHub workflow'),
       runId,
       attempt: Math.max(1, Number(workflowRun?.run_attempt ?? 1) || 1),
       conclusion,
@@ -1119,23 +1192,33 @@ export class GitHubAppService {
    *    (each mint invalidates nothing, but N round trips per burst is pure waste
    *    and counts against the App's rate limit).
    */
-  async installationToken(connection: GitConnection): Promise<string> {
+  async installationToken(connection: GitConnection, repositoryIds?: string[]): Promise<string> {
     if (connection.suspendedAt) throw new Error('GitHub App installation is suspended');
-    const cached = this.tokenCache.get(connection.id);
+    if (repositoryIds && (!repositoryIds.length || repositoryIds.some((id) => !/^\d+$/.test(id)
+      || !Number.isSafeInteger(Number(id)) || Number(id) <= 0))) throw new Error('invalid GitHub repository scope');
+    const ids = repositoryIds ? [...new Set(repositoryIds.map(Number))].sort((a, b) => a - b) : undefined;
+    const cacheKey = ids ? `${connection.id}:${ids.join(',')}` : connection.id;
+    const cached = this.tokenCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
-    const inFlight = this.tokenMints.get(connection.id);
+    const inFlight = this.tokenMints.get(cacheKey);
     if (inFlight) return inFlight;
-    const mint = (async () => {
-      const created = await this.appRequest<{ token: string; expires_at: string }>(
-        `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`, { method: 'POST' },
-      );
+    const mint = this.appRequest<{ token: string; expires_at: string }>(
+      `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`,
+      { method: 'POST', ...(ids ? { body: JSON.stringify({ repository_ids: ids }) } : {}) },
+    ).then((created) => {
       const parsed = Date.parse(created.expires_at ?? '');
       const expiresAt = Number.isFinite(parsed) ? parsed : Date.now() + 3600_000;
-      this.tokenCache.set(connection.id, { token: created.token, expiresAt });
+      if (this.tokenMints.get(cacheKey) === mint) this.tokenCache.set(cacheKey, { token: created.token, expiresAt });
       return created.token;
-    })().finally(() => this.tokenMints.delete(connection.id));
-    this.tokenMints.set(connection.id, mint);
+    }).finally(() => { if (this.tokenMints.get(cacheKey) === mint) this.tokenMints.delete(cacheKey); });
+    this.tokenMints.set(cacheKey, mint);
     return mint;
+  }
+
+  private clearInstallationTokens(connectionId: string): void {
+    for (const cache of [this.tokenCache, this.tokenMints]) {
+      for (const key of cache.keys()) if (key === connectionId || key.startsWith(`${connectionId}:`)) cache.delete(key);
+    }
   }
 
   /** Drop a token minted before an installation-permission upgrade. Calls are
@@ -1146,16 +1229,18 @@ export class GitHubAppService {
     const last = this.tokenInvalidatedAt.get(connectionId) ?? 0;
     if (now - last < cooldownMs) return false;
     this.tokenInvalidatedAt.set(connectionId, now);
-    this.tokenCache.delete(connectionId);
+    this.clearInstallationTokens(connectionId);
     return true;
   }
 
-  async brokerCredentials(repository: Repository): Promise<{ httpsToken: string; env: Record<string, string> }> {
+  /** The organization's enrollment of the repository scopes the broker's host
+   * mirror: tenants that enrolled the same repository never share objects. */
+  async brokerCredentials(repository: Repository): Promise<{ httpsToken: string; env: Record<string, string>; mirrorScope: string }> {
     if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
     const connection = (await this.store.getGitConnection(repository.gitConnectionId));
-    if (!connection) throw new Error('repository GitHub App connection is missing');
-    const token = await this.installationToken(connection);
-    return { httpsToken: token, env: { GH_TOKEN: token } };
+    if (!connection || connection.organizationId !== repository.organizationId) throw new Error('repository GitHub App connection is missing');
+    const token = await this.installationToken(connection, [repository.providerId ?? '']);
+    return { httpsToken: token, env: { GH_TOKEN: token }, mirrorScope: repository.id };
   }
 
   /** Repository-bound Actions client. Tokens remain inside this service and a
@@ -1163,13 +1248,13 @@ export class GitHubAppService {
   async actions(repository: Repository): Promise<GithubActionsApi> {
     if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
     const connection = (await this.store.getGitConnection(repository.gitConnectionId));
-    if (!connection) throw new Error('repository GitHub App connection is missing');
+    if (!connection || connection.organizationId !== repository.organizationId) throw new Error('repository GitHub App connection is missing');
     return new GithubActionsApi(async (options) => {
       if (options?.forceRefresh) {
-        this.tokenCache.delete(connection.id);
-        this.tokenMints.delete(connection.id);
+        this.tokenCache.delete(`${connection.id}:${repository.providerId}`);
+        this.tokenMints.delete(`${connection.id}:${repository.providerId}`);
       }
-      return this.installationToken(connection);
+      return this.installationToken(connection, [repository.providerId ?? '']);
     }, { apiBase: this.apiBase, fetch: this.fetcher });
   }
 
@@ -1443,7 +1528,9 @@ export class GitHubAppService {
   private async request<T = unknown>(pathname: string, token: string, init: RequestInit = {}): Promise<T> {
     const method = (init.method ?? 'GET').toUpperCase();
     for (let attempt = 0; ; attempt++) {
-      const response = await this.fetcher(`${this.apiBase}${pathname}`, { ...init, headers: {
+      const timeout = AbortSignal.timeout(30_000);
+      const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+      const response = await this.fetcher(`${this.apiBase}${pathname}`, { ...init, signal, headers: {
         accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
         'x-github-api-version': '2022-11-28', 'content-type': 'application/json', ...(init.headers ?? {}),
       } });
@@ -1653,6 +1740,7 @@ export class GitHubAppService {
 
   private async oauthToken(input: Record<string, string>): Promise<any> {
     const response = await this.fetcher('https://github.com/login/oauth/access_token', {
+      signal: AbortSignal.timeout(30_000),
       method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams(input).toString(),
     });

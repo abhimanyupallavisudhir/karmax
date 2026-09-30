@@ -2,6 +2,62 @@ import { describe, expect, it, vi } from 'vitest';
 import { DaytonaWorldProvider, type DaytonaFactory, type DaytonaSandboxLike } from '../src/world/daytona.js';
 
 describe('Daytona cloud world provider', () => {
+  it('rejects an unauthenticated legacy sandbox ID before any provider operation (WD-30)', async () => {
+    const sandbox = fakeSandbox();
+    const connect = vi.fn(async () => sandbox);
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, connect, get: connect } as any);
+    const world = await provider.create({ taskId: 'legacy', base: 'main' });
+    const forged = { ...world.handle, sealedProviderRef: undefined,
+      meta: { ...world.handle.meta, sandboxId: 'another-tenant-sandbox', organizationId: 'victim' } };
+    await expect(provider.open(forged)).rejects.toThrow('invalid Daytona world handle');
+    await expect(provider.destroy(forged)).rejects.toThrow('invalid Daytona world handle');
+    expect(connect).not.toHaveBeenCalled();
+    await expect(provider.open(world.handle)).resolves.toBeDefined();
+  });
+
+  it('propagates exec transport failures instead of reporting command exit 1 (WD-16)', async () => {
+    const sandbox = fakeSandbox();
+    const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
+      .create({ taskId: 'transport', base: 'main' });
+    sandbox.process.executeCommand = async () => { throw new Error('connection reset'); };
+    await expect(world.exec('true', [])).rejects.toThrow('connection reset');
+  });
+
+  it('evicts destroyed sandboxes and lifecycle cache entries (WD-3, PS-10)', async () => {
+    const sandbox = fakeSandbox();
+    let opens = 0;
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox,
+      connect: async () => { opens++; throw new Error('deleted'); },
+      get: async () => { opens++; throw new Error('deleted'); } } as any);
+    const world = await provider.create({ taskId: 'cache', base: 'main' });
+    await world.destroy();
+    expect((provider as any).sandboxes.size).toBe(0);
+    expect((provider as any).states.size).toBe(0);
+    await expect(provider.open(world.handle)).rejects.toThrow('deleted');
+    expect(opens).toBe(1);
+  });
+
+  it.each([
+    [Object.assign(new Error('getaddrinfo ENOTFOUND api.provider'), { code: 'ENOTFOUND' }), undefined],
+    [new Error('upstream returned 404 while resolving proxy'), undefined],
+    [Object.assign(new Error('deleted'), { status: 404 }), 'missing'],
+  ])('requires authoritative missing status (WD-8): %s', async (error, expected) => {
+    const sandbox = fakeSandbox();
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, connect: async () => sandbox,
+      get: async () => { throw error; } } as any);
+    const world = await provider.create({ taskId: 'probe', base: 'main' });
+    expect(await provider.probe(world.handle)).toBe(expected);
+  });
+
+  it('preserves undecidable sealed references during orphan comparison (WD-1)', async () => {
+    const sandbox = fakeSandbox();
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, connect: async () => sandbox,
+      get: async () => sandbox, list: async () => [sandbox] } as any);
+    const world = await provider.create({ taskId: 'sealed', base: 'main' });
+    const [listed] = await provider.listSandboxes();
+    expect(listed!.matches!({ ...world.handle, sealedProviderRef: 'unreadable' })).toBeUndefined();
+  });
+
   it('satisfies the opaque world/file/process/PTY/park contract with deny-by-default networking', async () => {
     const files = new Map<string, Buffer>();
     let createOptions: any;
@@ -229,7 +285,7 @@ describe('Daytona cloud world provider', () => {
     sandbox.updateNetworkSettings = vi.fn(async () => { expect(commands.at(-1)).toContain('rm -f'); });
     const create = vi.fn(async (_options: Record<string, unknown>) => sandbox);
     await new DaytonaWorldProvider({ create, get: async () => sandbox }).create({
-      taskId: 'ssh', base: 'main', repo: 'git@github.com:acme/private.git', gitCredentials: { sshKey: 'test-key' },
+      taskId: 'ssh', base: 'main', repo: 'git@github.com:acme/private.git', gitCredentials: { repositories: { 'git@github.com:acme/private.git': 'test-key' } },
     });
     expect(create.mock.calls[0]![0]).toMatchObject({ networkBlockAll: false });
     expect(create.mock.calls[0]![0]).not.toHaveProperty('domainAllowList');
@@ -266,6 +322,27 @@ describe('Daytona cloud world provider', () => {
     expect(await provider.status(world.handle)).toBe('missing');
     sandbox.delete = async () => { throw Object.assign(new Error('denied'), { statusCode: 403 }); };
     await expect(world.destroy()).rejects.toThrow('denied');
+  });
+
+  it('waits out a state change already in progress before deleting, and still fails if it never settles', async () => {
+    const sandbox = fakeSandbox();
+    const busy = () => Object.assign(new Error('Sandbox state change in progress'), { statusCode: 409 });
+    let attempts = 0;
+    sandbox.delete = vi.fn(async () => { if (++attempts < 3) throw busy(); });
+    const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox })
+      .create({ taskId: 'busy', base: 'main' });
+    vi.useFakeTimers();
+    try {
+      const destroyed = world.destroy();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await destroyed;
+      expect(sandbox.delete).toHaveBeenCalledTimes(3);
+      // Teardown retries a sandbox that never settles later, so the error still surfaces.
+      sandbox.delete = vi.fn(async () => { throw busy(); });
+      const stuck = world.destroy().catch((error: Error) => error);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(await stuck).toMatchObject({ message: 'Sandbox state change in progress' });
+    } finally { vi.useRealTimers(); }
   });
 
   it('cleans up a terminal when connection setup fails', async () => {
@@ -327,7 +404,7 @@ describe('Daytona cloud world provider', () => {
     sandbox.fs.uploadFile = async (value, file) => { writes.set(file, value); };
     const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
     const world = await provider.create({ taskId: 'private', base: 'main', repo: 'git@github.com:acme/private.git',
-      gitCredentials: { sshKey: 'PRIVATE KEY' } });
+      gitCredentials: { repositories: { 'git@github.com:acme/private.git': 'PRIVATE KEY' } } });
     expect(writes.get('/home/daytona/.ssh/karmax-auth-0')?.toString()).toContain('PRIVATE KEY');
     expect(commands.some((command) => command.includes('GIT_SSH_COMMAND=') && command.includes('git clone'))).toBe(true);
     expect(commands.at(-1)).toContain('rm -f');

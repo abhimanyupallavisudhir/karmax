@@ -59,10 +59,13 @@ const maintainer = [
   // A maintainer's agent may stand in for a human at a Review gate; a
   // developer's may not (it reviews through its own Confirm turn instead).
   'review:approve',
+  // Organization wiki pages reach every task in the organization, so
+  // PROJECT_GRANT_CEILING omits this: only an organization or global grant uses it.
+  'organization:wiki:write',
 ] satisfies Capability[];
 // A project grant can never turn into authority over unrelated projects or the
-// host. Global grants remain the explicit trust root for users, host processes,
-// safe mode, and installation settings. Organization grants can manage
+// host. Global grants remain the explicit trust root for users, host processes
+// and installation settings. Organization grants can manage
 // tenant-owned credentials and payments but cannot cross that boundary.
 const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*',
@@ -162,7 +165,9 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
   ]],
-  maintainer: [PREVIOUS_BUILTIN_CAPABILITIES.maintainer!, [...maintainer, 'workflow:install'],
+  maintainer: [PREVIOUS_BUILTIN_CAPABILITIES.maintainer!,
+    // workflow:install releases predate organization:wiki:write.
+    [...maintainer.filter((capability) => capability !== 'organization:wiki:write'), 'workflow:install'],
     // With workflow:install (before it became global authority), with and without `review:approve`…
     [...PREVIOUS_BUILTIN_CAPABILITIES.maintainer!, 'workflow:install'],
     [...PREVIOUS_BUILTIN_CAPABILITIES.maintainer!.filter((capability) => capability !== 'review:approve'), 'workflow:install'],
@@ -184,7 +189,7 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
     'workflow:install', 'workflow:edit', 'project:create', 'diagnostic:read',
-    'process:*', 'credential:*', 'payment:*', 'settings:*', 'safe-mode:write',
+    'process:*', 'credential:*', 'payment:*', 'settings:*',
   ]],
 };
 

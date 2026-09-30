@@ -1,5 +1,7 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import os from 'node:os';
+import { Context } from '@temporalio/activity';
+import { pingActivities } from '../src/activities/ping.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Client } from '@temporalio/client';
@@ -84,4 +86,34 @@ describe('live worker refresh (real dev server)', () => {
     await probe.signal('release');
     expect((await probe.result()).version).toBe('1.0.0');
   });
+  it('WF-15: an activity survives a worker roll beyond the old one-second grace', async () => {
+    let release!: (value: string) => void;
+    let started!: () => void;
+    const active = new Promise<void>(resolve => { started = resolve; });
+    const finish = new Promise<string>(resolve => { release = resolve; });
+    let cancelled = false;
+    const echo = vi.spyOn(pingActivities, 'echo').mockImplementation(async () => {
+      started();
+      return Promise.race([finish, Context.current().cancelled.catch(error => { cancelled = true; throw error; })]);
+    });
+    let probe: Awaited<ReturnType<Client['workflow']['start']>> | undefined;
+    try {
+      await mgr.refresh(mgr.packages);
+      probe = await client.workflow.start('pingWorkflow', {
+        taskQueue: TASK_QUEUE, workflowId: `activity-across-refresh-${Date.now()}`, args: ['held'],
+      });
+      await active;
+      await mgr.refresh(mgr.packages);
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      expect(cancelled).toBe(false);
+      release('echo:held');
+      await probe.signal('finish');
+      expect(await probe.result()).toMatchObject({ started: 'held' });
+    } finally {
+      release('echo:held');
+      await probe?.terminate('test cleanup').catch(() => undefined);
+      echo.mockRestore();
+    }
+  }, 60_000);
+
 });

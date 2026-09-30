@@ -1,3 +1,6 @@
+import dns from 'node:dns/promises';
+import { isIP } from 'node:net';
+import { publicAddress } from '../mcp/connections/http.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import { MailboxConfig, defaultMailboxRegistry } from './mailbox.js';
 import { extractMimeText, cleanAddress, htmlToText } from './agent-mail.js';
@@ -6,7 +9,7 @@ import { extractMimeText, cleanAddress, htmlToText } from './agent-mail.js';
 export interface PulledMessage { to: string; from: string; subject?: string; text: string; sourceId?: string }
 
 /**
- * Pull-based mail intake (PLAN-passwords.md §8). Unlike the webhook (push) path,
+ * Pull-based mail intake (wiki plans/PLAN-passwords §8). Unlike the webhook (push) path,
  * karmax reaches OUT to the mail service and fetches — so it works on a
  * locally-hosted karmax behind NAT, with no public URL. Two backends:
  *
@@ -45,12 +48,17 @@ export interface Puller {
 
 // ── IMAP ──────────────────────────────────────────────────────────────────────
 
-export interface ImapOpts { host: string; port: number; secure: boolean; user: string; pass: string }
+export interface ImapOpts { servername?: string; host: string; port: number; secure: boolean; user: string; pass: string }
 export interface ImapMessage { uid: number; source: string }
 export interface ImapConn {
-  fetchSince(lastUid: number): Promise<ImapMessage[]>;
+  /** INBOX UIDs in `from..to` (to the newest when `to` is omitted), ascending. */
+  uids(from: number, to?: number): Promise<number[]>;
+  fetch(uids: number[]): Promise<ImapMessage[]>;
   close(): Promise<void>;
 }
+
+/** Messages one poll fetches; new mail always takes the batch first. */
+const IMAP_BATCH = 50;
 
 export class ImapPuller implements Puller {
   constructor(private config: MailboxConfig, private deps: PullDeps) {}
@@ -61,13 +69,44 @@ export class ImapPuller implements Puller {
     const pass = this.deps.resolveSecret(passHandle);
     if (!imap || !pass) return 0;
     const open = this.deps.openImap ?? defaultOpenImap;
-    const conn = await open({ host: imap.host, port: imap.port, secure: imap.secure, user: imap.user, pass });
+    let host = imap.host;
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted') {
+      if (!imap.secure || imap.port !== 993) throw new Error('hosted IMAP requires TLS on port 993');
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const addresses = isIP(host) ? [{ address: host }] : await Promise.race([
+          dns.lookup(host, { all: true }),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('IMAP DNS lookup timed out')), 5000); }),
+        ]);
+        if (!addresses.length || addresses.some(a => !publicAddress(a.address))) throw new Error('IMAP host must resolve to public addresses, not private networks');
+        host = addresses[0]!.address;
+      } finally { clearTimeout(timer); }
+    }
+    const conn = await open({ host, servername: imap.host, port: imap.port, secure: imap.secure, user: imap.user, pass });
     let delivered = 0;
     const uidKey = `agent-mail:imap-uid:${this.deps.organizationId ?? 'legacy'}`;
-    let maxUid = Number((await this.deps.store.kvGet(uidKey)) ?? 0);
+    const gapKey = `agent-mail:imap-gaps:${this.deps.organizationId ?? 'legacy'}`;
+    const stored = await this.deps.store.kvGet(uidKey);
+    let maxUid = Number(stored ?? 0);
+    const gaps: Array<[number, number]> = JSON.parse((await this.deps.store.kvGet(gapKey)) ?? '[]');
     try {
-      const messages = await conn.fetchSince(maxUid);
-      for (const m of messages.sort((a, b) => a.uid - b.uid)) {
+      // Newest first, so a verification code never waits behind a backlog.
+      // History from before the first poll is not agent mail and is skipped;
+      // mail skipped since then (a burst larger than a batch) is backfilled.
+      const fresh = (await conn.uids(maxUid + 1)).filter(uid => uid > maxUid);
+      const wanted = fresh.slice(-IMAP_BATCH);
+      if (stored !== undefined && fresh.length > wanted.length) gaps.push([maxUid + 1, wanted[0]! - 1]);
+      if (wanted.length) maxUid = wanted.at(-1)!;
+      while (wanted.length < IMAP_BATCH && gaps.length) {
+        const [from, to] = gaps.at(-1)!;
+        const missed = await conn.uids(from, to);
+        const backfill = missed.slice(-(IMAP_BATCH - wanted.length));
+        if (backfill.length < missed.length) gaps[gaps.length - 1] = [from, backfill[0]! - 1];
+        else gaps.pop();
+        wanted.push(...backfill);
+      }
+      const messages = new Map((wanted.length ? await conn.fetch(wanted) : []).map(m => [m.uid, m]));
+      for (const m of wanted.map(uid => messages.get(uid)).filter((m): m is ImapMessage => !!m)) {
         const to = firstDeliveredTo(m.source) ?? firstHeader(m.source, 'to');
         const from = firstHeader(m.source, 'from');
         if (to) {
@@ -77,12 +116,12 @@ export class ImapPuller implements Puller {
           }));
           if (ok) delivered++;
         }
-        if (m.uid > maxUid) maxUid = m.uid;
       }
     } finally {
       await conn.close().catch(() => undefined);
     }
     (await this.deps.store.kvSet(uidKey, String(maxUid)));
+    (await this.deps.store.kvSet(gapKey, JSON.stringify(gaps)));
     return delivered;
   }
 }
@@ -95,15 +134,29 @@ async function defaultOpenImap(opts: ImapOpts): Promise<ImapConn> {
   } catch {
     throw new Error('IMAP support needs the "imapflow" package — run `npm install imapflow`.');
   }
-  const client = new ImapFlow({ host: opts.host, port: opts.port, secure: opts.secure, auth: { user: opts.user, pass: opts.pass }, logger: false });
-  await client.connect();
+  const client = new ImapFlow({ host: opts.host, servername: opts.servername, port: opts.port, secure: opts.secure,
+    connectionTimeout: 10_000, greetingTimeout: 10_000, socketTimeout: 15_000, maxLineLength: 65_536, maxLiteralSize: 65_536, auth: { user: opts.user, pass: opts.pass }, logger: false });
+  const deadline = setTimeout(() => client.close(), 30_000);
+  deadline.unref();
+  try { await client.connect(); } catch (error) { clearTimeout(deadline); client.close(); throw error; }
   return {
-    async fetchSince(lastUid: number): Promise<ImapMessage[]> {
+    async uids(from: number, to?: number): Promise<number[]> {
+      const lock = await client.getMailboxLock('INBOX');
+      try {
+        // `n:*` always matches the newest message, even below n.
+        const found: number[] = (await client.search({ uid: `${from}:${to ?? '*'}` }, { uid: true })) || [];
+        return found.filter(uid => uid >= from && uid <= (to ?? Infinity)).sort((a, b) => a - b);
+      } finally {
+        lock.release();
+      }
+    },
+    async fetch(uids: number[]): Promise<ImapMessage[]> {
       const out: ImapMessage[] = [];
       const lock = await client.getMailboxLock('INBOX');
       try {
-        for await (const msg of client.fetch({ uid: `${lastUid + 1}:*` }, { uid: true, source: true })) {
-          if (msg.uid > lastUid && msg.source) out.push({ uid: msg.uid, source: msg.source.toString('utf8') });
+        for await (const msg of client.fetch(uids.join(','), { uid: true, source: { maxLength: 65_536 } }, { uid: true })) {
+          if (msg.source) out.push({ uid: msg.uid, source: msg.source.toString('utf8') });
+          if (out.length >= IMAP_BATCH) break;
         }
       } finally {
         lock.release();
@@ -111,7 +164,8 @@ async function defaultOpenImap(opts: ImapOpts): Promise<ImapConn> {
       return out;
     },
     async close() {
-      await client.logout().catch(() => client.close?.());
+      clearTimeout(deadline);
+      client.close();
     },
   };
 }
@@ -128,7 +182,34 @@ function firstDeliveredTo(raw: string): string | undefined {
 // ── AgentMail (agentmail.to REST) ─────────────────────────────────────────────
 
 const AGENTMAIL_BASE = process.env.KARMAX_AGENTMAIL_BASE || 'https://api.agentmail.to/v0';
+export async function verifyAgentMailInbox(key: string, address: string, fetcher: typeof fetch = fetch): Promise<void> {
+  const response = await fetcher(`${AGENTMAIL_BASE}/inboxes/${encodeURIComponent(address)}`, {
+    headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error('AgentMail key cannot access this inbox');
+  const inbox = await response.json() as { inbox_id?: string };
+  if (cleanAddress(inbox.inbox_id ?? '') !== cleanAddress(address)) throw new Error('AgentMail returned a different inbox');
+}
+
 const amCursorKey = (address: string) => `agent-mail:am-cursor:${address}`;
+
+async function readMailResponse(response: Response): Promise<any> {
+  if (!response.body) return response.headers.get('content-type')?.includes('json') ? response.json() : response.text();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > 2 * 1_048_576) throw new Error('AgentMail response exceeds size limit');
+      chunks.push(chunk.value);
+    }
+  } finally { await reader.cancel(); }
+  const text = Buffer.concat(chunks).toString('utf8');
+  return response.headers.get('content-type')?.includes('json') ? JSON.parse(text) : text;
+}
 
 export class AgentMailPuller implements Puller {
   constructor(private config: MailboxConfig, private deps: PullDeps) {}
@@ -139,11 +220,11 @@ export class AgentMailPuller implements Puller {
     const key = this.key();
     const doFetch = this.deps.fetchFn ?? fetch;
     const res = await doFetch(`${AGENTMAIL_BASE}${path}`, {
-      ...init,
+      ...init, signal: AbortSignal.timeout(15_000),
       headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', ...(init.headers ?? {}) },
     });
     if (res.status === 404) return undefined;
-    const body = res.headers.get('content-type')?.includes('json') ? await res.json() : await res.text();
+    const body = await readMailResponse(res);
     if (!res.ok) {
       const message = typeof body === 'object'
         ? (body as any)?.message ?? (body as any)?.error?.message ?? (body as any)?.error ?? (body as any)?.detail
@@ -162,7 +243,7 @@ export class AgentMailPuller implements Puller {
     if (!list) throw new Error(`AgentMail inbox ${address} was not found`);
     const messages: any[] = list?.messages ?? list?.data ?? (Array.isArray(list) ? list : []);
     let newest = cursor;
-    for (const summary of messages) {
+    for (const summary of messages.slice(0, 50)) {
       const messageId = summary.message_id ?? summary.id;
       const m = (!summary.text && messageId)
         ? (await this.api(`/inboxes/${encodeURIComponent(address)}/messages/${encodeURIComponent(String(messageId))}`) ?? summary)

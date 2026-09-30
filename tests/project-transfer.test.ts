@@ -144,6 +144,9 @@ describe('project transfer boundaries and recovery', () => {
     for (const key of [`vault:grant:${task.id}`, `vault:pass:${task.id}`, `vault:task-policy:${task.id}`, `permission:grant:${task.id}`]) (await store.kvSet(key, 'secret-authority'));
     (await store.kvSet(`conversation-share-index:${task.id}:do`, 'public')); (await store.kvSet('conversation-share:public', '{}'));
     (await store.kvSet(`vault:requests:${source.id}`, JSON.stringify([{ taskId: task.id }, { taskId: 'other' }])));
+    // Permission requests are one row each (PL-8).
+    (await store.kvSet(`permission:request:${source.id}:${task.id}:preq_moved`, JSON.stringify({ id: 'preq_moved', taskId: task.id, projectId: project.id })));
+    (await store.kvSet(`permission:request:${source.id}:other:preq_kept`, JSON.stringify({ id: 'preq_kept', taskId: 'other', projectId: 'other-project' })));
     (await store.kvSet('service-connection:shared', JSON.stringify({ organizationId: source.id, projectIds: [project.id, 'other-project'] })));
     (await store.db.prepare('INSERT INTO profiles (id, json) VALUES (?, ?)').run(`${project.id}::do-default`, JSON.stringify({ id: `${project.id}::do-default`, account: 'source-account' })));
     (await store.setSettings(project.id, '__common__', { 'agent:do': { account: 'source-account' } }));
@@ -159,6 +162,8 @@ describe('project transfer boundaries and recovery', () => {
     expect((await store.kvGet(`vault:grant:${task.id}`))).toBeUndefined();
     expect((await store.kvGet('conversation-share:public'))).toBeUndefined();
     expect(JSON.parse((await store.kvGet(`vault:requests:${source.id}`))!)).toEqual([{ taskId: 'other' }]);
+    expect((await store.kvEntries(`permission:request:${source.id}:`)).map(({ key }) => key))
+      .toEqual([`permission:request:${source.id}:other:preq_kept`]);
     expect(JSON.parse((await store.kvGet('service-connection:shared'))!).projectIds).toEqual(['other-project']);
     expect((await store.getProfile(`${project.id}::do-default`))).toBeUndefined();
     expect((await store.getSettings(project.id, '__common__'))).toBeUndefined();

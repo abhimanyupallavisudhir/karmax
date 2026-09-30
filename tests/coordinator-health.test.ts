@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { WorkflowNotFoundError } from '@temporalio/client';
 import { healCoordinators } from '../src/platform/coordinator-health.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
@@ -162,21 +162,6 @@ describe('healCoordinators', () => {
     expect((await healCoordinators(f.client, 'karmax')).wedged).toEqual([]);
   });
 
-  it('reports a wedged budget coordinator instead of resetting its spend counters', async () => {
-    const f = fakeClient({
-      running: { budgetCoordinator: [{ workflowId: 'budget-coordinator' }] },
-      query: { 'budget-coordinator': 'fail' },
-      history: { 'budget-coordinator': 'failed-nondet' },
-    });
-
-    const health = await healCoordinators(f.client, 'karmax');
-
-    expect(health.wedged).toEqual(['budget-coordinator']);
-    expect(health.rebuilt).toEqual([]);
-    expect(f.terminated).toEqual([]);
-    expect(health.reported[0]?.reason).toMatch(/already spent/i);
-  });
-
   it('reports a wedged agent queue rather than orphaning parked turns', async () => {
     // A granted agent slot is a one-shot signal, not a poll: a fresh empty queue
     // would never re-grant a turn that is already parked waiting for one.
@@ -256,4 +241,100 @@ describe('account-pool discovery', () => {
       throw new Error('query task expired during worker replay');
     }).accountPoolSize()).rejects.toThrow('query task expired');
   });
+});
+
+describe('WF-13: lease-holder liveness', () => {
+  const activities = (describe: () => Promise<unknown>) => makeCoordinatorActivities({ client: { workflow: {
+    getHandle: () => ({ describe }),
+  } } as never, taskQueue: 'queue' });
+  it('propagates transient describe failures without reclaiming a live lease', async () => {
+    const error = new Error('UNAVAILABLE');
+    await expect(activities(async () => { throw error; }).isTaskAlive('task')).rejects.toBe(error);
+  });
+  it('reclaims only missing or closed executions', async () => {
+    expect(await activities(async () => { throw new WorkflowNotFoundError('missing', 'task', undefined); }).isTaskAlive('task')).toBe(false);
+    expect(await activities(async () => ({ status: { name: 'COMPLETED' } })).isTaskAlive('task')).toBe(false);
+    expect(await activities(async () => ({ status: { name: 'RUNNING' } })).isTaskAlive('task')).toBe(true);
+  });
+});
+
+it('replays coordinator histories recorded before the history-policy and acknowledgement changes', async () => {
+  const { Worker, bundleWorkflowCode } = await import('@temporalio/worker');
+  const { temporal } = await import('@temporalio/proto');
+  const fs = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const workflowBundle = await bundleWorkflowCode({ workflowsPath: fileURLToPath(new URL('../src/workflows/index.ts', import.meta.url)) });
+  // Policy v2 was recorded from 0cddcb35: grant, park, return, grant and return.
+  for (const name of ['review-legacy-accountCoordinator', 'review-legacy-mergeQueue', 'account-history-policy-v2']) {
+    const history = temporal.api.history.v1.History.fromObject(JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8')));
+    await Worker.runReplayHistory({ workflowBundle }, history);
+  }
+}, 60_000);
+
+it('WF-5: retries a lease acknowledgement from a coordinator continuing as new', async () => {
+  vi.useFakeTimers();
+  try {
+    const query = vi.fn().mockResolvedValueOnce({ waiting: false, continuingAsNew: true })
+      .mockResolvedValueOnce({ waiting: true, detail: 'Waiting for a free slot on an allowed account' });
+    const signalWithStart = vi.fn(async () => undefined);
+    const activity = makeCoordinatorActivities({ client: { workflow: {
+      signalWithStart, getHandle: () => ({ query }),
+    } } as never, taskQueue: 'queue' });
+    const pending = activity.leaseAccount('task', 'turn', 'mock');
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toEqual({ waiting: true, detail: 'Waiting for a free slot on an allowed account' });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(signalWithStart).toHaveBeenCalledTimes(1);
+  } finally { vi.useRealTimers(); }
+});
+
+it('bounds a stalled visibility scan (PS-6)', async () => {
+  vi.useFakeTimers();
+  try {
+    const client = { workflow: { list: () => ({ [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) }) } };
+    let finished = false;
+    const healing = healCoordinators(client as any, 'test').then(() => { finished = true; });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(finished).toBe(true);
+    await healing;
+  } finally { vi.useRealTimers(); }
+});
+
+it('probes independent coordinators with bounded concurrency (PS-6)', async () => {
+  let active = 0; let peak = 0;
+  const client = { workflow: {
+    list: ({ query }: { query: string }) => (async function* () {
+      if (query.includes("'mergeQueue'")) for (let n = 0; n < 12; n++) yield { workflowId: `merge-queue:${n}` };
+    })(),
+    getHandle: () => ({ query: async () => {
+      peak = Math.max(peak, ++active);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      active--;
+    } }),
+  } };
+  expect((await healCoordinators(client as any, 'test')).checked).toBe(12);
+  expect(peak).toBeGreaterThan(1);
+  expect(peak).toBeLessThanOrEqual(4);
+});
+
+// WF-25 (2026-09-26 review): a coordinator nothing starts is not harmless. The
+// worker still registers it, the boot probe still queries it, and it reads as
+// an active source of authority (the budget coordinator looked like the spend
+// cap long after payments moved to database reservations).
+it('registers only coordinators that the platform actually starts', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const src = path.resolve(__dirname, '../src');
+  const names = fs.readFileSync(path.join(src, 'coordinators/names.ts'), 'utf8');
+  const constants = [...names.matchAll(/export const (\w+_WORKFLOW) = '(\w+)'/g)].map(([, constant, type]) => ({ constant, type }));
+  const bundle = fs.readFileSync(path.join(src, 'workflows/index.ts'), 'utf8');
+  const registered = [...bundle.matchAll(/export \{ (\w+) \} from '\.\.\/coordinators\//g)].map(([, type]) => type);
+  const files = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory() ? files(path.join(dir, entry.name)) : entry.name.endsWith('.ts') ? [path.join(dir, entry.name)] : []);
+  // The coordinators themselves, their names and the health probe do not start anything.
+  const callers = files(src).filter((file) => !file.includes(`${path.sep}coordinators${path.sep}`)
+    && !file.endsWith(path.join('platform', 'coordinator-health.ts')) && !file.endsWith(path.join('workflows', 'index.ts')))
+    .map((file) => fs.readFileSync(file, 'utf8')).join('\n');
+  expect(registered.sort()).toEqual(constants.map(({ type }) => type).sort());
+  expect(constants.filter(({ constant }) => !new RegExp(`\\b${constant}\\b`).test(callers)).map(({ type }) => type)).toEqual([]);
 });

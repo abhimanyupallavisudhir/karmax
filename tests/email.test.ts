@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { connectOutboundEmail, describeOutboundProviders, EmailService, fromAddress, guessSmtpHost } from '../src/autonomy/email.js';
+import { connectOutboundEmail, describeOutboundProviders, EmailService, fromAddress, guessSmtpHost, smtpTransportOptions } from '../src/autonomy/email.js';
+
+describe('SMTP transport security (AU-30)', () => {
+  it('requires STARTTLS on a submission port so the password never crosses the network in plaintext', () => {
+    const config = { provider: 'smtp' as const, from: 'me@b.dev', host: 'smtp.b.dev', secretHandle: 'h' };
+    expect(smtpTransportOptions({ ...config, port: 587 }, 'pw')).toMatchObject({ secure: false, requireTLS: true });
+    expect(smtpTransportOptions({ ...config }, 'pw')).toMatchObject({ port: 587, requireTLS: true });
+    expect(smtpTransportOptions({ ...config, port: 465 }, 'pw')).toMatchObject({ secure: true });
+    // A relay on this machine never crosses a network.
+    expect(smtpTransportOptions({ ...config, host: 'localhost', port: 25 }, 'pw')).toMatchObject({ requireTLS: false });
+  });
+});
 
 describe('outbound email connect', () => {
   it('rejects a missing or invalid From', () => {

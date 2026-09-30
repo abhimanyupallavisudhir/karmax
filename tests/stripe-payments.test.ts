@@ -56,8 +56,22 @@ describe('Stripe Issuing organization rail', () => {
     });
     expect(started.status).toBe('awaiting_oauth');
     const state = new URL(started.url!).searchParams.get('state')!;
-    return stripe.completeOAuth(state, 'ac_test');
+    return stripe.completeOAuth(state, 'ac_test', 'user_a');
   }
+
+  it('rejects a callback from a different user without consuming state (AU-2)', async () => {
+    const started = await stripe.connect({ organizationId, userId: 'user_a', redirectUri: 'https://karmax.example/callback' });
+    const state = new URL(started.url!).searchParams.get('state')!;
+    await expect(stripe.completeOAuth(state, 'code', 'user_b')).rejects.toThrow(/state/);
+    expect(fetcher).not.toHaveBeenCalled();
+    await expect(stripe.completeOAuth(state, 'code', 'user_a')).resolves.toMatchObject({ organizationId });
+  });
+
+  it('refuses linking the same Stripe account to another tenant (AU-2)', async () => {
+    await connect();
+    const other = await store.createOrganization({ name: 'Other' });
+    await expect(store.upsertPaymentConnection({ organizationId: other.id, provider: 'stripe', accountId: 'acct_tenant_a' })).rejects.toThrow();
+  });
 
   function signed(event: unknown) {
     const raw = Buffer.from(JSON.stringify(event));
@@ -95,7 +109,7 @@ describe('Stripe Issuing organization rail', () => {
     });
     expect(new URL(started.url!).searchParams.get('client_id')).toBe('ca_ui_managed');
     const state = new URL(started.url!).searchParams.get('state')!;
-    await managed.completeOAuth(state, 'ac_test');
+    await managed.completeOAuth(state, 'ac_test', 'user_a');
     const oauth = fetcher.mock.calls.find(([url]) => url === 'https://connect.stripe.com/oauth/token')!;
     expect(new URLSearchParams(String(oauth[1].body)).get('client_secret')).toBe('sk_test_ui_managed');
 
@@ -121,6 +135,21 @@ describe('Stripe Issuing organization rail', () => {
       configured: true, clientId: 'ca_updated', secretKeyConfigured: true,
     });
     expect([...secrets.values()]).toContain('sk_test_retained');
+  });
+
+  it('validates names before issuing and cancels remote cards when persistence fails (AU-18)', async () => {
+    await connect();
+    const spec = { scope: 'organization' as const, scopeId: organizationId, organizationId, label: 'Duplicate', cap: 1000, cardholderId: 'ich_tenant_a' };
+    await stripe.provisionCard(spec);
+    fetcher.mockClear();
+    await expect(stripe.provisionCard(spec)).rejects.toThrow(/unique/);
+    expect(fetcher.mock.calls.some(([url]) => url === 'https://api.stripe.com/v1/issuing/cards')).toBe(false);
+    const save = vi.spyOn(store, 'createCard').mockRejectedValueOnce(new Error('database unavailable'));
+    await expect(stripe.provisionCard({ ...spec, label: 'Failure' })).rejects.toThrow(/database/);
+    save.mockRestore();
+    const create = fetcher.mock.calls.find(([url]) => url === 'https://api.stripe.com/v1/issuing/cards');
+    expect(new URLSearchParams(String(create?.[1]?.body)).get('status')).toBe('inactive');
+    expect(fetcher.mock.calls.some(([url, init]) => url.endsWith('/ic_tenant_a') && new URLSearchParams(String(init?.body)).get('status') === 'canceled')).toBe(true);
   });
 
   it('stores a separate connected account and balance for the organization', async () => {
@@ -185,7 +214,7 @@ describe('Stripe Issuing organization rail', () => {
     registry.register(stripe);
     const budget = new BudgetService(store, registry);
     const spend = await budget.request(
-      { organizationId, projectId, taskId: 'task_a' },
+      { organizationId, projectId, taskId: 'task_a' , capabilities: ['use-card:*'] },
       { amount: 2_500, merchant: 'shop.example', why: 'test purchase', cardId: card.id },
     );
     expect(spend).toMatchObject({ status: 'granted', cardId: card.id });
@@ -235,7 +264,7 @@ describe('Stripe Issuing organization rail', () => {
       const registry = new PaymentRegistry(store);
       registry.register(stripe);
       const budget = new BudgetService(store, registry);
-      const spend = await budget.request({ organizationId, projectId, taskId: 'task_a' },
+      const spend = await budget.request({ organizationId, projectId, taskId: 'task_a' , capabilities: ['use-card:*'] },
         { amount, merchant: 'shop.example', why: 'up to $100', cardId: card.id });
       expect(spend.status).toBe('granted');
       return { card, budget, spend };
@@ -264,7 +293,7 @@ describe('Stripe Issuing organization rail', () => {
       expect((await stripe.handleWebhook(capture.raw, capture.signature)).status).toBe(200);
       expect((await store.getPaymentSpendRequest(spend.requestId!))).toMatchObject({ status: 'settled', amount: 4_000 });
       // The 60 dollars the merchant never took are spendable again.
-      expect((await budget.request({ organizationId, projectId, taskId: 'task_b' },
+      expect((await budget.request({ organizationId, projectId, taskId: 'task_b' , capabilities: ['use-card:*'] },
         { amount: 8_000, cardId: card.id, why: 'second' })).status).toBe('granted');
     });
 
@@ -294,7 +323,8 @@ describe('Stripe Issuing organization rail', () => {
       registry.register(stripe);
       const budget = new BudgetService(store, registry);
       (await store.setSettings(`organization:${organizationId}`, 'payments', { provider: 'stripe', budget: 1_000 }));
-      const ctx = { organizationId, projectId, taskId: 'task_gate' };
+    const task_task_gate = await store.createTask({ projectId: projectId, title: 'task_gate', workflow: 'just-do', workflowVersion: '1', params: { prompt: '', _authorization: { capabilities: ['use-card:*'] } } });
+      const ctx = { organizationId, projectId, taskId: task_task_gate.id , capabilities: ['use-card:*'] };
       const first = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'first' });
       const second = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'second' });
       expect([first.status, second.status]).toEqual(['needs_approval', 'needs_approval']);

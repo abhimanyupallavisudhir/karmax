@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
-import { accountCoordinatorId, SIG_ACCOUNT_GRANTED } from '../src/coordinators/names.js';
+import { accountCoordinatorId, CREDENTIAL_POLICY_UNAVAILABLE, SIG_ACCOUNT_GRANTED } from '../src/coordinators/names.js';
 import { newId } from '../src/util/id.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 
@@ -257,13 +257,30 @@ describe('account coordinator — quota engine', () => {
     await coord.signal('setAccountAvailability', { accountId: 'A', status: 'needs-attention' });
     const g = await grantee();
     await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', allowed: ['A'] });
-    expect(await coord.query('accountLease', { taskId: g.id })).toEqual({
+    // A query can reach the run that is still continuing as new (the lease
+    // activity retries that acknowledgement the same way).
+    await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
       waiting: true, detail: 'Every allowed credential needs attention — sign in again or add one',
     });
     expect(await grants(g.id)).toEqual([]);
     await coord.signal('setAccountAvailability', { accountId: 'A', status: 'available', onlyIfStatus: 'needs-attention' });
     await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
     await expect.poll(() => grants(g.id), { timeout: 10_000 }).toEqual(['A']);
+    await g.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  // The workflow parks a real provider on this allow-list when its credential
+  // policy could not be read; "sign in again" sent people to fix credentials
+  // that were fine (WF-35).
+  it('says a parked request could not read its credential policy, not that credentials need attention', async () => {
+    const coord = await startCoord([A({ id: 'A' })]);
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', provider: 'claude', allowed: [CREDENTIAL_POLICY_UNAVAILABLE] });
+    await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
+      waiting: true, detail: 'Couldn\'t read this task\'s credential policy — Retry reads it again',
+    });
+    expect(await grants(g.id)).toEqual([]);
     await g.h.signal('finish');
     await coord.terminate('done');
   });
@@ -387,13 +404,14 @@ describe('account coordinator — quota engine', () => {
     const activities = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
     const immediate = await grantee();
 
-    await expect(activities.leaseAccount(immediate.id, 'immediate', 'claude')).resolves.toEqual({
+    // Real providers always lease through their policy allow-list (WF-6).
+    await expect(activities.leaseAccount(immediate.id, 'immediate', 'claude', ['A'])).resolves.toEqual({
       waiting: false,
     });
     await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
 
     const parked = await grantee();
-    await expect(activities.leaseAccount(parked.id, 'parked', 'claude')).resolves.toEqual({
+    await expect(activities.leaseAccount(parked.id, 'parked', 'claude', ['A'])).resolves.toEqual({
       waiting: true,
       detail: 'Waiting for a free slot on an allowed account',
     });

@@ -6,6 +6,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
   ACCOUNT_COORDINATOR_WORKFLOW,
+  CREDENTIAL_POLICY_UNAVAILABLE,
   SIG_ENQUEUE,
   SIG_RELEASE,
   SIG_PRIORITIZE,
@@ -92,7 +93,6 @@ async function agentQueueTarget(deps: CoordinatorActivityDeps,
     workflowId: string;
     capacity: number;
     detail?: string;
-    blocked?: boolean;
   }> {
   if (deps.store?.hosted) {
     const durableOrganizationId = item.queueId?.startsWith('agent-queue:')
@@ -111,7 +111,6 @@ async function agentQueueTarget(deps: CoordinatorActivityDeps,
       return {
         workflowId: agentQueueId(organizationId),
         capacity: 0,
-        blocked: true,
         detail: `${entitlements.planName} allows ${limit} organization user${limit === 1 ? '' : 's'}, but this organization has ${entitlements.currentMemberCount}. Remove ${extra} member${extra === 1 ? '' : 's'} or restore Team to start another agent run.`,
       };
     }
@@ -224,8 +223,9 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       try {
         const desc = await client.workflow.getHandle(taskId).describe();
         return desc.status.name === 'RUNNING';
-      } catch {
-        return false;
+      } catch (error) {
+        if (error instanceof WorkflowNotFoundError) return false;
+        throw error;
       }
     },
 
@@ -239,7 +239,9 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       provider?: string;
       title?: string;
       projectId?: string;
-    }): Promise<{ granted: boolean; position: number; capacity: number; detail?: string; blocked?: boolean; queueId: string }> {
+    }): Promise<{ granted: boolean; position: number; capacity: number; detail?: string;
+      /** Recorded by historical results only; workflows still read it on replay. */
+      blocked?: boolean; queueId: string }> {
       (await timing(item.taskId, item.turnId, 'queue.slot.requested'));
       const target = (await agentQueueTarget(deps, item));
       await client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
@@ -252,14 +254,12 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signal: SIG_SET_AGENT_CAPACITY,
         signalArgs: [{ capacity: target.capacity }],
       });
-      if (target.blocked) return {
-        granted: false,
-        position: -1,
-        capacity: 0,
-        blocked: true,
-        queueId: target.workflowId,
-        detail: target.detail,
-      };
+      // A blocked plan queues the turn at zero capacity. The entitlement
+      // reconciler restores capacity when membership or billing recovers, and
+      // the queue then grants by signal: waiting records no history, where
+      // returning `blocked` made every task re-request on a 30 s timer (WF-3).
+      // Tasks sleeping in that historical loop join the queue on their next
+      // request without a workflow change.
       const admission = await client.workflow.getHandle(target.workflowId).executeUpdate(UPD_REQUEST_AGENT, {
         args: [item],
       }) as { granted: boolean; position: number; capacity: number };
@@ -317,6 +317,11 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       provider?: AccountProvider,
       allowed?: string[],
     ): Promise<{ waiting: boolean; earliestResetAt?: number; detail?: string }> {
+      // The pool holds every organization's credentials. Without an allow-list
+      // the coordinator grants any account of the provider, so a real provider
+      // whose policy could not be resolved (the workflow's `.catch(() =>
+      // undefined)`) must fail closed. Only the mock keeps the provider fallback.
+      if (provider && provider !== 'mock' && allowed === undefined) allowed = [CREDENTIAL_POLICY_UNAVAILABLE];
       (await timing(taskId, turnId, 'queue.account.requested'));
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
@@ -325,13 +330,17 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signal: SIG_LEASE_ACCOUNT,
         signalArgs: [{ taskId, turnId, provider, allowed }],
       });
-      // A consistent query after signal acceptance observes the coordinator after
-      // it has either parked this request or sent its grant/denial signal. This
-      // lets the task publish a login-wait label only for a genuine queue wait.
-      return await client.workflow.getHandle(accountCoordinatorId()).query(
-        QRY_ACCOUNT_LEASE,
-        { taskId, turnId },
-      ) as { waiting: boolean; earliestResetAt?: number; detail?: string };
+      // A query may still be served by the closing run during continue-as-new.
+      // Retry that acknowledgement without issuing another lease request.
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const acknowledgement = await client.workflow.getHandle(accountCoordinatorId()).query(
+          QRY_ACCOUNT_LEASE,
+          { taskId, turnId },
+        ) as { waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true };
+        if (!acknowledgement.continuingAsNew) return acknowledgement;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(100 * 2 ** attempt, 1000)));
+      }
+      throw new Error('Account coordinator is still continuing as new; retry lease acknowledgement');
     },
     /** Remove a not-yet-granted account request when its task/turn is cancelled. */
     async cancelAccount(taskId: string, turnId: string): Promise<void> {

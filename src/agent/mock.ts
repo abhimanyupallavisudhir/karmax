@@ -1,5 +1,6 @@
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
+import { providerErrorFromMessage } from './limits.js';
 import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/types.js';
 import { platformToolHandlers } from './tools.js';
 
@@ -13,6 +14,8 @@ import { platformToolHandlers } from './tools.js';
  *   @write <path> :: <content>      write a file (\n decoded to newlines)
  *   @run <command...>               run a shell command in the world
  *   @subtask <title> :: <prompt>    spawn a child task
+ *   @subtaskwith <json> :: <title> :: <prompt>
+ *                                   spawn a child task with create_sub_task `params`
  *   @branch <name> [:: <base>]      add another branch/PR to this task (multi-PR)
  *   @respond <action> [:: text]     parent answers a raising child (open_pr/confirm/comment/retry/cancel)
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
@@ -130,10 +133,18 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`ran: ${rest} (exit ${r.code})`);
           break;
         }
-        case 'subtask': {
-          const [title, prompt = ''] = splitOn(rest, '::');
-          ctx.createSubTask({ title: title.trim(), prompt: prompt.trim() });
-          outputs.push(`subtask: ${title.trim()}`);
+        case 'subtask':
+        case 'subtaskwith': {
+          const [json, spec] = directive === 'subtaskwith' ? splitOn(rest, '::') : ['', rest];
+          const [title, prompt = ''] = splitOn(spec, '::');
+          try {
+            await ctx.createSubTask({ title: title.trim(), prompt: prompt.trim(), ...(json ? { params: JSON.parse(json) } : {}) });
+            outputs.push(`subtask: ${title.trim()}`);
+          } catch (e: any) {
+            // A refused create_sub_task is a tool error the agent reads, not a failed turn.
+            if (directive !== 'subtaskwith') throw e;
+            outputs.push(`subtask refused: ${e?.message ?? e}`);
+          }
           break;
         }
         case 'branch': {
@@ -150,12 +161,13 @@ export class MockAdapter implements AgentAdapter {
           break;
         }
         case 'respond': {
-          // @respond <action> [:: text] — parent answering a raising child. Omits
-          // child_task_id, so it targets all children currently waiting.
+          // @respond <action> [child_task_id] [:: text] — parent answering a child.
+          // Without child_task_id it targets all children currently waiting.
           const [action, textRest = ''] = splitOn(rest, '::');
-          const act = action.trim();
+          const [act = '', childTaskId] = action.trim().split(/\s+/);
           if (['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(act)) {
-            ctx.respondToSubTask({ action: act as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined });
+            await ctx.respondToSubTask({ action: act as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined,
+              ...(childTaskId ? { childTaskId } : {}) });
             outputs.push(`respond: ${act}`);
           }
           break;
@@ -244,13 +256,16 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`slept ${ms}ms`);
           break;
         }
+        // The mock stands in for a provider, so its failures are typed the way a
+        // real adapter types a provider's error: only provider-tagged failures
+        // may park a login (AD-2/AD-7); anything else stays a plain Error.
         case 'fail':
-          throw new Error(rest || 'mock failure');
+          throw providerErrorFromMessage('mock', rest || 'mock failure');
         case 'failonce': {
           const key = `${input.world.handle.id}:${rest}`;
           if (!failedOnce.has(key)) {
             failedOnce.add(key);
-            throw new Error(rest || 'mock transient failure');
+            throw providerErrorFromMessage('mock', rest || 'mock transient failure');
           }
           // Reached only when the retry REPLAYED the original prompt (no session
           // resume); a resumed retry sees just the continuation nudge instead.

@@ -209,6 +209,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
         { id: 'a1', role: 'agent', text: 'It is still portable.', ts: Date.parse('2026-08-25T11:00:01Z') },
       ],
       transcripts: [{ role: 'do', label: 'Agent', messages: [
+        { id: 's1', role: 'system', text: 'Task started.', ts: Date.parse('2026-08-25T10:59:59Z') },
         { id: 'u1', role: 'user', text: 'This came through the API rail.', ts: Date.parse('2026-08-25T11:00:00Z') },
         { id: 'a1', role: 'agent', text: 'It is still portable.', ts: Date.parse('2026-08-25T11:00:01Z') },
       ] }],
@@ -222,6 +223,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
     expect(response.status).toBe(200);
     expect(response.headers.get('x-karmax-conversation-source')).toBe('generated');
+    // PA-6: conversion warnings recorded with the frozen export travel with its download.
+    expect(JSON.parse(decodeURIComponent(response.headers.get('x-karmax-conversation-warnings') ?? '[]')))
+      .toEqual([{ code: 'codex_system_role_mapped', message: 'System messages were mapped to Codex developer messages.' }]);
     expect(response.headers.get('content-disposition')).toContain(sessions.do.filename);
     const data = Buffer.from(await response.arrayBuffer());
     expect(detectConversationImport(data)).toBe('codex');
@@ -1051,6 +1055,12 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const symlinkEscape = await fetch(`${base}/api/tasks/${task.id}/file?path=escape-link`, { headers: auth() });
     expect(symlinkEscape.status).toBe(400);
     await fs.promises.unlink(`${view.worldPath}/escape-link`);
+    // A file past the cap is refused, not loaded whole into the gateway (AD-1).
+    fs.writeFileSync(`${view.worldPath}/huge.bin`, '');
+    fs.truncateSync(`${view.worldPath}/huge.bin`, 101 * 1024 * 1024);
+    const huge = await fetch(`${base}/api/tasks/${task.id}/file?path=huge.bin`, { headers: auth() });
+    expect(huge.status).toBe(413);
+    await fs.promises.unlink(`${view.worldPath}/huge.bin`);
 
     // Land through the real workflow and release the Git worktree. The same
     // authenticated attachment URL must survive; no Git fallback can supply
@@ -1811,7 +1821,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(views.find((v: any) => v.id === view.id).query.filters[0].field).toBe('tag');
   });
 
-  // ── vault items + the credential pull model over HTTP (PLAN-passwords.md) ──
+  // ── vault items + the credential pull model over HTTP (wiki plans/PLAN-passwords) ──
   it('persists task credential policies and applies edits to agent access', async () => {
     const item: any = await (await fetch(`${base}/api/vault/items`, {
       method: 'POST', headers: auth(), body: JSON.stringify({
@@ -2348,19 +2358,40 @@ esac
   });
 
   it('connects an existing AgentMail inbox for only that organization', async () => {
-    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
-    const orgId = orgs[0]?.id;
-    const connect = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, {
-      method: 'POST',
-      headers: auth(),
-      body: JSON.stringify({ provider: 'agentmail', domain: 'MyInbox@agentmail.to', apiKey: 'am-test-key' }),
+    const originalFetch = globalThis.fetch;
+    let verified = 0;
+    const provider = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname !== 'api.agentmail.to') return originalFetch(input, init);
+      expect(url.pathname).toBe('/v0/inboxes/myinbox%40agentmail.to');
+      verified++;
+      const authorized = new Headers(init?.headers).get('authorization') === 'Bearer am-test-key';
+      return Response.json(authorized ? { inbox_id: 'myinbox@agentmail.to' } : { error: 'forbidden' },
+        { status: authorized ? 200 : 403 });
     });
-    expect(connect.status).toBe(200);
-    const mailbox: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
-    expect(mailbox.address).toBe('myinbox@agentmail.to');
-    expect(mailbox.configured).toBe(true);
-    expect((await h.store.kvGet(`agent-mail:provider:${orgId}`))).toContain('mailbox:agentmail:');
-    expect((await h.store.kvGet('agent-mail:provider'))).toBeUndefined();
+    try {
+      const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+      const orgId = orgs[0]?.id;
+      const before = await h.store.kvGet(`agent-mail:provider:${orgId}`);
+      const denied = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, {
+        method: 'POST', headers: auth(),
+        body: JSON.stringify({ provider: 'agentmail', domain: 'MyInbox@agentmail.to', apiKey: 'am-denied' }),
+      });
+      expect(denied.status).toBe(400);
+      expect(await h.store.kvGet(`agent-mail:provider:${orgId}`)).toBe(before);
+      const connect = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ provider: 'agentmail', domain: 'MyInbox@agentmail.to', apiKey: 'am-test-key' }),
+      });
+      expect(connect.status).toBe(200);
+      expect(verified).toBe(2);
+      const mailbox: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
+      expect(mailbox.address).toBe('myinbox@agentmail.to');
+      expect(mailbox.configured).toBe(true);
+      expect((await h.store.kvGet(`agent-mail:provider:${orgId}`))).toContain('mailbox:agentmail:');
+      expect((await h.store.kvGet('agent-mail:provider'))).toBeUndefined();
+    } finally { provider.mockRestore(); }
   });
 
   it('configures the shared Stripe Connect application from the operator API without returning secrets', async () => {

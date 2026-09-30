@@ -8,6 +8,17 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
 
 describe('organization cloud provider connections', () => {
+  it.each(['http://localhost:8080/api', 'https://127.0.0.1/api', 'https://private.example/api'])('rejects custom hosted control-plane endpoints (WD-15): %s', async apiUrl => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-provider-url-'));
+    const store = await Store.create(':memory:');
+    Object.defineProperty(store, 'hosted', { value: true });
+    const service = new WorldProviderConnectionService(store, new CredentialBroker(new Vault(dir)));
+    try {
+      await expect(service.save({ organizationId: 'org_personal', provider: 'daytona', apiKey: 'secret', config: { apiUrl } }))
+        .rejects.toThrow('hosted Daytona');
+    } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('keeps keys write-only, supports safe rotation, and removes vault material on disconnect', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-provider-vault-'));
     const store = (await Store.create(':memory:'));
@@ -19,7 +30,8 @@ describe('organization cloud provider connections', () => {
       config: { template: 'node-22' } }));
     expect(saved).toMatchObject({ provider: 'e2b', credentialConfigured: true, config: { template: 'node-22' } });
     expect(JSON.stringify((await service.list(organization.id)))).not.toContain('e2b-secret-one');
-    expect(fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8')).not.toContain('e2b-secret-one');
+    for (const file of fs.readdirSync(dir, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile()))
+      expect(fs.readFileSync(path.join(file.parentPath, file.name), 'utf8')).not.toContain('e2b-secret-one');
     expect((await service.resolve(organization.id, 'e2b')).apiKey).toBe('e2b-secret-one');
 
     // Omitting both key and template preserves them; sending a new key rotates

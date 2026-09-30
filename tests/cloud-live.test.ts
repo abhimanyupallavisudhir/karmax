@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { E2BWorldProvider } from '../src/world/e2b.js';
+import { liveEnabled } from './helpers/live-gate.js';
 
 /**
  * Live provider smoke tests. The unit suites (`e2b-world`, `daytona-world`)
@@ -8,11 +9,10 @@ import { E2BWorldProvider } from '../src/world/e2b.js';
  * same flow against the real control planes, catching SDK drift, credential
  * problems, and lifecycle-semantics changes the fakes cannot see.
  *
- * They self-skip without provider credentials, and `KARMAX_SKIP_LIVE=1`
- * force-skips them (same switch as `live-agent.test.ts`). They spend real
+ * They require `KARMAX_RUN_LIVE=1` and provider credentials. They spend real
  * provider credit: one tiny sandbox each, destroyed in `finally`.
  */
-const skipLive = process.env.KARMAX_SKIP_LIVE === '1';
+const skipLive = !liveEnabled();
 
 describe.skipIf(skipLive || !process.env.E2B_API_KEY)('E2B live smoke', () => {
   it('provisions a real sandbox, executes a command, and destroys it', async () => {
@@ -30,7 +30,7 @@ describe.skipIf(skipLive || !process.env.E2B_API_KEY)('E2B live smoke', () => {
     }
   }, 180_000);
 
-  // The cloud credential-fill path (PLAN-passwords.md §5B): the gateway hands the
+  // The cloud credential-fill path (wiki plans/PLAN-passwords §5B): the gateway hands the
   // secret to an in-sandbox helper over STDIN — never argv/env/a file the
   // co-resident agent could read. These are the pieces the offline fakes cannot
   // exercise: E2B's sendStdin/closeStdin/wait, and cdp-fill.mjs running under the

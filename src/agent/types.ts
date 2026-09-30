@@ -1,4 +1,4 @@
-import { AgentActivity, AgentProfile, AgentRole, AgentWait, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, AgentProfile, AgentRole, AgentWait, Message, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
@@ -20,7 +20,7 @@ export interface PlatformToolContext {
   createReviewInfo(info: ReviewInfo): void | Promise<void>;
   /** Spawn a child task the parent manages (branches off + merges back into the
    *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). */
-  createSubTask(t: { title: string; prompt: string }): void | Promise<void>;
+  createSubTask(t: SubTaskRequest): void | Promise<void>;
   /** Parent-agent ONLY: answer a child that raised to you (open_pr/comment/retry/
    *  cancel; `confirm` is a replay-compatible alias). */
   respondToSubTask(r: SubTaskResponse): void | Promise<void>;
@@ -66,12 +66,13 @@ export interface PlatformToolContext {
    * Card details remain in the trusted activity process and never enter model IO. */
   fillPaymentCard?(args: {
     requestId: string;
-    cdpUrl: string;
     selectors: import('../autonomy/card-fill.js').CardFillSelectors;
   }): Promise<{ filled: true; origin: string }>;
   /** Call the capability-checked karmax gateway under this turn's scoped token. */
   platformRequest?(method: string, path: string, body?: unknown): Promise<unknown>;
-  /** Stream incremental output to the task's live event log. */
+  /** Stream live output to the task's event log. For `assistant`, `text` is the
+   *  whole text so far of the block being generated (never a bare delta), so an
+   *  adapter may call this per token; the runtime coalesces publication. */
   emit(text: string, source?: 'assistant' | 'tool'): void;
   /** Publish a structured provider item for the durable conversation timeline. */
   emitActivity(activity: AgentActivity): void | Promise<void>;
@@ -124,7 +125,7 @@ export interface TurnInput {
   /** Credentials resolved JIT by the broker (never journaled); preferred over env. */
   resolvedAuth?: { apiKey?: string; configHome?: string; oauthToken?: string };
   /** Extra env for the agent subprocess, resolved JIT (never journaled) — e.g. the
-   *  git profile's GIT_SSH_COMMAND / GH_TOKEN (PLAN-git-config.md §4B), so an agent
+   *  git profile's GIT_SSH_COMMAND / GH_TOKEN (wiki plans/PLAN-git-config §4B), so an agent
    *  that pushes or runs `gh` does so as the project's git account. */
   extraEnv?: Record<string, string>;
   /** Environment-shaped project secrets and per-world service endpoints, resolved
@@ -209,7 +210,7 @@ export interface TurnResult {
   /** Provider timeline item carrying `output`, when the adapter emitted one. */
   finalActivity?: NonNullable<Message['sourceActivity']>;
   reviewInfo?: ReviewInfo;
-  subTasks?: { title: string; prompt: string }[];
+  subTasks?: SubTaskRequest[];
   /** Parent-agent responses to child raises this turn (SPEC §5.3). */
   subTaskResponses?: SubTaskResponse[];
   /** Child-agent request up to its parent this turn (SPEC §5.3). */

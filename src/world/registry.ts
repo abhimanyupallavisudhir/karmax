@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { WorldOperationLock } from './operation-lock.js';
 import { SharedWorldCoordination } from './shared-coordination.js';
 import { World, WorldHandle, WorldKind, WorldLifecycleState, WorldProvider, WorldSpec } from './types.js';
@@ -13,6 +14,7 @@ import { DaytonaWorldProvider } from './daytona.js';
  * worktree → container → remote is a config change, not a code change.
  */
 export class WorldRegistry {
+  private readonly recoveryDisabled = new AsyncLocalStorage<boolean>();
   private readonly operations: WorldOperationLock;
   private readonly shared?: SharedWorldCoordination;
   private readonly accessors = new Map<string, number>();
@@ -94,12 +96,17 @@ export class WorldRegistry {
     return this.shared ? this.shared.hasAccess(worldId) : this.activeAccessCount(worldId) > 0;
   }
 
+  withoutRecovery<T>(operation: () => Promise<T>): Promise<T> {
+    return this.recoveryDisabled.run(true, operation);
+  }
+
   async open(handle: WorldHandle): Promise<World> {
     return this.withOperation(handle.id, async () => {
       const current = (await this.resolveHandle?.(handle)) ?? handle;
       try {
         return await this.get(current.kind).open(current);
       } catch (error) {
+        if (this.recoveryDisabled.getStore()) throw error;
         const restored = await this.recover?.(current, error);
         if (!restored) throw error;
         return this.get(restored.kind).open(restored);

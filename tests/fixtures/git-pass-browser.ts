@@ -1,4 +1,4 @@
-/** Native browser + hosted gateway + authenticated HTTPS Git verification.
+/** Native browser + deployment policy + authenticated HTTPS Git verification.
  * Uses generated credentials only; no request interception or production accounts. */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -12,6 +12,9 @@ import { IdentityService } from '../../src/auth/identity.js';
 import { findFreePortFrom } from '../../src/util/ports.js';
 import { encryptIdentity } from '../helpers/age-encrypted-identity.js';
 import { totpCode } from '../../src/autonomy/vault-items.js';
+
+// Bodies passed to page.evaluate run in the page; this file has no DOM lib.
+declare const document: any;
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pass-browser-'));
 process.env.KARMAX_HOME = path.join(root, 'karmax');
@@ -163,7 +166,7 @@ try {
   const port = await findFreePortFrom(48900);
   const base = `http://127.0.0.1:${port}`;
   identity = await IdentityService.open(path.join(root, 'identity.db'), { baseURL: base });
-  await harness.startGateway({ hosted: true, identity, port });
+  const hostedGateway = await harness.startGateway({ hosted: true, identity, port });
   const setup = await fetch(base + '/api/setup', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -189,7 +192,7 @@ try {
   const signedIn = page.waitForResponse((r) => r.url().endsWith('/api/login') && r.request().method() === 'POST');
   await page.locator('#login-btn').click();
   assert.equal((await signedIn).status(), 200);
-  await page.waitForFunction("!document.querySelector('#login-btn')");
+  await page.waitForFunction(() => !document.querySelector('#login-btn'));
   // All requests below go through the real gateway, identity and authorization.
   const api = (url: string, body?: unknown) =>
     page.evaluate(
@@ -216,35 +219,41 @@ try {
   await page.goto(`${base}/${org.slug}/settings#settings-payments`);
   await page.locator('#onboarding-minimize').click();
   const row = page.locator('[data-conn="pass-git"]');
-  await row.locator('[data-git-pass-connect]').click();
-  const form = page.locator('[data-git-pass-root]');
-  await form.locator('.git-pass-repo').fill(gitBase + '/root.git');
-  await form.locator('.git-pass-key').fill(gpgPrivateKey);
-  await form.locator('.git-pass-profile').selectOption('staging');
-  await page.locator('[data-git-pass-add]').click();
-  const mount = page.locator('[data-git-pass-mount]');
-  await mount.locator('.git-pass-mount-name').fill('work');
-  await mount.locator('.git-pass-repo').fill(gitBase + '/work.git');
-  await mount.locator('.git-pass-profile').selectOption('staging');
-  await mount.locator('.git-pass-crypto').selectOption('age');
-  await mount.locator('.git-pass-age-file').setInputFiles(encryptedAgeKey);
-  await mount.locator('.git-pass-age-passphrase').fill('browser-test-passphrase');
-  await mount.locator('.git-pass-verify-entry').fill('otp');
-  const connected = page.waitForResponse(r => r.url().includes('/connectors/pass-git/connect') && r.request().method() === 'POST');
-  await page.locator('[data-git-pass-save]').click();
-  const connection = await connected;
+  const connectFromBrowser = async () => {
+    await row.locator('[data-git-pass-connect]').click();
+    const form = page.locator('[data-git-pass-root]');
+    await form.locator('.git-pass-repo').fill(gitBase + '/root.git');
+    await form.locator('.git-pass-key').fill(gpgPrivateKey);
+    await form.locator('.git-pass-profile').selectOption('staging');
+    await page.locator('[data-git-pass-add]').click();
+    const mount = page.locator('[data-git-pass-mount]');
+    await mount.locator('.git-pass-mount-name').fill('work');
+    await mount.locator('.git-pass-repo').fill(gitBase + '/work.git');
+    await mount.locator('.git-pass-profile').selectOption('staging');
+    await mount.locator('.git-pass-crypto').selectOption('age');
+    await mount.locator('.git-pass-age-file').setInputFiles(encryptedAgeKey);
+    await mount.locator('.git-pass-age-passphrase').fill('browser-test-passphrase');
+    await mount.locator('.git-pass-verify-entry').fill('otp');
+    const connected = page.waitForResponse(r => r.url().includes('/connectors/pass-git/connect') && r.request().method() === 'POST');
+    await page.locator('[data-git-pass-save]').click();
+    return await connected;
+  };
+  const refused = await connectFromBrowser();
+  assert.equal(refused.status(), 400);
+  assert.match(await refused.text(), /hosted Git password stores require public/);
+  assert.equal(requests.length, 0, 'hosted rejection must happen before contacting the private Git server');
+  // A private HTTPS remote is supported only on the self-hosted deployment.
+  await hostedGateway.close();
+  await harness.startGateway({ hosted: false, identity, port });
+  await page.reload();
+  const connection = await connectFromBrowser();
   assert.equal(connection.status(), 200, await connection.text());
   const checks = (await connection.json()).connector.checks;
   assert.equal(checks.length, 2);
   assert(checks.every((check: any) => check.read === 'verified' && check.encryption && check.push));
   await page.locator('[data-git-pass-root]').waitFor({ state: 'detached' });
-  const checked = page.waitForResponse(response => response.url().includes('/connectors/pass-git/check'));
-  await row.locator('[data-git-pass-check]').click();
-  const checkedResponse = await checked;
-  assert.equal(checkedResponse.status(), 200);
-  assert.deepEqual((await checkedResponse.json()).checks, checks);
-  await row.locator('[data-conn-import]').click();
-  await page.waitForFunction("document.querySelectorAll('.imp-pick').length === 2");
+  // A newly connected store opens its import picker by itself.
+  await page.waitForFunction(() => document.querySelectorAll('.imp-pick').length === 2);
   await page.locator('.imp-all').check();
   await page.locator('.imp-wb').check();
   await page.locator('.imp-reveal').selectOption('auto');
@@ -254,6 +263,11 @@ try {
   await page.locator('[data-imp-go]').click();
   assert.equal((await imported).status(), 200);
   await page.locator('[data-imp-go]').waitFor({ state: 'detached' });
+  const checked = page.waitForResponse(response => response.url().includes('/connectors/pass-git/check'));
+  await row.locator('[data-git-pass-check]').click();
+  const checkedResponse = await checked;
+  assert.equal(checkedResponse.status(), 200);
+  assert.deepEqual((await checkedResponse.json()).checks, checks);
   const listed = await api('/api/vault/items' + oq);
   assert.equal(listed.status, 200);
   assert.equal(listed.body.length, 2);
@@ -394,14 +408,15 @@ try {
   assert.equal((await failed).status(), 400);
   await page.locator('.toast.err').last().waitFor({ state: 'visible' });
   await page.locator('.toast.err .toast-dismiss').last().click();
-  await page.waitForFunction("!document.querySelector('[data-git-pass-save]')?.disabled");
+  await page.waitForFunction(() => !document.querySelector('[data-git-pass-save]')?.disabled);
   await page.locator('[data-git-pass-cancel]').click();
   assert.equal((await api('/api/vault/connectors/pass-git/list' + oq, {})).body.length, 4);
   assert.deepEqual(errors, []);
   console.log(
     JSON.stringify({
       browserLogin: true,
-      hostedGateway: true,
+      hostedPrivateRemoteRejected: true,
+      selfHostedGateway: true,
       tlsVerified: true,
       gitChallengeResponse: true,
       gpgAndAgeMountImport: true,

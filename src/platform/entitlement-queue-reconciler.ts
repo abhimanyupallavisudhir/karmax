@@ -8,6 +8,7 @@ import {
   agentQueueId,
 } from '../coordinators/names.js';
 import type { Store } from '../store/db.js';
+import { withTimeout } from '../util/timeout.js';
 
 interface AgentQueueItem {
   taskId: string;
@@ -36,6 +37,9 @@ export interface EntitlementQueueReconcilerOptions {
   client: Client;
   /** Periodic retry/startup repair interval. Set to 0 in focused tests. */
   intervalMs?: number;
+  /** Bound on each workflow query: organizations are reconciled one at a
+   * time, so a query a wedged workflow never answers would stall them all. */
+  queryTimeoutMs?: number;
   log?: (message: string) => void;
 }
 
@@ -50,6 +54,7 @@ export interface EntitlementQueueReconcilerOptions {
  */
 export class EntitlementQueueReconciler {
   private readonly intervalMs: number;
+  private readonly queryTimeoutMs: number;
   private readonly requested = new Set<string>();
   private unsubscribe?: () => void;
   private timer?: AsyncInterval;
@@ -57,6 +62,7 @@ export class EntitlementQueueReconciler {
 
   constructor(private readonly options: EntitlementQueueReconcilerOptions) {
     this.intervalMs = Math.max(0, Math.floor(options.intervalMs ?? 60_000));
+    this.queryTimeoutMs = options.queryTimeoutMs ?? 10_000;
   }
 
   async start(): Promise<void> {
@@ -136,7 +142,7 @@ export class EntitlementQueueReconciler {
       if (!result) {
         result = (async () => {
           try {
-            const taskView = await this.options.client.workflow.getHandle(taskId).query('view') as {
+            const taskView = await withTimeout(this.options.client.workflow.getHandle(taskId).query('view'), this.queryTimeoutMs) as {
               status?: string;
               agentTurn?: { turnId?: string; state?: string };
             };
@@ -165,7 +171,7 @@ export class EntitlementQueueReconciler {
 
     let view: AgentQueueView;
     try {
-      view = await handle.query(QRY_AGENT_QUEUE) as AgentQueueView;
+      view = await withTimeout(handle.query(QRY_AGENT_QUEUE), this.queryTimeoutMs) as AgentQueueView;
     } catch {
       return;
     }

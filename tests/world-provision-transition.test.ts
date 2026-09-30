@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
+import { Context } from '@temporalio/activity';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorldLifecycleManager } from '../src/world/runners.js';
@@ -44,4 +45,31 @@ it('protects a replacement allocation from orphan cleanup until provisioning reg
   finally { finish.resolve(); await creating; await sweeping; }
   expect(destroyed).not.toHaveBeenCalled();
   expect(await store.currentWorld(task.id)).toMatchObject({ generation: 2, sealedProviderRef: 'new' });
+});
+
+
+it('RT-6 heartbeats local provisioning until durable registration completes', async () => {
+  store = await Store.create(':memory:');
+  const entered = deferred(), finish = deferred();
+  const heartbeat = vi.fn();
+  vi.spyOn(Context, 'current').mockReturnValue({ heartbeat,
+    cancellationSignal: new AbortController().signal } as any);
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+  const worlds = new WorldRegistry();
+  worlds.register({ kind: 'memory', create: async () => {
+    entered.resolve(); await finish.promise;
+    return { handle: { id: 'local-slow', kind: 'memory', root: '/fixture', base: 'main', branch: 'task' },
+      destroy: async () => {} };
+  } } as any);
+  const core = makeCoreActivities({ store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+  const creating = core.createWorld({ taskId: 'local-slow', kind: 'memory', base: 'main' });
+  await entered.promise;
+  try {
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(heartbeat).toHaveBeenCalled();
+  } finally {
+    finish.resolve(); await creating;
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+  }
 });

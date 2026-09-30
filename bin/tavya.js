@@ -24,9 +24,9 @@ if (!taskId || (!ticket && !token)) usage('A one-time --ticket (from the Karmax 
 const url = new URL('/ws/terminal', gateway);
 url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
 url.searchParams.set('taskId', taskId);
-url.searchParams.set(ticket ? 'ticket' : 'token', ticket ?? token);
+if (ticket) url.searchParams.set('ticket', ticket);
 
-const ws = new WebSocket(url);
+const ws = new WebSocket(url, ticket ? {} : { headers: { authorization: `Bearer ${token}` } });
 let raw = false;
 const restore = () => {
   if (raw && process.stdin.isTTY) process.stdin.setRawMode(false);

@@ -47,6 +47,7 @@ export interface PlatformOps {
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
+  messageAgent(taskId: string, text: string, role?: string): Promise<void>;
   escalateToHuman(a: { audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
@@ -108,7 +109,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     // error for a task that already existed.
     createTask: (a) => api.createTask(getToken(), a),
     getTask: (id) => api.getTaskView(getToken(), id) as Promise<unknown>,
-    listTasks: async (pid) => (await api.listTasks(getToken(), pid)).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })),
+    listTasks: async (pid) => (await api.listTaskSummaries(getToken(), pid)).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })),
     searchTasks: async (pid, query) => {
       const [result, tags] = await Promise.all([api.searchTasks(getToken(), pid, query), api.listTags(getToken(), pid)]);
       return compactSearch(result, tags);
@@ -117,6 +118,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     tagTask: (id, add, remove) => api.tagTask(getToken(), id, { add, remove }),
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await api.signalTask(getToken(), id, sig as any, text, role, undefined, undefined, { otherAttempts, saveOtherAttemptsDefault })),
+    messageAgent: async (id, text, role) => void (await api.messageAgent(getToken(), id, text, role)),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
     requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
@@ -209,6 +211,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     tagTask: (id, add, remove) => req(`/api/tasks/${id}/tag`, { method: 'POST', body: JSON.stringify({ add, remove }) }) as Promise<{ tags: string[] }>,
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role, otherAttempts, saveOtherAttemptsDefault }) })),
+    messageAgent: async (id, text, role) => void (await req(`/api/tasks/${id}/messages`, { method: 'POST', body: JSON.stringify({ text, role }) })),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
     requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
@@ -441,7 +444,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'message_agent',
     { description: `Send a follow-up into an attached agent conversation (${AGENT_ROLE_NAMES.join(', ')}). This works for original or forked tasks and is delivered live when that agent is running.`, inputSchema: { taskId: z.string(), role: z.enum(AGENT_ROLE_NAMES).default('do'), message: z.string() } },
-    async (a) => wrap(async () => { await ops.signalTask(a.taskId, 'followUp', a.message, a.role); return 'message delivered'; }),
+    async (a) => wrap(async () => { await ops.messageAgent(a.taskId, a.message, a.role); return 'message delivered'; }),
   );
   server.registerTool(
     'escalate_to_human',
@@ -574,7 +577,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
           : { kind: 'environment', name: a.targetEnvironment! },
     }));
   }));
-  // Vault credentials (PLAN-passwords.md) — thin wrappers over the gateway's
+  // Vault credentials (wiki plans/PLAN-passwords) — thin wrappers over the gateway's
   // /api/vault surface so the pull model is first-class, not buried behind
   // platform_request. Available on the gateway-backed bridge; the in-process
   // apiOps embedding reports the same platform_request limitation.
@@ -616,7 +619,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         `Type a vault credential into the page open in your browser WITHOUT the secret entering your context — ${BRAND} resolves and types it over CDP after verifying the page origin matches the credential's domains. Call once per field (username, password, then totp for a one-time code). The ${BRAND} browser MCP already runs a Chrome that exposes this DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.`,
-      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string(), cdpUrl: z.string().optional() },
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/fill', a))),
   );
@@ -666,7 +669,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         'Enroll a NEW passkey belonging to tavya on the account open in your browser (the user\'s own passkeys are unusable — the OS biometric is theirs). tavya preps a virtual authenticator (origin-verified); you trigger the site\'s "create a passkey" button; then call save_passkey with the returned authenticatorId. Afterwards use_passkey logs in with no 2FA prompt.',
-      inputSchema: { domain: z.string(), cdpUrl: z.string().optional() },
+      inputSchema: { domain: z.string() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/enroll', a))),
   );
@@ -683,7 +686,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         `Log in with a ${BRAND}-enrolled passkey: ${BRAND} loads the stored credential into a virtual authenticator on the page; you trigger the site's "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticatorId (release it when done via platform_request POST /api/vault/passkey/release), or needs_approval/not_in_vault.`,
-      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), cdpUrl: z.string().optional() },
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/login', a))),
   );
@@ -695,7 +698,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'platform_request',
     {
-      description: `Call any authenticated ${BRAND} gateway API operation, including project/account/payment/settings/user/safe-mode/review administration. Call describe_platform first when unsure. This never bypasses authorization, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused.`,
+      description: `Call any authenticated ${BRAND} gateway API operation, including project/account/payment/settings/user/review administration. Call describe_platform first when unsure. This never bypasses authorization, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused.`,
       // See PLATFORM_REQUEST_BODY_SCHEMA for why `body` must declare a concrete
       // shape; the zod union below is its zod twin (both are asserted equivalent
       // in tests/platform-surface.test.ts).
@@ -768,7 +771,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', {
-    description: `Save a reusable skill (markdown) for future tasks. This writes INSTALLATION-WIDE global state — the skill is visible to every project and organization on this ${BRAND}, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).`,
+    description: 'Save a reusable skill (markdown) for future tasks; saving the same name overwrites it. It is saved to your task\'s project, or for your whole organization if your task has organization-wide authority (organization:wiki:write); the result says which. For content that task prompts should include, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
     inputSchema: { name: z.string(), content: z.string() },
   }, async (a) => wrap(async () => (await ops.saveSkill(a))));
   server.registerTool(

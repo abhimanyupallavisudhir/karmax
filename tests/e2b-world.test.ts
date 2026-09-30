@@ -1,15 +1,119 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
 import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
+  it('rejects an unauthenticated legacy sandbox ID before any provider operation (WD-30)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const connect = vi.fn(async () => sandbox);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect, get: connect } as any);
+    const world = await provider.create({ taskId: 'legacy', base: 'main' });
+    const forged = { ...world.handle, sealedProviderRef: undefined,
+      meta: { ...world.handle.meta, sandboxId: 'another-tenant-sandbox', organizationId: 'victim' } };
+    await expect(provider.open(forged)).rejects.toThrow('invalid E2B world handle');
+    await expect(provider.destroy(forged)).rejects.toThrow('invalid E2B world handle');
+    expect(connect).not.toHaveBeenCalled();
+    await expect(provider.open(world.handle)).resolves.toBeDefined();
+  });
+
+  it('uses one provider inventory request before a new allocation (LT-3)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const list = vi.fn(async () => []);
+    await new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox, list })
+      .create({ taskId: 'new-allocation', base: 'main' });
+    expect(list).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops lifecycle pagination after the overlapping cursor (WD-18, LT-19)', async () => {
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async input => {
+      const offset = Number(new URL(String(input)).searchParams.get('offset'));
+      return Response.json(Array.from({ length: 100 }, (_, index) => ({ timestamp: new Date(10_000 - offset - index).toISOString() })));
+    });
+    try {
+      const provider = new E2BWorldProvider();
+      expect((await provider.listUsageEvents('org', 9850)).resumeAt).toBeUndefined();
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  // LT-19: a feed longer than one sweep's page bound returns what it read and
+  // where to resume, instead of throwing away the whole scan every sweep.
+  it('returns a bounded scan with the offset to resume a long lifecycle feed from', async () => {
+    const offsets: number[] = [];
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async input => {
+      const offset = Number(new URL(String(input)).searchParams.get('offset'));
+      offsets.push(offset);
+      return Response.json(Array.from({ length: 100 }, (_, index) => lifecycleEvent(`execution-${offset + index}`)));
+    });
+    try {
+      const provider = new E2BWorldProvider();
+      const first = await provider.listUsageEvents('org');
+      expect(first.events.length).toBe(offsets.length * 100);
+      expect(first.events[0]?.id).toBe('execution-0');
+      expect(first.resumeAt).toBe(offsets.length * 100);
+      offsets.length = 0;
+      const second = await provider.listUsageEvents('org', undefined, first.resumeAt);
+      expect(offsets[0]).toBe(first.resumeAt);
+      expect(second.events[0]?.id).toBe(`execution-${first.resumeAt}`);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it('provisions each recorded checkout branch and directory (WD-11)', async () => {
+    const commands: string[] = [];
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.commands.run = async command => { commands.push(command); return { stdout: command.includes('rev-parse') ? 'a'.repeat(40) : '', stderr: '', exitCode: 0 }; };
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'restored', base: 'main',
+      repos: ['git@github.com:org/repo.git', 'git@github.com:org/repo.git'],
+      checkouts: [ { name: 'first', branch: 'saved-one', base: 'main', sourceAuthority: 'origin' },
+        { name: 'second', branch: 'saved-two', base: 'main', gitIdentity: { name: 'Saved', email: 'saved@test' } } ] });
+    expect(world.handle.repos?.map(repo => [repo.name, repo.branch])).toEqual([['first', 'saved-one'], ['second', 'saved-two']]);
+    expect(commands.join('\n')).toContain("checkout -q -B 'saved-two' 'origin/saved-two'");
+    expect(commands.join('\n')).toContain("config user.email 'saved@test'");
+  });
+
+  it('evicts destroyed sandboxes and lifecycle cache entries (WD-3, PS-10)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    let opens = 0;
+    const provider = new E2BWorldProvider({ create: async () => sandbox,
+      connect: async () => { opens++; throw new Error('deleted'); },
+      get: async () => { opens++; throw new Error('deleted'); } } as any);
+    const world = await provider.create({ taskId: 'cache', base: 'main' });
+    await world.destroy();
+    expect((provider as any).sandboxes.size).toBe(0);
+    expect((provider as any).states.size).toBe(0);
+    await expect(provider.open(world.handle)).rejects.toThrow('deleted');
+    expect(opens).toBe(1);
+  });
+
+  it.each([
+    [Object.assign(new Error('getaddrinfo ENOTFOUND api.provider'), { code: 'ENOTFOUND' }), undefined],
+    [new Error('upstream returned 404 while resolving proxy'), undefined],
+    [Object.assign(new Error('deleted'), { status: 404 }), 'missing'],
+  ])('requires authoritative missing status (WD-8): %s', async (error, expected) => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox,
+      get: async () => sandbox, info: async () => { throw error; } } as any);
+    const world = await provider.create({ taskId: 'probe', base: 'main' });
+    expect(await provider.probe(world.handle)).toBe(expected);
+  });
+
+  it('preserves undecidable sealed references during orphan comparison (WD-1)', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox,
+      get: async () => sandbox, list: async () => [sandbox] } as any);
+    const world = await provider.create({ taskId: 'sealed', base: 'main' });
+    const [listed] = await provider.listSandboxes();
+    expect(listed!.matches!({ ...world.handle, sealedProviderRef: 'unreadable' })).toBeUndefined();
+  });
+
   it('normalizes only this deployment\'s completed provider executions for billing', async () => {
     const sandbox = fakeSandbox(() => undefined);
     const factory: E2BFactory = {
       async create() { return sandbox; },
       async connect() { return sandbox; },
       async events() {
-        return [
+        return { events: [
           { id: 'pause-1', type: 'sandbox.lifecycle.paused', timestamp: '2026-07-31T10:05:00Z',
             sandbox_id: 'sandbox-1', sandbox_execution_id: 'execution-1', event_data: {
               sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1' },
@@ -26,13 +130,13 @@ describe('E2B cloud world provider', () => {
             sandbox_id: 'sandbox-1', sandbox_execution_id: 'execution-3', event_data: {
               sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1' },
             } },
-        ];
+        ] };
       },
     };
     const provider = new E2BWorldProvider(factory, undefined, undefined,
       () => ({ organizationId: 'org-1', provider: 'e2b', apiKey: 'secret', config: {} }));
 
-    expect(await provider.listUsageEvents!('org-1')).toEqual([{
+    expect((await provider.listUsageEvents!('org-1')).events).toEqual([{
       id: 'execution-1', sandboxId: 'sandbox-1', taskId: 'task-1',
       startedAt: Date.UTC(2026, 6, 31, 10), endedAt: Date.UTC(2026, 6, 31, 10, 5),
       activeMs: 300_000, cpu: 2, memoryMb: 512,
@@ -182,13 +286,14 @@ describe('E2B cloud world provider', () => {
     let terminalOutput = '';
     terminal.onData((chunk) => { terminalOutput += chunk; });
     ptyData?.(new TextEncoder().encode('ready'));
+    for (const byte of new TextEncoder().encode('🌍 नमस्ते')) ptyData?.(new Uint8Array([byte]));
     await terminal.write('pwd\n');
     await terminal.resize(120, 40);
     await terminal.close();
     expect(timeoutRefreshes).toBeGreaterThanOrEqual(2); // process + PTY leases
     expect(terminal.pid).toBeUndefined(); // remote pid must never enter the host process registry
     expect(ptyOptions.cmd).toBeUndefined();
-    expect(terminalOutput).toBe('ready');
+    expect(terminalOutput).toBe('ready🌍 नमस्ते');
     expect(ptyInput).toBe('exec agent\npwd\n');
     expect(await world.previewSocketTarget!(3000, '/hmr?x=1')).toMatchObject({
       url: 'wss://3000-sbx_test.e2b.app/hmr?x=1', headers: { 'x-access-token': 'provider-secret' },
@@ -234,7 +339,7 @@ describe('E2B cloud world provider', () => {
         return sandbox;
       },
       async list(options) {
-        return options.metadata.karmaxGeneration === '3'
+        return options.metadata.karmaxTaskId === 'retry-create'
           ? [{ sandboxId: sandbox.sandboxId, metadata }]
           : [];
       },
@@ -262,7 +367,7 @@ describe('E2B cloud world provider', () => {
       },
       async connect(id) { expect(id).toBe('late-create'); connects++; return sandbox; },
       async list(options) {
-        return allocated && options.metadata.karmaxGeneration === '1'
+        return allocated && options.metadata.karmaxTaskId === 'late'
           ? [{ sandboxId: sandbox.sandboxId, metadata }]
           : [];
       },
@@ -296,7 +401,7 @@ describe('E2B cloud world provider', () => {
       taskId: 'private',
       base: 'main',
       repo: 'git@github.com:acme/private.git',
-      gitCredentials: { sshKey: 'PRIVATE CLONE KEY' },
+      gitCredentials: { repositories: { 'git@github.com:acme/private.git': 'PRIVATE CLONE KEY' } },
     });
 
     expect(writes.get('/home/user/.ssh/karmax-auth-0')).toContain('PRIVATE CLONE KEY');
@@ -566,6 +671,12 @@ describe('E2B cloud world provider', () => {
     expect(await world.diagnose!({ since: at('04:50:43').getTime(), now })).toBeUndefined();
   });
 });
+
+function lifecycleEvent(execution: string) {
+  return { type: 'sandbox.lifecycle.paused', timestamp: '2026-07-31T10:05:00Z', sandbox_id: 'sandbox', sandbox_execution_id: execution,
+    event_data: { sandbox_metadata: { karmaxHome: serviceHomeLabel() },
+      execution: { started_at: '2026-07-31T10:00:00Z', execution_time: 1000, vcpu_count: 1, memory_mb: 512 } } };
+}
 
 function fakeSandbox(onKill: () => void): E2BSandboxLike {
   return {

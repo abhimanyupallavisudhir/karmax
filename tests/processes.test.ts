@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import { spawn, ChildProcess } from 'node:child_process';
 import { trackProcess, trackedProcesses, sampleProcesses, killTracked, processStartTick } from '../src/util/processes.js';
@@ -143,6 +143,28 @@ describe('process registry + /proc sampler (dashboard task manager)', () => {
     } catch {
       expect.unreachable('protected process was killed');
     }
+  });
+
+  itProc('stops an agent through its task without sending a retryable kill (AD-22)', async () => {
+    const child = sleeper();
+    const kill = vi.fn();
+    const stopTask = vi.fn(async () => {});
+    untracks.push(trackProcess({ pid: child.pid!, kind: 'agent', label: 'agent',
+      taskId: 'task_stop', startedAt: Date.now(), kill }));
+    expect(await killTracked(child.pid!, 'SIGKILL', stopTask)).toEqual({ ok: true });
+    expect(stopTask).toHaveBeenCalledExactlyOnceWith('task_stop');
+    expect(kill).not.toHaveBeenCalled();
+    expect(await waitGone(child.pid!, 100)).toBe(false);
+  });
+
+  itProc('does not kill an agent if task cancellation fails (AD-22)', async () => {
+    const child = sleeper();
+    const kill = vi.fn();
+    untracks.push(trackProcess({ pid: child.pid!, kind: 'agent', label: 'agent',
+      taskId: 'task_stop', startedAt: Date.now(), kill }));
+    const result = await killTracked(child.pid!, 'SIGTERM', async () => { throw new Error('not authorized'); });
+    expect(result).toEqual({ ok: false, error: 'not authorized' });
+    expect(kill).not.toHaveBeenCalled();
   });
 
   itProc('records a start tick so a recycled pid cannot be killed as ours', async () => {

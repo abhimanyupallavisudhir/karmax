@@ -54,6 +54,9 @@ export async function retryCredentials(
       accountId: credential.key, status: 'available', onlyIfStatus,
     });
   }
+  // A turn parked because its policy could not be read waits on an allow-list
+  // no credential matches: only reading the policy again frees it (WF-35).
+  await coordinator.relistAccountLeases();
 }
 
 /**

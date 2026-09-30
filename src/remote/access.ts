@@ -233,8 +233,8 @@ export class RemoteAccessController {
       }
     }
     const text = `${serve.stdout}\n${serve.stderr}`.trim();
-    const target = `127.0.0.1:${this.options.port()}`;
-    const active = text.includes(target);
+    const active = [...text.matchAll(/https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)(?=[/\s"']|$)/gi)]
+      .some(match => Number(match[1]) === this.options.port());
     const url = urlFromText(text) ?? (dnsName ? `https://${dnsName}` : undefined);
 
     if (active) {

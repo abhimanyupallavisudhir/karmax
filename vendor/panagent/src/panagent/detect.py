@@ -83,12 +83,15 @@ def detect_text(text: str, path: Path | None = None) -> str:
         if "claude" in lowered or "anthropic" in lowered or "challenge-platform" in lowered:
             return "claude-share"
     records: list[dict[str, Any]] = []
-    for index, line in enumerate(stripped.splitlines()):
+    lines = stripped.splitlines()
+    for index, line in enumerate(lines):
         if not line.strip():
             continue
         try:
             obj = json.loads(line.lstrip("\ufeff"))
         except json.JSONDecodeError as exc:
+            if index == len(lines) - 1 and not stripped.endswith(("\n", "\r")):
+                break
             suffix = f" ({path})" if path else ""
             raise FormatError(f"invalid JSONL at line {index + 1}{suffix}: {exc.msg}") from exc
         if not isinstance(obj, dict):

@@ -30,14 +30,34 @@ record({ env: {
 } });
 let pendingPrompt;
 let terminalId;
+const update = (value) => send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'session-new', update: value } });
+const text = (sessionUpdate, value, messageId) => update({ sessionUpdate, content: { type: 'text', text: value }, ...(messageId ? { messageId } : {}) });
 const finish = () => {
   send({ jsonrpc: '2.0', method: 'session/update', params: {
     sessionId: 'session-new',
     update: { sessionUpdate: 'tool_call_update', toolCallId: 'tool-1', status: 'completed' },
   } });
+  if (process.env.STUB_MESSAGES) {
+    text('agent_thought_chunk', 'Reading ', 'thought-1');
+    text('agent_thought_chunk', 'the ', 'thought-1');
+    text('agent_thought_chunk', 'parser.', 'thought-1');
+    text('agent_message_chunk', 'Found ', 'msg-1');
+    text('agent_message_chunk', 'the bug.', 'msg-1');
+    update({ sessionUpdate: 'tool_call', toolCallId: 'tool-2', title: 'Run tests', kind: 'execute', status: 'in_progress' });
+    text('agent_message_chunk', 'Tests pass.');
+    text('agent_thought_chunk', 'Summarize.');
+    text('agent_message_chunk', 'All ', 'msg-3');
+    text('agent_message_chunk', 'done.', 'msg-3');
+    send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: 'end_turn' } });
+    return;
+  }
   send({ jsonrpc: '2.0', method: 'session/update', params: {
     sessionId: 'session-new',
-    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } },
+    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'do' } },
+  } });
+  send({ jsonrpc: '2.0', method: 'session/update', params: {
+    sessionId: 'session-new',
+    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ne' } },
   } });
   send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: process.env.STUB_STOP_REASON || 'end_turn' } });
 };
@@ -126,12 +146,14 @@ describe('generic ACP agent adapter', () => {
     delete process.env.STUB_REQUESTS_OUT;
     delete process.env.STUB_STOP_REASON;
     delete process.env.STUB_AWAIT_CANCEL;
+    delete process.env.STUB_MESSAGES;
     delete process.env.KARMAX_HOME;
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
     dir = undefined;
   });
 
   async function run(opts: {
+    hugeOutput?: boolean;
     subscription?: boolean;
     secretEnv?: Record<string, string>;
     session?: string;
@@ -145,7 +167,7 @@ describe('generic ACP agent adapter', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-acp-'));
     const stub = path.join(dir, 'agent.cjs');
     const requests = path.join(dir, 'requests.jsonl');
-    fs.writeFileSync(stub, STUB);
+    fs.writeFileSync(stub, opts.hugeOutput ? STUB.replace('outputByteLimit: 1024', 'outputByteLimit: 1e12').replace('process.stdout.write("terminal-ok:"', 'process.stdout.write("x".repeat(2 * 1024 * 1024) + "terminal-ok:"') : STUB);
     fs.chmodSync(stub, 0o755);
     process.env.KARMAX_OPENCODE_CMD = stub;
     process.env.KARMAX_KIMI_CMD = stub;
@@ -183,6 +205,26 @@ describe('generic ACP agent adapter', () => {
     return { turn, output, activities, records };
   }
 
+  // #396 review item 6: ACP streams one turn as many messages. The live text is
+  // each message's own, a finished message is a timeline item of its own, and a
+  // thought is one reasoning item, not one per chunk.
+  it('streams each message on its own and records one reasoning item per thought', async () => {
+    process.env.STUB_MESSAGES = '1';
+    const { turn, output, activities } = await run();
+    expect(output).toEqual(['Found ', 'Found the bug.', 'Tests pass.', 'All ', 'All done.']);
+    expect(activities.filter((a) => a.kind === 'message').map((a) => a.title)).toEqual(['Found the bug.', 'Tests pass.', 'All done.']);
+    expect(activities.filter((a) => a.kind === 'reasoning').map((a) => a.detail)).toEqual(['Reading the parser.', 'Summarize.']);
+    expect(new Set(activities.filter((a) => a.kind === 'reasoning').map((a) => a.id)).size).toBe(2);
+    expect(turn.output).toBe('Found the bug.\n\nTests pass.\n\nAll done.');
+  });
+
+  it('caps provider-requested terminal output retention', async () => {
+    const { records } = await run({ hugeOutput: true });
+    const output = records.find(r => r.id === 903)?.result;
+    expect(output.truncated).toBe(true);
+    expect(Buffer.byteLength(output.output)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
   it('honors a leased subscription over ambient keys while giving terminals their project secrets', async () => {
     const prior = process.env.XAI_API_KEY;
     process.env.XAI_API_KEY = 'ambient-wrong-key';
@@ -210,7 +252,9 @@ describe('generic ACP agent adapter', () => {
       output: 'done',
       delivered: 1,
     });
-    expect(output.at(-1)).toBe('done');
+    // The console renders each emit as the whole live message (LT-5), so chunks
+    // are published as the growing text, never as bare deltas.
+    expect(output).toEqual(['do', 'done']);
     expect(activities).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'tool-1', kind: 'file', phase: 'started' }),
       expect.objectContaining({ id: 'tool-1', kind: 'file', phase: 'completed' }),

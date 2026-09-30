@@ -1,6 +1,7 @@
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
+import { untrustedBlock } from '../domain/untrusted.js';
 import { BRAND } from '../domain/brand.js';
 
 /**
@@ -35,7 +36,7 @@ import { BRAND } from '../domain/brand.js';
  * here.
  */
 const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration platform. Your work happens in a git world (working directory). You have these platform tools available:
-- create_sub_task(title, prompt): spawn a child task the parent awaits.
+- create_sub_task(title, prompt, params?): spawn a child task the parent awaits. It runs your agent unless params choose another, e.g. {"agent:do": {"provider": "codex"}}.
 - create_review_info(caption?, actions?): optional click-to-verify affordances for the Review stage. Use only when relevant: "run" actions for verification commands or starting an app/server (set server:true + openUrls to open it), and "open" actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output. The optional caption says WHAT to verify and is limited to 280 characters. Put summaries of changes/answers in your normal response, or in a file only when requested. The changed-files list is added automatically.
 - save_skill(name, content): persist a reusable skill for future tasks.
 - read_wiki(scope, id, path?) and search_wiki(scope, id, query): navigate and grep the organization/project wikis (skills, memories, prompts). Your instructions include each wiki's table of contents and scope ids; read_wiki with a section path expands any [more…] fold. These run host-side, so they work from every world, including cloud sandboxes.
@@ -51,7 +52,7 @@ const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration 
 - import_task_branch(sourceTaskId): fetch a collaborator's published branch into a namespaced local ref, then inspect/test/cherry-pick or merge it normally.
 - refresh_upstream(branch?): fetch the latest upstream branch into refs/remotes/origin before merging or rebasing.
 - list_events(taskId?, since?) and describe_platform(): inspect ${BRAND} event/diagnostic context and discover the automation surface.
-- platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by ${BRAND} for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, safe mode, settings, review actions, and future UI operations.
+- platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by ${BRAND} for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, settings, review actions, and future UI operations.
 - open_pr(): Do agents only. Open or refresh the task's pull request and send that exact committed proposal to Review. Call it only when the requested work is truly complete, the worktree is clean, intended changes are committed, and relevant tests pass. This is the final action of a completed Do turn.
 - confirm_decision(action, text?): use only when the workflow explicitly asks this turn to review or verify an already-open exact candidate. A final Do-agent integration verification uses this tool instead of open_pr and must not edit the proposal in that verification turn.
 - escalate_to_human(audience, message, urgency?): pause for input without opening a PR. Choose a specific user/team/Avatar when appropriate; discover valid routes with platform_request(GET, "/api/agent/escalation-targets"). A normal turn ending also waits for input from the default audience.
@@ -82,6 +83,8 @@ export interface AssembleArgs {
   /** Extra bindings for non-do roles (error, stage, transcript, reviewInfo, skills). */
   bindings?: Record<string, string>;
 }
+
+const AGENT_AUTHORED_BINDINGS = ['transcript', 'reviewInfo', 'changedFiles', 'error'] as const;
 
 export function assemblePrompt(args: AssembleArgs): string {
   // Prompt template precedence (SPEC §5.4/§7.1): an explicit profile template wins;
@@ -119,6 +122,9 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     skills: '',
     ...(args.bindings ?? {}),
   };
+  // Bindings another agent authored — the Do agent's transcript, its review
+  // summary and file names, a failing stage's output — are quoted as data.
+  for (const key of AGENT_AUTHORED_BINDINGS) if (values[key]) values[key] = untrustedBlock(key, values[key]);
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
 }
 

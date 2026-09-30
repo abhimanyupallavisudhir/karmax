@@ -32,7 +32,9 @@ it('discovers and saves install commands per repository in Project Settings → 
     await page.addScriptTag({ content: fs.readFileSync('web/totp-qr.js', 'utf8') });
     await page.addScriptTag({ content: fs.readFileSync('web/markdown.js', 'utf8') });
     await page.addScriptTag({ content: fs.readFileSync('web/app.js', 'utf8').replace(/^boot\(\)\.catch\(.*$/m, '') });
-    await evaluate(page, `toast = () => {}; hydrateProjectEnvironment({ id: 'project', organizationId: 'org' })`);
+    // The panel renders only for the project that is open, so a late answer
+    // for another project cannot fill in this one's form.
+    await evaluate(page, `toast = () => {}; S.projectId = 'project'; hydrateProjectEnvironment({ id: 'project', organizationId: 'org' })`);
 
     const install = (name: string) => page.locator(`[data-environment-install="${name}"]`);
     await expect.poll(() => install('api').inputValue()).toBe('uv sync');

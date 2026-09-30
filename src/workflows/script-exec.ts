@@ -6,6 +6,7 @@ import {
   defineQuery,
   setHandler,
   condition,
+  patched,
   workflowInfo,
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
@@ -13,6 +14,7 @@ import { TaskInput, TaskView, Stage, Message, DeclaredAction, WorldHandleLike,
   releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
+const scripts = proxyActivities<coreActivities>({ startToCloseTimeout: '45 minutes', heartbeatTimeout: '1 minute', retry: { maximumAttempts: 1 } });
 const long = proxyActivities<coreActivities>({ startToCloseTimeout: '45 minutes', retry: { maximumAttempts: 1 } });
 
 export const cancelSignal = defineSignal('cancel');
@@ -62,7 +64,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   stage = 'do';
   await publish();
   const command = input.command ?? input.prompt;
-  const result = await long.runScript({ taskId, worldHandle: world as any, command });
+  const result = await (patched('script-exec-heartbeat-v1') ? scripts : long).runScript({ taskId, worldHandle: world as any, command });
   code = result.code;
   msgs.push({ id: 'out', role: 'system', text: `exit ${result.code}\n${result.output}`.slice(0, 8000), ts: 1 });
 

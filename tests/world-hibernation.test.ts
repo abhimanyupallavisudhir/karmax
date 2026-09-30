@@ -27,7 +27,7 @@ async function fixture() {
   const open = vi.fn(async () => ({ handle, destroy }));
   const probe = vi.fn(async (): Promise<string | undefined> => undefined);
   worlds.register({ kind: 'memory', open, probe } as any);
-  const checkpointWorld = vi.fn(async () => checkpoint);
+  const checkpointWorld = vi.fn(async (_handle: WorldHandle) => checkpoint);
   const lifecycle = new WorldLifecycleManager(store, worlds, { checkpoint: checkpointWorld } as any);
   return { store, project, handle, worlds, destroy, open, probe, checkpointWorld, lifecycle };
 }
@@ -129,4 +129,86 @@ it('records a missing probe for an unchanged ready world', async () => {
   await f.lifecycle.sweep(Date.now() + 20 * 60_000);
   expect(await f.store.worldState(f.handle.id)).toBe('degraded');
   expect(await f.store.eventsOfType(f.handle.id, 'world.providerLost')).toHaveLength(1);
+});
+
+it('does not reap an undecidable provider reference (WD-1)', async () => {
+  const f = await fixture();
+  await f.store.setWorldState(f.handle, 'ready');
+  const destroy = vi.fn(async () => {});
+  f.worlds.register({ kind: 'memory', open: f.open, listSandboxes: async () => [{
+    sandboxId: 'unreadable', taskId: f.handle.id, matches: () => undefined, destroy,
+  }] } as any);
+  await f.lifecycle.sweep();
+  expect(destroy).not.toHaveBeenCalled();
+});
+
+it('continues after one checkpoint fails (WD-2)', async () => {
+  const f = await fixture();
+  const task = await f.store.createTask({ projectId: f.project.id, title: 'Second parked task',
+    workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
+  const second = await f.store.registerWorld({ ...f.handle, id: task.id }, f.project.id);
+  await f.store.setWorldState(second, 'parked');
+  vi.spyOn(f.store, 'latestWorldCheckpoint').mockResolvedValue(undefined);
+  f.checkpointWorld.mockImplementation(async handle => {
+    if (handle.id === f.handle.id) throw new Error('checkpoint unavailable');
+    return { id: 'second-checkpoint', worldId: task.id, generation: 1, projectId: f.project.id,
+      runnerPoolId: 'local', environmentDigest: 'test', repos: [], createdAt: Date.now() };
+  });
+  expect(await f.lifecycle.sweep(Date.now() + 100)).toBe(1);
+  expect(await f.store.worldState(f.handle.id)).toBe('parked');
+  expect(await f.store.worldState(second.id)).toBe('hibernated');
+});
+
+it('never invokes recovery to destroy an old sandbox (WD-7)', async () => {
+  const f = await fixture();
+  f.open.mockRejectedValue(new Error('sandbox vanished'));
+  const recover = vi.fn(async () => undefined);
+  f.worlds.setRecoveryHandler(recover);
+  await f.lifecycle.sweep(Date.now() + 1);
+  expect(recover).not.toHaveBeenCalled();
+});
+
+it('retries explicitly pending teardown for terminal tasks (WD-14)', async () => {
+  const f = await fixture();
+  await f.store.saveView(f.handle.id, { taskId: f.handle.id, title: 'Done', workflow: 'software-dev',
+    stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: Date.now() } as any);
+  const pending = await f.store.updateWorldMeta(f.handle, { teardownPending: true });
+  await f.store.setWorldState(pending, 'degraded');
+  await f.lifecycle.sweep();
+  expect(f.destroy).toHaveBeenCalledOnce();
+  expect(await f.store.worldState(f.handle.id)).toBe('released');
+});
+
+it('backs off a parked world whose checkpoint keeps failing (WD-2)', async () => {
+  const f = await fixture();
+  vi.spyOn(f.store, 'latestWorldCheckpoint').mockResolvedValue(undefined);
+  f.checkpointWorld.mockRejectedValue(new Error('checkpoint file limit exceeded'));
+  const start = Date.now() + 1;
+  const minute = 60_000;
+  // Every attempt opens (and so resumes and bills) the provider sandbox. A
+  // 60 s sweep must not repeat it every tick: attempts are spaced 5, 10, 20 min.
+  for (let at = start; at <= start + 40 * minute; at += minute) await f.lifecycle.sweep(at);
+  expect(f.checkpointWorld).toHaveBeenCalledTimes(4);
+  const failures = await f.store.eventsOfType(f.handle.id, 'world.hibernate_failed');
+  expect(failures).toHaveLength(4);
+  expect((failures.at(-1) as any).payload).toMatchObject({ attempts: 4, retryAt: start + 75 * minute });
+
+  // Using the world is new evidence: the next idle period starts afresh.
+  await f.store.setWorldState(f.handle, 'parked');
+  f.checkpointWorld.mockClear();
+  f.checkpointWorld.mockResolvedValue({ id: 'checkpoint-2', worldId: f.handle.id, generation: 1,
+    projectId: f.project.id, runnerPoolId: 'local', environmentDigest: 'test', repos: [], createdAt: Date.now() });
+  expect(await f.lifecycle.sweep(Date.now() + 1)).toBe(1);
+  expect(f.checkpointWorld).toHaveBeenCalledOnce();
+});
+
+it('backs off provider teardown failures the same way (WD-2)', async () => {
+  const f = await fixture();
+  f.destroy.mockRejectedValue(new Error('provider timeout'));
+  const start = Date.now() + 1;
+  await f.lifecycle.sweep(start);
+  await f.lifecycle.sweep(start + 60_000);
+  expect(f.destroy).toHaveBeenCalledOnce();
+  await f.lifecycle.sweep(start + 5 * 60_000);
+  expect(f.destroy).toHaveBeenCalledTimes(2);
 });

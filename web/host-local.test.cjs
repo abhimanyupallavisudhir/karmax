@@ -42,8 +42,6 @@ ok(hostLocal() === false, 'a gateway served elsewhere withdraws them');
 const gated = [
   ['/srv/code/repo', 'repository source accepting a host path'],
   ['id="data-source"', 'data import from a host path'],
-  ['id="resource-source-path"', 'resource import from a host directory'],
-  ['id="resource-scan"', 'scan of the host checkout'],
   ['id="data-discover"', 'discovery of ignored files in the host checkout'],
 ];
 for (const [marker, what] of gated) {
@@ -126,7 +124,7 @@ for (const l of lines.filter((l) => l.includes('use the host’s own Git setup')
 // All three fail closed the same way: the markup ships empty and `hidden`, and
 // only the server's `canManage` reveals it. Rendering first and removing later
 // would flash an operator control at a tenant on a slow connection.
-for (const [id, endpoint] of [['resilience-card', '/api/safe-mode'], ['outbound-email-card', '/api/email']]) {
+for (const [id, endpoint] of [['outbound-email-card', '/api/email']]) {
   ok(new RegExp(`id="${id}" hidden></div>`).test(src), `#${id} ships empty and hidden`);
   ok(new RegExp(`hydrateInstallationCard\\('#${id}', '${endpoint.replace(/\//g, '\\/')}'`).test(src),
     `#${id} is hydrated through the shared installation-card helper`);

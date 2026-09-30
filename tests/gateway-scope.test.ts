@@ -13,6 +13,7 @@ import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { PermissionRequests } from '../src/platform/permission-requests.js';
+import type { GitHubAppService } from '../src/integrations/github-app.js';
 
 /**
  * The gateway half of the tag/view scope hole.
@@ -83,9 +84,11 @@ describe('gateway request scope for bare-id routes', () => {
       worlds: new WorldRegistry(),
       githubApp: {
         status: () => ({ userAuthorized: false }),
-        handleWebhook: async () => {
+        deliverWebhook: async (...args: Parameters<GitHubAppService['deliverWebhook']>) => {
           if (webhookFailure) throw webhookFailure;
-          return { accepted: true, events: [], projectEvents: webhookProjectEvents };
+          const result = { accepted: true, events: [], projectEvents: webhookProjectEvents };
+          await args[4](result);
+          return result;
         },
       },
     } as any));
@@ -100,6 +103,15 @@ describe('gateway request scope for bare-id routes', () => {
   afterAll(async () => {
     await close?.();
     fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('audits denied reads but omits successful read traffic', async () => {
+    const count = async () => Number(((await store.db.prepare('SELECT COUNT(*) n FROM audit_log').get()) as any).n);
+    const before = await count();
+    expect((await fetch(`${base}/api/projects/${mine}`, { headers: auth() })).status).toBe(200);
+    expect(await count()).toBe(before);
+    expect((await fetch(`${base}/api/projects/${theirs}`, { headers: auth() })).status).toBe(403);
+    expect(await count()).toBe(before + 1);
   });
 
   it('refuses PATCH/DELETE /api/tags/:id across a project and tenant boundary', async () => {
@@ -324,14 +336,17 @@ describe('gateway request scope for bare-id routes', () => {
 
     const viewUrl = `${base}/api/tasks/${task.id}`;
     const headers = { authorization: `Bearer ${approver}`, 'content-type': 'application/json' };
-    expect(await (await fetch(viewUrl, { headers })).json()).toMatchObject({ approvalRequests: 1 });
+    expect(await (await fetch(viewUrl, { headers })).json()).toMatchObject({ approvalRequests: 1, pendingDecisions: 1 });
     const dismissed = await fetch(
       `${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${(await store.getProject(mine))!.organizationId}`,
       { method: 'POST', headers, body: JSON.stringify({ action: 'dismiss' }) },
     );
     expect(dismissed.status).toBe(200);
     expect(await dismissed.json()).toMatchObject({ status: 'pending', dismissed: { by: 'user:a' } });
-    expect(await (await fetch(viewUrl, { headers })).json()).not.toHaveProperty('approvalRequests');
+    // Dismissal silences the notification; the agent still waits on the decision.
+    const afterDismissal = await (await fetch(viewUrl, { headers })).json();
+    expect(afterDismissal).not.toHaveProperty('approvalRequests');
+    expect(afterDismissal).toMatchObject({ pendingDecisions: 1 });
     expect((await new PermissionRequests(store, (await store.getProject(mine))!.organizationId!).requests({ taskId: task.id })))
       .toEqual([expect.objectContaining({ status: 'pending', dismissed: expect.any(Object) })]);
 
@@ -419,6 +434,73 @@ describe('gateway request scope for bare-id routes', () => {
    * `no such task <id>` reached an agent looking like a server fault ("back
    * off") rather than a bad identifier ("retry with another id").
    */
+  /** PL-6: POST /api/tasks/:id/messages is message_agent's route, authorized as
+   *  task:conversation:message — and it stays inside the token's tenant. */
+  it('delivers message_agent under task:conversation:message, within the tenant', async () => {
+    const acmeTask = (await store.createTask({ projectId: mine, title: 'Fork', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    const otherTask = (await store.createTask({ projectId: theirs, title: 'Theirs', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    for (const t of [acmeTask, otherTask]) (await store.saveView(t.id, {
+      taskId: t.id, title: t.title, workflow: t.workflow, stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 1,
+    }));
+    const messenger = (await tokens.mintPrincipal('user:a', ['task:read', 'task:conversation:message'], mine, 60_000, acmeId)).token;
+    const send = (taskId: string, bearer: string) => fetch(`${base}/api/tasks/${taskId}/messages`, {
+      method: 'POST', headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ role: 'do', text: 'rebase please' }),
+    });
+    const ok = await send(acmeTask.id, messenger);
+    expect(ok.status).toBe(200);
+    expect((await ok.json() as any).message).toMatchObject({ role: 'user', text: 'rebase please' });
+    expect((await send(otherTask.id, messenger)).status).toBe(403);
+    const signaller = (await tokens.mintPrincipal('user:a', ['task:read', 'task:signal'], mine, 60_000, acmeId)).token;
+    expect((await send(acmeTask.id, signaller)).status).toBe(403);
+  });
+
+  // `?projectId=` used to outrank the addressed task's own project, so a token
+  // for one project could read, and run review actions in, any tenant's task
+  // just by naming its own project. The record decides; a contradiction is refused.
+  it('refuses a projectId or organizationId that contradicts the addressed task', async () => {
+    const foreign = (await store.createTask({ projectId: theirs, title: 'Theirs', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    const own = (await store.createTask({ projectId: mine, title: 'Mine', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    for (const t of [foreign, own]) (await store.saveView(t.id, {
+      taskId: t.id, title: t.title, workflow: t.workflow, stage: 'review', status: 'waiting', messages: [], actions: [], state: {}, updatedAt: 1,
+      reviewInfo: { summary: 'Check it', actions: [{ kind: 'open', label: 'Report', path: 'report.md' }] },
+    } as any));
+    const request = (taskId: string, route: string, query: string, init: RequestInit = {}) =>
+      fetch(`${base}/api/tasks/${taskId}/${route}${route.includes('?') ? '&' : '?'}${query}`, { headers: auth(), ...init });
+    const routes: Array<[string, RequestInit]> = [
+      ['responsibility', {}], ['subscribers', {}], ['widgets', {}], ['artifact?path=.env', {}],
+      ['review-action', { method: 'POST', body: JSON.stringify({ index: 0 }) }],
+      ['checkout', { method: 'POST', body: '{}' }], ['desktop', { method: 'POST', body: '{}' }],
+    ];
+    for (const [route, init] of routes) {
+      expect((await request(foreign.id, route, `projectId=${mine}`, init)).status, `${route} with a spoofed project`).toBe(403);
+      expect((await request(foreign.id, route, `organizationId=${acmeId}`, init)).status, `${route} with a spoofed organization`).toBe(403);
+    }
+    // The task's own project may still be named, and a contradiction is refused
+    // even for the caller's own task.
+    expect((await request(own.id, 'subscribers', `projectId=${mine}`)).status).toBe(200);
+    expect((await request(own.id, 'subscribers', `projectId=${theirs}`)).status).toBe(403);
+    // Bare-id records resolve the same way.
+    const foreignTag = (await store.createTag({ projectId: theirs, name: 'internal' }));
+    expect((await fetch(`${base}/api/tags/${foreignTag.id}?projectId=${mine}`, {
+      method: 'PATCH', headers: auth(), body: JSON.stringify({ name: 'pwned' }) })).status).toBe(403);
+    expect((await store.getTag(foreignTag.id))?.name).toBe('internal');
+  });
+
+  // Routes that fall back to the stored view when the live one is unavailable
+  // must not take that path when the live read was refused.
+  it('never serves a stored view to a caller refused the live one', async () => {
+    const task = (await store.createTask({ projectId: mine, title: 'Actions', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    (await store.saveView(task.id, {
+      taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting', messages: [], actions: [], state: {}, updatedAt: 1,
+      reviewInfo: { summary: 'Check it', actions: [{ kind: 'open', label: 'Report', path: 'report.md' }] },
+    } as any));
+    const executor = (await tokens.mintPrincipal('user:a', ['task:review:execute'], mine, 60_000, acmeId)).token;
+    const response = await fetch(`${base}/api/tasks/${task.id}/review-action`, { method: 'POST',
+      headers: { authorization: `Bearer ${executor}`, 'content-type': 'application/json' }, body: JSON.stringify({ index: 0 }) });
+    expect(response.status).toBe(403);
+  });
+
   it('answers a missing identifier with 404 rather than 500', async () => {
     const missing = await fetch(`${base}/api/tasks/task_missing/tag`, {
       method: 'POST', headers: auth(), body: JSON.stringify({ add: ['bug'] }),
@@ -428,10 +510,8 @@ describe('gateway request scope for bare-id routes', () => {
   });
 
   /**
-   * The webhook handler turned ANY exception into a 401, which makes GitHub
-   * redeliver — but `handleWebhook` has already inserted the delivery dedupe row
-   * by then, so the redelivery short-circuits as a duplicate and the reconcile is
-   * lost forever. Only a real signature failure may answer 401.
+   * Only signature failures are authentication errors. Processing failures
+   * return 500 and remain eligible for the durable inbox's local retries.
    */
   it('answers a GitHub webhook processing fault with 500, and a bad signature with 401', async () => {
     const deliver = () => fetch(`${base}/api/github/webhook`, {

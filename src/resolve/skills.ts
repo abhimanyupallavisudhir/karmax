@@ -20,10 +20,16 @@ export function organizationSkillsDir(contentDir: string, organizationId: string
   return path.join(contentDir, 'skills', 'organizations', organizationId);
 }
 
+/** Where one project's agent-saved skills live: those saved by agents without
+ *  organization-wide authority (`organization:wiki:write`). */
+export function projectSkillsDir(contentDir: string, projectId: string): string {
+  return path.join(contentDir, 'skills', 'projects', projectId);
+}
+
 /** Index the saved resolve skills: the operator's `<contentDir>/skills/` (canonical
  *  `resolve/<slug>.md` subdir plus the legacy flattened `resolve-<slug>.md` form) and,
- *  when an organization is given, that tenant's own directory. */
-export function listResolveSkills(contentDir: string, organizationId?: string): ResolveSkill[] {
+ *  when given, the organization's and the project's own directories. */
+export function listResolveSkills(contentDir: string, organizationId?: string, projectId?: string): ResolveSkill[] {
   const out: ResolveSkill[] = [];
   const seen = new Set<string>();
   const add = (name: string, file: string) => {
@@ -36,8 +42,12 @@ export function listResolveSkills(contentDir: string, organizationId?: string): 
     } catch { /* unreadable — index by name alone */ }
     out.push({ name, summary: summary.slice(0, 200) });
   };
-  const roots = [path.join(contentDir, 'skills')];
-  if (organizationId) roots.unshift(organizationSkillsDir(contentDir, organizationId)); // the tenant's own fix wins a name clash
+  // The most specific fix wins a name clash: project, organization, installation.
+  const roots = [
+    ...(projectId ? [projectSkillsDir(contentDir, projectId)] : []),
+    ...(organizationId ? [organizationSkillsDir(contentDir, organizationId)] : []),
+    path.join(contentDir, 'skills'),
+  ];
   for (const skillsDir of roots) {
     // Canonical: <root>/resolve/<slug>.md
     try {

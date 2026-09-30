@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { AuthorizationService, projectScope } from '../src/platform/authorization.js';
 import { AuthorizationRequests } from '../src/platform/authorization-requests.js';
@@ -7,8 +10,8 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { avatarAuthorizationCapabilities } from '../src/platform/avatars.js';
 import type { Avatar, AuthorizationSelection } from '../src/domain/types.js';
 
-async function fixture() {
-  const store = (await Store.create(':memory:'));
+async function fixture(dbPath = ':memory:') {
+  const store = (await Store.create(dbPath));
   (await store.claimPersonalOrganization('requester'));
   (await store.setOrganizationMembership('org_personal', 'approver', 'member'));
   (await store.setOrganizationMembership('org_personal', 'limited', 'member'));
@@ -38,6 +41,68 @@ async function fixture() {
 }
 
 describe('initial authorization delegation requests', () => {
+  it.each(['approve', 'deny', 'dismiss'] as const)('rejects a second gateway %s while approval is applying', async (action) => {
+    const f = await fixture();
+    const task = await f.store.createTask({ projectId: f.project.id, title: 'Contended', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { draft: true, prompt: 'work' } });
+    const request = await new AuthorizationRequests(f.store, 'org_personal').request({ projectId: f.project.id,
+      target: { kind: 'task', taskId: task.id }, authorization: f.requested, capabilities: [],
+      missingCapabilities: [], audience: ['user:approver'], recipients: ['approver'], reason: 'Access', requestedBy: 'user:requester' });
+    const second = new KarmaxApi({ store: f.store, tokens: f.tokens, authorization: f.authorization,
+      client: {} as any, taskQueue: 'test' });
+    const token = await f.tokenFor('approver');
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const original = f.api.setTaskAuthorization.bind(f.api);
+    vi.spyOn(f.api, 'setTaskAuthorization').mockImplementation(async (...args) => {
+      entered();
+      await blocked;
+      return original(...args);
+    });
+    const first = f.api.resolveAuthorizationRequest(token, { organizationId: 'org_personal', requestId: request.id, action: 'approve' });
+    await started;
+    try {
+      await expect(second.resolveAuthorizationRequest(token, {
+        organizationId: 'org_personal', requestId: request.id, action,
+      })).rejects.toThrow(/in progress/);
+    } finally {
+      release();
+      await first;
+    }
+    expect((await new AuthorizationRequests(f.store, 'org_personal').requests())[0]).toMatchObject({ status: 'granted' });
+  });
+
+  it('retains a durable claim across restart and never times out a possibly partial approval', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'authorization-claim-'));
+    let store: Store | undefined;
+    try {
+      const f = await fixture(path.join(root, 'store.sqlite'));
+      store = f.store;
+      const service = new AuthorizationRequests(store, 'org_personal');
+      const request = await service.request({ projectId: f.project.id,
+        target: { kind: 'avatar', avatarId: 'avatar_pending' }, authorization: f.requested,
+        capabilities: [], missingCapabilities: [], audience: ['user:approver'], recipients: ['approver'],
+        reason: 'Access', requestedBy: 'user:requester' });
+      const claim = await service.claim(request.id, 'approve', 'user:approver');
+      await store.close();
+      store = await Store.create(path.join(root, 'store.sqlite'));
+      const restarted = new AuthorizationRequests(store, 'org_personal');
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 24 * 60 * 60_000);
+      try {
+        await expect(restarted.claim(request.id, 'approve', 'user:approver')).rejects.toThrow(/in progress/);
+        await expect(restarted.resolve(request.id, 'deny', 'user:approver')).rejects.toThrow(/in progress/);
+        await expect(restarted.resolve(request.id, 'approve', 'user:other', claim)).rejects.toThrow(/in progress/);
+        await expect(restarted.resolve(request.id, 'approve', 'user:approver', 'wrong')).rejects.toThrow(/in progress/);
+        await expect(restarted.resolve(request.id, 'approve', 'user:approver', claim)).resolves.toMatchObject({ status: 'granted' });
+        await expect(restarted.claim(request.id, 'approve', 'user:approver')).rejects.toThrow(/already granted/);
+      } finally { clock.mockRestore(); }
+    } finally {
+      await store?.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('dismisses without changing authorization and permits a later denial', async () => {
     const f = (await fixture());
     const task = (await f.store.createTask({ projectId: f.project.id, title: 'Pending', workflow: 'just-do',

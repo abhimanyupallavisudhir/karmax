@@ -1,7 +1,10 @@
+import { boundedExec } from '../world/bounded-exec.js';
 import { currentTiming, timed, withTiming } from '../timing/index.js';
 import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
+import { MAX_REVIEW_TEXT_LENGTH, ReviewInfoRejected, validateReviewInfoCall } from './review-info.js';
 import { World } from '../world/types.js';
+import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { startJob, jobStatuses, describeJobs, listJobs, stopJobs } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
@@ -27,11 +30,10 @@ export interface ToolSchema {
 
 const MAX_OUTPUT = 12_000;
 const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + '\n…(truncated)' : s);
+/** UTF-8 spends at most 3 bytes per UTF-16 unit, so this many bytes always decode past MAX_OUTPUT. */
+const READ_FILE_MAX_BYTES = MAX_OUTPUT * 4;
 
-/** Review captions are orientation, not a second place for the agent's final answer. */
-export const MAX_REVIEW_TEXT_LENGTH = 280;
-
-const reviewTextLength = (value: string) => [...value].length;
+export { MAX_REVIEW_TEXT_LENGTH };
 
 /** How loudly an ask asks. One shared parameter across every human-facing tool,
  * so an agent learns the vocabulary once. See `Urgency` in domain/types.ts. */
@@ -109,17 +111,22 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_sub_task',
     description:
-      'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. You manage your children to completion before you finish.',
+      'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends. You manage your children to completion before you finish. '
+      + 'It runs your agent unless `params` choose another: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}} or {"agent:do": {"avatarId": "…"}}. Only the agent fields can be set; the branch, project and authorization stay yours. An invalid or unavailable choice is refused and nothing is created.',
     parameters: {
       type: 'object',
-      properties: { title: { type: 'string' }, prompt: { type: 'string' } },
+      properties: {
+        title: { type: 'string' },
+        prompt: { type: 'string' },
+        params: { type: 'object', description: 'Task-form agent fields for the child (e.g. "agent:do"), as in create_task; omit to run your agent.' },
+      },
       required: ['title', 'prompt'],
     },
   },
   {
     name: 'respond_to_sub_task',
     description:
-      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve a PR already at Review), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children.',
+      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve a PR already at Review), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends.',
     parameters: {
       type: 'object',
       properties: {
@@ -204,7 +211,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'save_skill',
-    description: `Save a reusable skill (markdown content) for future tasks. This writes INSTALLATION-WIDE global state — visible to every project and organization on this ${BRAND}, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).`,
+    description: 'Save a reusable skill (markdown) for future tasks; saving the same name overwrites it. It is saved to your task\'s project, or for your whole organization if your task has organization-wide authority (organization:wiki:write); the result says which. For content that task prompts should include, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
     parameters: {
       type: 'object',
       properties: { name: { type: 'string' }, content: { type: 'string' } },
@@ -241,11 +248,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_spend',
     description:
-      'Reserve authorization to pay with a permitted project/organization card. Amount in cents. Returns granted, needs_approval, needs_funding, or denied. If not granted, stop and report — the human will raise the card limit or approve, then you can retry.',
+      'Reserve authorization to pay with a permitted project/organization card. Amount in the smallest unit of the card\'s currency (cents for USD, whole yen for JPY; the task\'s payment context gives each scale). Returns granted, needs_approval, needs_funding, or denied. If not granted, stop and report — the human will raise the card limit or approve, then you can retry.',
     parameters: {
       type: 'object',
       properties: {
-        amount: { type: 'number', description: 'Amount in cents.' },
+        amount: { type: 'number', description: 'Amount in the smallest unit of the card\'s currency, e.g. 1250 for 12.50 USD or 1250 for 1,250 JPY.' },
         card_id: { type: 'string', description: 'Optional card id, as an alternative to card_name.' },
         card_name: { type: 'string', description: 'Name of the card to use (unique within the organization). Follow the user’s instructions about which card to use.' },
         merchant: { type: 'string' },
@@ -257,12 +264,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'fill_payment_card',
     description:
-      'After request_spend returns granted, securely fill that reserved card into checkout inputs over loopback Chrome DevTools. Card number and CVC never enter your context. Use the returned request_id; merchant in request_spend must be the checkout domain.',
+      'After request_spend returns granted, securely fill that reserved card into checkout inputs in your own browser (the one your browser tools drive). Card number and CVC never enter your context. Use the returned request_id; merchant in request_spend must be the checkout domain.',
     parameters: {
       type: 'object',
       properties: {
         request_id: { type: 'string' },
-        cdp_url: { type: 'string', description: 'Loopback Chrome DevTools endpoint, e.g. http://127.0.0.1:9222.' },
         number_selector: { type: 'string', description: 'CSS selector, or @focused after you focus an iframe field with the browser tool.' },
         cvc_selector: { type: 'string', description: 'CSS selector; @tab advances once from the prior field before typing.' },
         expiry_selector: { type: 'string', description: 'Combined MM/YY field. Use this or both month/year selectors. @tab advances once from the prior field.' },
@@ -273,7 +279,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         postal_code_selector: { type: 'string', description: 'Optional billing postal/ZIP field.' },
         country_selector: { type: 'string', description: 'Optional billing country field.' },
       },
-      required: ['request_id', 'cdp_url', 'number_selector', 'cvc_selector'],
+      required: ['request_id', 'number_selector', 'cvc_selector'],
     },
   },
   {
@@ -329,7 +335,6 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
         field: { type: 'string', enum: ['username', 'password', 'totp'], description: 'Default password. totp types the current one-time code.' },
         selector: { type: 'string', description: 'CSS selector of the input element to fill.' },
-        cdp_url: { type: 'string', description: 'DevTools endpoint (default http://127.0.0.1:9222).' },
       },
       required: ['selector'],
     },
@@ -421,7 +426,6 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       type: 'object',
       properties: {
         domain: { type: 'string', description: 'The site you are enrolling on, e.g. "example.com".' },
-        cdp_url: { type: 'string', description: 'Browser DevTools endpoint (default http://127.0.0.1:9222).' },
       },
       required: ['domain'],
     },
@@ -449,7 +453,6 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       properties: {
         item_id: { type: 'string' },
         domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
-        cdp_url: { type: 'string' },
       },
     },
   },
@@ -824,7 +827,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'platform_request',
-    description: `Call any authenticated ${BRAND} /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, safe mode, and more). Authorization is always enforced, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused. Call describe_platform when unsure.`,
+    description: `Call any authenticated ${BRAND} /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, and more). Authorization is always enforced, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused. Call describe_platform when unsure.`,
     parameters: {
       type: 'object',
       properties: {
@@ -930,14 +933,16 @@ export function platformToolHandlers(
     async bash(args) {
       const cmd = String(args?.command ?? '');
       const env = workEnv?.();
-      const r = await world.exec('bash', ['-lc', cmd], { timeoutMs: 120_000, ...(env ? { env } : {}) });
+      const r = await boundedExec(world, cmd, { maxBytes: 16_000, overflow: 'tail', timeoutMs: 120_000, ...(env ? { env } : {}) });
       ctx.emit(`$ ${cmd}`);
       const out = `exit ${r.code}\n${r.stdout}${r.stderr}`;
-      return truncate(out);
+      return out;
     },
     async read_file(args) {
       try {
-        return truncate(await world.readFile(String(args?.path ?? '')));
+        // A longer file still fills the result, so a huge one never has to
+        // reach this process whole (AD-1).
+        return truncate((await readWorldFilePrefix(world, String(args?.path ?? ''), READ_FILE_MAX_BYTES)).toString('utf8'));
       } catch (e: any) {
         return `error: ${e?.message ?? e}`;
       }
@@ -948,30 +953,28 @@ export function platformToolHandlers(
       return `wrote ${args?.path}`;
     },
     async create_review_info(args) {
-      // `summary` is no longer advertised, but validate it too for old/resumed
-      // sessions which may still call the legacy shape. Both fields occupy the
-      // same textual orientation slot in Review.
-      for (const field of ['caption', 'summary'] as const) {
-        const value = args?.[field];
-        if (typeof value !== 'string') continue;
-        const length = reviewTextLength(value);
-        if (length > MAX_REVIEW_TEXT_LENGTH) {
-          return `review info rejected: ${field} is ${length} characters; the maximum is ${MAX_REVIEW_TEXT_LENGTH}. Shorten it and retry.`;
-        }
+      // The runtime re-checks the accumulated total; either rejection goes back
+      // to the agent as a correctable tool result, never a lost attachment.
+      try {
+        await ctx.createReviewInfo(validateReviewInfoCall({
+          caption: args?.caption,
+          actions: args?.actions,
+          summary: args?.summary,
+          links: args?.links,
+          diff: args?.diff,
+          html: args?.html,
+        }));
+      } catch (error) {
+        if (error instanceof ReviewInfoRejected || (error as Error)?.name === 'ReviewInfoRejected')
+          return `review info rejected: ${(error as Error).message}`;
+        throw error;
       }
-      await ctx.createReviewInfo({
-        caption: args?.caption,
-        actions: Array.isArray(args?.actions) ? args.actions : undefined,
-        summary: args?.summary,
-        links: args?.links,
-        diff: args?.diff,
-        html: args?.html,
-      });
       return 'review info recorded';
     },
     async create_sub_task(args) {
-      await ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
-      return 'sub-task spawned (branches off your work; you are its confirmer)';
+      await ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? ''),
+        ...(args?.params !== undefined ? { params: args.params } : {}) });
+      return 'sub-task queued: it starts when this turn ends (branches off your work; you are its confirmer)';
     },
     async respond_to_sub_task(args) {
       const action = String(args?.action ?? '');
@@ -982,7 +985,7 @@ export function platformToolHandlers(
         action: action as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel',
         text: args?.text ? String(args.text) : undefined,
       });
-      return `responded to sub-task${args?.child_task_id ? ` ${args.child_task_id}` : 's'}: ${action}`;
+      return `${action} queued for sub-task${args?.child_task_id ? ` ${args.child_task_id}` : 's'}: delivered when this turn ends`;
     },
     async raise_to_parent(args) {
       const type = String(args?.type ?? '');
@@ -1066,8 +1069,13 @@ export function platformToolHandlers(
       }
     },
     async save_skill(args) {
-      await ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
-      return 'skill saved';
+      const skill = { name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') };
+      // The gateway saves it for the organization or the task's project,
+      // depending on the task's authority; the turn result only records it.
+      const saved = await platformRequest('POST', '/api/skills', skill) as { scope?: string } | undefined;
+      await ctx.saveSkill(skill);
+      return saved?.scope === 'organization' ? 'skill saved for your whole organization'
+        : saved?.scope === 'project' ? 'skill saved to your task\'s project' : 'skill saved';
     },
     async read_wiki(args) {
       const scope = args?.scope === 'organization' ? 'organizations' : 'projects';
@@ -1093,7 +1101,6 @@ export function platformToolHandlers(
       if (!ctx.fillPaymentCard) throw new Error('secure payment-card fill is unavailable');
       return JSON.stringify(await ctx.fillPaymentCard({
         requestId: String(args?.request_id ?? ''),
-        cdpUrl: String(args?.cdp_url ?? ''),
         selectors: {
           number: String(args?.number_selector ?? ''),
           cvc: String(args?.cvc_selector ?? ''),
@@ -1128,7 +1135,7 @@ export function platformToolHandlers(
     async fill_credential(args) {
       return JSON.stringify(await platformRequest('POST', '/api/vault/fill', {
         itemId: args?.item_id, domain: args?.domain, field: args?.field,
-        selector: String(args?.selector ?? ''), cdpUrl: args?.cdp_url,
+        selector: String(args?.selector ?? ''),
       }));
     },
     async get_credential(args) {
@@ -1175,7 +1182,7 @@ export function platformToolHandlers(
       return JSON.stringify(await platformRequest('GET', `/api/organizations/${org}/agent-mail${q.toString() ? `?${q}` : ''}`));
     },
     async enroll_passkey(args) {
-      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/enroll', { domain: args?.domain, cdpUrl: args?.cdp_url }));
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/enroll', { domain: args?.domain }));
     },
     async save_passkey(args) {
       return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/save', {
@@ -1183,7 +1190,7 @@ export function platformToolHandlers(
       }));
     },
     async use_passkey(args) {
-      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/login', { itemId: args?.item_id, domain: args?.domain, cdpUrl: args?.cdp_url }));
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/login', { itemId: args?.item_id, domain: args?.domain }));
     },
     // ─── task list operations (mirroring the platform MCP server) ─────────
     async create_task(args) {
@@ -1338,7 +1345,7 @@ export function platformToolHandlers(
     },
     async message_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
-      await platformRequest('POST', `/api/tasks/${taskId}/signal`, { signal: 'followUp', role: args?.role ?? 'do', text: args?.message });
+      await platformRequest('POST', `/api/tasks/${taskId}/messages`, { role: args?.role ?? 'do', text: args?.message });
       return 'message delivered';
     },
     async request_agent_action(args) {

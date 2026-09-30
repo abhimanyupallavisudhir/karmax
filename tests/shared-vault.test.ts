@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
+import { lockContended } from './helpers/lock-waiters.js';
 import { acquireFileLock } from '../src/util/file-lock.js';
 
 const linux = process.platform === 'linux' ? it : it.skip;
@@ -76,7 +77,7 @@ linux('waits asynchronously for another writer before reading the secret map', a
   let written = false;
   const writing = vault.put('later', 'fixture').then(() => { written = true; });
   try {
-    await new Promise(resolve => setTimeout(resolve, 30));
+    await lockContended(path.join(dir, 'secrets.json.lock'));
     expect(written).toBe(false);
   } finally { release(); await writing; }
   expect(vault.reveal('later')).toBe('fixture');
@@ -111,9 +112,55 @@ it('keeps the existing ciphertext intact when a mutation fails and releases admi
   const dir = directory();
   const vault = new Vault(dir);
   await vault.put('retained', 'fixture');
-  const before = fs.readFileSync(path.join(dir, 'secrets.json'));
+  const stored = () => fs.readdirSync(path.join(dir, 'entries')).sort().map((file) => [file, fs.readFileSync(path.join(dir, 'entries', file), 'utf8')]);
+  const before = stored();
   await expect(vault.move('missing', 'new')).rejects.toThrow('no secret');
-  expect(fs.readFileSync(path.join(dir, 'secrets.json'))).toEqual(before);
+  expect(stored()).toEqual(before);
   await vault.put('next', 'fixture-2');
   expect(vault.reveal('retained')).toBe('fixture');
+});
+
+it('bounds secret writes and reads only the requested entry (AU-5)', async () => {
+  const dir = directory();
+  const vault = new Vault(dir);
+  await expect(vault.put('oversized', 'x'.repeat(65_537))).rejects.toThrow(/size/);
+  await vault.put('one', 'first');
+  await vault.put('two', 'second');
+  const read = vi.spyOn(fs, 'readFileSync');
+  try {
+    expect(vault.reveal('one')).toBe('first');
+    expect(read.mock.calls.some(([file]) => String(file).endsWith('secrets.json'))).toBe(false);
+  } finally { read.mockRestore(); }
+});
+
+it('migrates legacy ciphertext without losing readable secrets (AU-5)', async () => {
+  const dir = directory();
+  const vault = new Vault(dir);
+  await vault.put('legacy', 'retained');
+  const entries = path.join(dir, 'entries');
+  const entry = JSON.parse(fs.readFileSync(path.join(entries, fs.readdirSync(entries).find(file => file.endsWith('.json'))!), 'utf8'));
+  fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify({ [entry.handle]: entry.blob }));
+  fs.rmSync(entries, { recursive: true });
+  const reopened = new Vault(dir);
+  expect(reopened.reveal('legacy')).toBe('retained');
+  await reopened.put('next', 'new');
+  expect(new Vault(dir).reveal('legacy')).toBe('retained');
+  expect(reopened.list().sort()).toEqual(['legacy', 'next']);
+});
+
+
+it('retains five encrypted prior values on rotation and deletes them with the handle (AU-22)', async () => {
+  const dir = directory();
+  const vault = new Vault(dir);
+  for (let i = 0; i < 8; i++) await vault.put('rotated', `rotation-secret-${i}`);
+  const reopened = new Vault(dir);
+  expect(reopened.reveal('rotated')).toBe('rotation-secret-7');
+  expect(reopened.reveal('rotated', 1)).toBe('rotation-secret-6');
+  expect(reopened.reveal('rotated', 5)).toBe('rotation-secret-2');
+  expect(reopened.reveal('rotated', 6)).toBeUndefined();
+  const files = fs.readdirSync(path.join(dir, 'entries')).filter(file => file.endsWith('.json'));
+  expect(files).toHaveLength(1);
+  expect(fs.readFileSync(path.join(dir, 'entries', files[0]!), 'utf8')).not.toContain('rotation-secret');
+  await reopened.delete('rotated');
+  expect(reopened.reveal('rotated', 1)).toBeUndefined();
 });

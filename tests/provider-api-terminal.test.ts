@@ -1,4 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+// The PTY transport is exercised in bounded-exec.test.ts; these fake worlds
+// answer commands directly, with the environment the tool delivers.
+vi.mock('../src/world/bounded-exec.js', () => ({
+  boundedExec: async (world: any, command: string, options: { env?: Record<string, string> }) =>
+    world.exec('bash', ['-lc', command], { env: options.env }),
+  IncompleteOutputError: class IncompleteOutputError extends Error {},
+}));
 import { TimingTrace, withTiming } from '../src/timing/index.js';
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CodexAdapter } from '../src/agent/codex.js';
@@ -25,7 +32,7 @@ describe('metered provider API terminal outcomes', () => {
       { id: 'r1', status: 'completed', output: [{ type: 'function_call', call_id: 't', name: 'bash', arguments: JSON.stringify({ command: 'app-test' }) }] },
       { id: 'r2', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'done' }] }] },
     ];
-    const request = vi.fn().mockImplementation(async () => ({ ok: true, json: async () => responses.shift() }));
+    const request = vi.fn().mockImplementation(async () => Response.json(responses.shift()));
     vi.stubGlobal('fetch', request);
     const adapter = provider === 'claude' ? new ClaudeAdapter() : new CodexAdapter();
     const result = await adapter.runTurn({
@@ -43,11 +50,8 @@ describe('metered provider API terminal outcomes', () => {
   });
 
   it.each([false, true])('accepts an Anthropic end_turn without requiring signal_completion (timing: %s)', async (tracing) => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn',
-        usage: { input_tokens: 12, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 2 } }),
-    }));
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => Response.json({ content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn',
+        usage: { input_tokens: 12, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 2 } })));
     const rows: any[] = [];
     const invoke = () => new ClaudeAdapter().runTurn({
       profile: { id: 'p', name: 'c', provider: 'claude', role: 'do', capabilities: [] },
@@ -61,10 +65,7 @@ describe('metered provider API terminal outcomes', () => {
   });
 
   it('rejects an Anthropic truncation that exhausts the turn backstop', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ content: [{ type: 'text', text: 'partial' }], stop_reason: 'max_tokens' }),
-    }));
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => Response.json({ content: [{ type: 'text', text: 'partial' }], stop_reason: 'max_tokens' })));
     await expect(new ClaudeAdapter().runTurn({
       profile: { id: 'p', name: 'c', provider: 'claude', role: 'do', capabilities: [] },
       world, messages, systemPrompt: 'Do it.', role: 'do', maxTurns: 1, resolvedAuth: { apiKey: 'test' },
@@ -72,11 +73,7 @@ describe('metered provider API terminal outcomes', () => {
   });
 
   it('types an Anthropic HTTP quota response as structured provider metadata', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: false,
-      status: 402,
-      text: async () => '{"error":{"message":"Your prepaid balance has been depleted"}}',
-    }));
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response('{"error":{"message":"Your prepaid balance has been depleted"}}', { status: 402 })));
     const failure = await new ClaudeAdapter().runTurn({
       profile: { id: 'p', name: 'c', provider: 'claude', role: 'do', capabilities: [] },
       world, messages, systemPrompt: 'Do it.', role: 'do', resolvedAuth: { apiKey: 'test' },
@@ -88,11 +85,8 @@ describe('metered provider API terminal outcomes', () => {
   });
 
   it.each([false, true])('accepts an OpenAI completed response without requiring signal_completion (timing: %s)', async (tracing) => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: 'r1', status: 'completed', usage: { input_tokens: 10, output_tokens: 5,
-        input_tokens_details: { cached_tokens: 6 } }, output: [{ type: 'message', content: [{ type: 'output_text', text: 'done' }] }] }),
-    }));
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => Response.json({ id: 'r1', status: 'completed', usage: { input_tokens: 10, output_tokens: 5,
+        input_tokens_details: { cached_tokens: 6 } }, output: [{ type: 'message', content: [{ type: 'output_text', text: 'done' }] }] })));
     const rows: any[] = [];
     const invoke = () => new CodexAdapter().runTurn({
       profile: { id: 'p', name: 'o', provider: 'codex', role: 'do', capabilities: [] },
@@ -106,13 +100,10 @@ describe('metered provider API terminal outcomes', () => {
   });
 
   it('rejects an OpenAI incomplete response even when it contains partial text, retryably', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        id: 'r1', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'partial' }] }],
-      }),
-    }));
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => Response.json({
+      id: 'r1', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'partial' }] }],
+    })));
     await expect(new CodexAdapter().runTurn({
       profile: { id: 'p', name: 'o', provider: 'codex', role: 'do', capabilities: [] },
       world, messages, systemPrompt: 'Do it.', role: 'do', resolvedAuth: { apiKey: 'test' },

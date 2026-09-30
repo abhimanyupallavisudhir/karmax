@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -22,6 +22,44 @@ import { worldWorkingRelativePath } from '../src/world/types.js';
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
 describe('project resources', () => {
+  it.each(['configured', 'default', 'legacy'] as const)('preserves %s global Git ignores alongside worktree secrets (WD-29)', async source => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-secret-inherited-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    const xdg = path.join(dir, 'config'); fs.mkdirSync(path.join(xdg, 'git'), { recursive: true });
+    const ignores = source !== 'default' ? path.join(dir, 'global-ignore') : path.join(xdg, 'git', 'ignore');
+    const config = path.join(dir, 'gitconfig');
+    fs.writeFileSync(config, source !== 'default' ? `[core]\nexcludesFile = ${ignores}\n` : '');
+    fs.writeFileSync(ignores, '*.cache\n');
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    await gitOrThrow(repo, ['commit', '-q', '--allow-empty', '-m', 'base']);
+    const world = await new WorktreeProvider(path.join(dir, 'worlds'))
+      .create({ taskId: 'inherited', repo, base: 'main', target: 'main' });
+    const exec = world.exec.bind(world);
+    world.exec = (command, args, options) => exec(command, args, { ...options,
+      env: { ...options?.env, GIT_CONFIG_GLOBAL: config, XDG_CONFIG_HOME: xdg } });
+    try {
+      if (source === 'legacy') {
+        await world.exec('git', ['config', 'extensions.worktreeConfig', 'true']);
+        const admin = (await world.exec('git', ['rev-parse', '--absolute-git-dir'])).stdout.trim();
+        fs.mkdirSync(path.join(admin, 'info'), { recursive: true });
+        fs.writeFileSync(path.join(admin, 'info/exclude'), '/.env.legacy\n');
+        await world.exec('git', ['config', '--worktree', 'core.excludesFile', path.join(admin, 'info/exclude')]);
+        await world.writeFile('.env.legacy', 'legacy secret');
+      }
+      await world.writeFile('artifact.cache', 'generated');
+      await world.writeFile('.env.local', 'secret');
+      await ensureWorldExcluded(world, '.env.local');
+      expect((await world.exec('git', ['status', '--porcelain'])).stdout.trim()).toBe('');
+      fs.appendFileSync(ignores, '*.log\n');
+      await world.writeFile('output.log', 'generated');
+      await world.writeFile('.env.second', 'second secret');
+      await ensureWorldExcluded(world, '.env.second');
+      expect((await world.exec('git', ['status', '--porcelain'])).stdout.trim()).toBe('');
+      expect(fs.readFileSync(ignores, 'utf8')).toBe('*.cache\n*.log\n');
+      expect((await git(repo, ['config', '--local', '--get', 'core.excludesFile'])).code).toBe(1);
+    } finally { await world.destroy(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([undefined, 'nested'] as const)('Git-excludes file secrets only in their owning worktree (%s layout)', async (layout) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-secret-exclude-'));
     const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
@@ -539,3 +577,64 @@ function allFiles(root: string): string[] {
     return entry.isDirectory() ? allFiles(value) : [value];
   });
 }
+
+it('forwards addCheckout through environment wrappers (WD-13)', async () => {
+  const service = new ProjectResourceService({} as any, {} as any, {} as any, {} as any);
+  service.environmentFor = async () => ({ TOKEN: 'secret' });
+  const handle = { id: 'world', root: '/w' } as any;
+  let received: unknown;
+  const world = { handle, addCheckout: async (spec: unknown) => { received = spec; return handle; } } as any;
+  const wrapped = await service.withEnvironment(world);
+  expect(wrapped.addCheckout).toBeTypeOf('function');
+  expect(await wrapped.addCheckout!({ name: 'branch' })).toBe(handle);
+  expect(received).toEqual({ name: 'branch' });
+  expect((await service.withEnvironment({ handle } as any)).addCheckout).toBeUndefined();
+});
+
+it('LT-20: backs off publish-slot queries while preserving immediate grant and release', async () => {
+  vi.useFakeTimers();
+  let token: string | undefined;
+  let available = false;
+  const query = vi.fn(async () => ({ current: available ? { token } : undefined }));
+  const signal = vi.fn(async () => undefined);
+  const client = { workflow: {
+    signalWithStart: vi.fn(async (_name, options) => { token = options.signalArgs[0].token; }),
+    getHandle: () => ({ query, signal }),
+  } };
+  const service = new ProjectResourceService({} as any, {} as any, {} as any, {} as any,
+    { client: client as any, taskQueue: 'test' });
+  const action = vi.fn(async () => 'published');
+  const publication = (service as any).serializeDurably('resource', 'task', action);
+  try {
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(query.mock.calls.length).toBeLessThanOrEqual(20);
+    expect(action).not.toHaveBeenCalled();
+  } finally {
+    available = true;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(await publication).toBe('published');
+    expect(action).toHaveBeenCalledTimes(1);
+    expect(signal).toHaveBeenCalledWith('releaseResourcePublish', { token });
+    vi.useRealTimers();
+  }
+});
+
+it('rejects oversized resource JSON before creating or importing a resource (GW-2)', async () => {
+  const { stubGateway } = await import('./helpers/stub-gateway.js');
+  const h = await stubGateway({ resources: {} as any });
+  try {
+    const project = await h.store.createProject('Bounded imports');
+    const token = (await h.tokens.mintPrincipal('user:test', ['*'])).token;
+    const resource = await h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'Existing', driver: 'volume@1', target: { kind: 'path', path: 'data' }, access: 'read',
+      isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' });
+    for (const suffix of ['', `/${resource.id}/import`]) {
+      const response = await fetch(`${h.base}/api/projects/${project.id}/resources${suffix}`, {
+        method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ files: [{ path: 'large', data: 'x'.repeat(2 * 1024 * 1024) }] }),
+      });
+      expect(response.status, await response.text()).toBe(413);
+    }
+    expect(await h.store.listResourceAttachments(project.id)).toHaveLength(1);
+  } finally { await h.close(); }
+});

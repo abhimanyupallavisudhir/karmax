@@ -150,6 +150,13 @@ describe('branding — portable defaults and dynamic surfaces', () => {
 });
 
 describe('branding — stable technical and operator identifiers', () => {
+  it('names the shared Markdown renderer after the platform, not a hosted brand', () => {
+    for (const file of ['web/markdown.js', 'web/app.js', 'web/shared-conversation.js']) {
+      expect(read(file), file).not.toContain('TavyaMarkdown');
+      expect(read(file), file).toContain('KarmaxMarkdown');
+    }
+  });
+
   it('keeps Phone Access and platform recovery diagnostics recognizable', () => {
     expect(read('src/remote/access.ts')).toContain('${BRAND} stays on localhost');
     expect(read('src/platform/api.ts')).toContain('${BRAND} recovered this task');

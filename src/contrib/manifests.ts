@@ -100,7 +100,7 @@ const landingAuthorityField = (): FieldSpec => ({
   scopes: ['project', 'global'],
   bind: 'project',
 });
-// Multi-PR (SPEC §11.1, PLAN-multi-pr.md). Off, a task is one branch per repo,
+// Multi-PR (SPEC §11.1). Off, a task is one branch per repo,
 // exactly as before. On, the Do agent may partition its change across several
 // branches with `create_branch`, each landing as its own pull request — so the
 // world nests its checkouts from Setup, which is the only structural difference
@@ -215,7 +215,7 @@ const DO_ROLE: WorkflowRole = {
     'task:*', 'project:*', 'organization:*', 'team:*', 'repository:*', 'inbox:*',
     'queue:*', 'workflow:*', 'profile:*', 'skill:write',
     'diagnostic:read', 'process:*', 'credential:*', 'vault:store', 'use-credential:*',
-    'payment:*', 'use-card:*', 'settings:*', 'safe-mode:write',
+    'payment:*', 'use-card:*', 'settings:*',
     'authorization:*', 'user:*',
   ],
   promptTemplate: `{{toolsPreamble}}

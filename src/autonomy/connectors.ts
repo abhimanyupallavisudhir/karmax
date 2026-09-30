@@ -28,7 +28,7 @@ function encryptedRevision(file: string): string {
 }
 
 /**
- * External password-store connectors (PLAN-passwords.md §9). The karmax vault
+ * External password-store connectors (wiki plans/PLAN-passwords §9). The karmax vault
  * is the runtime source of truth; a connector is a **selective mirror**, not a
  * live proxy: the user connects a store, picks items/folders to pull in, and
  * (opt-in) lets agent-created items push back. Runtime credential resolution
@@ -212,6 +212,7 @@ export class OnePasswordConnector implements CredentialConnector {
   constructor(
     private token: () => string | undefined,
     private exec: Exec = realExec,
+    private writer: OnePasswordSdkConnector = new OnePasswordSdkConnector(token),
   ) {}
   private env(): Record<string, string> {
     const t = this.token();
@@ -292,20 +293,30 @@ export class OnePasswordConnector implements CredentialConnector {
     }
     return { items: out, failures };
   }
-  /** Assignment edits preserve data the CLI's JSON representation cannot
-   * round-trip (notably passkeys). Never replace an item from its JSON export. */
+  /** Write-back edits one field through the SDK, with the same service-account
+   * token (AU-29). `op item edit` accepts a new value only as an argv
+   * assignment, readable by every local process from /proc, and its JSON
+   * template form replaces the whole item, losing what the CLI's export cannot
+   * round-trip (notably passkeys). The CLI names the vault holding the item.
+   *
+   * The SDK models no passkeys either, and its edit is a get-then-put of the
+   * whole item. An item that may hold one keeps the CLI's in-place assignment:
+   * the value is briefly visible in argv, which is better than losing a passkey. */
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
+    const item = JSON.parse(await this.exec('op', ['item', 'get', externalId, '--format=json'], { env: this.env() }));
+    if (typeof item?.vault?.id !== 'string') throw new Error(`1Password item "${externalId}" has no vault`);
+    const inPlace = () => this.assign(externalId, field, value);
+    if (mentionsPasskey(item)) return inPlace();
+    await this.writer.updateSecretIn(item.vault.id, externalId, field, value, inPlace);
+  }
+
+  private async assign(externalId: string, field: VaultFieldName, value: string): Promise<void> {
     const assignment =
-      field === 'password'
-        ? `password=${value}`
-        : field === 'secret'
-          ? `credential=${value}`
-          : field === 'totp'
-            ? `one-time password[otp]=${value}`
-            : field === 'note'
-              ? `notesPlain=${value}`
-              : field === 'privateKey'
-                ? `private_key=${value}`
+      field === 'password' ? `password=${value}`
+        : field === 'secret' ? `credential=${value}`
+          : field === 'totp' ? `one-time password[otp]=${value}`
+            : field === 'note' ? `notesPlain=${value}`
+              : field === 'privateKey' ? `private_key=${value}`
                 : undefined;
     if (!assignment) throw new Error(`1Password write-back does not support the "${field}" field`);
     await this.exec('op', ['item', 'edit', externalId, assignment], { env: this.env() });
@@ -431,15 +442,36 @@ export class OnePasswordSdkConnector implements CredentialConnector {
   }
 
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
-    const client = await this.client();
     const [vaultId, itemId] = await this.location(externalId);
+    await this.updateSecretIn(vaultId, itemId, field, value);
+  }
+
+  /** `unmodelled` edits an item holding data the SDK cannot represent (a
+   * passkey comes back `Unsupported`), which a put could drop; without it
+   * such an item is refused and its write goes to review. */
+  async updateSecretIn(vaultId: string, itemId: string, field: VaultFieldName, value: string,
+    unmodelled?: () => Promise<void>): Promise<void> {
+    const client = await this.client();
     const item = await client.items.get(vaultId, itemId);
+    if (item.category === 'Unsupported' || (item.fields ?? []).some((candidate: any) => candidate.fieldType === 'Unsupported')) {
+      if (unmodelled) return unmodelled();
+      throw new Error('1Password item holds data the SDK cannot rewrite safely (such as a passkey); update it in 1Password');
+    }
     if (field === 'note') {
       item.notes = value;
       await client.items.put(item);
       return;
     }
     const target = (item.fields ?? []).find((candidate: any) => onePasswordField(candidate, field));
+    if (!target && field === 'totp') {
+      // As `op item edit … 'one-time password[otp]=…'` did: add the field.
+      const sectionId = 'totpsection';
+      if (!(item.sections ?? []).some((section: any) => section.id === sectionId))
+        item.sections = [...(item.sections ?? []), { id: sectionId, title: '' }];
+      item.fields = [...(item.fields ?? []), { id: 'onetimepassword', title: 'one-time password', sectionId, fieldType: 'Totp', value }];
+      await client.items.put(item);
+      return;
+    }
     if (!target) throw new Error(`1Password item does not contain a writable "${field}" field`);
     item.fields = item.fields.map((candidate: any) =>
       candidate === target ? { ...candidate, value } : candidate);
@@ -484,6 +516,11 @@ function onePasswordSdkSecret(item: any, externalId: string): ExternalSecretItem
     fields: Object.keys(secrets) as VaultFieldName[],
     secrets,
   };
+}
+
+/** Does the CLI's view of an item show a passkey anywhere? */
+function mentionsPasskey(item: unknown): boolean {
+  return /passkey/i.test(JSON.stringify(item, (key, value) => key === 'value' ? undefined : value));
 }
 
 function onePasswordField(field: any, target: VaultFieldName): boolean {
@@ -767,6 +804,7 @@ interface GitPassConnection {
 }
 
 interface GitPassOptions {
+  hosted?: boolean;
   /** Tests may use a local bare remote; production accepts remote URLs only. */
   allowLocalRepository?: boolean;
   /** Prefer an organization-owned repository attachment over profile/host Git. */
@@ -963,6 +1001,12 @@ class GitPassStoreConnector implements CredentialConnector {
     const value = parsed as Partial<GitPassConnection>;
     const repositoryUrl = String(value.repositoryUrl ?? '').trim();
     if (!repositoryUrl) throw new Error('repository URL is required');
+    if (this.options.hosted) {
+      const url = new URL(repositoryUrl);
+      if (url.protocol !== 'https:' || !['github.com', 'gitlab.com', 'bitbucket.org'].includes(url.hostname)
+        || (url.port && url.port !== '443') || url.username || url.password)
+        throw new Error('hosted Git password stores require public GitHub, GitLab or Bitbucket HTTPS URLs');
+    }
     if (!this.options.allowLocalRepository && !isRemoteGitUrl(repositoryUrl)) {
       throw new Error('repository must use an HTTPS or SSH repository URL');
     }
@@ -1034,7 +1078,8 @@ class GitPassStoreConnector implements CredentialConnector {
       ...(await this.gitEnvironment(connection.gitProfile)),
       // Belt to the URL check's braces: git itself refuses any other transport
       // (`ext::`, `fd::`, or a helper smuggled in through a redirect).
-      GIT_ALLOW_PROTOCOL: this.options.allowLocalRepository ? 'https:ssh:file' : 'https:ssh',
+      GIT_ALLOW_PROTOCOL: this.options.hosted ? 'https' : this.options.allowLocalRepository ? 'https:ssh:file' : 'https:ssh',
+      ...(this.options.hosted ? { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.followRedirects', GIT_CONFIG_VALUE_0: 'false' } : {}),
     };
   }
 
@@ -1289,7 +1334,7 @@ export class GitPassConnector implements CredentialConnector {
           items.push({ ...item, externalId: prefix + item.externalId, label: prefix + item.label,
             folder: prefix ? prefix + (item.folder ?? '') : item.folder });
         }
-      } catch { failures.push({ store: prefix || 'root', error: 'Cannot read repository; check credentials and retry' }); }
+      } catch (error) { failures.push({ store: prefix || 'root', error: gitPassVerificationError(error) }); }
     }
     return { items, failures };
   }
@@ -1310,7 +1355,13 @@ export class GitPassConnector implements CredentialConnector {
       if (!ids.length) continue;
       let pulled: PullResult;
       try { pulled = await connector.pull(ids.map(id => id.slice(prefix.length))); }
-      catch { result.failures.push(...ids.map(externalId => ({ externalId, error: `Store ${prefix || 'root'} is unavailable; check its connection and retry` }))); continue; }
+      catch (error) {
+        // Name the store's own problem (moved, emptied, unreadable key) so its owner
+        // can act; raw Git output stays behind the helper's fixed wording (AU-41).
+        const reason = gitPassVerificationError(error);
+        result.failures.push(...ids.map(externalId => ({ externalId, error: `Store ${prefix || 'root'}: ${reason}` })));
+        continue;
+      }
       result.items.push(...pulled.items.map(item => ({ ...item, externalId: prefix + item.externalId,
         label: prefix + item.label, folder: prefix ? prefix + (item.folder ?? '') : item.folder })));
       result.failures.push(...pulled.failures.map(failure => ({ ...failure, externalId: prefix + failure.externalId })));
@@ -1540,8 +1591,12 @@ export class Connectors {
   }
   async setConfig(name: string, patch: Partial<ConnectorConfig>): Promise<ConnectorConfig> {
     return this.store.transaction(async () => {
-    const next = { ...(await this.config(name)), ...patch };
+    const current = (await this.config(name));
+    const next = { ...current, ...patch };
     (await this.store.kvSet(kvConfig(this.organizationId, name), JSON.stringify(next)));
+    // Turning write-back on consents to the store connected now, so writes
+    // queued while an earlier store was connected go to this one.
+    if (next.writeBack && !current.writeBack) await this.retargetWrites(name);
     return next;
       });
   }
@@ -1643,8 +1698,9 @@ export class Connectors {
 
   /** Validate a connector secret before keeping it. A failed replacement restores
    *  the previous working secret, so clicking Connect can never manufacture a
-   *  false-positive connection or break an existing one. */
-  async connect(name: string, secret: string): Promise<ConnectorInfo> {
+   *  false-positive connection or break an existing one. `newStore` means a
+   *  first connection or a different Git store: nothing is selected yet. */
+  async connect(name: string, secret: string): Promise<{ connector: ConnectorInfo; newStore: boolean }> {
     const connector = this.get(name);
     if (!connector) throw new Error(`no connector "${name}"`);
     if (!this.broker) throw new Error('credential storage is unavailable');
@@ -1670,14 +1726,20 @@ export class Connectors {
       if (!info.available) throw new Error(info.detail);
       // A selection and write-back consent belong to one external store. Never
       // carry them silently to a different repository during reconfiguration.
+      // Pending writes do follow it, still waiting for that consent: a rotation
+      // not yet written anywhere is the only copy of the newest secret, and its
+      // record is what keeps an import from overwriting it.
       if (replacedGitPassStore)
-        (await this.store.kvSet(
-          kvConfig(this.organizationId, name),
-          JSON.stringify({
-            autoSync: { enabled: false, importNew: false, externalIds: [] },
-          }),
-        ));
-      return info;
+        await this.store.transaction(async () => {
+          (await this.store.kvSet(
+            kvConfig(this.organizationId, name),
+            JSON.stringify({
+              autoSync: { enabled: false, importNew: false, externalIds: [] },
+            }),
+          ));
+          await this.retargetWrites(name);
+        });
+      return { connector: info, newStore: previous === undefined || replacedGitPassStore };
     } catch (error) {
       if (previous === undefined) (await this.broker.deleteHandle(handle));
       else (await this.broker.registerHandle(handle, previous));
@@ -2001,6 +2063,28 @@ export class Connectors {
       });
   }
 
+  /** Point a Git store's pending writes at the store connected now. Delivery
+   *  still refuses an entry that changed since the rotation was based on it,
+   *  and an export whose destination holds different data. Other connectors
+   *  have no store identity beyond their secret, so theirs stay blocked. */
+  private async retargetWrites(name: string): Promise<void> {
+    if (name !== 'pass-git') return;
+    return this.store.transaction(async () => {
+      const target = this.writeTarget(name);
+      const writes = (await this.pendingWrites());
+      if (writes.some((write) => write.connector === name && write.target !== target))
+        (await this.store.kvSet(connectorOutboxKey(this.organizationId), JSON.stringify(writes.map((write) =>
+          write.connector !== name || write.target === target ? write
+            : { ...write, target, attempts: 0, nextAttemptAt: Date.now(), error: undefined }))));
+      const binding = gitPassRepositoryIdentity(this.secretFor(name));
+      for (const item of (await this.items.list())) {
+        const pending = (await this.pending(item.id));
+        if (Object.keys(pending.fields).length && pending.binding !== binding)
+          (await this.store.kvSet(this.pendingKey(item.id), JSON.stringify({ ...pending, binding })));
+      }
+    });
+  }
+
   async retryWrites(
     options: { dueOnly?: boolean; connector?: string } = {},
   ): Promise<Array<{ connector: string; itemId: string; error?: string }>> {
@@ -2277,7 +2361,7 @@ export function defaultConnectors(store: ConnectorStore, items: VaultItems, brok
       return (await profiles.env(profile, {}));
     },
     undefined,
-    { repositoryCredential: (repositoryUrl) =>
+    { hosted: opts.hosted, repositoryCredential: (repositoryUrl) =>
       attachedRepositoryCredential(store, opts.githubApp, organizationId, repositoryUrl) },
   ));
   return connectors;

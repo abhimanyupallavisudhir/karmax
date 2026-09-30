@@ -117,6 +117,31 @@ describe('package loading is hostile-input safe', () => {
       .rejects.toThrow(/different repository/);
     fs.rmSync(root, { recursive: true, force: true });
   });
+  it('retries snapshot extraction after a failed tar invocation', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pkgretry-'));
+    const repo = path.join(root, 'demo'), bin = path.join(root, 'bin');
+    fs.mkdirSync(repo); fs.mkdirSync(bin);
+    const run = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' });
+    const priorPath = process.env.PATH;
+    try {
+      run('init', '-q', '-b', 'main'); run('config', 'user.email', 'a@b.c'); run('config', 'user.name', 'a');
+      fs.writeFileSync(path.join(repo, 'manifest.json'), JSON.stringify(valid()));
+      fs.writeFileSync(path.join(repo, 'workflow.js'), 'export default async function run() {}');
+      run('add', '-A'); run('commit', '-qm', 'init');
+      const loader = new WorkflowRepoLoader(path.join(root, 'cache'));
+      fs.writeFileSync(path.join(bin, 'tar'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+      process.env.PATH = `${bin}${path.delimiter}${priorPath}`;
+      await expect(loader.load({ url: repo, name: 'demo' })).rejects.toThrow();
+      process.env.PATH = priorPath;
+      const pkg = await loader.load({ url: repo, name: 'demo' });
+      expect(pkg.manifest.name).toBe('demo');
+      expect(fs.readFileSync(pkg.workflowEntry!, 'utf8')).toContain('export default');
+      expect(fs.readdirSync(path.dirname(pkg.dir)).sort()).toEqual(['.work', pkg.sha]);
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH; else process.env.PATH = priorPath;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('PackageStore (name@version resolution)', () => {

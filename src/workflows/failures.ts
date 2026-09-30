@@ -51,7 +51,7 @@ export function limitFailureClassification(err: unknown): LimitClassification | 
       diagnostic: detail.diagnostic,
     };
   }
-  const legacy = classifyLimitError(cause.message ?? '', { providerOrigin: true });
+  const legacy = classifyLimitError(cause.message ?? '', { providerOrigin: true, legacy: true });
   return legacy.limited ? legacy : { limited: true, kind: 'quota', window: '5h' };
 }
 

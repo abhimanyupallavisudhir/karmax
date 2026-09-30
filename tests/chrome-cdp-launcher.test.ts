@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -6,6 +6,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { expect, it } from 'vitest';
+import { CHROME_DEVTOOLS_MCP_VERSION } from '../src/autonomy/config-homes.js';
 
 const exec = promisify(execFile);
 const launcher = fileURLToPath(new URL('../src/autonomy/chrome-cdp-launcher.mjs', import.meta.url));
@@ -23,6 +24,7 @@ it.each([false, true])('keeps browser state across MCP exits only when opted in 
 const fs = require('node:fs');
 const http = require('node:http');
 fs.writeFileSync(process.env.TEST_BROWSER_PID, String(process.pid));
+fs.writeFileSync(process.env.TEST_BROWSER_PID + '.args', JSON.stringify(process.argv));
 let visits = 0;
 http.createServer((req, res) => {
   res.setHeader('content-type', 'application/json');
@@ -41,6 +43,7 @@ fetch('http://127.0.0.1:' + process.env.KARMAX_CDP_PORT + '/visit')
     const first = JSON.parse((await exec(process.execPath, [launcher], { env })).stdout);
     pid = first.pid;
     expect(first.visits).toBe(1);
+    expect(fs.readFileSync(pidFile + '.args', 'utf8')).not.toContain('--remote-allow-origins=*');
     // Its telemetry watchdog costs ~80 MB of a 2 GB sandbox and reports tenants' tool use.
     expect(first.telemetry).toBe('off');
     if (keepAlive) {
@@ -51,10 +54,47 @@ fetch('http://127.0.0.1:' + process.env.KARMAX_CDP_PORT + '/visit')
         try { await fetch(`http://127.0.0.1:${port}/json/version`); return true; }
         catch { return false; }
       }).toBe(false);
+      expect(fs.existsSync(path.join(dir, 'profile'))).toBe(false);
     }
   } finally {
     if (!pid && fs.existsSync(pidFile)) pid = Number(fs.readFileSync(pidFile, 'utf8'));
     if (pid) { try { process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+it('refuses to attach to an unowned CDP endpoint (AU-20)', async () => {
+  const server = http.createServer((_req, res) => res.end('{}'));
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  try {
+    await expect(exec(process.execPath, [launcher], { timeout: 3000, env: { ...process.env,
+      KARMAX_CDP_PORT: String(port), KARMAX_CDP_KEEP_ALIVE: '0', KARMAX_CDP_MCP_BIN: process.execPath,
+    } })).rejects.toThrow(/already in use/);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+it('runs the pinned chrome-devtools-mcp release when no version is configured (CI-33)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-browser-pin-'));
+  try {
+    // A PATH with no browser and a recording npx: the launcher falls back to
+    // pipe mode and shows exactly which package it would install.
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    fs.symlinkSync(execFileSync('sh', ['-c', 'command -v flock'], { encoding: 'utf8' }).trim(), path.join(bin, 'flock'));
+    fs.writeFileSync(path.join(bin, 'npx'), `#!/bin/sh\nprintf '%s\\n' "$@" > "${path.join(dir, 'args')}"\n`, { mode: 0o755 });
+    const reservation = http.createServer();
+    await new Promise<void>(resolve => reservation.listen(0, '127.0.0.1', resolve));
+    const port = (reservation.address() as { port: number }).port;
+    await new Promise<void>(resolve => reservation.close(() => resolve()));
+    await exec(process.execPath, [launcher], { env: { PATH: bin, HOME: dir, KARMAX_CDP_PORT: String(port) }, timeout: 20_000 });
+    const args = fs.readFileSync(path.join(dir, 'args'), 'utf8').trim().split('\n');
+    expect(args).toContain(`chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}`);
+    // The browser image bakes the same release for remote worlds.
+    expect(fs.readFileSync(new URL('../environments/browser/Dockerfile', import.meta.url), 'utf8'))
+      .toContain(`ARG CHROME_DEVTOOLS_MCP_VERSION=${CHROME_DEVTOOLS_MCP_VERSION}\n`);
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

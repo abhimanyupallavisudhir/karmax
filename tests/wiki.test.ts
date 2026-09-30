@@ -317,6 +317,24 @@ describe('parseFrontmatter', () => {
     expect(parseFrontmatter('---\nlabels: [a, b]\n---\nx').labels).toEqual(['a', 'b']);
     expect(parseFrontmatter('---\ndelivery: unconditional\nlabels: x\n---\nx').labels).toEqual(['default', 'x']);
   });
+
+  it('reads a YAML block-list `labels` and normalises a worded `importance` (WK-1)', () => {
+    const fm = parseFrontmatter('---\nname: X\nlabels:\n  - default\n  - "security"\n  -  vault\nimportance: 900\n---\nbody\n');
+    expect(fm.labels).toEqual(['default', 'security', 'vault']);
+    expect(fm.importance).toBe(900);
+    expect(fm.body).toBe('body\n');
+    // The list ends at the next key; a later scalar is still read.
+    const next = parseFrontmatter('---\nlabels:\n- a\n- b\ndescription: after\n---\nx');
+    expect(next.labels).toEqual(['a', 'b']);
+    expect(next.description).toBe('after');
+    // Worded importance keeps its intent instead of dropping to the default.
+    expect(parseFrontmatter('---\nimportance: high\n---\nx').importance).toBeGreaterThan(0);
+    expect(parseFrontmatter('---\nimportance: Low\n---\nx').importance).toBeLessThan(0);
+    expect(parseFrontmatter('---\nimportance: medium\n---\nx').importance).toBe(0);
+    // Unknown words and a blank value are absent, not 0 (so a builtin's own order survives).
+    expect(parseFrontmatter('---\nimportance: urgent-ish\n---\nx').importance).toBeUndefined();
+    expect(parseFrontmatter('---\nimportance:\n---\nx').importance).toBeUndefined();
+  });
 });
 
 describe('renderWikiToc', () => {
@@ -381,11 +399,12 @@ describe('searchWiki (host-side grep — the cloud-world-safe path)', () => {
   it('does not hang on a catastrophic-backtracking pattern', () => {
     const root = tmp();
     try {
-      writeWikiPage(root, 'bait', `---\ndescription: d\n---\n${'a'.repeat(60)}b\n`);
-      const started = Date.now();
-      const hits = searchWiki(root, '(a+)+$');
-      expect(Date.now() - started).toBeLessThan(2_000);
-      expect(Array.isArray(hits)).toBe(true);
+      // Run as a regex, the pattern backtracks for minutes on the bait line and
+      // cannot match the quoted one, which ends in `$`. Matched literally, it
+      // finds exactly the quoted line and never touches the bait.
+      writeWikiPage(root, 'bait', `---\ndescription: d\n---\n${'a'.repeat(60)}b\nquoted: (a+)+$\n`);
+      expect(isSafeSearchPattern('(a+)+$')).toBe(false);
+      expect(searchWiki(root, '(a+)+$').map((hit) => hit.text)).toEqual(['quoted: (a+)+$']);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -617,7 +636,7 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
   it('round-trips pages, exposes the read-only built-in, and enforces create/rename guards', async () => {
     const { k, contentDir, organization, project, mint } = (await harness());
     try {
-      const rw = (await mint(['project:read', 'organization:read', 'skill:write']));
+      const rw = (await mint(['project:read', 'organization:read', 'skill:write', 'organization:wiki:write']));
       (await k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: '---\ndescription: how\n---\nShip it.', kind: 'skill', create: true }));
       const projectRoot = wikiRoot(contentDir, 'project', project.id);
       expect(fs.existsSync(path.join(projectRoot, '.git'))).toBe(true);
@@ -642,11 +661,11 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       expect(builtinPage.page.builtin).toBe(true);
       // Editing a built-in writes its override; deleting the override restores the default.
       // Built-in and `default`-labelled organization pages reach every prompt in the
-      // organization, so `skill:write` alone (every Do agent) is refused: it takes
-      // an organization administrator.
+      // organization, so even `organization:wiki:write` is refused: it takes an
+      // organization administrator.
       await expect((async () => (await k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' })))()).rejects.toThrow(/organization:edit/);
       await expect((async () => (await k.saveWikiPage(rw, 'organization', organization.id, { path: 'rules/everywhere', content: '---\nlabels: default\n---\nEverywhere.', create: true })))()).rejects.toThrow(/organization:edit/);
-      const admin = (await mint(['project:read', 'organization:read', 'skill:write', 'organization:edit']));
+      const admin = (await mint(['project:read', 'organization:read', 'skill:write', 'organization:wiki:write', 'organization:edit']));
       (await k.saveWikiPage(admin, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' }));
       expect((await k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)).versions[0])
         .toMatchObject({ version: 2, operation: 'write', content: expect.stringContaining('Our own rules.') });
@@ -689,6 +708,10 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       const ro = (await mint(['project:read', 'organization:read']));
       await (async () => (await k.readWiki(ro, 'project', project.id)))();
       await expect((async () => (await k.saveWikiPage(ro, 'project', project.id, { path: 'x', content: 'y' })))()).rejects.toThrow(/skill:write/);
+      // skill:write edits the project wiki but not the organization's.
+      const developer = (await mint(['project:read', 'organization:read', 'skill:write']));
+      await expect((async () => (await k.saveWikiPage(developer, 'organization', organization.id, { path: 'x', content: 'y' })))()).rejects.toThrow(/organization:wiki:write/);
+      expect(((await k.readWiki(developer, 'organization', organization.id)) as any).view.writable).toBe(false);
       // Unknown project refuses rather than minting a stray directory.
       await expect((async () => (await k.readWiki(rw, 'project', 'nope')))()).rejects.toThrow(/no project/);
       expect(fs.existsSync(path.join(contentDir, 'wiki', 'project', project.id))).toBe(true);
@@ -842,9 +865,10 @@ describe('existing project wiki remote backfill', () => {
       tokens: new TokenAuthority(),
       staticDir: fs.mkdtempSync(path.join(home, 'static-')),
     } as any));
+    let listening: Awaited<ReturnType<Gateway['listen']>> | undefined;
     try {
-      const listening = await gateway.listen(49_000);
-      expect(actors).toEqual(['owner']);
+      listening = await gateway.listen(49_000);
+      await expect.poll(() => actors, { timeout: 5_000 }).toEqual(['owner']);
       expect(inputs).toMatchObject([{ private: true }]);
       await expect.poll(async () => (await store.projectWiki(project.id))?.repository, { timeout: 5_000 }).toBeTruthy();
       const linked = (await store.projectWiki(project.id))!.repository;
@@ -857,8 +881,8 @@ describe('existing project wiki remote backfill', () => {
           return '';
         }
       }, { timeout: 5_000 }).toMatch(/^[0-9a-f]{40}$/);
-      await listening.close();
     } finally {
+      await listening?.close();
       (await store.close());
       if (previousHome === undefined) delete process.env.KARMAX_HOME;
       else process.env.KARMAX_HOME = previousHome;
@@ -900,7 +924,12 @@ describe('remote task wiki views', () => {
       readFile: async (file: string) => files.get(file)!.toString('utf8'),
       writeFileBuffer: async (file: string, value: Buffer) => { files.set(file, Buffer.from(value)); },
       writeFile: async (file: string, value: string) => { files.set(file, Buffer.from(value)); },
-      exec: async (cmd: string, args: string[]) => {
+      exec: async (cmd: string, args: string[], options?: { cwd?: string }) => {
+        if (cmd === 'bash' && args.at(-1)?.includes('-print0')) {
+          expect(options?.cwd).toBe(repoRoot);
+          const pages = [...files.keys()].filter(file => /\/(SKILL|MEMORY)\.md$/.test(file));
+          return { code: 0, stdout: pages.map(file => `./${file.slice('project-wiki/'.length)}\0`).join(''), stderr: '' };
+        }
         if (cmd === 'git' && args[0] === 'commit') commits.push(args.at(-1)!);
         return { code: 0, stdout: '', stderr: '' };
       },
@@ -1169,10 +1198,10 @@ describe('search regex safety guard', () => {
     // back to a literal match, so this returns promptly instead of hanging.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-wiki-redos-'));
     try {
-      writeWikiPage(root, 'notes/long', `---\nname: Long\n---\n${'a'.repeat(4_000)}`, 'skill');
-      const started = Date.now();
-      expect(searchWiki(root, 'a*a*a*a*a*a*a*a*a*a*b')).toEqual([]);
-      expect(Date.now() - started).toBeLessThan(2_000);
+      // As a regex the pattern would match the bare `b` line (after backtracking
+      // through the run of `a`s); as a literal only the quoted line matches.
+      writeWikiPage(root, 'notes/long', `---\nname: Long\n---\n${'a'.repeat(4_000)}\nb\nquoted: a*a*a*a*a*a*a*a*a*a*b`, 'skill');
+      expect(searchWiki(root, 'a*a*a*a*a*a*a*a*a*a*b').map((hit) => hit.text)).toEqual(['quoted: a*a*a*a*a*a*a*a*a*a*b']);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

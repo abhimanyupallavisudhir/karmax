@@ -67,3 +67,13 @@ it('refuses a scope whose task belongs to a different project', async () => {
     expect(spoofed.reason).toMatch(/another project/);
   } finally { await store.close(); }
 });
+
+it('keeps persisted tokens out of the process map (PS-9)', async () => {
+  const store = await Store.create(':memory:');
+  try {
+    const authority = new TokenAuthority(store);
+    const minted = await authority.mintPrincipal('user:one', ['task:read']);
+    expect((authority as any).tokens.size).toBe(0);
+    expect(await authority.verify(minted.token)).toBeDefined();
+  } finally { await store.close(); }
+});

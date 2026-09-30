@@ -16,6 +16,10 @@ import {
   itemCaps,
   domainMatches,
   itemHandle,
+  removeTurnKeys,
+  removeLegacyKeyCopies,
+  turnKeyDirectory,
+  sweepTurnKeys,
 } from '../src/autonomy/vault-items.js';
 import { fillViaCdp } from '../src/autonomy/fill.js';
 
@@ -88,6 +92,20 @@ describe('vault items: CRUD + write-only secrets', () => {
   });
 });
 
+describe('a damaged vault index (AU-28)', () => {
+  it('fails closed instead of reading as empty and overwriting every item', async () => {
+    const { items, store } = makeService('org_damaged');
+    (await items.save({ type: 'login', label: 'Kept', secrets: { password: 'p' } }));
+    const damaged = '[{"id":"item_1","type":"login","label":"Kept"';
+    (await store.kvSet('vault:items:org_damaged', damaged));
+    await expect(items.list()).rejects.toThrow(/unreadable/);
+    await expect(items.save({ type: 'login', label: 'New', secrets: { password: 'q' } })).rejects.toThrow(/unreadable/);
+    expect(await store.kvGet('vault:items:org_damaged')).toBe(damaged);
+    (await store.kvSet('vault:requests:org_damaged', '{broken'));
+    await expect(items.requests()).rejects.toThrow(/unreadable/);
+  });
+});
+
 describe('vault usage frequency', () => {
   it('persists successful accesses without treating usage as an edit', async () => {
     const { items, store, broker, dir } = makeService();
@@ -119,6 +137,30 @@ describe('vault usage frequency', () => {
     (await broker.deleteHandle(itemHandle(item.id, 'password')));
     await expect((async () => (await items.resolveField(item, 'password', { mode: 'use' })))()).rejects.toThrow();
     expect((await items.get(item.id))?.useCount).toBe(1);
+  });
+});
+
+describe('vault usage writes (AU-25)', () => {
+  it('records an access without rewriting the organization item index', async () => {
+    const store = (await Store.create(':memory:'));
+    try {
+      const { broker, dir } = makeService();
+      const items = new VaultItems(store, broker, dir, 'org_usage');
+      for (let i = 0; i < 200; i++) (await items.save({ type: 'login', label: `Login ${i}`, username: `user${i}@example.com`,
+        domains: [`site-${i}.example.com`], tags: ['team'], secrets: { password: `secret-${i}` } }));
+      const target = (await items.list())[123]!;
+      const writes: Array<{ key: string; bytes: number }> = [];
+      const kvSet = store.kvSet.bind(store);
+      vi.spyOn(store, 'kvSet').mockImplementation(async (key, value) => { writes.push({ key, bytes: value.length }); return kvSet(key, value); });
+      (await items.resolveField(target, 'password', { mode: 'use' }));
+      (await items.resolveField(target, 'password', { mode: 'use' }));
+      expect(writes.map((write) => write.key)).toEqual([`vault:usage:org_usage:${target.id}`, `vault:usage:org_usage:${target.id}`]);
+      expect(Math.max(...writes.map((write) => write.bytes))).toBeLessThan(200);
+      expect((await items.get(target.id))).toMatchObject({ useCount: 2, updatedAt: target.updatedAt });
+      expect((await new VaultItems(store, broker, dir, 'org_usage').get(target.id))?.useCount).toBe(2);
+      (await items.delete(target.id));
+      expect((await store.kvGet(`vault:usage:org_usage:${target.id}`))).toBeUndefined();
+    } finally { (await store.close()); }
   });
 });
 
@@ -345,7 +387,7 @@ describe('the pull model: requests + human resolutions (§7)', () => {
 
 describe('spawn-time materialization (§5A)', () => {
   it('injects env bags, api keys under envVar, and ssh keys as 0600 files', async () => {
-    const { items } = makeService();
+    const { items, dir } = makeService();
     const caps = ['use-credential:*'];
     (await items.save({ type: 'env', label: 'proj env', secrets: { env: '# comment\nFOO=bar\nexport QUOTED="a b"\nbad line\n' } }));
     (await items.save({ type: 'api-key', label: 'openai', envVar: 'OPENAI_API_KEY', secrets: { secret: 'sk-123' } }));
@@ -353,14 +395,26 @@ describe('spawn-time materialization (§5A)', () => {
     // an `ask` item never injects ambiently
     (await items.save({ type: 'api-key', label: 'guarded', envVar: 'GUARDED', policy: { use: 'ask' }, secrets: { secret: 'nope' } }));
 
-    const env = (await items.envFor('t1', caps));
+    // Key files live for one turn, in a directory the turn owns (AU-33).
+    const turn = turnKeyDirectory();
+    const env = (await items.envFor('t1', caps, turn));
     expect(env.FOO).toBe('bar');
     expect(env.QUOTED).toBe('a b');
     expect(env.OPENAI_API_KEY).toBe('sk-123');
     expect(env.GUARDED).toBeUndefined();
     expect(fs.readFileSync(env.DEPLOY_KEY_FILE!, 'utf8')).toBe('PRIVATE\n');
     expect(fs.statSync(env.DEPLOY_KEY_FILE!).mode & 0o777).toBe(0o600);
-    expect(env.DEPLOY_KEY_FILE).toContain(ssh.id);
+    expect(path.dirname(env.DEPLOY_KEY_FILE!)).toBe(turn);
+    expect(fs.existsSync(path.join(dir, 'state', 'vault-items', ssh.id))).toBe(false);
+    await removeTurnKeys(turn);
+    expect(fs.existsSync(env.DEPLOY_KEY_FILE!)).toBe(false);
+    // Without a turn directory a key is not written anywhere.
+    expect((await items.envFor('t1', caps)).DEPLOY_KEY_FILE).toBeUndefined();
+    // Host copies kept by earlier versions are removed at boot.
+    fs.mkdirSync(path.join(dir, 'state', 'vault-items', ssh.id), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'state', 'vault-items', ssh.id, 'key'), 'PRIVATE');
+    removeLegacyKeyCopies(path.join(dir, 'state'));
+    expect(fs.existsSync(path.join(dir, 'state', 'vault-items'))).toBe(false);
     // ungranted task gets nothing
     expect(Object.keys((await items.envFor('t2', [])))).toHaveLength(0);
   });
@@ -396,10 +450,12 @@ describe('zero-exposure CDP fill (§5B)', () => {
         const msg = JSON.parse(String(raw));
         received.push(msg);
         let result: any = {};
+        if (msg.method === 'Page.getFrameTree') result = { frameTree: { frame: { id: 'main' } } };
+        if (msg.method === 'Page.createIsolatedWorld') result = { executionContextId: 7 };
         if (msg.method === 'Runtime.evaluate') {
           result = msg.params.expression === 'location.origin'
             ? { result: { value: origin } }
-            : { result: { value: true } }; // selector focus succeeds
+            : { result: { value: { origin } } }; // the in-page check or write succeeds
         }
         socket.send(JSON.stringify({ id: msg.id, result }));
       });
@@ -420,8 +476,10 @@ describe('zero-exposure CDP fill (§5B)', () => {
     try {
       const out = await fillViaCdp({ cdpUrl: `http://127.0.0.1:${b.port}`, selector: '#password', text: 's3cret', expectDomains: ['github.com'] });
       expect(out.origin).toBe('https://github.com');
-      const insert = b.received.find((m) => m.method === 'Input.insertText');
-      expect(insert?.params?.text).toBe('s3cret');
+      // Checked, then written, in the page's isolated world; the check never carries the secret.
+      const inPage = b.received.filter((m) => m.method === 'Runtime.evaluate' && m.params?.contextId === 7);
+      expect(inPage.map((m) => m.params.expression.includes('"s3cret"'))).toEqual([false, true]);
+      expect(b.received.some((m) => m.method === 'Input.insertText')).toBe(false);
       expect(JSON.stringify(out)).not.toContain('s3cret');
     } finally {
       await b.close();
@@ -476,7 +534,7 @@ describe('zero-exposure CDP fill (§5B)', () => {
   });
 
   it('rejects non-loopback endpoints', async () => {
-    await expect(fillViaCdp({ cdpUrl: 'http://example.com:9222', selector: 'x', text: 'y' })).rejects.toThrow(/loopback/);
+    await expect(fillViaCdp({ cdpUrl: 'http://example.com:9222', expectDomains: ['example.com'], selector: 'x', text: 'y' })).rejects.toThrow(/loopback/);
   });
 
   it('explains how to recover when the browser has no reachable CDP endpoint', async () => {
@@ -488,8 +546,8 @@ describe('zero-exposure CDP fill (§5B)', () => {
     await expect(fillViaCdp({
       cdpUrl: `http://127.0.0.1:${port}`,
       selector: '#password',
-      text: 's3cret',
-    })).rejects.toThrow(/tavya-managed chrome-devtools browser.*cdpUrl/);
+      text: 's3cret', expectDomains: ['example.com'],
+    })).rejects.toThrow(/Is this task's chrome-devtools browser still open/);
   });
 });
 
@@ -508,4 +566,69 @@ it('matches RFC 6238 SHA-256/SHA-512 vectors and a custom time step', () => {
   }
   const seed = encode('12345678901234567890');
   expect(totpCode(`otpauth://totp/test?secret=${seed}&period=60&digits=8`, 119000)).toBe('94287082');
+});
+
+it('rejects oversized item secrets before saving metadata or handles (AU-5)', async () => {
+  const { items, broker } = makeService();
+  await expect(items.save({ type: 'env', label: 'too big', secrets: { env: 'x'.repeat(65_537) } })).rejects.toThrow(/size/);
+  expect(await items.list()).toEqual([]);
+});
+
+it('bounds each organization independently and permits existing-item updates at quota (AU-5)', async () => {
+  const { items, store } = makeService();
+  const item = await items.save({ type: 'note', label: 'retained', secrets: { note: 'text' } });
+  await store.kvSet('vault:items:org_personal', JSON.stringify(Array.from({ length: 1000 }, (_, i) => ({ ...item, id: i ? `item_${i}` : item.id }))));
+  await expect(items.save({ type: 'note', label: 'extra' })).rejects.toThrow(/quota/);
+  await expect(items.save({ id: item.id, type: 'note', label: 'updated' })).resolves.toMatchObject({ label: 'updated' });
+});
+
+it('does not ambiently inject another agent task’s environment item (AU-13)', async () => {
+  const { items } = makeService();
+  const item = await items.save({ type: 'env', label: 'Agent environment', secrets: { env: 'NODE_OPTIONS=--require=/tmp/agent.js\nAPP_TOKEN=value' },
+    provenance: { source: 'agent', taskId: 'creator' } });
+  expect(await items.envFor('other', ['use-credential:*'])).toEqual({});
+  expect(await items.envFor('creator', ['use-credential:*'])).toHaveProperty('APP_TOKEN', 'value');
+  expect(await items.envFor('other', [`use-credential:item:${item.id}`])).toHaveProperty('APP_TOKEN', 'value');
+});
+
+it('delivers SSH-key files inside the receiving remote world (AU-21)', async () => {
+  const { items } = makeService();
+  await items.save({ type: 'ssh-key', label: 'Remote key', envVar: 'APP_SSH_KEY', secrets: { privateKey: 'PRIVATE' } });
+  const writes: any[] = [];
+  const world = { handle: { root: '/sandbox' }, writeFile: async (...args: any[]) => { writes.push(args); }, exec: async () => ({ code: 0, stdout: '', stderr: '' }) } as any;
+  const env = await items.envFor('task', ['use-credential:*'], world);
+  expect(env.APP_SSH_KEY).toMatch(/^\/sandbox\/\.karmax-injection\/vault\//);
+  expect(writes[0]?.[1]).toBe('PRIVATE\n');
+});
+
+
+it('rejects blank standalone notes without overwriting a stored note (AU-22)', async () => {
+  const { items } = makeService();
+  await expect(items.save({ type: 'note', label: 'Empty', secrets: { note: '' } })).rejects.toThrow(/empty/);
+  const item = await items.save({ type: 'note', label: 'Note', secrets: { note: 'retained' } });
+  await expect(items.save({ id: item.id, type: 'note', secrets: { note: '  ' } })).rejects.toThrow(/empty/);
+  expect(await items.resolveField(item, 'note', { mode: 'reveal' })).toBe('retained');
+});
+
+describe('turn key files after a crash', () => {
+  it('sweeps the directories of dead processes and keeps live turns', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-sweep-'));
+    try {
+      const live = turnKeyDirectory(tmp);
+      fs.writeFileSync(path.join(live, 'key'), 'LIVE');
+      // A pid no process can have: the turn that wrote it crashed.
+      const dead = path.join(tmp, 'karmax-turn-keys-2147483646-abc123');
+      fs.mkdirSync(dead);
+      fs.writeFileSync(path.join(dead, 'key'), 'PLAINTEXT');
+      const unowned = path.join(tmp, 'karmax-turn-keys-abc123');
+      fs.mkdirSync(unowned);
+      const unrelated = path.join(tmp, 'something-else');
+      fs.mkdirSync(unrelated);
+      expect(sweepTurnKeys(tmp)).toBe(2);
+      expect(fs.existsSync(dead)).toBe(false);
+      expect(fs.existsSync(unowned)).toBe(false);
+      expect(fs.readFileSync(path.join(live, 'key'), 'utf8')).toBe('LIVE');
+      expect(fs.existsSync(unrelated)).toBe(true);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
 });

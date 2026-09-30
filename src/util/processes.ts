@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { BRAND } from '../domain/brand.js';
 
 /**
@@ -84,7 +85,10 @@ const registry = new Map<number, TrackedProcess>();
  * stays dependency-free.
  */
 export function processStartTick(pid: number | undefined): string | undefined {
-  if (!pid || pid <= 0 || process.platform !== 'linux') return undefined;
+  if (!pid || pid <= 0) return undefined;
+  // Without procfs (macOS), `ps` reports the start time to the second, which
+  // still tells a recycled pid from the recorded process.
+  if (process.platform !== 'linux') return psColumn(pid, 'lstart');
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     // The comm field may itself contain spaces/parens; split after the LAST ')'.
@@ -92,6 +96,29 @@ export function processStartTick(pid: number | undefined): string | undefined {
     return afterComm[19]; // the array begins at field 3, so index 19 is field 22
   } catch {
     return undefined;
+  }
+}
+
+/** A process's arguments: exact from procfs; elsewhere from `ps`, which joins
+ * them with spaces, so `verbatim` values that may contain spaces stay whole. */
+export function processArgv(pid: number, verbatim: string[] = []): string[] | undefined {
+  if (process.platform === 'linux') {
+    try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean); }
+    catch { return undefined; }
+  }
+  let command = psColumn(pid, 'command');
+  if (!command) return undefined;
+  const kept = verbatim.filter(value => value.includes(' '));
+  kept.forEach((value, index) => { command = command!.split(value).join(`\0${index}\0`); });
+  return command.split(/\s+/).filter(Boolean).map(arg => arg.replace(/\0(\d+)\0/g, (_, index) => kept[Number(index)]!));
+}
+
+function psColumn(pid: number, column: 'lstart' | 'command'): string | undefined {
+  try {
+    return execFileSync('ps', ['-ww', '-o', `${column}=`, '-p', String(pid)],
+      { encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim() || undefined;
+  } catch {
+    return undefined; // exited, or no `ps` (Windows): unverifiable
   }
 }
 
@@ -324,7 +351,8 @@ export function sampleProcesses(): ProcessSample {
  * preferred (custody's SIGTERM→SIGKILL group escalation); otherwise the signal
  * goes to the process group when the pid leads one, else to the bare pid.
  */
-export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM'): Promise<{ ok: boolean; error?: string }> {
+export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM',
+  stopTask?: (taskId: string) => Promise<unknown>): Promise<{ ok: boolean; error?: string }> {
   if (!Number.isInteger(pid) || pid <= 1) return { ok: false, error: 'invalid pid' };
   if (pid === process.pid) return { ok: false, error: `refusing to kill ${BRAND} itself` };
   const entry = registry.get(pid);
@@ -343,6 +371,13 @@ export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM
   if (!inScope) return { ok: false, error: `pid is not a ${BRAND}-managed process` };
 
   try {
+    if (entry?.kind === 'agent' && entry.taskId) {
+      // Raw signals look like infrastructure failures and cause the workflow to
+      // retry. Cancellation owns process teardown and prevents another turn.
+      if (!stopTask) return { ok: false, error: 'stop the owning task to stop its agent' };
+      await stopTask(entry.taskId);
+      return { ok: true };
+    }
     if (entry?.kill) {
       await entry.kill(signal);
       return { ok: true };

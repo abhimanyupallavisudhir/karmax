@@ -112,7 +112,7 @@ export interface WorldHandle extends WorldHandleRef {
   warnings?: string[];
 }
 
-/** Git identity a world's commits carry (PLAN-git-config.md §4A), materialized
+/** Git identity a world's commits carry (wiki plans/PLAN-git-config §4A), materialized
  *  from the project's git profile. `signingKeyPath` is an SSH key file already
  *  written to disk by the profile service (never a secret in transit here). */
 export interface WorldGitIdentity {
@@ -139,6 +139,8 @@ export interface WorldSpec {
   repos?: string[];
   /** Keep a plain working directory in addition to configured companion repos. */
   scratch?: boolean;
+  /** Recorded checkout topology, indexed like repos, for portable recovery. */
+  checkouts?: Array<Pick<WorldRepo, 'name' | 'base' | 'target' | 'sourceAuthority'> & { branch?: string; gitIdentity?: WorldGitIdentity }>;
   base: string;
   target?: string;
   /** Check out this existing branch instead of creating karmax/<taskId> (merge-only). */
@@ -340,6 +342,8 @@ export interface World {
   exec(cmd: string, args: string[], opts?: ExecOptions): Promise<ExecResult>;
   readFile(relPath: string): Promise<string>;
   readFileBuffer(relPath: string): Promise<Buffer>;
+  /** At most `maxBytes` from the start of a regular file (world/file-prefix.ts). */
+  readFilePrefix?(relPath: string, maxBytes: number): Promise<Buffer>;
   writeFile(relPath: string, content: string): Promise<void>;
   writeFileBuffer?(relPath: string, content: Buffer): Promise<void>;
   listFiles(): Promise<string[]>;
@@ -374,7 +378,7 @@ export interface ProviderSandboxRef {
   taskId?: string;
   /** Whether this provider object is the sandbox sealed into a durable world
    * handle. Provider modules can answer without exposing the sealed id. */
-  matches?(handle: WorldHandleRef): boolean;
+  matches?(handle: WorldHandleRef): boolean | undefined;
   destroy(): Promise<void>;
 }
 
@@ -434,6 +438,8 @@ export interface WorldProvider {
   open(handle: WorldHandle): Promise<World>;
   /** Release metered compute while retaining the world's durable state. */
   park?(handle: WorldHandle): Promise<WorldHandle>;
+  /** Delete through the control plane without resuming the sandbox. */
+  destroy?(handle: WorldHandle): Promise<void>;
   status?(handle: WorldHandle): Promise<WorldLifecycleState>;
   /** Ask the provider's control plane for the sandbox's authoritative state
    * without resuming or otherwise mutating it. `status` reports the local
@@ -453,7 +459,15 @@ export interface WorldProvider {
   listSandboxes?(organizationId?: string): Promise<ProviderSandboxRef[]>;
   /** Completed provider-authoritative billable executions. Lease wall time is
    * not usage: providers can auto-pause while a local capacity lease is stale. */
-  listUsageEvents?(organizationId: string): Promise<ProviderUsageEvent[]>;
+  listUsageEvents?(organizationId: string, since?: number, resumeAt?: number): Promise<ProviderUsagePage>;
+}
+
+/** One bounded read of a provider's usage feed, newest first. `resumeAt` is
+ * set when the read stopped at its per-sweep bound before reaching `since` or
+ * the end of the feed; passing it back continues from there. */
+export interface ProviderUsagePage {
+  events: ProviderUsageEvent[];
+  resumeAt?: number;
 }
 
 /** Provider-independent confinement for every file/process cwd crossing the

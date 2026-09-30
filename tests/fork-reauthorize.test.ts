@@ -189,3 +189,94 @@ describe('vault task defaults', () => {
     } finally { (await f.store.close()); }
   });
 });
+
+/**
+ * RT-1: every agent spec can carry `resumeFrom` — the Do/Merge agents, each
+ * Confirm-agent layer of the Review route, and the Responder. The activity
+ * runtime honours all of them, so the API validates all of them against the
+ * SOURCE task, and the activity itself refuses a source its turn could not read
+ * (a task created before the check, a spawned run of an old template, a
+ * workflow path that never crossed the API).
+ */
+describe('resume sources outside the task’s authority', () => {
+  async function tenants() {
+    const f = (await fixture());
+    const other = (await f.store.createOrganization({ name: 'Victim', ownerUserId: 'victim' }));
+    const theirs = (await f.store.createProject('Theirs', {}, other.id));
+    const secret = (await f.store.createTask({ projectId: theirs.id, title: 'Secret', workflow: 'software-dev',
+      workflowVersion: '1.26.0', createdBy: { kind: 'user', userId: 'victim' }, params: { prompt: 'confidential' } }));
+    (await f.store.saveView(secret.id, { taskId: secret.id, status: 'done', messages: [
+      { role: 'user', text: 'the launch code is 0000' }], transcripts: [
+      { role: 'confirm', messages: [{ role: 'user', text: 'the launch code is 0000' }] }], state: {} } as any));
+    (await f.store.kvSet(`session:${secret.id}:do`, 'victim-session'));
+    return { ...f, theirs, secret };
+  }
+
+  it('authorizes Confirm-agent layers and the Responder against the source task', async () => {
+    const f = (await tenants());
+    const token = (await f.tokenFor('owner'));
+    const from = { resumeFrom: { taskId: f.secret.id, role: 'do' } };
+    try {
+      for (const params of [
+        { confirm: { layers: [{ kind: 'agent', ...from }] } },
+        { confirm: { mode: 'agent', ...from } },
+        { responder: { kind: 'agent', ...from } },
+      ]) {
+        await expect(f.api.createTask(token, { projectId: f.project.id, draft: true, params: { prompt: 'go', ...params } }))
+          .rejects.toThrow(/organization|capability/i);
+        await expect(f.api.updateArmedParams(token, f.source.id, { prompt: 'go', ...params })).rejects.toThrow(/organization|capability/i);
+      }
+      // A source inside the caller's authority still resumes.
+      await expect(f.api.createTask(token, { projectId: f.project.id, draft: true,
+        params: { prompt: 'go', confirm: { layers: [{ kind: 'agent', resumeFrom: { taskId: f.source.id } }] } } })).resolves.toBeTruthy();
+    } finally { (await f.store.close()); }
+  });
+
+  it('refuses in the activity a source the turn’s own authority cannot read', async () => {
+    const f = (await tenants());
+    const { makeCoreActivities } = await import('../src/activities/core.js');
+    const { WorldRegistry } = await import('../src/world/registry.js');
+    const { ProfileResolver } = await import('../src/agent/profiles.js');
+    const { TokenAuthority } = await import('../src/platform/tokens.js');
+    const sibling = (await f.store.createProject('Sibling'));
+    const hidden = (await f.store.createTask({ projectId: sibling.id, title: 'Hidden', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'sibling secret' } }));
+    (await f.store.saveView(hidden.id, { taskId: hidden.id, status: 'done', messages: [
+      { role: 'user', text: 'the launch code is 0000' }], state: {} } as any));
+    const seen: string[] = [];
+    const adapters = new Map([['mock', { provider: 'mock', async runTurn(input: any) {
+      seen.push(JSON.stringify(input.messages));
+      return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: 'ok' };
+    } }]]) as any;
+    const worlds = new WorldRegistry();
+    const run = async (sourceId: string, role: 'do' | 'confirm', tokens?: InstanceType<typeof TokenAuthority>) => {
+      const task = (await f.store.createTask({ projectId: f.project.id, title: 'Attacker', workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: 'x', _authorization: {
+          capabilities: ['task:*'], principal: 'user:owner', scope: 'projects', projectIds: [f.project.id], organizationId: 'org_personal' } } }));
+      const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+      const core = makeCoreActivities({ store: f.store, worlds, adapters, tokens,
+        profiles: new ProfileResolver(f.store, 'mock') } as any);
+      try {
+        return await core.runAgentTurn({ taskId: task.id, role, agentTurnId: `${task.id}#0`, agentSlotGranted: true,
+          worldHandle: world.handle, messages: [{ id: 'm1', role: 'user', text: 'go', ts: 0 }],
+          task: { taskId: task.id, projectId: f.project.id, title: task.title, prompt: 'x', project: {}, workflow: 'software-dev',
+            agents: { [role]: { provider: 'mock', resumeFrom: { taskId: sourceId, role } } } },
+        } as any);
+      } finally { await world.destroy(); }
+    };
+    try {
+      // Another organization is refused even without a token authority.
+      await expect(run(f.secret.id, 'confirm')).rejects.toThrow(/cannot resume/i);
+      // A sibling project outside the task's selected projects is refused by
+      // the turn's own token, exactly as get_conversation would refuse it.
+      await expect(run(hidden.id, 'do', new TokenAuthority(f.store))).rejects.toThrow(/cannot resume/i);
+      expect(seen.join('\n')).not.toContain('launch code');
+      expect((await f.store.kvGet(`session:${f.secret.id}:do`))).toBe('victim-session');
+      // The task's own project still forks.
+      (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'done', messages: [
+        { role: 'user', text: 'own history' }], state: {} } as any));
+      await run(f.source.id, 'do', new TokenAuthority(f.store));
+      expect(seen.at(-1)).toContain('own history');
+    } finally { (await f.store.close()); }
+  });
+});

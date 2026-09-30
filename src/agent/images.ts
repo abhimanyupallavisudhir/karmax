@@ -7,7 +7,7 @@ import type { ContentBlock } from '@agentclientprotocol/sdk';
 
 /**
  * Adapter-side re-hydration of image attachments (image prompts;
- * PLAN_IMAGE_PROMPTS.md). Messages carry only {@link ImageRef} handles through
+ * wiki plans/PLAN_IMAGE_PROMPTS). Messages carry only {@link ImageRef} handles through
  * the workflow/Temporal boundary; here — inside an activity, where filesystem
  * side effects are allowed — we resolve those handles back into whatever shape
  * each provider wants:

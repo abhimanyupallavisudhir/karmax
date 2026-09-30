@@ -1,3 +1,6 @@
+import type { TurnPreparationActivities } from '../activities/turn-preparation.js';
+import { githubLandingWatch } from './github-landing-watch.js';
+import { mergeQueueWatch } from './merge-queue-watch.js';
 import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
 import {
@@ -16,9 +19,12 @@ import {
   ParentClosePolicy,
   log,
   patched,
+  continueAsNew,
+  allHandlersFinished,
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
-import { ActivityCancellationType } from '@temporalio/common';
+import { ActivityCancellationType, msToNumber, type Duration } from '@temporalio/common';
+import type { childActivities } from '../activities/children.js';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED, RELIST_ACCOUNT_GRANT } from '../coordinators/names.js';
@@ -42,20 +48,24 @@ import {
   WorldHandleLike,
   ChildRaise,
   ParentResponse,
+  SubTaskRequest,
   SubTaskResponse,
   TaskPullRequest,
   GithubLandingParticipant,
   GitHubMergeAuthorization,
   TaskLandingState,
+  TaskContinuation,
+  TaskRecoveryCheckpoint,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
-import { conversationPublisher } from '../domain/view-publication.js';
+import { conversationPublisher, type TurnConversationBase } from '../domain/view-publication.js';
 import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 
+const coreChild = proxyActivities<childActivities>({ startToCloseTimeout: '20 seconds' });
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
 });
@@ -113,6 +123,11 @@ const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s
 // recorded command, so an in-flight execution must keep scheduling with the proxy
 // its history was written against.
 const boundedCoord = proxyActivities<coordinatorActivities>({
+  startToCloseTimeout: '30s',
+  retry: { maximumAttempts: 5, initialInterval: '1s', backoffCoefficient: 2 },
+});
+
+const turnPreparation = proxyActivities<TurnPreparationActivities>({
   startToCloseTimeout: '30s',
   retry: { maximumAttempts: 5, initialInterval: '1s', backoffCoefficient: 2 },
 });
@@ -215,6 +230,9 @@ export interface SoftwareDevInput extends TaskInput {
   /** Test/embedding override for GitHub policy polling. Production uses the
    * durable 30-second poll from the domain contract. */
   githubPollMs?: number;
+  /** Test override for how many events a run records before it continues as
+   * new (CONTINUE_AFTER_EVENTS). */
+  continueAfterEvents?: number;
 }
 
 const MAX_RESOLVE_ATTEMPTS = 2;
@@ -245,6 +263,31 @@ const MAX_GITHUB_ERROR_POLLS = 3;
  * person is asked for guidance instead of spending agent turns—and, from v1.17,
  * blocking the front landing slot—forever. */
 const MAX_AUTOMATED_LANDING_REPAIRS = 5;
+/** A run continues as new at the top of Do once it has grown by this much since
+ * it started (or loaded a predecessor's conversation), so however many turns a
+ * task takes its history stays far inside Temporal's 51,200-event / 50 MB
+ * limits. That bounds turns, not waits: a run continues only when it reaches
+ * the top of Do, so a run parked anywhere, the sub-task barrier inside Do
+ * included, grows until it is woken. Many waits record nothing meanwhile:
+ * they wake on signals, or on child watchers that poll GitHub and the merge
+ * queue (githubLandingWatch, mergeQueueWatch) and return only on a change.
+ * These still poll in the task:
+ * - the sub-task barrier, while it waits on children it holds no handle for,
+ *   rereads them at intervals doubling from an hour to a day;
+ * - a GitHub wait in a state the watcher cannot serve, and every GitHub wait
+ *   before v1.21, backing off to ten minutes: a v1.20 landing pass records
+ *   about 51 events, about 7,300 a day, so the limit in about seven days;
+ * - a merge-queue wait before v1.9, every 5 s. */
+const CONTINUE_AFTER_EVENTS = 4_000;
+const CONTINUE_AFTER_BYTES = 8 * 1024 * 1024;
+/** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
+const MAX_CONTINUATION_BYTES = 1024 * 1024;
+const CONTINUE_RETRY_EVENTS = 500;
+/** A parent waiting on children it holds no handle for rereads them after an
+ * hour, then at doubling intervals up to a day: about 11 history events per
+ * reread, so once daily the event limit is over a decade away. */
+const CHILD_SETTLEMENT_RECHECK_MS = 60 * 60 * 1000;
+const CHILD_SETTLEMENT_RECHECK_MAX_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
@@ -612,8 +655,17 @@ async function softwareDevImpl(
   // A new activity ARGUMENT is a recorded-input change, so it is versioned too.
   const identifiedAccountReturns = minor >= 10;
   const followUpWakesEscalation = minor >= 10;
+  // Continuing as new restores a run from the recovery checkpoint, whose Do
+  // entry is complete from v1.22 (restoresStagePrerequisites).
+  const continuesAsNew = minor >= 22;
   const taskId = input.taskId;
   const recovery = input.recovery;
+  // A continued run starts from what its predecessor carried: signals and
+  // updates buffered for it run at `setHandler`, before the run can restore
+  // anything, and must act on that state, not overwrite it.
+  const continued = recovery?.continued;
+  const carried = continued?.flags;
+  const carriedCount = continued?.counters;
   let recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
   let stage: Stage = recoveryStage;
   let status: TaskView['status'] = 'active';
@@ -625,23 +677,25 @@ async function softwareDevImpl(
   let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   let base = input.base ?? input.project.defaultBase ?? 'main';
   let goalMode = !!input.goalMode;
-  let confirmed = false;
-  let manualPrConfirmer: string | undefined;
-  let escalationAction: 'openPr' | 'confirm' | undefined;
-  let manualEscalationRequested = false;
-  let prRequested = recoveryStage === 'pr';
-  // checkout name -> head sha it was approved at (multi-PR Review, PLAN-multi-pr.md §3).
+  let confirmed = carried?.confirmed ?? false;
+  let manualPrConfirmer: string | undefined = continued?.manualPrConfirmer;
+  let escalationAction: 'openPr' | 'confirm' | undefined = continued?.escalationAction;
+  let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
+  let prRequested = carried?.prRequested ?? recoveryStage === 'pr';
+  // checkout name -> head sha it was approved at (multi-PR Review).
   let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
-  let checkoutHeads: Record<string, string> = {};
+  let checkoutHeads: Record<string, string> = { ...continued?.checkoutHeads };
   let cancelled = false;
   let lifecycleReplacement = false;
-  let retryRequested = false;
+  let retryRequested = carried?.retryRequested ?? false;
   let resourceResolutionEpoch = 0;
   let providerChangeEpoch = 0;
+  let landingWatcher: ChildWorkflowHandle<typeof githubLandingWatch> | undefined;
+  let landingWatchSequence = carriedCount?.landingWatchSequence ?? 0;
   let awaitingResourceDecision = false;
-  let resourceReviewSequence = 0;
+  let resourceReviewSequence = carriedCount?.resourceReviewSequence ?? 0;
   let applyingResources = false;
-  let resourcesApplied = false;
+  let resourcesApplied = carried?.resourcesApplied ?? false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
@@ -655,7 +709,7 @@ async function softwareDevImpl(
   let agentTurn: TaskView['agentTurn'];
   let agentTurnResumeStatus: TaskView['status'] = 'active';
   let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
-  let error: string | undefined;
+  let error: string | undefined = continued?.error;
   let terminalOrigin: Stage | undefined;
   let prs: TaskPullRequest[] = recovery?.prs?.map((candidate) => ({ ...candidate })) ?? [];
   let pr: TaskPullRequest | undefined = prs[0];
@@ -680,8 +734,8 @@ async function softwareDevImpl(
           : {}) }
     : { authorization: 'none', validation: 'none', provider: 'none' };
   let repairValidationPending = intentAuthorizedLanding && !!recovery?.repairValidationPending;
-  let forceHumanRepairReview = false;
-  let providerQueueAccepted = !frontHeldLanding && intentAuthorizedLanding
+  let forceHumanRepairReview = carried?.forceHumanRepairReview ?? false;
+  let providerQueueAccepted = carried ? carried.providerQueueAccepted : !frontHeldLanding && intentAuthorizedLanding
     && recoveryStage === 'merge'
     && (landing.provider === 'queued' || landing.provider === 'validating')
     && (!fairLanding || landing.authority === 'provider' || landing.authority === 'external');
@@ -693,34 +747,41 @@ async function softwareDevImpl(
   // storage only across one live fallback update/check/merge attempt; every Do
   // or human transition releases it before leaving Landing.
   let retainedMergeDomains: string[] = [];
-  let branchPreparedForPr = explicitPrCycle && (recoveryStage === 'review' || recoveryStage === 'merge');
+  let branchPreparedForPr = carried ? carried.branchPreparedForPr : explicitPrCycle && (recoveryStage === 'review' || recoveryStage === 'merge');
   let mergeQueuePos: { position: number; total: number } | undefined;
   // How many times we've re-prompted the agent to wait for its own in-harness
   // sub-agents this Do phase (bounded by MAX_SUBAGENT_NUDGES).
-  let subagentNudges = 0;
+  let subagentNudges = carriedCount?.subagentNudges ?? 0;
   // Same, for backgrounded shells the agent left running (bounded by MAX_SHELL_NUDGES).
-  let shellNudges = 0;
-  const subTaskIds: string[] = [];
+  let shellNudges = carriedCount?.shellNudges ?? 0;
+  const subTaskIds: string[] = [...continued?.subTasks.ids ?? []];
   // Sub-task hierarchy (SPEC §5.3). Children are managed, not blindly awaited: their
   // handles let us await completion, raised requests queue in `raises`, settlements in
   // `settled`, `outstanding` is the not-yet-finished set, and `awaitingResponse` is the
   // children currently parked on a reply from us.
   const childHandles = new Map<string, ChildWorkflowHandle<typeof softwareDev>>();
-  const raises: ChildRaise[] = [];
-  const settled: { childTaskId: string; stage: string; detail?: string }[] = [];
-  const outstanding = new Set<string>();
-  const awaitingResponse = new Set<string>();
+  // Handles dropped for replaced children: a barrier already waiting without a
+  // timer chooses again, since only a reread can see such a child settle.
+  let droppedChildHandles = 0;
+  // Children started before detached sub-tasks close with this run, so they
+  // rule out continuing as new while outstanding.
+  const attachedChildren = new Set<string>();
+  const raises: ChildRaise[] = [...continued?.subTasks.raises ?? []];
+  const settled: { childTaskId: string; stage: string; detail?: string }[] = [...continued?.subTasks.settled ?? []];
+  const outstanding = new Set<string>(continued?.subTasks.outstanding);
+  const awaitingResponse = new Set<string>(continued?.subTasks.awaitingResponse);
   // Cross-task collaboration is a durable, event-driven join. The requesting
   // agent keeps working for the rest of its current turn; if it finishes before
   // the target publishes, the workflow parks here and wakes on settlement.
-  const pendingCollaborations = new Set<string>();
   /** Requests already settled — guards against a settle that beats its request. */
-  const settledCollaborations = new Set<string>();
-  let pointOfNoReturnPassed = false;
+  const settledCollaborations = new Set<string>(continued?.collaborations.settled);
+  const pendingCollaborations = new Set<string>(continued?.collaborations.pending
+    .filter((id) => !settledCollaborations.has(id)));
+  let pointOfNoReturnPassed = carried?.pointOfNoReturnPassed ?? false;
   let lifecycleTransitionBlocked = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
-  let targetLocked = restoresStagePrerequisites && !!recovery
+  let targetLocked = carried ? carried.targetLocked : restoresStagePrerequisites && !!recovery
     && (['pr', 'review', 'merge'].includes(recoveryStage) || !!recovery.prs?.length);
   let mergeGranted = false;
   let seen = recovery?.seen ?? 0; // messages the Do agent has already processed
@@ -730,7 +791,7 @@ async function softwareDevImpl(
   // process-wide Resolve-agent flag was disabled.
   const recoveredTranscript = (role: string): Message[] =>
     recovery?.transcripts?.find((t) => t.role === role)?.messages.map((m) => ({ ...m })) ?? [];
-  const mergeMsgs: Message[] = recoveredTranscript('merge');
+  const mergeMsgs: Message[] = continued?.mergeMessages?.map((m) => ({ ...m })) ?? recoveredTranscript('merge');
   const resolveMsgs: Message[] = recoveredTranscript('resolve');
   const confirmMsgs: Message[] = recoveredTranscript('confirm');
   const responderMsgs: Message[] = recoveredTranscript('responder');
@@ -744,7 +805,8 @@ async function softwareDevImpl(
   // layers separately means switching back restores the task's original gate.
   // Mutable: the Review route is `untilUsed`, so an in-flight edit replaces these
   // layers and the gate below re-reads them on every iteration (SPEC §4.5/§5.5).
-  let softwareDevConfirmLayers = confirmLayersOf(input.confirm, modeSwitching ? false : !!input.autoConfirm);
+  let softwareDevConfirmLayers = continued?.confirmLayers
+    ?? confirmLayersOf(input.confirm, modeSwitching ? false : !!input.autoConfirm);
   // Bumped by every accepted `confirm` edit. The Review gate captures it before it
   // parks; a change while parked means the route it was playing is stale, so the
   // gate replays from its first layer rather than crediting layers approved under
@@ -755,6 +817,8 @@ async function softwareDevImpl(
   // The epoch wakes a human pause so an accepted edit reroutes that same question.
   let liveResponder = input.responder;
   let responderEpoch = 0;
+  let responderRounds = carriedCount?.responderRounds ?? 0;
+  let subtaskNags = carriedCount?.subtaskNags ?? 0;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   type AccountGrant = {
     accountId: string;
@@ -769,7 +833,7 @@ async function softwareDevImpl(
   // credential, so its re-lease parks until that credential recovers.
   let limitReportedToCoordinator = false;
   let turnSeq = 0;
-  let accountPool = 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
+  let accountPool = continued?.accountPool ?? 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
   // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
   // signal aborts the in-flight agent turn instead of waiting for it to finish.
   let activeTurn: CancellationScope | undefined;
@@ -784,12 +848,13 @@ async function softwareDevImpl(
   // the next best convenience in the conversation: the next turn that role runs
   // (e.g. a Do follow-up, a merge retry, or the next resolve attempt).
   const liveInput: SoftwareDevInput = { ...input, agents: { ...(input.agents ?? {}) } };
+  if (patched('software-dev-omit-recovery-input-v1')) delete liveInput.recovery;
   // Params the workflow has already consumed (value now load-bearing). `target` is
   // consumed once locked (PR open / merge enqueue); an auxiliary agent's IDENTITY
   // (provider/session) once its turn runs — its model/effort stay retunable after;
   // `confirm` once the Review gate it drives has fully passed (a gate that sends the
   // task back to Do will play again, so the route is not consumed yet).
-  const consumed = new Set<string>();
+  const consumed = new Set<string>(continued?.consumed);
   if (restoresStagePrerequisites && recoveryStage === 'merge') consumed.add('confirm');
   const isConsumed = (name: string): boolean => (name === 'target' ? targetLocked : consumed.has(name));
   const paramEditable = (name: string): boolean =>
@@ -900,6 +965,7 @@ async function softwareDevImpl(
     if (mutableInputResponder && patch.responder && typeof patch.responder === 'object') {
       liveResponder = patch.responder as ResponderConfig;
       responderEpoch++;
+      responderRounds = 0;
       applied.push('responder');
     }
     for (const name of Object.keys(patch)) {
@@ -1026,6 +1092,7 @@ async function softwareDevImpl(
         confirmed,
         ...(applyingResources ? { applyingResources: true } : {}),
         cancelled,
+        ...(lifecycleReplacement ? { lifecycleReplacement: true } : {}),
         turnsSeen: seen,
         worldReady: !!world,
         mergeGranted,
@@ -1063,13 +1130,28 @@ async function softwareDevImpl(
       // The task-scope params the UI may edit right now (SPEC §5.5): declared
       // `untilUsed` fields not yet consumed. `queue` fields never appear here.
       editableParams: editableParamsNow(),
-      updatedAt: workflowInfo().historyLength,
+      updatedAt: (continued?.updatedAtBase ?? 0) + workflowInfo().historyLength,
     };
   }
 
+  // Deltas and turn references keep each turn's history cost to its new
+  // messages instead of re-recording the whole transcript (WF-4).
   const publishConversation = conversationPublisher(workflowInfo().runId,
-    (view, reference) => publishTaskView(core, taskId, view, reference));
+    (view, reference) => publishTaskView(core, taskId, view, reference),
+    { patches: () => patched('software-dev-conversation-delta-v1') });
+  const turnMessages = (messages: Message[], role: AgentRole): { messages: Message[]; messagesBase?: TurnConversationBase } => {
+    if (!patched('software-dev-turn-conversation-reference-v1')) return { messages };
+    const { base, messages: rest } = publishConversation.turnBase(messages, role);
+    return base ? { messages: rest, messagesBase: base } : { messages };
+  };
+  // Until a continued run has loaded its conversation, the view would show an
+  // empty one: the view query refuses, publications wait, and messages that
+  // arrive meanwhile are appended after the loaded conversation.
+  let loadingConversation = !!continued;
+  const afterLoad: (() => void)[] = [];
+  const whenLoaded = (append: () => void) => { if (loadingConversation) afterLoad.push(append); else append(); };
   async function publish() {
+    if (loadingConversation) await condition(() => !loadingConversation);
     // Apply at the live edge of existing executions as well as new task pins.
     if (patched('software-dev-conversation-publication-v1')) {
       await publishConversation(buildView());
@@ -1199,6 +1281,7 @@ async function softwareDevImpl(
             return 'do';
           }
         }
+        if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
         waitingFor = {
           kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'],
@@ -1248,7 +1331,10 @@ async function softwareDevImpl(
   const conversationFor = (role?: string): Message[] =>
     role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : role === 'confirm' ? confirmMsgs
       : role === 'responder' ? responderMsgs : msgs;
-  setHandler(viewQuery, buildView);
+  setHandler(viewQuery, () => {
+    if (loadingConversation) throw new Error('The task is loading its conversation after continuing as new; try again.');
+    return buildView();
+  });
   setHandler(agentTurnStateSignal, async (next) => {
     // Ignore a late state signal from an activity that was cancelled/retried after
     // a newer turn took ownership of the view.
@@ -1277,13 +1363,17 @@ async function softwareDevImpl(
   });
   setHandler(followUpSignal, (m, role) => {
     manualPrConfirmer = undefined;
+    responderRounds = 0;
+    subtaskNags = 0;
     // Route the follow-up into the addressed agent's transcript (SPEC §5.5/§5.6).
     // Do is the default; merge/resolve queue it so it reaches that agent on its
     // next turn (each turn is fed its own accumulated transcript). A turn currently
     // running polls `pendingMessagesQuery` and injects it live (in-flight).
-    const target = conversationFor(role);
-    if (!target.some((candidate) => candidate.id === m.id))
-      target.push({ ...m, ts: m.ts || target.length });
+    whenLoaded(() => {
+      const target = conversationFor(role);
+      if (!target.some((candidate) => candidate.id === m.id))
+        target.push({ ...m, ts: m.ts || target.length });
+    });
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'followUp', role };
   });
@@ -1300,14 +1390,17 @@ async function softwareDevImpl(
   setHandler(collaborationSettledSignal, (requestId, message) => {
     settledCollaborations.add(requestId);
     pendingCollaborations.delete(requestId);
-    if (!msgs.some((candidate) => candidate.id === message.id))
-      msgs.push({ ...message, ts: message.ts || msgs.length });
+    whenLoaded(() => {
+      if (!msgs.some((candidate) => candidate.id === message.id))
+        msgs.push({ ...message, ts: message.ts || msgs.length });
+    });
   });
   setHandler(resourceResolvedSignal, () => {
     resourceResolutionEpoch++;
   });
-  if (fairLanding) setHandler(providerChangedSignal, () => {
+  if (fairLanding) setHandler(providerChangedSignal, async () => {
     providerChangeEpoch++;
+    await landingWatcher?.signal('providerChanged').catch(() => undefined);
   });
   setHandler(confirmSignal, () => {
     if (awaitingResourceDecision) return;
@@ -1355,7 +1448,7 @@ async function softwareDevImpl(
       cancelled = true;
       activeSetup?.cancel();
       activeTurn?.cancel();
-      cancelChildren();
+      if (!patched('software-dev-preserve-replacement-children-v1')) cancelChildren();
     }
   });
   setHandler(retrySignal, () => {
@@ -1364,7 +1457,15 @@ async function softwareDevImpl(
       humanPauseWake = { kind: 'retry' };
   });
   // A child raised to us: queue it so the Do agent can answer (SPEC §5.3).
+  // A child settles when its durable view does, which the publish activity
+  // signals here (platform/child-settlement.ts); that follows the task across
+  // lifecycle replacements of its run. A replaced run's own result is not a
+  // settlement: the task goes on in a successor run (WF-31).
+  const durableChildSettlement = patched('software-dev-durable-child-settlement-v1');
+  if ((recovery && patched('software-dev-preserve-replacement-children-v1')) || durableChildSettlement)
+    setHandler(defineSignal<[ { childTaskId: string; stage: Stage } ]>('childSettled'), (result) => { settled.push(result); });
   setHandler(raiseFromChildSignal, (r) => {
+    if (!awaitingResponse.has(r.childTaskId)) subtaskNags = 0;
     raises.push(r);
     awaitingResponse.add(r.childTaskId);
   });
@@ -1398,7 +1499,7 @@ async function softwareDevImpl(
         activeTurn?.cancel();
       }
     } else if (resp.action === 'comment') {
-      if (resp.text) msgs.push({ id: `p-${msgs.length}`, role: 'user', text: resp.text, ts: msgs.length });
+      if (resp.text) whenLoaded(() => msgs.push({ id: `p-${msgs.length}`, role: 'user', text: resp.text!, ts: msgs.length }));
       retryRequested = true; // unblocks an escalated child; at Review the new msg drives it
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'followUp', role: 'do' };
@@ -1461,12 +1562,12 @@ async function softwareDevImpl(
         // and wakes a Software Dev task already waiting at Review. In the latter
         // case the workflow returns to Do instead of auto-approving potentially
         // partial work that pre-dated the mode switch.
-        msgs.push({
+        whenLoaded(() => msgs.push({
           id: `mode-${msgs.length}`,
           role: 'user',
           text: 'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.',
           ts: msgs.length,
-        });
+        }));
         if (responsiveHumanHold && humanPauseActive)
           humanPauseWake = { kind: 'workflowChange', role: 'do' };
       }
@@ -1617,7 +1718,7 @@ async function softwareDevImpl(
                   worldHandle: world as any,
                   // Include the resolve agent's full transcript so a human follow-up
                   // addressed to it (SPEC §5.6) reaches it on this turn.
-                  messages: resolveMsgs,
+                  ...turnMessages(resolveMsgs, 'resolve'),
                   task: liveInput,
                   bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
                   accountConfigHome,
@@ -1760,6 +1861,7 @@ async function softwareDevImpl(
       admission?: { agentAdmissionManaged: true; agentSlotGranted?: true },
     ) => Promise<T>,
   ): Promise<T> {
+    const compactStart = patched('software-dev-compact-turn-start-v1');
     /** v1.1 publishes the host-admission state before scheduling the turn. The
      * activity changes it to `running` only after it actually acquires a slot. */
     const admittedTurn = async (
@@ -1780,7 +1882,7 @@ async function softwareDevImpl(
           provider,
           detail: durableAgentAdmission ? 'Starting agent' : 'Waiting for host capacity to run the agent',
         };
-        await publish();
+        if (!compactStart) await publish();
       }
       let slotHeld = false;
       let slotRequested = false;
@@ -1830,8 +1932,16 @@ async function softwareDevImpl(
               }
               if (cancelled && !slotHeld) throw new Cancelled();
               waitingFor = { kind: 'agentSlot', provider, detail: 'Starting agent' };
-              await publish();
+              if (!compactStart) await publish();
             }
+          }
+          if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
+          if (compactStart && liveAgentStates) {
+            waitingFor = { kind: 'agentSlot', provider, detail: 'Starting agent' };
+            await publish();
+            // A cancel delivered while that view was being published must still
+            // stop the turn before it starts (WF-11).
+            if (cancelled) throw new Cancelled();
           }
           return await fn(
             home,
@@ -1862,13 +1972,18 @@ async function softwareDevImpl(
       }
     };
 
+    const prepared = compactStart
+      ? await turnPreparation.prepareAgentTurn({ taskId, role, task: liveInput }) : undefined;
+    if (prepared) accountPool = prepared.accountPool;
+    else if (patched('agent-turn-account-pool-refresh-v1')) accountPool = await coordinator.accountPoolSize();
     // v1 took this exact zero-activity passthrough. v1.1 still exposes host-slot
     // admission even when there is no configured account pool.
     if (accountPool <= 0) {
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
       return await admittedTurn(agentTurnId(taskId, turnSeq++), undefined, status);
     }
-    const prov = await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
+    const prov = compactStart ? prepared?.provider
+      : await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
     const credentialProvider = typeof prov === 'string' && prov ? prov : undefined;
     if (!credentialProvider) {
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
@@ -1890,7 +2005,7 @@ async function softwareDevImpl(
     // apart: replay reports the marker unknown here exactly when the history
     // recorded it after that resolution, or not at all (both resolved first then).
     // Live executions take the current order.
-    const resolvedFirst = !patched('agent-turn-run-identity-v1');
+    const resolvedFirst = !compactStart && !patched('agent-turn-run-identity-v1');
     const firstAllowed = resolvedFirst ? await resolveAllowed() : undefined;
     const turnId = agentTurnId(taskId, turnSeq++);
     let priorStatus = status;
@@ -1899,8 +2014,11 @@ async function softwareDevImpl(
     // The coordinator hands a parked request back when credentials change under
     // it (a new login, a policy edit); resolve the allow-list again and re-ask.
     for (;;) {
-      // A re-ask must not reuse the first, now stale, list.
-      const allowed = requests === 0 && resolvedFirst ? firstAllowed : await resolveAllowed();
+      // The first ask may use a list resolved above (by a compact start, with the
+      // provider); a re-ask must not reuse that stale list.
+      const allowed = requests === 0 && compactStart ? prepared?.allowed
+        : requests === 0 && resolvedFirst ? firstAllowed
+        : await resolveAllowed();
       const lease = await coordinator.leaseAccount(taskId, turnId, credentialProvider, allowed);
       if (requests++ === 0) priorStatus = status;
       status = 'waiting';
@@ -1912,7 +2030,7 @@ async function softwareDevImpl(
         : { kind: 'account', provider: credentialProvider,
             ...(lease?.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
             ...(lease?.detail ? { detail: lease.detail } : {}) };
-      await publish();
+      if (!compactStart || lease?.waiting !== false) await publish();
       if (liveAgentStates) {
         // The coordinator owns refresh timers and signals every grant. An arbitrary
         // workflow-side timeout used to fall through with no grant and accidentally
@@ -1938,7 +2056,12 @@ async function softwareDevImpl(
       if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
       await publish();
     }
-    if (liveAgentStates && cancelled) throw new Cancelled();
+    if (liveAgentStates && cancelled) {
+      if (grant && grant.accountId !== '(passthrough)' && grant.accountId !== '(denied)'
+        && grant.accountId !== RELIST_ACCOUNT_GRANT && patched('software-dev-return-cancelled-grant-v1'))
+        await coordinator.returnAccount(grant.accountId, { taskId, turnId }).catch(() => undefined);
+      throw new Cancelled();
+    }
     // A coordinator replaying pre-credential-wait history denies a turn whose every
     // allowed credential needs human action (#5): escalate rather than run/park.
     // Current coordinators park that request until a credential recovers.
@@ -2016,7 +2139,10 @@ async function softwareDevImpl(
     const scope = new CancellationScope({ cancellable: true });
     activeTurn = scope;
     try {
-      return await scope.run(fn);
+      return await scope.run(async () => {
+        if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
+        return await fn();
+      });
     } finally {
       activeTurn = undefined;
     }
@@ -2054,7 +2180,7 @@ async function softwareDevImpl(
           taskId,
           role: 'do',
           worldHandle: world as any,
-          messages: msgs,
+          ...turnMessages(msgs, 'do'),
           session: resume,
           deliveredMessages: resume ? seen : 0,
           task: liveInput,
@@ -2143,7 +2269,7 @@ async function softwareDevImpl(
         worldHandle: world as any,
         // Feed the Merge agent its full transcript so a retry has the rejection
         // context and role-addressed human follow-ups are not lost.
-        messages: mergeMsgs,
+        ...turnMessages(mergeMsgs, 'merge'),
         session: sessionMatchesHome(accountConfigHome) ? session : undefined,
         task: liveInput,
         bindings: { reviewInfo: reviewInfo?.summary ?? '' },
@@ -2212,7 +2338,7 @@ async function softwareDevImpl(
           taskId,
           role: 'confirm',
           worldHandle: world as any,
-          messages: confirmMsgs,
+          ...turnMessages(confirmMsgs, 'confirm'),
           task: liveInput,
           bindings: {
             reviewInfo: reviewInfo?.summary ?? '',
@@ -2278,7 +2404,7 @@ async function softwareDevImpl(
         taskId,
         role: 'responder',
         worldHandle: world as any,
-        messages: responderMsgs,
+        ...turnMessages(responderMsgs, 'responder'),
         task: liveInput,
         bindings: { transcript: lastOutputs(msgs) },
         accountConfigHome,
@@ -2390,7 +2516,18 @@ Inspect the complete current diff and specifically compare its delta from the re
   /** Record a child's eventual settlement so the management loop can react. */
   function trackChild(childTaskId: string, child: ChildWorkflowHandle<typeof softwareDev>) {
     child.result().then(
-      (res) => settled.push({ childTaskId, stage: (res as { stage: Stage }).stage }),
+      (res) => {
+        if (durableChildSettlement && (res as { lifecycleReplacement?: boolean }).lifecycleReplacement) {
+          // The child goes on in a successor run this handle cannot follow, so
+          // it is reread at the barrier like a restored child.
+          if (patched('software-dev-forget-replaced-child-handle-v1')) {
+            childHandles.delete(childTaskId);
+            droppedChildHandles++;
+          }
+          return;
+        }
+        settled.push({ childTaskId, stage: (res as { stage: Stage }).stage });
+      },
       (err) => settled.push({ childTaskId, stage: 'failed', detail: describeError(err) }),
     );
   }
@@ -2399,7 +2536,7 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  off — and merges back into — THIS task's world branch, so `main` sees one merge at
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
-  async function spawnSubTasks(list: { title: string; prompt: string }[]) {
+  async function spawnSubTasks(list: SubTaskRequest[]) {
     await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
     for (const s of list) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
@@ -2426,9 +2563,13 @@ Inspect the complete current diff and specifically compare its delta from the re
         // Branch-scoped, least-privilege grant for the child (SPEC §8.2).
         parentBranch: world!.branch,
         parentGrant: input.grant,
+        // The child's own agent choice (PL-11). Only the activity's argument
+        // changes, never a command, so recorded histories replay unchanged.
+        ...(s.params ? { params: s.params } : {}),
       });
       subTaskIds.push(childInput.taskId);
       outstanding.add(childInput.taskId);
+      const detached = patched('software-dev-detached-subtask-cancellation-v1');
       const child = await startChild<typeof softwareDev>(
         childWorkflowType(behaviorVersion),
         {
@@ -2442,11 +2583,10 @@ Inspect the complete current diff and specifically compare its delta from the re
           // its workflow cleanup. Detach new children so the signal remains the
           // authority after the parent closes; `patched` preserves the original
           // StartChild command when replaying histories recorded before this fix.
-          ...(patched('software-dev-detached-subtask-cancellation-v1')
-            ? { parentClosePolicy: ParentClosePolicy.ABANDON }
-            : {}),
+          ...(detached ? { parentClosePolicy: ParentClosePolicy.ABANDON } : {}),
         },
       );
+      if (!detached) attachedChildren.add(childInput.taskId);
       childHandles.set(childInput.taskId, child);
       trackChild(childInput.taskId, child);
     }
@@ -2464,7 +2604,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         } catch {
           /* child already gone */
         }
-        awaitingResponse.delete(cid);
+        if (awaitingResponse.delete(cid)) subtaskNags = 0;
       }
     }
   }
@@ -2509,6 +2649,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
     while (settled.length) {
       const s = settled.shift()!;
+      // Both a run's result and the durable signal report one settlement.
+      if (((recovery && patched('software-dev-preserve-replacement-children-v1')) || durableChildSettlement)
+        && !outstanding.has(s.childTaskId)) continue;
+      subtaskNags = 0;
       outstanding.delete(s.childTaskId);
       awaitingResponse.delete(s.childTaskId);
       msgs.push({
@@ -2518,6 +2662,96 @@ Inspect the complete current diff and specifically compare its delta from the re
         ts: msgs.length,
       });
     }
+  }
+
+  // ── Continue-as-new (WF-3, WF-4) ──
+  // A long task continues as new at the top of Do, between turns, so its
+  // history stays bounded. The next run enters Do through the recovery
+  // checkpoint with `continued` carrying the rest of the in-flight state; the
+  // transcripts travel by reference to the acknowledged view publication.
+  let runStart = { events: 0, bytes: 0 };
+  // A continuation refused for a passing reason (the pin briefly foreign, a
+  // republish racing new messages) is retried after this many more events.
+  let continueRetryAt = 0;
+  const historyGrown = () => workflowInfo().historyLength >= continueRetryAt
+    && (workflowInfo().historyLength - runStart.events >= (input.continueAfterEvents ?? CONTINUE_AFTER_EVENTS)
+      || workflowInfo().historySize - runStart.bytes >= CONTINUE_AFTER_BYTES);
+  const retryContinuationLater = () => {
+    continueRetryAt = workflowInfo().historyLength + CONTINUE_RETRY_EVENTS;
+  };
+
+  function continuationInput(conversation: string, runPinned: boolean): SoftwareDevInput {
+    const { recovery: _previous, ...next } = liveInput;
+    return { ...next, base, goalMode, responder: liveResponder, recovery: {
+      resumeStage: 'do', messages: [], world: world as TaskRecoveryCheckpoint['world'], session, sessionHome, seen, target,
+      prs, reviewInfo, checkoutApprovals, landing, repairValidationPending,
+      continued: {
+        conversation,
+        ...(explicitPrCycle && mergeMsgs.length ? { mergeMessages: mergeMsgs } : {}),
+        runPinned,
+        updatedAtBase: (continued?.updatedAtBase ?? 0) + workflowInfo().historyLength,
+        goalMode,
+        confirmLayers: softwareDevConfirmLayers,
+        subTasks: { ids: subTaskIds, outstanding: [...outstanding], awaitingResponse: [...awaitingResponse], raises, settled },
+        collaborations: { pending: [...pendingCollaborations], settled: [...settledCollaborations] },
+        consumed: [...consumed],
+        checkoutHeads,
+        accountPool,
+        flags: { targetLocked, pointOfNoReturnPassed, branchPreparedForPr, forceHumanRepairReview, providerQueueAccepted,
+          prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied },
+        ...(manualPrConfirmer ? { manualPrConfirmer } : {}),
+        ...(escalationAction ? { escalationAction } : {}),
+        ...(error ? { error } : {}),
+        counters: { responderRounds, subtaskNags, subagentNudges, shellNudges, landingWatchSequence, resourceReviewSequence },
+      },
+    } };
+  }
+
+  /** Continue as new if nothing in flight would be lost; otherwise keep going. */
+  async function continueRun(): Promise<void> {
+    // Checked again at every Do turn: children and landing slots finish, and
+    // the carried input is measured in encoded bytes, as Temporal limits it.
+    if (retainedMergeDomains.length || [...outstanding].some((id) => attachedChildren.has(id))
+      || new TextEncoder().encode(JSON.stringify(continuationInput('', false))).length > MAX_CONTINUATION_BYTES) return;
+    const pin = await core.releaseTaskRun(taskId);
+    if (pin === 'foreign') return retryContinuationLater();
+    // The next run reads the conversation from the last acknowledged
+    // publication, so republish until nothing changed while one was in flight.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await condition(allHandlersFinished);
+      // A cancel or replacement ends this run instead.
+      if (cancelled) break;
+      const conversation = publishConversation.acknowledges(buildView());
+      if (conversation) return continueAsNew<typeof softwareDev>(continuationInput(conversation, pin === 'released'));
+      await publish();
+    }
+    if (!cancelled) retryContinuationLater();
+    if (pin === 'released') await core.adoptTaskRun(taskId);
+  }
+
+  /** The first step of a continued run: load what `continueRun` carried by
+   * reference. Everything carried by value is restored where it is declared. */
+  async function resumeContinuedRun(c: TaskContinuation): Promise<void> {
+    if (c.runPinned) await core.adoptTaskRun(taskId);
+    const loaded = new Map<string, Message[]>();
+    let offset: number | undefined = 0;
+    while (offset !== undefined) {
+      const page: { roles: { role: string; messages: Message[] }[]; next?: number } =
+        await core.readConversationPage(taskId, c.conversation, offset);
+      for (const { role, messages } of page.roles) loaded.set(role, [...(loaded.get(role) ?? []), ...messages]);
+      offset = page.next;
+    }
+    for (const role of ['do', 'merge', 'resolve', 'confirm', 'responder'])
+      conversationFor(role).push(...(loaded.get(role) ?? []));
+    // The publisher adopts exactly the snapshot, so later writes stay deltas.
+    publishConversation.seed(c.conversation, { messages: msgs, transcripts: buildTranscripts() });
+    loadingConversation = false;
+    for (const append of afterLoad.splice(0)) append();
+    // The predecessor learned of a child that failed or was terminated from
+    // its handle, which this run lacks; the child's durable view still says.
+    if (outstanding.size) for (const child of await coreChild.settledChildTasks(taskId, [...outstanding]))
+      if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
+    runStart = { events: workflowInfo().historyLength, bytes: workflowInfo().historySize };
   }
 
   /** Tell our parent (if any) we need a decision (SPEC §5.3). Best effort — if the
@@ -2538,6 +2772,19 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   try {
   // ── Setup ──
+  if (continued) await resumeContinuedRun(continued);
+  else if (recovery && patched('software-dev-preserve-replacement-children-v1')) {
+    const children = await coreChild.restoreChildTasks(taskId);
+    for (const child of children) {
+      subTaskIds.push(child.taskId);
+      outstanding.add(child.taskId);
+      if (child.waiting) {
+        awaitingResponse.add(child.taskId);
+        raises.push({ childTaskId: child.taskId, childTitle: child.title, type: 'needs_info', detail: child.detail });
+      }
+
+    }
+  }
   await publish();
   if (cancellableSetup && cancelled) return await abort();
   if (!world) {
@@ -2566,7 +2813,10 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
-  accountPool = await coordinator.accountPoolSize().catch(() => 0);
+  if (!patched('software-dev-compact-turn-start-v1'))
+    accountPool = patched('agent-turn-account-pool-refresh-v1')
+      ? await withResolve('setup', () => coordinator.accountPoolSize())
+      : await coordinator.accountPoolSize().catch(() => 0);
 
   // A platform-requested human hold is deliberately outside the pipeline. Keep
   // the originating stage visible. An explicit Resume always wakes it; v1.7 also
@@ -2628,7 +2878,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (githubAuthoritativeMerge) {
         const reopened = await withResolve('pr', () => core.openPr(world as any, target, {
           title: input.title,
-          summary: reviewInfo?.summary ?? lastOutputs(msgs),
+          summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
         }));
         prs = reopened ?? [];
         pr = prs[0];
@@ -2730,6 +2980,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     drainChildEvents();
     await publish();
     if (cancelled) return await abort();
+    if (continuesAsNew && historyGrown() && patched('software-dev-continue-as-new-v1')) {
+      await continueRun();
+      if (cancelled) return await abort();
+    }
 
     // A human/parent may request Open PR while the task is already parked. That
     // transition uses the proposal the Do agent just produced; it must not spend
@@ -2790,7 +3044,11 @@ Inspect the complete current diff and specifically compare its delta from the re
         // so the parent's own Review/Merge never races ahead of its delegated work.
         // Stay responsive: wake on a child raise/settlement or a human follow-up.
         status = 'waiting';
-        waitingFor = { kind: 'subtask' };
+        const boundedNags = patched('software-dev-bounded-input-loops-v1');
+        const needsHuman = boundedNags && awaitingResponse.size > 0 && subtaskNags >= 3;
+        waitingFor = needsHuman
+          ? { kind: 'human', audience: ['@creator'], detail: 'The managing agent has not answered its children after three reminders. Send guidance to continue.' }
+          : { kind: 'subtask' };
         await publish();
         const wake = () => raises.length > 0 || settled.length > 0 || cancelled || msgs.length > seen;
         // If a child is still awaiting OUR reply (it raised a needs_confirmation /
@@ -2800,8 +3058,33 @@ Inspect the complete current diff and specifically compare its delta from the re
         // and re-prompt the agent (the unresolved raise is still in the conversation)
         // until it acts — SPEC §5.3 "keep prompting". With nothing awaiting us, wait
         // indefinitely for the next child event or human follow-up.
-        if (awaitingResponse.size > 0) await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
-        else await condition(wake);
+        for (let chosen = false; !chosen;) {
+          const drops = droppedChildHandles;
+          chosen = true;
+          if (awaitingResponse.size > 0 && !needsHuman) {
+            if (boundedNags) subtaskNags++;
+            await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
+          } else if (!needsHuman && [...outstanding].some((id) => !childHandles.has(id))
+            && patched('software-dev-child-settlement-recheck-v1')) {
+            // A child restored without its handle (after continue-as-new or a
+            // replacement) is reported only by a best-effort signal, so its
+            // durable view is read again while the task waits. A wake does not
+            // wait for a read in flight.
+            const woken = condition(wake).then(() => undefined, () => undefined);
+            for (let delay = CHILD_SETTLEMENT_RECHECK_MS; !(await condition(wake, delay));
+              delay = Math.min(delay * 2, CHILD_SETTLEMENT_RECHECK_MAX_MS)) {
+              const scope = new CancellationScope({ cancellable: true });
+              const read = scope.run(() => coreChild.settledChildTasks(taskId, [...outstanding])).catch(() => []);
+              const children = await Promise.race([read, woken]);
+              if (!children) { scope.cancel(); break; }
+              for (const child of children)
+                if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
+            }
+          } else {
+            await condition(() => wake() || droppedChildHandles > drops);
+            chosen = wake();
+          }
+        }
         if (cancelled) return await abort();
       }
       // Otherwise the agent kept working (spawned/answered this turn) — loop and run
@@ -2831,7 +3114,8 @@ Inspect the complete current diff and specifically compare its delta from the re
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
         await publish();
-        await condition(() => cancelled || msgs.length > seen, '30 seconds');
+        if (patched('service-connections-signal-wait-v1')) await condition(() => cancelled || msgs.length > seen);
+        else await condition(() => cancelled || msgs.length > seen, '30 seconds');
       }
       if (cancelled) return await abort();
       if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }
@@ -3016,7 +3300,9 @@ Inspect the complete current diff and specifically compare its delta from the re
             while (!prRequested && !cancelled && msgs.length <= seen) {
               const routeEpoch = responderEpoch;
               const route = liveResponder;
-              if (routedInputResponder && route?.kind === 'agent') {
+              const boundedResponses = patched('software-dev-bounded-input-loops-v1');
+              if (routedInputResponder && route?.kind === 'agent' && (!boundedResponses || responderRounds < 3)) {
+                if (boundedResponses) responderRounds++;
                 waitingFor = { kind: 'responder', detail: question };
                 await publish();
                 const answer = await responderTurn(route, question);
@@ -3044,7 +3330,8 @@ Inspect the complete current diff and specifically compare its delta from the re
                   audience: routedInputResponder && route?.kind === 'human' && route.audience?.length
                     ? route.audience
                     : ['@creator'],
-                  detail: question,
+                  detail: boundedResponses && route?.kind === 'agent' && responderRounds >= 3
+                    ? `Three automated responses have not resolved this pause. ${question}` : question,
                 };
               }
               await publish();
@@ -3097,7 +3384,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             try {
               return { prs: await core.openPr(world as any, target, {
                 title: input.title,
-                summary: reviewInfo?.summary ?? lastOutputs(msgs),
+                summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
               }) };
             } catch (err) {
               if (failureHasType(err, 'task-branch-conflict')
@@ -3146,7 +3433,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           branchPreparedForPr = true;
           const opened = await withResolve('pr', () => core.openPr(world as any, target, {
             title: input.title,
-            summary: reviewInfo?.summary ?? lastOutputs(msgs),
+            summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
           }));
           prs = opened ?? [];
           pr = prs[0];
@@ -3293,7 +3580,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
     const opened = await withResolve('pr', () => core.openPr(world as any, target, {
       title: input.title,
-      summary: reviewInfo?.summary ?? lastOutputs(msgs),
+      summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
     }));
     prs = opened ?? [];
     pr = prs[0];
@@ -3325,6 +3612,74 @@ Inspect the complete current diff and specifically compare its delta from the re
   let mergeConflict: string | undefined;
   let mergeDirty: string | undefined;
   let githubErrorPolls = 0;
+  let observedPreflight: GitHubMergeAuthorization | undefined;
+  let priorPreflight: GitHubMergeAuthorization | undefined;
+  // A parent-side poll repeats the whole landing pass. While what it observes
+  // is unchanged, each wait doubles up to ten minutes, so polls the watcher
+  // cannot serve grow history more slowly, though still without bound (LT-12):
+  // current pins in states the watcher does not cover, and every pin before
+  // v1.21. A v1.20 webhook still wakes it at once.
+  let githubPollStreak = 0;
+  let githubPollObservation: string | undefined;
+  function githubPollDelay(pollMs: number | string, observation: GitHubMergeAuthorization): number | string {
+    if (!patched('software-dev-github-poll-backoff-v1')) return pollMs;
+    const key = JSON.stringify(observation);
+    githubPollStreak = key === githubPollObservation ? githubPollStreak + 1 : 0;
+    githubPollObservation = key;
+    return githubPollStreak ? Math.min(msToNumber(pollMs as Duration) * 2 ** githubPollStreak, 600_000) : pollMs;
+  }
+  async function waitForGithubChange(pollMs: number, observation: GitHubMergeAuthorization, repeatedFailure = false) {
+    // Keep leases and landing mutations in the parent. The watcher returns on
+    // any readiness change, including checks or target movement under fallback.
+    // A repeated terminal failure the preflight itself reported is watched the
+    // same way: a new run, head or target changes that preflight.
+    if (participantLanding && githubAuthoritativeMerge && priorPreflight
+      && (repeatedFailure
+        ? priorPreflight.status === 'needs-revision'
+          && priorPreflight.repair?.fingerprint === observation.repair?.fingerprint
+          && patched('software-dev-watch-repeated-landing-failure-v1')
+        : (priorPreflight.status === 'waiting' || priorPreflight.status === 'queued'
+          || (priorPreflight.status === 'planned' && priorPreflight.observationKey !== undefined))
+          && patched('software-dev-cheap-github-wait-v1'))) {
+      const previous = priorPreflight;
+      const providerSeen = providerChangeEpoch;
+      await runCancellable(async () => {
+        landingWatcher = await startChild(githubLandingWatch, {
+          workflowId: `${workflowInfo().workflowId}/landing-watch/${landingWatchSequence++}`,
+          args: [{ world: world!, previous, authority: configuredLandingAuthority, pollMs }],
+          parentClosePolicy: ParentClosePolicy.TERMINATE,
+        });
+        try {
+          if (providerChangeEpoch > providerSeen) await landingWatcher.signal('providerChanged');
+          observedPreflight = await landingWatcher.result();
+        }
+        finally { landingWatcher = undefined; }
+      });
+    } else {
+      const providerSeen = providerChangeEpoch;
+      await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), githubPollDelay(pollMs, observation));
+    }
+  }
+  // Even an unchanged position poll recorded about 11 events every 30 s, so a
+  // long merge-queue wait reached the history limit in about 1.5 days. A child
+  // watches the position instead and returns only when it changes; the grant
+  // still wakes the task at once (WF-3).
+  let mergeQueueWatches = 0;
+  async function watchMergeQueue(domain: string, previous: TaskView['mergeQueue']): Promise<void> {
+    // A watcher that fails ends the wait too: the task's own poll surfaces it.
+    let changed = false;
+    const scope = new CancellationScope({ cancellable: true });
+    void scope.run(async () => {
+      const watcher = await startChild(mergeQueueWatch, {
+        workflowId: `${workflowInfo().workflowId}/merge-queue-watch/${workflowInfo().runId}/${mergeQueueWatches++}`,
+        args: [{ domain, taskId, previous, pollMs: MERGE_POLL }],
+        parentClosePolicy: ParentClosePolicy.TERMINATE,
+      });
+      await watcher.result();
+    }).catch(() => undefined).finally(() => { changed = true; });
+    await condition(() => mergeGranted || cancelled || changed);
+    if (!changed) scope.cancel();
+  }
   for (;;) {
     stage = 'merge';
     status = 'active';
@@ -3366,9 +3721,11 @@ Inspect the complete current diff and specifically compare its delta from the re
     let plannedParticipants: GithubLandingParticipant[] = [];
     let fallbackPrs: TaskPullRequest[] = [];
     if (participantLanding && githubAuthoritativeMerge) {
-      const preflight = await core.mergeGithubPrs(world as any, prs, {
+      const preflight = observedPreflight ?? await core.mergeGithubPrs(world as any, prs, {
         mode: 'preflight', authority: configuredLandingAuthority,
       });
+      observedPreflight = undefined;
+      priorPreflight = preflight;
       prs = mergePrSnapshots(prs, preflight.prs);
       pr = prs[0];
       if (preflight.status !== 'planned') {
@@ -3464,7 +3821,8 @@ Inspect the complete current diff and specifically compare its delta from the re
             mergeQueuePos = pos;
             await publish();
           }
-          await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
+          if (boundedMergeWait && patched('software-dev-merge-queue-watch-v1')) await watchMergeQueue(domain, pos);
+          else await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
         }
         if (cancelled && !mergeGranted) {
           await coordinator.cancelMerge(domain, taskId); // drop the slot we're still waiting on
@@ -3509,7 +3867,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           // updates the existing PR rather than creating another one.
           const refreshed = await core.openPr(world as any, target, {
             title: input.title,
-            summary: reviewInfo?.summary ?? lastOutputs(msgs),
+            summary: pullRequestSummary(reviewInfo?.summary, msgs, !patched('github-public-pr-summary-v1')),
           });
           prs = refreshed;
           pr = prs[0];
@@ -3723,8 +4081,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         status = 'waiting';
         waitingFor = { kind: 'github', detail: `${landing.detail} The task is outside every admission queue while waiting for a new run, candidate head, or target state.` };
         await publish();
-        const providerSeen = providerChangeEpoch;
-        await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), input.githubPollMs ?? MERGE_POLL);
+        await waitForGithubChange((input.githubPollMs ?? MERGE_POLL) as number, decision, true);
         waitingFor = undefined;
         if (cancelled) return await abort();
         continue;
@@ -3823,8 +4180,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         status = 'waiting';
         waitingFor = { kind: 'github', detail: landing.detail };
         await publish();
-        const providerSeen = providerChangeEpoch;
-        await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), input.githubPollMs ?? MERGE_POLL);
+        await waitForGithubChange(input.githubPollMs ?? 30_000, decision);
         waitingFor = undefined;
         if (cancelled) return await abort();
         continue;
@@ -3913,9 +4269,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       status = 'waiting';
       waitingFor = { kind: 'github', detail: decision.detail ?? 'Waiting for GitHub checks or merge queue.' };
       await publish();
-      const providerSeen = providerChangeEpoch;
-      await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen),
-        classifiedGithubStates ? (input.githubPollMs ?? MERGE_POLL) : '30s');
+      await waitForGithubChange(classifiedGithubStates ? (input.githubPollMs ?? 30_000) : 30_000, decision);
       waitingFor = undefined;
       if (cancelled) return await abort();
       continue;
@@ -3926,7 +4280,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     if (result.merged) {
       sha = result.sha;
       pointOfNoReturnPassed = true;
-      // Remote policy 'push'/'pr' (PLAN-git-config.md §5): the landed target leaves
+      // Remote policy 'push'/'pr' (wiki plans/PLAN-git-config §5): the landed target leaves
       // the machine — push it (and under 'pr', GitHub marks the PR merged).
       // Best-effort: the merge IS the deliverable; a failed push is recorded, not fatal.
       if (remotePolicyOf(input.project) !== 'none') {
@@ -3996,7 +4350,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       continue proposalCycle;
     }
     // Merge rejected. Conflicts (including leftover markers) and dirty worktrees
-    // (commit-vs-gitignore is a judgment call — PLAN-git-config.md §6) are the
+    // (commit-vs-gitignore is a judgment call — wiki plans/PLAN-git-config §6) are the
     // merge agent's job: loop straight back to it with the details, bounded,
     // before bothering a human/parent (SPEC §5.2).
     error = `merge failed: ${result.conflict ?? result.dirty ?? result.note ?? 'unknown'}`;
@@ -4078,7 +4432,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     stage = 'cancelled';
     status = 'cancelled';
     if (retainedMergeDomains.length) await releaseRetainedLandingDomains();
-    await cancelChildren(liveAgentStates); // don't strand children when we go away
+    if (!lifecycleReplacement || !patched('software-dev-preserve-replacement-children-v1'))
+      await cancelChildren(liveAgentStates);
     // A cancelled task must not leave an open pull request proposing work that
     // will never land.
     if (!lifecycleReplacement && githubPrLifecycle && world && prs.length
@@ -4106,8 +4461,12 @@ Inspect the complete current diff and specifically compare its delta from the re
         }
       }
     }
-    return { stage } as { stage: Stage };
+    return (lifecycleReplacement && durableChildSettlement ? { stage, lifecycleReplacement: true } : { stage }) as { stage: Stage };
   }
+}
+
+export function pullRequestSummary(summary: string | undefined, msgs: Message[], legacy = false): string | undefined {
+  return summary ?? (legacy ? lastOutputs(msgs) : undefined);
 }
 
 function lastOutputs(msgs: Message[]): string {

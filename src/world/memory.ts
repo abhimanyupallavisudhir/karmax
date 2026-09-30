@@ -1,3 +1,4 @@
+import { scrubbedEnv } from '../autonomy/config-homes.js';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -5,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory } from './types.js';
 import { openLocalPty, startLocalProcess } from './local-execution.js';
+import { readRegularFilePrefix } from './file-prefix.js';
 import { taskBranch } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
@@ -49,7 +51,7 @@ class MemoryWorld implements World {
         cwd: opts.cwd ?? worldWorkingDirectory(this.handle),
         timeout: opts.timeoutMs ?? 60_000,
         maxBuffer: 32 * 1024 * 1024,
-        env: opts.env ? { ...process.env, ...opts.env } : process.env,
+        env: scrubbedEnv({ provider: 'mock', extra: opts.env }),
       });
       return { stdout, stderr, code: 0 };
     } catch (e: any) {
@@ -62,6 +64,9 @@ class MemoryWorld implements World {
   }
   async readFileBuffer(relPath: string): Promise<Buffer> {
     return fs.promises.readFile(this.filePath(relPath));
+  }
+  async readFilePrefix(relPath: string, maxBytes: number): Promise<Buffer> {
+    return readRegularFilePrefix(this.filePath(relPath), maxBytes);
   }
   async writeFile(relPath: string, content: string): Promise<void> {
     const abs = this.filePath(relPath);

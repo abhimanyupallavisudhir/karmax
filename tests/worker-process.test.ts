@@ -36,6 +36,17 @@ test('waits for readiness and drains accepted refreshes before stopping', async 
   await expect(worker.start()).rejects.toThrow('cannot be started again');
 });
 
+test('wakes the supervisor when the child commits events, coalescing a burst (LT-15)', async () => {
+  const onEvents = vi.fn();
+  const worker = manager('announce', { onEvents });
+  await worker.start();
+  await vi.waitFor(() => expect(onEvents).toHaveBeenCalledTimes(2), { timeout: 2_000 });
+  // The channel is ordered: once a ping sent now is answered, every notice the
+  // burst produced has arrived, so an uncoalesced burst would show up here.
+  await (worker as any).request('ping');
+  expect(onEvents).toHaveBeenCalledTimes(2);
+});
+
 test('keeps the previous package set when a refresh is rejected', async () => {
   const worker = manager('reject-refresh');
   const original = [{ type: 'fixture@1', entryFile: '/fixture/one.ts' }];
@@ -99,8 +110,11 @@ test('detects a child event loop that freezes after startup without a refresh re
 
 test('keeps a healthy idle worker alive across heartbeat checks', async () => {
   const worker = manager('', { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 500 });
+  const request = vi.spyOn(worker as any, 'request');
   await worker.start();
-  await new Promise(resolve => setTimeout(resolve, 100));
+  const answeredPings = () => request.mock.calls.filter(([action], index) => action === 'ping'
+    && request.mock.settledResults[index]?.type === 'fulfilled').length;
+  await vi.waitFor(() => expect(answeredPings()).toBeGreaterThanOrEqual(3));
   expect(worker.isReady).toBe(true);
   await worker.stop();
   expect(worker.failure).toBeUndefined();
@@ -164,4 +178,17 @@ test('kills an event-loop-stalled worker after its supervisor dies', async () =>
     await closed;
     if (alive()) process.kill(childPid!, 'SIGKILL');
   }
+});
+
+
+test('survives an isolated unhandled asynchronous callback rejection', async () => {
+  const onEvents = vi.fn();
+  const worker = manager('rejected-callback', { onEvents });
+  await worker.start();
+  // The fixture announces in a timer after the rejected one, which runs only
+  // once the process has handled the unhandled rejection and kept going.
+  await vi.waitFor(() => expect(onEvents).toHaveBeenCalled(), { timeout: 2_000 });
+  expect(worker.isReady).toBe(true);
+  await worker.refresh([]);
+  expect(worker.failure).toBeUndefined();
 });

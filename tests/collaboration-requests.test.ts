@@ -52,6 +52,18 @@ async function fixture(onSignal?: (taskId: string, args: unknown[]) => void | Pr
 }
 
 describe('durable background collaboration requests', () => {
+  it('routes ordinary view updates from their payload without hydrating the task', async () => {
+    const f = await fixture();
+    const getTask = vi.spyOn(f.store, 'getTask');
+    f.bus.emit({ taskId: f.target.id, type: 'view.updated', ts: Date.now(),
+      payload: { stage: 'do', status: 'active' }, seq: 1 });
+    // A payload without its stage must hydrate. Routed after the ordinary one,
+    // it marks the point by which the ordinary update would have hydrated too.
+    f.bus.emit({ taskId: f.requester.id, type: 'view.updated', ts: Date.now(), payload: {}, seq: 2 });
+    await vi.waitFor(() => expect(getTask).toHaveBeenCalled());
+    expect(getTask.mock.calls).toEqual([[f.requester.id]]);
+  });
+
   it('returns immediately after registering the requester and nudging the target', async () => {
     const f = (await fixture());
     const request = await f.api.requestAgentAction(f.token, {

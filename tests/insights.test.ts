@@ -27,6 +27,22 @@ async function seed() {
 }
 
 describe('organization insights', () => {
+  it('retains first completion dates after event retention removes the event', async () => {
+    const { store, organization, web, task, publish } = await seed();
+    try {
+      const shipped = await task(web.id, 'Shipped', NOW - 2 * DAY);
+      await publish(shipped.id, NOW - DAY, 'done', 'done');
+      await store.retentionSweep(NOW + 100 * DAY);
+      expect((await store.eventsSince(shipped.id, 0)).some((event) => event.type === 'view.updated')).toBe(false);
+      const queries: string[] = [];
+      const prepare = store.db.prepare.bind(store.db);
+      store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+      expect((await store.insightRows(organization.id, NOW - 30 * DAY, NOW)).completions)
+        .toEqual([{ taskId: shipped.id, doneAt: NOW - DAY }]);
+      expect(queries.some((sql) => sql.includes("e.payload LIKE"))).toBe(false);
+    } finally { await store.close(); }
+  });
+
   it('counts shipped work once, in the local day it first reached done, within the organization', async () => {
     const { store, organization, web, api, foreign, task, view, publish } = await seed();
     try {

@@ -3,6 +3,11 @@
    for the board details (ids, stages, branches, SHAs). One confident accent
    (electric indigo). The signature is the stage pipeline. */
 
+/* `hidden` always hides. Component display rules (.btn, .card, .inline-form…)
+   otherwise override the browser's own [hidden] rule, so a control hidden for
+   lack of permission stayed on screen. */
+[hidden] { display: none !important; }
+
 @font-face {
   font-family: "Inter";
   src: url("/fonts/inter/InterVariable.woff2") format("woff2");
@@ -26,7 +31,7 @@
   --surface-2: #fbfcfd;
   --ink: #15181e;
   --ink-2: #58616f;
-  --ink-3: #8b95a5;
+  --ink-3: #626e7e;
   --line: #e5e8ed;
   --line-strong: #d4d9e1;
   --accent: #5b5bd6;
@@ -57,7 +62,7 @@ html[data-theme="dark"],
   --surface-2: #1f232c;
   --ink: #e7e9ef;
   --ink-2: #9aa4b2;
-  --ink-3: #6a7383;
+  --ink-3: #929dad;
   --line: #292e39;
   --line-strong: #353c49;
   --accent: #8b8bf0;
@@ -83,7 +88,7 @@ html[data-theme="dark"],
     --surface-2: #1f232c;
     --ink: #e7e9ef;
     --ink-2: #9aa4b2;
-    --ink-3: #6a7383;
+    --ink-3: #929dad;
     --line: #292e39;
     --line-strong: #353c49;
     --accent: #8b8bf0;
@@ -1118,6 +1123,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 
 /* Hosted personal-workspace onboarding. Progress comes from the gateway; this
    floating surface only guides the user to the existing first-party controls. */
+body:has(#tf-page, .ck-compose) .hosted-onboarding { display: none; }
 .hosted-onboarding { position: fixed; z-index: 60; right: 22px; bottom: 20px; width: min(390px, calc(100vw - 28px)); }
 .onboarding-card {
   max-height: min(720px, calc(100vh - 82px)); overflow-y: auto;
@@ -3004,6 +3010,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .payment-caret { position: absolute; right: 5px; top: 7px; border: 0; background: none; color: var(--ink-3); cursor: pointer; padding: 6px; }
 .payment-budget-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .payment-budget { width: 100px; min-width: 0; min-height: 34px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; }
+.payment-currency { min-height: 34px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; }
 .payment-spent { color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
 .payment-save { justify-self: start; }
 .payment-error { color: var(--ink-3); font-size: 12px; }
@@ -3028,3 +3035,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .resource-review-name > * { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .resource-review-controls { display:flex; align-items:center; gap:8px; flex-shrink:0; }
 @media (max-width:480px) { .resource-review-controls .resource-selection-state { display:none; } }
+
+.text-prompt { width:min(480px,92vw); padding:20px; border:1px solid var(--line); border-radius:12px; background:var(--surface); color:var(--ink); }
+.text-prompt::backdrop { background:rgba(0,0,0,.4); }

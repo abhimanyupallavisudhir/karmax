@@ -4,6 +4,7 @@ import { TerminatedFailure } from '@temporalio/common';
 import { Store } from '../store/db.js';
 import { TaskView, TaskRecord } from '../domain/types.js';
 import { withTimeout } from '../util/timeout.js';
+import { notifyChildSettlement } from './child-settlement.js';
 
 const TERMINAL = ['done', 'failed', 'cancelled'];
 
@@ -39,17 +40,24 @@ function stubView(t: TaskRecord): TaskView {
  * treat those as failed too, so a restart cleans them up.
  */
 export async function reconcileTasks(store: Store, client: Client): Promise<{ checked: number; settled: number }> {
+  // A parent that continued as new no longer holds its child's handle, so the
+  // settled durable view is what tells it the child ended. Best effort: the
+  // next sweep skips a settled task, but each continued run of the parent
+  // reads its children's durable views again.
+  const settle = async (taskId: string, view: TaskView) => {
+    (await store.saveView(taskId, view));
+    await notifyChildSettlement(store, client, view).catch(() => undefined);
+  };
   let checked = 0;
   let settled = 0;
   for (const project of (await store.listProjects())) {
     // Reconciliation operates on Temporal executions, not logical list rows:
     // every sibling attempt has its own workflow that must be settled.
-    for (const t of (await store.listTaskAttempts(project.id))) {
-      if (t.params?.draft) continue; // drafts are intentionally not started
-      if (t.params?.triggerState === 'armed') continue; // armed triggered tasks have no workflow yet
-      if (t.params?.repeatable) continue; // a series never runs its own workflow — only its runs do
+    const candidates = await store.listReconciliationCandidates(project.id);
+    for (let offset = 0; offset < candidates.length; offset += 8) {
+      await Promise.all(candidates.slice(offset, offset + 8).map(async (t) => {
       const v: TaskView | undefined = t.lastView;
-      if (v && TERMINAL.includes(v.status)) continue;
+      if (v && TERMINAL.includes(v.status)) return;
       checked++;
       const base = v ?? stubView(t);
       try {
@@ -94,7 +102,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
             if (live?.state?.cancelled) {
               await handle.terminate('cancelled Setup did not settle').catch(() => undefined);
               for (const lease of (await store.worldLeasesForTask(t.id))) (await store.releaseWorldLease(String(lease.id)));
-              (await store.saveView(t.id, {
+              (await settle(t.id, {
                 ...live,
                 stage: 'cancelled',
                 status: 'cancelled',
@@ -106,7 +114,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
               settled++;
             }
           }
-          continue;
+          return;
         }
         let terminationReason: string | undefined;
         if (name === 'TERMINATED') {
@@ -126,12 +134,12 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
             : { ...base, status: 'failed', stage: 'failed', error: terminationReason
               ? `workflow terminated: ${terminationReason}`
               : base.error ?? `workflow ${name.toLowerCase()}`, updatedAt: base.updatedAt };
-        (await store.saveView(t.id, next));
+        (await settle(t.id, next));
         settled++;
       } catch (e) {
-        if (e instanceof Error && e.message === 'operation timed out') continue; // transient — don't fail a live task
+        if (e instanceof Error && e.message === 'operation timed out') return; // transient — don't fail a live task
         // workflow not found → lost (state reset) or never started (orphan row).
-        (await store.saveView(t.id, {
+        (await settle(t.id, {
           ...base,
           status: 'failed',
           stage: 'failed',
@@ -140,6 +148,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
         }));
         settled++;
       }
+      }));
     }
   }
   return { checked, settled };

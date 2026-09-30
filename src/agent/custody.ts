@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { paths } from '../config/paths.js';
+import { processStartTick } from '../util/processes.js';
 
 /**
  * Process-tree custody for spawned agent subprocesses (the other half of the
@@ -62,9 +63,10 @@ export interface AgentRecord {
   /** Unique inherited marker used to find descendants across process groups. */
   custodyId?: string;
   startedAt: number;
-  /** Linux `/proc/<pid>/stat` field 22 (process start tick) for `pid`, stamped by
-   *  `registerAgent`. Wall-clock `startedAt` cannot disambiguate pid reuse; this
-   *  can. Absent on non-Linux hosts and on records written before this existed. */
+  /** The process start time for `pid` (`/proc/<pid>/stat` field 22 on Linux,
+   *  `ps` lstart elsewhere), stamped by `registerAgent`. Wall-clock `startedAt`
+   *  cannot disambiguate pid reuse; this can. Absent on records written before
+   *  this existed. */
   pidStart?: string;
   /** The same start tick for `owner`, so a recycled owner pid cannot make a
    *  genuine orphan permanently unreapable. */
@@ -144,6 +146,21 @@ function recordFor(pid: number | undefined): AgentRecord | undefined {
   }
 }
 
+/** Custody ids of the task's agents that are running now. A record whose pid
+ *  was recycled does not count: only a verified start tick proves it. */
+export function taskCustodyIds(taskId: string): string[] {
+  let files: string[];
+  try {
+    files = fs.readdirSync(agentsDir()).filter((file) => file.endsWith('.json'));
+  } catch {
+    return [];
+  }
+  return files
+    .map((file) => recordFor(Number(file.slice(0, -5))))
+    .filter((rec): rec is AgentRecord => !!rec?.custodyId && rec.taskId === taskId && alive(rec.pid) && startMatches(rec.pid, rec.pidStart))
+    .map((rec) => rec.custodyId!);
+}
+
 /** Is `pid` a live process? `EPERM` means it exists but we can't signal it. */
 function alive(pid: number): boolean {
   try {
@@ -170,26 +187,15 @@ function cmdlineMatches(pid: number, cmd: string): boolean {
   }
 }
 
-/** Linux `/proc/<pid>/stat` field 22: the tick at which the process started. Two
+/** The process's start time: `/proc` field 22 on Linux, `ps` elsewhere. Two
  *  processes with the same pid at different times cannot share it, so it is the
- *  only reliable identity check available after the parent has died. Mirrors
- *  `processStart()` in src/activities/agent-slots.ts. */
-function processStart(pid: number | undefined): string | undefined {
-  if (!pid || pid <= 0 || process.platform !== 'linux') return undefined;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    // The comm field may itself contain spaces/parens; split after the LAST ')'.
-    const afterComm = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
-    return afterComm[19]; // the array begins at field 3, so index 19 is field 22
-  } catch {
-    return undefined;
-  }
-}
+ *  only reliable identity check available after the parent has died. */
+const processStart = processStartTick;
 
 /**
  * Is `pid` still the very process the record was written for?
  *
- * `recorded === undefined` (a pre-start-tick record, or a non-Linux host) is
+ * `recorded === undefined` (a pre-start-tick record, or no procfs or `ps`) is
  * treated as NOT verified. That is the conservative direction on purpose: an
  * unverifiable record can only cost us a leaked, already-dead pidfile for one
  * boot, whereas guessing "yes" reintroduces exactly the incident this guards —
@@ -298,16 +304,16 @@ export function killProcessGroup(pid: number | undefined, signal: NodeJS.Signals
   }
 }
 
-function signalAgentTree(pid: number, custodyId: string | undefined, signal: NodeJS.Signals): number {
+function signalAgentTree(pid: number, custodyId: string | undefined, signal: NodeJS.Signals, pidStart?: string): number {
   const marked = signalCustody(custodyId, signal);
   // Keep the original group kill as a fallback for legacy records and for a
   // descendant that deliberately scrubbed its environment.
-  killProcessGroup(pid, signal);
+  if (startMatches(pid, pidStart)) killProcessGroup(pid, signal);
   return marked;
 }
 
-function agentTreeAlive(pid: number, custodyId: string | undefined): boolean {
-  return alive(pid) || custodyProcesses(custodyId).length > 0;
+function agentTreeAlive(pid: number, custodyId: string | undefined, pidStart?: string): boolean {
+  return (startMatches(pid, pidStart) && alive(pid)) || custodyProcesses(custodyId).length > 0;
 }
 
 /**
@@ -321,10 +327,11 @@ export async function killAgent(
   custodyId = recordFor(pid)?.custodyId,
 ): Promise<void> {
   if (!pid) return;
-  signalAgentTree(pid, custodyId, 'SIGTERM');
+  const pidStart = recordFor(pid)?.pidStart;
+  signalAgentTree(pid, custodyId, 'SIGTERM', pidStart);
   const deadline = Date.now() + graceMs;
-  while (agentTreeAlive(pid, custodyId) && Date.now() < deadline) await delay(100);
-  if (agentTreeAlive(pid, custodyId)) signalAgentTree(pid, custodyId, 'SIGKILL');
+  while (agentTreeAlive(pid, custodyId, pidStart) && Date.now() < deadline) await delay(100);
+  if (agentTreeAlive(pid, custodyId, pidStart)) signalAgentTree(pid, custodyId, 'SIGKILL', pidStart);
   unregisterAgent(pid);
 }
 

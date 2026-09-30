@@ -27,7 +27,7 @@ file an operator setting lives only as long as the shell that exported it, and
 | Env var | Bucket | Notes |
 |---|---|---|
 | `KARMAX_HOME`, `KARMAX_HOST`, `KARMAX_PORT`, `KARMAX_PUBLIC_URL`, `KARMAX_PREVIEW_ORIGIN` | operator | Infrastructure and origins. |
-| `KARMAX_AUTH_SECRET`, `KARMAX_VAULT_KEY`, `KARMAX_WORLD_REF_KEY` | operator | Stable keys. Hosted startup refuses to boot without all three at ≥ 32 chars. |
+| `KARMAX_AUTH_SECRET`, `KARMAX_VAULT_KEY`, `KARMAX_WORLD_REF_KEY` | operator | Stable keys. Hosted startup refuses to boot without all three at ≥ 32 chars. New sandbox references are sealed with the vault's `world-reference:key:v2` (`WorldReferenceKeys`); `KARMAX_WORLD_REF_KEY` still opens references sealed before it. |
 | `KARMAX_DATABASE_URL`, `KARMAX_TEMPORAL_*`, `KARMAX_OBJECT_STORE`, `KARMAX_S3_*` | operator | Durability. Hosted requires PostgreSQL and a real Temporal address; managed cells require S3. |
 | `KARMAX_MANAGED_STORAGE_QUOTA_BYTES` | operator | Hard physical snapshot-byte allowance per organization. Hosted defaults to 5 GiB; `0` means unlimited and is unsuitable for open registration. |
 | `KARMAX_MANAGED_MODEL_REQUEST_CEILINGS` | operator | Optional JSON map of `provider/model` (or `provider/*`) to a conservative per-request micro-dollar ceiling. Empty means BYOK-only. It authorizes bounded admission, not provider credits. |
@@ -36,7 +36,6 @@ file an operator setting lives only as long as the shell that exported it, and
 | `KARMAX_GOOGLE_CLIENT_ID`, `KARMAX_GOOGLE_CLIENT_SECRET` | operator | Optional "Continue with Google". Separate from `KARMAX_OIDC_*` deliberately: that slot holds exactly one provider, so an install pointed at its company IdP would otherwise have to choose between the two. Set both or neither — the button appears only when both are non-empty. Register `https://<your-karmax-origin>/api/auth/callback/google` as the authorized redirect URI in the Google Cloud console; Better Auth serves that path itself, so it must match `KARMAX_PUBLIC_URL` exactly. Only the default `openid`/`email`/`profile` scopes are requested and no refresh token is asked for: karmax wants an identity, not access to the user's Google data, and an unused refresh token is only a long-lived secret to leak. A Google login on an address that already has a **verified** email+password account links into it rather than creating a duplicate; on an *unverified* one it is refused (the sign-in card explains why), because karmax's signup never proved that account owns the address. Read the comment in `src/auth/identity.ts` before relaxing either half of that. |
 | `KARMAX_MAX_WFT` / `_ACT` / `_CACHED_WORKFLOWS`, `KARMAX_AGENT_*` | operator | Worker and host-admission capacity. |
 | `KARMAX_CONTAINER_IMAGE`, `KARMAX_AGENT_PROVIDER`, `KARMAX_*_MODEL`, `KARMAX_*_BASE_URL` | operator default | Platform defaults; already overridable per-tenant via profiles. |
-| `KARMAX_SAFE_MODE` | operator | Also a UI toggle. |
 | `KARMAX_TOKEN`, `CLAUDE_CONFIG_DIR` | runtime | Not config — injected per agent spawn. |
 | `STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | optional bootstrap | Normally entered under **Organization settings → Payments**; UI values take precedence. They identify the deployment's Connect app, never a funding source. |
 | `KARMAX_PASSWORD` | **local only** | Rejected outright in hosted mode — the gateway returns 503 and requires the identity service. |
@@ -356,6 +355,12 @@ the generic Temporal pool does not silently replace these per-organization
 entitlements with the private-install default of 8. Operators may set
 `KARMAX_MAX_ACT` as an explicit fleet-capacity guard and scale workers when
 aggregate tenant demand approaches it.
+
+The hosted sticky workflow cache defaults to 250 (private installs: 20). A query
+or task for a workflow outside the cache replays its whole history, and the
+console and every running turn query their task's workflow. Raise
+`KARMAX_MAX_CACHED_WORKFLOWS` when a cell keeps more tasks open, as long as the
+worker's heap has room for their conversations.
 
 ## Payment rails
 

@@ -117,6 +117,12 @@ afterEach(() => {
 });
 
 describe('Claude Agent-SDK input stream vs. the harness control channel', () => {
+  it('does not convert SDK bootstrap errors into shared-login failures', async () => {
+    const error = Object.assign(new Error('E2B AuthenticationError HTTP 401 unauthorized'), { status: 401 });
+    fakeHarness(async function* () { throw error; });
+    await expect(runTurn([])).rejects.toBe(error);
+  });
+
   it('keeps the control channel alive while a backgrounded shell settles after the first result', async () => {
     const seen: string[] = [];
     fakeHarness(async function* (h) {
@@ -291,6 +297,18 @@ describe('Claude Agent-SDK input stream vs. the harness control channel', () => 
     const { remoteAgentEnv } = await import('../src/agent/remote-process.js');
     expect(remoteAgentEnv('claude', '/home', { CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }))
       .toMatchObject({ CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' });
+  });
+
+  it.each(['', '5m', '-1', 'Infinity'])('holds background work with invalid grace %j', async (value) => {
+    process.env.KARMAX_AGENT_BG_SETTLE_MS = value;
+    const h = fakeHarness(async function* () {
+      yield { type: 'system', subtype: 'task_started', task_id: 'bg' };
+      yield { type: 'result', subtype: 'success', session_id: 's' };
+      await sleep(10);
+      expect(h.current!.inputClosed).toBe(false);
+      yield { type: 'system', subtype: 'task_notification', task_id: 'bg', status: 'completed' };
+    });
+    await runTurn([]);
   });
 
   // Task 388: the agent waited on a `sleep 480` for CI. The grace closed the stream at

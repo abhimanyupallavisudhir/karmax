@@ -597,8 +597,7 @@ describe('TriggerScheduler (dispatcher)', () => {
     (await restarted.start());
     (await emitDone(dep.id));
     expect(fired).toEqual([[t.id, 'self']]);
-    await new Promise((r) => setTimeout(r, 0));
-    expect((await store.getTask(t.id))!.params.triggerPending).toBeUndefined();
+    await vi.waitFor(async () => expect((await store.getTask(t.id))!.params.triggerPending).toBeUndefined());
     restarted.stop();
   });
 
@@ -655,14 +654,12 @@ describe('TriggerScheduler (dispatcher)', () => {
     (await s.start());
     (await clock.advance(60_000));
     expect(fired).toEqual([[t.id, 'clone']]);
-    await new Promise((r) => setTimeout(r, 0));
-    expect(s.size).toBe(1); // still armed for the next occurrence
+    await vi.waitFor(() => expect(s.size).toBe(1)); // still armed for the next occurrence
     (await clock.advance(60_000));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(fired).toEqual([
+    await vi.waitFor(() => expect(fired).toEqual([
       [t.id, 'clone'],
       [t.id, 'clone'],
-    ]);
+    ]));
   });
 
   it('routes real bus events end-to-end through KarmaxApi arming', async () => {
@@ -686,8 +683,8 @@ describe('TriggerScheduler (dispatcher)', () => {
 
     // Simulate the dep completing on the bus → dispatcher fires b.
     (await bus.emit({ type: 'view.updated', taskId: dep.id, ts: 0, payload: { status: 'done' } } as KarmaxEvent));
-    await new Promise((r) => setTimeout(r, 0)); // let the async fire settle
-    expect(started).toContain(b.id);
+    // The fire is asynchronous (it resolves and validates the start first).
+    await vi.waitFor(() => expect(started).toContain(b.id));
     expect(scheduler.size).toBe(0);
   });
 
@@ -860,13 +857,13 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(series.params.triggerState).toBe('armed');
     expect((await store.runsOf(series.id))).toHaveLength(0); // waits for the first fire
 
+    // A fire spawns its run through several awaited store writes; wait for it
+    // rather than for one macrotask, which a loaded CI runner can outpace.
     (await clock.advance(60_000));
-    await new Promise((r) => setTimeout(r, 0));
-    expect((await store.runsOf(series.id))).toHaveLength(1);
+    await expect.poll(async () => (await store.runsOf(series.id)).length).toBe(1);
     expect(scheduler.size).toBe(1); // series stays armed for the next occurrence
     (await clock.advance(60_000));
-    await new Promise((r) => setTimeout(r, 0));
-    expect((await store.runsOf(series.id))).toHaveLength(2);
+    await expect.poll(async () => (await store.runsOf(series.id)).length).toBe(2);
   });
 
   it('does not double-fire a cron occurrence when the clock steps backwards', async () => {
@@ -923,8 +920,7 @@ describe('TriggerScheduler (dispatcher)', () => {
 
     (await emitDone(dep.id));
     expect(fired).toEqual([[series.id, 'clone']]);
-    await new Promise((r) => setTimeout(r, 0));
-    expect((await store.getTask(series.id))!.params.triggerPending).toBeUndefined();
+    await vi.waitFor(async () => expect((await store.getTask(series.id))!.params.triggerPending).toBeUndefined());
 
     (await clock.advance(60_000));
     expect(fired).toEqual([[series.id, 'clone'], [series.id, 'clone']]);
@@ -947,16 +943,14 @@ describe('TriggerScheduler (dispatcher)', () => {
     });
     (await first.start());
     (await clock.advance(60_000));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(failedAttempts).toBe(1);
+    await vi.waitFor(() => expect(failedAttempts).toBe(1));
     expect((await store.getTask(series.id))!.params.triggerPending).toBe(true);
 
     first.stop();
     const restarted = makeScheduler();
     (await restarted.start());
-    await new Promise((r) => setTimeout(r, 0));
-    expect(fired).toEqual([[series.id, 'clone']]);
-    expect((await store.getTask(series.id))!.params.triggerPending).toBeUndefined();
+    await vi.waitFor(() => expect(fired).toEqual([[series.id, 'clone']]));
+    await vi.waitFor(async () => expect((await store.getTask(series.id))!.params.triggerPending).toBeUndefined());
     restarted.stop();
   });
 

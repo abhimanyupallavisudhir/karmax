@@ -38,7 +38,7 @@ async function fixture() {
 
 it('refuses cleanup from a replaced workflow run', async () => {
   const f = await fixture();
-  await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'replacement' });
+  await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'replacement' });
   await f.core.destroyWorld(f.handle);
   expect(f.destroy).not.toHaveBeenCalled();
   expect(f.resources.release).not.toHaveBeenCalled();
@@ -77,7 +77,7 @@ it('does not reopen a released world when retrying lease cleanup', async () => {
 it('rechecks ownership after resource cleanup before touching the provider', async () => {
   const f = await fixture();
   f.resources.release.mockImplementation(async () => {
-    await f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'replacement' });
+    await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'replacement' });
   });
   await f.core.destroyWorld(f.handle);
   expect(f.destroy).not.toHaveBeenCalled();
@@ -136,4 +136,11 @@ it('destroys an unpublished world if cancellation arrives during resource restor
     expect(await store.currentWorld(task.id)).toBeUndefined();
     expect((await store.eventsSince(task.id, 0)).some(e => e.type === 'world.ready')).toBe(false);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('marks failed teardown for lifecycle retry (WD-14)', async () => {
+  const f = await fixture();
+  f.destroy.mockRejectedValue(new Error('provider unavailable'));
+  await f.core.destroyWorld(f.handle);
+  expect((await f.store.currentWorld(f.handle.id))?.meta?.teardownPending).toBe(true);
 });

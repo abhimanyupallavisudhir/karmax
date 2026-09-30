@@ -48,6 +48,15 @@ it('restores Review over HTTP while the cancelled Temporal execution is still cl
     return result;
   });
   const start = vi.spyOn(h.client.workflow, 'start');
+  // Count looks at the original run, so the test knows when the restore is waiting on it.
+  const getHandle = h.client.workflow.getHandle.bind(h.client.workflow);
+  let described = 0;
+  vi.spyOn(h.client.workflow, 'getHandle').mockImplementation((...args: Parameters<typeof getHandle>) => {
+    const handle = getHandle(...args);
+    if (args[0] !== task.id) return handle;
+    const describe = handle.describe.bind(handle);
+    return Object.assign(handle, { describe: async () => { const description = await describe(); described++; return description; } });
+  });
   let restore: Promise<Response> | undefined;
   try {
     const cancelled = await fetch(`${base}/api/tasks/${task.id}/signal`, {
@@ -61,7 +70,9 @@ it('restores Review over HTTP while the cancelled Temporal execution is still cl
     });
     let replied = false;
     void restore.then(() => { replied = true; });
-    await new Promise(resolve => setTimeout(resolve, 500));
+    const lookedBefore = described;
+    // Seen the original still running twice: the restore has chosen to wait.
+    await vi.waitFor(() => expect(described).toBeGreaterThanOrEqual(lookedBefore + 2), { timeout: 20_000 });
     expect(replied).toBe(false);
     expect(start).not.toHaveBeenCalled();
     release();

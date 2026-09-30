@@ -5,6 +5,7 @@ import {
   normalizeExplanationSettings,
   requestExplanation,
 } from '../src/agent/explanation.js';
+import { publicModelFetch } from '../src/mcp/connections/http.js';
 
 describe('explanation model calls', () => {
   it('defaults to Gemini Flash through OpenRouter', () => {
@@ -73,5 +74,51 @@ describe('explanation model calls', () => {
     expect(() => normalizeExplanationSettings({ endpoint: 'file:///tmp/key' })).toThrow('HTTP or HTTPS');
     expect(explanationProvider('https://api.together.xyz/v1/chat/completions')).toBe('together');
     expect(explanationProvider('https://openrouter.attacker.example/v1/chat/completions')).toBe('attacker');
+  });
+
+  // Any member (and any agent, via platform_request) may override the endpoint
+  // per request, and the organization's key follows the provider its host names.
+  it('names a provider only for its own domain, so its key cannot be sent elsewhere', () => {
+    expect(explanationProvider('https://api.openai.com/v1')).toBe('openai');
+    expect(explanationProvider('https://openai.com/v1')).toBe('openai');
+    expect(explanationProvider('https://evilopenai.com/v1')).toBe('evilopenai');
+    expect(explanationProvider('https://notanthropic.com/v1')).toBe('notanthropic');
+    expect(explanationProvider('https://fakex.ai/v1')).toBe('fakex');
+    expect(explanationProvider('https://api.x.ai/v1')).toBe('xai');
+  });
+
+  it('never lets a lookalike domain claim a known provider\'s key', () => {
+    // Only the provider's own domain may resolve to its credential namespace,
+    // whatever label, alias or TLD a lookalike borrows.
+    for (const endpoint of ['https://api.openai.xyz/v1', 'https://anthropic.evil/v1', 'https://openrouter.example/api/v1',
+      'https://claude.example/v1', 'https://codex.example/v1', 'https://grok.example/v1', 'https://gemini-proxy.google.example/v1',
+      'https://openai/v1'])
+      expect(() => explanationProvider(endpoint), endpoint).toThrow(/own/);
+    // A custom OpenAI-compatible server still gets its own namespace.
+    expect(explanationProvider('https://api.together.xyz/v1')).toBe('together');
+    expect(explanationProvider('https://openai.mycompany.com/v1')).toBe('mycompany');
+  });
+
+  it('sends keys only over HTTPS, except to a model server on this machine', () => {
+    expect(() => normalizeExplanationSettings({ endpoint: 'http://api.example.com/v1' })).toThrow('HTTPS');
+    expect(() => normalizeExplanationSettings({ endpoint: 'http://169.254.169.254/latest' })).toThrow('HTTPS');
+    expect(normalizeExplanationSettings({ endpoint: 'http://localhost:11434/v1' }).endpoint).toBe('http://localhost:11434/v1');
+    expect(normalizeExplanationSettings({ endpoint: 'http://127.0.0.1:8080/v1' }).endpoint).toBe('http://127.0.0.1:8080/v1');
+    expect(normalizeExplanationSettings({ endpoint: 'http://[::1]:8080/v1' }).endpoint).toBe('http://[::1]:8080/v1');
+  });
+
+  it('never follows a redirect with the key attached', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 })) as unknown as typeof fetch;
+    await requestExplanation({ settings: DEFAULT_EXPLANATION_SETTINGS, apiKey: 'k', message: 'm', userContext: [], fetchImpl });
+    expect((fetchImpl as any).mock.calls[0][1].redirect).toBe('error');
+  });
+
+  it('keeps a hosted cell off private networks', async () => {
+    const settings = { ...DEFAULT_EXPLANATION_SETTINGS, endpoint: 'https://169.254.169.254/v1' };
+    await expect(requestExplanation({ settings, apiKey: 'k', message: 'm', userContext: [], fetchImpl: publicModelFetch }))
+      .rejects.toThrow(/Private and local/);
+    const loopback = { ...DEFAULT_EXPLANATION_SETTINGS, endpoint: 'https://127.0.0.1/v1' };
+    await expect(requestExplanation({ settings: loopback, apiKey: 'k', message: 'm', userContext: [], fetchImpl: publicModelFetch }))
+      .rejects.toThrow(/Private and local/);
   });
 });

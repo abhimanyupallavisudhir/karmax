@@ -142,17 +142,20 @@ describe('MCP connections', () => {
   });
   it('wraps container connections in docker exec and revokes credential projections after edits', async () => {
     const c = (await service.save({ label: 'Container tool', transport: { type: 'stdio', command: 'example', args: [] } }, project));
-    const files = new Map<string, string>(); const commands: string[][] = [];
+    const files = new Map<string, string>();
     const world = { handle: { kind: 'container', root: '/host/task', meta: { container: 'karmax-test' } },
-      async exec(command: string, args: string[]) { commands.push([command, ...args]); return { code: 0, stdout: '', stderr: '' }; },
+      async exec() { return { code: 0, stdout: '', stderr: '' }; },
       async writeFile(file: string, content: string) { files.set(file, content); },
     } as any;
     let cleanup: (() => Promise<void>) | undefined;
     vi.useFakeTimers();
     try {
       const servers = await prepareConnections(service, world, [c.id], project, 'task', (fn) => { cleanup = fn; });
-      expect(servers[0]).toMatchObject({ command: 'docker', args: ['exec', '-i', '-w', '/work', 'karmax-test', '/usr/local/bin/node', expect.stringMatching(/^\/work\//), expect.stringMatching(/^\/work\//)] });
-      expect(commands.some((args) => args.some((arg) => arg.includes('/host/task')))).toBe(false);
+      // WD-6: container agents run inside the container on karmax's managed Node,
+      // installed under the worktree, which is also mounted at its host path.
+      expect(servers[0]).toMatchObject({ command: 'docker', args: ['exec', '-i', '-w', '/work', 'karmax-test',
+        expect.stringMatching(/^\/host\/task\/\.karmax-injection\/agent\/tools\/node-[\d.]+\/bin\/node$/),
+        expect.stringMatching(/^\/work\//), expect.stringMatching(/^\/work\//)] });
       (await service.save({ ...c, enabled: false }, project));
       await vi.advanceTimersByTimeAsync(30_000);
       expect([...files.entries()].find(([name]) => name.endsWith('.next'))?.[1]).toBe('{"revoked":true}');

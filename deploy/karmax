@@ -2,7 +2,9 @@
 # Turnkey Karmax control-plane operator. Requires only Docker with Compose.
 set -eu
 
-DEPLOY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The detached update runner executes a copy of this file from
+# deploy/.updates/<key>/ and names the instance it belongs to.
+DEPLOY_DIR=${KARMAX_DEPLOY_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
 ROOT_DIR=$(dirname "$DEPLOY_DIR")
 ENV_FILE="$DEPLOY_DIR/.turnkey.env"
 SECRETS_DIR="$DEPLOY_DIR/.secrets"
@@ -12,10 +14,62 @@ die() { echo "karmax: $*" >&2; exit 1; }
 note() { echo "• $*"; }
 dc() { docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
+# The checksums cover the dumps and secrets outside the signed control-plane
+# manifest, and the manifest itself, so the two signatures vouch for one backup.
+backup_checksums() (
+  destination=$1
+  (cd "$destination" && sha256sum *.dump deployment-secrets/* control-plane/manifest.json > SHA256SUMS)
+)
+
+# The checksums are signed by the same installation key (DB-10). $1 is the
+# app invocation: `exec -T app` for the live app, `run --rm --no-deps -T app`
+# for a validated candidate.
+sign_checksums() (
+  destination=$1; shift
+  dc "$@" npm run --silent backup -- --sign-checksums < "$destination/SHA256SUMS" > "$destination/SHA256SUMS.sig"
+)
+
 compact_backups() {
   # Optional space optimization must never invalidate a verified backup or
   # prevent an emergency deployment on a host without util-linux hardlink.
   sh "$DEPLOY_DIR/compact-backups.sh" "$DEPLOY_DIR/backups" || note 'Backup compaction failed; snapshots are retained.'
+}
+
+# Automatic snapshots are restore points for undoing a recent deploy, not an
+# archive: each carries fresh database dumps (tavya.io held 84 of them, 144 GB of
+# 193 GB before compaction), and they share the disk they protect. A daily
+# off-host copy is the hosting provider's job (tavya.io: one.com's daily image).
+# Earlier updaters named their snapshots by bare UTC stamp and aged them out
+# after two weeks; they keep that rule. Any other name (manual-*, incident-*, a
+# chosen path) is an operator's backup and is never pruned.
+PREDEPLOY_KEEP=10
+prune_backups() {
+  backups="$DEPLOY_DIR/backups"
+  [ -d "$backups" ] || return 0
+  # Fixed-width UTC stamps: name order is age order.
+  for name in $(ls -1 "$backups" | grep -E '^predeploy-[0-9]{8}T[0-9]{6}Z$' | sort -r | tail -n "+$((PREDEPLOY_KEEP + 1))"); do
+    rm -rf "${backups:?}/$name"
+  done
+  for name in $(ls -1 "$backups" | grep -E '^[0-9]{8}T[0-9]{6}Z$'); do
+    if [ -n "$(find "$backups/$name" -prune -type d -mtime +14)" ]; then rm -rf "${backups:?}/$name"; fi
+  done
+}
+
+# Housekeeping once the new revision serves; none of it may fail an update.
+reclaim_space() {
+  prune_backups || note 'Could not prune old snapshots; they are retained.'
+  compact_backups
+  prune_build_cache
+}
+
+# Each build leaves superseded layers behind, and the replaced image dangles;
+# unbounded, build cache alone reached 15.6 GB on tavya.io. A rollback rebuilds
+# the previous revision from source, so neither is needed once the update is up.
+prune_build_cache() {
+  docker image prune -f >/dev/null || true
+  docker builder prune -f --max-used-space 8gb >/dev/null 2>&1 \
+    || docker builder prune -f --keep-storage 8gb >/dev/null 2>&1 \
+    || docker builder prune -f --filter until=72h >/dev/null || true
 }
 
 need_docker() {
@@ -47,13 +101,36 @@ random_hex() { od -An -N"${1:-48}" -tx1 /dev/urandom | tr -d ' \n'; }
 # deploy/Dockerfile) which matches no host user — so a 0600 secret is
 # unreadable exactly where it is needed. $SECRETS_DIR stays 0700, which is what
 # actually keeps other users on the host out: they cannot traverse into it.
-secret_mode() { chmod 644 "$@"; }
+secret_mode() { set_mode 644 "$@"; }
+
+# chmod fails for anyone but a file's owner even when it would change nothing,
+# and a secret `sudo ./deploy/karmax up` created belongs to root; so only a
+# mode that differs is changed.
+set_mode() {
+  wanted_mode=$1; shift
+  for mode_target in "$@"; do
+    [ -n "$(find "$mode_target" -prune -perm "$wanted_mode" 2>/dev/null)" ] \
+      || chmod "$wanted_mode" "$mode_target" || return 1
+  done
+}
 
 write_secret() {
   file="$SECRETS_DIR/$1"
-  [ -s "$file" ] || random_hex 48 > "$file"
-  secret_mode "$file"
+  { [ -s "$file" ] || random_hex 48 > "$file"; } && secret_mode "$file"
 }
+
+# Every secret compose.turnkey.yml mounts; existing ones are kept. Updates and
+# restores call this too, so a release that mounts a new secret can start.
+# A subshell, so the umask cannot reach files a later checkout writes. Every
+# step checks its status because callers test it with `if`, where `set -e`
+# does not apply.
+ensure_secrets() (
+  umask 077
+  mkdir -p "$SECRETS_DIR" && set_mode 700 "$SECRETS_DIR" || exit 1
+  for secret in auth_secret vault_key world_ref_key; do
+    write_secret "$secret" || exit 1
+  done
+)
 
 configure() {
   requested_domain=${1:-}
@@ -106,12 +183,11 @@ configure() {
       }' "$ENV_FILE")
   fi
 
-  umask 077
-  mkdir -p "$SECRETS_DIR"
-  chmod 700 "$SECRETS_DIR"
-  write_secret auth_secret
-  write_secret vault_key
-  write_secret world_ref_key
+  ensure_secrets
+  # Only the file itself is private: a bare umask here would outlive this
+  # function, and an update that stages a domain move checks out the release
+  # next, which the app (another uid) must be able to read.
+  ( umask 077
   {
     printf 'KARMAX_DOMAIN=%s\n' "$domain"
     printf 'KARMAX_PREVIEW_DOMAIN=%s\n' "$preview"
@@ -124,7 +200,7 @@ configure() {
     printf 'TEMPORAL_VERSION=%s\n' "$temporal"
     printf 'POSTGRES_VERSION=%s\n' "$postgres"
     [ -z "$carried" ] || printf '%s\n' "$carried"
-  } > "$ENV_FILE"
+  } > "$ENV_FILE" )
   chmod 600 "$ENV_FILE"
 }
 
@@ -170,6 +246,28 @@ cmd_up() {
   print_finish
 }
 
+# A KARMAX_DATABASE_URL left in the app's karmax.env wins over the role's URL,
+# so ask PostgreSQL what the app actually connected as. The app names its
+# sessions, so an operator's psql or a backup's pg_dump does not count. Never
+# fails: it only reports.
+report_app_role() {
+  sessions=$(dc exec -T postgresql psql -U temporal -d postgres -Atc "SELECT DISTINCT a.usename, r.rolsuper
+    FROM pg_stat_activity a JOIN pg_roles r ON r.rolname = a.usename
+    WHERE a.datname = 'karmax' AND a.application_name = 'karmax'" < /dev/null) || {
+    echo 'karmax: warning: could not ask PostgreSQL which role the app connects as' >&2
+    return 0
+  }
+  [ -n "$sessions" ] || { note 'The app has no connection to the karmax database right now.'; return 0; }
+  printf '%s\n' "$sessions" | while IFS='|' read -r role superuser; do
+    [ -n "$role" ] || continue
+    if [ "$superuser" = t ]; then
+      echo "karmax: warning: the app connects to PostgreSQL as the superuser $role. Remove KARMAX_DATABASE_URL from /var/lib/karmax/karmax.env and restart the app." >&2
+    else
+      note "The app connects to PostgreSQL as $role, not a superuser."
+    fi
+  done
+}
+
 cmd_doctor() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured; run `./deploy/karmax up your-domain`'
@@ -180,6 +278,7 @@ cmd_doctor() {
   done
   note 'Durable secrets are present.'
   dc ps
+  report_app_role
   domain=$(env_value KARMAX_DOMAIN)
   if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 "https://$domain/api/health/ready" >/dev/null 2>&1; then
     note "Public HTTPS health check passed for $domain."
@@ -192,11 +291,16 @@ cmd_backup() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured'
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
-  destination=${1:-"$DEPLOY_DIR/backups/$stamp"}
+  # An operator's backup is named as one, so automatic pruning keeps it.
+  destination=${1:-"$DEPLOY_DIR/backups/manual-$stamp"}
   case "$destination" in /*) ;; *) destination="$PWD/$destination" ;; esac
   [ ! -e "$destination" ] || die "backup destination already exists: $destination"
-  mkdir -p "$destination"
-  chmod 700 "$destination"
+  staging="$destination.partial.$$"
+  [ ! -e "$staging" ] || die "backup staging path already exists: $staging"
+  mkdir -p "$(dirname "$destination")"
+  mkdir "$staging"
+  chmod 700 "$staging"
+  trap 'rm -rf "$staging"' EXIT
   temporary="/tmp/karmax-control-plane-$stamp"
   note 'Taking an online Karmax snapshot…'
   # The app is intentionally live here: SQLite uses its online backup API, and
@@ -205,14 +309,18 @@ cmd_backup() {
   # are not all taken at one instant; without this flag every automated update
   # fails before it can pull the commit that would fix the updater.
   dc exec -T app npm run backup -- --allow-running "$temporary"
-  dc cp "app:$temporary" "$destination/control-plane"
+  dc cp "app:$temporary" "$staging/control-plane"
   dc exec -T app rm -rf "$temporary"
   note 'Dumping Karmax and Temporal PostgreSQL data…'
-  dc exec -T postgresql pg_dump -U temporal -Fc karmax > "$destination/karmax.dump"
-  dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$destination/temporal.dump"
-  dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$destination/temporal-visibility.dump"
-  cp -R "$SECRETS_DIR" "$destination/deployment-secrets"
-  chmod -R go-rwx "$destination"
+  dc exec -T postgresql pg_dump -U temporal -Fc karmax > "$staging/karmax.dump"
+  dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$staging/temporal.dump"
+  dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$staging/temporal-visibility.dump"
+  cp -R "$SECRETS_DIR" "$staging/deployment-secrets"
+  backup_checksums "$staging"
+  sign_checksums "$staging" exec -T app
+  chmod -R go-rwx "$staging"
+  mv "$staging" "$destination"
+  trap - EXIT
   note "Backup complete: $destination"
   note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
   compact_backups
@@ -225,7 +333,7 @@ cmd_backup() {
 # volume while the existing service remains untouched.
 cmd_backup_candidate() {
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
-  destination="$DEPLOY_DIR/backups/$stamp"
+  destination="$DEPLOY_DIR/backups/predeploy-$stamp"
   [ ! -e "$destination" ] || die "backup destination already exists: $destination"
   mkdir -p "$destination"
   chmod 700 "$destination"
@@ -258,32 +366,128 @@ cmd_backup_candidate() {
     rm -rf "$destination"; return 1
   fi
   if ! cp -R "$SECRETS_DIR" "$destination/deployment-secrets"; then rm -rf "$destination"; return 1; fi
+  if ! backup_checksums "$destination"; then rm -rf "$destination"; return 1; fi
+  if ! sign_checksums "$destination" run --rm --no-deps -T app; then rm -rf "$destination"; return 1; fi
   if ! chmod -R go-rwx "$destination"; then rm -rf "$destination"; return 1; fi
   note "Backup complete: $destination"
   note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
-  compact_backups
 }
 
 cmd_restore() {
   need_docker
+  # Backups are signed (DB-10). --trust-key names the fingerprint of the key
+  # that signed one taken on another host; --accept-unsigned-v1 restores one
+  # from before signing, which nothing can authenticate, and is audited.
+  trust='' unsigned=''
+  while [ "$#" -gt 1 ]; do
+    case "$1" in
+      --trust-key)
+        case "${2:-}" in SHA256:[A-Za-z0-9+/]*) ;; *) die '--trust-key needs a SHA256:… key fingerprint' ;; esac
+        trust="$trust --trust-key $2"; shift 2 ;;
+      --accept-unsigned-v1) unsigned=' --accept-unsigned-v1'; shift ;;
+      *) break ;;
+    esac
+  done
   source=${1:-}
-  [ -n "$source" ] || die 'usage: ./deploy/karmax restore /path/to/backup'
+  [ -n "$source" ] || die 'usage: ./deploy/karmax restore [--trust-key SHA256:…] [--accept-unsigned-v1] /path/to/backup'
   case "$source" in /*) ;; *) source="$PWD/$source" ;; esac
+  [ -d "$source" ] || die "backup not found: $source"
+  [ -f "$ENV_FILE" ] || die 'configure the destination first with `./deploy/karmax up your-domain`'
+  # Verify and restore a private copy, never the backup directory itself,
+  # which could change between the check and the restore.
+  stage=$(mktemp -d "$DEPLOY_DIR/.restore-stage.XXXXXX") || die 'could not create a private restore stage'
+  trap 'rm -rf "$stage"' EXIT
+  chmod 700 "$stage"
+  cp -RP "$source/." "$stage/" || die "could not copy $source for verification"
+  [ -z "$(find "$stage" -type l)" ] || die 'backup contains a symbolic link; refusing to restore it'
+  echo "This replaces Karmax and Temporal data on this instance with: $source"
+  source=$stage
   [ -f "$source/control-plane/manifest.json" ] || die 'backup is missing control-plane/manifest.json'
   [ -f "$source/temporal.dump" ] || die 'backup is missing temporal.dump'
   [ -f "$source/temporal-visibility.dump" ] || die 'backup is missing temporal-visibility.dump'
   [ -d "$source/deployment-secrets" ] || die 'backup is missing deployment-secrets'
-  [ -f "$ENV_FILE" ] || die 'configure the destination first with `./deploy/karmax up your-domain`'
-  echo "This replaces Karmax and Temporal data on this instance with: $source"
-  printf 'Type RESTORE to continue: '
-  read answer
-  [ "$answer" = RESTORE ] || die 'restore cancelled'
+  if [ -f "$source/SHA256SUMS" ]; then
+    (cd "$source" && sha256sum -c SHA256SUMS) || die 'backup checksum verification failed'
+  elif [ -n "$unsigned" ]; then
+    # The previous release's updater wrote no checksums; its control plane is
+    # still checked against its manifest, and every dump by pg_restore below.
+    note 'This backup predates checksums: only its control plane and the readability of its dumps can be verified.'
+  else
+    die 'backup has no checksums (it predates them); restore it only if it stayed in trusted storage, with --accept-unsigned-v1'
+  fi
+  # Check both signatures, every checksum, the control-plane manifest and
+  # every payload file using the candidate app, while the live containers and
+  # all three databases are still untouched.
+  dc build app
+  # The backup is private to the operator who took it (0600) and the app image
+  # runs as its own uid, so the one-offs that read it run as root. Their stdin
+  # is closed so they cannot swallow the confirmation meant for the prompt.
+  # shellcheck disable=SC2086 # fingerprints and flags are validated words
+  dc run --rm --no-deps -T --user root -v "$source:/backup:ro" app npm run restore -- --verify-deployment$trust$unsigned /backup \
+    < /dev/null || die 'backup verification failed'
+  for dump in karmax temporal temporal-visibility; do
+    [ -f "$source/$dump.dump" ] || { [ "$dump" = karmax ] && continue; die "backup is missing $dump.dump"; }
+    dc run --rm --no-deps -T postgresql pg_restore -f /dev/null < "$source/$dump.dump" \
+      || die "PostgreSQL dump verification failed: $dump.dump"
+  done
+  # Staging holds a second copy of every database beside the live ones, on the
+  # disk that also takes the live write-ahead log, so filling it would stop the
+  # running instance too. A database restores to at least the size of its
+  # compressed dump, and usually a few times it.
+  dumps_kb=$(du -k "$source"/*.dump | awk '{ total += $1 } END { print total + 0 }')
+  free_kb=$(dc run --rm --no-deps -T postgresql df -Pk /var/lib/postgresql/data < /dev/null | awk 'NR == 2 { print $4 }')
+  case "$free_kb" in
+    ''|*[!0-9]*) note "Could not read the free space on PostgreSQL's disk." ;;
+    *)
+      [ "$free_kb" -ge "$dumps_kb" ] || die "not enough free space to stage the restore: PostgreSQL's disk has $((free_kb / 1024)) MiB free for $((dumps_kb / 1024)) MiB of dumps"
+      [ "$free_kb" -ge $((dumps_kb * 4)) ] || echo "karmax: warning: the restored databases may not fit: PostgreSQL's disk has $((free_kb / 1024)) MiB free for $((dumps_kb / 1024)) MiB of dumps, which usually restore to a few times that. Running out would stop the running instance too." >&2
+      ;;
+  esac
+  confirm=RESTORE
+  if [ -n "$unsigned" ]; then
+    echo 'This backup is unsigned: nothing proves it has not been altered since it was taken.'
+    confirm='RESTORE UNSIGNED'
+  fi
+  printf 'Type %s to continue: ' "$confirm"
+  read -r answer
+  [ "$answer" = "$confirm" ] || die 'restore cancelled'
+
+  # Nothing live changes until every database has been restored beside it,
+  # into <name>_restore, and the secrets have been copied beside theirs. A dump
+  # can fail only now: it may name a role this PostgreSQL does not have (a
+  # fresh volume has no karmax role), so it is restored without owners or
+  # grants; the karmax-database job hands everything to the app's role on the
+  # next start. A failure here leaves the instance exactly as it was.
+  staged_secrets="$SECRETS_DIR.restore.$$"
+  drop_staging() {
+    rm -rf "$staged_secrets"
+    for database in karmax temporal temporal_visibility; do
+      dc exec -T postgresql dropdb --if-exists -U temporal --force "${database}_restore" || true
+    done
+  }
+  abandon() { drop_staging; die "$1; nothing on this instance was changed"; }
+  cp -R "$source/deployment-secrets" "$staged_secrets" || abandon 'could not copy the deployment secrets'
+  chmod 700 "$staged_secrets" && secret_mode "$staged_secrets"/* || abandon 'could not protect the deployment secrets'
+  dc up -d postgresql || abandon 'PostgreSQL did not start'
+  attempt=0
+  until dc exec -T postgresql pg_isready -U temporal -d postgres >/dev/null 2>&1; do
+    attempt=$((attempt + 1)); [ "$attempt" -lt 60 ] || abandon 'PostgreSQL did not become ready'; sleep 2
+  done
+  for dump in karmax temporal temporal-visibility; do
+    database=$(printf '%s' "$dump" | tr - _)_restore
+    dc exec -T postgresql dropdb --if-exists -U temporal --force "$database" \
+      && dc exec -T postgresql createdb -U temporal "$database" \
+      || abandon "could not create $database"
+    [ -f "$source/$dump.dump" ] || continue
+    dc exec -T postgresql pg_restore -U temporal --no-owner --no-privileges -d "$database" < "$source/$dump.dump" \
+      || abandon "$dump.dump did not restore"
+  done
 
   dc down
   rm -rf "$SECRETS_DIR"
-  cp -R "$source/deployment-secrets" "$SECRETS_DIR"
-  chmod 700 "$SECRETS_DIR"
-  secret_mode "$SECRETS_DIR"/*
+  mv "$staged_secrets" "$SECRETS_DIR"
+  # A backup taken before a secret existed restores without it.
+  ensure_secrets
   dc up -d postgresql
   attempt=0
   until dc exec -T postgresql pg_isready -U temporal -d postgres >/dev/null 2>&1; do
@@ -291,17 +495,16 @@ cmd_restore() {
   done
   for database in karmax temporal temporal_visibility; do
     dc exec -T postgresql dropdb --if-exists -U temporal --force "$database"
-    dc exec -T postgresql createdb -U temporal "$database"
+    dc exec -T postgresql psql -U temporal -d postgres -v ON_ERROR_STOP=1 \
+      -c "ALTER DATABASE ${database}_restore RENAME TO $database"
   done
-  if [ -f "$source/karmax.dump" ]; then
-    dc exec -T postgresql pg_restore -U temporal -d karmax < "$source/karmax.dump"
-  fi
-  dc exec -T postgresql pg_restore -U temporal -d temporal < "$source/temporal.dump"
-  dc exec -T postgresql pg_restore -U temporal -d temporal_visibility < "$source/temporal-visibility.dump"
-  dc build app
-  dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore -- /restore
+  # shellcheck disable=SC2086 # fingerprints and flags are validated words
+  dc run --rm --no-deps -T --user root -v "$source/control-plane:/restore:ro" app \
+    sh -c "npm run restore --$trust$unsigned /restore && chown -R karmax:karmax /var/lib/karmax"
   dc up -d --remove-orphans
   wait_ready || die 'Karmax failed its readiness check after restore'
+  rm -rf "$stage"
+  trap - EXIT
   note 'Restore complete.'
   print_finish
 }
@@ -322,8 +525,15 @@ data_epoch() {
 cmd_update() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured'
-  requested=${1:-origin/master}
-  case "$requested" in -*) die "invalid deployment revision: $requested" ;; esac
+  accept_vault='' requested=''
+  for argument in "$@"; do
+    case "$argument" in
+      --accept-vault-findings) accept_vault=1 ;;
+      -*) die "unknown update option: $argument" ;;
+      *) [ -z "$requested" ] || die "update takes one revision, not $requested and $argument"; requested=$argument ;;
+    esac
+  done
+  requested=${requested:-origin/master}
   git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die 'the deployment source is not a Git checkout'
   if [ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=no)" ]; then
@@ -391,6 +601,14 @@ cmd_update() {
 
   note "Checking out validated revision $target…"
   git -C "$ROOT_DIR" checkout --detach "$target"
+  # This file is the target's own, so it knows every secret the target mounts.
+  if ! ensure_secrets; then
+    git -C "$ROOT_DIR" checkout --detach "$previous"
+    restore_migration
+    cleanup_migration
+    migration_backup=''
+    die "deployment $target could not write its secrets; production remains at $previous"
+  fi
 
   # Building does not replace the running container. It gives the one-off
   # snapshot process the candidate's backup implementation while production
@@ -402,6 +620,22 @@ cmd_update() {
     migration_backup=''
     die "deployment $target could not be built; production remains at $previous"
   fi
+  # A running workflow replays its history under whatever code the next worker
+  # loads, and one that cannot is wedged at its next event (WF-34 would have
+  # wedged every task on tavya.io). The candidate replays them all first.
+  if [ "${KARMAX_SKIP_REPLAY_CHECK:-}" = 1 ]; then
+    echo 'karmax: warning: replay check skipped (KARMAX_SKIP_REPLAY_CHECK=1); running workflows may not survive this release' >&2
+  else
+    note 'Replaying the running workflows under the candidate…'
+    if ! dc run --rm --no-deps -T app npm run --silent replay-check; then
+      git -C "$ROOT_DIR" checkout --detach "$previous"
+      restore_migration
+      dc build app || true
+      cleanup_migration
+      migration_backup=''
+      die "deployment $target stopped by the replay check, which lists above the running workflows it cannot replay or why it could not run; production remains at $previous. Fix the release, or rerun with KARMAX_SKIP_REPLAY_CHECK=1 only if those workflows may break"
+    fi
+  fi
   if ! cmd_backup_candidate; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
@@ -410,10 +644,31 @@ cmd_update() {
     migration_backup=''
     die "deployment $target could not be backed up; production remains at $previous"
   fi
+  # The candidate's first boot may migrate the vault one way (data epoch 3),
+  # where no automatic rollback follows. Check it read-only with the new image
+  # first. A secret it would quarantine (exit 3) keeps the previous app serving
+  # unless the operator accepts the findings; a refused key, an unreadable file
+  # or a vault it cannot open (exit 4) means the boot would fail, and always does.
+  preflight=0
+  dc run --rm --no-deps -T app npm run --silent vault-preflight || preflight=$?
+  if [ "$preflight" -eq 3 ] && [ -n "$accept_vault" ]; then
+    note 'Proceeding past the vault preflight findings (--accept-vault-findings).'
+  elif [ "$preflight" -ne 0 ]; then
+    git -C "$ROOT_DIR" checkout --detach "$previous"
+    restore_migration
+    dc build app || true
+    cleanup_migration
+    migration_backup=''
+    [ "$preflight" -eq 3 ] \
+      && die "deployment $target stopped by the vault preflight; production remains at $previous. Fix what it reported, or rerun update with --accept-vault-findings"
+    die "deployment $target could not boot on this vault (see the vault preflight above); production remains at $previous. Fix what it reported first"
+  fi
 
   if dc up -d --remove-orphans && wait_ready; then
     cleanup_migration
     migration_backup=''
+    report_app_role || true
+    reclaim_space
     note "Update complete at $target."
     return 0
   fi
@@ -440,6 +695,29 @@ cmd_update() {
   die "deployment $target failed and automatic rollback to $previous also failed"
 }
 
+# The superuser password: Temporal and the setup jobs connect with it, and
+# releases before the karmax role gave it to the app as well. The new value
+# travels on psql's stdin and in files, never on a command line `ps` shows.
+cmd_rotate_postgres_password() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  password=$(random_hex 32)
+  staged="$ENV_FILE.rotate.$$"
+  if ! (umask 077 && { sed '/^POSTGRES_PASSWORD=/d' "$ENV_FILE" && printf 'POSTGRES_PASSWORD=%s\n' "$password"; } > "$staged"); then
+    rm -f "$staged"; die 'could not stage the new password; nothing was changed'
+  fi
+  if ! printf "ALTER ROLE temporal PASSWORD '%s';\n" "$password" \
+      | dc exec -T postgresql psql -U temporal -d postgres -v ON_ERROR_STOP=1 -q; then
+    rm -f "$staged"; die 'PostgreSQL refused the new password; nothing was changed'
+  fi
+  mv "$staged" "$ENV_FILE"
+  note 'Password changed. Restarting PostgreSQL and Temporal with it…'
+  dc up -d --no-build --remove-orphans
+  wait_ready || die 'Karmax failed its readiness check after the password change'
+  report_app_role
+  note 'PostgreSQL password rotated.'
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./deploy/karmax COMMAND
@@ -449,8 +727,12 @@ Usage: ./deploy/karmax COMMAND
   status                       Show service health
   logs [SERVICE]               Follow logs (app by default)
   backup [DIRECTORY]           Snapshot Karmax, object data, Temporal, and keys
-  restore DIRECTORY            Verify and restore a complete snapshot
-  update [REVISION]             Backup, deploy an exact master revision, and restart
+  prune-backups                Drop automatic snapshots past their retention
+  restore [--trust-key FP] [--accept-unsigned-v1] DIRECTORY
+                               Verify signatures and restore a complete snapshot
+  update [--accept-vault-findings] [REVISION]
+                               Backup, check the vault, deploy an exact master revision, and restart
+  rotate-postgres-password      Replace PostgreSQL's superuser password
   down                          Stop everything without deleting durable data
 EOF
 }
@@ -463,8 +745,10 @@ case "$command" in
   status) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc ps ;;
   logs) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc logs -f --tail=200 "${1:-app}" ;;
   backup) cmd_backup "$@" ;;
+  prune-backups) prune_backups ;;
   restore) cmd_restore "$@" ;;
   update) cmd_update "$@" ;;
+  rotate-postgres-password) cmd_rotate_postgres_password "$@" ;;
   down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;
   help|-h|--help) usage ;;
   *) usage >&2; die "unknown command: $command" ;;

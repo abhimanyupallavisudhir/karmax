@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 
 /**
- * Agent mailbox (PLAN-passwords.md §8). Registration and email-verification
+ * Agent mailbox (wiki plans/PLAN-passwords §8). Registration and email-verification
  * flows need somewhere to receive codes and magic links — but never the user's
  * real inbox. karmax mints a dedicated agent address; an inbound mail webhook
  * drops messages here; the `check_agent_mail` tool reads them and pulls out the
@@ -43,8 +43,8 @@ export interface AgentMailStore {
 
 const kvMessages = (organizationId: string) => `agent-mail:messages:${organizationId}`;
 const kvAddress = (organizationId: string) => `agent-mail:address:${organizationId}`;
-/** Reverse route: local part → owning organization (what ingest consults). */
-const kvOwner = (localPart: string) => `agent-mail:owner:${localPart}`;
+/** Reverse route: full address → owning organization. */
+const kvOwner = (address: string) => `agent-mail:owner-address:${address}`;
 const MAX_MESSAGES = 200;
 
 /** Pull a one-time code out of mail text — 4–8 digits, or a 6–8 char
@@ -279,50 +279,48 @@ export class AgentMail {
    */
   async address(organizationId: string): Promise<string> {
     return this.store.transaction(async () => {
-    const existing = (await this.store.kvGet(kvAddress(organizationId)));
-    if (this.exactAddress) {
-      const address = cleanAddress(this.exactAddress);
-      const local = address.split('@')[0]!;
-      (await this.store.kvSet(kvAddress(organizationId), address));
-      (await this.store.kvSet(kvOwner(local), organizationId));
+      const existing = await this.store.kvGet(kvAddress(organizationId));
+      const token = existing?.match(/(agent-[0-9a-f]+)/)?.[1] ?? `agent-${crypto.randomBytes(6).toString('hex')}`;
+      const local = this.fixedLocal ? `${this.fixedLocal}+${token}` : token;
+      const address = this.exactAddress ? cleanAddress(this.exactAddress)
+        : existing && !this.domain ? existing : `${local}@${this.domain || 'agent.local'}`;
+      const owner = await this.store.kvGet(kvOwner(address)) || await this.ownerOf(address);
+      if (owner && owner !== organizationId) throw new Error('mailbox address is already owned by another organization');
+      if (existing && existing !== address) await this.store.kvSet(kvOwner(existing), '');
+      await this.store.kvSet(kvOwner(address), organizationId);
+      await this.store.kvSet(kvAddress(organizationId), address);
       return address;
-    }
-    if (existing && !this.domain) return existing; // never downgrade to the placeholder
-    const token = existing?.match(/(agent-[0-9a-f]+)/)?.[1] ?? `agent-${crypto.randomBytes(6).toString('hex')}`;
-    const local = this.fixedLocal ? `${this.fixedLocal}+${token}` : token;
-    const address = `${local}@${this.domain || 'agent.local'}`;
-    if (existing === address) return existing;
-    // First mint, placeholder upgrade, or provider switch: the org's random
-    // token is preserved and old reverse-routes stay in kv, so nothing breaks.
-    (await this.store.kvSet(kvAddress(organizationId), address));
-    (await this.store.kvSet(kvOwner(local.toLowerCase()), organizationId));
-    (await this.store.kvSet(kvOwner(token), organizationId)); // tag-only route survives providers that rewrite the base
-    return address;
-      });
-}
+    });
+  }
 
   configured(): boolean {
     return !!(this.domain || this.exactAddress);
   }
 
-  /** Which organization owns a recipient address. Tries the exact local part
-   *  (covers fixed-address `base+agent-x` mailboxes), then the plus-tag alone,
-   *  then the base local with tags stripped (`agent-ab12+github@…`). */
+  /** Exact addresses and subaddresses on the same domain only. Legacy local
+   * routes are accepted only when the owner's current full address agrees. */
   async ownerOf(to: string): Promise<string | undefined> {
-    const local = to.split('@')[0]?.trim().toLowerCase();
-    if (!local) return undefined;
-    const [base, tag] = local.split('+', 2);
-    return (await this.store.kvGet(kvOwner(local)))
-      ?? (tag ? (await this.store.kvGet(kvOwner(tag))) : undefined)
-      ?? (base ? (await this.store.kvGet(kvOwner(base))) : undefined);
+    const address = cleanAddress(to);
+    const [local, domain] = address.split('@');
+    if (!local || !domain) return undefined;
+    const baseAddress = `${local.split('+')[0]}@${domain}`;
+    for (const candidate of [...new Set([address, baseAddress])]) {
+      const owner = await this.store.kvGet(kvOwner(candidate))
+        || await this.store.kvGet(`agent-mail:owner:${candidate.split('@')[0]}`);
+      if (owner && await this.store.kvGet(kvAddress(owner)) === candidate) return owner;
+    }
+    return undefined;
   }
 
   private async all(organizationId: string): Promise<AgentMessage[]> {
     const raw = await this.store.kvGet(kvMessages(organizationId));
+    if (raw && Buffer.byteLength(raw) > 8 * 1_048_576) throw new Error('agent inbox exceeds size limit; archive it before polling');
+    // A damaged inbox must not read as empty: the next delivery would replace
+    // every stored message with just the new one (AU-28).
     try {
       return JSON.parse(raw ?? '[]');
     } catch {
-      return [];
+      throw new Error('The agent inbox is unreadable, so it was left untouched; restore it from a backup');
     }
   }
 
@@ -342,6 +340,7 @@ export class AgentMail {
     const existing = (await this.all(organizationId));
     // Polling may replay a boundary message; keep its original arrival time.
     if (existing.some((message) => message.id === id)) return { delivered: false };
+    msg = { ...msg, from: msg.from.slice(0, 512), to: msg.to.slice(0, 512), subject: msg.subject?.slice(0, 1024), text: msg.text.slice(0, 16_384) };
     const record: AgentMessage = {
       id,
       from: msg.from,
@@ -353,6 +352,11 @@ export class AgentMail {
       receivedAt: msg.receivedAt ?? Date.now(),
     };
     const next = [...existing, record].slice(-MAX_MESSAGES);
+    let bytes = Buffer.byteLength(JSON.stringify(next));
+    while (bytes > 1_048_576 && next.length > 1) {
+      next.shift();
+      bytes = Buffer.byteLength(JSON.stringify(next));
+    }
     (await this.store.kvSet(kvMessages(organizationId), JSON.stringify(next)));
     return { delivered: true, message: record };
       });

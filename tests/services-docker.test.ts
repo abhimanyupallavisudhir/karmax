@@ -8,17 +8,18 @@ import { WorktreeProvider } from '../src/world/worktree.js';
 import { destroyWorldServices, launchWorldServices, sweepOrphanedServiceContainers } from '../src/world/services.js';
 import { ensureWorldExcluded } from '../src/world/secret-exclude.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
+import { requireDocker } from './helpers/docker-gate.js';
 
 const pexec = promisify(execFile);
 let docker = false;
 beforeAll(async () => {
   docker = await pexec('docker', ['version', '--format', '{{.Server.Version}}'], { timeout: 5_000 })
     .then(() => true).catch(() => false);
+  if (process.env.KARMAX_SKIP_DOCKER !== '1') requireDocker(docker);
 });
 
 describe.skipIf(process.env.KARMAX_SKIP_DOCKER === '1')('per-world services (real Docker)', () => {
   it('launches from a typed seed resource and the orphan sweep removes it', async () => {
-    if (!docker) return;
     const previousHome = process.env.KARMAX_HOME;
     const installation = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-service-installation-'));
     const worldsHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-service-worlds-'));

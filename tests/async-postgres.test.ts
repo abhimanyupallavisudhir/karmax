@@ -6,6 +6,13 @@ describe.skipIf(!url)('native asynchronous PostgreSQL', () => {
   let db: AsyncPostgres;
   afterEach(async () => { await db?.close(); });
 
+  // `deploy/karmax doctor` and operators reading pg_stat_activity tell the
+  // app's sessions from psql, pg_dump and backups by this name.
+  it('names its sessions after the app', async () => {
+    db = new AsyncPostgres(url!, { max: 1 });
+    expect(await db.query("SELECT current_setting('application_name') AS name")).toEqual([{ name: 'karmax' }]);
+  });
+
   it('keeps timers and independent queries responsive while a query is sleeping', async () => {
     db = new AsyncPostgres(url!, { max: 2 });
     let timerFired = false;

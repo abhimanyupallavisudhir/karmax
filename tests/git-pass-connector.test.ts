@@ -116,10 +116,39 @@ describe('Git-backed unix pass connector', () => {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }, 30_000);
 
+  // AU-41: an owner moved their store out of the connected repository, and
+  // every sync after that said only "check its connection".
+  it('names why a store it syncs from became unusable', async () => {
+    const fixture = encryptedRemote();
+    const connector = new GitPassConnector(() => fixture.secret, 'org_test', () => ({}),
+      path.join(fixture.root, 'connector-state'), { allowLocalRepository: true });
+    expect((await connector.pull(['sites/example.com'])).items).toHaveLength(1);
+    run('git', ['rm', '-rq', '.password-store'], { cwd: fixture.seed });
+    run('git', ['commit', '-qm', 'move the store to its own repository'], { cwd: fixture.seed });
+    run('git', ['push', '-q', 'origin', 'main'], { cwd: fixture.seed });
+    const moved = 'password-store path ".password-store" is not a directory in the repository';
+    expect((await connector.pull(['sites/example.com'])).failures).toEqual([
+      { externalId: 'sites/example.com', error: `Store root: ${moved}` }]);
+    expect((await connector.catalog()).failures).toEqual([{ store: 'root', error: moved }]);
+    // Git's own output names server paths, so a fetch failure keeps its fixed wording.
+    fs.rmSync(fixture.remote, { recursive: true, force: true });
+    const unreachable = new GitPassConnector(() => fixture.secret, 'org_test', () => ({}),
+      path.join(fixture.root, 'fresh-state'), { allowLocalRepository: true });
+    expect((await unreachable.catalog()).failures).toEqual([
+      { store: 'root', error: 'cannot fetch the repository; select a Git profile that can access it' }]);
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }, 30_000);
+
   it('refuses host filesystem repositories outside explicit test mode', async () => {
     const connector = new GitPassConnector(() => JSON.stringify({
       repositoryUrl: '/etc', gpgPrivateKey: 'not-a-key',
     }), 'org_test', () => ({}), fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-pass-state-')));
     await expect(connector.list()).rejects.toThrow(/HTTPS or SSH repository URL/i);
   });
+});
+
+it('rejects arbitrary hosted Git transport hosts (AU-16)', async () => {
+  const connector = new GitPassConnector(() => JSON.stringify({ repositoryUrl: 'https://127.0.0.1/passwords.git', gpgPrivateKey: 'key' }),
+    'org', undefined, undefined, { hosted: true });
+  await expect(connector.list()).rejects.toThrow(/hosted.*Git|public/);
 });

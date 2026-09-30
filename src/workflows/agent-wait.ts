@@ -60,13 +60,14 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
     const interrupted = await condition(hooks.interrupted, untilMs - Date.now());
     return interrupted ? undefined : `(Resumed: your ${wait.minutes}-minute pause is over.)`;
   }
-  if (!hooks.world) return '(Resumed: the task has no world to check the jobs in.)';
+  const world = hooks.world;
+  if (!world) return '(Resumed: the task has no world to check the jobs in.)';
 
   let outcome: { finished: boolean; summary: string } | undefined;
   let failure: unknown;
   let settled = false;
   const scope = new CancellationScope();
-  const watching = scope.run(() => jobWatch.awaitJobs(hooks.world as any, jobs, untilMs)).then(
+  const watching = scope.run(() => jobWatch.awaitJobs(world, jobs, untilMs)).then(
     (result) => { outcome = result; },
     (error) => { if (!isCancellation(error)) failure = error; },
   ).finally(() => { settled = true; });

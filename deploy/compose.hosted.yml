@@ -1,11 +1,17 @@
 name: karmax
 
+x-bounded-logs: &bounded-logs
+  driver: json-file
+  options: { max-size: 10m, max-file: '3' }
+
 services:
   app:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
+    mem_limit: 4g
+    logging: *bounded-logs
     environment:
       KARMAX_DEPLOYMENT: hosted
       KARMAX_CELL_ID: ${KARMAX_CELL_ID:-cell-1}
@@ -50,6 +56,8 @@ services:
       KARMAX_OIDC_CLIENT_ID: ${KARMAX_OIDC_CLIENT_ID:-}
       KARMAX_OIDC_CLIENT_SECRET: ${KARMAX_OIDC_CLIENT_SECRET:-}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_CLIENT_ID: ${STRIPE_CLIENT_ID:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
     secrets:
       - auth_secret
       - vault_key
@@ -68,6 +76,8 @@ services:
       context: .
       dockerfile: Caddy.Dockerfile
     restart: unless-stopped
+    mem_limit: 512m
+    logging: *bounded-logs
     depends_on:
       app:
         condition: service_healthy

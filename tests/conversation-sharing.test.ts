@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { chromium } from 'playwright';
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { Gateway, routeCapability } from '../src/gateway/server.js';
@@ -195,14 +196,26 @@ describe('public conversation sharing over HTTP', async () => {
       page.setDefaultTimeout(process.env.KARMAX_TEST_REAL_MATHJAX ? 20000 : 5000);
       const errors: string[] = [];
       page.on('pageerror', error => errors.push(error.message));
-      // Deterministic loader fixture; a separate smoke run verifies real MathJax.
-      if (!process.env.KARMAX_TEST_REAL_MATHJAX) await page.route('https://cdn.jsdelivr.net/**', route => route.fulfill({ contentType: 'text/javascript', body: `
+      // Keep browser integrity enforcement enabled for the deterministic loader fixture.
+      if (!process.env.KARMAX_TEST_REAL_MATHJAX) {
+        const mathjax = `
         Object.assign(window.MathJax, { typesetClear() {}, typesetPromise: async nodes => {
           for (const node of nodes) node.innerHTML = '<mjx-container><svg aria-label="math"></svg></mjx-container>';
         } });
         window.MathJax.startup.defaultReady = () => {};
         window.MathJax.startup.ready();
-      ` }));
+        `;
+        const integrity = `sha384-${createHash('sha384').update(mathjax).digest('base64')}`;
+        await page.route('**/markdown.js', async route => {
+          const response = await route.fetch();
+          const source = await response.text();
+          expect(source).toMatch(/'tex-svg': 'sha384-[A-Za-z0-9+/=]+'/);
+          await route.fulfill({ response, body: source.replace(/'tex-svg': 'sha384-[A-Za-z0-9+/=]+'/, `'tex-svg': '${integrity}'`) });
+        });
+        await page.route('https://cdn.jsdelivr.net/**', route => route.fulfill({
+          contentType: 'text/javascript', headers: { 'access-control-allow-origin': '*' }, body: mathjax,
+        }));
+      }
       await page.goto(`${base}${url}`);
       await page.locator('.md-table').waitFor();
       expect(await page.getByRole('link', { name: 'tavya home' }).getAttribute('href')).toBe('/');

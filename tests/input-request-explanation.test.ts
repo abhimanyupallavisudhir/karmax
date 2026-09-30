@@ -22,6 +22,8 @@ describe('input request explanations over HTTP', () => {
   let view: any;
   let close: () => Promise<void>;
   let modelServer: http.Server;
+  let tokens: TokenAuthority;
+  let projectId: string;
   const modelRequests: any[] = [];
   const sourceKey = 'input-request:1710000010000';
   const post = (body: object) => fetch(`${base}/api/tasks/${taskId}/explanations`, {
@@ -48,7 +50,9 @@ describe('input request explanations over HTTP', () => {
     view = { status: 'waiting', updatedAt: 1710000010000,
       waitingFor: { kind: 'human', detail: 'Choose a deployment target.' },
       actions: [{ name: 'followUp', roles: ['do'], enabled: true }] };
-    const gateway = (await Gateway.create({ store, bus: new KarmaxBus(), tokens: new TokenAuthority(),
+    tokens = new TokenAuthority();
+    projectId = project.id;
+    const gateway = (await Gateway.create({ store, bus: new KarmaxBus(), tokens,
       contributions: new ContributionRegistry(), overlays: new Overlays(), client: {} as any,
       api: { taskConversation: async () => ({ messages: [{ role: 'user', text: 'Publish my update', ts: 1 }] }),
         getTaskView: async () => view } as any,
@@ -77,6 +81,25 @@ describe('input request explanations over HTTP', () => {
       { role: 'do', sourceKey: 'input-request:1', inputRequest: view.waitingFor.detail },
     ]) expect((await post(body)).status).toBe(409);
     expect(modelRequests).toHaveLength(0);
+  });
+
+  it('lets only a settings manager point an explanation at another endpoint with the organization\'s key', async () => {
+    const received: string[] = [];
+    const other = http.createServer((req, res) => { received.push(String(req.headers.authorization)); res.end('{}'); });
+    await new Promise<void>((resolve) => other.listen(0, '127.0.0.1', resolve));
+    try {
+      const agent = (await tokens.mint({ taskId, profileId: 'do', role: 'do', principal: 'user:reader', projectId,
+        ceiling: ['task:conversation:read', 'task:conversation:message'],
+        grantorCaps: ['task:conversation:read', 'task:conversation:message'] })).token;
+      const response = await fetch(`${base}/api/tasks/${taskId}/explanations`, {
+        method: 'POST', headers: { authorization: `Bearer ${agent}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ role: 'do', sourceKey, inputRequest: view.waitingFor.detail, settings: {
+          endpoint: `http://127.0.0.1:${(other.address() as { port: number }).port}/v1/chat/completions`,
+          model: 'any', prompt: 'Explain.' } }),
+      });
+      expect(response.status).toBe(403);
+      expect(received).toEqual([]);
+    } finally { await new Promise<void>((resolve) => other.close(() => resolve())); }
   });
 
   it('explains the authoritative prompt and persists its source through resolution', async () => {

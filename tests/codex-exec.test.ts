@@ -34,6 +34,17 @@ if (process.env.STUB_ENV_OUT) {
   }));
 }
 const mode = process.env.STUB_MODE || 'ok';
+if (mode === 'unicode') {
+  const line = Buffer.from(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'A😀B' } }) + '\\n');
+  const split = line.indexOf(Buffer.from('😀')) + 2;
+  process.stdout.write(line.subarray(0, split));
+  setTimeout(() => { process.stdout.write(line.subarray(split)); process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n'); }, 10);
+  return;
+}
+if (mode === 'stderr-tail') {
+  process.stderr.write('x'.repeat(200_000) + 'TAIL_DIAGNOSTIC', () => process.exit(1));
+  return;
+}
 if (mode === 'limit') {
   process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
   process.stdout.write(JSON.stringify({ type: 'turn.failed', error: { type: 'UsageLimitReachedError', resets_in_seconds: 1800 } }) + '\\n');
@@ -45,6 +56,10 @@ if (mode === 'partial-fail') {
   process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'partial' } }) + '\\n');
   process.stdout.write(JSON.stringify({ type: 'turn.failed', error: { message: 'connection reset during turn' } }) + '\\n');
   process.exit(1);
+}
+if (mode === 'stderr-flood') {
+  process.stderr.write('x'.repeat(1024 * 1024) + 'LATEST DIAGNOSTIC', () => process.exit(1));
+  return;
 }
 if (outFile) fs.writeFileSync(outFile, 'FINAL ANSWER from codex stub');
 process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
@@ -96,6 +111,11 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     expect(r.session).toBe('th_stub');
   });
 
+  it('keeps the recent diagnostic after a large stderr stream', async () => {
+    process.env.STUB_MODE = 'stderr-flood';
+    await expect(adapter.runTurn(makeInput() as any, ctx)).rejects.toThrow(/LATEST DIAGNOSTIC/);
+  });
+
   it('reports the turn\'s provider token usage on a fresh thread', async () => {
     delete process.env.STUB_MODE;
     const r = await adapter.runTurn(makeInput() as any, ctx);
@@ -113,6 +133,30 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     }) + '\n');
     const r = await adapter.runTurn({ ...makeInput(), session } as any, ctx);
     expect(r.usage).toBeUndefined();
+  });
+
+  it('decodes UTF-8 across exec stdout chunks', async () => {
+    process.env.STUB_MODE = 'unicode';
+    const output: string[] = [];
+    await adapter.runTurn(makeInput() as any, { emit: (text: string) => output.push(text) } as any);
+    expect(output).toContain('A😀B');
+  });
+
+  it('retains the bounded end of exec stderr diagnostics', async () => {
+    process.env.STUB_MODE = 'stderr-tail';
+    await expect(adapter.runTurn(makeInput() as any, ctx)).rejects.toThrow('TAIL_DIAGNOSTIC');
+  });
+
+  it('delivers large prompts through stdin instead of argv', async () => {
+    delete process.env.STUB_MODE;
+    const argvOut = path.join(dir, 'large-argv.json');
+    process.env.STUB_ARGV_OUT = argvOut;
+    try {
+      await adapter.runTurn({ ...makeInput(), systemPrompt: 'x'.repeat(200_000) } as any, ctx);
+      const rec = JSON.parse(fs.readFileSync(argvOut, 'utf8'));
+      expect(rec.argv.at(-1)).toBe('-');
+      expect(rec.argv.join(' ').length).toBeLessThan(20_000);
+    } finally { delete process.env.STUB_ARGV_OUT; }
   });
 
   it('keeps project secrets outside the legacy harness process', async () => {

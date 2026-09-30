@@ -7,13 +7,14 @@ import { GitProfile, ProjectConfig } from '../domain/types.js';
 import { CredentialBroker } from './broker.js';
 import { git, isolatedGitEnvironment } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
+import { shellQuote } from '../util/shell.js';
 import { paths } from '../config/paths.js';
 import { BRAND } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
 
 /**
- * Git profiles (PLAN-git-config.md §3): named identity + credentials for the
+ * Git profiles (wiki plans/PLAN-git-config §3): named identity + credentials for the
  * repos karmax works on — the git analogue of the agent config-home accounts.
  *
  * The registry (names, user.name/email, which-secrets-exist flags) lives in the
@@ -360,7 +361,9 @@ export class GitProfiles {
       // A fresh hosted container has no known_hosts file. `accept-new` permits
       // that first connection without weakening protection against a changed
       // host key on subsequent operations.
-      env.GIT_SSH_COMMAND = `ssh -i ${key} -o IdentitiesOnly=yes -o UserKnownHostsFile=${knownHosts} -o StrictHostKeyChecking=accept-new`;
+      // git runs this through a shell: a data home such as "Application Support"
+      // must not split the paths into separate arguments (AU-34).
+      env.GIT_SSH_COMMAND = `ssh -i ${shellQuote(key)} -o IdentitiesOnly=yes -o UserKnownHostsFile=${shellQuote(knownHosts)} -o StrictHostKeyChecking=accept-new`;
     }
     if (profile.githubToken) {
       env.GH_TOKEN = (await this.resolveSecret(profile.name, 'token', ctx));
@@ -373,7 +376,7 @@ export class GitProfiles {
   }
 
   /**
-   * The preflight/doctor check (PLAN-git-config.md §7): which tier a project's
+   * The preflight/doctor check (wiki plans/PLAN-git-config §7): which tier a project's
    * remote operations resolve to, and whether that tier can actually reach the
    * repos' remotes non-interactively. Read-only; never throws.
    */

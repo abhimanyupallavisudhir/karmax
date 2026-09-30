@@ -354,6 +354,8 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let out = '';
     let done = false;
+    let timedOut = false;
+    let forceKill: NodeJS.Timeout | undefined;
     const child = spawn(cmd, ['-p', '/usage'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     if (child.pid) {
       // Task-manager registry (dashboard Processes panel) — short-lived, but a
@@ -365,14 +367,20 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      if (forceKill) clearTimeout(forceKill);
       err ? reject(err) : resolve(out);
     };
-    const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* gone */ } finish(new Error('usage probe timed out')); }, timeoutMs);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill('SIGTERM'); } catch { /* gone */ }
+      forceKill = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 1_000);
+      forceKill.unref?.();
+    }, timeoutMs);
     timer.unref?.();
     child.stdout?.on('data', (b) => (out += b.toString()));
     child.stderr?.on('data', (b) => (out += b.toString()));
     child.once('error', (e) => finish(e as Error));
-    child.once('exit', (code, signal) => finish(code === 0 ? undefined
+    child.once('exit', (code, signal) => finish(timedOut ? new Error('usage probe timed out') : code === 0 ? undefined
       : new Error(`Claude usage/login refresh process failed (${signal ?? code ?? 'unknown exit'})`)));
   });
 }

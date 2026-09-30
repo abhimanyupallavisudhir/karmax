@@ -6,7 +6,7 @@ import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import previousProfiles from './fixtures/authorization-pre-diagnostics.json';
-import { allows, attenuate, CAPABILITIES, CHILD_TASK_CAPABILITIES } from '../src/platform/capabilities.js';
+import { allows, attenuate, CAPABILITIES, CHILD_TASK_CEILING } from '../src/platform/capabilities.js';
 
 describe('autonomous role defaults', () => {
   it('delegates Developer task management and diagnostics to children without peer mutation authority', async () => {
@@ -34,7 +34,7 @@ describe('autonomous role defaults', () => {
         projectId: project.id, profileId: 'developer', ceiling: ['*'], grantorCaps: caps });
       expect((await tokens.check(token.token, 'task:git:publish', { taskId: child.taskId })).ok).toBe(true);
       expect((await tokens.check(token.token, 'task:signal', { taskId: parent.id })).ok).toBe(false);
-      expect(attenuate(CHILD_TASK_CAPABILITIES, ['task:read'])).toEqual(['task:read']);
+      expect(attenuate(CHILD_TASK_CEILING, ['task:read'])).toEqual(['task:read']);
     } finally { await store.close(); }
   });
   it('upgrades untouched installed roles and preserves deliberately narrowed profiles', async () => {
@@ -59,7 +59,7 @@ describe('autonomous role defaults', () => {
       const caps = (await auth.profile('administrator'))!.capabilities;
       expect(CAPABILITIES.filter(cap => !allows(caps, cap))).toEqual([
         'workflow:install', 'process:kill', 'settings:read', 'settings:write',
-        'safe-mode:write', 'subscription:gift', 'authorization:read', 'authorization:write', 'user:read', 'user:write',
+        'subscription:gift', 'authorization:read', 'authorization:write', 'user:read', 'user:write',
       ]);
     } finally { await store.close(); }
   });
@@ -113,4 +113,53 @@ describe('autonomous role defaults', () => {
       expect((await tokens.check(agent.token, 'task:edit', { projectId: project.id })).ok).toBe(false);
     } finally { await store.close(); }
   });
+});
+
+it('gives a child its parent\'s grant, with merge authority only for the parent\'s branch (SPEC §8.2)', async () => {
+  const store = await Store.create(':memory:');
+  try {
+    const auth = await AuthorizationService.create(store);
+    const project = await store.createProject('Inherited grant');
+    const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1',
+      params: { prompt: 'work' } });
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+    const developer = (await auth.profile('developer'))!.capabilities;
+    const child = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work',
+      project: {}, parentBranch: 'parent-branch', parentGrant: developer });
+    // A sub-task reads the project (its wiki and settings) and uses what its parent may use.
+    for (const cap of ['project:read', 'project:settings:read', 'workflow:read', 'repository:read', 'github:actions:read',
+      'connection:use', 'credential:read', 'task:create', 'task:manage-own']) expect(allows(child.grant!, cap), cap).toBe(true);
+    // Never more than the parent.
+    for (const cap of child.grant!) if (cap !== 'merge-into:parent-branch') expect(allows(developer, cap), cap).toBe(true);
+    const owner = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Owner child', prompt: 'work',
+      project: {}, parentBranch: 'parent-branch', parentGrant: ['*'] });
+    expect(allows(owner.grant!, 'settings:write')).toBe(true);
+    expect(allows(owner.grant!, 'merge-into:parent-branch')).toBe(true);
+    expect(allows(owner.grant!, 'merge-into:main')).toBe(false);
+    expect(owner.grant).not.toContain('*');
+  } finally { await store.close(); }
+});
+
+it('delegates live parent card grants instead of stale start-time authority (RT-16, WF-17, AU-7)', async () => {
+  const store = await Store.create(':memory:');
+  try {
+    const project = await store.createProject('Live grant');
+    const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1',
+      params: { prompt: '', _authorization: { capabilities: ['task:read', 'use-card:allowed'] } } });
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+    const child = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work', project: {}, parentGrant: ['*'] });
+    expect(child.grant).toContain('use-card:allowed');
+    await store.kvSet(`permission:grant:${parent.id}`, JSON.stringify({ do: ['use-card:approved'] }));
+    const approvedChild = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id,
+      title: 'Approved child', prompt: 'work', project: {}, parentGrant: ['*'] });
+    expect(approvedChild.grant).toContain('use-card:approved');
+    expect(allows(child.grant!, 'task:create')).toBe(false);
+    expect(allows(child.grant!, 'use-card:other')).toBe(false);
+    await store.updateTaskParams(parent.id, { ...parent.params, _authorization: {
+      principal: 'avatar:deleted', capabilities: ['*'],
+    } });
+    const revokedChild = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id,
+      title: 'Revoked child', prompt: 'work', project: {}, parentGrant: ['*'] });
+    expect(revokedChild.grant).toEqual([]);
+  } finally { await store.close(); }
 });

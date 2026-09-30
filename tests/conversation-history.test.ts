@@ -93,7 +93,9 @@ const fs = require('fs');
 const argv = process.argv.slice(2);
 const oi = argv.indexOf('-o');
 const outFile = oi >= 0 ? argv[oi + 1] : null;
-if (process.env.STUB_ARGV_OUT) fs.writeFileSync(process.env.STUB_ARGV_OUT, JSON.stringify({ argv }));
+// AD-17: the prompt arrives on stdin (argv ends with '-') so it never shows in /proc.
+const prompt = argv[argv.length - 1] === '-' ? fs.readFileSync(0, 'utf8') : argv[argv.length - 1];
+if (process.env.STUB_ARGV_OUT) fs.writeFileSync(process.env.STUB_ARGV_OUT, JSON.stringify({ argv, prompt }));
 if (outFile) fs.writeFileSync(outFile, 'ok');
 process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
 process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n');
@@ -124,11 +126,11 @@ describe('codex exec sends only the delta when resuming a thread', () => {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
-  const argvFor = async (input: any) => {
+  const invocationFor = async (input: any) => {
     const out = path.join(dir, `argv-${Math.random().toString(36).slice(2)}.json`);
     process.env.STUB_ARGV_OUT = out;
     await adapter.runTurn(input, ctx);
-    return JSON.parse(fs.readFileSync(out, 'utf8')).argv as string[];
+    return JSON.parse(fs.readFileSync(out, 'utf8')) as { argv: string[]; prompt: string };
   };
 
   it('resume: only the new follow-up reaches the model, prior messages stay server-side', async () => {
@@ -143,9 +145,8 @@ describe('codex exec sends only the delta when resuming a thread', () => {
     fs.writeFileSync(path.join(sessions, `rollout-2026-09-09T00-00-00-${id}.jsonl`), JSON.stringify({
       ordinal: 0, type: 'session_meta', payload: { id, history_mode: 'paginated', timestamp: '2026-09-09T00:00:00Z' },
     }) + '\n');
-    const argv = await argvFor({ profile, world, messages, session: '11111111-1111-4111-8111-111111111111', deliveredMessages: 2, systemPrompt: 'SYS', role: 'do', resolvedAuth: { configHome: dir } });
+    const { argv, prompt } = await invocationFor({ profile, world, messages, session: '11111111-1111-4111-8111-111111111111', deliveredMessages: 2, systemPrompt: 'SYS', role: 'do', resolvedAuth: { configHome: dir } });
     expect(argv.slice(0, 3)).toEqual(['exec', 'resume', '11111111-1111-4111-8111-111111111111']);
-    const prompt = argv[argv.length - 1]!;
     expect(prompt).toContain('FOLLOW_UP_MESSAGE');
     expect(prompt).not.toContain('ORIGINAL_TASK');
     expect(prompt).not.toContain('AGENT_REPLY');
@@ -153,10 +154,9 @@ describe('codex exec sends only the delta when resuming a thread', () => {
 
   it('fresh: the whole conversation + system prompt is replayed', async () => {
     const messages = [msg('m0', 'user', 'ORIGINAL_TASK'), msg('a0', 'agent', 'AGENT_REPLY'), msg('m1', 'user', 'FOLLOW_UP_MESSAGE')];
-    const argv = await argvFor({ profile, world, messages, systemPrompt: 'SYS_PROMPT', role: 'do', resolvedAuth: { configHome: dir } });
+    const { argv, prompt } = await invocationFor({ profile, world, messages, systemPrompt: 'SYS_PROMPT', role: 'do', resolvedAuth: { configHome: dir } });
     expect(argv[0]).toBe('exec');
     expect(argv).not.toContain('resume');
-    const prompt = argv[argv.length - 1]!;
     expect(prompt).toContain('SYS_PROMPT');
     expect(prompt).toContain('ORIGINAL_TASK');
     expect(prompt).toContain('FOLLOW_UP_MESSAGE');

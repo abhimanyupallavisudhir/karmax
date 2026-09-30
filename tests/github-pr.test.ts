@@ -11,7 +11,7 @@ import { GithubActionsApiError } from '../src/integrations/github-actions.js';
 import type { TaskPullRequest } from '../src/domain/types.js';
 import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
 
-/** The GitHub pull-request integration (SPEC §5.2, PLAN-git-config.md §5):
+/** The GitHub pull-request integration (SPEC §5.2, wiki plans/PLAN-git-config §5):
  *  the REST client, the PR stage activity, merge/cancel reconciliation, and the
  *  webhook → karmax event feed. */
 
@@ -46,11 +46,12 @@ function fakeGithub() {
     tokens.push(new Headers(init.headers).get('authorization') ?? '');
     const json = (status: number, value: unknown) =>
       new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+    if (u.pathname.includes('/compare/')) return json(200, { ahead_by: 0 });
     const list = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
     if (list && method === 'GET') {
       const head = u.searchParams.get('head');
       const branch = head?.split(':')[1];
-      return json(200, prs.filter((pr) => pr.head.ref === branch && pr.repo === list[1]));
+      return json(200, prs.filter((pr) => pr.head.ref === branch && pr.repo === list[1]).reverse());
     }
     if (list && method === 'POST') {
       if (prs.some((pr) => pr.repo === list[1] && pr.head.ref === body.head && pr.state === 'open'))
@@ -75,6 +76,10 @@ function fakeGithub() {
       return json(200, pr);
     }
     const comment = u.pathname.match(/^\/repos\/[^/]+\/[^/]+\/issues\/(\d+)\/comments$/);
+    if (comment && method === 'GET') {
+      const page = Number(u.searchParams.get('page') ?? 1);
+      return json(200, comments.filter(row => row.number === Number(comment[1])).slice((page - 1) * 100, page * 100));
+    }
     if (comment && method === 'POST') {
       comments.push({ number: Number(comment[1]), body: body.body });
       return json(201, { id: comments.length });
@@ -141,6 +146,15 @@ async function remoteCoreFor(github: { options: { apiBase?: string; fetch?: type
         repo.localPath = sources[index]!;
       }
       world.handle.repo = remotes[0]!;
+      // The backing worktrees are released from their host checkouts. Their
+      // SSH-shaped remote names would otherwise be locked as paths relative to
+      // the test's working directory, leaving `git@github.com:…/` behind.
+      const destroy = world.destroy.bind(world);
+      world.destroy = async () => {
+        for (const [index, repo] of world.handle.repos!.entries()) repo.repo = sources[index]!;
+        world.handle.repo = sources[0]!;
+        await destroy();
+      };
       active.set(spec.taskId, world);
       return world;
     },
@@ -162,6 +176,14 @@ describe('GitHub PR client', () => {
     expect(githubSlug('/home/me/widgets')).toBeUndefined();
     expect(taskIdOfBranch('tavya/task_abc')).toBe('task_abc');
     expect(taskIdOfBranch('feature/x')).toBeUndefined();
+  });
+
+  it('refuses malformed repository slugs before making requests', async () => {
+    const gh = fakeGithub();
+    const api = new GithubPrApi('t', gh.options);
+    for (const slug of ['acme/app?x=1', 'acme/app#fragment', '../app', 'acme/..', 'acme/app/extra', 'acme/a%2Fb'])
+      await expect(api.get(slug, 7)).rejects.toThrow(/repository slug/);
+    expect(gh.calls).toEqual([]);
   });
 
   it('opens once, then updates the same PR instead of opening a second one', async () => {
@@ -490,6 +512,25 @@ describe('GitHub PR client', () => {
     expect(merged.pr.merged).toBe(true);
   });
 
+  it.each(['merged', 'closed'])('opens a fresh PR for new work after a %s PR', async (state) => {
+    const gh = fakeGithub();
+    const api = new GithubPrApi('t', gh.options);
+    const input = { head: 'karmax/followup', base: 'main', title: 'Follow-up', body: 'New work' };
+    const original = await api.openOrUpdate(SLUG, input);
+    gh.prs[0].state = 'closed';
+    if (state === 'merged') gh.prs[0].merged_at = '2026-01-01T00:00:00Z';
+    const followup = new GithubPrApi('t', { ...gh.options, fetch: (async (url: any, init: any = {}) => {
+      if (String(url).includes('/compare/')) return Response.json({ ahead_by: 2 });
+      if (init.method === 'PATCH') return Response.json({ message: 'Head branch was force pushed' }, { status: 422 });
+      return gh.fetcher(url, init);
+    }) as typeof fetch });
+    const result = await followup.openOrUpdate(SLUG, input);
+    expect(result.created).toBe(true);
+    expect(result.pr.number).not.toBe(original.pr.number);
+    expect(result.pr).toMatchObject({ state: 'open', merged: false });
+    expect((await api.openOrUpdate(SLUG, input)).pr.number).toBe(result.pr.number);
+  });
+
   it('adopts the existing PR when GitHub rejects the create as a duplicate', async () => {
     const gh = fakeGithub();
     const api = new GithubPrApi('t', gh.options);
@@ -550,6 +591,9 @@ describe('GitHub-authoritative merge activity', () => {
     const ref: TaskPullRequest = { repo: 'widgets', slug: SLUG, number: 91,
       url: 'https://github.test/acme/widgets/pull/91', state: 'open', headSha: landedSha };
 
+    await expect(core.mergeGithubPrs(handle, [{ ...ref, headSha: 'new-unmerged-head' }])).resolves.toMatchObject({
+      status: 'needs-revision',
+    });
     await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({
       status: 'merged', sha: landedSha,
     });
@@ -1440,6 +1484,7 @@ describe('GitHub-authoritative merge activity', () => {
   it('v1.21 preflights every PR before claiming any provider and assigns canonical owners per target', async () => {
     const mutations: string[] = [];
     let secondFails = true;
+    let checksPending = false;
     const headFor = (number: number) => number === 51 ? 'head-a' : 'head-b';
     const slugFor = (number: number) => number === 51 ? 'acme/service-a' : 'acme/service-b';
     const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -1458,7 +1503,7 @@ describe('GitHub-authoritative merge activity', () => {
         return Response.json({ data: { repository: { pullRequest: {
           id: `PR_${number}`, url: `https://github.test/${slugFor(number)}/pull/${number}`, state: 'OPEN', isDraft: false,
           merged: false, headRefOid: headFor(number), mergeable: 'MERGEABLE', mergeStateStatus: failing ? 'UNSTABLE' : 'CLEAN',
-          statusCheckRollup: { state: failing ? 'FAILURE' : 'SUCCESS', contexts: { nodes: [] } },
+          statusCheckRollup: { state: failing ? 'FAILURE' : checksPending ? 'PENDING' : 'SUCCESS', contexts: { nodes: [] } },
           viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
         } } } });
       }
@@ -1515,6 +1560,12 @@ describe('GitHub-authoritative merge activity', () => {
         { key: 'acme/service-b#52', owner: 'unowned', domain: 'github:acme/service-b:main' },
       ],
     });
+    expect(planned.observationKey).toEqual(expect.any(String));
+    checksPending = true;
+    const waiting = await core.mergeGithubPrs({ id: task.id } as any, refs, { mode: 'preflight', authority: 'auto' });
+    expect(waiting.status).toBe('planned');
+    expect(waiting.observationKey).not.toBe(planned.observationKey);
+    checksPending = false;
     const claimedA = await core.mergeGithubPrs({ id: task.id } as any, [refs[0]!], { mode: 'claim-provider', authority: 'auto' });
     const claimedB = await core.mergeGithubPrs({ id: task.id } as any, [refs[1]!], { mode: 'claim-provider', authority: 'auto' });
     expect(claimedA).toMatchObject({ status: 'queued', landingOwner: 'provider', participants: [{ owner: 'provider' }] });
@@ -1632,6 +1683,163 @@ describe('GitHub-authoritative merge activity', () => {
   });
 });
 
+/** A repository where freshness is observable: every commit knows its
+ *  ancestors, and merges and branch updates create real descendants. No branch
+ *  has strict protection, so GitHub never reports BEHIND (GH-26). */
+function freshnessGithub(branches: Record<string, string>) {
+  const ancestry = new Map<string, Set<string>>(Object.values(branches).map((sha) => [sha, new Set([sha])]));
+  const prs = new Map<number, { head: string; ref: string; base: string; merged?: string }>();
+  const checks = new Map<string, string>();
+  const calls: string[] = [];
+  const commit = (sha: string, ...parents: string[]) => {
+    ancestry.set(sha, new Set([sha, ...parents.flatMap((parent) => [...ancestry.get(parent)!])]));
+    return sha;
+  };
+  const contains = (head: string, sha: string) => ancestry.get(head)!.has(sha);
+  const behindBy = (head: string, base: string) => [...ancestry.get(base)!].filter((sha) => !contains(head, sha)).length;
+  const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+    const url = new URL(String(input));
+    const method = init.method ?? 'GET';
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    calls.push(`${method} ${decodeURIComponent(url.pathname)}`);
+    const compare = decodeURIComponent(url.pathname).match(/\/compare\/(.+)\.\.\.(.+)$/);
+    if (compare) {
+      const base = branches[compare[1]!] ?? compare[1]!;
+      return Response.json({ status: 'diverged', base_commit: { sha: base },
+        ahead_by: behindBy(base, compare[2]!), behind_by: behindBy(compare[2]!, base) });
+    }
+    const number = Number(url.pathname.match(/\/pulls\/(\d+)/)?.[1] ?? body.variables?.number);
+    const pr = prs.get(number)!;
+    const view = () => ({ number, node_id: `PR_${number}`, html_url: `https://github.test/${SLUG}/pull/${number}`,
+      state: pr.merged ? 'closed' : 'open', merged: Boolean(pr.merged), ...(pr.merged ? { merge_commit_sha: pr.merged } : {}),
+      head: { ref: pr.ref, sha: pr.head }, base: { ref: pr.base } });
+    if (method === 'GET' && url.pathname.endsWith(`/pulls/${number}`)) return Response.json(view());
+    if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness')) {
+      const state = checks.get(pr.head) ?? 'PENDING';
+      return Response.json({ data: { repository: { pullRequest: {
+        id: `PR_${number}`, url: view().html_url, state: pr.merged ? 'MERGED' : 'OPEN', isDraft: false,
+        merged: Boolean(pr.merged), headRefOid: pr.head, baseRefOid: branches[pr.base], mergeable: 'MERGEABLE',
+        mergeStateStatus: state === 'SUCCESS' ? 'CLEAN' : 'UNSTABLE',
+        statusCheckRollup: { state, contexts: { nodes: [] } },
+        viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+    }
+    if (method === 'PUT' && url.pathname.endsWith('/update-branch')) {
+      expect(body).toEqual({ expected_head_sha: pr.head });
+      pr.head = commit(`${pr.head}+${branches[pr.base]}`, pr.head, branches[pr.base]!);
+      return Response.json({ message: 'Updating pull request branch.' }, { status: 202 });
+    }
+    if (method === 'PUT' && url.pathname.endsWith('/merge')) {
+      expect(body.sha).toBe(pr.head);
+      pr.merged = branches[pr.base] = commit(`merge-${number}`, branches[pr.base]!, pr.head);
+      return Response.json({ merged: true, sha: pr.merged, message: 'Pull Request successfully merged' });
+    }
+    return Response.json({ message: `unrouted ${method} ${url.pathname}` }, { status: 404 });
+  }) as typeof fetch;
+  return { fetcher, branches, prs, checks, calls, commit,
+    options: { apiBase: 'https://api.github.test', fetch: fetcher } };
+}
+
+async function freshnessCore(github: ReturnType<typeof freshnessGithub>) {
+  const core = await coreFor(github, {
+    activeUserAccountId: () => 'reviewer-account',
+    repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+    userAccessToken: async () => 'reviewer-token',
+  });
+  (await core.store.claimPersonalOrganization('owner'));
+  const project = (await core.store.createProject('Sub-task landing', { landingAuthority: 'auto' }));
+  (await core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member'));
+  (await core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer'));
+  const parent = (await core.store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev',
+    workflowVersion: '1.24.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
+  (await core.store.registerWorld({ id: parent.id, kind: 'worktree', branch: 'karmax/task_parent',
+    base: 'main', repo: tmp, root: tmp } as any, project.id));
+  /** A confirmed task with one open PR, landed the way fallback admission does. */
+  const confirmed = async (number: number, head: string, base: string, parentTaskId?: string) => {
+    const task = (await core.store.createTask({ projectId: project.id, title: `PR ${number}`, workflow: 'software-dev',
+      workflowVersion: '1.24.0', params: { prompt: 'x', base, target: base },
+      createdBy: { kind: 'user', userId: 'owner' }, ...(parentTaskId ? { parentTaskId } : {}) }));
+    (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+      userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number, headSha: head }],
+    } }));
+    github.prs.set(number, { head, ref: `karmax/${task.id}`, base });
+    const handle = { id: task.id, kind: 'worktree', branch: `karmax/${task.id}`, base, repo: tmp, root: tmp } as any;
+    let prs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number, nodeId: `PR_${number}`,
+      url: `https://github.test/${SLUG}/pull/${number}`, state: 'open', headSha: head }];
+    return {
+      task,
+      land: async () => {
+        const result = await core.mergeGithubPrs(handle, prs, { mode: 'submit-fallback', authority: 'karmax' });
+        prs = result.prs;
+        return result;
+      },
+    };
+  };
+  return { core, parent, confirmed };
+}
+
+describe('Sub-task landing freshness (GH-26)', () => {
+  it('updates a green sibling that lacks the parent branch head and waits for its fresh checks', async () => {
+    const github = freshnessGithub({ 'karmax/task_parent': 'parent-0' });
+    github.checks.set(github.commit('first-head', 'parent-0'), 'SUCCESS');
+    github.checks.set(github.commit('second-head', 'parent-0'), 'SUCCESS');
+    const { core, parent, confirmed } = await freshnessCore(github);
+    const first = await confirmed(1, 'first-head', 'karmax/task_parent', parent.id);
+    const second = await confirmed(2, 'second-head', 'karmax/task_parent', parent.id);
+
+    await expect(first.land()).resolves.toMatchObject({ status: 'merged' });
+    expect(github.branches['karmax/task_parent']).toBe('merge-1');
+
+    // GitHub still calls the second PR CLEAN: its green CI never saw merge-1.
+    await expect(second.land()).resolves.toMatchObject({
+      status: 'waiting', landingOwner: 'karmax',
+      prs: [expect.objectContaining({ headSha: 'second-head+merge-1' })],
+      detail: expect.stringMatching(/mechanically updated/),
+    });
+    expect(github.calls).not.toContain('PUT /repos/acme/widgets/pulls/2/merge');
+    await expect(second.land()).resolves.toMatchObject({
+      status: 'waiting', detail: expect.stringMatching(/waiting for required checks/),
+    });
+    expect(github.prs.get(2)?.merged).toBeUndefined();
+
+    github.checks.set('second-head+merge-1', 'SUCCESS');
+    await expect(second.land()).resolves.toMatchObject({ status: 'merged' });
+    expect(github.calls.filter((call) => call.endsWith('/update-branch'))).toEqual(['PUT /repos/acme/widgets/pulls/2/update-branch']);
+    expect((await core.store.eventsOfTypes(second.task.id, ['github.pr.merged'])).map((event) => event.payload))
+      .toEqual([expect.objectContaining({ number: 2, sha: 'merge-2', strategy: 'provider-policy' })]);
+    expect(github.branches['karmax/task_parent']).toBe('merge-2');
+  });
+
+  it('merges a sibling whose head already contains the parent branch head without updating it', async () => {
+    const github = freshnessGithub({ 'karmax/task_parent': 'parent-0' });
+    github.branches['karmax/task_parent'] = github.commit('parent-1', 'parent-0');
+    github.checks.set(github.commit('fresh-head', 'parent-1'), 'SUCCESS');
+    const { parent, confirmed } = await freshnessCore(github);
+    const sibling = await confirmed(1, 'fresh-head', 'karmax/task_parent', parent.id);
+
+    await expect(sibling.land()).resolves.toMatchObject({ status: 'merged' });
+    expect(github.calls).toContain('GET /repos/acme/widgets/compare/karmax/task_parent...fresh-head');
+    expect(github.calls.some((call) => call.endsWith('/update-branch'))).toBe(false);
+    expect(github.branches['karmax/task_parent']).toBe('merge-1');
+  });
+
+  it("keeps GitHub's policy authoritative for a target that is not the parent's task branch", async () => {
+    const github = freshnessGithub({ main: 'main-0', 'karmax/task_parent': 'parent-0' });
+    github.branches.main = github.commit('main-1', 'main-0');
+    github.checks.set(github.commit('stale-head', 'main-0'), 'SUCCESS');
+    github.checks.set(github.commit('stale-child-head', 'main-0'), 'SUCCESS');
+    const { parent, confirmed } = await freshnessCore(github);
+    // A top-level task, and a sub-task whose PR targets another branch than its parent's.
+    const topLevel = await confirmed(1, 'stale-head', 'main');
+    const elsewhere = await confirmed(2, 'stale-child-head', 'main', parent.id);
+
+    await expect(topLevel.land()).resolves.toMatchObject({ status: 'merged' });
+    await expect(elsewhere.land()).resolves.toMatchObject({ status: 'merged' });
+    expect(github.calls.some((call) => call.includes('/compare/') || call.endsWith('/update-branch'))).toBe(false);
+  });
+});
+
 describe('PR stage (remote policy "pr")', () => {
   it('pushes the task branch and opens a PR carrying the task summary', async () => {
     const gh = fakeGithub();
@@ -1659,6 +1867,10 @@ describe('PR stage (remote policy "pr")', () => {
     expect(again[0]!.number).toBe(1);
     expect(gh.prs).toHaveLength(1);
     expect(gh.prs[0].title).toBe('Add a feature v2');
+    await core.openPr(handle, 'main', { summary: '😀'.repeat(70_000) });
+    expect(Buffer.byteLength(gh.prs[0].body, 'utf8')).toBeLessThanOrEqual(65_536);
+    expect(gh.prs[0].body).toContain('task_pr1');
+    expect(gh.prs[0].body).not.toContain('\uFFFD');
     await core.destroyWorld(handle);
   });
 
@@ -1720,22 +1932,57 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
-  it('treats GitHub\'s "No commits between" as nothing to propose, not a failure', async () => {
+  it('does not propose commits the fetched target already has when the local target is stale', async () => {
+    // refresh_upstream advances only origin/<target>; the world's local target
+    // stays at its provisioning commit. A task that merged the refreshed target
+    // has nothing of its own, and GitHub refuses that PR with 422 "No commits
+    // between" — which escalated tasks 368, 369, 372 and 373.
     const gh = fakeGithub();
-    const noCommits = { options: { ...gh.options, fetch: (async (url: string, init: RequestInit = {}) =>
-      (init.method === 'POST' && /\/pulls$/.test(new URL(String(url)).pathname))
-        ? new Response(JSON.stringify({ message: 'Validation Failed', errors: [{ resource: 'PullRequest', code: 'custom',
-          message: 'No commits between main and karmax/task_pr_github_ahead' }] }), { status: 422, headers: { 'content-type': 'application/json' } })
-        : gh.fetcher(url, init)) as unknown as typeof fetch } };
-    const core = await coreFor(noCommits);
-    const repo = await repoWithGithubOrigin('github-ahead');
-    const handle = await core.createWorld({ taskId: 'task_pr_github_ahead', repo, base: 'main', target: 'main', kind: 'worktree' });
-    fs.writeFileSync(path.join(handle.root, 'x.txt'), 'x');
-    await git(handle.root, ['add', '-A']);
-    await git(handle.root, ['commit', '-q', '-m', 'work GitHub already has']);
-    await expect(core.openPr(handle, 'main', { title: 'Already upstream' })).resolves.toEqual([]);
-    const skipped = (await core.store.eventsSince('task_pr_github_ahead', 0)).filter((event) => event.type === 'pr.skipped');
-    expect(skipped.at(-1)?.payload).toMatchObject({ repo: 'github-ahead', reason: 'no commits ahead of main on GitHub' });
+    const core = await coreFor(gh);
+    const repo = await repoWithGithubOrigin('stale-local-target');
+    const handle = await core.createWorld({
+      taskId: 'task_pr_stale_target', repo, base: 'main', target: 'main', kind: 'worktree',
+    });
+    const checkout = handle.repos![0]!;
+    const staleMain = (await gitOrThrow(checkout.root, ['rev-parse', 'main'])).trim();
+    fs.writeFileSync(path.join(checkout.root, 'landed-elsewhere.txt'), 'already on the target');
+    await gitOrThrow(checkout.root, ['add', '-A']);
+    await gitOrThrow(checkout.root, ['commit', '-q', '-m', 'landed on the target by someone else']);
+    await gitOrThrow(checkout.root, ['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    expect((await gitOrThrow(checkout.root, ['rev-parse', 'main'])).trim()).toBe(staleMain);
+
+    await expect(core.openPr(handle, 'main', { title: 'Nothing new' })).resolves.toEqual([]);
+    expect(gh.prs).toHaveLength(0);
+
+    fs.writeFileSync(path.join(checkout.root, 'own.txt'), 'the task\'s own change');
+    await gitOrThrow(checkout.root, ['add', '-A']);
+    await gitOrThrow(checkout.root, ['commit', '-q', '-m', 'task work']);
+    await expect(core.openPr(handle, 'main', { title: 'Own change' })).resolves.toHaveLength(1);
+    await core.destroyWorld(handle);
+  });
+
+  it('skips a checkout GitHub reports has no commits between its branch and the target', async () => {
+    const gh = fakeGithub();
+    const fetcher = gh.options.fetch;
+    gh.options.fetch = (async (url: string, init: RequestInit = {}) => {
+      if ((init.method ?? 'GET') === 'POST' && /\/pulls$/.test(new URL(String(url)).pathname))
+        return Response.json({ message: 'Validation Failed', errors: [{ resource: 'PullRequest', code: 'custom',
+          message: 'No commits between main and karmax/task_pr_github_empty' }] }, { status: 422 });
+      return fetcher(url, init);
+    }) as typeof fetch;
+    const core = await coreFor(gh);
+    const repo = await repoWithGithubOrigin('github-empty');
+    const handle = await core.createWorld({
+      taskId: 'task_pr_github_empty', repo, base: 'main', target: 'main', kind: 'worktree',
+    });
+    const checkout = handle.repos![0]!;
+    fs.writeFileSync(path.join(checkout.root, 'work.txt'), 'already landed upstream');
+    await gitOrThrow(checkout.root, ['add', '-A']);
+    await gitOrThrow(checkout.root, ['commit', '-q', '-m', 'work GitHub already has']);
+
+    await expect(core.openPr(handle, 'main', { title: 'Empty on GitHub' })).resolves.toEqual([]);
+    expect((await core.store.eventsSince(handle.id, 0)).filter((event) => event.type === 'pr.skipped'))
+      .toEqual([expect.objectContaining({ payload: expect.objectContaining({ repo: checkout.name }) })]);
     await core.destroyWorld(handle);
   });
 
@@ -2044,6 +2291,32 @@ describe('PR lifecycle after the merge', () => {
     return { gh, core, handle, prs };
   }
 
+  it('RT-20 does not repeat finalization comments when the activity retries', async () => {
+    const { gh, core, handle, prs } = await withOpenPr();
+    try {
+      const outcome = { target: 'main', sha: 'abc1234', pushed: ['svc'] };
+      await core.finalizePrs(handle, prs, outcome);
+      await core.finalizePrs(handle, prs, outcome);
+      expect(gh.comments).toHaveLength(1);
+    } finally { await core.destroyWorld(handle); }
+  });
+
+  it('RT-20 finds the accepted cancellation comment after its acknowledgement is lost', async () => {
+    const { gh, core, handle, prs } = await withOpenPr();
+    const original = GithubPrApi.prototype.comment;
+    const comment = vi.spyOn(GithubPrApi.prototype, 'comment').mockImplementationOnce(async function(this: GithubPrApi, slug, number, body) {
+      await original.call(this, slug, number, body);
+      throw new Error('connection lost after comment');
+    });
+    try {
+      await core.closePrs(handle, prs, 'cancelled');
+      expect(gh.prs[0].state).toBe('open');
+      await core.closePrs(handle, prs, 'cancelled');
+      expect(gh.prs[0].state).toBe('closed');
+      expect(gh.comments).toHaveLength(1);
+    } finally { comment.mockRestore(); await core.destroyWorld(handle); }
+  });
+
   it('records a PR GitHub already merged, and comments the tavya outcome', async () => {
     const { gh, core, handle, prs } = await withOpenPr();
     gh.prs[0].state = 'closed';
@@ -2152,9 +2425,24 @@ describe('GitHub PR state → task view', () => {
 describe('PR webhooks → karmax events', () => {
   const delivery = (action: string, over: Record<string, unknown> = {}) => ({
     action,
-    repository: { full_name: SLUG },
+    repository: { id: 99, full_name: SLUG },
     pull_request: { number: 7, html_url: `https://github.com/${SLUG}/pull/7`, state: 'open',
-      title: 'Work', head: { ref: 'tavya/task_abc' }, base: { ref: 'main' }, ...over },
+      title: 'Work', head: { ref: 'tavya/task_abc', repo: { id: 99 } }, base: { ref: 'main' }, ...over },
+  });
+
+  it('rejects fork PRs, fork checks and untrusted reviews naming a task branch', () => {
+    expect(pullRequestWebhookEvent('pull_request', delivery('closed', {
+      merged: true, head: { ref: 'tavya/task_abc', repo: { id: 100 } },
+    }))).toBeUndefined();
+    expect(pullRequestWebhookEvent('check_run', { action: 'completed', repository: { id: 99 },
+      check_run: { check_suite: { head_branch: 'tavya/task_abc' },
+        pull_requests: [{ head: { ref: 'tavya/task_abc', repo: { id: 100 } } }] },
+    })).toBeUndefined();
+    for (const association of ['NONE', 'FIRST_TIMER', 'CONTRIBUTOR', undefined]) {
+      expect(pullRequestWebhookEvent('pull_request_review', { ...delivery('submitted'),
+        review: { state: 'approved', author_association: association },
+      })).toBeUndefined();
+    }
   });
 
   it('maps a merged PR to github.pr.merged, correlated to its task', () => {
@@ -2169,7 +2457,7 @@ describe('PR webhooks → karmax events', () => {
     expect(pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed' }))?.type).toBe('github.pr.closed');
     expect(pullRequestWebhookEvent('pull_request', delivery('opened'))?.type).toBe('github.pr.opened');
     const review = pullRequestWebhookEvent('pull_request_review',
-      { ...delivery('submitted'), review: { state: 'approved', user: { login: 'ada' } } });
+      { ...delivery('submitted'), review: { author_association: 'COLLABORATOR', state: 'approved', user: { login: 'ada' } } });
     expect(review).toMatchObject({ type: 'github.pr.review' });
     expect(review!.payload).toMatchObject({ review: 'approved', reviewer: 'ada' });
     // A human's own PR is not a karmax task's PR.
@@ -2180,9 +2468,10 @@ describe('PR webhooks → karmax events', () => {
 
   it('correlates a completed check run to the task branch for prompt reconciliation', () => {
     const event = pullRequestWebhookEvent('check_run', {
-      action: 'completed', repository: { full_name: SLUG }, check_run: {
+      action: 'completed', repository: { id: 99, full_name: SLUG }, check_run: {
         name: 'CI', status: 'completed', conclusion: 'failure', details_url: 'https://ci.test/run/1',
         check_suite: { head_branch: 'tavya/task_abc' },
+        pull_requests: [{ head: { ref: 'tavya/task_abc', repo: { id: 99 } } }],
       },
     });
     expect(event).toMatchObject({ taskId: 'task_abc', type: 'github.check.completed', payload: {
@@ -2213,11 +2502,12 @@ describe('PR webhooks → karmax events', () => {
       pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed' }))!,
       pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed', merged: true }))!,
       pullRequestWebhookEvent('pull_request_review',
-        { ...delivery('submitted'), review: { state: 'approved', user: { login: 'ada' } } })!,
+        { ...delivery('submitted'), review: { author_association: 'COLLABORATOR', state: 'approved', user: { login: 'ada' } } })!,
       pullRequestWebhookEvent('check_run', {
-        action: 'completed', repository: { full_name: SLUG }, check_run: {
+        action: 'completed', repository: { id: 99, full_name: SLUG }, check_run: {
           name: 'CI', status: 'completed', conclusion: 'success', details_url: 'https://ci.test/run/1',
           check_suite: { head_branch: 'tavya/task_abc' },
+        pull_requests: [{ head: { ref: 'tavya/task_abc', repo: { id: 99 } } }],
         },
       })!,
     ];

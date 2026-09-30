@@ -1,5 +1,5 @@
 /**
- * Task search + organization engine (PLAN-search-views).
+ * Task search + organization engine.
  *
  * A *view* IS a *query*: every task-list surface is the result of evaluating a
  * `TaskQuery` (free text + structured filters + sort + group) against the project's

@@ -1,3 +1,6 @@
+import { withWorktreeLock } from './worktree-lock.js';
+import { concurrentMap } from '../util/concurrent-map.js';
+import { conflictMarkerFiles as scanConflictMarkers } from './conflict-markers.js';
 import { timed } from '../timing/index.js';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
@@ -12,6 +15,7 @@ import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merg
 import { materializeGitCredential, type GitCredential } from './git-credential.js';
 import { canonicalRepositoryIdentity } from './repository-identity.js';
 import { BRAND } from '../domain/brand.js';
+import { mirroredClone, type MirroredClone } from './git-mirror.js';
 
 /** Clone options for the broker's throwaway repositories. `git fetch` and
  * `git commit` start `git maintenance run --auto`, which current Git detaches;
@@ -21,7 +25,12 @@ import { BRAND } from '../domain/brand.js';
  * command in it inherits them. */
 const THROWAWAY_CLONE = ['-c', 'maintenance.auto=false', '-c', 'gc.auto=0'];
 
-export interface GitBrokerCredential extends GitCredential {}
+export interface GitBrokerCredential extends GitCredential {
+  /** Which tenant the credential acts for, such as an organization's
+   * enrollment of the repository. Only operations with the same scope share a
+   * host mirror of the repository (see git-mirror.ts). */
+  mirrorScope?: string;
+}
 export type GitBrokerAuth = Record<string, string> | ((repo: WorldRepo) => Promise<GitBrokerCredential>);
 /** Called with the immutable tip actually transported, never a later world HEAD. */
 export type OriginPublicationRecorder = (repo: WorldRepo, headSha: string) => void | Promise<void>;
@@ -59,6 +68,8 @@ export async function brokerEnrollRepository(
   spec: GitBrokerEnrollmentSpec,
   auth: GitBrokerAuth,
 ): Promise<WorldRepo> {
+  if (spec.name !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(spec.name))
+    throw new Error('invalid checkout name');
   if (!/^(?:ssh:\/\/|git@)/.test(spec.source)) throw new Error('dynamic repository enrollment requires an SSH remote');
   if (!validGitBranch(spec.branch)) throw new Error(`invalid task branch "${spec.branch}"`);
   if (!validGitBranch(spec.base)) throw new Error(`invalid repository base branch "${spec.base}"`);
@@ -234,33 +245,30 @@ function recordedBaseViolation(repo: WorldRepo): string {
  */
 export async function brokerPublishBranch(
   world: World, auth: GitBrokerAuth, expectedRemoteHeads: Record<string, string> = {},
-  onPublished?: OriginPublicationRecorder,
+  onPublished?: OriginPublicationRecorder, options: { omitUnchangedBase?: boolean } = {},
 ): Promise<GitBrokerPublishResult> {
-  const pushed: string[] = [];
-  const skipped: string[] = [];
-  const errors: Record<string, string> = {};
-  for (const repo of worldRepos(world.handle)) {
-    try {
-      // Worktree-backed worlds already share refs with their source repository.
-      // Trying to bundle/fetch the live branch back into that same repository
-      // either mistakes its local path for an SSH remote or hits Git's
-      // checked-out branch safety interlock. Verify the shared ref instead; no
-      // transfer is necessary for another task on this Karmax host to import
-      // it. Container worlds qualify too — they bind-mount the very same host
-      // worktree — so this must not be a `kind === 'worktree'` test, which used
-      // to fall all the way through to "Git broker requires an SSH remote".
-      const shared = sharesHostRefDatabase(world.handle.kind);
-      const local = await localAuthority(repo, shared);
-      if (local && shared) await verifySharedWorktreeBranch(world, repo, local);
-      else if (local) await importBranchToLocal(world, repo, local);
-      else await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished);
-      pushed.push(repo.name);
-    } catch (error) {
-      skipped.push(repo.name);
-      errors[repo.name] = error instanceof Error ? error.message : String(error);
+  return publishRepositories(worldRepos(world.handle), async repo => {
+    // Idle capture can restore the provisioned commit from the base without
+    // creating a task ref. Explicit publication still transports every branch.
+    if (options.omitUnchangedBase && repo.baseSha && !expectedRemoteHeads[repo.name]) {
+      const tip = await world.exec('git', ['rev-parse', '--verify', `refs/heads/${repo.branch}`], { cwd: repo.root });
+      if (tip.code !== 0) throw new Error(`could not resolve task branch ${repo.branch}: ${tip.stderr || tip.stdout}`);
+      if (tip.stdout.trim() === repo.baseSha) return 'omitted';
     }
-  }
-  return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
+    // Worktree-backed worlds already share refs with their source repository.
+    // Trying to bundle/fetch the live branch back into that same repository
+    // either mistakes its local path for an SSH remote or hits Git's
+    // checked-out branch safety interlock. Verify the shared ref instead; no
+    // transfer is necessary for another task on this Karmax host to import
+    // it. Container worlds qualify too — they bind-mount the very same host
+    // worktree — so this must not be a `kind === 'worktree'` test, which used
+    // to fall all the way through to "Git broker requires an SSH remote".
+    const shared = sharesHostRefDatabase(world.handle.kind);
+    const local = await localAuthority(repo, shared);
+    if (local && shared) await verifySharedWorktreeBranch(world, repo, local);
+    else if (local) await importBranchToLocal(world, repo, local);
+    else await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished);
+  });
 }
 
 /** The host-local repository this repo is authoritative to, if any. A recorded
@@ -593,11 +601,14 @@ async function authorityBundle(temp: string, repo: WorldRepo, branch: string, au
   if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
   const credential = await resolveCredential(auth, repo);
   const { env } = materializeGitCredential(temp, credential);
-  const clone = path.join(temp, 'repo');
-  const cloned = await git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', '--branch', branch, '--single-branch', source, clone],
-    { env, timeoutMs: 10 * 60_000 });
-  if (cloned.code !== 0) throw new Error(`could not fetch branch "${branch}": ${cloned.stderr || cloned.stdout}`);
-  return createGitBundle(args => git(clone, args, { timeoutMs: 10 * 60_000 }), `refs/heads/${branch}`, bundlePath, known);
+  let scratch;
+  try { scratch = await mirroredClone(source, path.join(temp, 'repo'), env, { branch, scratch: temp, scope: mirrorScope(credential) }); }
+  catch (error) { throw new Error(`could not fetch branch "${branch}": ${error instanceof Error ? error.message : String(error)}`); }
+  try {
+    return await createGitBundle(args => git(scratch.clone, args, { timeoutMs: 10 * 60_000 }), `refs/heads/${branch}`, bundlePath, known);
+  } finally {
+    try { removeTemporaryDirectory(scratch.clone); } finally { await scratch.release(); }
+  }
 }
 
 export async function brokerFinalizeMerge(
@@ -641,8 +652,9 @@ export async function brokerFinalizeMerge(
       const one = await withTransferredRepo(world, repo, auth, async (clone, env) => {
         const fetched = await git(clone, ['fetch', 'origin', repoTarget], { env });
         if (fetched.code !== 0) throw new Error(`target "${repoTarget}" is unavailable: ${fetched.stderr || fetched.stdout}`);
-        const changed = await git(clone, ['diff', '--name-only', `origin/${repoTarget}...${repo.branch}`]);
-        const files = changed.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+        const changed = await git(clone, ['diff', '-z', '--name-only', `origin/${repoTarget}...${repo.branch}`]);
+        if (changed.code !== 0) throw new Error(`could not list changed files: ${changed.stderr}`);
+        const files = changed.stdout.split('\0').filter(Boolean);
         const marked = await conflictMarkerFiles(clone, repo.branch, files);
         if (marked.length) return { merged: false, landedFiles: files, conflict: marked.join('\n'), note: 'conflict markers are committed in the branch' } satisfies MergeResult;
         const checkout = await git(clone, ['checkout', '-q', '-B', repoTarget, `origin/${repoTarget}`]);
@@ -665,7 +677,7 @@ export async function brokerFinalizeMerge(
         if (pushTarget.code !== 0) throw new Error(`target push failed (protected or advanced concurrently): ${pushTarget.stderr || pushTarget.stdout}`);
         const head = await git(clone, ['rev-parse', 'HEAD']);
         return { merged: true, sha: head.stdout.trim(), landedFiles: files } satisfies MergeResult;
-      });
+      }, repoTarget);
       landedFiles.push(...one.landedFiles.map((file) => repos.length > 1 ? `${repo.name}/${file}` : file));
       if (!one.merged) return { ...one, landedFiles };
       sha = one.sha;
@@ -690,18 +702,34 @@ export async function brokerPushBranches(
   expectedRemoteHeads: Record<string, string> = {},
   onPublished?: OriginPublicationRecorder,
 ): Promise<GitBrokerPublishResult> {
-  const pushed: string[] = [];
-  const skipped: string[] = [];
-  const errors: Record<string, string> = {};
-  for (const repo of repos) {
-    try {
-      await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished);
-      pushed.push(repo.name);
-    } catch (error) {
-      skipped.push(repo.name);
-      errors[repo.name] = error instanceof Error ? error.message : String(error);
+  return publishRepositories(repos, repo => pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished));
+}
+
+/** Publish each repository, at most three repositories at once; checkouts of
+ * one repository run in order. `run` returns 'omitted' for a checkout that had
+ * nothing to publish, which is reported as neither pushed nor skipped. */
+async function publishRepositories(repos: WorldRepo[], run: (repo: WorldRepo) => Promise<void | 'omitted'>): Promise<GitBrokerPublishResult> {
+  const groups = new Map<string, Array<{ repo: WorldRepo; index: number }>>();
+  repos.forEach((repo, index) => {
+    const key = canonicalRepositoryIdentity(worldRepoSource(repo));
+    const group = groups.get(key) ?? [];
+    group.push({ repo, index }); groups.set(key, group);
+  });
+  const failures: Array<string | undefined> = new Array(repos.length);
+  const omitted = new Set<number>();
+  await concurrentMap([...groups.values()], 3, async group => {
+    for (const { repo, index } of group) {
+      try { if ((await run(repo)) === 'omitted') omitted.add(index); }
+      catch (error) { failures[index] = error instanceof Error ? error.message : String(error); }
     }
-  }
+  });
+  const pushed: string[] = [], skipped: string[] = [];
+  const errors: Record<string, string> = {};
+  repos.forEach((repo, index) => {
+    if (omitted.has(index)) return;
+    if (failures[index] === undefined) pushed.push(repo.name);
+    else { skipped.push(repo.name); errors[repo.name] = failures[index]!; }
+  });
   return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
 }
 
@@ -736,17 +764,21 @@ async function landLocalBranch(localRepo: string, repo: WorldRepo, target: strin
   // `worktree add` and the `finally` would otherwise litter their source tree
   // with a directory they never created.
   const tmp = path.join(scratchWorktreeHome(), `.karmax-land-${cryptoSafeName(worldId)}-${cryptoSafeName(repo.name)}`);
-  if (fs.existsSync(tmp)) {
-    await git(localRepo, ['worktree', 'remove', '--force', tmp]);
-    removeTemporaryDirectory(tmp);
-  }
-  const added = await git(localRepo, ['worktree', 'add', '--force', tmp, repo.branch]);
-  if (added.code !== 0) throw new Error(`could not check out the task branch for landing: ${added.stderr || added.stdout}`);
+  await withWorktreeLock(localRepo, async () => {
+    if (fs.existsSync(tmp)) {
+      await git(localRepo, ['worktree', 'remove', '--force', tmp]);
+      removeTemporaryDirectory(tmp);
+    }
+    const added = await git(localRepo, ['worktree', 'add', '--force', tmp, repo.branch]);
+    if (added.code !== 0) throw new Error(`could not check out the task branch for landing: ${added.stderr || added.stdout}`);
+  });
   try {
     return await finalizeMergeRepo({ ...repo, repo: localRepo, root: tmp }, target, worldId, identity);
   } finally {
-    await git(localRepo, ['worktree', 'remove', '--force', tmp]);
-    removeTemporaryDirectory(tmp);
+    await withWorktreeLock(localRepo, async () => {
+      await git(localRepo, ['worktree', 'remove', '--force', tmp]);
+      removeTemporaryDirectory(tmp);
+    });
   }
 }
 
@@ -755,17 +787,24 @@ async function withTransferredRepo<T>(
   repo: WorldRepo,
   auth: GitBrokerAuth,
   use: (clone: string, env: Record<string, string>) => Promise<T>,
+  branch?: string,
 ): Promise<T> {
+  if (branch && !validGitBranch(branch)) throw new Error('invalid broker clone branch');
   const source = worldRepoSource(repo);
   if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
   let operationFailed = false;
+  let scratch: MirroredClone | undefined;
   try {
     const credential = await resolveCredential(auth, repo);
     const { env } = materializeGitCredential(temp, credential);
-    const clone = path.join(temp, 'repo');
-    const cloned = await timed('git-broker.clone', () => git(temp, ['clone', ...THROWAWAY_CLONE, '-q', '--no-checkout', source, clone], { env, timeoutMs: 10 * 60_000 }));
-    if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
+    // The mirror supplies history; origin is asked only for its current tips
+    // and the objects the mirror lacks (WD-17, LT-10). The task branch stays a
+    // negotiation base, so an already-published checkpoint is not sent again.
+    scratch = await timed('git-broker.clone', () => mirroredClone(source, path.join(temp, 'repo'), env,
+      { branch, also: [repo.branch], scratch: temp, scope: mirrorScope(credential) }))
+      .catch((error) => { throw new Error(`authenticated clone failed: ${error instanceof Error ? error.message : String(error)}`); });
+    const clone = scratch.clone;
     await timed('git-broker.import-world', () => importWorldBranch(world, repo, clone, `refs/heads/${repo.branch}`, temp));
     if (repo.baseSha) {
       const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
@@ -777,7 +816,7 @@ async function withTransferredRepo<T>(
     throw error;
   } finally {
     try {
-      removeTemporaryDirectory(temp);
+      try { removeTemporaryDirectory(temp); } finally { await scratch?.release(); }
     } catch (cleanupError) {
       // Cleanup must not replace the useful Git rejection (for example a stale
       // force-with-lease) with an incidental filesystem error.
@@ -790,6 +829,15 @@ async function resolveCredential(auth: GitBrokerAuth, repo: WorldRepo): Promise<
   return typeof auth === 'function' ? auth(repo) : { env: auth };
 }
 
+/** A credential without an explicit scope is partitioned by the SSH identity
+ * it authenticates as (a Git profile's key file names its organization), and
+ * only credentials with neither share the unscoped mirror. */
+function mirrorScope(credential: GitBrokerCredential): string | undefined {
+  if (credential.mirrorScope) return credential.mirrorScope;
+  const identity = credential.sshKey ?? credential.env?.GIT_SSH_COMMAND;
+  return identity ? `ssh:${crypto.createHash('sha256').update(identity).digest('hex')}` : undefined;
+}
+
 function identityArgs(identity?: WorldGitIdentity): string[] {
   if (!identity) return [];
   const args = ['-c', `user.name=${identity.name}`, '-c', `user.email=${identity.email}`];
@@ -798,14 +846,7 @@ function identityArgs(identity?: WorldGitIdentity): string[] {
 }
 
 async function conflictMarkerFiles(dir: string, branch: string, files: string[]): Promise<string[]> {
-  if (!files.length) return [];
-  const grep = async (pattern: string): Promise<Set<string>> => {
-    const result = await git(dir, ['grep', '-l', '-E', pattern, branch, '--', ...files]);
-    return new Set(result.stdout.split('\n').map((line) => line.replace(new RegExp(`^${escapeRegExp(branch)}:`), '').trim()).filter(Boolean));
-  };
-  const open = await grep('^<{7}( |$)');
-  const close = await grep('^>{7}( |$)');
-  return [...open].filter((file) => close.has(file));
+  return scanConflictMarkers(args => git(dir, args), branch, files);
 }
 
 function escapeRegExp(value: string): string {

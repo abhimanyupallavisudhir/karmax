@@ -9,6 +9,8 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { AgentMcpServer } from '../../contrib/manifests.js';
 import type { World } from '../../world/types.js';
 import { RemoteSpawnedProcess, isRemoteAgentWorld } from '../../agent/remote-process.js';
+import { createCustodyEnv, registerAgent, releaseAgent } from '../../agent/custody.js';
+import path from 'node:path';
 const quote = (s: string) => `'${s.replace(/'/g, `'"'"'`)}'`;
 
 /** The shared host only parses bounded MCP data. Custom executables are spawned
@@ -16,17 +18,38 @@ const quote = (s: string) => `'${s.replace(/'/g, `'"'"'`)}'`;
 export async function connectWorldMcp(world: World, server: AgentMcpServer, signal?: AbortSignal) {
   if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !isRemoteAgentWorld(world)) throw new Error('Hosted MCP requires a remote world');
   const env = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: process.env.HOME ?? '/tmp', ...server.env };
+  // A local server is the turn's own process, as a CLI agent is: its custody
+  // marker is how a fill finds the browser it launched (task-browser.ts), and
+  // how its descendants are reaped with it.
+  const custody = isRemoteAgentWorld(world) ? undefined : createCustodyEnv(env);
   const child = isRemoteAgentWorld(world)
     ? new RemoteSpawnedProcess(world, `stty raw -echo; printf '\\036KARMAX_AGENT_READY\\036'; exec ${[server.command, ...(server.args ?? [])].map(quote).join(' ')} 2>/dev/null`, world.handle.root, server.env ?? {}, signal)
-    : spawn(server.command, server.args ?? [], { cwd: world.handle.root, env, stdio: ['pipe', 'pipe', 'ignore'] });
+    : spawn(server.command, server.args ?? [], { cwd: world.handle.root, env: custody!.env, stdio: ['pipe', 'pipe', 'ignore'] });
+  if (custody && child.pid) {
+    const pid = child.pid;
+    registerAgent({ pid, cmd: path.basename(server.command), provider: 'mcp', taskId: world.handle.id, role: server.name,
+      owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
+    child.once('close', () => { void releaseAgent(pid, custody.custodyId); });
+  }
   let buffered = ''; let bufferedBytes = 0; const decoder = new StringDecoder('utf8');
+  let closed = false, stopping = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  child.once('close', () => { closed = true; clearTimeout(killTimer); signal?.removeEventListener('abort', abort); });
+  const stop = () => {
+    if (closed || stopping) return;
+    stopping = true; buffered = ''; bufferedBytes = 0;
+    child.kill();
+    if (!(child instanceof RemoteSpawnedProcess))
+      killTimer = setTimeout(() => { if (!closed) child.kill('SIGKILL'); }, 1000).unref();
+  };
   const transport: Transport = {
     async start() {
       child.on('error', (e) => transport.onerror?.(e));
       child.on('close', () => transport.onclose?.());
-      child.stdin?.on('error', (error) => { child.kill(); transport.onerror?.(error); });
-      child.stdout?.on('error', (error) => { child.kill(); transport.onerror?.(error); });
+      child.stdin?.on('error', (error) => { stop(); transport.onerror?.(error); });
+      child.stdout?.on('error', (error) => { stop(); transport.onerror?.(error); });
       child.stdout!.on('data', (chunk: Buffer) => {
+        if (stopping) return;
         const decoded = decoder.write(chunk); buffered += decoded; bufferedBytes += Buffer.byteLength(decoded);
         try {
           let end: number;
@@ -37,12 +60,12 @@ export async function connectWorldMcp(world: World, server: AgentMcpServer, sign
             if (line.trim()) transport.onmessage?.(JSONRPCMessageSchema.parse(JSON.parse(line)));
           }
           if (bufferedBytes > 2 * 1024 * 1024) throw new Error('MCP response exceeds 2 MiB');
-        } catch { child.kill(); transport.onerror?.(new Error('Invalid or oversized MCP response')); }
+        } catch { stop(); transport.onerror?.(new Error('Invalid or oversized MCP response')); }
 
       });
     },
     async send(message) { const data = serializeMessage(message); if (Buffer.byteLength(data) > 2 * 1024 * 1024) throw new Error('MCP request exceeds 2 MiB'); child.stdin!.write(data); },
-    async close() { signal?.removeEventListener('abort', abort); child.kill(); },
+    async close() { signal?.removeEventListener('abort', abort); stop(); },
   };
   const abort = () => { void transport.close(); };
   signal?.addEventListener('abort', abort, { once: true });

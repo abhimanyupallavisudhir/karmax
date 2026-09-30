@@ -5,6 +5,27 @@ import { describe, expect, it } from 'vitest';
 import { WebSocketServer } from 'ws';
 
 describe('tavya attach CLI', () => {
+  it('sends the reusable token in an authorization header, not the logged URL', async () => {
+    const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await once(server, 'listening');
+    let requested = '', authorization: string | undefined;
+    server.on('connection', (ws, req) => {
+      requested = req.url ?? ''; authorization = req.headers.authorization;
+      ws.close(1000);
+    });
+    const address = server.address() as { port: number };
+    const env: NodeJS.ProcessEnv = { ...process.env, KARMAX_TOKEN: 'reusable-secret' };
+    delete env.KARMAX_TERMINAL_TICKET;
+    const child = spawn(process.execPath, [path.resolve('bin/tavya.js'), 'attach', 'task-7',
+      '--url', `http://127.0.0.1:${address.port}`], {
+      env, stdio: 'pipe',
+    });
+    try {
+      await once(child, 'exit');
+      expect(requested).toBe('/ws/terminal?taskId=task-7');
+      expect(authorization).toBe('Bearer reusable-secret');
+    } finally { child.kill(); await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
   it('relays terminal input, output, and resize frames', async () => {
     const server = new WebSocketServer({ port: 0 });
     await once(server, 'listening');

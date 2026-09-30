@@ -178,6 +178,7 @@ eval(extractFn('wireAttempts'));
     return [];
   };
   global.scheduleTaskPageRender = () => {};
+  global.syncLiveWatch = () => {};
   eval(extractFn('mergeTaskHistory'));
   eval(extractFn('refreshTaskHistory'));
   eval(extractFn('showDraftPage'));

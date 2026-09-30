@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { rememberSubscriptionCatalog } from './catalog.js';
 import type { Store } from '../store/db.js';
 import { HOSTED_PLANS, hostedMonthlyPriceCents, isHostedPlanId,
   type HostedPlanId } from '../domain/entitlements.js';
@@ -14,6 +15,9 @@ export const PAST_DUE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 export type SubscriptionStatus = 'none' | 'trialing' | 'active' | 'past_due' | 'unpaid'
   | 'incomplete' | 'incomplete_expired' | 'paused' | 'canceled';
 export const TERMINAL_PROVIDER_SUBSCRIPTION_STATUSES = ['canceled', 'incomplete_expired'] as const;
+/** How long after an uncertain billing write the provider's reads must still
+ * show no effect before the write counts as never applied. */
+export const ABSENT_WRITE_SETTLE_MS = 10 * 60_000;
 
 export interface SubscriptionCatalogConfig {
   individualPriceId: string;
@@ -82,7 +86,9 @@ export interface SubscriptionProvider {
     seats: number; successUrl: string; cancelUrl: string; idempotencyKey: string }): Promise<{ id: string; url: string }>;
   resumeCheckout?(input: Parameters<SubscriptionProvider['createCheckout']>[0] & { checkoutId: string }): Promise<{ id: string; url: string } | null>;
   cancelCheckout?(checkoutId: string): Promise<{ id: string }>;
-  reconcileRequest?(intent: BillingRequestIntent, reference: string, createdAt: number): Promise<{ id: string; url?: string } | null>;
+  /** The recovered result, `{ absent: true }` when a complete read shows the
+   * write had no effect, or null when the reads prove neither. */
+  reconcileRequest?(intent: BillingRequestIntent, reference: string, createdAt: number): Promise<{ id: string; url?: string } | { absent: true } | null>;
   createPortal(input: { customerId: string; subscriptionId?: string; returnUrl: string; idempotencyKey: string }): Promise<{ url: string }>;
   changePlan(input: { subscriptionId: string; plan: PaidHostedPlanId; seats: number;
     items: Record<string, string>; idempotencyKey: string }): Promise<{ id: string }>;
@@ -163,12 +169,25 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
       'subscription_data[metadata][karmax_organization_id]': input.organizationId,
       'line_items[0][price]': input.plan === 'individual' ? catalog.individualPriceId : catalog.teamBasePriceId,
       'line_items[0][quantity]': 1, allow_promotion_codes: true,
+      'metadata[karmax_plan]': input.plan, 'metadata[karmax_seats]': input.seats,
     };
     if (input.plan === 'team' && additionalTeamUsers > 0) {
       params['line_items[1][price]'] = catalog.teamSeatPriceId;
       params['line_items[1][quantity]'] = additionalTeamUsers;
     }
     return this.request('/v1/checkout/sessions', params, input.idempotencyKey);
+  }
+
+  async resumeCheckout(input: Parameters<NonNullable<SubscriptionProvider['resumeCheckout']>>[0]) {
+    const path = `/v1/checkout/sessions/${encodeURIComponent(input.checkoutId)}`;
+    const session = await this.request(path, {}, input.idempotencyKey, 'GET');
+    if (session.status === 'expired') return null;
+    if (session.status !== 'open') throw new BillingRequestRejected('Stripe is processing checkout; wait for subscription confirmation');
+    if (session.customer !== input.customerId) throw new BillingRequestRejected('Stripe checkout customer does not match');
+    if (session.metadata?.karmax_plan === input.plan && Number(session.metadata?.karmax_seats) === input.seats)
+      return { id: session.id, url: session.url };
+    await this.request(`${path}/expire`, {}, `${input.idempotencyKey}:expire`);
+    return null;
   }
 
   createPortal(input: { customerId: string; returnUrl: string; idempotencyKey: string }) {
@@ -238,12 +257,12 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
     if (!catalog) throw new Error('subscription price identifiers are not configured');
     return catalog;
   }
-  private async request(path: string, params: Record<string, string | number | boolean>, idempotencyKey: string): Promise<any> {
+  private async request(path: string, params: Record<string, string | number | boolean>, idempotencyKey: string, method = 'POST'): Promise<any> {
     const key = (await this.secretKey());
     if (!key) throw new Error('Stripe subscription billing is not configured');
     const body = new URLSearchParams();
     for (const [name, value] of Object.entries(params)) body.set(name, String(value));
-    const response = await this.fetcher(`https://api.stripe.com${path}`, { method: 'POST', body,
+    const response = await this.fetcher(`https://api.stripe.com${path}`, { method, ...(method === 'POST' ? { body } : {}),
       headers: { authorization: `Bearer ${key}`, 'content-type': 'application/x-www-form-urlencoded',
         'idempotency-key': idempotencyKey, 'stripe-version': STRIPE_BILLING_API_VERSION } });
     const payload = await response.json().catch(() => ({})) as any;
@@ -360,7 +379,12 @@ export class SubscriptionBillingService {
   async reconcileEntitlements(now = Date.now()): Promise<void> {
     if (!this.hosted) return;
     const rows = (await this.store.db.prepare('SELECT * FROM subscription_billing_accounts').all()) as any[];
-    for (const row of rows) (await this.reconcileAccount(rowAccount(row)!, now));
+    const errors: unknown[] = [];
+    for (const row of rows) {
+      try { await this.reconcileAccount(rowAccount(row)!, now); }
+      catch (error) { errors.push(error); }
+    }
+    if (errors.length) throw new AggregateError(errors, 'Some subscription entitlements could not be reconciled');
   }
 
   async checkout(organizationId: string, plan: unknown, urls: { success: string; cancel: string }, key: string): Promise<SubscriptionCheckoutResult> {
@@ -405,7 +429,7 @@ export class SubscriptionBillingService {
       session ??= await provider.createCheckout(input);
       await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_checkouts
         (provider, checkoutId, organizationId, createdAt, state) VALUES (?, ?, ?, ?, ?)`)
-        .run(provider.name, session.id, organizationId, Date.now(), provider.customerMode === 'checkout' ? 'pending' : 'unverified');
+        .run(provider.name, session.id, organizationId, Date.now(), provider.resumeCheckout ? 'pending' : 'unverified');
       return { ...checkoutResult, checkoutSessionReference: session.id, url: session.url };
     }, provider, intent);
   }
@@ -486,9 +510,23 @@ export class SubscriptionBillingService {
     const intent = JSON.parse(lock.intentJson) as BillingRequestIntent;
     const result = await provider.reconcileRequest(intent, lock.providerReference, Number(lock.createdAt));
     if (!result) return { reconciled: false, pending: true };
+    if ('absent' in result) {
+      // Proven to have had no effect. A request cannot apply long after it was
+      // sent, so once that window has passed the reservation is released and
+      // the person can simply try again; nothing is ever re-sent for them (GH-5).
+      if (Date.now() - Number(lock.createdAt) < ABSENT_WRITE_SETTLE_MS) return { reconciled: false, pending: true };
+      return this.store.transaction(async () => {
+        const current = await this.store.db.prepare('SELECT requestKey FROM subscription_billing_locks WHERE organizationId=?').get(organizationId) as any;
+        if (current?.requestKey !== lock.requestKey) return { reconciled: true, pending: false, applied: false };
+        await this.store.db.prepare('DELETE FROM subscription_billing_requests WHERE requestKey=? AND organizationId=? AND responseJson IS NULL')
+          .run(lock.requestKey, organizationId);
+        await this.store.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=? AND requestKey=?').run(organizationId, lock.requestKey);
+        return { reconciled: true, pending: false, applied: false };
+      });
+    }
     return this.store.transaction(async () => {
       const current = await this.store.db.prepare('SELECT requestKey FROM subscription_billing_locks WHERE organizationId=?').get(organizationId) as any;
-      if (current?.requestKey !== lock.requestKey) return { reconciled: true, pending: false };
+      if (current?.requestKey !== lock.requestKey) return { reconciled: true, pending: false, applied: true };
       if (intent.kind === 'checkout') {
         await this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_checkouts
           (provider, checkoutId, organizationId, createdAt) VALUES (?, ?, ?, ?)`)
@@ -500,7 +538,7 @@ export class SubscriptionBillingService {
       await this.store.db.prepare('UPDATE subscription_billing_requests SET responseJson=? WHERE requestKey=? AND organizationId=? AND responseJson IS NULL')
         .run(JSON.stringify(response), lock.requestKey, organizationId);
       await this.store.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=? AND requestKey=?').run(organizationId, lock.requestKey);
-      return { reconciled: true, pending: false };
+      return { reconciled: true, pending: false, applied: true };
     });
   }
 
@@ -564,6 +602,15 @@ export class SubscriptionBillingService {
         && (!event.checkoutId || !['canceled', 'incomplete_expired'].includes(account.status))) return;
     } else if (!account && customerId) account = await this.accountByCustomer(customerId);
     if (account && account.provider !== provider.name) return;
+    if (provider.customerMode !== 'checkout' && account) {
+      const completed = event.type === 'checkout.session.completed'
+        ? await this.store.db.prepare('SELECT checkoutId FROM subscription_billing_checkouts WHERE provider=? AND checkoutId=? AND organizationId=?')
+          .get(provider.name, String(object.id), account.organizationId) : undefined;
+      if (event.type === 'checkout.session.completed' && !completed) return;
+      if (account.subscriptionId && account.subscriptionId !== subscriptionId) {
+        if (!completed || !['canceled', 'incomplete_expired'].includes(account.status)) return;
+      }
+    }
     if (!account) return; // Never adopt a tenant association from provider metadata.
     if (provider.customerMode === 'checkout' && event.checkoutId && subscriptionId)
       await this.store.db.prepare("UPDATE subscription_billing_checkouts SET subscriptionId=?, state='associated' WHERE provider=? AND checkoutId=? AND organizationId=?")
@@ -657,14 +704,16 @@ export class SubscriptionBillingService {
   }
 
   private async mapSubscription(object: any, provider: SubscriptionProvider): Promise<{ plan: HostedPlanId; seats: number; items: Record<string, string> }> {
-    const catalog = (await provider.catalog());
-    if (!catalog) throw new Error('subscription catalog is not configured');
+    const currentCatalog = await provider.catalog();
+    if (!currentCatalog) throw new Error('subscription catalog is not configured');
+    const catalogs = await rememberSubscriptionCatalog(this.store, provider.name, currentCatalog);
     const items: Record<string, string> = {};
     let plan: HostedPlanId | undefined;
     let seats = HOSTED_PLANS.team.includedActiveUsers;
     for (const item of object.items?.data ?? []) {
       const price = stringId(item.price);
       const product = stringId(item.price?.product);
+      const catalog = catalogs.find((entry) => [entry.individualPriceId, entry.teamBasePriceId, entry.teamSeatPriceId].includes(price ?? '')) ?? currentCatalog;
       if (price === catalog.individualPriceId) {
         if (provider.customerMode === 'checkout' && item.quantity !== 1) throw new Error('base plan quantity must be one');
         if (plan) throw new Error('subscription contains multiple configured base plan prices');
@@ -748,9 +797,10 @@ export class SubscriptionBillingService {
       // only a stale local reservation resumes safely without duplicating money.
       if (Number(prior.createdAt) > Date.now() - 5 * 60_000)
         throw new Error('an identical billing request is already in progress');
+      await this.store.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=? AND requestKey=?').run(organizationId, key);
       (await this.store.db.prepare('DELETE FROM subscription_billing_requests WHERE requestKey=? AND responseJson IS NULL').run(key));
     }
-    if (provider?.supportsIdempotency === false) {
+    if (provider?.supportsIdempotency === false || operation.startsWith('checkout:')) {
       const pending = await this.store.db.prepare('SELECT requestKey FROM subscription_billing_requests WHERE organizationId=? AND responseJson IS NULL')
         .get(organizationId);
       if (pending) throw new Error('another billing request is in progress or requires provider reconciliation');
@@ -785,6 +835,8 @@ export class SubscriptionBillingService {
     if (!this.hosted) throw new Error('hosted subscription billing is not used by self-hosted installations');
     const provider = await this.provider(name);
     if (!(await provider.configured())) throw new Error('hosted subscription billing is not configured');
+    const catalog = await provider.catalog();
+    if (catalog) await rememberSubscriptionCatalog(this.store, provider.name, catalog);
     return provider;
   }
   private requireKey(key: string): void {

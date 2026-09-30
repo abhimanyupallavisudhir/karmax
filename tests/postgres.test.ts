@@ -20,11 +20,294 @@ const url = process.env.KARMAX_TEST_POSTGRES_URL;
 const integration = url ? describe : describe.skip;
 const admin = url ? new Pool({ connectionString: url }) : undefined;
 
+/**
+ * Hold an exclusive lock on `table` in another session until `release()`.
+ * `waiting()` resolves once some other backend is blocked on it, so a test
+ * asserts that a read is still pending only after the read has reached the
+ * lock, however slowly the runner got there. The holder's own sleep bounds the
+ * lock server-side if a regression blocks the JS event loop.
+ */
+async function holdLock(table: string) {
+  const blocker = await admin!.connect();
+  const pid = (await blocker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid as number;
+  await blocker.query('BEGIN');
+  await blocker.query(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`);
+  let slept = false;
+  const held = blocker.query('SELECT pg_sleep(10)').catch(() => undefined).finally(() => { slept = true; });
+  let released: Promise<void> | undefined;
+  return {
+    waiting: () => vi.waitFor(async () => {
+      const { rows } = await admin!.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+        WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))`, [pid]);
+      expect(rows[0].n).toBeGreaterThan(0);
+    }, { timeout: 5_000 }),
+    release: () => released ??= (async () => {
+      // A cancel that lands before the sleep starts is lost; repeat until it ends.
+      while (!slept) {
+        await admin!.query('SELECT pg_cancel_backend($1)', [pid]);
+        await Promise.race([held, new Promise((resolve) => setTimeout(resolve, 50))]);
+      }
+      await blocker.query('ROLLBACK');
+      blocker.release();
+    })(),
+  };
+}
+
 integration('PostgreSQL cutover', () => {
   beforeEach(async () => {
     await admin!.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
   });
   afterAll(async () => { await admin?.end(); });
+
+  it('looks up one identity user by primary key', async () => {
+    const named = async () => (await admin!.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE datname = current_database() AND application_name = 'karmax'`)).rows[0].n as number;
+    const before = await named();
+    const identity = await IdentityService.open(':memory:', { databaseUrl: url!, baseURL: 'http://localhost:4599',
+      secret: 'fixture-only-identity-secret-32-characters' });
+    try {
+      const user = await identity.createUser({ name: 'Alice', email: 'alice@example.com', password: 'fixture-password-123' });
+      expect(await identity.userById(user.id)).toMatchObject({ id: user.id, email: user.email });
+      // Its own pool is named like the store's, so doctor sees it as the app.
+      expect(await named()).toBeGreaterThan(before);
+    } finally { await identity.close(); }
+  });
+
+  it('looks up merged task events without hydrating event history', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Merge');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.appendEvent({ taskId: task.id, type: 'merge.result', ts: 1, payload: { merged: true } });
+      expect(await store.hasMergedTaskEvent(task.id)).toBe(true);
+    } finally { await store.close(); }
+  });
+
+  // Sub-tasks spawned in one agent turn are created within one millisecond,
+  // and task ids end in random bytes, so only the list position is a stable
+  // tie-break. SQLite's rowid is translated to id here.
+  it('lists children created in the same millisecond in creation order', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Same millisecond');
+      const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: 'p' } });
+      vi.spyOn(Date, 'now').mockReturnValue(1_790_000_000_000);
+      const children = [];
+      for (let i = 0; i < 8; i++)
+        children.push(await store.createTask({ projectId: project.id, title: `Child ${i}`, workflow: 'software-dev',
+          workflowVersion: '1.26.0', params: { prompt: `c${i}` }, parentTaskId: parent.id }));
+      vi.restoreAllMocks();
+      expect((await store.childTaskSummaries(parent.id)).map((summary) => summary.id)).toEqual(children.map((child) => child.id));
+    } finally { vi.restoreAllMocks(); await store.close(); }
+  });
+
+  it('expires deduplicated GitHub PR observations', async () => {
+    const store = await Store.create(url!);
+    try {
+      expect(await store.claimGithubPrObservation('digest', 1000)).toBe(true);
+      expect(await store.claimGithubPrObservation('digest', 1001)).toBe(false);
+      expect((await store.retentionSweep(1000 + 31 * 86400_000)).githubPrObservations).toBe(1);
+    } finally { await store.close(); }
+  });
+
+  it('translates JSON draft booleans and arbitrary json_remove paths', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('JSON translation');
+      const task = await store.createTask({ projectId: project.id, title: 'Draft', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'fixture', draft: true } });
+      const draft = await store.db.prepare("SELECT COALESCE(json_extract(params, '$.draft'), 0) AS draft FROM tasks WHERE id=?")
+        .get(task.id) as { draft: number };
+      expect(Number(draft.draft)).toBe(1);
+      await store.db.prepare('UPDATE tasks SET params=? WHERE id=?')
+        .run(JSON.stringify({ prompt: 'fixture', draft: 'false' }), task.id);
+      const stringDraft = await store.db.prepare("SELECT COALESCE(json_extract(params, '$.draft'), 0) AS draft FROM tasks WHERE id=?")
+        .get(task.id) as { draft: number };
+      expect(Number(stringDraft.draft)).toBe(1);
+      const removed = await store.db.prepare("SELECT json_remove(params, '$.prompt', '$.draft', '$.missing', '$.nested.value') AS value FROM tasks WHERE id=?")
+        .get(task.id) as { value: string };
+      expect(JSON.parse(removed.value)).toEqual({});
+    } finally { await store.close(); }
+  });
+
+  it('matches exact team selectors during deletion', async () => {
+    const store = await Store.create(url!);
+    try {
+      const org = await store.createOrganization({ name: 'Teams', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      const dev = await store.createTeam({ organizationId: org.id, name: 'Dev' });
+      const developers = await store.createTeam({ organizationId: org.id, name: 'Developers' });
+      await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture', responder: { kind: 'human', audience: ['@team:developers'] } } });
+      await store.deleteTeam(dev.id);
+      await expect(store.deleteTeam(developers.id)).rejects.toThrow(/still used/);
+    } finally { await store.close(); }
+  });
+
+  it('allocates distinct synthetic inbox sequences for simultaneous asks', async () => {
+    const store = await Store.create(url!);
+    try {
+      const org = await store.createOrganization({ name: 'Approvals', ownerUserId: 'owner' });
+      const project = await store.createProject('App', {}, org.id);
+      for (const [avatarId, requestId] of [['avatar-a', 'Aa'], ['avatar-b', 'BB']] as const)
+        await store.addAuthorizationInbox(org.id, ['owner'],
+          { kind: 'avatar-authorization', avatarId, projectId: project.id, requestId }, 1000);
+      expect((await store.listInbox('owner', org.id)).map((row) => row.subject?.kind === 'avatar-authorization' ? row.subject.requestId : undefined).sort()).toEqual(['Aa', 'BB']);
+    } finally { await store.close(); }
+  });
+
+  it('removes project admission reservations with the project', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Reservations');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.db.prepare(`INSERT INTO usage_admissions
+        (id, organizationId, projectId, taskId, kind, provider, fundingSource, state, createdAt)
+        VALUES (?, ?, ?, ?, 'agent', 'mock', 'byok', 'active', 1)`)
+        .run('reservation', project.organizationId, project.id, task.id);
+      await store.deleteProject(project.id);
+      expect(await store.db.prepare('SELECT id FROM usage_admissions WHERE projectId=?').all(project.id)).toEqual([]);
+    } finally { await store.close(); }
+  });
+
+  it('scans only literal kv key prefixes', async () => {
+    const store = await Store.create(url!);
+    try {
+      await store.kvSet('case:A', 'one');
+      await store.kvSet('case:a', 'two');
+      await store.kvSet('case%literal', 'three');
+      expect(await store.kvEntries('case:A')).toEqual([{ key: 'case:A', value: 'one' }]);
+      expect(await store.kvEntries('case%')).toEqual([{ key: 'case%literal', value: 'three' }]);
+    } finally { await store.close(); }
+  });
+
+  it('creates the event-type index for approval and inbox scans', async () => {
+    const store = await Store.create(url!);
+    try {
+      const indexes = await store.db.prepare("SELECT indexname FROM pg_indexes WHERE tablename='events'").all() as Array<{ indexname: string }>;
+      expect(indexes.map((row) => row.indexname)).toContain('idx_events_type');
+    } finally { await store.close(); }
+  });
+
+  it('selects only unsettled attempt metadata for reconciliation', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Reconciliation');
+      const live = await store.createTask({ projectId: project.id, title: 'Live', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      const done = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.saveView(done.id, { taskId: done.id, title: done.title, workflow: done.workflow,
+        stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
+      expect((await store.listReconciliationCandidates(project.id)).map((task) => task.id)).toEqual([live.id]);
+    } finally { await store.close(); }
+  });
+
+  it('prunes superseded terminal view snapshots without losing the current conversation', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Retention');
+      const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture', _workflowRunId: 'run' } });
+      await store.kvSet(`view-conversation:${task.id}:run:0`, '{"messages":[]}');
+      await store.kvSet(`view-conversation:${task.id}:run:1`, '{"messages":[]}');
+      await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 }, 'run:1');
+      // RT-30a: pre-fix run-scoped and legacy turn checkpoints go too.
+      for (const key of [`turnsession:${task.id}:run#1`, 'turnsession:legacy:run:activity']) await store.kvSet(key, 'x');
+      expect((await store.retentionSweep(Date.now() + 30 * 24 * 60 * 60 * 1000))).toMatchObject({ viewSnapshots: 1, turnSessions: 2 });
+      expect(await store.kvGet(`view-conversation:${task.id}:run:0`)).toBeUndefined();
+      expect(await store.kvGet(`view-conversation:${task.id}:run:1`)).toBeDefined();
+      expect((await store.retentionSweep(Date.now() + 31 * 24 * 60 * 60 * 1000)).turnSessions).toBe(0);
+    } finally { await store.close(); }
+  });
+
+  // The upgrade rehearsal (#421): PostgreSQL may cast every kv value before the
+  // join narrows them to settle times, and one non-numeric value ("developer",
+  // "seen") aborted the whole hourly sweep, so nothing was ever purged.
+  it('sweeps settled tasks while other kv values are not numbers', async () => {
+    // Make PostgreSQL scan kv and filter it before the join, as production's planner did.
+    const planned = new URL(url!);
+    planned.searchParams.set('options', '-c enable_nestloop=off -c enable_indexscan=off -c enable_bitmapscan=off');
+    const store = await Store.create(planned.toString());
+    try {
+      const project = await store.createProject('Retention with settings');
+      const task = await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do', workflowVersion: '1',
+        params: { prompt: 'fixture', _workflowRunId: 'run' } });
+      await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+        stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 1 });
+      for (const [key, value] of [['authz:default:global', 'developer'], ['git:onboarding:x', 'seen'], ['session:x', 'mock-1']] as const)
+        await store.kvSet(key, value);
+      await store.kvSet(`turnsession:${task.id}:run#1`, 'x');
+      await store.kvSet(`retention:settled:${task.id}`, String(Date.now() - 8 * 86_400_000));
+      expect((await store.retentionSweep(Date.now())).turnSessions).toBe(1);
+    } finally { await store.close(); }
+  });
+
+  it('skips completed PostgreSQL row migrations on repeated initialization', async () => {
+    const store = await Store.create(url!);
+    try {
+      const prepare = store.db.prepare.bind(store.db);
+      const queries: string[] = [];
+      store.db.prepare = ((sql: string) => { queries.push(sql); return prepare(sql); }) as typeof store.db.prepare;
+      await (store as any).migrateData();
+      expect(queries.some((sql) => sql.includes('SELECT id, config FROM projects'))).toBe(false);
+    } finally { await store.close(); }
+  });
+
+  it('expires old events and audit rows while retaining unresolved approval evidence', async () => {
+    const store = await Store.create(url!);
+    try {
+      const now = Date.UTC(2026, 8, 26);
+      const project = await store.createProject('Retention');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.appendEvent({ taskId: task.id, type: 'task.note', ts: now - 91 * 86400_000, payload: {} });
+      await store.appendEvent({ taskId: task.id, type: 'permission.approval-requested', ts: now - 91 * 86400_000, payload: { requestId: 'ask' } });
+      await store.appendAudit({ principalId: 'user:a', action: 'old', ts: now - 366 * 86400_000 });
+      const swept = await store.retentionSweep(now);
+      expect(swept.events).toBe(1);
+      expect(swept.auditEntries).toBe(1);
+      expect((await store.eventsSince(task.id, 0)).map((event) => event.type)).toEqual(['permission.approval-requested']);
+    } finally { await store.close(); }
+  });
+
+  it('keeps completion dates after event retention', async () => {
+    const store = await Store.create(url!);
+    try {
+      const now = Date.UTC(2026, 8, 26);
+      const project = await store.createProject('Insight metrics');
+      const task = await store.createTask({ projectId: project.id, title: 'Shipped', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.appendEvent({ taskId: task.id, type: 'view.updated', ts: now - 86400_000, payload: { status: 'done' } });
+      await store.retentionSweep(now + 100 * 86400_000);
+      expect((await store.insightRows('org_personal', now - 30 * 86400_000, now)).completions)
+        .toContainEqual({ taskId: task.id, doneAt: now - 86400_000 });
+    } finally { await store.close(); }
+  });
+
+  it('revokes scoped tokens through indexed project membership', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Tokens');
+      const task = await store.createTask({ projectId: project.id, title: 'T', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+      await store.putScopedToken('by-project', 'one', { principal: 'user:a', projectId: project.id }, Date.now() + 60_000);
+      await store.putScopedToken('by-task', 'two', { principal: 'user:b', taskId: task.id }, Date.now() + 60_000);
+      await store.putScopedToken('other', 'three', { principal: 'user:c', projectId: 'unrelated' }, Date.now() + 60_000);
+      expect(await store.revokeScopedTokens({ projectId: project.id })).toBe(2);
+      expect((await store.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE revokedAt IS NULL').all()))
+        .toEqual([{ tokenHash: 'other' }]);
+    } finally { await store.close(); }
+  });
+
+  it('backfills legacy PostgreSQL scoped-token membership', async () => {
+    const db = openSqlDatabase(url!);
+    await db.exec(`CREATE TABLE scoped_tokens (tokenHash TEXT PRIMARY KEY, tokenId TEXT NOT NULL UNIQUE,
+      json TEXT NOT NULL, expiresAt INTEGER NOT NULL, revokedAt INTEGER)`);
+    await db.prepare('INSERT INTO scoped_tokens VALUES (?,?,?,?,NULL)').run('old-token', 'old-id',
+      JSON.stringify({ principal: 'user:old', projectIds: ['project-old'] }), Date.now() + 60_000);
+    await db.close();
+    const store = await Store.create(url!);
+    try { expect(await store.revokeScopedTokens({ projectId: 'project-old' })).toBe(1); }
+    finally { await store.close(); }
+  });
 
   it('closes one real identity while preserving shared PostgreSQL task content and the other owner', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pg-erasure-'));
@@ -230,49 +513,44 @@ integration('PostgreSQL cutover', () => {
 
   it('keeps the event loop live while a native permission lookup waits for the database', async () => {
     const store = (await Store.create(url!));
-    const blocker = await admin!.connect();
+    let lock: Awaited<ReturnType<typeof holdLock>> | undefined;
     try {
       const authorization = (await AuthorizationService.create(store));
       (await authorization.grant('root', { principalId: 'user:reader', scopeKey: 'global', profileId: 'god' }));
       (await store.kvSet('permission-probe', 'ready'));
       await authorization.capabilitiesAsync('user:reader');
-      await blocker.query('BEGIN');
-      await blocker.query('LOCK TABLE authorization_profiles IN ACCESS EXCLUSIVE MODE');
-      const unlock = blocker.query('SELECT pg_sleep(0.4); COMMIT');
+      lock = await holdLock('authorization_profiles');
       let complete = false;
       const reading = authorization.capabilitiesAsync('user:reader').then(caps => { complete = true; return caps; });
-      await new Promise(resolve => setTimeout(resolve, 20));
+      await lock.waiting();
       expect(complete).toBe(false);
       expect(await store.kvGetAsync('permission-probe')).toBe('ready');
       expect(complete).toBe(false);
-      await unlock;
+      await lock.release();
       expect(await reading).toEqual(['*']);
-    } finally { await blocker.query('ROLLBACK'); blocker.release(); (await store.close()); }
+    } finally { await lock?.release(); (await store.close()); }
   });
 
   it('keeps timers and independent reads live while a task-table lock delays detail and full-list reads', async () => {
     const store = (await Store.create(url!));
-    const blocker = await admin!.connect();
+    let lock: Awaited<ReturnType<typeof holdLock>> | undefined;
     try {
       const project = (await store.createProject('Blocked read'));
       const task = (await store.createTask({ projectId: project.id, title: 'Lock fixture', workflow: 'just-do',
         workflowVersion: '1', params: { prompt: 'fixture' } }));
       (await store.kvSet('unrelated-read', 'ready'));
       await store.taskMetadataAsync(task.id); // establish the pool before timing the lock
-      await blocker.query('BEGIN');
-      await blocker.query('LOCK TABLE tasks IN ACCESS EXCLUSIVE MODE');
-      // Server-side release also bounds this test if a regression blocks JS timers.
-      const unlock = blocker.query('SELECT pg_sleep(0.4); COMMIT');
+      lock = await holdLock('tasks');
       let finished = false;
       const read = Promise.all([store.taskMetadataAsync(task.id), store.listTasksAsync(project.id)])
         .then(([value, tasks]) => { expect(tasks.map(t => t.id)).toEqual([task.id]); finished = true; return value; });
-      await new Promise(resolve => setTimeout(resolve, 20));
+      await lock.waiting();
       expect(finished).toBe(false);
       expect(await store.kvGetAsync('unrelated-read')).toBe('ready');
       expect(finished).toBe(false);
-      await unlock;
+      await lock.release();
       expect((await read)?.id).toBe(task.id);
-    } finally { await blocker.query('ROLLBACK'); blocker.release(); (await store.close()); }
+    } finally { await lock?.release(); (await store.close()); }
   });
 
   it('looks up usage IDs in bounded batches and task ownership without loading views', async () => {
@@ -318,9 +596,11 @@ integration('PostgreSQL cutover', () => {
       const card = await provider.provisionCard({ scope: 'project', scopeId: project.id, label: 'Work', cap: 10000 });
       await provider.fund(card.id, 10000);
       const task = (await store.createTask({ projectId: project.id, title: 'Pay', workflow: 'just-do',
-        workflowVersion: '1.0.0', params: { prompt: 'Pay', paymentPolicy: { cardIds: [card.id], budget: 100 } } }));
+        workflowVersion: '1.0.0', params: { prompt: 'Pay', paymentPolicy: { cardIds: [card.id], budget: 100 },
+          _authorization: { capabilities: [`use-card:${card.id}`] } } }));
       const service = new BudgetService(store, provider);
-      const ctx = { projectId: project.id, taskId: task.id };
+      const ctx = { projectId: project.id, taskId: task.id, capabilities: [`use-card:${card.id}`] };
+      expect(await service.cards({ ...ctx, capabilities: [] })).toEqual([]);
       const results = await Promise.all([service.request(ctx, { amount: 100, why: 'first' }),
         service.request(ctx, { amount: 100, why: 'second' })]);
       expect(results.map(r => r.status).sort()).toEqual(['granted', 'needs_approval']);

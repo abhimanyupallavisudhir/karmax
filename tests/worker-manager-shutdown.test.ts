@@ -73,3 +73,33 @@ it('still stops the live worker when an accepted refresh build fails', async () 
   await Promise.all([refresh, manager.stop()]);
   expect(initial.shutdown).toHaveBeenCalledTimes(1);
 });
+
+it('WF-15: refresh finishes while the retired worker drains, and stop awaits that drain', async () => {
+  const completion = deferred<void>();
+  const initial = { run: vi.fn(() => completion.promise), shutdown: vi.fn() };
+  const next = worker();
+  mocks.makeWorker.mockResolvedValueOnce(initial).mockResolvedValueOnce(next);
+  const manager = managerWithControlledBuild();
+  await manager.start();
+  let refreshed = false;
+  const refresh = manager.refresh([]).then(() => { refreshed = true; });
+  try {
+    // The retired worker never finishes on its own, so waiting for it would time out.
+    await vi.waitFor(() => expect(refreshed).toBe(true));
+    let stopped = false;
+    const stop = manager.stop().then(() => { stopped = true; });
+    // Stop has shut the current worker down and seen it finish; from here only
+    // promise callbacks remain, and a macrotask turn runs all of them, so a stop
+    // that skipped the retired worker's drain would have resolved.
+    await vi.waitFor(() => expect(next.shutdown).toHaveBeenCalled());
+    await next.run.mock.results[0]!.value;
+    await new Promise(resolve => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    completion.resolve();
+    await stop;
+  } finally {
+    completion.resolve();
+    await refresh;
+    await manager.stop();
+  }
+});

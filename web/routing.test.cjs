@@ -52,6 +52,7 @@ global.S = S;
 // Bring the real declarations into scope.
 eval(extractConst('TASK_TABS'));
 eval(extractConst('ORG_VIEWS'));
+eval(extractConst('PROJECT_SCOPED_TABS'));
 eval(extractFn('slugify'));
 eval(extractFn('projectSlug'));
 eval(extractFn('projectById'));

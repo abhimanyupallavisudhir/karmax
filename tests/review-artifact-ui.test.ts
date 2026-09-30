@@ -105,20 +105,29 @@ describe('review artifact reader', () => {
     }
   });
 
-  it('renders HTML artifacts inside a sandboxed frame, never as a bare same-origin blob', async () => {
-    // A `blob:` URL carries the console's origin; an agent-authored page opened
-    // bare would run with the console session. The frame has no allow-same-origin.
-    const frame: Record<string, unknown> = { style: {}, setAttribute: vi.fn() };
-    const popup = { document: { title: '', createElement: () => frame, body: { style: {}, appendChild: vi.fn() } } };
+  it('opens HTML artifacts as their own sandboxed document, never as a same-origin blob', async () => {
+    // A `blob:` URL carries the console's origin and its policy; the artifact's
+    // own URL is served under a `sandbox` policy that gives it an opaque origin.
+    const popup: Record<string, unknown> = { opener: 'console' };
     const t = setup('text/html', '<script>alert(1)</script>', 'report.html');
     t.open.mockReturnValueOnce(popup);
     await t.run();
     expect(t.show).not.toHaveBeenCalled();
-    expect(t.open).toHaveBeenCalledWith('', '_blank', 'noopener=no');
-    expect(t.open).not.toHaveBeenCalledWith('blob:test', '_blank', 'noopener');
-    expect(frame.setAttribute).toHaveBeenCalledWith('sandbox', expect.not.stringContaining('allow-same-origin'));
-    expect(frame.src).toBe('blob:test');
-    expect(popup.document.body.appendChild).toHaveBeenCalledWith(frame);
+    expect(t.open).toHaveBeenCalledWith('/artifact', '_blank');
+    expect(t.open).toHaveBeenCalledTimes(1);
+    expect(popup.opener).toBeNull();
+  });
+
+  it('downloads an HTML artifact when a popup blocker stops its window', async () => {
+    const anchor = { click: vi.fn(), remove: vi.fn() } as Record<string, any>;
+    const t = setup('text/html', '<p>report</p>', 'report.html');
+    t.context.document = { createElement: () => anchor, body: { appendChild: vi.fn() } };
+    t.open.mockReturnValueOnce(null);
+    await t.run();
+    expect(anchor.href).toBe('blob:test');
+    expect(anchor.download).toBe('report.html');
+    expect(anchor.click).toHaveBeenCalled();
+    expect(t.open).toHaveBeenCalledTimes(1);
   });
 
   it('opens external URLs without fetching them with credentials', async () => {

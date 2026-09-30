@@ -18,6 +18,9 @@ import * as environmentRecords from '../src/store/project-environment.js';
 import { selectProjectEnvironment } from '../src/world/project-runtime.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 
+// Bodies passed to page.evaluate run in the page; this file has no DOM lib.
+declare const document: any, window: any;
+
 let nextPort = 49500;
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const fn of cleanups.splice(0).reverse()) await fn(); });
@@ -38,12 +41,17 @@ async function fixture(options: { fullApp?: boolean } = {}) {
   const gateway = await Gateway.create({ api, store, tokens, client, worlds, authorization, taskQueue: 'test', staticDir: options.fullApp ? path.resolve('web') : dir,
     providerConnections: { resolve: (organizationId: string) => ({ apiKey: `test-key-${organizationId}`, config: {} }), list: () => [] } as any,
     bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(),
-    identity: { connectOrganizationNames: () => {}, session: async (headers: Headers) => headers.get('cookie') === 'test=alice'
+    identity: { sessionActive: async (id: string, userId: string) => id === 'session-alice' && userId === 'alice',
+      connectOrganizationNames: () => {}, session: async (headers: Headers) => headers.get('cookie') === 'test=alice'
       ? { user: { id: 'alice', name: 'Alice', email: 'alice@example.com' }, session: { id: 'session-alice' } } : undefined,
       providersForUser: () => [], providersForUserAsync: async () => [], listUsers: () => [] } as any,
     agentInfo: { provider: 'mock', reason: 'test' } });
   const server = await gateway.listen(await findFreePortFrom(nextPort += 10));
   cleanups.push(async () => { await server.close(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
+  // listen() repairs every project's wiki in the background, and the move plan
+  // fingerprints the wiki record. Let that settle, or a preview taken first is
+  // (correctly) refused as stale when its record lands before the confirmation.
+  await vi.waitFor(async () => { if (!(await store.projectWiki(project.id))) throw new Error('wiki not ready'); }, { timeout: 30_000 });
   const request = (route: string, body?: unknown, bearer?: string) => fetch(server.url + route, {
     method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json', ...(bearer ? { authorization: `Bearer ${bearer}` } : { cookie: 'test=alice' }) },
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -53,6 +61,13 @@ async function fixture(options: { fullApp?: boolean } = {}) {
 }
 
 describe('project transfer HTTP authorization', () => {
+  it('confirms a preview taken as soon as the gateway is up', async () => {
+    const f = await fixture();
+    const preview = await (await f.request(f.route + `?destinationOrganizationId=${f.destination.id}`)).json() as any;
+    await new Promise(resolve => setTimeout(resolve, 500));
+    expect((await f.request(f.route, { destinationOrganizationId: f.destination.id, previewId: preview.id })).status).toBe(200);
+  });
+
   it('lets a cookie session authorized in both organizations preview and move', async () => {
     const f = await fixture();
     const access = await f.request(`/api/settings/access?projectId=${f.project.id}`);
@@ -135,9 +150,11 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
     page.on('pageerror', error => errors.push(error.message));
     await page.context().addCookies([{ name: 'test', value: 'alice', url: f.server.url }]);
     await page.goto(`${f.server.url}/source/project/settings`, { waitUntil: 'domcontentloaded' });
-    let confirmation = '';
-    page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept('The old gateway is stopped; no host artifact exists.'); });
     await page.locator('[data-environment-recover]').click();
+    const dialog = page.getByRole('dialog');
+    const confirmation = await dialog.innerText();
+    await dialog.getByRole('textbox').fill('The old gateway is stopped; no host artifact exists.');
+    await dialog.getByRole('button', { name: 'Continue', exact: true }).click();
     await expect.poll(async () => (await environments.builds(f.project.id))[0]?.status).toBe('failed');
     expect(confirmation).toContain('does not stop or delete provider resources for you');
     expect(confirmation).toContain('another gateway');
@@ -159,7 +176,7 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
     await page.locator('.settings-nav a[href="#project-advanced"]').click();
     await page.locator('#move-project').click();
     await page.selectOption('[data-destination]', f.destination.id);
-    await page.waitForFunction("!document.querySelector('[role=dialog] [type=submit]')?.disabled");
+    await page.waitForFunction(() => !document.querySelector('[role=dialog] [type=submit]')?.disabled);
     await page.locator('[role="dialog"] [type="submit"]').click();
     await page.waitForURL('**/destination/project/settings');
     await page.locator('.settings-nav a[href="#project-advanced"]').click();
@@ -212,16 +229,16 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
       document.querySelector('#move')!.addEventListener('click', () => w.moveProject(project));
     }, { project: f.project, organization: f.destination, move });
     await page.click('#move');
-    await page.waitForFunction("!document.querySelector('[data-destination]')?.disabled");
+    await page.waitForFunction(() => !document.querySelector('[data-destination]')?.disabled);
     await page.keyboard.press('Escape');
     expect(await page.locator('[role="dialog"]').count()).toBe(0);
     expect(await page.locator('#move').evaluate(el => el === (globalThis as any).document.activeElement)).toBe(true);
     await page.click('#move');
     await page.selectOption('[data-destination]', f.destination.id);
-    await page.waitForFunction("!document.querySelector('[type=submit]')?.disabled");
+    await page.waitForFunction(() => !document.querySelector('[type=submit]')?.disabled);
     expect(await page.locator('[data-preview]').textContent()).toContain('History preserved');
     await page.setViewportSize({ width: 390, height: 844 });
-    expect(await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     if (process.env.KARMAX_TRANSFER_SCREENSHOT) await page.screenshot({ path: process.env.KARMAX_TRANSFER_SCREENSHOT });
     // A second administrator changes destination policy while the dialog is open.
     (await f.store.setSettings(`organization:${f.destination.id}`, '__common__', { prompt: 'new defaults' }));
@@ -229,11 +246,11 @@ describe.runIf(fs.existsSync(chromium.executablePath()))('project transfer brows
     await page.waitForSelector('[data-error] button');
     expect((await f.store.getProject(f.project.id))?.organizationId).toBe(f.source.id);
     await page.click('[data-error] button');
-    await page.waitForFunction("!document.querySelector('[type=submit]')?.disabled");
+    await page.waitForFunction(() => !document.querySelector('[type=submit]')?.disabled);
     await page.click('[type="submit"]');
-    await page.waitForFunction("Boolean(window.visited)");
+    await page.waitForFunction(() => Boolean(window.visited));
     expect((await f.store.getProject(f.project.id))?.organizationId).toBe(f.destination.id);
-    expect(await page.evaluate("window.visited")).toBe(`/moved/${f.project.id}/settings`);
+    expect(await page.evaluate(() => window.visited)).toBe(`/moved/${f.project.id}/settings`);
     expect(errors).toEqual([]);
   });
 });

@@ -64,10 +64,11 @@ ok(interactionInFlight(root) === false, 'a selection outside root does not defer
 
 // ── updateLiveBubble: follow the stream only when parked at the bottom ────────
 global.esc = (s) => s;
-global.S = { liveOutput: 'streaming text' };
+global.S = { liveOutput: { do: { text: 'streaming text' } }, view: { status: 'active' } };
 let bubble, thread;
 global.document.getElementById = (id) => (id === 'live-bubble' ? bubble : id === 'ck-thread' ? thread : null);
 eval(extractFn('updateLiveBubble'));
+eval(extractFn('liveOutputFor'));
 
 function makeBubble() {
   return { innerHTML: '', _scrolled: false, classList: { remove() {} }, scrollIntoView() { this._scrolled = true; } };
@@ -75,18 +76,18 @@ function makeBubble() {
 // Reader parked at the bottom (scrollHeight - scrollTop - clientHeight <= 2).
 bubble = makeBubble();
 thread = { scrollHeight: 1000, scrollTop: 970, clientHeight: 30 };
-updateLiveBubble();
+updateLiveBubble('do');
 ok(bubble._scrolled === true, 'at the bottom → the stream keeps the view pinned to the latest text');
 
 // Reader scrolled up reading history — must NOT be yanked down.
 bubble = makeBubble();
 thread = { scrollHeight: 1000, scrollTop: 100, clientHeight: 300 };
-updateLiveBubble();
+updateLiveBubble('do');
 ok(bubble._scrolled === false, 'scrolled up → streaming text does not steal the view');
 ok(bubble.innerHTML.includes('streaming text'), 'the bubble content still updates while scrolled up');
 bubble = makeBubble();
 thread = { scrollHeight: 1000, scrollTop: 680, clientHeight: 300 };
-updateLiveBubble();
+updateLiveBubble('do');
 ok(bubble._scrolled === false, 'even a small upward scroll releases the live stream from the bottom');
 
 console.log(`\n${pass} passed, ${fail} failed`);

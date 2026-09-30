@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { ReviewInfo } from '../domain/types.js';
 import { worldWorkingRelativePath, type World } from '../world/types.js';
+import { readWorldFilePrefix } from '../world/file-prefix.js';
 import type { Store } from './db.js';
 import type { ObjectStore } from './objects.js';
 import { ARTIFACT_MIME } from './artifact-mime.js';
@@ -57,7 +58,9 @@ export async function preserveReviewArtifacts(store: Store, objects: ObjectStore
       if (!stat.isFile()) throw new Error('review artifact must be a file');
       if (stat.size > MAX_REVIEW_ARTIFACT_BYTES) throw new Error('artifact exceeds 100 MiB');
     }
-    const data = await world.readFileBuffer(relative);
+    // A remote world has no host path to stat: one byte past the cap tells a
+    // larger artifact apart without loading it whole.
+    const data = await readWorldFilePrefix(world, relative, MAX_REVIEW_ARTIFACT_BYTES + 1);
     if (data.length > MAX_REVIEW_ARTIFACT_BYTES) throw new Error('artifact exceeds 100 MiB');
     const sha256 = hash(data);
     const id = `review-${hash(`${taskId}\0${target}\0${sha256}`)}`;

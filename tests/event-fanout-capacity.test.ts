@@ -13,7 +13,7 @@ it('routes a burst once per database page, irrespective of browser count, and yi
   const task = (await store.createTask({ projectId: project.id, title: 'Long conversation', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: "fixture" } }));
   const bus = new KarmaxBus();
   const fanout = (await DurableEventFanout.create(store, bus, 60_000)); cleanups.push(() => fanout.close());
-  const projects = vi.spyOn(store, 'taskProjectIds');
+  const projects = vi.spyOn(store, 'taskEventRoutes');
   const hydrate = vi.spyOn(store, 'getTask').mockImplementation(() => { throw Error('must not hydrate conversations'); });
   const received: number[][] = Array.from({ length: 20 }, () => []);
   for (const rows of received) fanout.on((event, projectId) => {

@@ -1,10 +1,138 @@
 import { describe, expect, it, vi } from 'vitest';
+import { Context } from '@temporalio/activity';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
 describe('agent turn admission', () => {
+  it.each(['requests', 'active'])('retries organization %s backpressure without parking a login', async (kind) => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Backpressure');
+    const task = await store.createTask({ projectId: project.id, title: 'Blocked', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    await store.setOrganizationUsagePolicy(project.organizationId!, {
+      maxAgentStartsPerMinute: kind === 'requests' ? 1 : 10, maxActiveAgentTurns: 1,
+    });
+    await store.admitAgentUsage({ id: 'occupied', organizationId: project.organizationId!, projectId: project.id,
+      taskId: task.id, provider: 'anthropic', fundingSource: 'customer' });
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    const core = makeCoreActivities({ store, worlds, adapters: new Map() as any,
+      profiles: new ProfileResolver(store, 'claude') });
+    try {
+      await expect(core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: 'blocked',
+        agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
+        messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
+        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {},
+          workflow: 'just-do', agents: { do: { provider: 'claude', model: 'test' } } },
+      } as any)).rejects.toMatchObject({ type: 'agent-infra', nonRetryable: false });
+    } finally { await world.destroy(); await store.close(); }
+  });
+
+  it.each(['failure', 'cancel', 'cancel-metered', 'timeout', 'post-turn', 'billing'])('retains managed cost and retries safely after %s', async mode => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'fake-managed-key');
+    vi.stubEnv('KARMAX_MANAGED_MODEL_REQUEST_CEILINGS', JSON.stringify({ 'anthropic/test-model': 100_000 }));
+    vi.stubEnv('KARMAX_MANAGED_MODEL_PRICING', mode === 'cancel-metered' ? JSON.stringify({ 'anthropic/test-model': { inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 1_000_000 } }) : '');
+    const store = await Store.create(':memory:', { hosted: true });
+    const org = await store.createOrganization({ name: 'Failure billing', ownerUserId: 'owner' });
+    const project = await store.createProject('Failure billing', {}, org.id);
+    const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    await store.setOrganizationUsagePolicy(org.id, { managedSpendCapMicros: 1_000_000, managedModelProviders: ['anthropic'] });
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    let attempt = 1;
+    let abort = new AbortController();
+    vi.spyOn(Context, 'current').mockImplementation(() => ({
+      info: { attempt, activityId: 'turn', workflowExecution: { runId: 'run' } },
+      cancellationSignal: abort.signal, heartbeat: () => {},
+    }) as any);
+    let costAtProviderStart = 0;
+    const runTurn = vi.fn(async () => {
+      costAtProviderStart = (await store.usageSummary(org.id)).estimatedCostMicros;
+      if (mode === 'failure') throw new Error('provider disconnected');
+      if (mode.startsWith('cancel') || mode === 'timeout') abort.abort(new Error(mode));
+      return { termination: { kind: 'success', status: 'end_turn' }, output: 'durable output',
+        ...(mode === 'cancel-metered' ? { usage: { inputTokens: 75, outputTokens: 25 } } : {}) };
+    });
+    const core = makeCoreActivities({ store, worlds,
+      adapters: new Map([['claude', { provider: 'claude', runTurn }]]) as any,
+      profiles: new ProfileResolver(store, 'claude') });
+    const append = store.appendEvent.bind(store);
+    vi.spyOn(store, 'appendEvent').mockImplementation(async event => {
+      if (mode === 'post-turn' && event.type === 'turn.result' && attempt === 1) throw new Error('result publication failed');
+      return append(event);
+    });
+    const finish = store.finishUsageAdmission.bind(store);
+    vi.spyOn(store, 'finishUsageAdmission').mockImplementation(async (...params) => {
+      if (mode === 'billing' && params[1] !== undefined && attempt === 1) throw new Error('billing write failed');
+      return finish(...params);
+    });
+    const args = { taskId: task.id, role: ['post-turn', 'billing'].includes(mode) ? 'confirm' : 'do', agentTurnId: `${task.id}#0`,
+      agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle, messages: [],
+      task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
+        agents: { do: { provider: 'claude', model: 'test-model' }, confirm: { provider: 'claude', model: 'test-model' } } } } as any;
+    try {
+      if (mode === 'post-turn' || mode === 'billing') await expect(core.runAgentTurn(args)).rejects.toMatchObject({ type: 'agent-infra', nonRetryable: false });
+      else await expect(core.runAgentTurn(args)).rejects.toThrow();
+      expect(costAtProviderStart).toBe(100_000);
+      expect(await store.usageSummary(org.id)).toMatchObject({
+        costMicros: mode === 'cancel-metered' ? 100 : 100_000,
+        incurredCostMicros: mode === 'cancel-metered' ? 100 : 0, activeReservationsMicros: 0 });
+      attempt = 2;
+      abort = new AbortController();
+      if (mode === 'post-turn' || mode === 'billing') {
+        await expect(core.runAgentTurn(args)).resolves.toMatchObject({ output: 'durable output' });
+        expect(runTurn).toHaveBeenCalledTimes(1);
+        expect(JSON.parse((await store.kvGet(`confirm-transcript:${task.id}`))!)).toHaveLength(1);
+        expect(await store.usageSummary(org.id)).toMatchObject({ estimatedCostMicros: 100_000 });
+      } else {
+        await expect(core.runAgentTurn(args)).rejects.toThrow();
+        expect(await store.usageSummary(org.id)).toMatchObject({ costMicros: mode === 'cancel-metered' ? 200 : 200_000, activeReservationsMicros: 0 });
+      }
+    } finally {
+      vi.restoreAllMocks(); vi.unstubAllEnvs();
+      await world.destroy(); await store.close();
+    }
+  }, 2_000);
+
+  it('replaces a lost attempt without releasing its cost or rerunning a completed admission', async () => {
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Lost attempt');
+    const task = await store.createTask({ projectId: project.id, title: 'Retry', workflow: 'just-do', workflowVersion: '1.0.0', params: {} as any });
+    await store.setOrganizationUsagePolicy(project.organizationId!, { maxActiveAgentTurns: 1 });
+    const admission = { id: 'turn', organizationId: project.organizationId!, projectId: project.id,
+      taskId: task.id, provider: 'anthropic', fundingSource: 'customer' as const };
+    try {
+      await store.admitAgentUsage(admission);
+      await store.finishUsageAdmission('turn', undefined, Date.now(), [{ id: 'usage:cost:turn',
+        organizationId: project.organizationId!, projectId: project.id, taskId: task.id, provider: 'anthropic',
+        kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: 100, costClassification: 'estimated',
+        startedAt: Date.now(), endedAt: Date.now() }]);
+      await expect(store.admitAgentUsage({ ...admission, id: 'turn:attempt:3', retryOf: ['turn', 'turn:attempt:2'] } as any)).resolves.toEqual({ reused: false });
+      expect(await store.usageSummary(project.organizationId!)).toMatchObject({ estimatedCostMicros: 100 });
+      expect(await store.activeAgentUsageAdmissions(project.organizationId!)).toEqual([{ id: 'turn:attempt:3', taskId: task.id }]);
+      await store.finishUsageAdmission('turn:attempt:3', true);
+      await expect(store.admitAgentUsage({ ...admission, id: 'turn:attempt:4', retryOf: ['turn', 'turn:attempt:2', 'turn:attempt:3'] } as any))
+        .rejects.toThrow('already completed');
+    } finally { await store.close(); }
+  });
+
+  it('classifies failures while preparing a turn before provider admission', async () => {
+    const store = await Store.create(':memory:');
+    const worlds = new WorldRegistry();
+    const profiles = new ProfileResolver(store, 'mock');
+    vi.spyOn(profiles, 'resolve').mockRejectedValue(new Error('invalid turn profile'));
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(), profiles });
+    try {
+      await expect(core.runAgentTurn({ taskId: 'task', role: 'do', messages: [],
+        worldHandle: { kind: 'memory', id: 'task' },
+        task: { projectId: 'project', title: 'Work', prompt: 'work', project: {} } } as any))
+        .rejects.toMatchObject({ type: 'agent-error', nonRetryable: true });
+    } finally { vi.restoreAllMocks(); await store.close(); }
+  });
+
   it('does not release another admission when a colliding turn is rejected', async () => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Collision'));
@@ -55,6 +183,9 @@ describe('agent turn admission', () => {
     } }]]) as any;
     const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'claude') });
     try {
+      expect(await core.resolveCredentialOrder({ taskId: task.id, projectId: project.id, provider: 'claude', role: 'do',
+        task: { taskId: task.id, projectId: project.id, agents: { do: { provider: 'claude', model: 'test-model' } } } as any,
+      })).toEqual([]);
       await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`,
         agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
         messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],

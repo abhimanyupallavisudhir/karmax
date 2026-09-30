@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   acpHomeEnv,
+  apiKeyEnv,
   canonicalModelProvider,
   credentialAliases,
   credentialMatchesProfile,
@@ -15,6 +16,13 @@ import {
 } from '../src/agent/provider-registry.js';
 
 describe('agent/model provider separation', () => {
+  it('never maps arbitrary model prefixes to host infrastructure keys', () => {
+    expect(apiKeyEnv('e2b')).toBe('');
+    expect(apiKeyEnv('daytona')).toBe('');
+    expect(apiKeyEnv('stripe')).toBe('');
+    expect(apiKeyEnv('openai')).toBe('OPENAI_API_KEY');
+    expect(apiKeyEnv('opencode')).toBe('');
+  });
   it('admits OpenCode but keeps native Kimi and Grok harnesses disabled', () => {
     expect(isAgentProvider('opencode')).toBe(true);
     expect(isLoginProvider('opencode')).toBe(true);

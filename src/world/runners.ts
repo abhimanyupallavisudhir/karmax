@@ -150,6 +150,11 @@ export class WorldLifecycleManager {
   /** Last provider probe per world generation, so reconciliation does not hit
    * the provider control plane on every sweep tick. */
   private probedAt = new Map<string, number>();
+  /** Failed hibernation attempts of one parked snapshot (generation and
+   * updatedAt). Each attempt reopens, and so resumes and bills, the provider
+   * sandbox, so a persistent failure must not repeat on every sweep (WD-2).
+   * Touching the world starts a fresh idle period and so a fresh schedule. */
+  private hibernateFailures = new Map<string, { generation: number; updatedAt: number; attempts: number; retryAt: number }>();
   constructor(private store: Store, private worlds: WorldRegistry, private checkpoints: WorldCheckpointService,
     private intervalMs = 60_000, private objects?: ObjectStore, private runners?: RunnerPoolService,
     private access?: import('./access.js').WorldAccessService) {}
@@ -174,6 +179,7 @@ export class WorldLifecycleManager {
 
   private async sweepOnce(now: number): Promise<number> {
     (await this.runners?.reconcileWorldLeases(now));
+    await this.checkpoints.collectGarbage?.();
     await this.reconcileProviderUsage(now);
     for (const artifact of (await this.store.expiredPromotedArtifacts(now))) {
       (await this.store.deletePromotedArtifact(artifact.id));
@@ -217,9 +223,56 @@ export class WorldLifecycleManager {
         });
       }
     }
+    for (const candidate of await this.store.listWorldInstances('degraded')) {
+      if (!candidate.handle.meta?.teardownPending) continue;
+      await this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
+        const eligible = async () => {
+          const current = await this.store.worldStateSnapshot(candidate.handle.id);
+          const task = await this.store.taskMetadata(candidate.handle.id);
+          return current?.state === 'degraded' && current.generation === (candidate.handle.generation ?? 1)
+            && (!task || ['done', 'failed', 'cancelled'].includes(task.lastView?.status ?? 'active'))
+            && !(await this.worlds.hasActiveAccess(candidate.handle.id))
+            && await this.store.activeWorldLeaseCount(candidate.handle.id) === 0;
+        };
+        if (!(await eligible())) return;
+        try {
+          const provider = this.worlds.get(candidate.handle.kind);
+          if (provider.destroy) await provider.destroy(candidate.handle as any);
+          else {
+            const world = await this.worlds.open(candidate.handle as any);
+            if (!(await eligible())) return;
+            await world.destroy();
+          }
+        } catch {
+          if (await this.worlds.probe(candidate.handle as any).catch(() => undefined) !== 'missing') return;
+        }
+        if (!(await eligible())) return;
+        await this.store.setWorldState(candidate.handle, 'released');
+        await this.recordLifecycle(candidate.handle, 'world.destroyed', { retried: true });
+      }));
+    }
+    for (const [key, probedAt] of this.probedAt)
+      if (probedAt < now - Math.max(2 * reconcileAfter, 60_000)) this.probedAt.delete(key);
     await this.reapOrphanSandboxes();
     let hibernated = 0;
-    for (const candidate of (await this.store.listWorldInstances('parked'))) {
+    const parked = await this.store.listWorldInstances('parked');
+    const parkedIds = new Set(parked.map(candidate => candidate.handle.id));
+    for (const id of this.hibernateFailures.keys()) if (!parkedIds.has(id)) this.hibernateFailures.delete(id);
+    for (const candidate of parked) {
+      const failed = this.hibernateFailures.get(candidate.handle.id);
+      const sameSnapshot = failed?.generation === (candidate.handle.generation ?? 1)
+        && failed.updatedAt === Number(candidate.updatedAt);
+      if (failed && sameSnapshot && now < failed.retryAt) continue;
+      const attempts = sameSnapshot ? failed!.attempts + 1 : 1;
+      const hibernateFailed = (error: unknown) => {
+        const retryAt = now + Math.min(HIBERNATE_RETRY_MS * 2 ** (attempts - 1), HIBERNATE_RETRY_MAX_MS);
+        this.hibernateFailures.set(candidate.handle.id, { generation: candidate.handle.generation ?? 1,
+          updatedAt: Number(candidate.updatedAt), attempts, retryAt });
+        return this.recordLifecycle(candidate.handle, 'world.hibernate_failed', {
+          error: error instanceof Error ? error.message : String(error), attempts, retryAt,
+        });
+      };
+      try {
       const projectId = String(candidate.handle.meta?.projectId ?? '');
       const project = (await this.store.getProject(projectId));
       const after = project ? (await this.store.effectiveProjectConfig(project)).hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
@@ -227,7 +280,7 @@ export class WorldLifecycleManager {
       // Selection is only a hint: a gateway or activity can resume this world
       // while the sweep awaits another provider. Own the complete destructive
       // transition, and recheck after every potentially slow preparation step.
-      await this.worlds.withOperation(candidate.handle.id, async () => {
+      await this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
         const eligible = async (checkSelection = false) => {
           const current = await this.store.worldStateSnapshot(candidate.handle.id);
           return !!current && current.generation === (candidate.handle.generation ?? 1)
@@ -243,19 +296,19 @@ export class WorldLifecycleManager {
           checkpoint = await this.checkpoints.checkpoint(candidate.handle);
         if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1) || !(await eligible())) return;
         try {
-          const world = await this.worlds.open(candidate.handle as any);
-          // Recovery may replace a missing sandbox during open. Never destroy
-          // that new generation on the authority of the old parked candidate.
-          if (!(await eligible())) return;
-          await world.destroy();
+          const provider = this.worlds.get(candidate.handle.kind);
+          if (provider.destroy) await provider.destroy(candidate.handle as any);
+          else {
+            const world = await this.worlds.open(candidate.handle as any);
+            if (!(await eligible())) return;
+            await world.destroy();
+          }
         } catch (error) {
           // A timeout/5xx is not proof of eviction. Preserve the recoverable
           // state and let the next sweep retry unless the provider proves loss.
           const state = await this.worlds.probe(candidate.handle as any).catch(() => undefined);
           if (state !== 'missing' || !(await eligible())) {
-            await this.recordLifecycle(candidate.handle, 'world.hibernate_failed', {
-              error: error instanceof Error ? error.message : String(error),
-            });
+            await hibernateFailed(error);
             return;
           }
           await this.store.setWorldState(candidate.handle, 'hibernated');
@@ -266,7 +319,10 @@ export class WorldLifecycleManager {
         await this.store.setWorldState(candidate.handle, 'hibernated');
         await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id });
         hibernated++;
-      });
+      }));
+      } catch (error) {
+        await hibernateFailed(error);
+      }
     }
     return hibernated;
   }
@@ -283,7 +339,14 @@ export class WorldLifecycleManager {
         let previous: Record<string, unknown> = {};
         try { previous = JSON.parse((await this.store.kvGet(syncKey)) ?? '{}'); } catch {}
         try {
-          const events = await provider.listUsageEvents!(organization.id);
+          const lastFullScanAt = Number(previous.lastFullScanAt ?? 0);
+          // A read that stopped at the provider's per-sweep bound continues
+          // where it stopped, so a huge feed still makes progress every sweep.
+          const pending = previous.scan as { since?: number; resumeAt: number; startedAt: number } | undefined;
+          const fullScan = pending ? pending.since === undefined : !lastFullScanAt || now - lastFullScanAt >= 24 * 60 * 60_000;
+          const cursor = Number(previous.lastSuccessfulAt);
+          const since = pending ? pending.since : !fullScan && Number.isFinite(cursor) ? cursor - 60 * 60_000 : undefined;
+          const { events, resumeAt } = await provider.listUsageEvents!(organization.id, since, pending?.resumeAt);
           // Providers return a rolling history. Check immutable execution IDs
           // in batches before doing attribution or writes, including after a
           // restart. A timestamp cursor would lose late-arriving executions.
@@ -316,12 +379,20 @@ export class WorldLifecycleManager {
             // must let HTTP requests and activity heartbeats make progress.
             await yieldToEventLoop();
           }
+          // The events read are recorded; the cursor moves only once the scan
+          // completes, to when it began (anything newer is read next time).
+          const startedAt = pending?.startedAt ?? now;
+          if (resumeAt !== undefined) {
+            (await this.store.kvSet(syncKey, JSON.stringify({ ...previous, status: 'catching-up', at: now, error: undefined,
+              scan: { ...(since !== undefined ? { since } : {}), resumeAt, startedAt } })));
+            continue;
+          }
           const retentionMs = 7 * 24 * 60 * 60_000;
           const lastSuccessfulAt = Number(previous.lastSuccessfulAt ?? previous.at);
           const coverageFrom = Number(previous.coverageFrom);
-          (await this.store.kvSet(syncKey, JSON.stringify({ status: 'ready', at: now, lastSuccessfulAt: now,
-            coverageFrom: Number.isFinite(coverageFrom) ? coverageFrom : now - retentionMs,
-            retentionDays: 7,
+          (await this.store.kvSet(syncKey, JSON.stringify({ status: 'ready', at: now, lastSuccessfulAt: startedAt,
+            coverageFrom: Number.isFinite(coverageFrom) ? coverageFrom : startedAt - retentionMs,
+            retentionDays: 7, lastFullScanAt: fullScan ? startedAt : lastFullScanAt,
             ...(previous.gap === true || (Number.isFinite(lastSuccessfulAt) && now - lastSuccessfulAt > retentionMs)
               ? { gap: true } : {}) })));
         } catch (error) {
@@ -374,7 +445,7 @@ export class WorldLifecycleManager {
           await this.worlds.withOperation(taskId, async () => {
             const task = (await this.store.taskMetadata(taskId));
             const current = task ? (await this.store.currentWorld(taskId)) : undefined;
-            const duplicate = Boolean(task && current && sandbox.matches && !sandbox.matches(current));
+            const duplicate = Boolean(task && current && sandbox.matches && sandbox.matches(current) === false);
             if (task && !duplicate) return;
             try {
               await sandbox.destroy();
@@ -397,6 +468,10 @@ export class WorldLifecycleManager {
     } }));
   }
 }
+
+/** First retry delay after a failed hibernation; doubles per failure up to the cap. */
+const HIBERNATE_RETRY_MS = 5 * 60_000;
+const HIBERNATE_RETRY_MAX_MS = 6 * 60 * 60_000;
 
 /** How long a ready world may go untouched before its provider is probed.
  * `0` disables reconciliation entirely. */

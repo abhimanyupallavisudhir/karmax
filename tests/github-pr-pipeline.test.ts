@@ -25,6 +25,7 @@ const prs: any[] = [];
 const comments: { number: number; body: string }[] = [];
 let afterPrOpened: (() => Promise<void>) | undefined;
 let githubReadiness: Record<string, unknown> = {};
+let readinessReads = 0;
 const githubReadinessBySlug = new Map<string, Record<string, unknown>>();
 let mergeHttpStatus: number | undefined;
 let useMergeQueue = false;
@@ -143,6 +144,7 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     return json(201, pr);
   }
   if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('PullRequestReadiness')) {
+    readinessReads++;
     const querySlug = `${body.variables?.owner}/${body.variables?.name}`;
     const pr = prs.find((candidate) => candidate.repo === querySlug
       && candidate.number === Number(body.variables?.number)) ?? prs[0];
@@ -216,6 +218,12 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     return json(200, pr);
   }
   const comment = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments$/);
+  if (comment && method === 'GET') {
+    const page = Number(u.searchParams.get('page') ?? 1);
+    const perPage = Number(u.searchParams.get('per_page') ?? 30);
+    return json(200, comments.filter(entry => entry.number === Number(comment[2]))
+      .slice((page - 1) * perPage, page * perPage));
+  }
   if (comment && method === 'POST') {
     comments.push({ number: Number(comment[2]), body: body.body });
     return json(201, {});
@@ -1419,6 +1427,73 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(final.state.mergeDomains).toBeUndefined();
   }, 120_000);
 
+  /** A reviewed two-repository proposal whose first PR was merged outside
+   *  karmax (a parent integrating the head), the second still open. */
+  async function reviewWithOneExternallyMergedPr(name: string) {
+    const slugA = `acme/${name}-a`;
+    const slugB = `acme/${name}-b`;
+    const repoA = await repoWithOrigin(`${name}-a`, slugA);
+    const repoB = await repoWithOrigin(`${name}-b`, slugB);
+    const project = (await h.store.createProject(`External merge ${name}`, { repos: [repoA, repoB], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: `${name}-installation`, accountLogin: 'acme', accountType: 'Organization' }));
+    for (const [slug, repoName] of [[slugA, `${name}-a`], [slugB, `${name}-b`]] as const) {
+      const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+        providerId: slug, owner: 'acme', name: repoName, sshUrl: `git@github.com:${slug}.git`, defaultBranch: 'main',
+        private: true, gitConnectionId: connection.id }));
+      (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    }
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Externally merged', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x', _githubAccountId: 'a-github' }, createdBy: { kind: 'user', userId: 'a' } }));
+    const nameA = path.basename(repoA);
+    const nameB = path.basename(repoB);
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: `@write ${nameA}/a.md :: A\n@write ${nameB}/b.md :: B\n`
+          + `@run git -C ${nameA} add -A && git -C ${nameA} commit -q -m A\n`
+          + `@run git -C ${nameB} add -A && git -C ${nameB} commit -q -m B\n@openpr`,
+        base: 'main', target: 'main', githubPollMs: 10,
+        project: { repos: [repoA, repoB], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+    await expect.poll(async () => `${(await view(handle)).stage}/${prs.length}`, { timeout: 30_000 }).toBe('review/2');
+    const merged = prs.find((candidate) => candidate.repo === slugA)!;
+    await landProviderTarget(merged, 'main');
+    merged.state = 'closed';
+    merged.merged_at = new Date().toISOString();
+    return { task, project, handle, merged, open: prs.find((candidate) => candidate.repo === slugB)!, slugB };
+  }
+
+  // Item 9 of the 2026-09-26 review follow-up: a PR integrated outside karmax
+  // before Review is confirmed must settle as merged, and its open sibling
+  // must land normally rather than be closed.
+  it('v1.26 settles an externally merged PR and lands its open sibling on confirm', async () => {
+    const { handle, merged, open, slugB } = await reviewWithOneExternallyMergedPr('confirm-after-merge');
+    await handle.signal('confirm');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'done' });
+    expect(open).toMatchObject({ state: 'closed' });
+    expect(open.merged_at).toBeTruthy();
+    expect(merged.merged_at).toBeTruthy();
+    expect((await git(remoteBySlug.get(slugB)!, ['show', 'main:b.md'])).stdout).toContain('B');
+    const final = await view(handle);
+    expect(final.prs.map((candidate: any) => candidate.merged)).toEqual([true, true]);
+    expect(comments.some((comment) => /was cancelled/.test(comment.body ?? ''))).toBe(false);
+  }, 120_000);
+
+  // Task #395: marking a Review done stopped its workflow through cancellation,
+  // whose cleanup closed the still-open PR and dropped that work.
+  it('marking a Review done keeps its still-open pull requests open', async () => {
+    const { task, project, handle, open } = await reviewWithOneExternallyMergedPr('manual-done');
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    expect(await h.api.moveTaskStage(token, task.id, 'done')).toMatchObject({ stage: 'done', status: 'done' });
+    await handle.result().catch(() => undefined);
+    expect(open.state).toBe('open');
+    expect(comments.some((comment) => /was cancelled/.test(comment.body ?? ''))).toBe(false);
+    expect((await h.store.getTask(task.id))?.lastView).toMatchObject({ stage: 'done', status: 'done' });
+  }, 120_000);
+
   it('v1.21 withdraws queued provider siblings before returning a failed participant to Do', async () => {
     const slugA = 'acme/withdraw-a';
     const slugB = 'acme/withdraw-b';
@@ -1499,32 +1574,33 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     githubReadiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' };
     await handle.signal('confirm');
     const publications = async () => (await h.store.eventsSince(task.id, 0)).filter((e) => e.type === 'view.updated').length;
-    // Drive full polling cycles explicitly. A 1ms timer can start another
-    // non-heartbeating activity during shutdown; losing its completion then
-    // leaves replay waiting for the five-minute activity timeout. This test
-    // measures history size and replay, so restart at a durable timer boundary.
-    const waitForPoll = async (previous: number) => {
+    // Let the read-only watcher settle before stopping its worker. Each wake
+    // must complete a real GitHub read without republishing the conversation.
+    const watcherId = `${task.id}/landing-watch/0`;
+    const waitForPoll = async () => {
       await expect.poll(async () => {
         const description = await h.client.workflowService.describeWorkflowExecution({
-          namespace: h.client.options.namespace, execution: { workflowId: task.id },
-        });
+          namespace: h.client.options.namespace, execution: { workflowId: watcherId },
+        }).catch(() => undefined);
         const current = (await h.store.getTask(task.id))?.lastView;
-        return (await publications()) > previous && current?.stage === 'merge'
-          && current.waitingFor?.kind === 'github'
+        return !!description && current?.stage === 'merge' && current.waitingFor?.kind === 'github'
           && !description.pendingActivities?.length && !description.pendingWorkflowTask;
       }, { timeout: 30_000 }).toBe(true);
     };
-    const advancePublications = async (minimum: number) => {
-      while ((await publications()) <= minimum) {
-        const previous = (await publications());
+    const advancePolls = async (count: number) => {
+      for (let i = 0; i < count; i++) {
+        const previous = readinessReads;
         await handle.signal('providerChanged');
-        await waitForPoll(previous);
+        await expect.poll(() => readinessReads, { timeout: 10_000 }).toBeGreaterThan(previous);
+        await waitForPoll();
       }
     };
-    await waitForPoll(0);
-    await advancePublications(30);
+    await waitForPoll();
+    const initialPublications = await publications();
+    await advancePolls(5);
     await h.restartWorker();
-    await advancePublications(100);
+    await advancePolls(5);
+    expect(await publications()).toBe(initialPublications);
     const live = await view(handle);
     expect(live.stage).toBe('merge');
     expect(live.messages.map((m: any) => m.text).join('\n')).toContain(log);
@@ -1549,10 +1625,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       ? [e.activityTaskScheduledEventAttributes] : []);
     const decode = (payload: any) => JSON.parse(Buffer.from(payload.data).toString());
     const bodies = scheduled.map((e) => decode(e.input!.payloads![1]));
-    expect(bodies.filter((v) => v.messages === undefined).length).toBeGreaterThan(90);
+    expect(bodies.filter((v) => v.messages === undefined).length).toBeGreaterThan(0);
     expect(JSON.stringify(events).length).toBeLessThan(10_000_000);
-    // The previous protocol crossed Temporal's 50MB limit with this workload.
-    expect(Buffer.byteLength(JSON.stringify(live)) * scheduled.length).toBeGreaterThan(50 * 1024 * 1024);
+    // Idle GitHub observations add no publication commands at all.
+    expect(scheduled.length).toBeLessThan(35);
     expect((await h.store.getTask(task.id))?.lastView?.messages).toEqual(live.messages);
   }, 240_000);
 

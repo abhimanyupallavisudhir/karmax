@@ -36,6 +36,38 @@ const complete = (enabled = true) => ({
 });
 
 describe('installation paid-launch settings', () => {
+  it('preserves omitted launch, contact and price settings in partial updates', async () => {
+    const { store, service } = await harness();
+    try {
+      await service.configure(complete(), 'https://krmax.test');
+      await service.configure({ contacts: { billing: 'new@krmax.test' }, stripe: { teamSeatPriceId: 'price_new' } }, 'https://krmax.test');
+      expect(await service.stored()).toMatchObject({ paidLaunch: true, founderReviewedPolicyVersion: POLICY_VERSION,
+        operatorName: 'Krmax Labs Ltd', contacts: { billing: 'new@krmax.test', legal: 'legal@krmax.test' },
+        stripe: { individualPriceId: 'price_individual', teamSeatPriceId: 'price_new' } });
+      await service.configure({ paidLaunch: false, founderReviewed: false, operatorName: '' }, 'https://krmax.test');
+      expect(await service.stored()).toMatchObject({ paidLaunch: false });
+      expect((await service.stored()).operatorName).toBeUndefined();
+      expect((await service.stored()).founderReviewedPolicyVersion).toBeUndefined();
+    } finally { await store.close(); }
+  });
+
+  it.each(['contact', 'price'])('does not rotate billing secrets when a %s field is invalid', async invalid => {
+    const { store, service } = await harness();
+    try {
+      await service.configure({ ...complete(false), paddle: { environment: 'live', apiKey: 'pdl_live_apikey_original', webhookSecret: 'pdl_ntfset_original' } }, 'https://tavya.test');
+      const before = await service.stored();
+      const input = { ...complete(false),
+        paddle: { environment: 'live', apiKey: 'pdl_live_apikey_replacement', webhookSecret: 'pdl_ntfset_replacement' },
+        stripe: { ...complete(false).stripe, secretKey: 'sk_live_replacement', webhookSecret: 'whsec_replacement',
+          ...(invalid === 'price' ? { individualPriceId: 'invalid' } : {}) },
+        ...(invalid === 'contact' ? { contacts: { legal: 'invalid' } } : {}),
+      };
+      await expect(service.configure(input, 'https://tavya.test')).rejects.toThrow(/valid contact email|price IDs/);
+      expect(await service.subscriptionConfig()).toMatchObject({ secretKey: 'sk_live_billing', webhookSecret: 'whsec_billing' });
+      expect(await service.paddleConfig()).toMatchObject({ apiKey: 'pdl_live_apikey_original', webhookSecret: 'pdl_ntfset_original' });
+      expect(await service.stored()).toEqual(before);
+    } finally { await store.close(); }
+  });
   it('never carries bootstrap secrets or prices into a different Paddle environment', async () => {
     const { store, broker } = await harness();
     const service = new PaidLaunchSettingsService(store, broker, {

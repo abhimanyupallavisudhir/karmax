@@ -67,6 +67,18 @@ export interface EmailMessage {
 const EMAIL_RE = /^[^@\s]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
 
 /** Pull the bare address out of a "Name <addr@host>" or plain "addr@host" From. */
+/** Without requireTLS a network attacker can strip STARTTLS from a submission
+ * port and read the password in plaintext (AU-30). Only a relay on this
+ * machine, which never crosses a network, may speak plain SMTP. */
+export function smtpTransportOptions(c: OutboundEmailConfig, password: string) {
+  const port = c.port ?? 587;
+  const secure = c.secure ?? (port === 465);
+  const host = String(c.host ?? '').replace(/^\[|\]$/g, '').toLowerCase();
+  const local = host === 'localhost' || host.endsWith('.localhost') || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
+  return { host: c.host, port, secure, requireTLS: !secure && !local,
+    auth: { user: c.user ?? fromAddress(c.from), pass: password } };
+}
+
 export function fromAddress(from: string | undefined): string | undefined {
   if (!from) return undefined;
   const angle = from.match(/<([^>]+)>/);
@@ -190,10 +202,7 @@ export class EmailService {
   private async sendSmtp(c: OutboundEmailConfig, password: string, msg: EmailMessage): Promise<void> {
     // Imported lazily so installs that never send email don't load nodemailer.
     const nodemailer = (await import('nodemailer')).default;
-    const transport = nodemailer.createTransport({
-      host: c.host, port: c.port ?? 587, secure: c.secure ?? (c.port === 465),
-      auth: { user: c.user ?? fromAddress(c.from), pass: password },
-    });
+    const transport = nodemailer.createTransport(smtpTransportOptions(c, password));
     await transport.sendMail({ from: c.from, to: msg.to, subject: msg.subject, text: msg.text, ...(msg.html ? { html: msg.html } : {}) });
   }
 }

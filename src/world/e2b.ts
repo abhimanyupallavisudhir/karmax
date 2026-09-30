@@ -1,3 +1,6 @@
+import { TextDecoder } from 'node:util';
+import type { WorldReferenceKeys } from './reference-keys.js';
+import { isMissingSandbox } from './provider-errors.js';
 import { timed } from '../timing/index.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -11,6 +14,7 @@ import type {
   WorldHttpRequest,
   WorldLifecycleState,
   ProviderUsageEvent,
+  ProviderUsagePage,
   WorldProcess,
   WorldProcessSpec,
   WorldProvider,
@@ -42,6 +46,8 @@ export const DEFAULT_E2B_TEMPLATE = 'uj125w982t7wflqad4ig';
 const DEFAULT_REQUEST_TIMEOUT_MS = 2 * 60_000;
 // Long enough to see the memory spike that froze a sandbox before a retry.
 const DIAGNOSIS_WINDOW_MS = 30 * 60_000;
+/** Lifecycle-event pages one usage sweep reads; a longer feed resumes next sweep. */
+const LIFECYCLE_PAGES_PER_READ = 100;
 // Resuming a paused sandbox takes seconds; a frozen one never answers.
 const REATTACH_REQUEST_MS = 60_000;
 // A stream reattached right after E2B resumes may drop once more (live-tested);
@@ -104,7 +110,7 @@ export interface E2BFactory {
    * handle — and, again, without resuming it first. */
   kill?(id: string, options: { apiKey?: string }): Promise<unknown>;
   /** Completed lifecycle executions from E2B's seven-day event feed. */
-  events?(options: { apiKey?: string }): Promise<unknown[]>;
+  events?(options: { apiKey?: string; since?: number; offset?: number }): Promise<{ events: unknown[]; resumeAt?: number }>;
 }
 
 /** E2B cloud worlds: one isolated sandbox per task attempt, automatically paused
@@ -116,6 +122,7 @@ export class E2BWorldProvider implements WorldProvider {
   private sandboxes = new Map<string, E2BSandboxLike>();
   private states = new Map<string, WorldLifecycleState>();
   private refKey: Buffer;
+  private destroyed = new WeakSet<WorldHandle>();
 
   constructor(
     private factory: E2BFactory = defaultE2BFactory(),
@@ -123,10 +130,12 @@ export class E2BWorldProvider implements WorldProvider {
     private template = process.env.KARMAX_E2B_TEMPLATE?.trim() || DEFAULT_E2B_TEMPLATE,
     private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>,
     private desktopTemplate = process.env.KARMAX_E2B_DESKTOP_TEMPLATE ?? 'desktop',
+    private referenceKeys?: WorldReferenceKeys,
   ) {
-    // Hosted deployments must set KARMAX_WORLD_REF_KEY. E2B_API_KEY is a stable
-    // compatibility seed for self-hosted installs; the development constant is
-    // intentionally usable only when neither cloud credential exists.
+    // Legacy KWR1 key. With WorldReferenceKeys (every real boot) new references
+    // are sealed with the vault's world-reference:key:v2, so this only reopens
+    // references sealed before it: under KARMAX_WORLD_REF_KEY, else E2B_API_KEY
+    // on self-hosted installs, else the development constant.
     this.refKey = crypto.createHash('sha256').update(
       process.env.KARMAX_WORLD_REF_KEY ?? process.env.E2B_API_KEY ?? 'karmax-development-world-ref',
     ).digest();
@@ -230,11 +239,15 @@ export class E2BWorldProvider implements WorldProvider {
           ...(selectedTemplate ? { environmentArtifact: selectedTemplate } : {}) },
         ...(warnings.length ? { warnings } : {}),
       };
-      return new E2BWorld(handle, sandbox, this.idleMs);
+      return new E2BWorld(handle, sandbox, this.idleMs, () => {
+        this.sandboxes.delete(sandbox.sandboxId);
+        this.states.delete(sandbox.sandboxId);
+        this.destroyed.add(handle);
+      });
     } catch (error) {
       await sandbox.kill().catch(() => undefined);
       this.sandboxes.delete(sandbox.sandboxId);
-      this.states.set(sandbox.sandboxId, 'missing');
+      this.states.delete(sandbox.sandboxId);
       throw error;
     }
   }
@@ -252,7 +265,21 @@ export class E2BWorldProvider implements WorldProvider {
       this.sandboxes.set(sandboxId, sandbox);
     }
     this.states.set(sandboxId, 'ready');
-    return new E2BWorld(handle, sandbox, this.idleMs);
+    return new E2BWorld(handle, sandbox, this.idleMs, () => {
+        this.sandboxes.delete(sandbox.sandboxId);
+        this.states.delete(sandbox.sandboxId);
+        this.destroyed.add(handle);
+      });
+  }
+
+  async destroy(handle: WorldHandle): Promise<void> {
+    const reference = this.refOf(handle);
+    const connection = await this.connection(reference.organizationId);
+    if (!this.factory.kill) { await (await this.open(handle)).destroy(); return; }
+    await this.factory.kill(reference.sandboxId, connection?.apiKey ? { apiKey: connection.apiKey } : {});
+    this.sandboxes.delete(reference.sandboxId);
+    this.states.delete(reference.sandboxId);
+    this.destroyed.add(handle);
   }
 
   async park(handle: WorldHandle): Promise<WorldHandle> {
@@ -271,6 +298,7 @@ export class E2BWorldProvider implements WorldProvider {
   }
 
   async status(handle: WorldHandle): Promise<WorldLifecycleState> {
+    if (this.destroyed.has(handle)) return 'missing';
     const id = this.sandboxIdOf(handle);
     if (this.states.has(id)) return this.states.get(id)!;
     return 'ready'; // after a process restart the durable provider is authoritative on connect
@@ -290,7 +318,7 @@ export class E2BWorldProvider implements WorldProvider {
       if (['running', 'starting', 'resuming', 'ready'].includes(state)) return 'ready';
       return 'missing';
     } catch (error) {
-      return looksLikeMissingSandbox(error) ? 'missing' : undefined;
+      return isMissingSandbox(error) ? 'missing' : undefined;
     }
   }
 
@@ -307,13 +335,13 @@ export class E2BWorldProvider implements WorldProvider {
       ...(sandbox.metadata?.karmaxTaskId ? { taskId: sandbox.metadata.karmaxTaskId } : {}),
       matches: (handle) => {
         try { return handle.kind === this.kind && this.sandboxIdOf(handle as WorldHandle) === sandbox.sandboxId; }
-        catch { return false; }
+        catch { return undefined; }
       },
       destroy: async () => {
         if (this.factory.kill) await this.factory.kill(sandbox.sandboxId, apiKey);
         else await (await this.factory.connect(sandbox.sandboxId, { timeoutMs: this.idleMs, ...apiKey })).kill();
         this.sandboxes.delete(sandbox.sandboxId);
-        this.states.set(sandbox.sandboxId, 'missing');
+        this.states.delete(sandbox.sandboxId);
       },
     }));
   }
@@ -321,10 +349,11 @@ export class E2BWorldProvider implements WorldProvider {
   /** E2B pause/kill events carry the exact execution time and actual template
    * resources. Those are the billable intervals; a karmax runner lease is only
    * admission capacity and can outlive an auto-paused sandbox by days. */
-  async listUsageEvents(organizationId: string): Promise<ProviderUsageEvent[]> {
-    if (!this.factory.events) return [];
+  async listUsageEvents(organizationId: string, since?: number, resumeAt?: number): Promise<ProviderUsagePage> {
+    if (!this.factory.events) return { events: [] };
     const connection = (await this.connection(organizationId));
-    const events = await this.factory.events(connection?.apiKey ? { apiKey: connection.apiKey } : {});
+    const { events, resumeAt: next } = await this.factory.events({
+      ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}), since, offset: resumeAt });
     const home = serviceHomeLabel();
     const normalized: ProviderUsageEvent[] = [];
     for (const raw of events) {
@@ -349,10 +378,11 @@ export class E2BWorldProvider implements WorldProvider {
           ? { taskId: metadata.karmaxTaskId } : {}),
         startedAt, endedAt: startedAt + activeMs, activeMs, cpu, memoryMb });
     }
-    return normalized;
+    return { events: normalized, ...(next !== undefined ? { resumeAt: next } : {}) };
   }
 
   private sealRef(value: Record<string, string>): string {
+    if (this.referenceKeys) return this.referenceKeys.seal(value);
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', this.refKey, iv);
     const body = Buffer.concat([cipher.update(JSON.stringify(value), 'utf8'), cipher.final()]);
@@ -360,6 +390,7 @@ export class E2BWorldProvider implements WorldProvider {
   }
 
   private openRef(value: string): Record<string, string> {
+    if (value.startsWith('KWR2.') && this.referenceKeys) return this.referenceKeys.open(value);
     const blob = Buffer.from(value, 'base64url');
     if (blob.subarray(0, 4).toString() !== 'KWR1') throw new Error('invalid sealed provider reference');
     const decipher = crypto.createDecipheriv('aes-256-gcm', this.refKey, blob.subarray(4, 16));
@@ -372,10 +403,6 @@ export class E2BWorldProvider implements WorldProvider {
       const value = this.openRef(handle.sealedProviderRef);
       if (value.sandboxId) return { sandboxId: value.sandboxId, organizationId: value.organizationId };
     }
-    // V1 replay compatibility only. Newly created handles never take this path.
-    const legacy = handle.meta?.sandboxId;
-    if (typeof legacy === 'string' && legacy) return { sandboxId: legacy,
-      organizationId: typeof handle.meta?.organizationId === 'string' ? handle.meta.organizationId : undefined };
     throw new Error('invalid E2B world handle');
   }
 
@@ -395,13 +422,10 @@ export class E2BWorldProvider implements WorldProvider {
       requestTimeoutMs: options.requestTimeoutMs,
       ...(options.signal ? { signal: options.signal } : {}),
     };
-    let matches = await this.factory.list({ ...api, metadata });
-    if (!matches.length) {
-      const { karmaxGeneration: _generation, ...legacy } = metadata;
-      const candidates = await this.factory.list({ ...api, metadata: legacy });
-      matches = candidates.filter((candidate) => !candidate.metadata?.karmaxGeneration
-        || candidate.metadata.karmaxGeneration === metadata.karmaxGeneration);
-    }
+    const { karmaxGeneration: generation, ...scope } = metadata;
+    const candidates = await this.factory.list({ ...api, metadata: scope });
+    let matches = candidates.filter(candidate => candidate.metadata?.karmaxGeneration === generation);
+    if (!matches.length) matches = candidates.filter(candidate => !candidate.metadata?.karmaxGeneration);
     if (!matches.length) return undefined;
     if (matches.length > 1) {
       // No candidate has been registered yet, so none contains user work. Clear
@@ -422,7 +446,7 @@ export class E2BWorldProvider implements WorldProvider {
 }
 
 class E2BWorld implements World {
-  constructor(public handle: WorldHandle, private sandbox: E2BSandboxLike, private idleMs: number) {}
+  constructor(public handle: WorldHandle, private sandbox: E2BSandboxLike, private idleMs: number, private onDestroy: () => void) {}
 
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const line = [cmd, ...args].map(shellQuote).join(' ');
@@ -470,6 +494,31 @@ class E2BWorld implements World {
     return typeof value === 'string' ? Buffer.from(value) : Buffer.from(toBytes(value));
   }
 
+  async readFilePrefix(relPath: string, maxBytes: number): Promise<Buffer> {
+    const abort = new AbortController();
+    const stream = await this.sandbox.files.read(this.filePath(relPath),
+      { format: 'stream', signal: abort.signal }) as unknown as ReadableStream<Uint8Array>;
+    const reader = stream.getReader();
+    const chunks: Buffer[] = [];
+    let length = 0, finished = false;
+    try {
+      while (length < maxBytes) {
+        const { done, value } = await reader.read();
+        if (done) { finished = true; break; }
+        const chunk = Buffer.from(value.buffer, value.byteOffset, Math.min(value.byteLength, maxBytes - length));
+        chunks.push(chunk);
+        length += chunk.length;
+      }
+    } finally {
+      // Stop the download at the limit instead of draining the rest.
+      if (!finished) {
+        await reader.cancel().catch(() => undefined);
+        abort.abort();
+      }
+    }
+    return Buffer.concat(chunks, length);
+  }
+
   async writeFile(relPath: string, content: string): Promise<void> {
     await this.sandbox.files.write(this.filePath(relPath), content);
   }
@@ -479,7 +528,7 @@ class E2BWorld implements World {
   }
 
   async listFiles(): Promise<string[]> {
-    const listed = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print | sed 's#^./##'"],
+    const listed = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print -o -type l -not -path '*/.git/*' -print | sed 's#^./##'"],
       { cwd: this.handle.root, timeoutMs: 120_000 });
     if (listed.code !== 0) throw new Error(listed.stderr || 'failed to list remote world files');
     return listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
@@ -490,8 +539,10 @@ class E2BWorld implements World {
     const exits = new Set<(code: number | null) => void>();
     const pending: string[] = [];
     let attached = false;
-    const emit = (data: unknown) => {
-      const chunk = sdkText(data);
+    const stdoutDecoder = new TextDecoder(), stderrDecoder = new TextDecoder();
+    const emit = (data: unknown, decoder: TextDecoder) => {
+      const chunk = sdkText(data, decoder);
+      if (!chunk) return;
       if (!attached) pending.push(chunk);
       for (const listener of outputs) listener(chunk);
     };
@@ -505,14 +556,16 @@ class E2BWorld implements World {
       // with a spurious exit; 0 disables that bound, as openPty already does.
       // (keepAlive() below refreshes the *sandbox* lease, not this timeout.)
       timeoutMs: 0,
-      onStdout: emit,
-      onStderr: emit,
+      onStdout: (data: unknown) => emit(data, stdoutDecoder),
+      onStderr: (data: unknown) => emit(data, stderrDecoder),
     });
     let exited = false;
     let exitCode: number | null = null;
     const stopKeepAlive = this.keepAlive();
     void Promise.resolve(command?.wait?.()).then((result) => {
       stopKeepAlive();
+      emit(stdoutDecoder.decode(), stdoutDecoder);
+      emit(stderrDecoder.decode(), stderrDecoder);
       exited = true;
       exitCode = Number(result?.exitCode ?? result?.code ?? 0);
       for (const listener of exits) listener(exitCode);
@@ -521,7 +574,7 @@ class E2BWorld implements World {
       // wait() rejects with CommandExitError for every nonzero exit; its stderr
       // has already streamed. Only a lost stream has no status of its own.
       const code = processExitCode(error);
-      if (code === undefined) emit(error?.message ?? error);
+      if (code === undefined) emit(error?.message ?? error, stderrDecoder);
       exited = true;
       exitCode = code ?? -1;
       for (const listener of exits) listener(exitCode);
@@ -554,8 +607,10 @@ class E2BWorld implements World {
     let exitCode: number | null = null;
     let termination: WorldPtyTermination | undefined;
     let closed = false;
+    const decoder = new TextDecoder();
     const onData = (data: unknown) => {
-      const chunk = sdkText(data);
+      const chunk = sdkText(data, decoder);
+      if (!chunk) return;
       if (!attached) pending.push(chunk);
       for (const listener of outputs) listener(chunk);
     };
@@ -574,6 +629,7 @@ class E2BWorld implements World {
     const follow = () => void Promise.resolve(terminal.wait?.()).then((result) => {
       stopKeepAlive();
       const code = Number(result?.exitCode ?? result?.code ?? 0);
+      onData(decoder.decode());
       exited = true;
       exitCode = code;
       for (const listener of exits) listener(code);
@@ -622,6 +678,7 @@ class E2BWorld implements World {
 
   async destroy(): Promise<void> {
     await this.sandbox.kill();
+    this.onDestroy();
   }
 
   /** E2B pauses a sandbox when its plan's continuous-runtime cap expires (one
@@ -787,15 +844,12 @@ function provisionTarget(sandbox: E2BSandboxLike, signal?: AbortSignal): Provisi
   };
 }
 
-function looksLikeMissingSandbox(error: unknown): boolean {
-  return /not\s*found|does not exist|404/i.test(String((error as Error)?.message ?? error));
-}
 
 function defaultE2BFactory(): E2BFactory {
   const sdk = async (): Promise<any> => {
     try {
-      // Avoid loading the optional cloud SDK on local-only boots.
-      return await (new Function('return import("e2b")')() as Promise<any>);
+      // Loaded on first use so local-only boots never pay for the cloud SDK.
+      return await import('e2b');
     } catch (error) {
       throw new Error(`E2B world requested but the e2b SDK is unavailable: ${String(error)}`);
     }
@@ -843,24 +897,30 @@ function defaultE2BFactory(): E2BFactory {
       return Sandbox.kill(id, options);
     },
     async events(options) {
+      const since = options.since;
+      const start = options.offset ?? 0;
+      const end = start + LIFECYCLE_PAGES_PER_READ * 100;
       const result: unknown[] = [];
-      // E2B retains seven days. Drain every page on each sweep; the store's
-      // provider-execution key makes overlap/restarts harmless and avoids a
-      // fragile offset cursor while new events are arriving at the front.
-      for (let offset = 0; offset < 50_000; offset += 100) {
+      // Cursor overlap and periodic full reconciliation are owned by the lifecycle
+      // service. Keep the whole boundary page for equal timestamps/late arrivals.
+      for (let offset = start; offset < end; offset += 100) {
         const query = new URLSearchParams({ limit: '100', offset: String(offset), orderAsc: 'false' });
         query.append('types', 'sandbox.lifecycle.paused');
         query.append('types', 'sandbox.lifecycle.killed');
         const response = await fetch(`https://api.e2b.app/events/sandboxes?${query}`, {
           headers: options.apiKey ? { 'X-API-Key': options.apiKey } : {},
+          signal: AbortSignal.timeout(30_000),
         });
         if (!response.ok) throw new Error(`E2B lifecycle events failed (${response.status})`);
         const body: any = await response.json();
         const page = Array.isArray(body) ? body : Array.isArray(body?.events) ? body.events : [];
         result.push(...page);
-        if (page.length < 100) break;
+        if (page.length < 100 || (since !== undefined && page.some((event: any) =>
+          Number.isFinite(Date.parse(event.timestamp)) && Date.parse(event.timestamp) <= since))) return { events: result };
       }
-      return result;
+      // Newest first: events arriving meanwhile only shift older ones to higher
+      // offsets, so resuming here may re-read (deduplicated), never skip.
+      return { events: result, resumeAt: end };
     },
   };
 }
@@ -874,10 +934,10 @@ function toBytes(value: Uint8Array | ArrayBuffer): Uint8Array {
   return value instanceof Uint8Array ? value : new Uint8Array(value);
 }
 
-function sdkText(value: unknown): string {
+function sdkText(value: unknown, decoder: TextDecoder): string {
   if (typeof value === 'string') return value;
-  if (value instanceof Uint8Array) return new TextDecoder().decode(value);
-  if (value && typeof value === 'object' && 'data' in value) return sdkText((value as { data: unknown }).data);
+  if (value instanceof Uint8Array) return decoder.decode(value, { stream: true });
+  if (value && typeof value === 'object' && 'data' in value) return sdkText((value as { data: unknown }).data, decoder);
   return String(value ?? '');
 }
 

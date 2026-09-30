@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createFollowUpInjector, toSdkUserMessage } from '../src/agent/sdk-stream.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import type { PlatformToolContext, TurnInput } from '../src/agent/types.js';
@@ -17,12 +17,12 @@ describe('createFollowUpInjector (SDK streaming input)', () => {
     const consumer = (async () => {
       for await (const m of inj.stream) seen.push(m.message.content as string);
     })();
-    // let the initial message flush, then inject two more mid-stream
-    await new Promise((r) => setTimeout(r, 10));
+    // inject two more mid-stream: each after the consumer has read the last
+    await vi.waitFor(() => expect(seen).toEqual(['one']));
     inj.push(toSdkUserMessage('two'));
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.waitFor(() => expect(seen).toEqual(['one', 'two']));
     inj.push(toSdkUserMessage('three'));
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.waitFor(() => expect(seen).toEqual(['one', 'two', 'three']));
     expect(inj.closed).toBe(false);
     (await inj.close());
     await consumer;
@@ -102,5 +102,180 @@ describe('mock adapter in-flight injection + delivered accounting', () => {
     expect(writes).not.toContain('nope.txt'); // system messages are never executed
     expect(writes).toContain('yes.txt');
     expect(turn.delivered).toBe(3); // 1 initial + system (counted, skipped) + user follow-up
+  });
+});
+
+describe('live follow-up channel cost (LT-13)', () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  interface Channel {
+    pull(from: number): Promise<Message[]>;
+    /** The workflow applies an accepted followUp signal. */
+    apply(message: Message): void;
+    /** The API journals the accepted follow-up (after Temporal accepted it). */
+    journal(message: Message): Promise<void>;
+    queries(): number;
+  }
+
+  /** Run one real runAgentTurn activity whose adapter polls like the SDK/Codex
+   * adapters do; the fake workflow counts its pendingMessages queries. */
+  async function runPollingTurn(script: (channel: Channel) => Promise<void>) {
+    const { Context } = await import('@temporalio/activity');
+    const { makeCoreActivities } = await import('../src/activities/core.js');
+    const { ProfileResolver } = await import('../src/agent/profiles.js');
+    const { Store } = await import('../src/store/db.js');
+    const { WorldRegistry } = await import('../src/world/registry.js');
+    const store = await Store.create(':memory:');
+    const project = await store.createProject('Follow-ups');
+    const task = await store.createTask({ projectId: project.id, title: 'Poll', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    const transcript: Message[] = [{ id: 'm0', role: 'user', text: 'work', ts: 0 }];
+    let queries = 0;
+    const heartbeat = vi.fn();
+    const handle = {
+      query: async (_name: string, _role: string, from: number) => { queries++; return transcript.slice(from); },
+      signal: async () => {},
+    };
+    const spy = vi.spyOn(Context, 'current').mockImplementation(() => ({
+      info: { attempt: 1, activityId: 'turn', workflowExecution: { runId: 'run' } },
+      cancellationSignal: new AbortController().signal, heartbeat,
+    }) as any);
+    const runTurn = async (_input: TurnInput, ctx: PlatformToolContext) => {
+      await script({
+        pull: ctx.pullFollowUps!,
+        apply: (message) => { transcript.push(message); },
+        journal: async (message) => {
+          await store.appendEvent({ taskId: task.id, type: 'conversation.message', ts: Date.now(), payload: { role: 'do', message } });
+        },
+        queries: () => queries,
+      });
+      return { termination: { kind: 'success' as const, status: 'end_turn' }, output: 'ok' };
+    };
+    const core = makeCoreActivities({ store, worlds, client: { workflow: { getHandle: () => handle } } as any,
+      adapters: new Map([['claude', { provider: 'claude', runTurn }]]) as any,
+      profiles: new ProfileResolver(store, 'claude') });
+    try {
+      await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`, agentSlotGranted: true,
+        worldHandle: world.handle, messages: [...transcript],
+        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {},
+          workflow: 'just-do', agents: { do: { provider: 'claude', model: 'test' } } } } as any);
+      return { queries: () => queries, heartbeat };
+    } finally { spy.mockRestore(); await world.destroy(); await store.close(); }
+  }
+
+  it('queries the workflow only when a follow-up was journaled, and still delivers it', async () => {
+    let quiet = 0;
+    let delivered: Message[] = [];
+    const { queries } = await runPollingTurn(async (channel) => {
+      // A quiet stretch of a long turn: 20 adapter polls.
+      for (let i = 0; i < 20; i++) expect(await channel.pull(1)).toEqual([]);
+      quiet = channel.queries();
+      const followUp: Message = { id: 'u1', role: 'user', text: 'also update the docs', ts: 1 };
+      channel.apply(followUp);
+      await channel.journal(followUp);
+      delivered = await channel.pull(1);
+      for (let i = 0; i < 5; i++) expect(await channel.pull(2)).toEqual([]);
+    });
+    // The first poll always asks (a message may predate the turn's start);
+    // quiet polls do not; the journaled follow-up costs exactly one query.
+    expect(quiet).toBe(1);
+    expect(delivered.map((m) => m.id)).toEqual(['u1']);
+    expect(queries()).toBe(2);
+  });
+
+  it('keeps asking while the journal is ahead of the workflow, then stops', async () => {
+    let delivered: Message[] = [];
+    let settled = 0;
+    await runPollingTurn(async (channel) => {
+      await channel.pull(1);
+      const followUp: Message = { id: 'u2', role: 'user', text: 'stop after tests', ts: 2 };
+      // Journaled, but the query still races the workflow task applying the signal.
+      await channel.journal(followUp);
+      expect(await channel.pull(1)).toEqual([]);
+      expect(await channel.pull(1)).toEqual([]);
+      channel.apply(followUp);
+      delivered = await channel.pull(1);
+      settled = channel.queries();
+      for (let i = 0; i < 5; i++) await channel.pull(2);
+      expect(channel.queries()).toBe(settled);
+    });
+    expect(delivered.map((m) => m.id)).toEqual(['u2']);
+    expect(settled).toBe(4);
+  });
+
+  it('beats once per second for the whole activity, not once per timer', async () => {
+    const { heartbeat } = await runPollingTurn(async () => { await sleep(2_100); });
+    expect(heartbeat.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(heartbeat.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+});
+
+describe('gateFollowUps (LT-13)', () => {
+  it('asks once after a view publication, and at the backstop for writers that journal nothing', async () => {
+    const { gateFollowUps, FOLLOW_UP_BACKSTOP_MS } = await import('../src/activities/follow-up-gate.js');
+    let clock = 0, queries = 0;
+    const journal: { seq: number; messageId?: string }[] = [];
+    const pull = gateFollowUps({
+      query: async () => { queries++; return []; },
+      cursor: async () => 5,
+      journaled: async (seq) => journal.filter((entry) => entry.seq > seq),
+      now: () => clock,
+    });
+    await pull(1);
+    journal.push({ seq: 6 }); // e.g. a mode switch appended a message and published
+    await pull(1); await pull(1);
+    expect(queries).toBe(2);
+    for (clock = 1_000; clock < FOLLOW_UP_BACKSTOP_MS + 1_000; clock += 1_000) await pull(1);
+    expect(queries).toBe(3);
+  });
+
+  it('stops asking once a journaled message for another agent has had time to arrive', async () => {
+    const { gateFollowUps, FOLLOW_UP_SETTLE_MS } = await import('../src/activities/follow-up-gate.js');
+    let clock = 0, queries = 0;
+    const journal: { seq: number; messageId?: string }[] = [];
+    const pull = gateFollowUps({
+      query: async () => { queries++; return []; },
+      cursor: async () => 5,
+      journaled: async (seq) => journal.filter((entry) => entry.seq > seq),
+      now: () => clock,
+    });
+    await pull(1);
+    journal.push({ seq: 6, messageId: 'for-merge' }); // routed to the merge agent: never in this transcript
+    for (; clock <= FOLLOW_UP_SETTLE_MS + 2_000; clock += 1_000) await pull(1);
+    expect(queries).toBe(1 + FOLLOW_UP_SETTLE_MS / 1_000);
+  });
+
+  it('keeps asking after a pending parent answer until it arrives, then only until the window lapses', async () => {
+    const { gateFollowUps, FOLLOW_UP_SETTLE_MS } = await import('../src/activities/follow-up-gate.js');
+    let clock = 0, queries = 0;
+    const journal: { seq: number; pending?: boolean }[] = [];
+    const inbox: Message[] = [];
+    const pull = gateFollowUps({
+      query: async () => { queries++; return inbox.splice(0); },
+      cursor: async () => 5,
+      journaled: async (seq) => journal.filter((entry) => entry.seq > seq),
+      now: () => clock,
+    });
+    await pull(1);
+    // Journaled by the parent's turn before its workflow sends the signal.
+    journal.push({ seq: 6, pending: true });
+    clock = 1_000; expect(await pull(1)).toEqual([]);
+    inbox.push({ id: 'p-3', role: 'user', text: 'use postgres', ts: 3 });
+    clock = 2_000; expect((await pull(1)).map((m) => m.id)).toEqual(['p-3']);
+    for (clock = 3_000; clock <= FOLLOW_UP_SETTLE_MS + 5_000; clock += 1_000) await pull(2);
+    expect(queries).toBe(1 + FOLLOW_UP_SETTLE_MS / 1_000);
+  });
+
+  it('asks the workflow when the journal cannot be read', async () => {
+    const { gateFollowUps } = await import('../src/activities/follow-up-gate.js');
+    let queries = 0;
+    const pull = gateFollowUps({
+      query: async () => { queries++; return [{ id: 'u', role: 'user', text: 'hi', ts: 0 }]; },
+      cursor: async () => 0,
+      journaled: async () => { throw new Error('database unavailable'); },
+    });
+    await pull(1);
+    expect((await pull(1)).map((m) => m.id)).toEqual(['u']);
+    expect(queries).toBe(2);
   });
 });

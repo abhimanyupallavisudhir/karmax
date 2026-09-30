@@ -1,5 +1,7 @@
+import type { World } from '../world/types.js';
 import { decayVaultUsage, type VaultUsage, type VaultSelectionUsage } from '../util/vault-usage.js';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CredentialBroker } from './broker.js';
@@ -9,7 +11,7 @@ import { newId } from '../util/id.js';
 import { paths } from '../config/paths.js';
 
 /**
- * Vault items (PLAN-passwords.md §4): the typed product layer over the raw
+ * Vault items (wiki plans/PLAN-passwords §4): the typed product layer over the raw
  * handle→secret vault. An item bundles what a human thinks of as "one
  * credential" — a site login (password + TOTP seed + domains), an API key, an
  * SSH key, a .env bag — so it can be granted to tasks as a unit.
@@ -130,6 +132,9 @@ export interface VaultItemStore {
   vaultUsageHistory?(itemIds: string[], now: number): (Record<string, VaultUsage>) | Promise<Record<string, VaultUsage>>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
+  kvDelete?(k: string): (void) | Promise<void>;
+  /** One range read of every key under a prefix; stores without it are read per key. */
+  kvEntries?(prefix: string): Promise<Array<{ key: string; value: string }>>;
   appendAudit(entry: { principalId: string; action: string; scopeKey?: string; detail?: Record<string, unknown> }): (number) | Promise<number>;
 }
 
@@ -139,6 +144,18 @@ export interface VaultItemStore {
 // no org qualifier.
 const kvItems = (org: string) => `vault:items:${org}`;
 const kvRequests = (org: string) => `vault:requests:${org}`;
+/** Access statistics live beside the index, one key per item: bumping them on
+ *  every access used to rewrite the whole organization index (AU-25). */
+export const kvUsagePrefix = (org: string) => `vault:usage:${org}:`;
+type ItemUsage = Pick<VaultItem, 'useCount' | 'frecencyScore' | 'frecencyUpdatedAt' | 'lastUsedAt'>;
+
+/** A damaged index must never read as empty: the next write would replace
+ *  every entry with just the new one (AU-28). Fail closed; the stored bytes
+ *  stay untouched for recovery. */
+function parseIndex<T>(raw: string, what: string): T {
+  try { return JSON.parse(raw) as T; }
+  catch { throw new Error(`${what} is unreadable, so it was left untouched; restore it from a backup`); }
+}
 const kvGrant = (taskId: string) => `vault:grant:${taskId}`;
 const kvPasses = (taskId: string) => `vault:pass:${taskId}`;
 const kvTaskPolicies = (taskId: string) => `vault:task-policy:${taskId}`;
@@ -214,7 +231,46 @@ export function totpCode(seed: string, nowMs = Date.now(), stepSeconds = 30, dig
   return code;
 }
 
-// ── the service ──────────────────────────────────────────────────────────────
+// ── the service ────────────────────────────────────────────────────���─────────
+
+const TURN_KEYS = '.karmax-injection/vault';
+
+const TURN_KEY_PREFIX = 'karmax-turn-keys-';
+
+/** A private host directory for one turn's key files, named by its owner's pid
+ * so a later sweep can tell a crashed turn's plaintext keys from a live one's. */
+export function turnKeyDirectory(tmp = os.tmpdir()): string {
+  return fs.mkdtempSync(path.join(tmp, `${TURN_KEY_PREFIX}${process.pid}-`));
+}
+
+/** Remove the turn key directories whose process is gone (a crash skipped
+ * `removeTurnKeys`). Run at primary and worker start; returns how many. */
+export function sweepTurnKeys(tmp = os.tmpdir()): number {
+  let swept = 0;
+  for (const name of fs.readdirSync(tmp)) {
+    if (!name.startsWith(TURN_KEY_PREFIX)) continue;
+    const pid = Number(/^karmax-turn-keys-(\d+)-/.exec(name)?.[1]);
+    if (pid > 0) {
+      try { process.kill(pid, 0); continue; } // alive (or not ours to signal): a live turn may own it
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'EPERM') continue; }
+    }
+    fs.rmSync(path.join(tmp, name), { recursive: true, force: true });
+    swept++;
+  }
+  return swept;
+}
+
+/** Delete the key files `envFor` wrote for a turn that has ended. */
+export async function removeTurnKeys(keys: World | string): Promise<void> {
+  if (typeof keys === 'string') { fs.rmSync(keys, { recursive: true, force: true }); return; }
+  const removed = await keys.exec('rm', ['-rf', '--', path.posix.join(keys.handle.root, TURN_KEYS)]);
+  if (removed.code !== 0) throw new Error('could not remove the turn\'s key files');
+}
+
+/** Remove every host copy of a vault key left by versions before AU-33. */
+export function removeLegacyKeyCopies(home = paths().state): void {
+  fs.rmSync(path.join(home, 'vault-items'), { recursive: true, force: true });
+}
 
 export class VaultItems {
   constructor(
@@ -231,12 +287,7 @@ export class VaultItems {
     return this.store.transaction(async () => {
     const raw = (await this.store.kvGet(kvItems(this.organizationId)));
     if (!raw) return [];
-    let items: VaultItem[];
-    try {
-      items = JSON.parse(raw) as VaultItem[];
-    } catch {
-      return [];
-    }
+    const items = parseIndex<VaultItem[]>(raw, 'The vault item index');
     const legacy = items.filter((item) => item.frecencyUpdatedAt === undefined);
     if (legacy.length) {
       const now = Date.now();
@@ -249,6 +300,15 @@ export class VaultItems {
         });
       }
       (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items)));
+    }
+    const prefix = kvUsagePrefix(this.organizationId);
+    const usage = this.store.kvEntries ? await this.store.kvEntries(prefix)
+      : (await Promise.all(items.map(async (item) => ({ key: prefix + item.id, value: await this.store.kvGet(prefix + item.id) }))))
+        .filter((row): row is { key: string; value: string } => row.value !== undefined);
+    const byId = new Map(items.map((item) => [item.id, item]));
+    for (const { key, value } of usage) {
+      const item = byId.get(key.slice(prefix.length));
+      if (item) Object.assign(item, JSON.parse(value) as ItemUsage);
     }
     return items;
 
@@ -314,6 +374,10 @@ export class VaultItems {
     if (prior && prior.type !== args.type) throw new Error(`vault item ${prior.id} is a ${prior.type}, not a ${args.type}`);
     const label = args.label?.trim() || prior?.label;
     if (!label) throw new Error('a vault item needs a label');
+    if (!prior && (await this.list()).length >= 1000) throw new Error('organization vault item quota reached (1000)');
+    if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 65_536) throw new Error('vault item exceeds size limit (64 KiB)');
+    if (args.type === 'note' && !args.replaceSecrets && args.secrets?.note !== undefined && !args.secrets.note.trim())
+      throw new Error('a standalone note cannot be empty');
     const id = prior?.id ?? newId('vi');
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
@@ -418,9 +482,10 @@ export class VaultItems {
     return this.store.transaction(async () => {
     const item = (await this.get(id));
     (await deleteItemConnectorWrites(this.store, this.broker, this.organizationId, id));
-    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.list()).filter((i) => i.id !== id))));
     for (const field of item?.fields ?? []) (await this.broker?.deleteHandle(itemHandle(id, field)));
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
+    (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify((await this.list()).filter((i) => i.id !== id))));
+    (await this.store.kvDelete?.(kvUsagePrefix(this.organizationId) + id));
 
     });
   }
@@ -570,23 +635,27 @@ export class VaultItems {
     if (!item.fields.includes(field)) throw new Error(`item "${item.label}" has no ${field}`);
     const handle = itemHandle(item.id, field);
     const secret = this.requireBroker().resolve(handle, { taskId: ctx.taskId, caps: [`use-credential:${handle}`] });
-    // Migrate history before appending this access so it is counted only once.
-    const items = (await this.list());
+    // Read fresh usage: callers may reuse an item across several fields. An item
+    // without its own usage key yet reads the index, which also migrates legacy
+    // history before this access is audited, so it is counted only once.
+    const usageKey = kvUsagePrefix(this.organizationId) + item.id;
+    const stored = (await this.store.kvGet(usageKey));
+    const current: ItemUsage | undefined = stored ? JSON.parse(stored) : (await this.list()).find((candidate) => candidate.id === item.id);
     (await this.store.appendAudit({
       principalId: ctx.principal ?? (ctx.taskId ? `task:${ctx.taskId}` : 'system'),
       action: ctx.mode === 'reveal' ? 'vault.revealed' : 'vault.used',
       detail: { itemId: item.id, label: item.label, field, ...(ctx.taskId ? { taskId: ctx.taskId } : {}) },
     }));
-    // Read fresh metadata: callers may reuse an item across several fields.
     // Usage must not move updatedAt, which connector sync uses for edits.
-    const current = items.find((candidate) => candidate.id === item.id);
     if (current) {
       const now = Date.now();
-      current.useCount = (current.useCount ?? 0) + 1;
-      current.frecencyScore = decayVaultUsage(current.frecencyScore ?? 0, current.frecencyUpdatedAt ?? now, now) + 1;
-      current.frecencyUpdatedAt = now;
-      current.lastUsedAt = now;
-      (await this.store.kvSet(kvItems(this.organizationId), JSON.stringify(items)));
+      const usage: ItemUsage = {
+        useCount: (current.useCount ?? 0) + 1,
+        frecencyScore: decayVaultUsage(current.frecencyScore ?? 0, current.frecencyUpdatedAt ?? now, now) + 1,
+        frecencyUpdatedAt: now,
+        lastUsedAt: now,
+      };
+      (await this.store.kvSet(usageKey, JSON.stringify(usage)));
     }
     return secret;
 
@@ -603,12 +672,16 @@ export class VaultItems {
    * Env for a task's agent subprocess from its granted `auto` items: `env`
    * items contribute their KEY=VALUE lines, `api-key` items their secret under
    * `envVar`, `ssh-key` items a 0600 key file path under `envVar`. `ask` items
-   * and unattached items never inject ambiently.
+   * and unattached items never inject ambiently. Key files are written to
+   * `keys` — the receiving world, or a host directory — for one turn, and
+   * `removeTurnKeys` deletes them when it ends (AU-33).
    */
-  async envFor(taskId: string, caps: Capability[]): Promise<Record<string, string>> {
+  async envFor(taskId: string, caps: Capability[], keys?: World | string): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
     for (const item of (await this.list())) {
       if (!['env', 'api-key', 'ssh-key'].includes(item.type)) continue;
+      if (item.provenance.taskId && item.provenance.taskId !== taskId
+        && !caps.includes(`use-credential:item:${item.id}`)) continue;
       if ((await this.access(caps, taskId, item, 'use', { ambient: true })).status !== 'granted') continue;
       try {
         if (item.type === 'env' && item.fields.includes('env')) {
@@ -620,7 +693,7 @@ export class VaultItems {
         } else if (item.type === 'api-key' && item.envVar && item.fields.includes('secret')) {
           env[item.envVar] = (await this.resolveField(item, 'secret', { taskId, mode: 'use' }));
         } else if (item.type === 'ssh-key' && item.envVar && item.fields.includes('privateKey')) {
-          env[item.envVar] = (await this.materializeKey(item, { taskId }));
+          env[item.envVar] = (await this.materializeKey(item, { taskId }, keys));
         }
       } catch (e) {
         // One corrupted/missing secret must not block every turn granted to it;
@@ -635,12 +708,7 @@ export class VaultItems {
 
   async requests(filter: { taskId?: string; status?: CredentialAccessRequest['status'] } = {}): Promise<CredentialAccessRequest[]> {
     const raw = (await this.store.kvGet(kvRequests(this.organizationId)));
-    let all: CredentialAccessRequest[] = [];
-    try {
-      all = raw ? JSON.parse(raw) : [];
-    } catch {
-      all = [];
-    }
+    const all: CredentialAccessRequest[] = raw ? parseIndex(raw, 'The credential request list') : [];
     return all.filter((r) => (!filter.taskId || r.taskId === filter.taskId) && (!filter.status || r.status === filter.status));
   }
 
@@ -742,17 +810,28 @@ export class VaultItems {
     });
   }
 
-  /** Write a key to a 0600 file (idempotent per save) and return its path. */
-  private async materializeKey(item: VaultItem, ctx: { taskId?: string }): Promise<string> {
-    const file = path.join(this.keyDir(item.id), 'key');
-    if (!fs.existsSync(file)) {
-      const secret = (await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' }));
-      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(file, secret.endsWith('\n') ? secret : `${secret}\n`, { mode: 0o600 });
+  /** Write a key to a 0600 file for this turn and return its path. */
+  private async materializeKey(item: VaultItem, ctx: { taskId?: string }, keys?: World | string): Promise<string> {
+    if (!keys) throw new Error('no turn directory for key files');
+    const secret = await this.resolveField(item, 'privateKey', { ...ctx, mode: 'use' });
+    const content = secret.endsWith('\n') ? secret : `${secret}\n`;
+    const name = `${crypto.createHash('sha256').update(item.id).digest('hex')}.key`;
+    if (typeof keys === 'string') {
+      fs.mkdirSync(keys, { recursive: true, mode: 0o700 });
+      const file = path.join(keys, name);
+      fs.writeFileSync(file, content, { mode: 0o600 });
+      return file;
     }
+    const relative = `${TURN_KEYS}/${name}`;
+    await keys.writeFile(relative, content);
+    const file = path.posix.join(keys.handle.root, relative);
+    const mode = await keys.exec('chmod', ['600', file]);
+    if (mode.code !== 0) throw new Error('could not restrict remote key file permissions');
     return file;
   }
 
+  /** Copies of keys that versions before AU-33 kept on the host until the item
+   *  was deleted; nothing reads them any more. */
   private keyDir(id: string): string {
     return path.join(this.home, 'vault-items', id);
   }

@@ -3,9 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { WorktreeProvider } from '../src/world/worktree.js';
-import { World } from '../src/world/types.js';
 import { git, gitOrThrow, currentBranch, ensureIdentity } from '../src/world/git.js';
-import { withWorktreeLock } from '../src/world/worktree-lock.js';
+import { holdWorktreeLock } from './helpers/lock-waiters.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { Store } from '../src/store/db.js';
 import { makeCoreActivities } from '../src/activities/core.js';
@@ -344,6 +343,21 @@ describe('WorktreeProvider (real git)', () => {
     }
   });
 
+  it('bounds repositoryless review metadata (WD-20)', async () => {
+    const store = await Store.create(':memory:');
+    const worlds = new WorldRegistry();
+    const files = Array.from({ length: 20_000 }, (_, i) => `${i}-${'長'.repeat(100)}`);
+    const handle = { kind: 'memory', id: 'review-limit', root: '/w', branch: 'main', base: 'main' } as const;
+    worlds.register({ kind: 'memory', open: async () => ({ handle, listFiles: async () => files }) } as any);
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+    try {
+      const review = await core.buildReview(handle, 'main');
+      expect(Buffer.byteLength(JSON.stringify(review))).toBeLessThan(300_000);
+      expect(review.summary).toContain('20000');
+      expect(review.summary).toContain('Showing');
+    } finally { await store.close(); }
+  });
+
   it('reports only this branch\'s changes when the base branch advances mid-task', async () => {
     const store = (await Store.create(':memory:'));
     const worlds = new WorldRegistry();
@@ -395,6 +409,43 @@ describe('WorktreeProvider (real git)', () => {
       expect(world.handle.repos![0]).toMatchObject({ base: 'main', target: 'main' });
       expect(world.handle.warnings!.join('\n')).toContain('Base and target branch changed to "main" because "master" did not exist');
     } finally { await world.destroy(); }
+  });
+
+  it('starts a reset world from the base, discarding the task branch\'s old commits', async () => {
+    const provider = new WorktreeProvider(home);
+    const first = await provider.create({ taskId: 'reset', repo, base: 'main', target: 'main' });
+    fs.writeFileSync(path.join(first.handle.root, 'old.txt'), 'old work\n');
+    await gitOrThrow(first.handle.root, ['add', '-A']);
+    await gitOrThrow(first.handle.root, ['commit', '-q', '-m', 'old work']);
+    const reset = await provider.create({ taskId: 'reset', repo, base: 'main', target: 'main', resetBranch: true });
+    try {
+      expect(await gitOrThrow(repo, ['rev-parse', 'tavya/reset'])).toBe(await gitOrThrow(repo, ['rev-parse', 'main']));
+      expect(fs.existsSync(path.join(reset.handle.root, 'old.txt'))).toBe(false);
+    } finally { await reset.destroy(); }
+  });
+
+  it('refuses to reset a task branch checked out in another worktree, naming it (WD-34)', async () => {
+    const provider = new WorktreeProvider(home);
+    const first = await provider.create({ taskId: 'held', repo, base: 'main', target: 'main' });
+    fs.writeFileSync(path.join(first.handle.root, 'old.txt'), 'old work\n');
+    await gitOrThrow(first.handle.root, ['add', '-A']);
+    await gitOrThrow(first.handle.root, ['commit', '-q', '-m', 'old work']);
+    const old = await gitOrThrow(repo, ['rev-parse', 'tavya/held']);
+    await first.destroy();
+    // "Work locally": the user checked the task branch out in a checkout of their own.
+    const local = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-')), 'checkout');
+    await gitOrThrow(repo, ['worktree', 'add', local, 'tavya/held']);
+    try {
+      const reset = provider.create({ taskId: 'held', repo, base: 'main', target: 'main', resetBranch: true });
+      await expect(reset).rejects.toThrow(`can't reset branch "tavya/held" to "main": it is checked out at ${local}`);
+      await expect(reset).rejects.toThrow(`git -C ${local} switch --detach`);
+      // Nothing moved under the user's checkout.
+      expect(await gitOrThrow(repo, ['rev-parse', 'tavya/held'])).toBe(old);
+      expect(await currentBranch(local)).toBe('tavya/held');
+    } finally {
+      await git(repo, ['worktree', 'remove', '--force', local]);
+      fs.rmSync(path.dirname(local), { recursive: true, force: true });
+    }
   });
 
   it('does not warn when the configured base branch exists', async () => {
@@ -476,13 +527,13 @@ describe('WorktreeProvider (real git)', () => {
   it('creates a world only while holding the repo\'s worktree lock', async () => {
     const provider = new WorktreeProvider(home);
     let created = false;
-    let creating!: Promise<World>;
-    await withWorktreeLock(repo, async () => {
-      creating = provider.create({ taskId: 'arriving', repo, base: 'main', target: 'main' })
-        .then((world) => { created = true; return world; });
-      await new Promise((resolve) => setTimeout(resolve, 250));
+    const holder = holdWorktreeLock(repo);
+    const creating = provider.create({ taskId: 'arriving', repo, base: 'main', target: 'main' })
+      .then((world) => { created = true; return world; });
+    try {
+      await holder.waiting();
       expect(created, 'world creation ran its `worktree add` while another holder had the lock').toBe(false);
-    });
+    } finally { holder.release(); }
     await (await creating).destroy();
   });
 
@@ -490,11 +541,12 @@ describe('WorktreeProvider (real git)', () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'leaving', repo, base: 'main', target: 'main' });
     let released = false;
-    await withWorktreeLock(repo, async () => {
-      void world.destroy().then(() => { released = true; });
-      await new Promise((resolve) => setTimeout(resolve, 250));
+    const holder = holdWorktreeLock(repo);
+    void world.destroy().then(() => { released = true; });
+    try {
+      await holder.waiting();
       expect(released, 'world release ran its `worktree remove` while another holder had the lock').toBe(false);
-    });
+    } finally { holder.release(); }
     await vi.waitFor(() => expect(released).toBe(true));
   });
 });

@@ -4,12 +4,10 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
   ACCOUNT_COORDINATOR_WORKFLOW,
-  BUDGET_COORDINATOR_WORKFLOW,
   RESOURCE_PUBLISH_COORDINATOR_WORKFLOW,
   QRY_QUEUE,
   QRY_AGENT_QUEUE,
   QRY_ACCOUNTS,
-  QRY_BUDGET,
   QRY_RESOURCE_PUBLISH,
 } from '../coordinators/names.js';
 import { BRAND } from '../domain/brand.js';
@@ -60,13 +58,6 @@ const SPECS: Record<string, CoordinatorSpec> = {
     query: QRY_ACCOUNTS,
     rebuild: null,
     reason: 'in-flight account leases would be lost while their holders keep using them',
-  },
-  // Its `spent` counters exist nowhere else; resetting them re-authorizes money
-  // that has already been spent.
-  [BUDGET_COORDINATOR_WORKFLOW]: {
-    query: QRY_BUDGET,
-    rebuild: null,
-    reason: 'spend counters exist nowhere else; a reset would re-authorize money already spent',
   },
   [RESOURCE_PUBLISH_COORDINATOR_WORKFLOW]: {
     query: QRY_RESOURCE_PUBLISH,
@@ -154,46 +145,48 @@ export async function healCoordinators(
       continue; // visibility unavailable — nothing safe to conclude
     }
 
-    for (const { workflowId, runId } of running) {
-      result.checked++;
-      let queryError: unknown;
-      try {
-        await withTimeout(client.workflow.getHandle(workflowId, runId).query(spec.query), PROBE_TIMEOUT_MS);
-        continue; // answered — healthy
-      } catch (e) {
-        queryError = e;
-      }
-
-      // The query error is conclusive when it names the divergence itself;
-      // otherwise fall back to what the history recorded.
-      let wedged = isReplayFailure(queryError);
-      if (!wedged) {
+    for (let offset = 0; offset < running.length; offset += 4) {
+      await Promise.all(running.slice(offset, offset + 4).map(async ({ workflowId, runId }) => {
+        result.checked++;
+        let queryError: unknown;
         try {
-          wedged = await isUnreplayable(client, workflowId, runId);
-        } catch {
-          continue; // couldn't classify — never rebuild on a guess
+          await withTimeout(client.workflow.getHandle(workflowId, runId).query(spec.query), PROBE_TIMEOUT_MS);
+          return; // answered — healthy
+        } catch (e) {
+          queryError = e;
         }
-      }
-      if (!wedged) continue;
 
-      result.wedged.push(workflowId);
-      if (!spec.rebuild) {
-        result.reported.push({ workflowId, reason: spec.reason ?? 'no safe rebuild' });
-        continue;
-      }
-      try {
-        await client.workflow
-          .getHandle(workflowId, runId)
-          .terminate(`${BRAND}: coordinator history is unreplayable by current code`);
-        await client.workflow.start(type, {
-          workflowId,
-          taskQueue,
-          args: spec.rebuild(workflowId),
-        });
-        result.rebuilt.push(workflowId);
-      } catch {
-        result.reported.push({ workflowId, reason: 'rebuild failed' });
-      }
+        // The query error is conclusive when it names the divergence itself;
+        // otherwise fall back to what the history recorded.
+        let wedged = isReplayFailure(queryError);
+        if (!wedged) {
+          try {
+            wedged = await isUnreplayable(client, workflowId, runId);
+          } catch {
+            return; // couldn't classify — never rebuild on a guess
+          }
+        }
+        if (!wedged) return;
+
+        result.wedged.push(workflowId);
+        if (!spec.rebuild) {
+          result.reported.push({ workflowId, reason: spec.reason ?? 'no safe rebuild' });
+          return;
+        }
+        try {
+          await client.workflow
+            .getHandle(workflowId, runId)
+            .terminate(`${BRAND}: coordinator history is unreplayable by current code`);
+          await client.workflow.start(type, {
+            workflowId,
+            taskQueue,
+            args: spec.rebuild(workflowId),
+          });
+          result.rebuilt.push(workflowId);
+        } catch {
+          result.reported.push({ workflowId, reason: 'rebuild failed' });
+        }
+      }));
     }
   }
   return result;
@@ -201,9 +194,19 @@ export async function healCoordinators(
 
 async function collectRunning(client: Client, type: string) {
   const running: { workflowId: string; runId?: string }[] = [];
-  const iter = client.workflow.list({ query: `WorkflowType = '${type}' AND ExecutionStatus = 'Running'` });
-  for await (const wf of iter) {
-    running.push({ workflowId: wf.workflowId, runId: wf.runId });
+  const iterator = client.workflow.list({ query: `WorkflowType = '${type}' AND ExecutionStatus = 'Running'` })[Symbol.asyncIterator]();
+  const deadline = Date.now() + PROBE_TIMEOUT_MS;
+  try {
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error('coordinator visibility scan timed out');
+      const next = await withTimeout(iterator.next(), remaining);
+      if (next.done) break;
+      running.push({ workflowId: next.value.workflowId, runId: next.value.runId });
+    }
+  } finally {
+    // A timed-out next() may still be pending; don't await return() behind it.
+    void iterator.return?.().catch(() => {});
   }
   return running;
 }

@@ -1,3 +1,4 @@
+import { rememberSubscriptionCatalog } from '../billing/catalog.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { STRIPE_BILLING_API_VERSION, STRIPE_BILLING_WEBHOOK_EVENTS } from '../billing/stripe-contract.js';
 import type { Store } from '../store/db.js';
@@ -212,10 +213,13 @@ export class PaidLaunchSettingsService {
   async configure(input: Record<string, unknown>, publicUrl: string) {
     if (this.provisioning) throw new Error('wait for Paddle setup to finish before editing settings');
     const current = (await this.stored());
+    await rememberSubscriptionCatalog(this.store, 'stripe-billing', await this.subscriptionConfig());
+    await rememberSubscriptionCatalog(this.store, 'paddle-billing', await this.paddleConfig());
     if (input.billingProvider !== undefined && input.billingProvider !== 'stripe' && input.billingProvider !== 'paddle')
       throw new Error('choose Stripe or Paddle');
     const paddleInput = input.paddle && typeof input.paddle === 'object' && !Array.isArray(input.paddle)
       ? input.paddle as Record<string, unknown> : undefined;
+    const secrets: [string, string][] = [];
     let paddle = current.paddle;
     if (paddleInput) {
       const currentEnvironment = (await this.paddleConfig()).environment;
@@ -240,8 +244,8 @@ export class PaidLaunchSettingsService {
       paddle = { environment, clientToken, individualPriceId: paddleId('individualPriceId', 'pri'),
         teamBasePriceId: paddleId('teamBasePriceId', 'pri'), teamSeatPriceId: paddleId('teamSeatPriceId', 'pri'),
         individualProductId: paddleId('individualProductId', 'pro'), teamProductId: paddleId('teamProductId', 'pro') };
-      if (apiKey) await this.broker.registerHandle(`platform:paddle-subscriptions:${environment}:api-key`, apiKey);
-      if (webhookSecret) await this.broker.registerHandle(`platform:paddle-subscriptions:${environment}:webhook-secret`, webhookSecret);
+      if (apiKey) secrets.push([`platform:paddle-subscriptions:${environment}:api-key`, apiKey]);
+      if (webhookSecret) secrets.push([`platform:paddle-subscriptions:${environment}:webhook-secret`, webhookSecret]);
     }
     const stripeInput = input.stripe && typeof input.stripe === 'object' && !Array.isArray(input.stripe)
       ? input.stripe as Record<string, unknown> : {};
@@ -260,31 +264,34 @@ export class PaidLaunchSettingsService {
       throw new Error('Stripe secret key must be an sk_test_… or sk_live_… key');
     if (webhookSecret && !/^whsec_\S+$/.test(webhookSecret))
       throw new Error('Stripe webhook signing secret must start with whsec_');
-    if (secretKey) (await this.broker.registerHandle(SUBSCRIPTION_STRIPE_SECRET_HANDLE, secretKey));
-    if (webhookSecret) (await this.broker.registerHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, webhookSecret));
+    if (secretKey) secrets.push([SUBSCRIPTION_STRIPE_SECRET_HANDLE, secretKey]);
+    if (webhookSecret) secrets.push([SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, webhookSecret]);
     const next: StoredPaidLaunchSettings = {
       billingProvider: (input.billingProvider as 'stripe' | 'paddle' | undefined) ?? current.billingProvider,
       paddle,
-      paidLaunch: input.paidLaunch === true,
-      founderReviewedPolicyVersion: input.founderReviewed === true ? POLICY_VERSION : undefined,
-      operatorName: clean(input.operatorName), operatorCountry: clean(input.operatorCountry),
-      governingLaw: clean(input.governingLaw), legalNoticeAddress: clean(input.legalNoticeAddress),
+      paidLaunch: input.paidLaunch === undefined ? current.paidLaunch : input.paidLaunch === true,
+      founderReviewedPolicyVersion: input.founderReviewed === undefined ? current.founderReviewedPolicyVersion
+        : input.founderReviewed === true ? POLICY_VERSION : undefined,
+      operatorName: input.operatorName === undefined ? current.operatorName : clean(input.operatorName), operatorCountry: input.operatorCountry === undefined ? current.operatorCountry : clean(input.operatorCountry),
+      governingLaw: input.governingLaw === undefined ? current.governingLaw : clean(input.governingLaw), legalNoticeAddress: input.legalNoticeAddress === undefined ? current.legalNoticeAddress : clean(input.legalNoticeAddress),
       contacts: {
-        legal: email(contactsInput.legal), privacy: email(contactsInput.privacy),
-        security: email(contactsInput.security), incident: email(contactsInput.incident),
-        dpa: email(contactsInput.dpa), billing: email(contactsInput.billing),
+        legal: contactsInput.legal === undefined ? current.contacts?.legal : email(contactsInput.legal), privacy: contactsInput.privacy === undefined ? current.contacts?.privacy : email(contactsInput.privacy),
+        security: contactsInput.security === undefined ? current.contacts?.security : email(contactsInput.security), incident: contactsInput.incident === undefined ? current.contacts?.incident : email(contactsInput.incident),
+        dpa: contactsInput.dpa === undefined ? current.contacts?.dpa : email(contactsInput.dpa), billing: contactsInput.billing === undefined ? current.contacts?.billing : email(contactsInput.billing),
       },
       stripe: input.stripe === undefined ? current.stripe : {
-        individualPriceId: id(stripeInput.individualPriceId, 'price'),
-        teamBasePriceId: id(stripeInput.teamBasePriceId, 'price'),
-        teamSeatPriceId: id(stripeInput.teamSeatPriceId, 'price'),
-        individualProductId: id(stripeInput.individualProductId, 'product'),
-        teamProductId: id(stripeInput.teamProductId, 'product'),
+        individualPriceId: stripeInput.individualPriceId === undefined ? current.stripe?.individualPriceId : id(stripeInput.individualPriceId, 'price'),
+        teamBasePriceId: stripeInput.teamBasePriceId === undefined ? current.stripe?.teamBasePriceId : id(stripeInput.teamBasePriceId, 'price'),
+        teamSeatPriceId: stripeInput.teamSeatPriceId === undefined ? current.stripe?.teamSeatPriceId : id(stripeInput.teamSeatPriceId, 'price'),
+        individualProductId: stripeInput.individualProductId === undefined ? current.stripe?.individualProductId : id(stripeInput.individualProductId, 'product'),
+        teamProductId: stripeInput.teamProductId === undefined ? current.stripe?.teamProductId : id(stripeInput.teamProductId, 'product'),
       },
       completedTasks: Array.isArray(input.completedTasks)
         ? [...new Set(input.completedTasks.filter((value): value is string => typeof value === 'string' && taskIds.has(value)))]
         : current.completedTasks ?? [],
     };
+    // Validate the complete form before rotating any live billing credential.
+    for (const [handle, value] of secrets) await this.broker.registerHandle(handle, value);
     (await this.store.kvSet(PAID_LAUNCH_SETTINGS_KEY, JSON.stringify(next)));
     const status = (await this.status(publicUrl));
     if (next.paidLaunch && !status.canEnable) {

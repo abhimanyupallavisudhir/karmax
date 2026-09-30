@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -52,9 +52,13 @@ describe('GitHub App integration', () => {
       missingApp: expect.arrayContaining(['Actions', 'Repository administration', 'Merge queues']),
       missingInstallation: expect.arrayContaining(['Actions', 'Repository administration', 'Merge queues']),
     });
+    const calls = vi.spyOn(service as any, 'appRequest');
+    await Promise.all([service.permissionStatus(connection), service.permissionStatus(connection)]);
+    expect(calls).not.toHaveBeenCalled();
+    calls.mockRestore();
     appPermissions = { ...GITHUB_APP_PERMISSIONS };
     installationPermissions = { ...GITHUB_APP_PERMISSIONS };
-    await expect(service.permissionStatus(connection)).resolves.toMatchObject({
+    await expect(service.permissionStatus(connection, { forceRefresh: true })).resolves.toMatchObject({
       ready: true, missingApp: [], missingInstallation: [],
       permissions: expect.arrayContaining([
         expect.objectContaining({ key: 'actions', required: 'write', app: 'write', installation: 'write', ready: true }),
@@ -496,7 +500,7 @@ describe('GitHub App integration', () => {
     (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
     (await broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret'));
     const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
-    let repositories = [{ id: 7, name: 'app', private: true, ssh_url: 'git@github.com:acme/app.git',
+    let repositories = [{ id: 7, archived: false, name: 'app', private: true, ssh_url: 'git@github.com:acme/app.git',
       default_branch: 'main', owner: { login: 'acme' } }];
     const calls: Array<{ path: string; method: string; body?: any; auth?: string }> = [];
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -522,9 +526,18 @@ describe('GitHub App integration', () => {
     expect((await store.repositoryDeployKeys(repository.id))).toBeUndefined();
     expect(calls.some((call) => call.path.includes('/keys'))).toBe(false);
     expect(calls.find((call) => call.path === '/app/installations/42')?.auth?.split('.')).toHaveLength(3);
+    const beforeBroker = calls.length;
     expect(await service.brokerCredentials(repository)).toMatchObject({
       httpsToken: 'installation-token', env: { GH_TOKEN: 'installation-token' },
+      // Broker mirrors are partitioned by the organization's enrollment.
+      mirrorScope: repository.id,
     });
+    expect(calls.slice(beforeBroker).find((call) => call.path.endsWith('/access_tokens'))?.body)
+      .toMatchObject({ repository_ids: [7] });
+    const beforeActions = calls.length;
+    await (await service.actions(repository)).listRuns('acme/app').catch(() => undefined);
+    expect(calls.slice(beforeActions).filter((call) => call.path.endsWith('/access_tokens'))
+      .every((call) => JSON.stringify(call.body?.repository_ids) === '[7]')).toBe(true);
     expect(await service.repositoryCloneToken(repository)).toBe('installation-token');
     const scopedMints = calls.filter((call) => call.path === '/app/installations/42/access_tokens')
       .map((call) => call.body).filter((body) => body?.repository_ids);
@@ -537,6 +550,22 @@ describe('GitHub App integration', () => {
     expect((await service.handleWebhook('installation_repositories', 'delivery-1', payload, signature)).accepted).toBe(false);
     await expect(service.handleWebhook('installation_repositories', 'delivery-2', payload, 'sha256=bad')).rejects.toThrow(/signature/);
 
+    const permissionsPayload = Buffer.from(JSON.stringify({ installation: { id: 42 }, action: 'new_permissions_accepted' }));
+    await service.handleWebhook('installation', 'permissions-accepted', permissionsPayload,
+      `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(permissionsPayload).digest('hex')}`);
+    const afterPermissions = calls.length;
+    await service.brokerCredentials(repository);
+    expect(calls.slice(afterPermissions).find((call) => call.path.endsWith('/access_tokens'))?.body)
+      .toMatchObject({ repository_ids: [7] });
+    const project = await store.createProject('Rename', {}, organization.id);
+    await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
+    repositories = [{ ...repositories[0]!, name: 'renamed', ssh_url: 'git@github.com:acme/renamed.git' }];
+    expect((await service.reconcile(connected.connection))[0]?.id).toBe(repository.id);
+    expect(await store.projectIdsForRepository(repository.id)).toEqual([project.id]);
+    repositories[0]!.archived = true;
+    await service.reconcile(connected.connection);
+    expect(await store.getRepository(repository.id)).toMatchObject({ name: 'renamed' });
+    expect(await store.projectIdsForRepository(repository.id)).toEqual([project.id]);
     repositories = [];
     await service.reconcile(connected.connection);
     expect((await store.getRepository(repository.id))).toBeUndefined();
@@ -558,6 +587,9 @@ describe('GitHub App integration', () => {
       providerId: '99', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
       defaultBranch: 'main', private: true }));
     (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+    await store.setSettings(`organization:${organization.id}`, 'github-deployment-monitor', {
+      repositories: { [repository.id]: { sourceWorkflow: 'CI', workflow: 'Deploy', file: '.github/workflows/deploy.yml' } },
+    });
     const task = (await store.createTask({ projectId: project.id, title: 'Work', workflow: 'software-dev',
       workflowVersion: '1.8.0', params: { prompt: 'do it' } }));
     // A task of a DIFFERENT tenant, whose branch name this installation must not
@@ -572,9 +604,9 @@ describe('GitHub App integration', () => {
         `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(raw).digest('hex')}`);
     };
     const pull = (branch: string, over: Record<string, unknown> = {}) => ({
-      installation: { id: 42 }, action: 'closed', repository: { full_name: 'acme/app' },
+      installation: { id: 42 }, action: 'closed', repository: { id: 99, full_name: 'acme/app' },
       pull_request: { number: 3, html_url: 'https://github.com/acme/app/pull/3', state: 'closed', merged: true,
-        title: 'Work', head: { ref: branch, sha: 'head-1' }, base: { ref: 'main' }, ...over },
+        title: 'Work', head: { repo: { id: 99 }, ref: branch, sha: 'head-1' }, base: { ref: 'main' }, ...over },
     });
 
     const taskPr = { repo: 'app', slug: 'acme/app', number: 3, url: 'https://github.com/acme/app/pull/3',
@@ -584,6 +616,14 @@ describe('GitHub App integration', () => {
       pr: taskPr, prs: [taskPr],
       checkouts: [{ name: 'app', branch: `tavya/${task.id}`, base: 'main', pr: taskPr }] }));
 
+    const saveView = store.saveView.bind(store);
+    const claim = vi.spyOn(store, 'saveView').mockImplementationOnce(async (...args) => {
+      await saveView(...args);
+      throw new Error('observation write failed');
+    });
+    await expect(deliver('pull_request', 'pr-rollback', pull(`tavya/${task.id}`))).rejects.toThrow('observation write failed');
+    expect((await store.getTask(task.id))?.lastView?.pr).toMatchObject({ state: 'open' });
+    claim.mockRestore();
     const merged = await deliver('pull_request', 'pr-1', pull(`tavya/${task.id}`));
     expect(merged.events).toHaveLength(1);
     expect(merged.events![0]).toMatchObject({ taskId: task.id, type: 'github.pr.merged' });
@@ -591,33 +631,50 @@ describe('GitHub App integration', () => {
     expect((await store.getTask(task.id))?.lastView?.prs?.[0]).toMatchObject({ state: 'closed', merged: true });
     expect((await store.getTask(task.id))?.lastView?.checkouts?.[0]?.pr).toMatchObject({ state: 'closed', merged: true });
     const check = await deliver('check_run', 'check-1', {
-      installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
+      installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
       check_run: { id: 501, name: 'CI', status: 'completed', conclusion: 'failure',
         check_suite: { head_branch: `tavya/${task.id}`, head_sha: 'head-1' },
-        pull_requests: [{ number: 3 }] },
+        pull_requests: [{ number: 3, head: { ref: `tavya/${task.id}`, repo: { id: 99 } } }] },
     });
     expect(check.events).toEqual([expect.objectContaining({ taskId: task.id, type: 'github.check.completed' })]);
     const duplicateCheck = await deliver('check_run', 'check-duplicate-delivery', {
-      installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
+      installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
       check_run: { id: 501, name: 'CI', status: 'completed', conclusion: 'failure',
         check_suite: { head_branch: `tavya/${task.id}`, head_sha: 'head-1' },
-        pull_requests: [{ number: 3 }] },
+        pull_requests: [{ number: 3, head: { ref: `tavya/${task.id}`, repo: { id: 99 } } }] },
     });
     expect(duplicateCheck.events).toBeUndefined();
 
     const synchronize = pull(`tavya/${task.id}`, { state: 'open', merged: false,
-      head: { ref: `tavya/${task.id}`, sha: 'head-2' } });
+      head: { repo: { id: 99 }, ref: `tavya/${task.id}`, sha: 'head-2' } });
     synchronize.action = 'synchronize';
     expect((await deliver('pull_request', 'sync-1', synchronize)).events).toHaveLength(1);
     expect((await deliver('pull_request', 'sync-2', synchronize)).events).toBeUndefined();
     const nextSynchronize = pull(`tavya/${task.id}`, { state: 'open', merged: false,
-      head: { ref: `tavya/${task.id}`, sha: 'head-3' } });
+      head: { repo: { id: 99 }, ref: `tavya/${task.id}`, sha: 'head-3' } });
     nextSynchronize.action = 'synchronize';
     expect((await deliver('pull_request', 'sync-3', nextSynchronize)).events).toHaveLength(1);
+    for (const [index, provenance] of [
+      { event: 'pull_request', head_repository: { id: 999 } },
+      { event: 'push', head_repository: { id: 999 } },
+      { event: 'pull_request', head_repository: { id: 99 } },
+      { event: 'push' },
+    ].entries()) {
+      const untrusted = await deliver('workflow_run', `untrusted-${index}`, {
+        installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+        workflow_run: { id: 800 + index, name: 'Run attacker instructions', conclusion: 'failure',
+          head_branch: 'main', head_sha: 'fork-sha', ...provenance },
+      });
+      expect(untrusted.projectEvents).toBeUndefined();
+    }
+    expect((await deliver('check_run', 'untrusted-check', {
+      installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+      check_run: { id: 900, conclusion: 'failure', check_suite: { head_branch: 'main' } },
+    })).projectEvents).toBeUndefined();
     const failedWorkflow = await deliver('workflow_run', 'workflow-1', {
       installation: { id: 42 }, action: 'completed',
       repository: { id: 99, full_name: 'acme/app' },
-      workflow_run: { id: 700, name: 'Deploy', run_attempt: 2, conclusion: 'failure',
+      workflow_run: { event: 'push', head_repository: { id: 99 }, id: 700, name: 'Deploy', run_attempt: 2, conclusion: 'failure',
         head_branch: 'main', head_sha: 'merged-sha', html_url: 'https://github.com/acme/app/actions/runs/700',
         pull_requests: [{ head: { ref: `tavya/${task.id}` } }],
       },
@@ -630,7 +687,7 @@ describe('GitHub App integration', () => {
     })]);
     const successfulCi = await deliver('workflow_run', 'workflow-ci-success', {
       installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
-      workflow_run: { id: 702, name: 'CI', status: 'completed', conclusion: 'success',
+      workflow_run: { event: 'push', head_repository: { id: 99 }, id: 702, name: 'CI', status: 'completed', conclusion: 'success',
         head_branch: 'main', head_sha: 'validated-sha', html_url: 'https://github.com/acme/app/actions/runs/702' },
     });
     expect(successfulCi).toMatchObject({ accepted: true });
@@ -649,7 +706,7 @@ describe('GitHub App integration', () => {
     // environment can leave a perfectly real deployment waiting for approval.
     await deliver('workflow_run', 'workflow-deploy-waiting', {
       installation: { id: 42 }, action: 'requested', repository: { id: 99, full_name: 'acme/app' },
-      workflow_run: { id: 703, name: 'Deploy', status: 'waiting', conclusion: null,
+      workflow_run: { event: 'workflow_run', head_repository: { id: 99 }, id: 703, name: 'Deploy', status: 'waiting', conclusion: null,
         head_branch: 'main', head_sha: 'validated-sha' },
     });
     expect((await store.kvEntries('github:deployment-expectation:'))).toEqual([]);
@@ -760,6 +817,30 @@ describe('GitHub App failure and suspension handling', () => {
     // A successful delivery IS still deduped.
     expect(await h.deliver('installation_repositories', 'd-1', body)).toMatchObject({ accepted: false });
     (await h.store.close()); fs.rmSync(h.dir, { recursive: true, force: true });
+  });
+
+  it('retries failed webhook processing without a GitHub redelivery', async () => {
+    let failing = true;
+    const h = await harness(async (url) => {
+      if (url.pathname.endsWith('/access_tokens')) return Response.json({ token: 't', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/installation/repositories') return failing ? new Response('unavailable', { status: 503 }) : Response.json({ repositories: [] });
+      return new Response('', { status: 404 });
+    });
+    try {
+      await h.store.upsertGitConnection({ organizationId: h.organization.id, provider: 'github', installationId: '42', accountLogin: 'acme' });
+      const raw = Buffer.from(JSON.stringify({ installation: { id: 42 }, action: 'added' }));
+      const signature = `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(raw).digest('hex')}`;
+      const results: unknown[] = [];
+      const dispatch = async (result: unknown) => { results.push(result); };
+      await expect(h.service.deliverWebhook('installation_repositories', 'durable', raw, signature, dispatch)).rejects.toThrow();
+      failing = false;
+      const now = Date.now() + 600_000;
+      for (let index = 0; index < 100; index++) await h.store.kvSet(`github:webhook-pending:000-${index}`,
+        JSON.stringify({ nextAt: now + 60_000, leaseUntil: 0 }));
+      await h.service.retryWebhooks(dispatch, now);
+      expect(results).toEqual([expect.objectContaining({ accepted: true, reconciled: 0 })]);
+      expect(await h.store.kvEntries('github:webhook-pending:')).toHaveLength(100);
+    } finally { await h.store.close(); fs.rmSync(h.dir, { recursive: true, force: true }); }
   });
 
   it('un-suspends an installation on the unsuspend webhook', async () => {
@@ -941,4 +1022,17 @@ describe('GitHub App failure and suspension handling', () => {
     await expect(service.installationToken((await store.getGitConnection(connection.id))!)).rejects.toThrow(/suspended/);
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
+});
+
+it('bounds GitHub provisioning requests with an abort signal (PS-7)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-timeout-'));
+  const store = await Store.create(':memory:');
+  let signal: AbortSignal | null | undefined;
+  try {
+    const app = await GitHubAppService.create(store, new CredentialBroker(new Vault(dir)), { fetch: async (_input, init) => {
+      signal = init?.signal; return Response.json({ ok: true });
+    } });
+    await (app as any).request('/repos/example/wiki', 'fixture');
+    expect(signal).toBeInstanceOf(AbortSignal);
+  } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

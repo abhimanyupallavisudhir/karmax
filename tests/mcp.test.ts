@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -55,6 +55,10 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'get_execution_policy', 'set_execution_policy',
       ]),
     );
+    // PL-7: saveSkill writes under the caller's organization, not installation-wide.
+    const saveSkill = tools.find((t) => t.name === 'save_skill')!;
+    expect(saveSkill.description).not.toMatch(/installation-wide/i);
+    expect(saveSkill.description).toMatch(/organization/i);
     const described: any = await client.callTool({ name: 'describe_platform', arguments: {} });
     const catalog = JSON.parse(described.content[0].text);
     expect(catalog.administration).toContain('GET|POST /api/users');
@@ -72,6 +76,15 @@ describe('platform MCP server (capability-checked tool calls)', () => {
       model: { type: 'string' },
       effort: { enum: expect.arrayContaining(['low', 'high', 'xhigh']) },
     });
+  });
+
+  it('projects bare task listings from summaries', async () => {
+    const full = vi.fn(async () => { throw new Error('full conversation listing used'); });
+    const summaries = vi.fn(async () => [{ id: 'task-1', title: 'Task', workflow: 'just-do' }]);
+    const ops = apiOps({ listTasks: full, listTaskSummaries: summaries } as any, () => 'token');
+    expect(await ops.listTasks('project')).toEqual([{ id: 'task-1', title: 'Task', workflow: 'just-do' }]);
+    expect(summaries).toHaveBeenCalledWith('token', 'project');
+    expect(full).not.toHaveBeenCalled();
   });
 
   it('routes exact historical verification through the authorized API', async () => {
@@ -451,12 +464,23 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   });
 
   it('permits a tool call when the token carries the capability', async () => {
+    // Without a project of its own or organization:wiki:write there is nowhere to save.
     currentToken = (await tokens.mint({
       taskId: 't1',
       profileId: 'do',
       principal: 'user:a',
       ceiling: ['save-skill'],
       grantorCaps: ['save-skill'],
+    })).token;
+    const refused: any = await client.callTool({ name: 'save_skill', arguments: { name: 'greet', content: '# hi' } });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toMatch(/organization:wiki:write/);
+    currentToken = (await tokens.mint({
+      taskId: 't1',
+      profileId: 'do',
+      principal: 'user:a',
+      ceiling: ['save-skill', 'organization:wiki:write'],
+      grantorCaps: ['save-skill', 'organization:wiki:write'],
     })).token;
     const res: any = await client.callTool({ name: 'save_skill', arguments: { name: 'greet', content: '# hi' } });
     expect(res.isError).toBeFalsy();

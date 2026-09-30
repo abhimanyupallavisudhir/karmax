@@ -23,11 +23,14 @@ async function repositoryFixture(store: Store) {
     private: true,
   }));
   (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+  await store.setSettings(`organization:${organization.id}`, 'github-deployment-monitor', {
+    repositories: { [repository.id]: { sourceWorkflow: 'CI', workflow: 'Deploy', file: '.github/workflows/deploy.yml' } },
+  });
   return { project, repository };
 }
 
 const successfulCi = (sha = 'a'.repeat(40)) => ({
-  id: 700,
+  event: 'push', head_repository: { id: 99 }, id: 700,
   name: 'CI',
   status: 'completed',
   conclusion: 'success',
@@ -49,6 +52,28 @@ function githubWithRuns(runs: any[] = []) {
 }
 
 describe('missing GitHub deployment runs', () => {
+  it('requires explicit repository monitoring and defers API outages', async () => {
+    const store = await Store.create(':memory:');
+    try {
+      const { repository } = await repositoryFixture(store);
+      const scope = `organization:${repository.organizationId}`;
+      const configured = await store.getSettings(scope, 'github-deployment-monitor');
+      await store.setSettings(scope, 'github-deployment-monitor', {});
+      await observeDeploymentWorkflowRun(store, repository, successfulCi(), { now: 1000 });
+      expect(await store.kvEntries('github:deployment-expectation:')).toEqual([]);
+      await store.setSettings(scope, 'github-deployment-monitor', configured!);
+      await observeDeploymentWorkflowRun(store, repository, successfulCi(), { now: 1000 });
+      const { github, listRuns } = githubWithRuns();
+      listRuns.mockRejectedValue(new Error('GitHub unavailable'));
+      const monitor = new GitHubDeploymentMonitor(store, github);
+      expect(await monitor.reconcile(1000 + DEPLOYMENT_RUN_GRACE_MS)).toEqual([]);
+      expect(await store.kvEntries('github:deployment-expectation:')).toHaveLength(1);
+      listRuns.mockResolvedValue({ total: 0, page: 1, perPage: 100, runs: [] });
+      github.repositoryFileStatus.mockResolvedValue({ status: 'unreadable', error: 'GitHub unavailable' } as any);
+      expect(await monitor.reconcile(1000 + DEPLOYMENT_RUN_GRACE_MS)).toEqual([]);
+    } finally { await store.close(); }
+  });
+
   it('reports no Deploy run after successful master CI and the bounded grace period', async () => {
     const store = (await Store.create(':memory:'));
     const { project, repository } = (await repositoryFixture(store));
@@ -120,7 +145,7 @@ describe('missing GitHub deployment runs', () => {
     const store = (await Store.create(':memory:'));
     const { repository } = (await repositoryFixture(store));
     (await observeDeploymentWorkflowRun(store, repository, {
-      id: 699, name: 'Deploy', status: 'completed', conclusion: 'success',
+      event: 'workflow_run', head_repository: { id: 99 }, id: 699, name: 'Deploy', status: 'completed', conclusion: 'success',
       head_branch: 'master', head_sha: 'b'.repeat(40),
     }));
     (await observeDeploymentWorkflowRun(store, repository, successfulCi(), { now: 4_500_000 }));

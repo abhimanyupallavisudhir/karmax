@@ -3,7 +3,8 @@
 ```bash
 npm test            # full suite (sequential, resource-capped)
 npm run typecheck
-npm run test:coverage   # same suite, instrumented (needs `npm i` once for @vitest/coverage-v8)
+npm run lint        # oxlint + warning and `as any` budgets that fail when exceeded (scripts/lint.ts)
+npm run test:coverage   # same suite, instrumented; coverage dependency is installed by npm ci
 ```
 
 ## Coverage
@@ -19,14 +20,14 @@ than vanishing from the report, which is the gap worth seeing. Report lands in
 Most of karmax's behavior is only meaningful against the **real** durable engine,
 so the integration tests don't mock Temporal — each integration test file boots
 an actual `temporal server start-dev` process **and** a Temporal Worker (which
-bundles the workflow code and runs a reusable-VM pool). Six test files do this.
+bundles the workflow code and runs a reusable-VM pool). Many integration files do this.
 
-If those run **in parallel**, you get six full Temporal servers + six workers +
+If those run **in parallel**, you get multiple Temporal servers and workers with
 their thread pools at once, which can peg every core and exhaust RAM — enough to
 freeze a laptop. The config prevents that:
 
 - **`vitest.config.ts`** runs files **sequentially in a single process**
-  (`fileParallelism: false`, `singleFork: true`, `maxConcurrency: 1`), so at most
+  (`fileParallelism: false`, `maxWorkers: 1`, `isolate: false`, `maxConcurrency: 1`), so at most
   **one** Temporal server + worker is alive at a time.
 - **The Worker is resource-capped** (`src/temporal/worker.ts`):
   `maxCachedWorkflows`, `maxConcurrentWorkflowTaskExecutions`, and
@@ -49,17 +50,38 @@ npx vitest run tests/pipeline.test.ts -t "merge queue"
 ```
 
 These files need **no** Temporal server (fast, cheap, run them freely):
-`ports`, `store`, `world`, `merge`, `security`, `mcp`, `overlays`, `repo-path`.
+`ports`, `store`, `world`, `worktree-lock`, `merge`, `merge-wait`,
+`coordinator-health`, `stage-transitions`, `security`, `mcp`, `overlays`,
+`repo-path`, `deploy-edge`, `inbox`, `collaboration`, `web-regressions`.
 
 These boot a Temporal dev server (heavier, one at a time):
 `temporal`, `pipeline`, `workflows`, `gateway`, `autonomy`, `live-agent`.
+
+Hosted deployments run on PostgreSQL. Store-level suites that cover tenancy,
+billing or core store state run on both databases through
+`tests/helpers/store-backends.ts` (`describe.each(storeBackends)`): SQLite
+always, and PostgreSQL too when `KARMAX_TEST_POSTGRES_URL` is set, as it is on
+every CI shard. Each PostgreSQL store gets a schema of its own, dropped when
+its test ends. Locally:
+
+```bash
+KARMAX_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:5432/db npx vitest run tests/store.test.ts
+```
+
+Console UI tests exercise the real console: `tests/helpers/console-page.ts`
+loads `web/` into Chromium with a scripted `/api`, so a test renders a
+component with the console's own functions and then clicks, types and reads
+the DOM and the requests made. (Chromium comes from `npx playwright install
+chromium`, as in CI.) Do not assert on the text of `web/` or `src/` files:
+`tests/source-text-ratchet.test.ts` fails on any such assertion.
 
 ## CI
 
 CI (`.github/workflows/ci.yml`) splits the suite across parallel runners with
 Vitest's `--shard`; each runner still runs its files one at a time. The
-required `typecheck + tests` check passes only when the typecheck and every
-shard pass. To reproduce a failing shard, run the same slice locally:
+required `typecheck + tests` check passes only when the typecheck, every
+shard and `deploy artifacts` pass. To reproduce a failing shard, run the same
+slice locally:
 
 ```bash
 npx vitest run --shard=2/5
@@ -75,24 +97,69 @@ measurements from a green CI run:
 gh run view <run-id> --log | npm run test:durations
 ```
 
-No shard can finish faster than the slowest single file (`pipeline.test.ts`,
-about 6.5 minutes in CI). Adding a number to the `test` job's `shard` list helps
+No shard can finish faster than the slowest single file
+(`github-pr-pipeline.test.ts`, about 3.5 minutes). Adding a number to the `test` job's `shard` list helps
 only while the shards are well above that; past it, split the slowest file.
+
+Jobs install through `.github/actions/install`, which restores `node_modules`
+from the Actions cache when the lockfile, platform and Node release match an
+earlier run, and runs `npm ci` only on a miss; the shards also cache the
+locked Playwright release's Chromium.
+
+`deploy artifacts` installs the turnkey stack exactly as an operator does
+(`./deploy/karmax up karmax.localhost`), then checks the booted hosted cell:
+the edge routes to it, and the app reaches PostgreSQL only as its own role.
+Pull requests that change only tests, docs or other workflows skip it.
+`tests/hosted-main.test.ts` boots `src/main.ts` as a hosted cell on the
+shards' PostgreSQL and a Temporal dev server; it needs
+`KARMAX_TEST_POSTGRES_URL`, like every PostgreSQL test.
 
 ## The live-agent test
 
-`tests/live-agent.test.ts` is **skipped unless** a real key is present. It spends
-real tokens, so it stays off by default:
+Every suite that imports `tests/helpers/live-gate.js` (`live-agent`, `cloud-live`,
+`e2b-workflow-live`, `github-live`, the Daytona suites, …) requires `KARMAX_RUN_LIVE=1`
+in addition to its credentials. They spend model or
+provider credit or write to a GitHub fixture, so ordinary `npm test` never runs them:
 
 ```bash
-OPENAI_API_KEY=…  npx vitest run tests/live-agent.test.ts
-KARMAX_SKIP_LIVE=1 npm test     # force-skip even if a key is set
+KARMAX_RUN_LIVE=1 OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
 ```
+
+### Live tests in GitHub Actions
+
+`.github/workflows/live.yml` runs every suite behind the live gate on demand
+(Actions → Live → Run workflow, optionally one suite), and every Monday once
+the repository variable `KARMAX_LIVE_SCHEDULE` is `true`; until then the
+schedule does nothing. A suite whose secret is missing is skipped, and the
+`choose suites` log says why.
+
+The `LIVE_*` secrets must be secrets of the `live` environment, restricted to
+the `master` branch and with a required reviewer, never repository secrets.
+A dispatch runs the chosen branch's workflow file and test code, so a
+repository secret would reach any branch someone can push. Every job also
+refuses to run off master, but a branch can edit that guard away; the
+environment's branch rule is the control.
+
+
+
+| Suite | Secret | Runs |
+| --- | --- | --- |
+| `models` | `LIVE_ANTHROPIC_API_KEY`, `LIVE_OPENAI_API_KEY` (either) | `live-providers` |
+| `agent` | `LIVE_OPENAI_API_KEY` | `live-agent` |
+| `claude` | `LIVE_CLAUDE_CODE_OAUTH_TOKEN` | `claude-permission` |
+| `e2b` | `LIVE_E2B_API_KEY` | `cloud-live`, `e2b-workflow-live` (a task that pauses at Review, resumes and tears down) |
+| `daytona` | `LIVE_DAYTONA_API_KEY` | `daytona-live`, `daytona-environment-live`, `daytona-workflow-live` |
+| `github` | `LIVE_GITHUB_TOKEN`: a fine-grained token for the private `karmax-e2e-tests` repository only (Contents, Issues and Pull requests read and write; Commit statuses read). Clones and pushes go over HTTPS with it. | `github-live` |
+
+The Daytona snapshot build keeps its own switch (`KARMAX_DAYTONA_LIVE_BUILD`)
+and does not run there. The `e2b` and `daytona` suites together use about ten
+minutes of sandbox time (2026-09-29); the model suites send a few small requests.
 
 ## Docker test
 
-`tests/container.test.ts` uses Docker (image `node:22-slim`). It self-skips if
-Docker isn't running; force-skip with `KARMAX_SKIP_DOCKER=1`.
+`tests/container.test.ts` and `tests/services-docker.test.ts` use Docker. An
+enabled suite fails if Docker is unavailable; explicitly skip them with
+`KARMAX_SKIP_DOCKER=1` on a machine without a Docker daemon.
 
 ## Cleaning up stray processes
 
@@ -101,12 +168,11 @@ Temporal dev server child can be orphaned and keep using RAM. Find and clear the
 
 ```bash
 pgrep -af 'temporal server start-dev'    # list any orphans
-pkill -f 'temporal server start-dev'     # kill them
-npm run reset                            # also wipes karmax's Temporal + local state
+ps -fp <pid>                             # identify the owning test before stopping it
 ```
 
-When stopping the app, prefer **Ctrl-C** (runs graceful shutdown, which kills the
-Temporal child) over `fuser -k <port>` / `kill -9` (leaves the child orphaned).
+Do not blanket-kill Temporal processes or run `npm run reset` on an active app:
+the shared dev server survives normal Ctrl-C shutdown and is reused by the next boot.
 
 ## Agent MCP connections
 
@@ -119,7 +185,7 @@ they do not spend model tokens. `mcp-workflow.test.ts` additionally runs a real
 Temporal task through Review and checks secret exclusion from workflow history.
 
 ```bash
-TEMPORAL_CLI=/path/to/temporal KARMAX_SKIP_LIVE=1 npx vitest run tests/mcp*.test.ts
+TEMPORAL_CLI=/path/to/temporal npx vitest run tests/mcp*.test.ts
 npm run typecheck
 ```
 
@@ -146,25 +212,6 @@ and native tool discovery does not establish successful live model tool use.
 These checks reduce risk; they do not certify arbitrary third-party servers or
 prove the absence of vulnerabilities.
 
-### Verification recorded 2026-09-16
-
-- MCP checks: **123 passed**, including a real browser, native Codex startup,
-  live Registry → Microsoft Learn tool call, and a real Temporal task. The one
-  deployment smoke test was skipped: Docker/E2B/Daytona were unavailable.
-- Repository regression: the initial single-worker run reached 1,536 passing
-  tests before an unexpected worker exit. The remaining files and affected
-  tests were run in sequential batches of 20, with targeted reruns afterward.
-  The batches recorded 964 passes; final targeted verification recorded 25
-  passes. These counts overlap and must not be added as unique coverage.
-- Every observed assertion failure was resolved and passed on rerun: missing
-  local native dependencies, an existing lineage fixture that modified host
-  Node symlinks, and omitted MCP routes in the API discovery catalog.
-- No live cloud sandbox, real-account OAuth consent, or paid model invocation
-  was verified. OAuth and model API interaction tests use protocol fixtures.
-
-The broad run was not one uninterrupted green suite. Use the commands above to
-reproduce the relevant checks; preserve per-run results and explicit skips.
-
 ## Daytona
 
 Unit and SDK-contract regressions (no account or cloud credit required):
@@ -178,7 +225,7 @@ With `DAYTONA_API_KEY` supplied securely in the environment, run these sequentia
 ```bash
 npx vitest run tests/daytona-live.test.ts tests/daytona-environment-live.test.ts
 KARMAX_DAYTONA_LIVE_BUILD=1 npx vitest run tests/daytona-environment-live.test.ts
-KARMAX_DAYTONA_LIVE_WORKFLOW=1 npx vitest run tests/daytona-workflow-live.test.ts
+KARMAX_RUN_LIVE=1 npx vitest run tests/daytona-workflow-live.test.ts
 KARMAX_MCP_LIVE_WORLD=daytona npx vitest run tests/mcp-deployment.test.ts
 ```
 

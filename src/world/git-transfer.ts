@@ -1,3 +1,5 @@
+import path from 'node:path';
+import { Context } from '@temporalio/activity';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import type { World, ExecResult } from './types.js';
@@ -60,9 +62,8 @@ export async function createGitBundle(run: GitRunner, branch: string, file: stri
 
 function checkSize(bytes: number): void {
   if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('Invalid Git bundle size');
-  // No implicit repository-size ceiling: large content is streamed. Operators
-  // may still explicitly impose a transfer quota, checked BEFORE reading data.
-  const configured = process.env.KARMAX_MAX_GIT_BUNDLE_MB;
+  const configured = process.env.KARMAX_MAX_GIT_BUNDLE_MB
+    ?? (process.env.KARMAX_DEPLOYMENT === 'hosted' ? '1024' : undefined);
   if (configured === undefined) return;
   const limit = Number(configured);
   if (!Number.isFinite(limit) || limit <= 0) throw new Error('KARMAX_MAX_GIT_BUNDLE_MB must be a positive number');
@@ -70,26 +71,36 @@ function checkSize(bytes: number): void {
     throw new Error(`Git bundle (${bytes} bytes) exceeds configured ${limit} MiB policy`);
 }
 
-export async function downloadGitBundle(world: World, relative: string, destination: string): Promise<void> {
+export async function downloadGitBundle(world: World, relative: string, destination: string, signal = activitySignal()): Promise<void> {
+  signal?.throwIfAborted();
   const cwd = world.handle.root;
   const bytes = Number(await gitTransferCheck(world.exec('stat', ['-c', '%s', '--', relative], { cwd })));
   checkSize(bytes);
   const piece = `${relative}.${crypto.randomUUID()}.chunk`;
+  const disk = await fs.promises.statfs(path.dirname(destination));
+  if (disk.bavail * disk.bsize < bytes + 64 * 1024 * 1024) throw new Error('Insufficient disk space for Git bundle');
+  signal?.throwIfAborted();
   const output = await fs.promises.open(destination, 'wx', 0o600);
   try {
     for (let offset = 0; offset < bytes; offset += CHUNK_BYTES) {
+      signal?.throwIfAborted();
       await gitTransferCheck(world.exec('dd', [`if=${relative}`, `of=${piece}`, `bs=${CHUNK_BYTES}`, `skip=${offset / CHUNK_BYTES}`, 'count=1', 'status=none'], { cwd }));
       const data = await world.readFileBuffer(piece);
       if (data.length !== Math.min(CHUNK_BYTES, bytes - offset)) throw new Error('Truncated Git bundle transfer');
+      signal?.throwIfAborted();
       await output.writeFile(data);
     }
+  } catch (error) {
+    await fs.promises.rm(destination, { force: true });
+    throw error;
   } finally {
     await output.close();
     await world.exec('rm', ['-f', '--', piece], { cwd }).catch(() => undefined);
   }
 }
 
-export async function uploadGitBundle(world: World, source: string, relative: string): Promise<void> {
+export async function uploadGitBundle(world: World, source: string, relative: string, signal = activitySignal()): Promise<void> {
+  signal?.throwIfAborted();
   const bytes = (await fs.promises.stat(source)).size;
   checkSize(bytes);
   if (!world.writeFileBuffer) throw new Error('world provider cannot receive binary Git handoffs');
@@ -98,7 +109,8 @@ export async function uploadGitBundle(world: World, source: string, relative: st
   try {
     await gitTransferCheck(world.exec('truncate', ['-s', '0', '--', relative], { cwd }));
     let offset = 0;
-    for await (const data of fs.createReadStream(source, { highWaterMark: CHUNK_BYTES })) {
+    for await (const data of fs.createReadStream(source, { highWaterMark: CHUNK_BYTES, signal })) {
+      signal?.throwIfAborted();
       await world.writeFileBuffer(piece, data as Buffer);
       await gitTransferCheck(world.exec('dd', [`if=${piece}`, `of=${relative}`, 'bs=1M', `seek=${offset}`, 'oflag=seek_bytes', 'conv=notrunc', 'status=none'], { cwd }));
       offset += (data as Buffer).length;
@@ -107,4 +119,8 @@ export async function uploadGitBundle(world: World, source: string, relative: st
   } finally {
     await world.exec('rm', ['-f', '--', piece], { cwd }).catch(() => undefined);
   }
+}
+
+function activitySignal(): AbortSignal | undefined {
+  try { return Context.current().cancellationSignal; } catch { return undefined; }
 }

@@ -4,6 +4,17 @@ import { ImapPuller, AgentMailPuller, MailPoller, createPuller, type PullStore, 
 import { ImapMailboxProvider, AgentMailboxProvider, guessImapHost, type MailboxConfig } from '../src/autonomy/mailbox.js';
 import { AgentMail } from '../src/autonomy/agent-mail.js';
 
+/** An IMAP INBOX that answers UID searches and fetches like a server. */
+function mailbox(initial: { uid: number; source: string }[]): ImapConn & { add(messages: { uid: number; source: string }[]): void } {
+  const messages = [...initial];
+  return {
+    add: (more) => { messages.push(...more); },
+    uids: async (from, to = Infinity) => messages.map(m => m.uid).filter(uid => uid >= from && uid <= to).sort((a, b) => a - b),
+    fetch: async (uids) => messages.filter(m => uids.includes(m.uid)).sort((a, b) => a.uid - b.uid),
+    close: async () => {},
+  };
+}
+
 function store(seed: Record<string, string> = {}): PullStore & { transaction: ReturnType<typeof memoryTransaction>; kv: Map<string, string>; orgs: { id: string }[] } {
   const kv = new Map<string, string>(Object.entries(seed));
   const orgs: { id: string }[] = [];
@@ -44,7 +55,7 @@ describe('ImapPuller', () => {
     const mail = new AgentMail(s as any, 'gmail.com', 'agent');
     s.orgs.push({ id: 'org_a' });
     const addr = (await mail.address('org_a')); // agent+agent-<tok>@gmail.com
-    const conn: ImapConn = { fetchSince: async (last) => [raw(5, addr, '111222'), raw(6, addr, '333444')].filter((m) => m.uid > last), close: async () => {} };
+    const conn = mailbox([raw(5, addr, '111222'), raw(6, addr, '333444')]);
     const puller = new ImapPuller(config, {
       store: s, organizationId: 'org_a', resolveSecret: (h) => (h === config.apiKeyHandle ? 'app-pass' : undefined),
       ingest: async (m) => (await mail.ingest(m)), openImap: async () => conn,
@@ -53,8 +64,40 @@ describe('ImapPuller', () => {
     expect((await s.kvGet('agent-mail:imap-uid:org_a'))).toBe('6');
     expect((await mail.recent('org_a')).map((m) => m.code)).toContain('111222');
     // a second poll starts after uid 6 → nothing new
-    conn.fetchSince = async (last) => [raw(6, addr, '333444')].filter((m) => m.uid > last);
     expect(await puller.poll()).toBe(0);
+  });
+
+  // AU-16: new mail (a verification code) must arrive within one poll, however
+  // much history the mailbox holds or however far a backlog has grown.
+  it('delivers the newest mail first, skips pre-connection history and backfills later gaps', async () => {
+    const s = store();
+    const delivered: number[] = [];
+    const conn = mailbox(Array.from({ length: 1000 }, (_, i) => raw(i + 1, 'agent@gmail.com', String(i + 1))));
+    const puller = new ImapPuller(config, {
+      store: s, organizationId: 'org_a', resolveSecret: () => 'app-pass', openImap: async () => conn,
+      ingest: (m) => { delivered.push(Number(/code is (\d+)/.exec(m.text)?.[1])); return { delivered: true }; },
+    });
+    await puller.poll();
+    expect(delivered).toEqual(Array.from({ length: 50 }, (_, i) => 951 + i));
+    expect(await s.kvGet('agent-mail:imap-uid:org_a')).toBe('1000');
+    delivered.length = 0;
+    await puller.poll();
+    expect(delivered).toEqual([]);
+    // 120 messages arrive between polls: the newest are delivered at once.
+    conn.add(Array.from({ length: 120 }, (_, i) => raw(1001 + i, 'agent@gmail.com', String(1001 + i))));
+    await puller.poll();
+    expect(delivered).toEqual(Array.from({ length: 50 }, (_, i) => 1071 + i));
+    delivered.length = 0;
+    conn.add([raw(1121, 'agent@gmail.com', '1121')]);
+    await puller.poll();
+    expect(delivered[0]).toBe(1121);
+    expect(delivered.slice(1)).toEqual(Array.from({ length: 49 }, (_, i) => 1022 + i));
+    delivered.length = 0;
+    await puller.poll();
+    expect(delivered).toEqual(Array.from({ length: 21 }, (_, i) => 1001 + i));
+    delivered.length = 0;
+    await puller.poll();
+    expect(delivered).toEqual([]);
   });
 
   it('returns 0 (no crash) when no password is stored', async () => {
@@ -119,4 +162,28 @@ describe('MailPoller loop', () => {
     expect(createPuller({ provider: 'agentmail', apiKeyHandle: 'am-key', agentmailDomain: 'agentmail.to', agentmailAddress: 'x@agentmail.to' }, deps)).toBeInstanceOf(AgentMailPuller);
     expect(createPuller({ provider: 'self-managed', domain: 'x.com' }, deps)).toBeUndefined();
   });
+});
+
+it('verifies that an AgentMail key can access the requested inbox (AU-1)', async () => {
+  const { verifyAgentMailInbox } = await import('../src/autonomy/mail-pull.js');
+  const denied = async () => new Response('{}', { status: 403 });
+  await expect(verifyAgentMailInbox('key', 'victim@example.com', denied as typeof fetch)).rejects.toThrow();
+  const mismatch = async () => new Response(JSON.stringify({ inbox_id: 'other@example.com' }));
+  await expect(verifyAgentMailInbox('key', 'victim@example.com', mismatch as typeof fetch)).rejects.toThrow();
+  const allowed = async () => new Response(JSON.stringify({ inbox_id: 'victim@example.com' }));
+  await expect(verifyAgentMailInbox('key', 'victim@example.com', allowed as typeof fetch)).resolves.toBeUndefined();
+});
+
+it('refuses hosted IMAP access to private addresses before opening a connection (AU-16)', async () => {
+  const old = process.env.KARMAX_DEPLOYMENT;
+  process.env.KARMAX_DEPLOYMENT = 'hosted';
+  let opened = false;
+  try {
+    const puller = new ImapPuller({ provider: 'imap', apiKeyHandle: 'key', imap: { host: '127.0.0.1', port: 993, secure: true, user: 'u' } }, {
+      store: store(), resolveSecret: () => 'secret', ingest: () => ({ delivered: false }),
+      openImap: async () => { opened = true; return mailbox([]); },
+    });
+    await expect(puller.poll()).rejects.toThrow(/private|public/);
+    expect(opened).toBe(false);
+  } finally { if (old === undefined) delete process.env.KARMAX_DEPLOYMENT; else process.env.KARMAX_DEPLOYMENT = old; }
 });

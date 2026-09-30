@@ -23,6 +23,76 @@ const event = (id: string, type: string, object: any, created = 100) =>
   Buffer.from(JSON.stringify({ id, type, created, data: { object } }));
 
 describe('hosted subscription billing', () => {
+  it('reconciles later organizations when an earlier entitlement update fails', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    try {
+      const billing = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true);
+      for (const name of ['First', 'Second']) {
+        const org = await store.createOrganization({ name, ownerUserId: 'owner' });
+        await billing.checkout(org.id, 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, `checkout-${name}`);
+      }
+      const reconcile = vi.spyOn(billing as any, 'reconcileAccount').mockRejectedValueOnce(new Error('one bad row')).mockResolvedValue(undefined);
+      await expect(billing.reconcileEntitlements()).rejects.toThrow();
+      expect(reconcile).toHaveBeenCalledTimes(2);
+    } finally { await store.close(); }
+  });
+
+  it('ignores events for another subscription of an already-bound customer', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    try {
+      const org = await store.createOrganization({ name: 'Bound', ownerUserId: 'owner' });
+      const billing = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true);
+      await billing.checkout(org.id, 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'bound-checkout');
+      await billing.handleWebhook(event('bound-active', 'customer.subscription.updated', {
+        id: 'sub_bound', customer: `cus_${org.id}`, status: 'active',
+        items: { data: [{ id: 'si_bound', price: 'price_individual', quantity: 1 }] },
+      }));
+      for (const type of ['customer.subscription.deleted', 'invoice.payment_failed', 'checkout.session.completed']) {
+        await billing.handleWebhook(event(`foreign-${type}`, type, {
+          id: type.startsWith('customer.') ? 'sub_foreign' : 'foreign',
+          subscription: 'sub_foreign', customer: `cus_${org.id}`, status: 'canceled',
+        }, 200));
+      }
+      expect(await billing.current(org.id)).toMatchObject({ plan: 'individual', status: 'active' });
+    } finally { await store.close(); }
+  });
+
+  it('resumes a pending Stripe checkout across different client request keys', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    try {
+      const org = await store.createOrganization({ name: 'One checkout', ownerUserId: 'owner' });
+      const fetcher = vi.fn(async (url: any, init: any) => {
+        if (String(url).endsWith('/customers')) return Response.json({ id: 'cus_test' });
+        return Response.json({ id: 'cs_one', url: 'https://checkout.test/one', status: 'open',
+          customer: 'cus_test', metadata: { karmax_plan: 'individual', karmax_seats: '1' } });
+      });
+      const provider = new StripeSubscriptionProvider(() => ({ secretKey: 'sk_test_fake', webhookSecret: 'whsec_fake',
+        individualPriceId: 'price_individual', teamBasePriceId: 'price_team', teamSeatPriceId: 'price_seat' }), fetcher);
+      const billing = new SubscriptionBillingService(store, provider, true);
+      const urls = { success: 'https://test/s', cancel: 'https://test/c' };
+      await billing.checkout(org.id, 'individual', urls, 'stripe-checkout-first');
+      await billing.checkout(org.id, 'individual', urls, 'stripe-checkout-second');
+      expect(fetcher.mock.calls.filter(([url, init]) => String(url).endsWith('/checkout/sessions') && init.method === 'POST')).toHaveLength(1);
+    } finally { await store.close(); }
+  });
+
+  it('continues reconciling subscriptions sold under a retired price', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    try {
+      const org = await store.createOrganization({ name: 'Grandfathered', ownerUserId: 'owner' });
+      const catalog = { individualPriceId: 'price_old', teamBasePriceId: 'price_team', teamSeatPriceId: 'price_seat' };
+      const provider = new FakeSubscriptionProvider(catalog);
+      const billing = new SubscriptionBillingService(store, provider, true);
+      await billing.checkout(org.id, 'individual', { success: 'https://test/s', cancel: 'https://test/c' }, 'old-price-checkout');
+      catalog.individualPriceId = 'price_new';
+      await billing.handleWebhook(event('old-price-active', 'customer.subscription.updated', {
+        id: 'sub_old', customer: `cus_${org.id}`, status: 'active',
+        items: { data: [{ id: 'si_old', price: 'price_old', quantity: 1 }] },
+      }));
+      expect(await billing.current(org.id)).toMatchObject({ plan: 'individual', status: 'active' });
+    } finally { await store.close(); }
+  });
+
   it('persists complimentary plans without Stripe and restores paid access after removal', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-gifts-'));
     const database = path.join(directory, 'billing.db');

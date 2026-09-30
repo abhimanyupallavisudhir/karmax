@@ -51,7 +51,20 @@ esac
     appendGitConfig(env, 'url.https://github.com/.insteadOf', 'ssh://git@ssh.github.com:443/');
     files.push(tokenPath, askpassPath);
   }
+  // WD-22: Git asks configured credential helpers before GIT_ASKPASS, so an
+  // operator's helper (store, osxkeychain, …) would answer this operation with
+  // the operator's credential, and `store` would keep this one. An empty value
+  // resets the helper list; a caller that configured its own helpers keeps them.
+  if ((credential.sshKey || credential.httpsToken) && !configuresKey(env, 'credential.helper'))
+    appendGitConfig(env, 'credential.helper', '');
   return { env, files };
+}
+
+function configuresKey(env: Record<string, string>, key: string): boolean {
+  const count = Number(env.GIT_CONFIG_COUNT ?? 0);
+  for (let index = 0; Number.isSafeInteger(count) && index < count; index++)
+    if (env[`GIT_CONFIG_KEY_${index}`]?.toLowerCase() === key) return true;
+  return false;
 }
 
 /** Append a process-local Git config entry without replacing caller isolation

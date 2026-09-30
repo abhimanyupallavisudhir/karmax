@@ -6,6 +6,7 @@
 export type {
   TaskInput,
   TaskRecoveryCheckpoint,
+  TaskContinuation,
   TaskView,
   Stage,
   TaskStatus,
@@ -25,6 +26,7 @@ export type {
   ProjectConfig,
   ChildRaise,
   ParentResponse,
+  SubTaskRequest,
   SubTaskResponse,
   RaiseToParent,
   AgentWait,

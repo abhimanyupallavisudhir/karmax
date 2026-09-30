@@ -5,6 +5,7 @@
 export class AsyncInterval {
   private timer: NodeJS.Timeout;
   private running?: Promise<void>;
+  private again?: Promise<void>;
   private stopped = false;
 
   constructor(private operation: () => unknown, milliseconds: number,
@@ -17,6 +18,13 @@ export class AsyncInterval {
     return this.running ??= Promise.resolve().then(this.operation).then(() => {}, error => {
       try { this.onError(error); } catch { /* a diagnostic must not reject the timer */ }
     }).finally(() => { this.running = undefined; });
+  }
+  /** Run now, or once more as soon as the invocation in flight settles: a
+   * wake-up that arrives mid-run may concern work that run has already passed
+   * (#396 review item 9). Wake-ups during one run coalesce into one rerun. */
+  wake(): Promise<void> {
+    if (!this.running) return this.run();
+    return this.again ??= this.running.then(() => { this.again = undefined; return this.run(); });
   }
   unref(): this { this.timer.unref(); return this; }
   async stop(): Promise<void> {

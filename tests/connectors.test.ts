@@ -75,7 +75,7 @@ describe('Bitwarden connector', () => {
     await expect(connectors.connect('bitwarden', '')).rejects.toThrow(/session key/i);
     expect(connectors.secretFor('bitwarden')).toBeUndefined();
 
-    await expect(connectors.connect('bitwarden', 'sess')).resolves.toMatchObject({ available: true });
+    await expect(connectors.connect('bitwarden', 'sess')).resolves.toMatchObject({ connector: { available: true }, newStore: true });
     expect(connectors.secretFor('bitwarden')).toBe('sess');
   });
 
@@ -118,6 +118,81 @@ describe('1Password connector', () => {
     const [pulled] = (await c.pull(['op1'])).items;
     expect(pulled!.username).toBe('octo');
     expect(pulled!.secrets).toEqual({ password: 'sw0rd', totp: 'JBSWY3DPEHPK3PXP' });
+  });
+
+  // AU-29: `op item edit` takes a new value only as an argv assignment, which
+  // every local process can read from /proc; the write goes through the SDK.
+  it('writes a rotated secret back without putting it in argv', async () => {
+    const commands: string[][] = [];
+    const cli = async (cmd: string, args: string[]) => {
+      commands.push([cmd, ...args]);
+      return args.slice(0, 2).join(' ') === 'item get' ? JSON.stringify({ id: 'op1', vault: { id: 'vault1' } }) : '{}';
+    };
+    const puts: any[] = [];
+    const client: any = {
+      vaults: { list: async () => { throw new Error('the item location comes from the CLI'); } },
+      items: {
+        list: async () => [],
+        get: async (vaultId: string, itemId: string) => ({ id: itemId, vaultId, fields: [
+          { id: 'username', value: 'octo', fieldType: 'Text' }, { id: 'password', value: 'sw0rd', fieldType: 'Concealed' }] }),
+        put: async (item: any) => { puts.push(item); return item; },
+      },
+    };
+    const c = new OnePasswordConnector(() => 'tok', cli, new OnePasswordSdkConnector(() => 'tok', async () => client));
+    await c.updateSecret('op1', 'password', 'rotated-s3cret');
+    expect(JSON.stringify(commands)).not.toContain('rotated-s3cret');
+    expect(puts).toHaveLength(1);
+    expect(puts[0]).toMatchObject({ id: 'op1', vaultId: 'vault1' });
+    expect(puts[0].fields).toEqual([{ id: 'username', value: 'octo', fieldType: 'Text' }, { id: 'password', value: 'rotated-s3cret', fieldType: 'Concealed' }]);
+  });
+
+  // The CLI's `one-time password[otp]=` assignment created the field when an
+  // item had none; the SDK path adds it the same way.
+  it('adds a one-time password field to an item without one', async () => {
+    const puts: any[] = [];
+    const client: any = { vaults: { list: async () => [] }, items: {
+      list: async () => [],
+      get: async (vaultId: string, id: string) => ({ id, vaultId, category: 'Login', sections: [],
+        fields: [{ id: 'password', title: 'password', value: 'sw0rd', fieldType: 'Concealed' }] }),
+      put: async (item: any) => { puts.push(item); return item; } } };
+    const c = new OnePasswordConnector(() => 'tok', async () => JSON.stringify({ id: 'op1', vault: { id: 'v' } }),
+      new OnePasswordSdkConnector(() => 'tok', async () => client));
+    await c.updateSecret('op1', 'totp', 'JBSWY3DPEHPK3PXP');
+    expect(puts[0].fields).toContainEqual(expect.objectContaining({ fieldType: 'Totp', value: 'JBSWY3DPEHPK3PXP', sectionId: expect.any(String) }));
+    expect(puts[0].sections.map((section: any) => section.id)).toContain(puts[0].fields.at(-1).sectionId);
+    expect(puts[0].fields[0]).toEqual({ id: 'password', title: 'password', value: 'sw0rd', fieldType: 'Concealed' });
+  });
+
+  // The SDK models no passkeys, so its get-then-put could drop one. Items that
+  // may hold one keep the CLI's in-place assignment (the pre-AU-29 path).
+  it.each([
+    ['the CLI shows a passkey', { fields: [{ id: 'passkey', type: 'PASSKEY', label: 'passkey' }] }, []],
+    ['the SDK cannot model a field', {}, [{ id: 'x', title: 'passkey', value: '', fieldType: 'Unsupported' }]],
+  ])('keeps the in-place CLI edit when %s', async (_case, cliExtra, sdkExtra) => {
+    const commands: string[][] = [];
+    const puts: any[] = [];
+    const client: any = { vaults: { list: async () => [] }, items: {
+      list: async () => [],
+      get: async (vaultId: string, id: string) => ({ id, vaultId, category: 'Login', sections: [],
+        fields: [{ id: 'password', title: 'password', value: 'old', fieldType: 'Concealed' }, ...sdkExtra] }),
+      put: async (item: any) => { puts.push(item); return item; } } };
+    const c = new OnePasswordConnector(() => 'tok', async (_cmd, args) => {
+      commands.push(args);
+      return args[1] === 'get' ? JSON.stringify({ id: 'op1', vault: { id: 'v' }, ...cliExtra }) : '{}';
+    }, new OnePasswordSdkConnector(() => 'tok', async () => client));
+    await c.updateSecret('op1', 'password', 'rotated');
+    expect(puts).toHaveLength(0);
+    expect(commands.at(-1)).toEqual(['item', 'edit', 'op1', 'password=rotated']);
+  });
+
+  it('refuses a hosted write-back that could drop a passkey', async () => {
+    const client: any = { vaults: { list: async () => [] }, items: {
+      list: async () => [],
+      get: async (vaultId: string, id: string) => ({ id, vaultId, category: 'Login', sections: [],
+        fields: [{ id: 'x', title: 'passkey', value: '', fieldType: 'Unsupported' }, { id: 'password', value: 'old', fieldType: 'Concealed' }] }),
+      put: async () => { throw new Error('must not put'); } } };
+    const c = new OnePasswordSdkConnector(() => 'tok', async () => client);
+    await expect(c.updateSecretIn('v', 'op1', 'password', 'rotated')).rejects.toThrow(/cannot rewrite.*passkey/);
   });
 
   it('does not connect without a service-account token', async () => {
@@ -998,23 +1073,80 @@ describe('pass TOTP import migration', () => {
 });
 
 describe('Git password-store reconfiguration', () => {
-  it('resets auto-sync and write-back when mount bindings change, but not when keys rotate', async () => {
-    const { items, store, broker } = makeVault();
-    const service = new Connectors(store, items, broker);
-    const connector = new GitPassConnector(() => service.secretFor('pass-git'));
-    // Binding/consent unit test; live verification is exercised with real remotes.
+  const config = { repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test-key',
+    mounts: [{ name: 'work', repositoryUrl: 'https://github.com/example/work.git', gpgPrivateKey: 'test-key' }] };
+  const moved = { ...config, mounts: [{ ...config.mounts[0], repositoryUrl: 'https://github.com/example/other.git' }] };
+  // Binding/consent unit tests; live verification is exercised with real remotes.
+  const service = () => {
+    const vault = makeVault();
+    const connectors = new Connectors(vault.store, vault.items, vault.broker);
+    const connector = new GitPassConnector(() => connectors.secretFor('pass-git'));
     connector.validateSecret = async () => ({ name: 'pass-git', label: 'Pass', available: true, canPush: true, detail: 'test' });
-    service.register(connector);
-    const config = { repositoryUrl: 'https://github.com/example/root.git', gpgPrivateKey: 'test-key',
-      mounts: [{ name: 'work', repositoryUrl: 'https://github.com/example/work.git', gpgPrivateKey: 'test-key' }] };
-    await service.connect('pass-git', JSON.stringify(config));
-    (await service.setConfig('pass-git', { writeBack: true }));
-    (await service.setAutoSync('pass-git', { keepUpdated: true, externalIds: ['work/otp'] }));
-    await service.connect('pass-git', JSON.stringify({ ...config, gpgPrivateKey: 'rotated-key' }));
-    expect((await service.config('pass-git')).writeBack).toBe(true);
-    await service.connect('pass-git', JSON.stringify({ ...config, mounts: [{ ...config.mounts[0], repositoryUrl: 'https://github.com/example/other.git' }] }));
-    expect((await service.config('pass-git')).writeBack).toBeUndefined();
-    expect((await service.config('pass-git')).autoSync).toEqual({ enabled: false, importNew: false, externalIds: [] });
+    const pushedTo: string[] = [];
+    let online = false;
+    connector.push = async (item) => {
+      if (!online) throw new Error('offline');
+      pushedTo.push(JSON.parse(connectors.secretFor('pass-git')!).mounts[0].repositoryUrl);
+      return { externalId: item.externalId };
+    };
+    connectors.register(connector);
+    return { ...vault, connectors, pushedTo, goOnline: () => { online = true; } };
+  };
+  const queueExport = async ({ connectors, items }: ReturnType<typeof service>) => {
+    const created = (await items.save({ type: 'login', label: 'deploy key', secrets: { password: 'generated' },
+      provenance: { source: 'task:t1', taskId: 't1' } }));
+    expect((await connectors.writeBackCreated(created.id))[0]?.error).toMatch(/pending retry/);
+    return created;
+  };
+
+  it('resets selection and write-back for a different store, and sends its queued writes there once write-back is back on', async () => {
+    const s = service();
+    const { connectors, broker, items } = s;
+    expect(await connectors.connect('pass-git', JSON.stringify(config))).toMatchObject({ newStore: true });
+    (await connectors.setConfig('pass-git', { writeBack: true }));
+    (await connectors.setAutoSync('pass-git', { keepUpdated: true, externalIds: ['work/otp'] }));
+    const created = await queueExport(s);
+    const [queued] = await connectors.pendingWrites();
+    // Rotating keys keeps the store, its consent and its queue.
+    expect(await connectors.connect('pass-git', JSON.stringify({ ...config, gpgPrivateKey: 'rotated-key' })))
+      .toMatchObject({ connector: { available: true }, newStore: false });
+    expect((await connectors.config('pass-git')).writeBack).toBe(true);
+    expect(await connectors.pendingWrites()).toEqual([queued]);
+
+    expect(await connectors.connect('pass-git', JSON.stringify(moved))).toMatchObject({ newStore: true });
+    expect((await connectors.config('pass-git')).writeBack).toBeUndefined();
+    expect((await connectors.config('pass-git')).autoSync).toEqual({ enabled: false, importNew: false, externalIds: [] });
+    const [waiting] = await connectors.pendingWrites();
+    expect(waiting).toMatchObject({ id: queued!.id, attempts: 0 });
+    expect(waiting!.target).not.toBe(queued!.target);
+    expect(waiting!.error).toBeUndefined();
+    s.goOnline();
+    // Paused until write-back is turned on for this store.
+    expect(await connectors.retryWrites()).toEqual([]);
+    expect(s.pushedTo).toEqual([]);
+    (await connectors.setConfig('pass-git', { writeBack: true }));
+    expect(await connectors.retryWrites()).toEqual([{ connector: 'pass-git', itemId: created.id }]);
+    expect(s.pushedTo).toEqual(['https://github.com/example/other.git']);
+    expect(await connectors.pendingWrites()).toEqual([]);
+    expect(broker.hasHandle(queued!.snapshotHandle!)).toBe(false);
+    expect((await items.get(created.id))!.provenance.externalIds).toEqual({ 'pass-git': queued!.externalId });
+  });
+
+  it('sends a write queued for an earlier store to the current one when write-back is turned on', async () => {
+    // Releases before this one left such writes pointing at the replaced store.
+    const s = service();
+    const { connectors, store } = s;
+    await connectors.connect('pass-git', JSON.stringify(config));
+    (await connectors.setConfig('pass-git', { writeBack: true }));
+    const created = await queueExport(s);
+    const key = 'vault:write-outbox:org_personal';
+    const [queued] = JSON.parse((await store.kvGet(key))!);
+    (await store.kvSet(key, JSON.stringify([{ ...queued, target: 'replaced-store' }])));
+    (await connectors.setConfig('pass-git', { writeBack: false }));
+    s.goOnline();
+    (await connectors.setConfig('pass-git', { writeBack: true }));
+    expect(await connectors.retryWrites()).toEqual([{ connector: 'pass-git', itemId: created.id }]);
+    expect(s.pushedTo).toEqual(['https://github.com/example/work.git']);
   });
 });
 
@@ -1241,18 +1373,20 @@ it('publishes local pass ciphertext exclusively when another writer wins the nam
   }
 });
 
-it('uses field assignments for 1Password edits instead of destructive JSON templates', async () => {
-  const writes: any[] = [];
-  const c = new OnePasswordConnector(
-    () => 'token',
-    async (_cmd, args, opts) => {
-      writes.push({ args, opts });
-      return '{}';
-    },
-  );
+it('edits one 1Password field instead of replacing the item from a JSON template', async () => {
+  const commands: string[][] = [];
+  const puts: any[] = [];
+  const fields = [{ id: 'public_key', value: 'ssh-ed25519 AAAA', fieldType: 'Text' }, { id: 'private_key', value: 'old', fieldType: 'SshKey' }];
+  const client: any = { vaults: { list: async () => [] }, items: {
+    list: async () => [], get: async (vaultId: string, id: string) => ({ id, vaultId, fields: structuredClone(fields) }),
+    put: async (item: any) => { puts.push(item); return item; } } };
+  const c = new OnePasswordConnector(() => 'token', async (_cmd, args) => {
+    commands.push(args);
+    return JSON.stringify({ id: 'id', vault: { id: 'v' } });
+  }, new OnePasswordSdkConnector(() => 'token', async () => client));
   await c.updateSecret('id', 'privateKey', 'synthetic-key');
-  expect(writes[0].args).toEqual(['item', 'edit', 'id', 'private_key=synthetic-key']);
-  expect(writes[0].opts.input).toBeUndefined();
+  expect(commands).toEqual([['item', 'get', 'id', '--format=json']]);
+  expect(puts[0].fields).toEqual([fields[0], { ...fields[1], value: 'synthetic-key' }]);
 });
 
 it('does not let an in-flight stale import undo a completed rotation', async () => {

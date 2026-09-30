@@ -5,7 +5,7 @@ import { MockAdapter } from '../src/agent/mock.js';
 import { WorldRepo } from '../src/world/types.js';
 
 /**
- * Review approval for a multi-PR task (SPEC §11.1, PLAN-multi-pr.md §3).
+ * Review approval for a multi-PR task (SPEC §11.1).
  *
  * The gate stays singular — one Do agent, one Review, one Merge — but a human
  * may approve branches ONE AT A TIME, so they can confirm what is finished and

@@ -1,5 +1,6 @@
 import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
+import { conversationPublisher } from '../domain/view-publication.js';
 import {
   proxyActivities,
   defineSignal,
@@ -17,7 +18,7 @@ import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer,
   releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
-import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
+import { AgentTurnCancelled, CredentialUnavailable, createAgentTurnLeaser } from './agent-turn-lease.js';
 import { SIG } from './names.js';
 import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 
@@ -170,7 +171,10 @@ async function justDoImpl(
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
-  const publish = async () => publishTaskView(core, taskId, view());
+  const publishConversation = conversationPublisher(workflowInfo().runId,
+    (snapshot, reference) => publishTaskView(core, taskId, snapshot, reference));
+  const publish = async () => patched('just-do-conversation-reference-v1')
+    ? publishConversation(view()) : publishTaskView(core, taskId, view());
   const leaser = managedTurns
     ? createAgentTurnLeaser(core, coordinator, {
         taskId,
@@ -259,6 +263,13 @@ async function justDoImpl(
   await publish();
   const worldKind = input.project.worldProvider ?? 'worktree';
   world = (await createTaskWorld(core, { taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
+  // A failed Do or Review releases the world as a finished run does: left
+  // allocated, a cloud sandbox stays billed until the hibernation sweep. Once
+  // the work is approved a failure retains the world instead, as a failed
+  // finalization does: it holds the only copy of that work. Recorded failures
+  // emitted no release.
+  let approved = false;
+  try {
   if (leaser) await leaser.init();
 
   let infraRetries = 0;
@@ -287,6 +298,16 @@ async function justDoImpl(
       turn = leaser ? await leaser.run('do', invoke) : await invoke();
     } catch (err) {
       if (managedTurns && cancelled && (err instanceof AgentTurnCancelled || isCancellation(err))) break;
+      if (err instanceof CredentialUnavailable && patched('just-do-credential-denial-v1')) {
+        status = 'waiting';
+        waitingFor = { kind: 'human', audience: ['@creator'], detail: err.message };
+        await publish();
+        await condition(() => cancelled || msgs.length > deliveredNow);
+        if (cancelled) break;
+        status = 'active';
+        waitingFor = undefined;
+        continue;
+      }
       // Infrastructure outage that outlived the activity retries: park with
       // backoff and re-run the turn (which resumes its session) rather than
       // failing the task. Anything else propagates as before.
@@ -339,7 +360,8 @@ async function justDoImpl(
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
         await publish();
-        await condition(() => cancelled || msgs.length > seen, '30 seconds');
+        if (patched('service-connections-signal-wait-v1')) await condition(() => cancelled || msgs.length > seen);
+        else await condition(() => cancelled || msgs.length > seen, '30 seconds');
       }
       if (cancelled) break;
       if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }
@@ -402,6 +424,7 @@ async function justDoImpl(
         // no verdict → degrade this layer to the human gate below
       }
       // A human layer: one Confirm click passes ONE layer; a follow-up → back to Do.
+      if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
       waitingFor = { kind: 'human', audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'] };
       await publish();
       await condition(() => confirmed || cancelled || msgs.length > seen);
@@ -412,6 +435,7 @@ async function justDoImpl(
     }
     if (cancelled) break;
     if (!backToDo) {
+      approved = true;
       if (automaticResources) {
         applyingResources = true;
         status = 'active';
@@ -423,6 +447,18 @@ async function justDoImpl(
     }
     stage = 'do';
     status = 'active';
+  }
+  } catch (err) {
+    if (!isCancellation(err) && !approved && world && releaseWorldOnCompletion(world)
+      && patched('just-do-failure-releases-world-v1')) {
+      const remote = remoteWorldProvider(world.provider ?? world.kind);
+      await core.destroyWorld(world as any);
+      if (remote) {
+        world = undefined;
+        await publish();
+      }
+    }
+    throw err;
   }
 
   // No merge machinery: the world IS the deliverable. Persist approved output

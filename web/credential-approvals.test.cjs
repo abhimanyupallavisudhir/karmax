@@ -57,6 +57,11 @@ const rows = credentialRequestRows([request], [{ id: 'vi_1', label: 'Example log
 ok(rows.includes('Example login') && rows.includes('sign in'), 'request row explains the item and reason');
 ok(rows.includes('data-vreq-act="once"') && rows.includes('data-vreq-act="always"'), 'request row exposes the decision scopes');
 ok(!rows.includes('tell the agent'), 'request UI never asks the human to perform a mechanical retry');
+// #367 review item 16: "Once" on a passkey loads it into the agent's browser
+// for a whole sign-in session, not one operation; say so.
+const passkeyRows = credentialRequestRows([request], [{ id: 'vi_1', label: 'GitHub passkey', type: 'passkey' }]);
+ok(/Once: .*passkey.*agent.*browser.*3 minutes/.test(passkeyRows), 'a passkey once-grant says it lasts a browser session');
+ok(!/Once: .*3 minutes/.test(rows), 'other once-grants keep the one-operation wording');
 
 const permission = {
   id: 'preq_1',

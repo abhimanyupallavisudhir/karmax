@@ -10,6 +10,7 @@ import { capturedToken } from '../src/autonomy/config-homes.js';
 import { paths } from '../src/config/paths.js';
 import type { PlatformToolContext, TurnInput } from '../src/agent/types.js';
 import type { AgentProfile, Message } from '../src/domain/types.js';
+import { liveEnabled } from './helpers/live-gate.js';
 
 /**
  * Real-Claude smoke test for the permission seam that broke in production.
@@ -28,11 +29,11 @@ import type { AgentProfile, Message } from '../src/domain/types.js';
  * (the Write/Edit tools can't produce one), so if the adapter regresses to
  * `acceptEdits` the harness gates Bash, no commit lands, and this fails.
  *
- * Gated on an ambient Claude Code login (the SDK path) + KARMAX_SKIP_LIVE!=1.
+ * Gated on an ambient Claude Code login (the SDK path) + KARMAX_RUN_LIVE=1.
  * Costs real tokens, so it is skipped in the hermetic suite. Run with:
- *   npx vitest run tests/claude-permission.test.ts
+ *   KARMAX_RUN_LIVE=1 npx vitest run tests/claude-permission.test.ts
  */
-const LIVE = ClaudeAdapter.hasAmbientLogin() && process.env.KARMAX_SKIP_LIVE !== '1';
+const LIVE = liveEnabled() && ClaudeAdapter.hasAmbientLogin();
 
 describe.skipIf(!LIVE)('claude agent executes commands headless (permission seam)', () => {
   it('runs a shell command — proven by a git commit only Bash can make', async () => {
@@ -139,8 +140,8 @@ describe.skipIf(!LIVE)('claude agent executes commands headless (permission seam
  * Without the canUseTool approver the write is denied and the file never appears.
  *
  * Gated on a captured setup-token being available (env or any karmax claude
- * config home) + KARMAX_SKIP_LIVE!=1. Run with:
- *   npx vitest run tests/claude-permission.test.ts -t "FRESH config home"
+ * config home) + KARMAX_RUN_LIVE=1. Run with:
+ *   KARMAX_RUN_LIVE=1 npx vitest run tests/claude-permission.test.ts -t "FRESH config home"
  */
 function freshLoginToken(): string | undefined {
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) return process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -154,7 +155,7 @@ function freshLoginToken(): string | undefined {
   return undefined;
 }
 const FRESH_TOKEN = freshLoginToken();
-const FRESH_LIVE = !!FRESH_TOKEN && process.env.KARMAX_SKIP_LIVE !== '1';
+const FRESH_LIVE = liveEnabled() && !!FRESH_TOKEN;
 
 describe.skipIf(!FRESH_LIVE)('claude agent writes files in a FRESH config home (bypass-downgrade seam)', () => {
   it('writes a file that lands in the world — fails if the policy downgrade has no canUseTool approver', async () => {

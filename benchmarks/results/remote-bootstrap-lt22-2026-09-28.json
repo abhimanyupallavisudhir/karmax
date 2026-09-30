@@ -1,0 +1,315 @@
+{
+ "benchmark": "benchmarks/remote-bootstrap.ts 6 512 [promptMs] (with browser:chrome-devtools connection preparation)",
+ "date": "2026-09-28",
+ "items": [
+  "LT-22"
+ ],
+ "latency": {
+  "roundTripMs": 180,
+  "bytesPerMs": 10000,
+  "cliStartMs": 900,
+  "accountReadMs": 700,
+  "smokeMs": 4000
+ },
+ "note": "Fake Codex app-server and a baked browser (4 s launch smoke test) in a directory sandbox; no sandbox, model or credit. connectionMs is prepareConnections after the prompt was ready. before = f5bd6abe with this benchmark; after = this branch.",
+ "before": {
+  "promptMs0": [
+   {
+    "turn": 1,
+    "modelStartMs": 7865,
+    "connectionMs": 5442,
+    "exportMs": 867,
+    "roundTrips": 17,
+    "execsBeforeModel": 6,
+    "uploadedKiB": 22,
+    "downloadedKiB": 742,
+    "cliStarts": 1,
+    "historyKiB": 555
+   },
+   {
+    "turn": 2,
+    "modelStartMs": 3431,
+    "connectionMs": 1001,
+    "exportMs": 826,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 1067
+   },
+   {
+    "turn": 3,
+    "modelStartMs": 3430,
+    "connectionMs": 992,
+    "exportMs": 859,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 1578
+   },
+   {
+    "turn": 4,
+    "modelStartMs": 3434,
+    "connectionMs": 989,
+    "exportMs": 871,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 2090
+   },
+   {
+    "turn": 5,
+    "modelStartMs": 3430,
+    "connectionMs": 998,
+    "exportMs": 864,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 2601
+   },
+   {
+    "turn": 6,
+    "modelStartMs": 3417,
+    "connectionMs": 986,
+    "exportMs": 907,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 3113
+   }
+  ],
+  "promptMs800": [
+   {
+    "turn": 1,
+    "modelStartMs": 8395,
+    "connectionMs": 5444,
+    "exportMs": 835,
+    "roundTrips": 17,
+    "execsBeforeModel": 6,
+    "uploadedKiB": 22,
+    "downloadedKiB": 742,
+    "cliStarts": 1,
+    "historyKiB": 555
+   },
+   {
+    "turn": 2,
+    "modelStartMs": 3963,
+    "connectionMs": 1002,
+    "exportMs": 852,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 1067
+   },
+   {
+    "turn": 3,
+    "modelStartMs": 3953,
+    "connectionMs": 993,
+    "exportMs": 848,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 1578
+   },
+   {
+    "turn": 4,
+    "modelStartMs": 3961,
+    "connectionMs": 1003,
+    "exportMs": 832,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 2090
+   },
+   {
+    "turn": 5,
+    "modelStartMs": 3949,
+    "connectionMs": 988,
+    "exportMs": 938,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 2601
+   },
+   {
+    "turn": 6,
+    "modelStartMs": 3969,
+    "connectionMs": 1005,
+    "exportMs": 853,
+    "roundTrips": 15,
+    "execsBeforeModel": 4,
+    "uploadedKiB": 22,
+    "downloadedKiB": 685,
+    "cliStarts": 1,
+    "historyKiB": 3113
+   }
+  ]
+ },
+ "after": {
+  "promptMs0": [
+   {
+    "turn": 1,
+    "modelStartMs": 7457,
+    "connectionMs": 5062,
+    "exportMs": 895,
+    "roundTrips": 16,
+    "execsBeforeModel": 5,
+    "uploadedKiB": 21,
+    "downloadedKiB": 741,
+    "cliStarts": 1,
+    "historyKiB": 555
+   },
+   {
+    "turn": 2,
+    "modelStartMs": 2889,
+    "connectionMs": 449,
+    "exportMs": 834,
+    "roundTrips": 12,
+    "execsBeforeModel": 3,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 1067
+   },
+   {
+    "turn": 3,
+    "modelStartMs": 2872,
+    "connectionMs": 442,
+    "exportMs": 865,
+    "roundTrips": 12,
+    "execsBeforeModel": 3,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 1578
+   },
+   {
+    "turn": 4,
+    "modelStartMs": 2878,
+    "connectionMs": 441,
+    "exportMs": 851,
+    "roundTrips": 12,
+    "execsBeforeModel": 3,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 2090
+   },
+   {
+    "turn": 5,
+    "modelStartMs": 2901,
+    "connectionMs": 454,
+    "exportMs": 868,
+    "roundTrips": 12,
+    "execsBeforeModel": 3,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 2601
+   },
+   {
+    "turn": 6,
+    "modelStartMs": 2901,
+    "connectionMs": 459,
+    "exportMs": 860,
+    "roundTrips": 12,
+    "execsBeforeModel": 3,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 3113
+   }
+  ],
+  "promptMs800": [
+   {
+    "turn": 1,
+    "modelStartMs": 7029,
+    "connectionMs": 4079,
+    "exportMs": 852,
+    "roundTrips": 14,
+    "execsBeforeModel": 3,
+    "uploadedKiB": 21,
+    "downloadedKiB": 741,
+    "cliStarts": 1,
+    "historyKiB": 555
+   },
+   {
+    "turn": 2,
+    "modelStartMs": 2958,
+    "connectionMs": 0,
+    "exportMs": 833,
+    "roundTrips": 10,
+    "execsBeforeModel": 1,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 1067
+   },
+   {
+    "turn": 3,
+    "modelStartMs": 2961,
+    "connectionMs": 0,
+    "exportMs": 857,
+    "roundTrips": 10,
+    "execsBeforeModel": 1,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 1578
+   },
+   {
+    "turn": 4,
+    "modelStartMs": 2970,
+    "connectionMs": 0,
+    "exportMs": 853,
+    "roundTrips": 10,
+    "execsBeforeModel": 1,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 2090
+   },
+   {
+    "turn": 5,
+    "modelStartMs": 2961,
+    "connectionMs": 1,
+    "exportMs": 852,
+    "roundTrips": 10,
+    "execsBeforeModel": 1,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 2601
+   },
+   {
+    "turn": 6,
+    "modelStartMs": 2963,
+    "connectionMs": 0,
+    "exportMs": 870,
+    "roundTrips": 10,
+    "execsBeforeModel": 1,
+    "uploadedKiB": 10,
+    "downloadedKiB": 684,
+    "cliStarts": 1,
+    "historyKiB": 3113
+   }
+  ]
+ }
+}

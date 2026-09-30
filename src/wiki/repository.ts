@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { wikiRoot } from './wiki.js';
+import { withDirectoryLock } from '../world/worktree-lock.js';
 import { materializeGitCredential, type GitCredential } from '../world/git-credential.js';
 import { BRAND } from '../domain/brand.js';
 
@@ -41,22 +42,13 @@ function setRemote(root: string, remote: string): void {
   git(root, exists ? ['remote', 'set-url', 'origin', remote] : ['remote', 'add', 'origin', remote]);
 }
 
-/** Canonical wiki writes and remote reconciliation both mutate the same `main`
- * worktree. Keep them in one per-repository lane: otherwise a second browser
- * save can commit while the first save is fetching/merging origin, or startup's
- * best-effort remote wiring can race an interface edit through Git's index. */
-const projectWikiOperations = new Map<string, Promise<unknown>>();
-
-async function serializeProjectWikiOperation<T>(root: string, operation: () => Promise<T> | T): Promise<T> {
-  const key = path.resolve(root);
-  const previous = projectWikiOperations.get(key) ?? Promise.resolve();
-  const current = previous.catch(() => undefined).then(operation);
-  projectWikiOperations.set(key, current);
-  try {
-    return await current;
-  } finally {
-    if (projectWikiOperations.get(key) === current) projectWikiOperations.delete(key);
-  }
+/** Canonical writes, task landings, and remote reconciliation share one lane
+ * across the gateway and activity worker. Keep the lock outside the checkout
+ * so initial repository creation neither dirties the wiki nor pre-creates .git. */
+export async function serializeProjectWikiOperation<T>(root: string, operation: () => Promise<T> | T): Promise<T> {
+  const resolved = path.resolve(root);
+  const lock = path.join(path.dirname(resolved), `.${path.basename(resolved)}.karmax-wiki.lock`);
+  return withDirectoryLock(lock, async () => operation());
 }
 
 export class ProjectWikiPublishError extends Error {
@@ -91,6 +83,39 @@ export function ensureProjectWikiRepository(contentDir: string, projectId: strin
   const current = git(root, ['branch', '--show-current']);
   if (current && current !== PROJECT_WIKI_BRANCH) git(root, ['switch', '-q', PROJECT_WIKI_BRANCH]);
   return root;
+}
+
+/** Remove a deleted project's wiki: its repository and branch views. It runs in
+ * the wiki's Git lane, so an in-flight sync cannot write into it mid-removal. */
+export async function removeProjectWikiRepository(contentDir: string, projectId: string): Promise<void> {
+  const root = wikiRoot(contentDir, 'project', projectId);
+  await serializeProjectWikiOperation(root, async () => {
+    await fs.promises.rm(path.join(contentDir, 'wiki-views', projectId), { recursive: true, force: true });
+    await fs.promises.rm(root, { recursive: true, force: true });
+  });
+}
+
+/** Gateway startup must not run Git synchronously on the HTTP event loop. */
+export async function ensureProjectWikiRepositoryAsync(contentDir: string, projectId: string): Promise<string> {
+  const root = wikiRoot(contentDir, 'project', projectId);
+  return serializeProjectWikiOperation(root, async () => {
+    await fs.promises.mkdir(root, { recursive: true });
+    if (!fs.existsSync(path.join(root, '.git'))) {
+      await gitAsync(root, ['init', '-q', '-b', PROJECT_WIKI_BRANCH]);
+      await gitAsync(root, ['config', 'user.name', BRAND]);
+      await gitAsync(root, ['config', 'user.email', `${BRAND}@localhost`]);
+    }
+    try { await gitAsync(root, ['rev-parse', '--verify', 'HEAD']); }
+    catch {
+      await gitAsync(root, ['add', '-A']);
+      await gitAsync(root, ['commit', '-q', '--allow-empty', '-m', `${BRAND}: initialize project wiki`]);
+    }
+    try { await gitAsync(root, ['rev-parse', '--verify', `refs/heads/${PROJECT_WIKI_BRANCH}`]); }
+    catch { await gitAsync(root, ['branch', PROJECT_WIKI_BRANCH, 'HEAD']); }
+    const current = await gitAsync(root, ['branch', '--show-current']);
+    if (current && current !== PROJECT_WIKI_BRANCH) await gitAsync(root, ['switch', '-q', PROJECT_WIKI_BRANCH]);
+    return root;
+  });
 }
 
 /**

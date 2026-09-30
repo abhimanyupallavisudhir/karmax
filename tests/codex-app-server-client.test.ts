@@ -8,7 +8,7 @@ import { CodexAppServerClient } from '../src/agent/codex-app-server-client.js';
  * notification fan-out. No real `codex` binary — a PassThrough feeds server lines
  * and a capturing Writable records what the client sends.
  */
-function harness() {
+function harness(maxLineBytes?: number) {
   const stdout = new PassThrough();
   const sent: any[] = [];
   const stdin = new Writable({
@@ -17,12 +17,25 @@ function harness() {
       cb();
     },
   });
-  const client = new CodexAppServerClient(stdin, stdout);
+  const client = new CodexAppServerClient(stdin, stdout, maxLineBytes);
   const feed = (obj: unknown) => stdout.write(JSON.stringify(obj) + '\n');
   return { client, sent, feed, stdout };
 }
 
 describe('CodexAppServerClient', () => {
+  it.each([false, true])('rejects oversized protocol lines (fragmented=%s)', async (fragmented) => {
+    const { client, stdout } = harness(128);
+    const result = client.request('initialize', {});
+    const rejected = expect(result).rejects.toThrow(/line exceeds/);
+    if (fragmented) {
+      for (let n = 0; n < 70; n++) stdout.write('é');
+    } else stdout.write('x'.repeat(129) + '\n');
+    // A later valid response must not rescue a transport that exceeded its cap.
+    stdout.write('{"id":1,"result":{}}\n');
+    await rejected;
+    await expect(client.request('thread/start', {})).rejects.toThrow(/closed/);
+  });
+
   it('correlates a response to its request by id and resolves the result', async () => {
     const { client, sent, feed } = harness();
     const p = client.request('thread/start', { cwd: '/w' });
@@ -92,18 +105,34 @@ describe('CodexAppServerClient', () => {
   });
 
   it('receives a large fragmented response without starving the control plane', async () => {
-    const { client, stdout } = harness();
-    const pending = client.request('thread/resume', {});
-    const content = 'x'.repeat(32 * 1024 * 1024);
-    const wire = JSON.stringify({ id: 1, result: { content } }) + '\n';
-    const started = performance.now();
-    for (let offset = 0; offset < wire.length; offset += 4096)
-      stdout.write(wire.slice(offset, offset + 4096));
-    expect((await pending).content).toBe(content);
-    // Generous for a ~100ms linear parse, but catches the former multi-second
-    // repeated copy/scan that blocked health checks and cloud keep-alives.
-    expect(performance.now() - started).toBeLessThan(2000);
-    client.close();
+    const parse = async (bytes: number) => {
+      const { client, stdout } = harness();
+      const pending = client.request('thread/resume', {});
+      const content = 'x'.repeat(bytes);
+      const wire = JSON.stringify({ id: 1, result: { content } }) + '\n';
+      const started = performance.now();
+      for (let offset = 0; offset < wire.length; offset += 4096)
+        stdout.write(wire.slice(offset, offset + 4096));
+      const received = (await pending).content;
+      const elapsed = performance.now() - started;
+      expect(received).toBe(content);
+      client.close();
+      return elapsed;
+    };
+    const fastest = async (bytes: number) => {
+      let best = Infinity;
+      for (let run = 0; run < 3; run++) best = Math.min(best, await parse(bytes));
+      return best;
+    };
+    // The former parser rescanned the whole accumulated line on every chunk, so
+    // four times the bytes cost about sixteen times as long and a large response
+    // blocked health checks and cloud keep-alives for seconds. A linear parser
+    // costs about four times as long. Comparing the fastest of three runs at two
+    // sizes measures that growth on any runner, where a fixed time bound mostly
+    // measures the runner.
+    const small = await fastest(2 * 1024 * 1024);
+    const large = await fastest(8 * 1024 * 1024);
+    expect(large / small).toBeLessThan(8);
   });
 
   it('preserves UTF-8 characters split across stdout buffers', () => {

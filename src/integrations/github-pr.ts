@@ -1,6 +1,6 @@
 /**
  * GitHub pull requests — the optional integration output of the PR stage
- * (SPEC §5.2, PLAN-git-config.md §5 `remote: 'pr'`).
+ * (SPEC §5.2, wiki plans/PLAN-git-config §5 `remote: 'pr'`).
  *
  * Everything here speaks the REST API with a bearer token, deliberately *not*
  * the `gh` CLI: the token is already resolvable (user App authorization for
@@ -12,6 +12,7 @@
  * for automation and compatibility callers.
  */
 
+import { createHash } from 'node:crypto';
 import type { TaskPullRequest, TaskView } from '../domain/types.js';
 import { taskIdOfBranch, BRAND } from '../domain/brand.js';
 
@@ -41,6 +42,15 @@ export interface GithubMergeResult {
 export interface GithubRefUpdateResult {
   updated: boolean;
   message: string;
+}
+
+export interface GithubComparison {
+  /** Commits `head` has that `base` lacks. */
+  aheadBy: number;
+  /** Commits `base` has that `head` lacks: above zero, `head` never saw base's tip. */
+  behindBy: number;
+  /** The commit GitHub resolved `base` to for this comparison. */
+  baseSha?: string;
 }
 
 export interface GithubBranchUpdateResult {
@@ -233,14 +243,14 @@ export class GithubPrApi {
   }
 
   async get(slug: string, number: number): Promise<GithubPullRequest> {
-    return normalize(await this.request(`/repos/${slug}/pulls/${number}`));
+    return normalize(await this.request(`/repos/${repositorySlug(slug)}/pulls/${number}`));
   }
 
   /** The open-or-closed PR for a head branch in the same repository, if any. */
   async findByHead(slug: string, branch: string): Promise<GithubPullRequest | undefined> {
     const owner = slug.split('/')[0];
     const found = await this.request<any[]>(
-      `/repos/${slug}/pulls?state=all&per_page=1&head=${encodeURIComponent(`${owner}:${branch}`)}`);
+      `/repos/${repositorySlug(slug)}/pulls?state=all&per_page=1&head=${encodeURIComponent(`${owner}:${branch}`)}`);
     return found?.length ? normalize(found[0]) : undefined;
   }
 
@@ -254,14 +264,24 @@ export class GithubPrApi {
   Promise<{ pr: GithubPullRequest; created: boolean }> {
     const existing = await this.findByHead(slug, input.head);
     let reopenRefused = false;
-    if (existing) {
+    if (existing?.merged) {
+      const comparison = await this.request<{ ahead_by: number }>(
+        `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(input.base)}...${encodeURIComponent(input.head)}`);
+      if (comparison.ahead_by === 0) return { pr: existing, created: false };
+      if (!Number.isSafeInteger(comparison.ahead_by) || comparison.ahead_by < 0)
+        throw new Error('GitHub did not report whether the branch contains new commits');
+    } else if (existing) {
       let current = existing;
       // A PR closed without merging is reopened: the task is live again. GitHub
       // refuses a base change on a closed PR (task 387), so reopen on its own
-      // first; if it cannot be reopened (e.g. the branch was recreated), open anew.
-      if (existing.state === 'closed' && !existing.merged) {
+      // first. If GitHub cannot reopen it (a recreated or force-pushed head), open
+      // anew; any other failure is retried rather than duplicating the PR.
+      if (existing.state === 'closed') {
         try { current = await this.update(slug, existing.number, { state: 'open' }); }
-        catch { reopenRefused = true; }
+        catch (error) {
+          if (!(error instanceof GithubApiError) || error.status !== 422) throw error;
+          reopenRefused = true;
+        }
       }
       if (!reopenRefused) {
         const pr = await this.update(slug, existing.number, {
@@ -271,34 +291,61 @@ export class GithubPrApi {
       }
     }
     try {
-      return { pr: normalize(await this.request(`/repos/${slug}/pulls`, {
+      return { pr: normalize(await this.request(`/repos/${repositorySlug(slug)}/pulls`, {
         method: 'POST',
         body: JSON.stringify({ title: input.title, body: input.body, head: input.head, base: input.base }),
       })), created: true };
     } catch (error) {
       // Lost a race (or GitHub indexed the head late) — adopt the existing PR.
       const raced = reopenRefused ? undefined : await this.findByHead(slug, input.head).catch(() => undefined);
-      if (!raced) throw error;
+      if (!raced || raced.state !== 'open' || raced.merged) throw error;
       return { pr: raced, created: false };
     }
   }
 
   async update(slug: string, number: number,
     patch: { title?: string; body?: string; base?: string; state?: 'open' | 'closed' }): Promise<GithubPullRequest> {
-    return normalize(await this.request(`/repos/${slug}/pulls/${number}`, {
+    return normalize(await this.request(`/repos/${repositorySlug(slug)}/pulls/${number}`, {
       method: 'PATCH', body: JSON.stringify(patch),
     }));
   }
 
   async comment(slug: string, number: number, body: string): Promise<void> {
-    await this.request(`/repos/${slug}/issues/${number}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
+    await this.request(`/repos/${repositorySlug(slug)}/issues/${number}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
+  }
+
+  /** Recover the provider-side receipt even when POST succeeded but its reply was lost. */
+  async commentOnce(slug: string, number: number, body: string, key: string): Promise<void> {
+    const marker = `<!-- karmax-comment:${createHash('sha256').update(key).digest('hex')} -->`;
+    for (let page = 1; page <= 100; page++) {
+      const comments = await this.request<Array<{ body?: string }>>(
+        `/repos/${repositorySlug(slug)}/issues/${number}/comments?per_page=100&page=${page}`);
+      if (comments.some(comment => comment.body?.includes(marker))) return;
+      if (comments.length < 100) {
+        await this.comment(slug, number, `${body}\n\n${marker}`);
+        return;
+      }
+    }
+    throw new Error('cannot verify comment receipt within the pull request comment limit');
+  }
+
+  /** How `head` relates to `base`. A branch `base` is compared at its live
+   * tip, which the PR's own base commit may not yet reflect. */
+  async compare(slug: string, base: string, head: string): Promise<GithubComparison> {
+    const value = await this.request<any>(
+      `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`);
+    const aheadBy = Number(value?.ahead_by);
+    const behindBy = Number(value?.behind_by);
+    if (!Number.isSafeInteger(aheadBy) || aheadBy < 0 || !Number.isSafeInteger(behindBy) || behindBy < 0)
+      throw new Error(`GitHub did not report how ${head} relates to ${base}`);
+    return { aheadBy, behindBy, ...(value?.base_commit?.sha ? { baseSha: String(value.base_commit.sha) } : {}) };
   }
 
   /** Mirror an explicit krmax Human-confirm decision into GitHub's native PR
    * review record. GitHub may reject self-approval or an already-settled review;
    * callers treat that as non-fatal and let repository policy decide at merge. */
   async approve(slug: string, number: number, headSha: string, body: string): Promise<void> {
-    await this.request(`/repos/${slug}/pulls/${number}/reviews`, {
+    await this.request(`/repos/${repositorySlug(slug)}/pulls/${number}/reviews`, {
       method: 'POST', body: JSON.stringify({ commit_id: headSha, event: 'APPROVE', body }),
     });
   }
@@ -308,7 +355,7 @@ export class GithubPrApi {
    * and otherwise advances the exact validated head with force:false. */
   async merge(slug: string, number: number, headSha: string,
     mergeMethod: GithubMergeMethod = 'merge'): Promise<GithubMergeResult> {
-    const value = await this.request<any>(`/repos/${slug}/pulls/${number}/merge`, {
+    const value = await this.request<any>(`/repos/${repositorySlug(slug)}/pulls/${number}/merge`, {
       method: 'PUT',
       body: JSON.stringify({ sha: headSha, merge_method: mergeMethod }),
     }, [405, 409, 422]);
@@ -369,7 +416,7 @@ export class GithubPrApi {
    * update instead of manufacturing a different, unvalidated merge result. */
   async fastForwardTarget(slug: string, target: string, headSha: string): Promise<GithubRefUpdateResult> {
     const value = await this.request<any>(
-      `/repos/${slug}/git/refs/heads/${target.split('/').map(encodeURIComponent).join('/')}`,
+      `/repos/${repositorySlug(slug)}/git/refs/heads/${target.split('/').map(encodeURIComponent).join('/')}`,
       { method: 'PATCH', body: JSON.stringify({ sha: headSha, force: false }) },
       [409, 422],
     );
@@ -382,7 +429,7 @@ export class GithubPrApi {
   /** Inspect the PR state GitHub uses when deciding whether and how it may
    * merge, including reviews, checks, queue state, and viewer capabilities. */
   async readiness(slug: string, number: number): Promise<GithubPullRequestReadiness> {
-    const [owner, name, ...extra] = slug.split('/');
+    const [owner, name, ...extra] = repositorySlug(slug).split('/');
     if (!owner || !name || extra.length) throw new Error(`Invalid GitHub repository slug: ${slug}`);
     const query = (checkLevel: 'details' | 'aggregate' | 'none') => `query PullRequestReadiness($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
@@ -514,9 +561,9 @@ export class GithubPrApi {
   async failedChecksForRef(slug: string, ref: string): Promise<GithubFailedCheck[]> {
     const encoded = encodeURIComponent(ref);
     const [runs, combined] = await Promise.all([
-      this.request<any>(`/repos/${slug}/commits/${encoded}/check-runs?per_page=100&filter=latest`)
+      this.request<any>(`/repos/${repositorySlug(slug)}/commits/${encoded}/check-runs?per_page=100&filter=latest`)
         .catch(() => undefined),
-      this.request<any>(`/repos/${slug}/commits/${encoded}/status?per_page=100`)
+      this.request<any>(`/repos/${repositorySlug(slug)}/commits/${encoded}/status?per_page=100`)
         .catch(() => undefined),
     ]);
     const candidates: Array<GithubFailedCheck & { databaseId?: number }> = [];
@@ -548,7 +595,7 @@ export class GithubPrApi {
     candidates: Array<GithubFailedCheck & { databaseId?: number }>): Promise<GithubFailedCheck[]> {
     for (const check of candidates) {
       if (!check.databaseId) continue;
-      const run = await this.request<any>(`/repos/${slug}/check-runs/${check.databaseId}`)
+      const run = await this.request<any>(`/repos/${repositorySlug(slug)}/check-runs/${check.databaseId}`)
         .catch(() => undefined);
       const output = run?.output
         ? [run.output.title, run.output.summary, run.output.text]
@@ -556,7 +603,7 @@ export class GithubPrApi {
           .filter(Boolean).join('\n')
         : '';
       const annotations = await this.request<any[]>(
-        `/repos/${slug}/check-runs/${check.databaseId}/annotations?per_page=100`,
+        `/repos/${repositorySlug(slug)}/check-runs/${check.databaseId}/annotations?per_page=100`,
       ).catch(() => undefined);
       const rendered = (Array.isArray(annotations) ? annotations : []).map((annotation) => {
         const location = annotation.path
@@ -566,7 +613,8 @@ export class GithubPrApi {
           .map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean).join(' — ');
         return `${location ? `${location}: ` : ''}${message || annotation.annotation_level || 'check annotation'}`;
       }).join('\n');
-      check.detail = [check.detail, output, rendered].filter(Boolean).join('\n').slice(0, 24_000);
+      const detail = [check.detail, output, rendered].filter(Boolean).join('\n').slice(0, 24_000);
+      if (detail) check.detail = detail;
     }
     return candidates.map(({ databaseId: _databaseId, ...check }) => check);
   }
@@ -596,7 +644,7 @@ export class GithubPrApi {
    * is mechanical and expected-head guarded: a real conflict is returned to the
    * caller, while a racing writer gets a 422 rather than being overwritten. */
   async updateBranch(slug: string, number: number, expectedHeadSha: string): Promise<GithubBranchUpdateResult> {
-    const value = await this.request<any>(`/repos/${slug}/pulls/${number}/update-branch`, {
+    const value = await this.request<any>(`/repos/${repositorySlug(slug)}/pulls/${number}/update-branch`, {
       method: 'PUT', body: JSON.stringify({ expected_head_sha: expectedHeadSha }),
     }, [422]);
     const message = String(value?.message ?? 'GitHub accepted the pull-request branch update');
@@ -701,13 +749,30 @@ export function reconcilePullRequestView(
 }
 
 /**
+ * Apply the PR states `source` records to the same PRs in `view` (WF-32).
+ * `mergedOnly` carries just merges, which are immutable, for when `source`
+ * may be older than `view`: a workflow never sees a webhook's reconciliation,
+ * so its next publication would otherwise report a merged PR open again.
+ */
+export function withPullRequestStates(view: TaskView, source: TaskView | undefined, options: { mergedOnly?: boolean } = {}): TaskView {
+  const known = source ? [source.pr, ...(source.prs ?? []), ...(source.checkouts ?? []).map((checkout) => checkout.pr)] : [];
+  return known.reduce((next, pr) => !pr || (options.mergedOnly && !pr.merged) ? next
+    : reconcilePullRequestView(next, { repo: pr.slug, number: pr.number, state: pr.state, merged: pr.merged === true }), view);
+}
+
+/**
  * Normalize a `pull_request` / `pull_request_review` delivery into the karmax
  * event a trigger can match (`github.pr.merged`, `github.pr.closed`,
  * `github.pr.review`, …). Only PRs whose head is a karmax task branch produce
  * events: those are the ones that belong to a task's timeline.
  */
 export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWebhookEvent | undefined {
+  const repositoryId = payload?.repository?.id;
+  if (!repositoryId) return undefined;
   if (event === 'check_run') {
+    const heads = payload?.check_run?.pull_requests;
+    if (!Array.isArray(heads) || !heads.length || heads.some((pr: any) =>
+      pr.head?.repo?.id !== repositoryId || pr.head?.ref !== payload.check_run.check_suite?.head_branch)) return undefined;
     const taskId = taskIdOfBranch(payload?.check_run?.check_suite?.head_branch);
     if (!taskId || payload?.action !== 'completed') return undefined;
     const run = payload.check_run;
@@ -725,7 +790,7 @@ export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWe
   }
   const pr = payload?.pull_request;
   const taskId = taskIdOfBranch(pr?.head?.ref);
-  if (!taskId) return undefined;
+  if (!taskId || pr.head?.repo?.id !== repositoryId) return undefined;
   const base = {
     number: Number(pr.number),
     url: String(pr.html_url ?? ''),
@@ -745,10 +810,18 @@ export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWe
     return { taskId, type: `github.pr.${action}`, payload: { ...base, action } };
   }
   if (event === 'pull_request_review') {
+    if (!['OWNER', 'MEMBER', 'COLLABORATOR'].includes(payload?.review?.author_association)) return undefined;
     const review = String(payload?.review?.state ?? '').toLowerCase();
     if (!review) return undefined;
     return { taskId, type: 'github.pr.review', payload: { ...base, review,
       ...(payload.review?.user?.login ? { reviewer: String(payload.review.user.login) } : {}) } };
   }
   return undefined;
+}
+
+function repositorySlug(slug: string): string {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(slug)
+    || slug.split('/').some((part) => part === '.' || part === '..'))
+    throw new Error('Invalid GitHub repository slug');
+  return slug;
 }

@@ -19,6 +19,24 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   },
 }));
 
+// Provider transport bounds are exercised in bounded-exec.test.ts; these fake
+// worlds answer commands directly instead of through a PTY.
+vi.mock('../src/world/bounded-exec.js', () => ({
+  boundedExec: async (world: any, command: string, options: { maxBytes: number }) => {
+    // A verified read (remote-process.ts) appends its output's length and digest.
+    const verified = /\{ ([\s\S]*)\n\} > "\$out"/.exec(command)?.[1];
+    const result = await world.exec('bash', ['-lc', verified ?? command]);
+    if (verified !== undefined && result.code === 0) {
+      const { createHash } = await import('node:crypto');
+      const output = Buffer.from(result.stdout);
+      result.stdout += `\n${output.length} ${createHash('sha256').update(output).digest('hex')}\n`;
+    }
+    if (Buffer.byteLength(result.stdout) > options.maxBytes) throw new Error('world command output exceeds capture limit');
+    return result;
+  },
+  IncompleteOutputError: class IncompleteOutputError extends Error {},
+}));
+
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CUSTODY_ENV } from '../src/agent/custody.js';
 import { ProviderFailure, isTransportError } from '../src/agent/limits.js';
@@ -52,6 +70,14 @@ const ctx: any = {
 
 describe('Claude Agent SDK terminal outcome contract', () => {
   beforeEach(() => { sdkState.messages = []; sdkState.options = undefined; sdkState.run = undefined; });
+
+  it('passes explicit per-turn and profile caps to the SDK', async () => {
+    sdkState.messages = [{ type: 'result', subtype: 'success' }];
+    await new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, maxTurns: 7 } }, ctx);
+    expect(sdkState.options.maxTurns).toBe(7);
+    await new ClaudeAdapter().runTurn({ ...input, profile: { ...input.profile, maxTurns: 7 }, maxTurns: 3 }, ctx);
+    expect(sdkState.options.maxTurns).toBe(3);
+  });
 
   it('retries a silent SDK startup without waiting for the 45-minute activity timeout', async () => {
     vi.useFakeTimers();
@@ -110,13 +136,27 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(JSON.parse(diagnostic.detail)).toMatchObject({ version: 1, reason: 'error', remote: false });
   });
 
+  it('retains safe startup diagnostics from local harness stderr', async () => {
+    sdkState.run = async function* (options) {
+      const child = options.spawnClaudeCodeProcess({ command: process.execPath, args: ['-e', 'process.stderr.write("Cannot find module SECRET_TOKEN"); process.exitCode = 1'], env: {}, signal: new AbortController().signal });
+      await new Promise(resolve => child.once('close', resolve));
+      throw new Error('harness exited');
+    };
+    const activities: any[] = [];
+    await expect(new ClaudeAdapter().runTurn(input, { ...ctx, emitActivity: (e: any) => activities.push(e) })).rejects.toThrow('harness exited');
+    const detail = activities.find(a => a.id === 'claude-startup-diagnostics').detail;
+    expect(JSON.parse(detail).stderr.flags).toContain('package');
+    expect(detail).not.toContain('SECRET_TOKEN');
+  });
+
   it('uses one stdio platform server plus a disjoint local-control server', async () => {
     sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
     await new ClaudeAdapter().runTurn({ ...input, extraEnv: { KARMAX_TOKEN: 'scoped' } }, ctx);
     expect(sdkState.options.strictMcpConfig).toBe(true);
+    expect(sdkState.options.env.KARMAX_TOKEN).toBe('scoped');
     expect(sdkState.options.mcpServers.karmax).toMatchObject({
       command: process.execPath,
-      env: expect.objectContaining({ KARMAX_TOKEN: 'scoped' }),
+      env: expect.not.objectContaining({ KARMAX_TOKEN: expect.anything() }),
       alwaysLoad: true,
     });
     expect(sdkState.options.mcpServers.karmax_control).toMatchObject({ type: 'sdk', name: 'karmax_control' });
@@ -211,6 +251,31 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
+  it.each(['account_on_hold', 'verification_required', 'cloud_credential_error'])(
+    'recognizes the structured %s login failure before a success result', async (code) => {
+      sdkState.messages = [
+        { type: 'assistant', error: code, message: { content: [{ type: 'text', text: 'Action required' }] } },
+        { type: 'result', subtype: 'success' },
+      ];
+      await expect(new ClaudeAdapter().runTurn(input, ctx)).rejects.toMatchObject({
+        metadata: { kind: 'credential', permanence: 'hard', diagnostic: { code } },
+      });
+    },
+  );
+
+  it.each(['model_not_found', 'invalid_request', 'unknown', 'future_error'])(
+    'fails the task without parking the login for structured %s', async (code) => {
+      sdkState.messages = [
+        { type: 'assistant', error: code, message: { content: [{ type: 'text', text: 'Bad request' }] } },
+        { type: 'result', subtype: 'success' },
+      ];
+      const failure = await new ClaudeAdapter().runTurn(input, ctx).catch(error => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(ProviderFailure);
+      expect(failure.message).toContain(code);
+    },
+  );
+
   it('returns only after an explicit SDK success result', async () => {
     sdkState.messages = [
       { type: 'assistant', session_id: 's1', message: { content: [{ type: 'text', text: 'done' }] } },
@@ -219,6 +284,23 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     const turn = await new ClaudeAdapter().runTurn(input, ctx);
     expect(turn.termination).toEqual({ kind: 'success', status: 'success', reason: 'end_turn' });
     expect(turn.output).toBe('done');
+  });
+
+  it.each(['rate_limit', 'authentication_failed'])('keeps sandbox %s signals task-local', async (code) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-untrusted-claude-'));
+    const world: any = {
+      handle: { version: 2, kind: 'e2b', sealedProviderRef: 'sealed', id: 'remote', root: '/workspace' },
+      async exec() { return { stdout: '', stderr: '', code: 0 }; },
+      async writeFileBuffer() {}, async writeFile() {}, async listFiles() { return []; },
+      async readFile() { throw new Error('missing'); }, async readFileBuffer() { throw new Error('missing'); },
+    };
+    sdkState.messages = [{ type: 'assistant', error: code,
+      message: { content: [{ type: 'text', text: 'usage limit; resets in 1209600s' }] } }];
+    try {
+      const failure = await new ClaudeAdapter().runTurn({ ...input, world, resolvedAuth: { configHome: home } }, ctx).catch(error => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(ProviderFailure);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
   it('selects the remote Claude spawn rail and keeps all platform tools available', async () => {
@@ -308,19 +390,16 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     await expect(new ClaudeAdapter().runTurn(input, ctx)).rejects.toThrow(/error_during_execution.*stream disconnected/i);
   });
 
-  it('types novel credit-exhaustion wording from an SDK error result', async () => {
-    sdkState.messages = [
-      {
-        type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 's1',
-        errors: ['Your prepaid balance has now been fully consumed.'],
-      },
-    ];
-    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
-    expect(failure).toBeInstanceOf(ProviderFailure);
-    expect(failure.metadata).toMatchObject({
-      kind: 'quota', permanence: 'hard', provider: 'claude', source: 'message',
-    });
-  });
+  it.each(['Your prepaid balance has now been fully consumed.', 'Disk quota exceeded', 'npm 401 Unauthorized'])(
+    'keeps aggregate SDK errors task-local: %s', async (detail) => {
+      sdkState.messages = [{ type: 'result', subtype: 'error_during_execution', is_error: true,
+        session_id: 's1', errors: [detail] }];
+      const failure = await new ClaudeAdapter().runTurn(input, ctx).catch(error => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(ProviderFailure);
+      expect(failure.message).toContain(detail);
+    },
+  );
 
   it('uses the structured assistant rate-limit signal even when the SDK result lies about success', async () => {
     sdkState.messages = [

@@ -9,6 +9,7 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git, gitOrThrow } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 import { GithubPrApi, githubSlug } from '../src/integrations/github-pr.js';
+import { liveEnabled } from './helpers/live-gate.js';
 
 /**
  * The pull-request integration against **real GitHub**. `github-pr.test.ts` and
@@ -18,7 +19,7 @@ import { GithubPrApi, githubSlug } from '../src/integrations/github-pr.js';
  * own that a PR is `merged` once its commits reach the base branch, its 422 on a
  * duplicate head, and whether the branch push actually authenticates.
  *
- * It self-skips without a GitHub token, and `KARMAX_SKIP_LIVE=1` force-skips it
+ * It requires `KARMAX_RUN_LIVE=1` and a GitHub token
  * (same switch as `live-agent.test.ts` / `cloud-live.test.ts`). It touches a real
  * account: one dedicated **private** repository, reused across runs and left in
  * place (deleting it would need a `delete_repo` token scope this deliberately
@@ -28,7 +29,7 @@ import { GithubPrApi, githubSlug } from '../src/integrations/github-pr.js';
 
 const pexec = promisify(execFile);
 const REPO_NAME = 'karmax-e2e-tests';
-const skipLive = process.env.KARMAX_SKIP_LIVE === '1';
+const skipLive = !liveEnabled();
 
 /** The host's GitHub token, however it is stored (env, then the `gh` login). */
 async function hostToken(): Promise<string | undefined> {
@@ -37,7 +38,7 @@ async function hostToken(): Promise<string | undefined> {
   catch { return undefined; }
 }
 
-const token = await hostToken();
+const token = skipLive ? undefined : await hostToken();
 
 describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', () => {
   let h: Harness;
@@ -63,15 +64,27 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
     return full;
   }
 
+  /** Git configuration this run adds through the environment, restored afterwards. */
+  const savedGitConfig: Record<string, string | undefined> = {};
+
   beforeAll(async () => {
     process.env.GH_TOKEN = token!;
     slug = await ensureTestRepo();
     mainBranch = (await pexec('gh', ['repo', 'view', slug, '--json', 'defaultBranchRef',
       '--jq', '.defaultBranchRef.name'], { timeout: 30_000 })).stdout.trim();
     expect(mainBranch).toBeTruthy();
-    expect(githubSlug(`git@github.com:${slug}.git`)).toBe(slug);
+    expect(githubSlug(`https://github.com/${slug}.git`)).toBe(slug);
     api = new GithubPrApi(token!);
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-gh-live-'));
+    // The token is the only credential a CI runner has: clones and karmax's own
+    // pushes go over HTTPS, through a helper that reads it from a private file.
+    // Host Git takes operator configuration from GIT_CONFIG_* (src/world/git.ts).
+    const tokenFile = path.join(dir, '.token');
+    fs.writeFileSync(tokenFile, token!, { mode: 0o600 });
+    for (const key of ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0']) savedGitConfig[key] = process.env[key];
+    process.env.GIT_CONFIG_COUNT = '1';
+    process.env.GIT_CONFIG_KEY_0 = 'credential.https://github.com.helper';
+    process.env.GIT_CONFIG_VALUE_0 = `!f() { test "$1" = get || exit 0; echo username=x-access-token; printf 'password=%s\\n' "$(cat '${tokenFile}')"; }; f`;
     h = await bootHarness('mock');
   }, 240_000);
 
@@ -85,6 +98,9 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
         .catch(() => undefined);
     }
     delete process.env.GH_TOKEN;
+    for (const [key, value] of Object.entries(savedGitConfig)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
     await h?.stop();
     fs.rmSync(dir, { recursive: true, force: true });
   }, 120_000);
@@ -93,7 +109,7 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
    *  so `origin` is the real GitHub remote and every push is a real push. */
   async function cloneFixture(name: string): Promise<string> {
     const local = path.join(dir, name);
-    await gitOrThrow(dir, ['clone', '-q', `git@github.com:${slug}.git`, local]);
+    await gitOrThrow(dir, ['clone', '-q', `https://github.com/${slug}.git`, local]);
     await git(local, ['config', 'user.name', 'karmax-live-test']);
     await git(local, ['config', 'user.email', 'karmax-live-test@localhost']);
     return local;
@@ -146,7 +162,7 @@ describe.skipIf(skipLive || !token)('GitHub pull requests against real GitHub', 
         taskId,
         projectId: 'p1',
         title: `karmax live: ${taskId}`,
-        // A competent Do agent commits its own work (PLAN-git-config.md §2.2), which
+        // A competent Do agent commits its own work (wiki plans/PLAN-git-config §2.2), which
         // is what gives the PR stage something to propose.
         prompt: `Implement it.\n@write ${file} :: export const live = true;\n`
           + `@run git add -A && git commit -q -m "karmax live: add ${file}"\n`

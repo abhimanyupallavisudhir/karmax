@@ -47,3 +47,24 @@ it('shares a boot invocation with timer ticks and refuses new work after stop', 
   await interval.run();
   expect(job).toHaveBeenCalledTimes(1);
 });
+
+// #396 review item 9: a wake-up that arrives while the job runs must not wait
+// for the next tick, and wake-ups during one run coalesce into one more run.
+it('runs once more after the invocation in flight when woken during it', async () => {
+  vi.useFakeTimers();
+  const releases: Array<() => void> = [];
+  const job = vi.fn(() => new Promise<void>(resolve => { releases.push(resolve); }));
+  const interval = new AsyncInterval(job, 60_000);
+  void interval.wake();
+  await vi.advanceTimersByTimeAsync(0);
+  const woken = [interval.wake(), interval.wake()];
+  expect(job).toHaveBeenCalledTimes(1);
+  releases.shift()!();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(job).toHaveBeenCalledTimes(2);
+  releases.shift()!();
+  await Promise.all(woken);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(job).toHaveBeenCalledTimes(2);
+  await interval.stop();
+});

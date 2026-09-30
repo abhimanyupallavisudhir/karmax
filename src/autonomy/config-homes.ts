@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { paths } from '../config/paths.js';
 import { replaceFileSync } from '../util/replace-file.js';
 import { DEFAULT_CDP_PORT } from './cdp-endpoint.js';
+import { CUSTODY_ENV } from '../agent/custody.js';
 import { Provider } from '../domain/types.js';
 import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 
@@ -199,7 +200,8 @@ export class ConfigHomeManager {
             .map(([name, server]) => [name, claudeMcpServer(server)]),
         );
         cur.mcpServers = { ...existing, ...refreshed, karmax: claudeMcpServer(platform) };
-        replaceFileSync(file, JSON.stringify(cur, null, 2));
+        const updated = JSON.stringify(cur, null, 2);
+        if (!fs.existsSync(file) || fs.readFileSync(file, 'utf8') !== updated) replaceFileSync(file, updated);
       } else if (provider === 'codex') {
         const file = path.join(home, 'config.toml');
         const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
@@ -210,7 +212,8 @@ export class ConfigHomeManager {
           ...selectedBrowsers.map(([name]) => `mcp_servers.${name}`),
         ]);
         const browserToml = selectedBrowsers.map(([name, server]) => codexMcpServer(name, server)).join('');
-        replaceFileSync(file, preserved.trimEnd() + browserToml + codexMcpServer('karmax', platform));
+        const updated = preserved.trimEnd() + browserToml + codexMcpServer('karmax', platform);
+        if (existing !== updated) replaceFileSync(file, updated);
       }
     }
   }
@@ -224,7 +227,7 @@ export class ConfigHomeManager {
       : path.join(this.root, 'organizations', sanitize(organizationId));
   }
 
-  private allHomes(): Array<{ provider: string; path: string }> {
+  allHomes(): Array<{ provider: string; path: string }> {
     if (!fs.existsSync(this.root)) return [];
     const homes = this.list().map(({ provider, path: home }) => ({ provider, path: home }));
     const organizations = path.join(this.root, 'organizations');
@@ -298,7 +301,7 @@ export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
   if (spec.browser === 'chrome-devtools') {
     // Run chrome-devtools-mcp through karmax's launcher so it drives a Chrome
     // that also exposes a loopback DevTools port — the same port host-side
-    // fill_credential types into (PLAN-passwords.md §5B). Bare
+    // fill_credential types into (wiki plans/PLAN-passwords §5B). Bare
     // `chrome-devtools-mcp` uses a pipe with no HTTP endpoint, so the fill
     // could never reach the agent's browser. The launcher falls back to plain
     // pipe mode if Chrome is unavailable, so browser tools never regress.
@@ -307,6 +310,9 @@ export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
       command: process.execPath,
       args: [launcher],
       env: { KARMAX_CDP_MCP_VERSION: CHROME_DEVTOOLS_MCP_VERSION, KARMAX_CDP_PORT: String(DEFAULT_CDP_PORT) },
+      // The custody marker is how a fill finds this task's browser (task-browser.ts);
+      // Codex passes an MCP server only the variables it is told to.
+      forwardEnv: [CUSTODY_ENV],
     };
   } else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`] };
   if (spec.platform) out['karmax'] = spec.platform;
@@ -489,7 +495,7 @@ export function hasClaudeNativeCredential(home: string): boolean {
  *  their targets so the path to a mounted secret does not leak either. */
 const AGENT_VISIBLE_KARMAX_ENV = new Set([
   'KARMAX_GATEWAY_URL', 'KARMAX_PUBLIC_URL', 'KARMAX_TOKEN', 'KARMAX_RUNTIME_PROTOCOL',
-  'KARMAX_HOME', 'KARMAX_DEPLOYMENT', 'KARMAX_HOST_LOCAL', 'KARMAX_CELL_ID',
+  'KARMAX_CUSTODY_CHAIN', 'KARMAX_HOME', 'KARMAX_DEPLOYMENT', 'KARMAX_HOST_LOCAL', 'KARMAX_CELL_ID',
   'KARMAX_ANTHROPIC_BASE_URL', 'KARMAX_OPENAI_BASE_URL', 'KARMAX_KIMI_BASE_URL',
   'KARMAX_CODEX_USE_EXEC', 'KARMAX_CODEX_EXEC_CMD', 'KARMAX_OPENCODE_CMD', 'KARMAX_KIMI_CMD', 'KARMAX_GROK_CMD',
   'KARMAX_AGENT_BG_SETTLE_MS', 'KARMAX_CLAUDE_MODEL', 'KARMAX_OPENAI_MODEL', 'KARMAX_AGENT_PROVIDER',

@@ -3,8 +3,9 @@ import { Daytona } from '@daytona/sdk';
 import { DaytonaWorldProvider } from '../src/world/daytona.js';
 import { buildEnvironment, environmentArtifactName } from '../src/world/environment-build.js';
 import type { World } from '../src/world/types.js';
+import { liveEnabled } from './helpers/live-gate.js';
 
-const live = process.env.KARMAX_SKIP_LIVE !== '1' && !!process.env.DAYTONA_API_KEY;
+const live = liveEnabled() && !!process.env.DAYTONA_API_KEY;
 describe.skipIf(!live)('Daytona live environments', () => {
   it.skipIf(process.env.KARMAX_DAYTONA_LIVE_BUILD !== '1')('builds a setup snapshot and launches it without resource overrides', async () => {
     const client = new Daytona();

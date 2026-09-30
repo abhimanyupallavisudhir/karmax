@@ -30,13 +30,16 @@ function isLoopbackHost(host: string): boolean {
  *
  * Detected from how the gateway is served — a managed cell, a non-loopback bind,
  * or a public URL all mean someone else is on the other end. `KARMAX_HOST_LOCAL`
- * (`1`/`0`) overrides the detection for setups it cannot see, such as a tunnel
- * in front of a loopback bind.
+ * (`1`/`0`, also true/false, yes/no, on/off) overrides the detection for setups
+ * it cannot see, such as a tunnel in front of a loopback bind.
  */
 export function hostLocal(env: NodeJS.ProcessEnv = process.env): boolean {
   if (env.KARMAX_DEPLOYMENT === 'hosted') return false; // a managed cell is nobody's own machine
-  const override = env.KARMAX_HOST_LOCAL?.trim();
-  if (override) return override !== '0';
+  // Anything but a recognizable yes/no leaves detection in charge: `false` once
+  // meant "on", exposing the host's pass store to whoever reached the gateway.
+  const override = env.KARMAX_HOST_LOCAL?.trim().toLowerCase() ?? '';
+  if (['1', 'true', 'yes', 'on'].includes(override)) return true;
+  if (['0', 'false', 'no', 'off'].includes(override)) return false;
   if (!isLoopbackHost(env.KARMAX_HOST?.trim() || '127.0.0.1')) return false;
   const publicUrl = env.KARMAX_PUBLIC_URL?.trim();
   if (!publicUrl) return true;
@@ -59,8 +62,8 @@ const SECRET_FILE_ENV = [
  * process.env. Explicit NAME values win, making local and managed-secret
  * deployments use the same downstream configuration. */
 export function hydrateSecretFiles(env: NodeJS.ProcessEnv = process.env,
-  read: (filename: string) => string): void {
-  for (const name of SECRET_FILE_ENV) {
+  read: (filename: string) => string, names: readonly (typeof SECRET_FILE_ENV)[number][] = SECRET_FILE_ENV): void {
+  for (const name of names) {
     if (env[name]) continue;
     const filename = env[`${name}_FILE`]?.trim();
     if (filename) env[name] = read(filename).trimEnd();

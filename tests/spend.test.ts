@@ -127,14 +127,14 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
   it('captures inherited defaults and preserves them when a draft is replaced', async () => {
     (await h.store.setSettings(projectId, 'payments', { cardIds: [cardId], budget: 4500 }));
     const task = await post(`/api/projects/${projectId}/tasks`, { workflow: 'just-do', draft: true, params: { prompt: 'Inherited payments' } });
-    expect(task.params.paymentPolicy).toEqual({ cardIds: [cardId], budget: 4500 });
+    expect(task.params.paymentPolicy).toEqual({ cardIds: [cardId], budget: 4500, currency: 'usd' });
     (await h.store.setSettings(projectId, 'payments', { cardIds: [], budget: 0 }));
     const response = await fetch(`${base}/api/tasks/${task.id}/params`, { method: 'PATCH', headers: auth(),
       body: JSON.stringify({ params: { prompt: 'Edited prompt' }, replace: true }) });
     expect(response.status).toBe(200);
     expect(await get(`/api/tasks/${task.id}/payments`)).toMatchObject({ cardIds: [cardId], budget: 4500, spent: 0 });
     const next = await post(`/api/projects/${projectId}/tasks`, { workflow: 'just-do', draft: true, params: { prompt: 'New defaults' } });
-    expect(next.params.paymentPolicy).toEqual({ cardIds: [], budget: 0 });
+    expect(next.params.paymentPolicy).toEqual({ cardIds: [], budget: 0, currency: 'usd' });
   });
 
 });

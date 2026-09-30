@@ -25,6 +25,7 @@ for (const local of [false, true]) test(`${local ? 'local' : 'hosted'} checkout 
       return { cwd: '/checkout', workspace: '/workspace', repositories: [], cloneScript: '', updateScript: '', pushScript: '' };
     },
   });
+  vm.runInContext(between('async function localHandoffDialog(', 'async function openLocalCheckout('), context);
   vm.runInContext(local
     ? between('async function materializeLocalCheckout(', 'async function forkCloudSessionLocally(')
     : between('async function openLocalCheckout(', 'async function openProjectCheckout('), context);

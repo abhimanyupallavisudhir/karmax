@@ -46,6 +46,7 @@ const helpers = `
         if (url !== '/api/connections/conn_mail/callback?organizationId=org' || body.state !== 'fixture-state' || body.code !== 'fixture-code') throw new Error('Wrong callback ' + url);
         return { status: 'active' };
       }
+      const siteNameMarkup = () => 'Fixture';
       ${callback}
       window.done = finishMcpCallback();
     ` });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { previewLocation, toPublicPayload } from '../src/gateway/server.js';
+import { Gateway, previewLocation, toPublicPayload } from '../src/gateway/server.js';
 import { hashPreviewToken, previewCookieHeader, previewCookieValue, previewLeaseOrigin, previewTokenMatches } from '../src/gateway/previews.js';
 import { PREVIEW_TLS_GRACE_MS, Store } from '../src/store/db.js';
 
@@ -29,6 +29,20 @@ function view(world: Record<string, unknown>, worldPath: string) {
 }
 
 describe('public gateway payloads', () => {
+  it('includes the authorized project in websocket events (RQ-3)', async () => {
+    const gateway = Object.create(Gateway.prototype) as any;
+    let publish: (event: unknown, projectId: string) => Promise<void>;
+    gateway.socketAuth = async () => ({ apiToken: 'fixture' });
+    gateway.watchTiming = async () => () => {};
+    gateway.deps = { tokens: { verify: async () => ({}), check: async () => ({ ok: true }) } };
+    gateway.fanout = { on: (listener: typeof publish) => { publish = listener; return () => {}; } };
+    const sent: any[] = [];
+    const ws = { readyState: 1, bufferedAmount: 0, on: () => {}, once: () => {}, send: (value: string) => sent.push(JSON.parse(value)) };
+    await gateway.eventStream(ws, { url: '/ws' });
+    await publish!({ type: 'view.updated', taskId: 'task-1', payload: {} }, 'project-1');
+    expect(sent[0]).toMatchObject({ projectId: 'project-1', taskId: 'task-1' });
+  });
+
   it('projects a cloud world to availability without leaking its handle or virtual path', () => {
     expect(toPublicPayload(view(remoteWorld, remoteWorld.root))).toEqual({
       taskId: 'task-1',
