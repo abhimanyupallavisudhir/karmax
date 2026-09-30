@@ -22,6 +22,7 @@ import { ApplicationFailure } from '@temporalio/common';
 import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
+import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -2554,11 +2555,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // reservation retry-safe and binds every request to its org/project/task.
         if (profile.provider !== 'mock') {
           const turnId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}`;
-          const admissionId = activityAttempt > 1 ? `${turnId}:attempt:${activityAttempt}` : turnId;
+          const admissionId = admissionIdFor(turnId, activityAttempt);
           (await store.admitAgentUsage({ id: admissionId, organizationId, projectId: args.task.projectId,
             taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
             ...(activityAttempt > 1 ? { retryOf: Array.from({ length: activityAttempt - 1 },
-              (_, index) => index === 0 ? turnId : `${turnId}:attempt:${index + 1}`) } : {}),
+              (_, index) => admissionIdFor(turnId, index + 1)) } : {}),
             reservedCostMicros: managedReservationMicros }));
           // A rejected admission does not own the existing reservation and must
           // not release it in finally (it may belong to a different live turn).

@@ -9,6 +9,7 @@ import {
 } from '../coordinators/names.js';
 import type { Store } from '../store/db.js';
 import { withTimeout } from '../util/timeout.js';
+import { admissionTurnId } from '../domain/turn-admission.js';
 
 interface AgentQueueItem {
   taskId: string;
@@ -164,8 +165,9 @@ export class EntitlementQueueReconciler {
     // workflow versions did not expose stable turn ownership in their views, so
     // preserve those admissions rather than mistaking an old shape for staleness.
     for (const admission of (await this.options.store.activeAgentUsageAdmissions(organizationId))) {
+      // A retried attempt's admission (`<turn>:attempt:<n>`) belongs to its turn.
       if ((await hasDurableTurnIdentity(this.options.store, admission.taskId))
-        && !(await stillOwned(admission.taskId, admission.id)))
+        && !(await stillOwned(admission.taskId, admissionTurnId(admission.id))))
         (await this.options.store.finishUsageAdmission(admission.id, false));
     }
 
