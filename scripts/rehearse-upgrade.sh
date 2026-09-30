@@ -19,7 +19,7 @@
 # Nothing reaches production or spends credit: the stack is its own Compose
 # project, agents are the mock, worlds come from a local E2B stand-in
 # (scripts/rehearsal/fake-e2b.ts) and the card is the vault-card rail. Needs
-# Linux, Docker with Compose v2 and ~10 GB of disk. The wiki page
+# Linux, Docker with Compose v2, openssl and ~10 GB of disk. The wiki page
 # ops/release-and-deploy ("Rehearsing an upgrade") lists the traps.
 set -euo pipefail
 
@@ -32,7 +32,11 @@ WORK=''
 KEEP=0
 RUNNER=1
 BEFORE_UPDATE=''
-DOMAIN=rehearse.localhost
+# Reserved (RFC 2606): it never resolves, and Caddy treats it as a public name
+# whose certificate it manages from storage, as tavya.io's. Caddy never gets a
+# certificate for a .localhost name here: the Caddyfile's on-demand catch-all
+# makes it ask the app, which allows only preview hosts.
+DOMAIN=rehearse.invalid
 # A project of its own, so the rehearsal never touches an installation's
 # `karmax` containers or volumes on the same host. deploy/karmax runs every
 # Compose command without -p, so it honours this.
@@ -112,6 +116,27 @@ summary() {
 abort() { summary; exit 1; }
 
 # ---------------------------------------------------------------- stack helpers
+# The certificate an installation already holds for its domain, as tavya.io's
+# does: Caddy loads it from storage at start instead of asking an ACME CA, so
+# HTTPS through the edge works and nothing leaves this host. The project's
+# caddy_data volume is created with Compose's labels before `up` uses it.
+seed_edge_certificate() {
+  local volume="${COMPOSE_PROJECT_NAME}_caddy_data" seed name dir
+  docker volume inspect "$volume" >/dev/null 2>&1 || docker volume create \
+    --label "com.docker.compose.project=$COMPOSE_PROJECT_NAME" --label com.docker.compose.volume=caddy_data \
+    --label com.docker.compose.version="$(docker compose version --short)" "$volume" >/dev/null
+  seed=$(mktemp -d)
+  for name in "$DOMAIN" "www.$DOMAIN"; do
+    dir=$seed/caddy/certificates/acme-v02.api.letsencrypt.org-directory/$name
+    mkdir -p "$dir"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 90 -subj "/CN=$name" \
+      -addext "subjectAltName=DNS:$name" -keyout "$dir/$name.key" -out "$dir/$name.crt" 2>/dev/null
+    printf '{"sans":["%s"],"issuer_data":{"url":"https://acme-v02.api.letsencrypt.org/directory"}}' "$name" > "$dir/$name.json"
+  done
+  docker run --rm -v "$volume:/data" -v "$seed:/seed:ro" "$NODE_IMAGE" cp -r /seed/caddy /data/
+  rm -rf "$seed"
+}
+
 by_project() { docker ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" "$@"; }
 app_container() { by_project --filter status=running --filter label=com.docker.compose.service=app | head -n 1; }
 app_url() {
@@ -145,6 +170,33 @@ client() {
     -v "$REHEARSAL:/rehearsal:ro" -v "$WORK:/work" "$NODE_IMAGE" \
     node --experimental-strip-types --no-warnings /rehearsal/client.ts "$@" \
     --app http://app:4505 --origin "https://$DOMAIN" --state /work/state.json
+}
+
+# The public edge, probed from this host as a visitor would reach it
+# (scripts/rehearsal/edge-probe.sh). FROM's result is recorded, never judged:
+# it shows what the update changes.
+edge_probe() { "$REHEARSAL/edge-probe.sh" "$1" "$DOMAIN" "${2:-probe}"; }
+observe() {
+  local name=$1 log=$2 status; shift 2
+  say "$name"
+  set +e; "$@" 2>&1 | tee "$LOGS/$log"; status=${PIPESTATUS[0]}; set -e
+  record info "$name: $([ "$status" -eq 0 ] && echo ok || echo "not ok (exit $status; $LOGS/$log)")"
+}
+# Like step, except that a probe which could not run (exit 2) is a skip.
+judge_edge() {
+  local name=$1 log=$2 status; shift 2
+  say "$name"
+  set +e; "$@" 2>&1 | tee "$LOGS/$log"; status=${PIPESTATUS[0]}; set -e
+  case "$status" in
+    0) record ok "$name" ;;
+    2) record skip "$name (could not run here; $LOGS/$log)" ;;
+    *) record FAIL "$name (exit $status; $LOGS/$log)" ;;
+  esac
+}
+# A release whose Compose file names a trusted proxy promises each client its
+# own address; one that does not only gets observed.
+promises_client_addresses() {
+  git -C "$WORK/origin.git" show "$DEPLOY_SHA:deploy/compose.turnkey.yml" | grep -q 'KARMAX_TRUSTED_PROXY_IP'
 }
 
 # Point the app at the E2B stand-in. $KARMAX_HOME/karmax.env is the operator's
@@ -200,6 +252,7 @@ trap cleanup EXIT
 say "Rehearsing $FROM ($FROM_SHA) -> $TO ($TO_SHA) in $WORK"
 docker info >/dev/null 2>&1 || die 'Docker is not running or not accessible (sudo dockerd &; sudo chmod 666 /var/run/docker.sock)'
 docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required'
+command -v openssl >/dev/null 2>&1 || die 'openssl is required (it makes the certificate the edge serves)'
 docker image inspect "$NODE_IMAGE" >/dev/null 2>&1 || docker pull -q "$NODE_IMAGE" >/dev/null
 [ -z "$(by_project)" ] || { echo "Removing the previous rehearsal's $COMPOSE_PROJECT_NAME project…"; wipe_project; }
 wipe_sandboxes
@@ -269,8 +322,11 @@ step 'Warm the TO image build (not timed as the update)' warm-build.log warm_bui
 
 # ---------------------------------------------------------------- a. install FROM
 cd "$WORK/install"
+seed_edge_certificate
 step 'a. Install FROM (deploy/karmax up)' up-from.log ./deploy/karmax up "$DOMAIN" || abort
 step '   Point FROM at the E2B stand-in' e2b-from.log use_fake_e2b || abort
+observe '   Edge on FROM: HTTPS through Caddy' edge-from-reach.log edge_probe reach from
+observe '   Edge on FROM: each client keeps its address' edge-from-addresses.log edge_probe addresses from
 
 # ---------------------------------------------------------------- b. seed
 step 'b. Seed through the FROM API' seed.log client seed || abort
@@ -355,6 +411,12 @@ else
   step 'e. Verify every record through the TO API' verify-to.log client verify --phase upgraded --resume || true
   step '   doctor: the app connects as its own role' doctor.log doctor_role || true
   step "   The app's background jobs run cleanly" jobs-to.log background_jobs || true
+  judge_edge 'e. Edge: HTTPS through Caddy reaches the app' edge-to-reach.log edge_probe reach to
+  if promises_client_addresses; then
+    judge_edge 'e. Edge: each client keeps its address' edge-to-addresses.log edge_probe addresses to
+  else
+    observe '   Edge on TO: each client keeps its address' edge-to-addresses.log edge_probe addresses to
+  fi
 fi
 
 # ---------------------------------------------------------------- f. restore
@@ -382,6 +444,7 @@ restore() {
   fi
   printf '%s\n' "$confirm" | ./deploy/karmax restore "${accept[@]}" "$BACKUP"
 }
+seed_edge_certificate
 if step 'f. Install a fresh TO stack (deploy/karmax up)' up-fresh.log ./deploy/karmax up "$DOMAIN" \
   && step 'f. Restore the pre-update backup (deploy/karmax restore)' restore.log restore \
   && step '   Point the restored stack at the E2B stand-in' e2b-restore.log use_fake_e2b; then
