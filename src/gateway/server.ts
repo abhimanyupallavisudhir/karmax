@@ -4030,9 +4030,18 @@ export class Gateway {
             const { remoteName } = await import('../world/provision-git.js');
             const repositories = [...new Set([...(project.config.repos ?? []).map(remoteName),
               ...(await store.listProjectRepositories(project.id)).map(({ repository }) => repository.name)])];
+            const { environmentBase } = await import('../world/project-runtime.js');
+            const bases = new Map<string, string | undefined>();
+            const builds = [];
+            for (const build of (await environments.builds(project.id))) {
+              if (!bases.has(build.provider)) bases.set(build.provider, await environmentBase(store, project.id, build.provider));
+              const base = bases.get(build.provider);
+              // Worlds skip a build made on another template (selectProjectEnvironment).
+              builds.push({ ...build, recoveryRevision: environmentBuildRevision(build),
+                ...(base !== undefined && build.base !== base ? { stale: true } : {}) });
+            }
             return this.json(res, 200, { spec: spec ?? null, repositories,
-              digest: spec ? environments.digest(spec) : null, builds: (await environments.builds(project.id)).map(build => ({ ...build,
-                recoveryRevision: environmentBuildRevision(build) })) });
+              digest: spec ? environments.digest(spec) : null, builds });
           }
           if (method === 'PUT' && !sub) {
             const body = await this.body(req);
@@ -4075,7 +4084,7 @@ export class Gateway {
               ...(connection ? { connection: { apiKey: connection.apiKey,
                 apiUrl: (connection.config as any)?.apiUrl, target: (connection.config as any)?.target,
                 template: (connection.config as any)?.template } } : {}) })
-              .then((result) => finishEnvironmentBuild(store, attempt, { ref: result.ref, status: 'ready' }),
+              .then((result) => finishEnvironmentBuild(store, attempt, { ref: result.ref, ...(result.base ? { base: result.base } : {}), status: 'ready' }),
                 (error) => finishEnvironmentBuild(store, attempt,
                   { status: 'failed', error: String(error instanceof Error ? error.message : error).slice(0, 800) }))
               .catch(error => console.error('Failed to persist environment build completion', error));

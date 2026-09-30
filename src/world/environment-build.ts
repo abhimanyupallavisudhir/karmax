@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ProjectEnvironmentSpec } from '../domain/types.js';
 import { environmentArtifactName } from '../util/environment-artifact.js';
+import { e2bTemplate } from './e2b-template.js';
 export { environmentArtifactName } from '../util/environment-artifact.js';
 
 const pexec = promisify(execFile);
@@ -12,7 +13,9 @@ const DOCKER_SETUP = 'command -v docker >/dev/null 2>&1 || (curl -fsSL https://g
 export const DOCKER_BOOT = 'command -v dockerd >/dev/null 2>&1 && { docker info >/dev/null 2>&1 || '
   + '{ nohup dockerd >/tmp/karmax-dockerd.log 2>&1 & for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done; }; } || true';
 
-export interface EnvironmentBuildResult { ref: string }
+/** `base` is the provider template an E2B artifact was built on. Worlds use the
+ * artifact only while a new build would start from that same template. */
+export interface EnvironmentBuildResult { ref: string; base?: string }
 export interface EnvironmentBuildInput {
   provider: string;
   projectId: string;
@@ -22,7 +25,7 @@ export interface EnvironmentBuildInput {
   assertActive?: () => void | Promise<void>;
   spec: ProjectEnvironmentSpec;
   connection?: { apiKey?: string; apiUrl?: string; target?: string; template?: string };
-  createBuilderSandbox?: (base: string | undefined, options: { apiKey?: string }) => Promise<BuilderSandbox>;
+  createBuilderSandbox?: (base: string, options: { apiKey?: string }) => Promise<BuilderSandbox>;
 }
 export interface BuilderSandbox {
   id?: string;
@@ -65,9 +68,7 @@ async function buildContainer(input: EnvironmentBuildInput): Promise<Environment
 async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildResult> {
   const create = input.createBuilderSandbox ?? (async (base, options) => {
     const { Sandbox } = await import('e2b');
-    const sandbox: any = base
-      ? await (Sandbox as any).create(base, { ...options, timeoutMs: 45 * 60_000 })
-      : await (Sandbox as any).create({ ...options, timeoutMs: 45 * 60_000 });
+    const sandbox: any = await (Sandbox as any).create(base, { ...options, timeoutMs: 45 * 60_000 });
     return {
       id: sandbox.sandboxId,
       async run(command: string, runOptions: { timeoutMs: number }) {
@@ -82,9 +83,11 @@ async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildR
     } satisfies BuilderSandbox;
   });
   // ProjectEnvironmentSpec.image is an OCI base for container/Daytona builds.
-  // E2B launches from its provider-native template configured under Compute.
-  const builder = await create(input.connection?.template,
-    { ...(input.connection?.apiKey ? { apiKey: input.connection.apiKey } : {}) });
+  // E2B builds on the template task worlds start from. With none named under
+  // Compute that is karmax's own; E2B's stock image has neither the browser
+  // tools nor the memory those worlds need.
+  const base = e2bTemplate(input.connection?.template);
+  const builder = await create(base, { ...(input.connection?.apiKey ? { apiKey: input.connection.apiKey } : {}) });
   try {
     if (builder.id) await input.onBuilderCreated?.(builder.id);
     for (const command of setupCommands(input.spec)) {
@@ -93,7 +96,7 @@ async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildR
       if (result.exitCode !== 0) throw new Error(`setup "${command}" failed: ${(result.stderr || result.stdout).slice(-500)}`);
     }
     await input.assertActive?.();
-    return { ref: (await builder.createSnapshot(environmentArtifactName(input.projectId, input.digest, input.buildId))).snapshotId };
+    return { ref: (await builder.createSnapshot(environmentArtifactName(input.projectId, input.digest, input.buildId))).snapshotId, base };
   } finally { await builder.kill(); }
 }
 
