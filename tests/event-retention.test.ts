@@ -17,7 +17,7 @@ it.each([['sqlite', ':memory:'], ...(postgres ? [['postgresql', postgres]] : [])
   const task = await store.createTask({ projectId: project.id, title: 'Idle task', workflow: 'software-dev',
     workflowVersion: '1.26.0', params: { prompt: 'work' } });
   const old = Date.now() - 200 * DAY;
-  const event = (type: string, payload: object, ts = old) => store.appendEvent({ taskId: task.id, type, ts, payload });
+  const event = (type: string, payload: Record<string, unknown>, ts = old) => store.appendEvent({ taskId: task.id, type, ts, payload });
   await event('push.head', { repo: 'app', branch: 'task', headSha: sha('a') });
   await event('pr.opened', { repo: 'app', headSha: sha('b') });
   await event('push.head', { repo: 'app', branch: 'task', headSha: sha('c') });

@@ -2890,20 +2890,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // A limit reported from inside a sandbox changes shared login availability
         // only when the host's own reading of the leased login confirms it (AD-7);
         // otherwise it stays with this task, which waits instead of escalating.
+        let turnError = err;
         if (err instanceof SandboxProviderFailure) {
           const login = resolvedAuth?.configHome && (profile.provider === 'claude' || profile.provider === 'codex')
             ? { provider: profile.provider, configHome: resolvedAuth.configHome } : undefined;
           const probe = deps.probeUsage ?? (({ provider, configHome }) => provider === 'codex'
             ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }));
-          err = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now());
+          turnError = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now());
         }
-        const failure = classifyTurnError(err, profile.provider);
+        const failure = classifyTurnError(turnError, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else
         // in a remote world may be the sandbox's fault, which its metrics can show.
         if (!world.diagnose || !(failure instanceof ApplicationFailure) || !['agent-error', 'agent-infra'].includes(failure.type ?? '')) throw failure;
         const diagnosis = await world.diagnose({ since: attemptStarted }).catch(() => undefined);
         if (diagnosis && turnSessionKey) (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify(diagnosis)));
-        throw classifyTurnError(err, profile.provider, { diagnosis });
+        throw classifyTurnError(turnError, profile.provider, { diagnosis });
       } finally {
         try {
           if (usageAdmissionId && !usageAdmissionFinished) {
