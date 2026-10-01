@@ -112,3 +112,69 @@ it('falls back to whole verified reads when a measured tail read keeps losing it
   await syncRemoteAgentHome(lossyWorld(root, (terminal) => terminal <= 3, true), 'codex', { relative, absolute }, localHome, id);
   expect(hostCopies(localHome, id)).toEqual([digest(content)]);
 }, 30_000);
+
+/** Bytes a sandbox printed to the host's terminals: what crossed the wire. */
+function meteredWorld(root: string, withExec = true): { world: World; printed: () => number } {
+  const inner = lossyWorld(root, () => false, withExec);
+  let bytes = 0;
+  return {
+    printed: () => bytes,
+    world: { ...inner, async openPty(spec) {
+      const pty = await inner.openPty!(spec);
+      pty.onData((chunk) => { bytes += Buffer.byteLength(chunk); });
+      return pty;
+    } } as World,
+  };
+}
+function appendRecords(file: string, megabytes: number, label: string): void {
+  const record = (i: number) => JSON.stringify({ type: 'response_item', payload: { text: `${label} ${i} ${'y'.repeat(1000)}` } });
+  const lines: string[] = [];
+  for (let i = 0; i < megabytes * 1024; i++) lines.push(record(i));
+  fs.appendFileSync(file, lines.join('\n') + '\n');
+}
+
+// Native histories of long tasks reach 177 MiB on tavya.io. A 16 MiB cap on
+// the whole file left LegiBench3 #10's last turns only in its sandbox
+// ("remote history byte limit exceeded", 2026-09-30); one read is still
+// bounded, so a long history crosses in several.
+it('exports a history longer than one terminal read, then only what a turn appended', async () => {
+  const root = temp(), localHome = temp();
+  const id = '01a0e28b-93ca-7d81-9d6f-2f82e8b44915';
+  const { relative, absolute } = rollout(root, localHome, id);
+  const file = fs.readdirSync(absolute, { recursive: true }).map(String).find((name) => name.endsWith(`${id}.jsonl`))!;
+  appendRecords(path.join(absolute, file), 20, 'early');
+  const first = meteredWorld(root);
+  await syncRemoteAgentHome(first.world, 'codex', { relative, absolute }, localHome, id);
+  expect(hostCopies(localHome, id)).toEqual([digest(fs.readFileSync(path.join(absolute, file)))]);
+
+  appendRecords(path.join(absolute, file), 2, 'late');
+  const second = meteredWorld(root);
+  await syncRemoteAgentHome(second.world, 'codex', { relative, absolute }, localHome, id);
+  expect(hostCopies(localHome, id)).toEqual([digest(fs.readFileSync(path.join(absolute, file)))]);
+  // Two appended MiB cross as base64 (about 2.7 MiB), not the whole history again.
+  expect(second.printed()).toBeLessThan(4 * 1024 * 1024);
+}, 120_000);
+
+it('exports a history longer than one terminal read through whole verified reads', async () => {
+  const root = temp(), localHome = temp();
+  const id = '01a0e28b-93ca-7d81-9d6f-2f82e8b44917';
+  const { relative, absolute } = rollout(root, localHome, id);
+  const file = fs.readdirSync(absolute, { recursive: true }).map(String).find((name) => name.endsWith(`${id}.jsonl`))!;
+  appendRecords(path.join(absolute, file), 20, 'early');
+  // Without exec the sandbox cannot measure its history in place; every file crosses whole.
+  await syncRemoteAgentHome(meteredWorld(root, false).world, 'codex', { relative, absolute }, localHome, id);
+  expect(hostCopies(localHome, id)).toEqual([digest(fs.readFileSync(path.join(absolute, file)))]);
+}, 120_000);
+
+it.each([true, false])('refuses a history larger than the host accepts without reading it (exec: %s)', async (withExec) => {
+  const root = temp(), localHome = temp();
+  const id = withExec ? '01a0e28b-93ca-7d81-9d6f-2f82e8b44916' : '01a0e28b-93ca-7d81-9d6f-2f82e8b44918';
+  const { relative, absolute } = rollout(root, localHome, id);
+  const file = fs.readdirSync(absolute, { recursive: true }).map(String).find((name) => name.endsWith(`${id}.jsonl`))!;
+  fs.truncateSync(path.join(absolute, file), 512 * 1024 * 1024 + 1); // sparse: no disk used
+  const metered = meteredWorld(root, withExec);
+  await expect(syncRemoteAgentHome(metered.world, 'codex', { relative, absolute }, localHome, id))
+    .rejects.toThrow('remote history byte limit exceeded');
+  expect(hostCopies(localHome, id)).toEqual([]);
+  expect(metered.printed()).toBeLessThan(1024 * 1024);
+}, 120_000);

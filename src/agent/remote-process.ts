@@ -455,8 +455,13 @@ export function remoteAgentHomeRelative(provider: Provider, localHome: string): 
   return `${REMOTE_ROOT}/${provider}/${identity}`;
 }
 
-const HISTORY_FILE_BYTES = 16 * 1024 * 1024;
-const HISTORY_TOTAL_BYTES = 32 * 1024 * 1024;
+/** The most one verified terminal read carries; longer reads are split. */
+const HISTORY_READ_BYTES = 16 * 1024 * 1024;
+/** The largest history file the host takes from a sandbox, and the most one
+ * sync transfers. Native histories of long tasks reach 177 MiB on tavya.io
+ * (2026-09-30), and the host already holds a whole history when it seeds one. */
+const HISTORY_FILE_BYTES = 512 * 1024 * 1024;
+const HISTORY_TOTAL_BYTES = 512 * 1024 * 1024;
 const HISTORY_FILE_COUNT = 64;
 type HistoryBudget = { bytes: number; files: number };
 
@@ -497,16 +502,23 @@ async function verifiedRemoteOutput(world: World, command: string, maxBytes: num
   }
 }
 
-async function readRemoteHistory(world: World, file: string, budget: HistoryBudget, maxBytes = HISTORY_FILE_BYTES): Promise<Buffer> {
+async function readRemoteHistory(world: World, file: string, budget: HistoryBudget): Promise<Buffer> {
   if (++budget.files > HISTORY_FILE_COUNT) throw new Error('remote history file count limit exceeded');
-  const encoded = await verifiedRemoteOutput(world,
-    `head -c ${maxBytes + 1} -- ${quote(path.posix.join(world.handle.root, file))} | base64 -w 0`,
-    Math.ceil((maxBytes + 1) / 3) * 4, 'read remote history');
-  const data = Buffer.from(encoded.toString('latin1'), 'base64');
-  budget.bytes += data.length;
-  if (data.length > maxBytes || budget.bytes > HISTORY_TOTAL_BYTES)
+  const absolute = quote(path.posix.join(world.handle.root, file));
+  // Refuse an oversized history before any of it crosses.
+  const size = Number((await verifiedRemoteOutput(world, `wc -c < ${absolute}`, 1024, 'measure remote history')).toString().trim());
+  if (!Number.isSafeInteger(size) || size > HISTORY_FILE_BYTES || budget.bytes + size > HISTORY_TOTAL_BYTES)
     throw new Error('remote history byte limit exceeded');
-  return data;
+  const chunks: Buffer[] = [];
+  let read = 0;
+  for (;;) {
+    const chunk = await readRemoteChunk(world, file, read, HISTORY_READ_BYTES);
+    chunks.push(chunk);
+    read += chunk.length;
+    budget.bytes += chunk.length;
+    if (read > HISTORY_FILE_BYTES || budget.bytes > HISTORY_TOTAL_BYTES) throw new Error('remote history byte limit exceeded');
+    if (chunk.length < HISTORY_READ_BYTES) return Buffer.concat(chunks);
+  }
 }
 
 /** Export only this turn's conversation and physical Codex history dependencies.
@@ -596,10 +608,11 @@ async function exportHistoryTails(world: World, provider: Provider, remoteHome: 
   }
   const fetch = async (copy: RemoteHistoryCopy, host?: Buffer): Promise<Buffer> => {
     if (++budget.files > HISTORY_FILE_COUNT) throw new Error('remote history file count limit exceeded');
-    budget.bytes += copy.size;
+    const offset = host && copy.size > host.length && copy.prefix === sha256(host) ? host.length : 0;
+    // Only the bytes the host lacks cross, so only they count against a sync.
+    budget.bytes += copy.size - offset;
     if (copy.size > HISTORY_FILE_BYTES || budget.bytes > HISTORY_TOTAL_BYTES) throw new Error('remote history byte limit exceeded');
     const file = `${remoteHome.relative}/${copy.file}`;
-    const offset = host && copy.size > host.length && copy.prefix === sha256(host) ? host.length : 0;
     const tail = await readRemoteHistoryRange(world, file, offset, copy.size - offset);
     const content = offset ? Buffer.concat([host!, tail]) : tail;
     if (sha256(content) !== copy.sha256) throw new Error('could not read remote history: the sandbox copy changed while it was read');
@@ -647,14 +660,27 @@ async function exportHistoryTails(world: World, provider: Provider, remoteHome: 
 }
 
 async function readRemoteHistoryRange(world: World, file: string, offset: number, length: number): Promise<Buffer> {
-  // The capture allows a whole file's worth, like readRemoteHistory: whatever a
-  // login shell prints before the output must not fail a short read.
+  const chunks: Buffer[] = [];
+  for (let read = 0; read < length;) {
+    const want = Math.min(HISTORY_READ_BYTES, length - read);
+    const chunk = await readRemoteChunk(world, file, offset + read, want);
+    if (chunk.length !== want) throw new Error('could not read remote history: the sandbox copy changed while it was read');
+    chunks.push(chunk);
+    read += want;
+  }
+  return Buffer.concat(chunks);
+}
+
+/** Up to `length` (at most one read's worth) bytes of a sandbox file from `offset`. */
+async function readRemoteChunk(world: World, file: string, offset: number, length: number): Promise<Buffer> {
+  // The capture allows a full read's worth whatever `length` is: anything a
+  // login shell prints before the output must not fail a short read. `head`
+  // reads the file itself: as the pipe's reader it would stop early, and the
+  // writer's SIGPIPE fails the read under pipefail.
   const encoded = await verifiedRemoteOutput(world,
-    `tail -c +${offset + 1} -- ${quote(path.posix.join(world.handle.root, file))} | head -c ${length} | base64 -w 0`,
-    Math.ceil((HISTORY_FILE_BYTES + 1) / 3) * 4, 'read remote history');
-  const data = Buffer.from(encoded.toString('latin1'), 'base64');
-  if (data.length !== length) throw new Error('could not read remote history: the sandbox copy changed while it was read');
-  return data;
+    `head -c ${offset + length} -- ${quote(path.posix.join(world.handle.root, file))} | tail -c +${offset + 1} | base64 -w 0`,
+    Math.ceil((HISTORY_READ_BYTES + 1) / 3) * 4, 'read remote history');
+  return Buffer.from(encoded.toString('latin1'), 'base64');
 }
 
 function localCodexHistory(localHome: string, id: string): Buffer | undefined {
