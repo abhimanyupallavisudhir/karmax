@@ -110,11 +110,15 @@ bearer header. The marker cannot refresh OAuth and remote auth is never imported
 back into the canonical home.
 Usage probes (Insights, Settings) read quota with the current token first and rotate OAuth
 only when that authenticated read fails; a usage refresh must never rotate
-credentials out from under live remote turns. Current Codex also treats that
-projection as logged out when its short-lived ID token expires, even while the
-access token is still valid. Before each remote process Karmax checks the ID-token
-expiry locally (no provider request) and, inside a ten-minute safety window,
-serializes one refresh through the canonical host authority before projection.
+credentials out from under live remote turns. Codex authenticates with the
+access token (about ten days) and refreshes it only in its last five minutes; it
+never reads the one-hour ID token's expiry. Before each remote process Karmax
+checks the access-token expiry locally (no provider request) and, within a day
+of it, serializes one refresh through the canonical host authority before
+projection. `account/read` reports no refresh error, so Karmax judges the result
+from the token itself: a failed early refresh (an OpenAI sign-in outage) keeps a
+still-usable token, a token left unusable is a retryable outage, and a login the
+refresh left without an account is marked signed out for a person to sign in again.
 If a long-running projection nevertheless receives a terminal
 expired/unauthorized response — including `codexErrorInfo=other` with an HTTP 401
 "Missing bearer or basic authentication" message — Karmax extracts the safe HTTP

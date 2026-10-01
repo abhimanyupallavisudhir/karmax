@@ -18,7 +18,7 @@ import {
   isUsageStale,
   USAGE_TTL_MS,
 } from '../src/agent/usage.js';
-import { ProviderFailure } from '../src/agent/limits.js';
+import { isTransportError, ProviderFailure, ProviderOutage } from '../src/agent/limits.js';
 
 /**
  * Hermetic verification of the proactive-quota parser + probe (#6). The panel text
@@ -470,44 +470,59 @@ describe('probeCodexUsage', () => {
     }
   });
 
-  it('refreshes an expired Codex ID token before projecting a remote login', async () => {
-    const home = mkHome(false);
-    const jwt = (exp: number) => `e30.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.signature`;
+  // Codex authenticates model requests with the access token (about ten days)
+  // and refreshes only near its expiry; it never reads the one-hour ID token's
+  // expiry. Task legibench3#10 (2026-10-01) failed a pre-turn refresh during an
+  // OpenAI sign-in outage although its access token had 225 hours left.
+  const codexJwt = (expiresAt: number) =>
+    `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(expiresAt / 1000) })).toString('base64url')}.signature`;
+  const writeCodexAuth = (home: string, accessExpiresAt: number, idExpiresAt = NOW - 60 * 60_000) =>
     fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({
       auth_mode: 'chatgpt',
-      tokens: { id_token: jwt(Math.floor(NOW / 1000) - 1), access_token: 'still-valid', refresh_token: 'host-only' },
+      tokens: { id_token: codexJwt(idExpiresAt), access_token: codexJwt(accessExpiresAt), refresh_token: 'host-only' },
     }));
+  const rotateCodexAuth = (home: string) => {
+    writeCodexAuth(home, NOW + 10 * 24 * 60 * 60_000, NOW + 60 * 60_000);
+    return CODEX_LIMITS;
+  };
+
+  it('launches without rotating a login whose ID token expired but whose access token covers the turn', async () => {
+    const home = mkHome(false);
+    writeCodexAuth(home, NOW + 225 * 60 * 60_000);
+    try {
+      await expect(ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => {
+        throw new Error('a valid access token must not rotate');
+      } })).resolves.toBe(false);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refreshes a Codex access token nearing expiry before projecting a remote login', async () => {
+    const home = mkHome(false);
+    writeCodexAuth(home, NOW + 60 * 60_000);
     let calls = 0;
     try {
-      await ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => {
+      await expect(ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => {
         calls++;
-        const auth = JSON.parse(fs.readFileSync(path.join(home, 'auth.json'), 'utf8'));
-        auth.tokens.id_token = jwt(Math.floor((NOW + 60 * 60_000) / 1000));
-        fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify(auth));
-        return CODEX_LIMITS;
-      } });
+        return rotateCodexAuth(home);
+      } })).resolves.toBe(true);
       expect(calls).toBe(1);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
   });
 
-  it('shares one ID-token refresh across concurrent remote preflights', async () => {
+  it('shares one access-token refresh across concurrent remote preflights', async () => {
     const home = mkHome(false);
-    const jwt = (exp: number) => `e30.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.signature`;
-    fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({
-      tokens: { id_token: jwt(Math.floor(NOW / 1000) - 1), refresh_token: 'host-only' },
-    }));
+    writeCodexAuth(home, NOW - 1);
     let calls = 0;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const run = async () => {
       calls++;
       await gate;
-      const auth = JSON.parse(fs.readFileSync(path.join(home, 'auth.json'), 'utf8'));
-      auth.tokens.id_token = jwt(Math.floor((NOW + 60 * 60_000) / 1000));
-      fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify(auth));
-      return CODEX_LIMITS;
+      return rotateCodexAuth(home);
     };
     try {
       const first = ensureCodexLoginFresh({ configHome: home, now: NOW, run });
@@ -522,25 +537,67 @@ describe('probeCodexUsage', () => {
     }
   });
 
-  it('does not rotate a Codex login whose ID token covers the safety window', async () => {
+  it('keeps a still-usable access token when the early refresh fails', async () => {
     const home = mkHome(false);
-    const idToken = `e30.${Buffer.from(JSON.stringify({ exp: Math.floor((NOW + 30 * 60_000) / 1000) })).toString('base64url')}.signature`;
-    fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({ tokens: { id_token: idToken } }));
+    writeCodexAuth(home, NOW + 2 * 60 * 60_000);
     try {
-      await ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => {
-        throw new Error('fresh login must not rotate');
-      } });
+      await expect(ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => {
+        throw new Error('auth.openai.com unavailable');
+      } })).resolves.toBe(false);
+      await expect(ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => CODEX_LIMITS }))
+        .resolves.toBe(false);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
   });
 
-  it('rejects a refresh that leaves the projected Codex ID token stale', async () => {
-    const home = mkHome(true);
+  it('retries as a provider outage when a needed refresh does not renew the access token', async () => {
+    const home = mkHome(false);
+    writeCodexAuth(home, NOW + 60_000);
     try {
-      await expect(ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => CODEX_LIMITS }))
-        .rejects.toThrow(/fresh ID token/i);
+      const failure = await ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => CODEX_LIMITS })
+        .catch((error) => error);
+      expect(failure).toBeInstanceOf(ProviderOutage);
+      expect(isTransportError(failure)).toBe(true);
+      expect(failure.message).toMatch(/OpenAI/);
     } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('marks a Codex login signed out when the host refresh is refused', async () => {
+    const home = mkHome(false);
+    writeCodexAuth(home, NOW - 1);
+    const stub = path.join(home, 'codex-signed-out-stub.cjs');
+    const oldCmd = process.env.KARMAX_CODEX_USAGE_CMD;
+    // codex app-server swallows refresh errors; a permanent one leaves no account.
+    fs.writeFileSync(stub, `#!/usr/bin/env node
+const readline = require('readline');
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} });
+  else if (msg.method === 'account/read') send({ id: msg.id, result: { account: null, requiresOpenaiAuth: true } });
+  else if (msg.method === 'account/rateLimits/read' && process.env.STUB_RATE_LIMITS_UNAUTHORIZED)
+    send({ id: msg.id, error: { code: -32001, message: '401 Unauthorized' } });
+  else if (msg.method === 'account/rateLimits/read') send({ id: msg.id, result: ${JSON.stringify(CODEX_LIMITS)} });
+});
+`);
+    fs.chmodSync(stub, 0o755);
+    process.env.KARMAX_CODEX_USAGE_CMD = stub;
+    try {
+      const failure = await ensureCodexLoginFresh({ configHome: home, now: NOW, timeoutMs: 2_000 }).catch((error) => error);
+      expect(failure).toBeInstanceOf(ProviderFailure);
+      expect(failure.metadata).toMatchObject({ kind: 'credential', permanence: 'hard', provider: 'codex' });
+      expect(failure.message).toMatch(/sign in again/i);
+      // The host probe that confirms a sandbox's sign-in failure sees the same.
+      process.env.STUB_RATE_LIMITS_UNAUTHORIZED = '1';
+      await expect(probeCodexUsage({ configHome: home, now: NOW, timeoutMs: 2_000 }))
+        .resolves.toMatchObject({ ok: false, reason: 'logged-out' });
+    } finally {
+      if (oldCmd === undefined) delete process.env.KARMAX_CODEX_USAGE_CMD;
+      else process.env.KARMAX_CODEX_USAGE_CMD = oldCmd;
+      delete process.env.STUB_RATE_LIMITS_UNAUTHORIZED;
       fs.rmSync(home, { recursive: true, force: true });
     }
   });
