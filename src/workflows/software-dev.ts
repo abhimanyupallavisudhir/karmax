@@ -3071,11 +3071,38 @@ Inspect the complete current diff and specifically compare its delta from the re
     // The agent asked to be resumed later (`pause`): park here and resume it with
     // the outcome. A message, a child's event, or a cancellation ends it early.
     if (turn.wait && patched('agent-wait-v1')) {
+      // `needs_input`: ask the task's ordinary input route unless the agent
+      // named people. A configured response agent answers at once, as it does
+      // for a question ending an ordinary turn; people get a Needs input hold.
+      const needsInput = turn.wait.needsInput;
+      const question = needsInput?.message ?? (turn.output?.trim() || 'The agent paused for your input.');
+      const route = needsInput && !needsInput.audience?.length && routedInputResponder ? liveResponder : undefined;
+      if (needsInput && route?.kind === 'agent' && responderRounds < 3) {
+        responderRounds++;
+        status = 'waiting';
+        waitingFor = { kind: 'responder', detail: question };
+        await publish();
+        const answer = await responderTurn(route, question);
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        if (answer) {
+          msgs.push({ id: `responder-${msgs.length}`, role: 'user', text: `Responder: ${answer}`, ts: msgs.length });
+          continue;
+        }
+      }
       const note = await waitForAgent(turn.wait, {
         world,
         ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
+        ...(needsInput ? { ask: {
+          audience: needsInput.audience?.length ? needsInput.audience
+            : route?.kind === 'human' && route.audience?.length ? route.audience : ['@creator'],
+          detail: question,
+          ...(needsInput.urgency ? { urgency: needsInput.urgency } : {}),
+        } } : {}),
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
-        interrupted: () => cancelled || msgs.length > seen || raises.length > 0 || settled.length > 0,
+        // A Needs input hold offers Open PR, like any input hold in Do.
+        interrupted: () => cancelled || msgs.length > seen || raises.length > 0 || settled.length > 0
+          || (!!needsInput && prRequested),
       });
       if (cancelled) return await abort();
       if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });

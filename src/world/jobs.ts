@@ -15,6 +15,7 @@ import { ensureWorldExcluded } from './secret-exclude.js';
  * lives in files inside the world:
  *
  *   .karmax-injection/jobs/<id>/command   the command, run with `bash`
+ *                               name      what the agent called it, if anything
  *                               cwd       where it runs
  *                               pid       session leader (= process group)
  *                               pidstart  /proc start tick, a PID-reuse guard
@@ -38,6 +39,8 @@ export interface JobStatus {
   state: JobState;
   exitCode?: number;
   command?: string;
+  /** What the agent called it, shown to people while a task waits on it. */
+  name?: string;
   startedAt?: number;
   endedAt?: number;
   /** World path of the job's combined output. */
@@ -66,9 +69,10 @@ const ALIVE = `alive() { p=$(cat "$1/pid" 2>/dev/null) || return 1; [ -n "$p" ] 
 // script works on the host, in a container (root mounted elsewhere), and in a
 // remote sandbox.
 const LAUNCH = `set -e
-id=$1; cwd=$2; d=${JOB_ROOT}/$id
+id=$1; cwd=$2; name=$3; d=${JOB_ROOT}/$id
 mkdir -p "$d"; d=$(cd "$d" && pwd)
 cat > "$d/command"
+[ -z "$name" ] || printf '%s\n' "$name" > "$d/name"
 printf '%s\\n' "$cwd" > "$d/cwd"; date +%s > "$d/started"
 cd -- "$cwd"
 setsid bash -c 'd=$1; echo $$ > "$d/pid.tmp"; cut -d" " -f22 /proc/$$/stat > "$d/pidstart" 2>/dev/null || true
@@ -78,11 +82,17 @@ setsid bash -c 'd=$1; echo $$ > "$d/pid.tmp"; cut -d" " -f22 /proc/$$/stat > "$d
 i=0; while [ ! -s "$d/pid" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done
 [ -s "$d/pid" ]`;
 
+/** The longest job name: it is a label, not a description. */
+export const MAX_JOB_NAME = 60;
+
 /** Start `command` as a durable job. `cwd` is relative to the agent's working
  * directory unless absolute. `env` carries the project's work secrets. */
-export async function startJob(world: World, spec: { command: string; cwd?: string; env?: Record<string, string> }): Promise<JobStatus> {
+export async function startJob(world: World, spec: { command: string; cwd?: string; name?: string; env?: Record<string, string> }): Promise<JobStatus> {
   const command = spec.command.trim();
   if (!command) throw new Error('command is required');
+  // One line: the status script reads it back as one.
+  const name = spec.name?.replace(/\s+/g, ' ').trim() || undefined;
+  if (name && [...name].length > MAX_JOB_NAME) throw new Error(`name must be at most ${MAX_JOB_NAME} characters`);
   const workdir = worldWorkingDirectory(world.handle).replace(/\\/g, '/');
   const cwd = spec.cwd ? (path.posix.isAbsolute(spec.cwd) ? spec.cwd : path.posix.join(workdir, spec.cwd)) : workdir;
   // The launcher runs from the world root, which a container maps elsewhere:
@@ -92,11 +102,11 @@ export async function startJob(world: World, spec: { command: string; cwd?: stri
   const launchCwd = !inside ? '.' : inside.startsWith('..') || path.posix.isAbsolute(inside) ? cwd : inside;
   await ensureWorldExcluded(world, '.karmax-injection').catch(() => {});
   const id = `job-${crypto.randomBytes(4).toString('hex')}`;
-  const result = await world.exec('bash', ['-c', LAUNCH, 'karmax-job-launch', id, launchCwd], {
+  const result = await world.exec('bash', ['-c', LAUNCH, 'karmax-job-launch', id, launchCwd, name ?? ''], {
     cwd: world.handle.root, input: `${command}\n`, timeoutMs: 30_000, ...(spec.env ? { env: spec.env } : {}),
   });
   if (result.code !== 0) throw new Error(`could not start job: ${(result.stderr || result.stdout).trim().slice(0, 500) || `exit ${result.code}`}`);
-  return { id, state: 'running', command, log: `${jobDirectory(world, id)}/log` };
+  return { id, state: 'running', command, ...(name ? { name } : {}), log: `${jobDirectory(world, id)}/log` };
 }
 
 const STATUS = `${ALIVE}
@@ -105,6 +115,7 @@ for id in "$@"; do d=${JOB_ROOT}/$id
   if [ ! -d "$d" ]; then printf '%s %s missing\\n' "$b" "$id"; continue; fi
   if [ -f "$d/exit" ]; then s="exited $(cat "$d/exit")"; elif alive "$d"; then s=running; else s=lost; fi
   printf '%s %s %s %s %s\\n' "$b" "$id" "$s" "$(cat "$d/started" 2>/dev/null)" "$(cat "$d/ended" 2>/dev/null)"
+  printf '%s\\n' "$(head -n 1 "$d/name" 2>/dev/null)"
   head -c 300 "$d/command" 2>/dev/null | head -n 1; echo
   if [ "$lines" -gt 0 ] && [ -f "$d/log" ]; then tail -c 6000 "$d/log" | tail -n "$lines"; fi
 done
@@ -124,7 +135,8 @@ export async function jobStatuses(world: World, ids: string[], opts: { tailLines
     let body: string[] = [];
     const flush = () => {
       if (!current) return;
-      const [command, ...tail] = body;
+      const [name, command, ...tail] = body;
+      if (name) current.name = name;
       if (command) current.command = command;
       const text = tail.join('\n').replace(/^\n+/, '').trimEnd();
       if (opts.tailLines && text) current.tail = text;
@@ -211,13 +223,14 @@ export function formatDuration(ms: number): string {
 export function describeJobs(jobs: JobStatus[], now = Date.now()): string {
   return jobs.map((job) => {
     const took = job.startedAt !== undefined ? formatDuration((job.endedAt ?? now) - job.startedAt) : undefined;
+    const it = job.name ? `${job.id} (${job.name})` : job.id;
     const head = job.state === 'exited'
-      ? `Job ${job.id} exited with code ${job.exitCode}${took ? ` after ${took}` : ''}.`
+      ? `Job ${it} exited with code ${job.exitCode}${took ? ` after ${took}` : ''}.`
       : job.state === 'running'
-        ? `Job ${job.id} is still running${took ? ` (${took} so far)` : ''}.`
+        ? `Job ${it} is still running${took ? ` (${took} so far)` : ''}.`
         : job.state === 'lost'
-          ? `Job ${job.id} stopped without recording an exit code (its world was restarted or the process was killed).`
-          : `Job ${job.id} was not found in this world.`;
+          ? `Job ${it} stopped without recording an exit code (its world was restarted or the process was killed).`
+          : `Job ${it} was not found in this world.`;
     const lines = [head];
     if (job.command) lines.push(`Command: ${job.command}`);
     if (job.log) lines.push(`Log: ${job.log}`);

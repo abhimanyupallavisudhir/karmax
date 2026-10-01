@@ -266,6 +266,21 @@ describe.each(storeBackends)('inbox urgency ($name)', ({ name, open }) => {
     expect((await g.inbox())[0]).toMatchObject({ urgency: 'normal' });
   });
 
+  // `pause` with needs_input raises its ask through the task's own view, not a
+  // separate event: the published lifecycle tick is what carries its urgency.
+  it('takes the urgency a paused agent stated on its Needs input hold', async () => {
+    const f = (await fixture(open));
+    const ask = { stage: 'do', status: 'waiting', waitingFor: { kind: 'human', audience: ['user:reviewer'],
+      detail: 'Which region?', until: Date.now() + 3_600_000, urgency: 'high' } };
+    (await f.store.saveView(f.task.id, { taskId: f.task.id, title: f.task.title, workflow: f.task.workflow,
+      messages: [], actions: [], state: {}, updatedAt: Date.now(), ...ask } as any));
+    expect((await f.inbox())).toEqual([expect.objectContaining({ kind: 'escalated', urgency: 'high', actionable: true })]);
+    // It carries on without an answer: the ask is withdrawn.
+    (await f.store.saveView(f.task.id, { taskId: f.task.id, title: f.task.title, workflow: f.task.workflow,
+      messages: [], actions: [], state: {}, updatedAt: Date.now(), stage: 'do', status: 'active' } as any));
+    expect((await f.inbox())).toEqual([]);
+  });
+
   it('puts the most urgent ask first, whatever its age', async () => {
     const f = (await fixture(open));
     const wait = { status: 'waiting', waitingFor: { kind: 'human', audience: ['user:reviewer'] } };

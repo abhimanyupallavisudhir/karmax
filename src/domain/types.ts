@@ -1623,8 +1623,13 @@ export interface TaskView {
    * agent login to free up or refresh. Cleared once unparked.
    */
   waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder' | 'job' | 'timer'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience;
-    /** `job` / `timer`: when the agent is resumed at the latest (epoch ms). */
-    until?: number };
+    /** `job` / `timer` / a paused agent's `human` ask: when the agent is resumed at the latest (epoch ms). */
+    until?: number;
+    /** `human`: how loudly the ask was raised; omitted means the inbox kind's default. */
+    urgency?: Urgency;
+    /** Durable jobs this wait watches (a `job` wait, or an ask that also waits
+     * on jobs): their world must keep running, or parking it freezes them. */
+    jobs?: string[] };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
@@ -1875,15 +1880,22 @@ export interface SubTaskResponse {
   text?: string;
 }
 
-/** A child-agent's explicit request up to its parent (the `raise_to_parent` tool). */
 /** An agent's request to end its turn and be resumed later: when every listed
  * durable job has exited, when a message arrives, or after `minutes` —
  * whichever comes first. Without jobs it is a timed pause. */
 export interface AgentWait {
   minutes: number;
   jobs?: string[];
+  /** The names the agent gave those jobs (`start_job`'s `name`), for people. */
+  jobNames?: string[];
+  /** The agent is waiting on an answer, not just on time: the task parks as
+   * Needs input and asks `audience` (default: the task's ordinary input route),
+   * and `minutes` becomes the deadline after which the agent carries on without
+   * it. `message` defaults to the turn's final response. */
+  needsInput?: { message?: string; audience?: HumanAudience; urgency?: Urgency };
 }
 
+/** A child-agent's explicit request up to its parent (the `raise_to_parent` tool). */
 export interface RaiseToParent {
   type: RaiseType;
   detail?: string;

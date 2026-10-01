@@ -156,6 +156,66 @@ describe('durable jobs (real worktree world)', () => {
       expect(ctx.waits).toEqual([{ minutes: 10 }, { minutes: 90, jobs: [running.id] }]);
     });
 
+    // An agent that paused while waiting on someone's answer read "Paused", and
+    // nobody was told. needs_input makes the same pause an ask.
+    it('a job may be named, and the name follows it to every wait on it', async () => {
+      const ctx = { started: [] as string[], waits: [] as AgentWait[] };
+      const t = tools(ctx);
+      expect(await t.start_job!({ command: 'sleep 30', name: 'x'.repeat(61) })).toBe('error: name must be at most 60 characters');
+      const reply = await t.start_job!({ command: 'sleep 30', name: '  render\nfinal  ' });
+      const render = reply.match(/job-[a-f0-9]{8}/)![0];
+      expect(reply).toContain(`Started job ${render} (render final)`);
+      const unnamed = (await t.start_job!({ command: 'sleep 30' })).match(/job-[a-f0-9]{8}/)![0];
+      expect((await jobStatuses(world, [render, unnamed])).map((job) => job.name)).toEqual(['render final', undefined]);
+      expect(describeJobs(await jobStatuses(world, [render]))).toContain(`Job ${render} (render final) is still running`);
+
+      expect(await t.pause!({ minutes: 30, jobs: [render, unnamed] })).toContain('Waiting for');
+      expect(await t.pause!({ minutes: 30, jobs: [render] })).toBe('error: ' + unnamed + ' is still running. Pass it in jobs: a pause without it lets the world be suspended, which freezes it. You are still resumed after minutes at the latest.');
+      await stopJobs(world, [unnamed]);
+      expect(await t.pause!({ minutes: 30, jobs: [render] })).toContain('Waiting for render final');
+      expect(ctx.waits).toEqual([
+        { minutes: 30, jobs: [render, unnamed], jobNames: ['render final'] },
+        { minutes: 30, jobs: [render], jobNames: ['render final'] },
+      ]);
+      await stopJobs(world, [render]);
+    });
+
+    it('pause with needs_input asks for an answer, routed and as loud as the agent said', async () => {
+      const ctx = { started: [] as string[], waits: [] as AgentWait[] };
+      const targets = { users: [{ selector: 'user:ana' }], teams: [{ selector: '@team:ops' }], special: [{ selector: '@creator' }] };
+      const requests: string[] = [];
+      const t = platformToolHandlers(world, {
+        requestWait: (wait: AgentWait) => { ctx.waits.push(wait); },
+        platformRequest: async (method: string, requestPath: string) => { requests.push(`${method} ${requestPath}`); return targets; },
+        emit: () => {},
+      } as any);
+      const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'pause')!.parameters as any;
+      expect(Object.keys(schema.properties)).toEqual(['minutes', 'jobs', 'needs_input', 'message', 'audience', 'urgency']);
+      expect(schema.properties.urgency.enum).toEqual(['low', 'normal', 'high', 'critical']);
+
+      // The ask's fields only mean something on an ask.
+      expect(await t.pause!({ minutes: 5, urgency: 'high' })).toBe('error: message, audience and urgency apply only with needs_input: true');
+      // A route nobody receives would park the task on an ask nobody sees.
+      expect(await t.pause!({ minutes: 5, needs_input: true, audience: ['user:nobody'] }))
+        .toBe('error: no such route: user:nobody. Valid routes: user:ana, @team:ops, @creator');
+      expect(await t.pause!({ minutes: 5, needs_input: true, audience: ['avatar:a1'] }))
+        .toBe('error: avatar:a1: ask an Avatar with escalate_to_human');
+      expect(await t.pause!({ minutes: 5, needs_input: true, message: '  ' })).toBe('error: message must not be empty');
+      expect(ctx.waits).toEqual([]);
+
+      const asked = await t.pause!({ minutes: 120, needs_input: true, audience: ['user:ana', '@team:ops'],
+        message: 'Which region should the bucket live in?', urgency: 'high' });
+      expect(asked).toContain('Asking user:ana, @team:ops');
+      expect(asked).toContain('after 120 min to carry on without it');
+      // With no question, the final response is the question.
+      expect(await t.pause!({ minutes: 30, needs_input: true })).toContain('with the question as your final response');
+      expect(ctx.waits).toEqual([
+        { minutes: 120, needsInput: { message: 'Which region should the bucket live in?', audience: ['user:ana', '@team:ops'], urgency: 'high' } },
+        { minutes: 30, needsInput: {} },
+      ]);
+      expect(requests).toEqual(['GET /api/agent/escalation-targets', 'GET /api/agent/escalation-targets']);
+    });
+
     it('stop_job stops running jobs and reports each one', async () => {
       const t = tools({ started: [], waits: [] });
       expect(await t.stop_job!({ jobs: [] })).toBe('error: jobs is required');

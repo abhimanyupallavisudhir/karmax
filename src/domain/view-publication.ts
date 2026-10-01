@@ -178,9 +178,18 @@ export function lifecycleEventPayload(view: Pick<TaskView, 'stage' | 'status' | 
     waitingProvider: view.waitingFor?.provider ?? null,
     waitingResetAt: view.waitingFor?.earliestResetAt ?? null,
     waitingUntil: view.waitingFor?.until ?? null,
+    // Only an ask that states its urgency carries one: the inbox keeps the
+    // level an ask was raised at when a later tick says nothing.
+    ...(view.waitingFor?.urgency ? { urgency: view.waitingFor.urgency } : {}),
     agentTurn: view.agentTurn?.state ?? null,
     agentRole: view.agentTurn?.role ?? null,
   };
+}
+
+/** A wait on durable jobs needs its world running: parking would freeze them.
+ * `job` waits before `jobs` was recorded still say so by their kind. */
+export function watchesJobs(view: Pick<TaskView, 'waitingFor'>): boolean {
+  return view.waitingFor?.kind === 'job' || Boolean(view.waitingFor?.jobs?.length);
 }
 
 /** These waits still own live work or are about to enter a turn. */

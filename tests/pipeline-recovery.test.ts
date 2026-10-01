@@ -292,6 +292,31 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
       && message.text.startsWith('Responder:'))).toBe(true);
   });
 
+  it('agent Responder answers a needs-input pause at once, instead of waiting out its deadline', async () => {
+    const repo = await h.makeRepo('responder-pause');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.24.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'AgentResponderPause', prompt: '@write paused.txt :: answered\n@pause 600 :: input -- Which region?' }),
+          responder: { kind: 'agent', provider: 'mock', prompt: 'Answer: {{question}}' },
+          confirm: { layers: [] },
+        },
+      ],
+    });
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:paused.txt'])).stdout).toContain('answered');
+    const v = await view(handle);
+    const responder = v.transcripts?.find((transcript: any) => transcript.role === 'responder');
+    expect(responder?.messages.some((message: any) => message.role === 'user' && message.text.includes('Answer: Which region?'))).toBe(true);
+    // It never parked on a person.
+    const kinds = (await h.store.eventsOfType(taskId, 'view.updated')).map((e: any) => e.payload.waitingFor);
+    expect(kinds).not.toContain('human');
+  });
+
   it('confirm layers: an agent review layer, then a final human confirmation (SPEC §5.2)', async () => {
     const repo = await h.makeRepo('confirm-layers');
     const taskId = newId('task');

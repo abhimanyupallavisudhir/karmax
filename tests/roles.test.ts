@@ -133,8 +133,9 @@ describe('prompt assembly derives from the declared role (not a hardcoded map)',
 
   it('tells every Do agent its own shell dies with the turn, and how to wait on long work (videos #1)', () => {
     const out = assemblePrompt({ profile: profile({ role: 'do' }), role: 'do', task, world, globalInstructions: GLOBAL_INSTRUCTIONS });
-    expect(out).toContain('- start_job(command, cwd?):');
-    expect(out).toContain('- pause(minutes, jobs?):');
+    expect(out).toContain('- start_job(command, cwd?, name?):');
+    expect(out).toContain('- pause(minutes, jobs?, needs_input?):');
+    expect(out).toContain('the task shows Needs input and notifies them');
     expect(out).toContain('- stop_job(jobs):');
     expect(out).toContain('Anything you run from your own shell stops when your turn ends.');
     // The default organization prompt carries the working practice.
