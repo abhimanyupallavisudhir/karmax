@@ -65,7 +65,12 @@ it('notices a socket that went silent, reconnects and shows the task as it is no
 it('keeps a socket that answers, however long it stays quiet', async () => {
   const { ui, sockets } = await openList({ answerFirstSocket: true });
   try {
-    await ui.page.clock.runFor(10 * 60_000);
+    // Step the fake clock one liveness tick at a time and let each pong (a
+    // real socket message) land: a single long jump would outrun every answer.
+    for (let tick = 0; tick < 120; tick++) {
+      await ui.page.clock.runFor(5_000);
+      await expect.poll(() => ui.run('wsPingSentAt')).toBe(0);
+    }
     expect(sockets[0]!.received.filter((m) => JSON.parse(m).type === 'ping').length).toBeGreaterThan(5);
     expect(sockets.length).toBe(1);
     expect(ui.errors).toEqual([]);
