@@ -150,7 +150,11 @@ describe('credential selection ranking through HTTP', () => {
       }).then((response) => response.json() as Promise<any>)));
       expect(pages).toBe(1);
       expect(logins.filter((login) => login.status === 'granted')).toHaveLength(1);
-      expect(logins.filter((login) => /passkey sessions open/.test(login.error ?? ''))).toHaveLength(4);
+      // The rest are refused: by the session cap, or (a request that checks its
+      // grant after the winner spent it, as on a loaded CI runner) for approval.
+      const refused = logins.filter((login) => login.status !== 'granted');
+      expect(refused).toHaveLength(4);
+      for (const login of refused) expect(login.error ?? login.status).toMatch(/passkey sessions open|needs_approval/);
 
 
     } finally {
