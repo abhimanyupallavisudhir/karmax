@@ -2102,6 +2102,17 @@ html[data-theme="dark"] .github-signin-btn:active,
   border: none; background: var(--warn, #e0b15a); color: #fff;
 }
 .cred-signin:hover { filter: brightness(1.1); }
+.btn.cred-save {
+  display: inline-flex; align-items: center; gap: 6px; margin-top: 8px;
+  padding: 3px 10px 3px 4px; font-size: 12px; line-height: 1.6;
+  border-radius: 999px; border-color: var(--warn, #e0b15a); color: var(--ink-1);
+}
+.btn.cred-save[hidden] { display: none; }
+.cred-save svg { width: 14px; height: 14px; }
+.cred-save-alert {
+  width: 16px; height: 16px; border-radius: 50%; display: inline-grid; place-items: center;
+  font: 800 11px/1 var(--font-ui); background: var(--warn, #e0b15a); color: #fff;
+}
 .cred-login-flow { margin-top: 8px; font-size: 12px; overflow-wrap: anywhere; }
 .cred-row.dragging { opacity: 0.4; }
 .cred-drag { cursor: grab; color: var(--ink-3); user-select: none; font-size: 11px; line-height: 1; }
