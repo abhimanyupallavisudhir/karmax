@@ -528,7 +528,7 @@ describe('subscription administration HTTP authorization', () => {
     vi.unstubAllEnvs();
   });
 
-  const post = (action: 'gift' | 'checkout' | 'portal' | 'change' | 'cancel' | 'sync-seats',
+  const post = (action: 'gift' | 'checkout' | 'portal' | 'change' | 'cancel' | 'sync-seats' | 'storage-packs',
     organizationId: string, token: string, body: Record<string, unknown> = {}) => fetch(
     `${base}/api/organizations/${organizationId}/subscription/${action}`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json',
@@ -536,7 +536,7 @@ describe('subscription administration HTTP authorization', () => {
         acceptedPolicies: true, policyVersions: policyVersions('checkout'), ...body }),
     });
 
-  it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats'] as const)(
+  it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats', 'storage-packs'] as const)(
     'rejects an agent without a verified owner subject from %s', async (action) => {
       const agent = (await tokens.mint({ taskId: `task_billing_attack_${action}`, profileId: 'developer', principal: 'agent:test',
         organizationId: memberOrganizationId, ceiling: ['payment:write'], grantorCaps: ['payment:write'] })).token;
@@ -588,7 +588,7 @@ describe('subscription administration HTTP authorization', () => {
     await store.db.prepare('DELETE FROM policy_acceptances WHERE organizationId=?').run(org.id);
   });
 
-  it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats'] as const)(
+  it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats', 'storage-packs'] as const)(
     'rejects an interactive non-owner from %s', async (action) => {
       const response = await post(action, memberOrganizationId, browserToken);
       expect(response.status).toBe(403);
@@ -683,6 +683,20 @@ describe('subscription administration HTTP authorization', () => {
     expect((await post('gift', recipient.id, scoped.token)).status).toBe(403);
     expect((await post('gift', recipient.id, agent.token, { plan: null })).status).toBe(200);
     expect((await billing.current(recipient.id)).plan).toBe('free');
+  });
+
+  it('lets the interactive owner change storage packs on a verified subscription', async () => {
+    const org = await store.createOrganization({ name: 'Storage pack owner', ownerUserId: 'me' });
+    await billing.checkout(org.id, 'team', { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-pack-owner');
+    await billing.handleWebhook(event('evt_pack_owner', 'customer.subscription.updated', { id: `sub_${org.id}`, customer: `cus_${org.id}`,
+      status: 'active', items: { data: [{ id: 'si_base', price: { id: 'price_team_base' }, quantity: 1 }] } }, 500));
+    const response = await post('storage-packs', org.id, browserToken, { packs: 2 });
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({ id: `sub_${org.id}` });
+    expect(provider.calls.at(-1)).toMatchObject({ method: 'updateStoragePacks', input: { subscriptionId: `sub_${org.id}`, storagePacks: 2 } });
+    const invalid = await post('storage-packs', org.id, browserToken, { packs: -1 });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: expect.stringMatching(/whole number/) });
   });
 
   it('makes owner-only administration explicit in subscription status', async () => {

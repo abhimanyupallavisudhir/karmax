@@ -74,13 +74,15 @@ export function hostedPlan(plan: HostedPlanId): HostedPlan {
   return HOSTED_PLANS[plan];
 }
 
-/** Billing calls this helper rather than duplicating per-seat pricing rules. */
-export function hostedMonthlyPriceCents(plan: HostedPlanId, activeUsers: number): number {
+/** Billing calls this helper rather than duplicating per-seat pricing rules.
+ * Storage packs are billed only on a paid plan, like their storage. */
+export function hostedMonthlyPriceCents(plan: HostedPlanId, activeUsers: number, storagePacks = 0): number {
   const definition = hostedPlan(plan);
   const users = Math.max(0, Math.floor(Number(activeUsers) || 0));
   const additional = Math.max(0, users - definition.includedActiveUsers);
+  const packs = plan === 'free' ? 0 : Math.max(0, Math.floor(Number(storagePacks) || 0));
   return definition.monthlyBasePriceCents
-    + additional * definition.monthlyAdditionalActiveUserPriceCents;
+    + additional * definition.monthlyAdditionalActiveUserPriceCents + packs * STORAGE_PACK.monthlyPriceCents;
 }
 
 /** Shared agent concurrency for the organization's current active-user count. */

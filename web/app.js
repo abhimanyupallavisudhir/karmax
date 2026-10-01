@@ -14873,6 +14873,7 @@ async function wirePaidLaunchCard() {
         <label class="form-row">Individual $9 price<input class="paid-paddle-individual-price" value="${esc(paddle.individualPriceId || '')}" placeholder="pri_…" /></label>
         <label class="form-row">Team $19 base price<input class="paid-paddle-team-base-price" value="${esc(paddle.teamBasePriceId || '')}" placeholder="pri_…" /></label>
         <label class="form-row">Additional user $5 price<input class="paid-paddle-team-seat-price" value="${esc(paddle.teamSeatPriceId || '')}" placeholder="pri_…" /></label>
+        <label class="form-row">Storage pack $4 price<input class="paid-paddle-storage-pack-price" value="${esc(paddle.storagePackPriceId || '')}" placeholder="pri_…" /></label>
         <label class="form-row">Default payment link<input value="${esc(paddle.checkoutUrl || '')}" readonly /></label>
         <label class="form-row">Webhook destination<input value="${esc(paddle.webhookUrl || '')}" readonly /></label>
       </div></details>
@@ -14931,6 +14932,7 @@ async function wirePaidLaunchCard() {
           individualPriceId: box.querySelector('.paid-paddle-individual-price').value,
           teamBasePriceId: box.querySelector('.paid-paddle-team-base-price').value,
           teamSeatPriceId: box.querySelector('.paid-paddle-team-seat-price').value,
+          storagePackPriceId: box.querySelector('.paid-paddle-storage-pack-price').value,
         },
         paidLaunch: box.querySelector('.paid-launch-enabled').checked,
         founderReviewed: box.querySelector('.paid-founder-reviewed').checked,
@@ -17868,11 +17870,18 @@ async function hydrateOrganizationSubscription(organizationId) {
     <select id="billing-gift-plan" aria-label="Gift subscription">${Object.values(catalog).filter(plan => plan.id !== 'free').map(plan => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select>
     <button class="btn sm billing-gift" title="Complimentary access until removed. Existing paid billing continues.">${state.gift ? 'Update gift' : 'Gift'}</button>
     ${state.gift ? '<button class="btn sm billing-gift-remove">Remove gift</button>' : ''}</div>` : '';
+  const pack = state.storagePack || {};
+  const packs = Number(state.storagePacks || 0);
+  const packBusy = ownerDisabled || (state.pendingRequest ? 'disabled title="Wait for the pending billing request"' : '');
+  const storagePacks = hasSubscription && pack.available && ['active', 'trialing', 'past_due'].includes(state.status)
+    ? `<div class="member-row"><span>Storage packs ${policyTip(`Each pack adds ${formatBytes(pack.bytes)} of storage for ${price(pack.monthlyPriceCents)}/month, prorated on your next bill. Packs end with the subscription.`)}</span>
+      <span class="team-actions"><button class="btn sm billing-packs" data-packs="${packs - 1}" aria-label="Remove a storage pack" ${packs > 0 ? packBusy : 'disabled'}>−</button><b>${packs}</b><button class="btn sm billing-packs" data-packs="${packs + 1}" aria-label="Add a storage pack" ${state.status === 'past_due' ? 'disabled title="Update the payment method first"' : packBusy}>+</button>
+      <span class="task-sub">${packs ? `${esc(price(packs * pack.monthlyPriceCents))}/month` : `${esc(price(pack.monthlyPriceCents))}/month each`}</span></span></div>` : '';
   const giftNotice = state.gift && hasSubscription ? `<div class="member-row"><span><b>${esc(names[state.gift.plan])}</b> <span class="chip">Gifted · no expiry</span></span></div>` : '';
   const effective = hasSubscription && state.plan !== billedPlan ? ` · effective access: ${esc(names[state.plan] || state.plan)}` : '';
   box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[hasSubscription ? billedPlan : state.plan] || state.plan)} <span class="chip">${esc(state.gift && !hasSubscription ? 'Gifted · no expiry' : statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}${effective}</span></span>
     <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
-    ${giftNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
+    ${storagePacks}${giftNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
     ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel online at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
     ${state.pendingRequest ? `<p class="task-sub">A billing request is pending confirmation. Wait a minute, then check its result before retrying. <button class="btn sm billing-reconcile" ${ownerDisabled}>Check pending billing request</button></p>` : ''}
     ${state.pendingCheckout && !hasSubscription ? `<p class="task-sub">An unpaid checkout is open. <button class="btn sm billing-cancel-checkout" ${ownerDisabled}>Cancel pending checkout</button></p>` : ''}
@@ -17925,6 +17934,15 @@ async function hydrateOrganizationSubscription(organizationId) {
     }); toast('Plan change submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
     catch (error) { toast(error.message, true); }
   });
+  box.querySelectorAll('.billing-packs').forEach((button) => button.addEventListener('click', async () => {
+    const next = Number(button.dataset.packs);
+    if (!confirm(next > packs ? `Add a ${formatBytes(pack.bytes)} storage pack for ${price(pack.monthlyPriceCents)}/month?` : 'Remove a storage pack?')) return;
+    button.disabled = true;
+    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/storage-packs`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ packs: next }),
+    }); toast('Storage change submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    catch (error) { button.disabled = false; toast(error.message, true); }
+  }));
   box.querySelector('.billing-cancel')?.addEventListener('click', async () => {
     if (!confirm('Cancel this subscription at the end of its current billing period?')) return;
     try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {

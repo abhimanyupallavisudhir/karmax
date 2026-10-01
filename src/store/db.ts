@@ -745,7 +745,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS subscription_billing_accounts (
         organizationId TEXT PRIMARY KEY, provider TEXT NOT NULL, customerId TEXT UNIQUE,
         subscriptionId TEXT UNIQUE, plan TEXT NOT NULL, status TEXT NOT NULL,
-        seats INTEGER NOT NULL, itemsJson TEXT NOT NULL, currentPeriodEnd INTEGER,
+        seats INTEGER NOT NULL, storagePacks INTEGER NOT NULL DEFAULT 0, itemsJson TEXT NOT NULL, currentPeriodEnd INTEGER,
         cancelAtPeriodEnd INTEGER NOT NULL, lastEventAt INTEGER NOT NULL,
         lastEventRank INTEGER NOT NULL DEFAULT 0,
         verifiedAt INTEGER, pastDueAt INTEGER, lastError TEXT,
@@ -1051,6 +1051,8 @@ export class Store {
       (await this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN pastDueAt INTEGER'));
     if (!subscriptionBillingCols.some((c) => c.name === 'lastEventRank'))
       (await this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN lastEventRank INTEGER NOT NULL DEFAULT 0'));
+    if (!subscriptionBillingCols.some((c) => c.name === 'storagePacks'))
+      (await this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN storagePacks INTEGER NOT NULL DEFAULT 0'));
     (await this.db.exec(`UPDATE subscription_billing_accounts SET lastEventRank=CASE status
       WHEN 'canceled' THEN 690 WHEN 'incomplete_expired' THEN 680
       WHEN 'unpaid' THEN 670 WHEN 'paused' THEN 660 WHEN 'incomplete' THEN 650

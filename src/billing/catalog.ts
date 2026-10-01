@@ -12,6 +12,8 @@ export async function rememberSubscriptionCatalog(store: Pick<Store, 'db' | 'kvG
       individualPriceId: input.individualPriceId, teamBasePriceId: input.teamBasePriceId, teamSeatPriceId: input.teamSeatPriceId,
       ...(input.individualProductId ? { individualProductId: input.individualProductId } : {}),
       ...(input.teamProductId ? { teamProductId: input.teamProductId } : {}),
+      ...(input.storagePackPriceId ? { storagePackPriceId: input.storagePackPriceId } : {}),
+      ...(input.storagePackProductId ? { storagePackProductId: input.storagePackProductId } : {}),
     };
     if (!history.some((entry) => JSON.stringify(entry) === JSON.stringify(catalog))) {
       history.unshift(catalog);
