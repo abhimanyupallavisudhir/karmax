@@ -78,7 +78,7 @@ export function publicConversationHtml(share?: ConversationShare, options: { sit
       <div class="shared-eyebrow">Shared conversation</div>
       <h1>${title}</h1>
       <div class="shared-toolbar"><p title="A fixed snapshot of message text. Attachments and tool activity aren’t included.">Snapshot · <time datetime="${new Date(share.createdAt).toISOString()}">${new Date(share.createdAt).toISOString().slice(0, 10)}</time></p>
-        <button type="button" class="conversation-math" aria-label="Typeset math in this conversation" aria-pressed="true" title="Toggle math typesetting for this conversation" hidden><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
+        <button type="button" class="conversation-math" aria-label="Typeset math" aria-pressed="true" title="Typeset math in all conversations" hidden><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
       </div>
     </header>
     <div class="thread shared-thread">${share.messages.map(m => `<article class="msg ${m.role === 'user' ? 'user' : 'agent'}" data-share-message>

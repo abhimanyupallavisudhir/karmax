@@ -759,6 +759,9 @@ export interface EnvironmentBuildRecord {
   digest: string;
   status: 'building' | 'ready' | 'failed';
   ref?: string;
+  /** Provider template the artifact was built on (E2B). Absent on builds made
+   * before it was recorded, which is why they are no longer used. */
+  base?: string;
   error?: string;
   createdAt: number;
   updatedAt: number;

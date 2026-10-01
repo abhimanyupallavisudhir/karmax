@@ -230,12 +230,16 @@ describe('public conversation sharing over HTTP', async () => {
       expect(await page.locator('.msg-text a[href^="javascript:"]').count()).toBe(0);
       await page.locator('mjx-container').first().waitFor();
       expect(await page.locator('mjx-container a[href]').count()).toBe(0);
-      const toggle = page.getByRole('button', { name: 'Typeset math in this conversation' });
+      const toggle = page.getByRole('button', { name: 'Typeset math' });
       expect(await toggle.getAttribute('aria-pressed')).toBe('true');
       await toggle.click();
       expect(await toggle.getAttribute('aria-pressed')).toBe('false');
       expect(await page.locator('mjx-container').count()).toBe(0);
       expect(await page.locator('[data-share-message]').last().innerText()).toContain('$x^2$');
+      expect(await page.evaluate(() => (globalThis as any).localStorage.getItem('karmax-mathjax'))).toBe('0');
+      await page.reload();
+      await page.locator('.conversation-math[aria-pressed="false"]:not([hidden])').waitFor();
+      expect(await page.locator('mjx-container').count()).toBe(0);
       await toggle.click();
       await page.locator('mjx-container').first().waitFor();
       for (const width of [390, 1280]) {
@@ -253,8 +257,8 @@ describe('public conversation sharing over HTTP', async () => {
       await offline.goto(`${base}${url}`);
       expect(await offline.locator('.md-table').count()).toBe(1);
       expect(await offline.locator('.md-math').first().innerText()).toBe('$x^2$');
-      await offline.getByRole('button', { name: 'Typeset math in this conversation' }).click();
-      expect(await offline.getByRole('button', { name: 'Typeset math in this conversation' }).getAttribute('aria-pressed')).toBe('false');
+      await offline.getByRole('button', { name: 'Typeset math' }).click();
+      expect(await offline.getByRole('button', { name: 'Typeset math' }).getAttribute('aria-pressed')).toBe('false');
       await offline.close();
       const deps = (gateway as any).deps;
       const identity = deps.identity;

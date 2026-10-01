@@ -8,6 +8,7 @@ import { beginEnvironmentBuild, environmentBuildRevision, finishEnvironmentBuild
 import { ProjectTransfers } from '../src/platform/project-transfer.js';
 import { selectProjectEnvironment } from '../src/world/project-runtime.js';
 import { buildEnvironment, environmentArtifactName } from '../src/world/environment-build.js';
+import { DEFAULT_E2B_TEMPLATE } from '../src/world/e2b-template.js';
 
 const cleanup: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -49,7 +50,7 @@ describe('durable environment build recovery', () => {
     await expect(recoverEnvironmentBuild(f.peer, f.project.id, f.scope, f.request, 'user:alice')).rejects.toThrow(/changed/);
     expect((await finishEnvironmentBuild(f.peer, f.attempt, status === 'ready' ? { status, ref: 'stale-source' } : { status, error: 'late failure' }))).toBe(false);
     expect((await f.environments.builds(f.project.id))[0]?.buildId).toBe(replacement.buildId);
-    expect((await finishEnvironmentBuild(f.store, replacement, { status: 'ready', ref: 'replacement-snapshot' }))).toBe(true);
+    expect((await finishEnvironmentBuild(f.store, replacement, { status: 'ready', ref: 'replacement-snapshot', base: DEFAULT_E2B_TEMPLATE }))).toBe(true);
     expect((await selectProjectEnvironment(f.store, f.project.id, 'e2b', undefined)).environment?.snapshot).toBe('replacement-snapshot');
     const preview = (await f.transfers.preview(f.project.id, f.destination.id));
     await f.transfers.move(f.project.id, f.destination.id, preview.id);
@@ -67,7 +68,7 @@ describe('durable environment build recovery', () => {
     (await f.environments.recordBuild(f.project.id, { provider: 'e2b', digest: f.digest, status: 'ready', ref: 'legacy-source' }));
     (await f.environments.recordBuild(f.project.id, { provider: 'e2b', digest: f.digest, status: 'failed', error: 'late error' }));
     expect((await f.environments.builds(f.project.id))[0]?.buildId).toBe(replacement.buildId);
-    expect((await finishEnvironmentBuild(f.peer, replacement, { status: 'ready', ref: 'replacement' }))).toBe(true);
+    expect((await finishEnvironmentBuild(f.peer, replacement, { status: 'ready', ref: 'replacement', base: DEFAULT_E2B_TEMPLATE }))).toBe(true);
     expect((await f.environments.readyBuild(f.project.id, 'e2b', f.digest))?.ref).toBe('replacement');
   });
 
@@ -100,5 +101,33 @@ describe('durable environment build recovery', () => {
     })).rejects.toThrow('invalidated');
     expect(killed).toBe(true);
     expect(snapshotted).toBe(false);
+  });
+
+  // An E2B artifact is only as good as the template its builder started from:
+  // worlds must never boot from one made on a different base than a new build
+  // would use (the pre-fix builds used E2B's stock image and record no base).
+  it('uses an E2B build only while it was made from the template a new build would use', async () => {
+    const f = (await persistent());
+    (await recoverEnvironmentBuild(f.store, f.project.id, f.scope, f.request, 'user:alice'));
+    const select = async () => (await selectProjectEnvironment(f.store, f.project.id, 'e2b', undefined));
+    const finish = async (base: string | undefined) => {
+      const attempt = (await beginEnvironmentBuild(f.store, f.project.id, f.scope, 'e2b', f.digest));
+      expect((await finishEnvironmentBuild(f.store, attempt, { status: 'ready', ref: `snapshot-on-${base}`, ...(base ? { base } : {}) }))).toBe(true);
+    };
+    await finish(undefined); // built before builds recorded their base
+    expect((await select())).toMatchObject({ built: false, environment: undefined });
+    await finish('base');
+    expect((await select()).built).toBe(false);
+    await finish(DEFAULT_E2B_TEMPLATE);
+    expect((await select()).environment?.snapshot).toBe(`snapshot-on-${DEFAULT_E2B_TEMPLATE}`);
+    // A template configured under Compute moves the base for the next build.
+    (await f.store.upsertWorldProviderConnection({ organizationId: f.source.id, provider: 'e2b', name: 'E2B',
+      credentialHandle: 'world-provider:test:e2b:api-key', config: { template: 'org-template' }, enabled: true }));
+    expect((await select()).built).toBe(false);
+    await finish('org-template');
+    expect((await select()).environment?.snapshot).toBe('snapshot-on-org-template');
+    // Other providers' artifacts carry no E2B base.
+    (await f.environments.recordBuild(f.project.id, { ...f.scope, provider: 'container', digest: f.digest, status: 'ready', ref: 'image:tag' }));
+    expect((await selectProjectEnvironment(f.store, f.project.id, 'container', undefined)).environment?.image).toBe('image:tag');
   });
 });

@@ -209,6 +209,18 @@ describe('Project settings', () => {
     await ui.close();
   });
 
+  it('marks a build that worlds no longer use as stale, explaining why on hover', async () => {
+    const build = (over: object) => ({ provider: 'e2b', digest: 'abcdef0123456789', status: 'ready', ref: 'snapshot', ...over });
+    const ui = await settings({ api: ({ method, path }) => method === 'GET' && path.split('?')[0]!.endsWith('/environment')
+      ? { spec: { setup: ['true'] }, digest: 'abcdef0123456789', repositories: [],
+        builds: [build({ stale: true, recoveryRevision: 'r1' }), build({ provider: 'daytona', recoveryRevision: 'r2' })] } : undefined });
+    const chips = ui.page.locator('.queue-item .chip', { hasText: 'abcdef01' });
+    await chips.first().waitFor();
+    expect(await chips.allTextContents()).toEqual(['abcdef01 · stale', 'abcdef01']);
+    expect(await chips.first().getAttribute('title')).toBe('Built on an older base image. Rebuild to use it.');
+    await ui.close();
+  });
+
   it('opens GitHub repository creation from a button beside Save repositories', async () => {
     const ui = await settings({ api: ({ method, path: route }) => method !== 'GET' ? undefined
       : route.endsWith('/github/app') ? { configured: true, userAuthorized: true }
