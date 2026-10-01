@@ -59,6 +59,7 @@ const root = __dirname;
       const dot = await head.locator('.info-dot').boundingBox(), text = await head.boundingBox();
       assert.ok(dot.y >= text.y && dot.y + dot.height <= text.y + text.height + 1, `${heading}: ⓘ is on the heading line`);
       assert.equal(await row.locator('.cf-audience').getAttribute('aria-label'), heading);
+      assert.deepEqual(await head.evaluate(el => { const c = getComputedStyle(el); return [c.fontSize, c.fontWeight]; }), ['12px', '600'], `${heading}: styled like other form headings`);
       await head.click({ position: { x: 2, y: text.height / 2 } });
       assert.equal(await page.locator('.toast').count(), 0, `${heading}: clicking the heading does not open the tip`);
     }
