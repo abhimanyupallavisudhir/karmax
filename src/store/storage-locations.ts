@@ -4,7 +4,7 @@ import { isIP } from 'node:net';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { StorageLocation, StorageLocationUsage } from '../domain/types.js';
 import type { Store } from './db.js';
-import { S3ObjectStore, type ObjectStore } from './objects.js';
+import { S3ObjectStore, type ObjectRequestOptions, type ObjectStore } from './objects.js';
 import { newId } from '../util/id.js';
 import { BRAND } from '../domain/brand.js';
 
@@ -176,7 +176,7 @@ class PrefixedObjectStore implements ObjectStore {
   constructor(private inner: ObjectStore, private prefix: string) {}
   put(key: string, data: Buffer, contentType?: string): Promise<void> { return this.inner.put(this.key(key), data, contentType); }
   get(key: string): Promise<Buffer> { return this.inner.get(this.key(key)); }
-  delete(key: string): Promise<void> { return this.inner.delete(this.key(key)); }
+  delete(key: string, options?: ObjectRequestOptions): Promise<void> { return this.inner.delete(this.key(key), options); }
   private key(key: string): string { return this.prefix ? `${this.prefix}/${key}` : key; }
 }
 

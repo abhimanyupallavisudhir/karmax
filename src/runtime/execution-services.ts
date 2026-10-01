@@ -14,7 +14,8 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { WorldProviderConnectionService } from '../world/connections.js';
 import { E2BWorldProvider } from '../world/e2b.js';
 import { DaytonaWorldProvider } from '../world/daytona.js';
-import { LocalObjectStore, S3ObjectStore } from '../store/objects.js';
+import { LocalObjectStore, S3ObjectStore, managedS3Options } from '../store/objects.js';
+import { DeferredDeleteObjectStore, objectDeleteDelayMs } from '../store/deferred-delete.js';
 import { StorageLocationService } from '../store/storage-locations.js';
 import { WorldCheckpointService } from '../world/checkpoint.js';
 import { RunnerPoolService } from '../world/runners.js';
@@ -59,13 +60,11 @@ export async function createExecutionServices(input: {
     const warning = unreadableReferenceWarning(unreadable);
     if (warning) console.warn(warning);
   }
-  const objectStore = process.env.KARMAX_OBJECT_STORE === 's3'
-    ? new S3ObjectStore({
-        endpoint: requiredEnv('KARMAX_S3_ENDPOINT'), bucket: requiredEnv('KARMAX_S3_BUCKET'),
-        region: process.env.KARMAX_S3_REGION ?? 'us-east-1', accessKeyId: requiredEnv('KARMAX_S3_ACCESS_KEY_ID'),
-        secretAccessKey: requiredEnv('KARMAX_S3_SECRET_ACCESS_KEY'), sessionToken: process.env.KARMAX_S3_SESSION_TOKEN,
-      })
-    : new LocalObjectStore(p.objects);
+  // Every consumer of the managed store shares this wrapper, so every delete
+  // is delayed alike; the lifecycle sweep purges (src/world/runners.ts).
+  const objectStore = new DeferredDeleteObjectStore(process.env.KARMAX_OBJECT_STORE === 's3'
+    ? new S3ObjectStore(managedS3Options()) : new LocalObjectStore(p.objects),
+  store, { delayMs: objectDeleteDelayMs() });
   // Hosted managed storage follows each organization's plan; this cap is for
   // private installations only.
   const configuredStorageQuota = deployment.hosted ? undefined : process.env.KARMAX_MANAGED_STORAGE_QUOTA_BYTES;
@@ -108,10 +107,4 @@ export async function createExecutionServices(input: {
   const configHomes = new ConfigHomeManager(p.configHomes);
   return { worlds, adapters, profiles, tokens, providerConnections, objectStore, storageLocations,
     resources, checkpoints, runners, worldAccess, payments, paymentRegistry, configHomes };
-}
-
-function requiredEnv(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is required`);
-  return value;
 }

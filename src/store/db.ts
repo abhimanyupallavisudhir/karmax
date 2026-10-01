@@ -613,6 +613,10 @@ export class Store {
         bytes INTEGER NOT NULL, mediaType TEXT NOT NULL, name TEXT NOT NULL,
         createdAt INTEGER NOT NULL, expiresAt INTEGER
       );
+      CREATE TABLE IF NOT EXISTS object_tombstones (
+        objectKey TEXT PRIMARY KEY, deletedAt INTEGER NOT NULL, purgeAfter INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_object_tombstones_due ON object_tombstones(purgeAfter);
       CREATE TABLE IF NOT EXISTS executions (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -7103,6 +7107,27 @@ export class Store {
   async expiredPromotedArtifacts(now = Date.now()): Promise<PromotedArtifact[]> {
     return ((await this.db.prepare('SELECT * FROM promoted_artifacts WHERE expiresAt IS NOT NULL AND expiresAt<=?').all(now)) as any[])
       .map((row) => ({ ...row, expiresAt: Number(row.expiresAt) }));
+  }
+
+  // Delayed deletion of managed objects (src/store/deferred-delete.ts).
+  async objectTombstone(key: string): Promise<{ key: string; deletedAt: number; purgeAfter: number } | undefined> {
+    const row = (await this.db.prepare('SELECT deletedAt, purgeAfter FROM object_tombstones WHERE objectKey=?').get(key)) as
+      { deletedAt: number | bigint; purgeAfter: number | bigint } | undefined;
+    return row ? { key, deletedAt: Number(row.deletedAt), purgeAfter: Number(row.purgeAfter) } : undefined;
+  }
+
+  async recordObjectTombstone(key: string, deletedAt: number, purgeAfter: number): Promise<void> {
+    (await this.db.prepare(`INSERT INTO object_tombstones (objectKey, deletedAt, purgeAfter) VALUES (?, ?, ?)
+      ON CONFLICT(objectKey) DO UPDATE SET deletedAt=excluded.deletedAt, purgeAfter=excluded.purgeAfter`).run(key, deletedAt, purgeAfter));
+  }
+
+  async deleteObjectTombstone(key: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM object_tombstones WHERE objectKey=?').run(key));
+  }
+
+  async dueObjectTombstones(now: number, limit: number): Promise<string[]> {
+    return ((await this.db.prepare('SELECT objectKey FROM object_tombstones WHERE purgeAfter<=? ORDER BY purgeAfter, objectKey LIMIT ?')
+      .all(now, limit)) as Array<{ objectKey: string }>).map((row) => String(row.objectKey));
   }
 
   async createExecution(input: Omit<ExecutionRecord, 'state' | 'startedAt' | 'heartbeatAt'>

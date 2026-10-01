@@ -32,7 +32,7 @@ describe('turnkey PostgreSQL credentials', () => {
     expect(app.environment?.KARMAX_DATABASE_URL_FILE).toBe('/run/karmax-database/database_url');
     expect(app.volumes).toContain('karmax_database:/run/karmax-database:ro');
     expect(app.secrets).not.toContain('database_url');
-    expect(Object.keys(turnkey.secrets).sort()).toEqual(['auth_secret', 'vault_key', 'world_ref_key']);
+    expect(Object.keys(turnkey.secrets).sort()).toEqual(['auth_secret', 's3_access_key_id', 's3_secret_access_key', 'vault_key', 'world_ref_key']);
     expect(Object.keys(turnkey.volumes)).toContain('karmax_database');
     expect(JSON.stringify(app)).not.toContain('POSTGRES_PASSWORD');
   });

@@ -27,6 +27,8 @@
     "backup": "tsx src/scripts/backup.ts",
     "restore": "tsx src/scripts/restore.ts",
     "vault-preflight": "tsx src/scripts/vault-preflight.ts",
+    "migrate-objects": "tsx src/scripts/object-store-migrate.ts",
+    "object-store-check": "tsx src/scripts/object-store-check.ts",
     "replay-check": "tsx src/scripts/replay-check.ts",
     "benchmark:latency": "tsx benchmarks/latency.ts",
     "timing:report": "tsx src/scripts/timing-report.ts"
