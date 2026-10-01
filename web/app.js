@@ -2637,10 +2637,51 @@ function renderFlag(key, dflt) {
 const markdownEnabled = () => renderFlag('karmax-md-render', true);
 const mathjaxEnabled = () => renderFlag('karmax-mathjax', true);
 
-// One preference, set from Appearance or any conversation's TeX button.
+// One preference, set from Appearance or any TeX button. Conversations repaint
+// with the task page; every other Markdown surface repaints in place.
 function setMathjaxEnabled(on) {
   try { localStorage.setItem('karmax-mathjax', on ? '1' : '0'); } catch {}
+  for (const el of markdownSurfaces) {
+    if (el.isConnected) paintMarkdownSurface(el);
+    else markdownSurfaces.delete(el);
+  }
+  if (typeof document !== 'undefined') {
+    document.querySelectorAll('.tex-toggle').forEach((btn) => btn.setAttribute('aria-pressed', String(on)));
+  }
   if (S.taskTab === 'checkin') renderTaskPage();
+}
+
+// Markdown outside a conversation (file previews, wiki pages): `render(math)`
+// returns its HTML, `after(el)` re-wires its content after each paint.
+const markdownSurfaces = new Set();
+function mountMarkdownSurface(el, render, after) {
+  if (!el) return;
+  el.markdownSurface = { render, after };
+  markdownSurfaces.add(el);
+  paintMarkdownSurface(el);
+}
+function paintMarkdownSurface(el) {
+  window.MathJax?.typesetClear?.([el]);
+  el.innerHTML = el.markdownSurface.render(mathjaxEnabled());
+  el.markdownSurface.after?.(el);
+  typesetMath(el);
+}
+
+// The TeX button beside every conversation message and Markdown preview.
+function texToggleHtml(disabled = false) {
+  return `<button type="button" class="tex-toggle" aria-label="Typeset math" aria-pressed="${mathjaxEnabled()}" title="${disabled ? 'Enable Markdown in Appearance to typeset math' : 'Typeset math everywhere'}" ${disabled ? 'disabled' : ''}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>`;
+}
+function wireTexToggles(root) {
+  root?.querySelectorAll('.tex-toggle').forEach((btn) => {
+    if (btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', () => {
+      const at = [...document.querySelectorAll('.tex-toggle')].indexOf(btn);
+      setMathjaxEnabled(!mathjaxEnabled());
+      // A conversation repaint replaces this button; keep focus on its successor.
+      if (!btn.isConnected) document.querySelectorAll('.tex-toggle')[at]?.focus({ preventScroll: true });
+    });
+  });
 }
 
 // A message body: Markdown when enabled, otherwise the previous plain-escaped
@@ -2689,7 +2730,7 @@ function ensureMathJax() {
 }
 function typesetMath(root) {
   const scope = root || document.getElementById('ck-thread');
-  const enabled = () => mathjaxEnabled() && markdownEnabled();
+  const enabled = () => mathjaxEnabled();
   if (!scope || !enabled() || !scope.querySelector('.md-math')) return;
   ensureMathJax().then(() => {
     if (!scope.isConnected || !enabled() || !window.MathJax || !window.MathJax.typesetPromise) return;
@@ -8373,12 +8414,13 @@ function showArtifactReader(text, kind, name, blob) {
   dialog.className = 'modal-card artifact-reader';
   dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
   dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="artifact-reader-title">${esc(name)}</h2>
-    <a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
+    ${kind === 'markdown' ? texToggleHtml() : ''}<a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
     <div class="artifact-reader-content" tabindex="0"></div>`;
   const content = dialog.querySelector('.artifact-reader-content');
   if (kind === 'markdown') {
     content.classList.add('msg-text', 'md');
-    content.innerHTML = renderMarkdown(text);
+    mountMarkdownSurface(content, (math) => renderMarkdown(text, { math }));
+    wireTexToggles(dialog);
   } else {
     const pre = document.createElement('pre');
     pre.textContent = text;
@@ -9479,7 +9521,7 @@ function explainMessageAffordance(entry, v) {
   return `<div class="explain-tools" data-source-key="${key}" data-role="${role}">
     <button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
     <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>
-    <button type="button" class="conversation-math" aria-label="Typeset math" aria-pressed="${mathjaxEnabled()}" title="${markdownEnabled() ? 'Typeset math in all conversations' : 'Enable Markdown in Appearance to typeset math'}" ${markdownEnabled() ? '' : 'disabled'}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
+    ${texToggleHtml(!markdownEnabled())}
     ${error}
   </div>`;
 }
@@ -9572,13 +9614,7 @@ function wireExplainMessages(v) {
     tools.dataset.wired = '1';
     const sourceKey = tools.dataset.sourceKey;
     const role = tools.dataset.role || 'do';
-    tools.querySelector('.conversation-math')?.addEventListener('click', () => {
-      setMathjaxEnabled(!mathjaxEnabled());
-      // The repaint replaces this button; keep keyboard focus on its successor.
-      const replacement = [...$('#main').querySelectorAll('.explain-tools')]
-        .find((el) => el.dataset.sourceKey === sourceKey && el.dataset.role === role);
-      replacement?.querySelector('.conversation-math')?.focus({ preventScroll: true });
-    });
+    wireTexToggles(tools);
     tools.querySelector('.explain-run')?.addEventListener('click', () => runExplanation(tools.conversationView, role, sourceKey));
     tools.querySelector('.explain-more')?.addEventListener('click', () => openExplanationForm(tools.conversationView, role, sourceKey));
   });
@@ -13367,18 +13403,20 @@ function wireWikiLocalLinks(root, proj) {
 // Index: exactly what agents receive each turn — every unconditional entry in
 // full, then the rendered table of contents (importance order, [more…] folds).
 function renderWikiHome(info, proj, pane, data) {
+  const bodies = [...(data.unconditional || []).map((u) => u.body || ''), ...(data.tocText ? [data.tocText] : [])];
   pane.innerHTML = (data.unconditional || []).map((u) => `
     <div class="card wiki-uncond">
       <div class="wiki-uncond-head"><b>${esc(u.name)}</b>${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
-        ${data.view?.writable === false || u.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}</div>
-      <div class="msg-text md wiki-md">${renderMessageBody(u.body || '')}</div>
+        ${data.view?.writable === false || u.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}${texToggleHtml(!markdownEnabled())}</div>
+      <div class="msg-text md wiki-md"></div>
     </div>`).join('') + (data.tocText ? `
     <div class="card wiki-uncond">
-      <div class="wiki-uncond-head"><b>Table of contents</b><span class="chip" title="Sent to agents as names and descriptions only; they open entries with read_wiki">titles only</span></div>
-      <div class="msg-text md wiki-md">${renderMessageBody(data.tocText)}</div>
+      <div class="wiki-uncond-head"><b>Table of contents</b><span class="chip" title="Sent to agents as names and descriptions only; they open entries with read_wiki">titles only</span><span class="grow"></span>${texToggleHtml(!markdownEnabled())}</div>
+      <div class="msg-text md wiki-md"></div>
     </div>` : '');
-  typesetMath(pane);
-  wireWikiLocalLinks(pane, proj);
+  pane.querySelectorAll('.wiki-md').forEach((el, i) =>
+    mountMarkdownSurface(el, (math) => renderMessageBody(bodies[i], math), (body) => wireWikiLocalLinks(body, proj)));
+  wireTexToggles(pane);
   pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
     try {
       const read = await api(wikiUrl(info, '', { path: b.dataset.path }));
@@ -13403,12 +13441,12 @@ function renderWikiPage(info, proj, pane, page) {
       ${page.overridden ? '<span class="chip">customized</span>' : ''}
       ${page.description ? `<small>${esc(page.description)}</small>` : ''}</div></div>
     <div class="card">
-      <div class="msg-text md wiki-md">${renderMessageBody(wikiBody(page.content))}</div>
+      <div class="msg-text md wiki-md"></div>
       ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}</div>
+      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}${texToggleHtml(!markdownEnabled())}</div>
     </div>`;
-  typesetMath(pane);
-  wireWikiLocalLinks(pane, proj);
+  mountMarkdownSurface(pane.querySelector('.wiki-md'), (math) => renderMessageBody(wikiBody(page.content), math), (body) => wireWikiLocalLinks(body, proj));
+  wireTexToggles(pane);
   $('#wiki-page-delete')?.addEventListener('click', async () => {
     const q = page.builtin
       ? `Restore the built-in default for “${page.name}”? Your customized text is discarded.`
@@ -13458,6 +13496,7 @@ function renderWikiEditor(info, proj, pane, page) {
         <button class="wiki-body-tab active" id="wiki-tab-write" type="button">Write</button>
         <button class="wiki-body-tab" id="wiki-tab-preview" type="button">Preview</button>
         <span class="grow"></span>
+        ${texToggleHtml(!markdownEnabled())}
         <label class="switch"><input type="checkbox" id="wiki-yaml"><span>YAML</span></label>
       </div>
       <textarea id="wiki-body" rows="16">${esc(body)}</textarea>
@@ -13514,11 +13553,12 @@ function renderWikiEditor(info, proj, pane, page) {
     $('#wiki-tab-preview').classList.add('active');
     $('#wiki-tab-write').classList.remove('active');
     const preview = $('#wiki-preview');
-    preview.innerHTML = renderMessageBody($('#wiki-body').value) || '<span class="task-sub">Nothing to preview.</span>';
+    const source = $('#wiki-body').value;
+    mountMarkdownSurface(preview, (math) => renderMessageBody(source, math) || '<span class="task-sub">Nothing to preview.</span>');
     $('#wiki-body').hidden = true;
     preview.hidden = false;
-    typesetMath(preview);
   });
+  wireTexToggles(pane);
 
   $('#wiki-cancel').addEventListener('click', () => { S.wikiEditing = null; wireWikiView(proj); });
   $('#wiki-save').addEventListener('click', async () => {
@@ -17309,7 +17349,7 @@ function profileView() {
       <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
       <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
       <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
-      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
+      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">Per-browser display choices.</p>
     </div>
     ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><p class="task-sub">Paid-plan subscriptions started through your account. Organization owners can change or cancel them in Plans &amp; billing.</p><div id="profile-paid-subscriptions" aria-live="polite">Loading subscriptions…</div></div>' : ''}
     <div class="card data-export-card">
