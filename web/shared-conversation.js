@@ -26,6 +26,10 @@
     catch { /* Keep readable TeX if typesetting is unavailable. */ }
   };
   toggle.hidden = false;
-  toggle.addEventListener('click', () => { math = !math; draw(); });
+  toggle.addEventListener('click', () => {
+    math = !math;
+    try { localStorage.setItem('karmax-mathjax', math ? '1' : '0'); } catch {}
+    draw();
+  });
   draw();
 })();

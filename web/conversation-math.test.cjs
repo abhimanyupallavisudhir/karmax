@@ -1,4 +1,5 @@
-// Memory-only conversation math preferences and asynchronous typesetting.
+// The conversation TeX button toggles the global math preference; typesetting
+// stays asynchronous and never runs after the preference is switched off.
 // Run: node web/conversation-math.test.cjs
 const fs = require('fs');
 const path = require('path');
@@ -20,71 +21,66 @@ function extractFn(name) {
 
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
-let preference = true, rerenders = 0, typesets = 0, finishLoading;
+const store = new Map();
+let rerenders = 0, typesets = 0, finishLoading;
 const context = vm.createContext({
-  S: {},
-  mathjaxEnabled: () => preference,
+  S: { taskTab: 'checkin' },
+  localStorage: { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)) },
   markdownEnabled: () => true,
   renderTaskPage: () => rerenders++,
   renderMarkdown: (text, options) => options.math ? '<math>' + text + '</math>' : text,
   ensureMathJax: () => new Promise((resolve) => { finishLoading = resolve; }),
   window: { MathJax: { typesetPromise: async () => { typesets++; } } },
 });
-for (const name of ['conversationMathEnabled', 'toggleConversationMath', 'renderMessageBody', 'typesetMath', 'wireExplainMessages']) {
+vm.runInContext(src.match(/^function renderFlag\([\s\S]*?^}\n/m)[0], context);
+vm.runInContext(src.match(/^const mathjaxEnabled = .*$/m)[0].replace('const ', 'globalThis.'), context);
+for (const name of ['setMathjaxEnabled', 'renderMessageBody', 'typesetMath', 'wireExplainMessages']) {
   vm.runInContext(extractFn(name), context);
 }
-const a = { taskId: 'a' }, b = { taskId: 'b' };
-const enabled = (v, role = 'do') => context.conversationMathEnabled(v, role);
-assert.equal(enabled(a), true);
-preference = false;
-assert.equal(enabled(a), false, 'untouched conversation follows changed preference');
-context.toggleConversationMath(a, 'do');
-assert.equal(enabled(a), true, 'can enable over an off preference');
-assert.equal(enabled(a, 'merge'), false, 'other agents remain independent');
-assert.equal(enabled(b), false, 'other tasks remain independent');
-assert.equal(context.renderMessageBody('$x$', enabled(a)), '<math>$x$</math>');
-assert.equal(context.renderMessageBody('$x$'), '$x$', 'non-conversation rendering follows profile');
-preference = true;
-context.toggleConversationMath(a, 'do');
-assert.equal(enabled(a), false, 'can disable over an on preference');
-assert.equal(context.renderMessageBody('$x$', enabled(a)), '$x$');
-assert.equal(preference, true, 'toggle never changes the profile preference');
-assert.equal(rerenders, 2, 'each click refreshes the conversation');
-context.S = {};
-assert.equal(enabled(a), true, 'fresh page state forgets the override');
+assert.equal(src.includes('conversationMath'), false, 'no per-conversation math override remains');
+assert.equal(context.mathjaxEnabled(), true, 'math is on by default');
+context.setMathjaxEnabled(false);
+assert.equal(store.get('karmax-mathjax'), '0', 'turning math off persists the global preference');
+assert.equal(context.mathjaxEnabled(), false);
+assert.equal(context.renderMessageBody('$x$'), '$x$');
+context.setMathjaxEnabled(true);
+assert.equal(store.get('karmax-mathjax'), '1');
+assert.equal(context.renderMessageBody('$x$'), '<math>$x$</math>');
+assert.equal(rerenders, 2, 'each change refreshes the open conversation');
 
 let click, focused = false, bindings = 0;
 const control = { addEventListener: (_, handler) => { bindings++; click = handler; }, focus: () => { focused = true; } };
 const toolbar = { dataset: { role: 'merge', sourceKey: 'message:1' }, querySelector: (selector) => selector === '.conversation-math' ? control : null };
 context.$ = () => ({ querySelectorAll: () => [toolbar] });
+const a = { taskId: 'a' };
 context.wireExplainMessages(a);
 context.wireExplainMessages({ ...a });
 assert.equal(bindings, 1, 'retained toolbars are not wired repeatedly');
 click();
-assert.equal(enabled(a, 'merge'), false, 'button click overrides its own conversation');
-assert.equal(enabled(a), true, 'button click leaves other conversations untouched');
+assert.equal(store.get('karmax-mathjax'), '0', 'button click toggles the global preference');
+click();
+assert.equal(store.get('karmax-mathjax'), '1', 'a second click turns it back on');
 assert.equal(focused, true, 'button retains keyboard focus after repaint');
 
 (async () => {
   const math = [{ dataset: {} }];
   const scope = { querySelectorAll: () => math, id: 'ck-thread', dataset: { taskId: 'a', role: 'do' }, isConnected: true, querySelector: () => true };
   context.typesetMath(scope);
-  context.toggleConversationMath(a, 'do');
+  context.setMathjaxEnabled(false);
   finishLoading(true);
   await Promise.resolve();
   assert.equal(typesets, 0, 'loading MathJax cannot typeset after switching off');
-  context.toggleConversationMath(a, 'do');
+  context.setMathjaxEnabled(true);
   context.typesetMath(scope);
   scope.isConnected = false;
   finishLoading(true);
   await Promise.resolve();
   assert.equal(typesets, 0, 'loading MathJax cannot typeset a replaced thread');
   scope.isConnected = true;
-  preference = false;
   context.typesetMath(scope);
   finishLoading(true);
   await Promise.resolve();
-  assert.equal(typesets, 1, 'conversation override enables typesetting over off profile');
+  assert.equal(typesets, 1, 'math typesets when the preference is on');
   context.typesetMath(scope);
   finishLoading(true);
   await Promise.resolve();
@@ -94,5 +90,5 @@ assert.equal(focused, true, 'button retains keyboard focus after repaint');
   finishLoading(true);
   await Promise.resolve();
   assert.equal(typesets, 2, 'new messages still get typeset');
-  console.log('Conversation math scope, rendering, toggling and async loading checks passed');
+  console.log('Conversation math preference, rendering, toggling and async loading checks passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

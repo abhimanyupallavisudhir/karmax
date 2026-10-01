@@ -2639,17 +2639,10 @@ function renderFlag(key, dflt) {
 const markdownEnabled = () => renderFlag('karmax-md-render', true);
 const mathjaxEnabled = () => renderFlag('karmax-mathjax', true);
 
-// Memory-only overrides are scoped to the task and agent conversation. Unset
-// conversations continue to follow Appearance; reloading drops all overrides.
-function conversationMathEnabled(v, role = 'do') {
-  return S.conversationMath?.[JSON.stringify([v.taskId, role])] ?? mathjaxEnabled();
-}
-
-function toggleConversationMath(v, role) {
-  const enabled = conversationMathEnabled(v, role);
-  S.conversationMath ||= {};
-  S.conversationMath[JSON.stringify([v.taskId, role])] = !enabled;
-  renderTaskPage();
+// One preference, set from Appearance or any conversation's TeX button.
+function setMathjaxEnabled(on) {
+  try { localStorage.setItem('karmax-mathjax', on ? '1' : '0'); } catch {}
+  if (S.taskTab === 'checkin') renderTaskPage();
 }
 
 // A message body: Markdown when enabled, otherwise the previous plain-escaped
@@ -2698,9 +2691,7 @@ function ensureMathJax() {
 }
 function typesetMath(root) {
   const scope = root || document.getElementById('ck-thread');
-  const enabled = () => scope?.id === 'ck-thread'
-    ? conversationMathEnabled({ taskId: scope.dataset.taskId }, scope.dataset.role) && markdownEnabled()
-    : mathjaxEnabled() && markdownEnabled();
+  const enabled = () => mathjaxEnabled() && markdownEnabled();
   if (!scope || !enabled() || !scope.querySelector('.md-math')) return;
   ensureMathJax().then(() => {
     if (!scope.isConnected || !enabled() || !window.MathJax || !window.MathJax.typesetPromise) return;
@@ -9476,13 +9467,13 @@ function explainMessageAffordance(entry, v) {
   return `<div class="explain-tools" data-source-key="${key}" data-role="${role}">
     <button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
     <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>
-    <button type="button" class="conversation-math" aria-label="Typeset math in this conversation" aria-pressed="${conversationMathEnabled(v, entry.conversationRole || 'do')}" title="${markdownEnabled() ? 'Toggle math typesetting for this conversation' : 'Enable Markdown in Appearance to typeset math'}" ${markdownEnabled() ? '' : 'disabled'}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
+    <button type="button" class="conversation-math" aria-label="Typeset math" aria-pressed="${mathjaxEnabled()}" title="${markdownEnabled() ? 'Typeset math in all conversations' : 'Enable Markdown in Appearance to typeset math'}" ${markdownEnabled() ? '' : 'disabled'}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
     ${error}
   </div>`;
 }
 
 function renderConversationEntry(entry, v = S.view) {
-  const math = conversationMathEnabled(v, entry.conversationRole || 'do');
+  const math = mathjaxEnabled();
   const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'input-request') {
     return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
@@ -9570,7 +9561,7 @@ function wireExplainMessages(v) {
     const sourceKey = tools.dataset.sourceKey;
     const role = tools.dataset.role || 'do';
     tools.querySelector('.conversation-math')?.addEventListener('click', () => {
-      toggleConversationMath(tools.conversationView, role);
+      setMathjaxEnabled(!mathjaxEnabled());
       // The repaint replaces this button; keep keyboard focus on its successor.
       const replacement = [...$('#main').querySelectorAll('.explain-tools')]
         .find((el) => el.dataset.sourceKey === sourceKey && el.dataset.role === role);
@@ -17571,8 +17562,7 @@ function wireProfileView() {
     toast(`Markdown rendering ${e.target.checked ? 'on' : 'off'}`);
   });
   $('#profile-mathjax')?.addEventListener('change', (e) => {
-    try { localStorage.setItem('karmax-mathjax', e.target.checked ? '1' : '0'); } catch {}
-    if (S.taskTab === 'checkin') renderTaskPage();
+    setMathjaxEnabled(e.target.checked);
     toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
   });
   $('#export-user-data')?.addEventListener('click', () => location.assign('/api/user/export'));
