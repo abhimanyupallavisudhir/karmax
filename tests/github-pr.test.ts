@@ -1691,6 +1691,7 @@ function freshnessGithub(branches: Record<string, string>) {
   const prs = new Map<number, { head: string; ref: string; base: string; merged?: string }>();
   const checks = new Map<string, string>();
   const calls: string[] = [];
+  const outage = { readiness: undefined as string | undefined };
   const commit = (sha: string, ...parents: string[]) => {
     ancestry.set(sha, new Set([sha, ...parents.flatMap((parent) => [...ancestry.get(parent)!])]));
     return sha;
@@ -1715,6 +1716,7 @@ function freshnessGithub(branches: Record<string, string>) {
       head: { ref: pr.ref, sha: pr.head }, base: { ref: pr.base } });
     if (method === 'GET' && url.pathname.endsWith(`/pulls/${number}`)) return Response.json(view());
     if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness')) {
+      if (outage.readiness) return Response.json({ errors: [{ message: outage.readiness }] });
       const state = checks.get(pr.head) ?? 'PENDING';
       return Response.json({ data: { repository: { pullRequest: {
         id: `PR_${number}`, url: view().html_url, state: pr.merged ? 'MERGED' : 'OPEN', isDraft: false,
@@ -1736,7 +1738,7 @@ function freshnessGithub(branches: Record<string, string>) {
     }
     return Response.json({ message: `unrouted ${method} ${url.pathname}` }, { status: 404 });
   }) as typeof fetch;
-  return { fetcher, branches, prs, checks, calls, commit,
+  return { fetcher, branches, prs, checks, calls, commit, outage,
     options: { apiBase: 'https://api.github.test', fetch: fetcher } };
 }
 
@@ -1778,6 +1780,25 @@ async function freshnessCore(github: ReturnType<typeof freshnessGithub>) {
   };
   return { core, parent, confirmed };
 }
+
+describe('Fallback landing readiness (task 450)', () => {
+  it('reports a failed readiness read as a GitHub error, not as GitHub still computing', async () => {
+    const github = freshnessGithub({ main: 'main-0' });
+    github.checks.set(github.commit('reviewed-head', 'main-0'), 'SUCCESS');
+    const { confirmed } = await freshnessCore(github);
+    const proposal = await confirmed(1, 'reviewed-head', 'main');
+
+    github.outage.readiness = 'Something went wrong while executing your query';
+    const failed = await proposal.land();
+    expect(failed).toMatchObject({ status: 'retryable-error',
+      detail: expect.stringMatching(/could not be inspected.*Something went wrong/) });
+    expect(failed.detail).not.toMatch(/still computing/);
+    expect(github.calls).not.toContain('PUT /repos/acme/widgets/pulls/1/merge');
+
+    github.outage.readiness = undefined;
+    await expect(proposal.land()).resolves.toMatchObject({ status: 'merged' });
+  });
+});
 
 describe('Sub-task landing freshness (GH-26)', () => {
   it('updates a green sibling that lacks the parent branch head and waits for its fresh checks', async () => {

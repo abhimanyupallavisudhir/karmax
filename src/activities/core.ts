@@ -4758,6 +4758,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               landingOwner: 'karmax',
             };
           }
+          // A failed read is not GitHub computing: a `waiting` here is watched
+          // through preflights, which can read the same as before the failure.
+          if (!readiness && readinessError) return errorDecision(readinessError, current);
           if (!readiness || readiness.mergeable === 'UNKNOWN' || readiness.mergeStateStatus === 'UNKNOWN') {
             return {
               status: 'waiting', prs: current, actorUserId,
