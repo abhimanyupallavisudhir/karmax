@@ -1308,8 +1308,8 @@ function humanAudienceOptions() {
   ];
 }
 // A comma-separated audience box whose suggestions follow the entry being typed.
-function audienceComboHtml(className, audience) {
-  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" autocomplete="off" spellcheck="false" /><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
+function audienceComboHtml(className, audience, label) {
+  return `<div class="combo audience-combo"><input class="${className}" value="${esc(audience)}" aria-label="${esc(label)}" placeholder="@creator, @team:leaders, or search for a person" autocomplete="off" spellcheck="false" /><button type="button" class="combo-caret" tabindex="-1" aria-label="Show people and teams">▾</button><div class="combo-menu" hidden></div></div>`;
 }
 function wireAudienceCombos(root) {
   root.querySelectorAll('.audience-combo').forEach((combo) => wireCombo(combo, humanAudienceOptions, null, { multiple: true }));
@@ -1328,8 +1328,7 @@ function cfLayerHtml(f, layer, agentDefault) {
       <button type="button" class="btn sm cf-del" title="Remove this step">✕</button>
     </div>
     <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-      <label class="form-row">Who confirms${audienceComboHtml('cf-audience', audience)}</label>
-      ${policyTip('Separate people or teams with commas. Add steps for reviews in sequence.')}
+      <div class="form-row"><span class="form-row-head">Who confirms ${policyTip('Separate people or teams with commas. Add steps for reviews in sequence.')}</span>${audienceComboHtml('cf-audience', audience, 'Who confirms')}</div>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
       <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review prompt ${policyTip('Sent at each review. Type [[ for wiki context. Variables: {{prompt}}, {{response}}, {{reviewInfo}}, {{changedFiles}}, {{transcript}}.')}</div>
@@ -1406,8 +1405,7 @@ function renderResponderField(f, own, inherited, alt) {
         <select class="cf-kind rf-kind"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
       </div>
       <div class="cf-human rf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-        <label class="form-row">Who responds${audienceComboHtml('cf-audience rf-audience', audience)}</label>
-        ${policyTip('Separate people or teams with commas. Any selected person may answer.')}
+        <div class="form-row"><span class="form-row-head">Who responds ${policyTip('Separate people or teams with commas. Any selected person may answer.')}</span>${audienceComboHtml('cf-audience rf-audience', audience, 'Who responds')}</div>
       </div>
       <div class="cf-agent rf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}
         <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Response prompt — sent whenever the task waits for input. Type [[ to add wiki context. Placeholders: {{title}}, {{prompt}}, {{question}}, {{transcript}}.</div>
@@ -4908,6 +4906,8 @@ function pullRequestLinks(v) {
   }).join('');
 }
 
+const PARKED_WAITS = new Set(['timer', 'job', 'subtask', 'collaboration', 'parent']);
+
 // Human-facing pipeline label. Keep this stable while the immediate wait changes:
 // GitHub may alternate between queue admission, checks, and mergeability without
 // the task ever leaving Landing. The short wait reason is rendered separately.
@@ -4920,6 +4920,9 @@ function stageLabel(v) {
   if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
   // So is a turn parked on its credential or quota: nothing is working.
   if (v.status === 'waiting' && v.waitingFor?.kind === 'account') return waitingText(v.waitingFor);
+  // Nor is an agent that ended its turn to wait for a job, a time or other tasks
+  // (task 433 read "working" for hours while paused until the next morning).
+  if (v.stage === 'do' && v.status === 'waiting' && PARKED_WAITS.has(v.waitingFor?.kind)) return waitingText(v.waitingFor);
   // `do` and `merge` are the replay-stable workflow keys; a person reads them
   // as "working" and "landing" and never has to learn the internal names.
   return { do: 'working', merge: 'landing' }[v.stage || 'setup'] || v.stage || 'setup';
@@ -10095,14 +10098,19 @@ function waitingText(w) {
     if (summary) return summary.slice(0, 72);
   }
   if (w?.kind === 'human') return 'Needs input';
-  if (w?.kind === 'timer') {
-    return Number.isFinite(w.until)
-      ? `Paused until ${new Date(w.until).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
-      : 'Paused';
-  }
+  if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Paused until ${waitDeadline(w.until)}` : 'Paused';
+  // The deadline is when the agent resumes even if the job never finishes.
+  if (w?.kind === 'job' && Number.isFinite(w.until)) return `Waiting for job until ${waitDeadline(w.until)}`;
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
   return `Waiting for ${label}`;
+}
+
+// A clock time, with the weekday when it is not today.
+function waitDeadline(until) {
+  const at = new Date(until);
+  const today = at.toDateString() === new Date().toDateString();
+  return at.toLocaleString([], { ...(today ? {} : { weekday: 'short' }), hour: 'numeric', minute: '2-digit' });
 }
 
 // The durable wait detail is actionable when admission itself is blocked (for
@@ -10324,14 +10332,23 @@ async function renderCredentialEditor(el, scope, opts = {}) {
         ${keyActions ? '<span class="cred-key-edit" title="Edit API key">✎</span><span class="cred-key-del" title="Delete API key">✕</span>' : ''}
       </div>`;
     })
-    .join('')}</div><div class="cred-login-flow" hidden></div>`;
+    .join('')}</div>${opts.local ? '' : `<button class="btn sm cred-save" type="button" hidden title="Save the new order"><span class="cred-save-alert" aria-hidden="true">!</span>Unsaved changes${ICON.save}</button>`}<div class="cred-login-flow" hidden></div>`;
+  // A reorder is staged until Save (the New Task form is itself a draft, so it
+  // applies there at once). Any other save persists the staged order with it,
+  // so what is saved is always what is on screen.
+  let stagedOrder = null;
+  const saveButton = el.querySelector('.cred-save');
   const save = async (policy) => {
+    if (stagedOrder) policy = { ...policy, order: stagedOrder };
     // Local mode: keep the change client-side (applied when the task is created); else
     // persist immediately, keyed by taskId/projectId scope.
     if (opts.local) { opts.onChange?.(policy); renderCredentialEditor(el, scope, { ...opts, policy }); return; }
     const authScope = opts.taskId ? `?taskId=${encodeURIComponent(opts.taskId)}` : opts.projectId ? `?projectId=${encodeURIComponent(opts.projectId)}` : '';
     try { await api(`${organizationBase}/credentials/policy${authScope}`, { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
-    catch (e) { toast(e.message, true); }
+    catch (e) {
+      toast(e.message, true);
+      if (stagedOrder) { saveButton.disabled = false; return; } // keep the unsaved order on screen
+    }
     renderCredentialEditor(el, scope, opts);
   };
   el.querySelectorAll('.cred-row').forEach((row) => {
@@ -10385,7 +10402,12 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     });
   });
   // Drag-to-reorder → precedence order for this scope.
-  wireCredDrag(el.querySelector('.cred-list'), (order) => save({ ...own, order }));
+  wireCredDrag(el.querySelector('.cred-list'), (order) => {
+    if (opts.local) return save({ ...own, order });
+    stagedOrder = order.join('\n') === ordered.join('\n') ? null : order;
+    saveButton.hidden = !stagedOrder;
+  });
+  saveButton?.addEventListener('click', () => { saveButton.disabled = true; save(own); });
 }
 
 function openApiKeyEditor({ organizationBase, credential, onSaved }) {
@@ -10418,13 +10440,18 @@ function openApiKeyEditor({ organizationBase, credential, onSaved }) {
   host.querySelector('.api-key-edit-account').focus();
 }
 
-// HTML5 drag-and-drop reordering for the credential rows; calls onReorder(keys[]) on drop.
+// HTML5 drag-and-drop reordering for the credential rows; calls onReorder(keys[])
+// when a drag ends. Not on `drop`: releasing just off the one-line strip fires
+// no drop, yet the rows have already moved to where the person put them.
 function wireCredDrag(list, onReorder) {
   if (!list) return;
   let dragging = null;
   list.querySelectorAll('.cred-row').forEach((row) => {
     row.addEventListener('dragstart', (e) => { dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', row.dataset.key); } catch {} });
-    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+    row.addEventListener('dragend', () => {
+      row.classList.remove('dragging'); dragging = null;
+      onReorder([...list.querySelectorAll('.cred-row')].map((r) => r.dataset.key));
+    });
   });
   list.addEventListener('dragover', (e) => {
     e.preventDefault();
@@ -10443,7 +10470,7 @@ function wireCredDrag(list, onReorder) {
     }
     best ? list.insertBefore(dragging, best) : list.appendChild(dragging);
   });
-  list.addEventListener('drop', (e) => { e.preventDefault(); onReorder([...list.querySelectorAll('.cred-row')].map((r) => r.dataset.key)); });
+  list.addEventListener('drop', (e) => e.preventDefault());
 }
 
 // Which agent role "owns" a given stage — drives which transcript opens by default.

@@ -362,6 +362,7 @@ async function main() {
     worldAccess,
     objects: objectStore,
     resources,
+    checkpoints,
     subscriptions: subscriptionBilling,
     paidLaunchSettings,
     cellId: deployment.cellId,

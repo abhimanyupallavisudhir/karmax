@@ -1,4 +1,3 @@
-import { readCheckpointFiles } from './checkpoint-read.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
@@ -17,12 +16,12 @@ import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
 import { sameRepository } from './repository-identity.js';
 import { clearCheckpointStale } from './checkpoint-staleness.js';
+import { ChunkedCheckpointStore, CheckpointRefusedError, formatBytes, type CaptureEntry } from './checkpoint-chunks.js';
+import { transferResourceChunk } from './resource-transfer.js';
 
-import type { DeltaFile, PortableDelta } from './checkpoint-encoding.js';
-import { encodeEncryptedCheckpoint, type CheckpointFile } from './checkpoint-executor.js';
+import type { PortableDelta } from './checkpoint-encoding.js';
 const gunzip = promisify(zlib.gunzip);
-const MAX_CHECKPOINT_FILE_BYTES = 32 * 1024 * 1024;
-const MAX_CHECKPOINT_BYTES = 128 * 1024 * 1024;
+/** Legacy whole-document checkpoints (KMX1) remain readable up to this size. */
 const MAX_CHECKPOINT_JSON_BYTES = 192 * 1024 * 1024;
 export const CHECKPOINT_KEY_HANDLE = 'checkpoint:encryption-key';
 
@@ -70,7 +69,9 @@ export class WorldCheckpointService {
     private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService,
     private resources?: import('./resources.js').ProjectResourceService, runners?: RunnerPoolService) {
     this.runners = runners ?? new RunnerPoolService(store);
+    this.chunks = new ChunkedCheckpointStore(store, broker, objects, resources?.storageLocationService?.());
   }
+  private chunks: ChunkedCheckpointStore;
 
   async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean; checkContinue?: () => Promise<void>; reuseClean?: boolean } = {}): Promise<WorldCheckpoint> {
     return this.worlds.withOperation(handleInput.id, async () => {
@@ -158,62 +159,37 @@ export class WorldCheckpointService {
         return previous;
       }
     }
-    if (files.length > 100_000) throw new Error('checkpoint file count limit exceeded');
-    const paths = files.flatMap(file => file.readPath === undefined ? [] : [file.readPath]);
-    let expectedBytes = 0;
-    const fileSizes = new Map<string, number>();
-    for (let offset = 0; offset < paths.length; offset += 128) {
-      const batch = paths.slice(offset, offset + 128);
-      const stat = await world.exec('stat', ['-c', '%s', '--', ...batch], { cwd: world.handle.root });
-      const sizes = stat.stdout.trim().split('\n').map(Number);
-      if (stat.code !== 0 || sizes.length !== batch.length || sizes.some(size => !Number.isSafeInteger(size) || size < 0))
-        throw new Error('could not size checkpoint files');
-      if (sizes.some(size => size > MAX_CHECKPOINT_FILE_BYTES)) throw new Error('checkpoint file limit exceeded');
-      batch.forEach((file, index) => fileSizes.set(file, sizes[index]!));
-      expectedBytes += sizes.reduce((sum, size) => sum + size, 0);
-      if (expectedBytes > MAX_CHECKPOINT_BYTES) throw new Error('checkpoint total size limit exceeded');
-    }
-    const metadataBytes = files.reduce((sum, file) => sum + Buffer.byteLength(JSON.stringify(file)), 0);
-    if (metadataBytes + Math.ceil(expectedBytes / 3) * 4 + files.length * 8 > MAX_CHECKPOINT_JSON_BYTES)
-      throw new Error('checkpoint JSON size limit exceeded');
-    async function* contents(): AsyncGenerator<CheckpointFile> {
-      for (const { readPath, ...file } of files) if (readPath === undefined) yield file;
-      const byPath = new Map(files.flatMap(file => file.readPath === undefined ? [] : [[file.readPath, file] as const]));
-      for await (const { path, data, symlink } of readCheckpointFiles(world, fileSizes, options.checkContinue)) {
-        const { readPath, ...file } = byPath.get(path)!;
-        yield { ...file, ...(symlink ? { symlink } : {}), data };
-      }
-    }
-    const { encrypted, sha256: digest } = await encodeEncryptedCheckpoint(contents(), await this.key());
     await options.checkContinue?.();
     const checkpointId = newId('checkpoint');
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
-    const managedStorage = (await this.store.listStorageLocations(project.organizationId))
-      .find((location) => location.kind === 'managed');
-    if (managedStorage) (await this.store.reserveStorageUpload(`checkpoint:${checkpointId}`, project.organizationId,
-      managedStorage.id, encrypted.length, Date.now() + 60 * 60_000));
-    try { await this.objects.put(objectKey, encrypted); }
-    catch (error) {
-      if (managedStorage) (await this.store.releaseStorageUpload(`checkpoint:${checkpointId}`));
+    let captured: Awaited<ReturnType<ChunkedCheckpointStore['capture']>>;
+    try {
+      captured = await this.chunks.capture({ world, organizationId: project.organizationId, worldId: handle.id,
+        generation: handle.generation ?? 1, objectKey, entries: files, checkContinue: options.checkContinue,
+        baseline: await this.store.latestWorldCheckpoint(handle.id) });
+    } catch (error) {
+      if (error instanceof CheckpointRefusedError) await this.store.kvSet(noticeKey(handle.id), refusalNotice(error));
       throw error;
     }
+    const { delta, omitted, uploadedBytes } = captured;
     const checkpoint: WorldCheckpoint = {
-      id: checkpointId, ...manifest,
-      filesystemDelta: { objectKey, sha256: digest, bytes: encrypted.length },
+      id: checkpointId, ...manifest, filesystemDelta: delta,
+      ...(omitted.length ? { omitted: omitted.slice(0, 100) } : {}),
       createdAt: Date.now(),
     };
     try { (await this.store.saveWorldCheckpoint(checkpoint)); }
-    catch (error) { await this.objects.delete(objectKey).catch(() => undefined); throw error; }
-    finally { if (managedStorage) (await this.store.releaseStorageUpload(`checkpoint:${checkpointId}`)); }
+    catch (error) { await captured.rollback().catch(() => undefined); throw error; }
     (await this.store.attachWorldCheckpoint(handle, checkpoint.id));
     await clearCheckpointStale(this.store, handle.id);
+    if (omitted.length) await this.store.kvSet(noticeKey(handle.id), omittedNotice(omitted));
+    else await this.store.kvDelete(noticeKey(handle.id));
     await this.store.updateWorldMeta(handle, { cleanCheckpoint: cleanFingerprint
       ? { id: checkpoint.id, fingerprint: cleanFingerprint } : null });
     (await this.store.recordUsage({ organizationId: project.organizationId, projectId, taskId: handle.id, worldId: handle.id,
-      provider: handle.kind, kind: 'checkpoint.storage', quantity: encrypted.length, unit: 'byte', costMicros: 0,
+      provider: handle.kind, kind: 'checkpoint.storage', quantity: uploadedBytes, unit: 'byte', costMicros: 0,
       fundingSource: 'managed',
       startedAt: checkpoint.createdAt, endedAt: checkpoint.createdAt,
-      metadata: { checkpointId, generation: checkpoint.generation } }));
+      metadata: { checkpointId, generation: checkpoint.generation, files: delta.files, contentBytes: delta.contentBytes } }));
     await options.checkContinue?.();
     if (options.scrubSecrets !== false) await this.resources?.scrubSecrets(handle);
     await this.store.pruneWorldCheckpoints(handle.id);
@@ -225,14 +201,40 @@ export class WorldCheckpointService {
   async collectGarbage(onlyWorldId?: string): Promise<void> {
     for (const pending of (await this.store.kvEntries('checkpoint-gc:')).slice(0, 100)) {
       try {
-        const { worldId, objectKey } = JSON.parse(pending.value);
+        const { worldId, objectKey, projectId, filesystemDelta } = JSON.parse(pending.value);
         if (onlyWorldId && worldId !== onlyWorldId) continue;
+        const checkpointId = pending.key.slice('checkpoint-gc:'.length);
         await this.worlds.withOperation(worldId, async () => {
+          if (filesystemDelta?.format === 2) {
+            const organizationId = (await this.store.getProject(projectId))?.organizationId;
+            if (organizationId) await this.chunks.release({ id: checkpointId, worldId, filesystemDelta } as WorldCheckpoint,
+              organizationId, () => this.store.completeCheckpointDeletion(checkpointId));
+            else await this.store.completeCheckpointDeletion(checkpointId);
+            return;
+          }
           await this.objects.delete(objectKey);
-          await this.store.completeCheckpointDeletion(pending.key.slice('checkpoint-gc:'.length));
+          await this.store.completeCheckpointDeletion(checkpointId);
         });
       } catch { /* retry from the lifecycle sweep */ }
     }
+  }
+
+  /** Release every chunked checkpoint of a project being deleted. Legacy
+   * checkpoint objects are deleted with the project's other object keys. */
+  async deleteProject(projectId: string): Promise<void> {
+    const organizationId = (await this.store.getProject(projectId))?.organizationId;
+    if (!organizationId) return;
+    for (const checkpoint of await this.store.listProjectCheckpoints(projectId)) {
+      if (checkpoint.filesystemDelta?.format !== 2) continue;
+      await this.chunks.release(checkpoint, organizationId, () => this.store.completeCheckpointDeletion(checkpoint.id));
+    }
+  }
+
+  /** What the agent should know about its last checkpoint, once. */
+  async takeNotice(taskId: string): Promise<string | undefined> {
+    const notice = await this.store.kvGet(noticeKey(taskId));
+    if (notice) await this.store.kvDelete(noticeKey(taskId));
+    return notice;
   }
 
   async restore(checkpointId: string, provider?: WorldKind, options?: RestoreOptions): Promise<WorldHandle> {
@@ -243,11 +245,8 @@ export class WorldCheckpointService {
     const project = (await this.store.getProject(checkpoint.projectId));
     if (!project?.organizationId) throw new Error('checkpoint project no longer exists');
     const executionConfig = (await this.store.effectiveProjectConfig(project));
-    if (filesystemDelta.bytes > MAX_CHECKPOINT_JSON_BYTES) throw new Error('checkpoint object size limit exceeded');
-    const encrypted = await this.objects.get(filesystemDelta.objectKey);
-    if (sha256(encrypted) !== filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
-    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted), { maxOutputLength: MAX_CHECKPOINT_JSON_BYTES })).toString('utf8')) as PortableDelta;
-    if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
+    // Read (and verify) the manifest before provisioning a billable sandbox.
+    const delta = await this.deltaFiles(checkpoint, project.organizationId);
     // A checkpoint must be restorable after its sandbox disappears even when a
     // checkout is not a normal project enrollment (the project wiki is the
     // important example), or when project repository settings change later.
@@ -367,8 +366,8 @@ export class WorldCheckpointService {
         world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,
           checkpoint.generation + 1, revisions);
       }
-      const writes: Array<[string, DeltaFile]> = [];
-      for (const file of delta.files) {
+      const writes: Array<[string, RestoredFile]> = [];
+      for await (const file of delta) {
         const checkout = checkpoint.repos.find(repo => repo.checkoutPath === file.repo) ?? checkpoint.repos[0];
         const relative = checkout && checkout.checkoutPath !== '.' ? `${checkout.checkoutPath}/${file.path}` : file.path;
         if (file.deleted) {
@@ -411,11 +410,10 @@ export class WorldCheckpointService {
     if (!checkpoint?.filesystemDelta || checkpoint.projectId !== projectId)
       throw new Error('fork checkpoint is unavailable in this project');
     if (checkpoint.worldId === world.handle.id) throw new Error('fork requires an independent world');
-    if (checkpoint.filesystemDelta.bytes > MAX_CHECKPOINT_JSON_BYTES) throw new Error('checkpoint object size limit exceeded');
-    const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
-    if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
-    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted), { maxOutputLength: MAX_CHECKPOINT_JSON_BYTES })).toString('utf8')) as PortableDelta;
-    if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
+    const organizationId = (await this.store.getProject(projectId))?.organizationId;
+    if (!organizationId) throw new Error('fork checkpoint project no longer exists');
+    const files: RestoredFile[] = [];
+    for await (const file of await this.deltaFiles(checkpoint, organizationId)) files.push(file);
     const destinations = new Map<string, WorldRepo>();
     for (const repo of checkpoint.repos) {
       options.signal?.throwIfAborted();
@@ -443,10 +441,10 @@ export class WorldCheckpointService {
       destination.baseSha = repo.headSha;
       destinations.set(repo.checkoutPath === '.' ? worldRepos(world.handle)[0]!.name : repo.checkoutPath, destination);
       // Single-repo legacy deltas store the checkout name even though the manifest says '.'.
-      if (checkpoint.repos.length === 1) for (const file of delta.files) destinations.set(file.repo, destination);
+      if (checkpoint.repos.length === 1) for (const file of files) destinations.set(file.repo, destination);
     }
-    const writes: Array<[string, DeltaFile]> = [];
-    for (const file of delta.files) {
+    const writes: Array<[string, RestoredFile]> = [];
+    for (const file of files) {
       options.signal?.throwIfAborted();
       const repo = destinations.get(file.repo);
       const plain = checkpoint.repos.length === 0 && file.repo === '' && worldRepos(world.handle).length === 0;
@@ -461,6 +459,38 @@ export class WorldCheckpointService {
     options.signal?.throwIfAborted();
   }
 
+  /** A checkpoint's files in order, chunked or legacy. Each file's bytes are
+   * fetched only when written, so a restore holds one chunk at a time. */
+  private async deltaFiles(checkpoint: WorldCheckpoint, organizationId: string): Promise<AsyncIterable<RestoredFile>> {
+    const filesystemDelta = checkpoint.filesystemDelta!;
+    if (filesystemDelta.format === 2) {
+      // Opening it here verifies the manifest before the caller does any work.
+      const entries = this.chunks.entries(checkpoint, organizationId, await this.chunks.manifest(checkpoint, organizationId));
+      return (async function* () {
+        for await (const entry of entries) {
+          if ('deleted' in entry) yield { repo: entry.repo, path: entry.path, deleted: true };
+          else if ('link' in entry) yield { repo: entry.repo, path: entry.path, link: entry.link };
+          else yield { repo: entry.repo, path: entry.path, content: entry.content!, ...('executable' in entry && entry.executable ? { executable: true } : {}) };
+        }
+      })();
+    }
+    if (filesystemDelta.bytes > MAX_CHECKPOINT_JSON_BYTES) throw new Error('checkpoint object size limit exceeded');
+    const encrypted = await this.objects.get(filesystemDelta.objectKey);
+    if (sha256(encrypted) !== filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
+    const delta = JSON.parse((await gunzip(await this.decrypt(encrypted), { maxOutputLength: MAX_CHECKPOINT_JSON_BYTES })).toString('utf8')) as PortableDelta;
+    if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
+    return (async function* () {
+      for (const file of delta.files) {
+        if (file.deleted) yield { repo: file.repo, path: file.path, deleted: true };
+        else if (file.symlink) yield { repo: file.repo, path: file.path, link: file.data ?? '' };
+        else {
+          const data = Buffer.from(file.data ?? '', 'base64');
+          yield { repo: file.repo, path: file.path, content: async function* () { yield data; } };
+        }
+      }
+    })();
+  }
+
   private async key(): Promise<Buffer> {
     if (!this.broker.hasHandle(CHECKPOINT_KEY_HANDLE))
       await this.broker.ensureHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
@@ -473,6 +503,24 @@ export class WorldCheckpointService {
     decipher.setAuthTag(blob.subarray(16, 32));
     return Buffer.concat([decipher.update(blob.subarray(32)), decipher.final()]);
   }
+}
+
+/** One file to put back: deleted, a link (`link` is its base64 target) or bytes. */
+interface RestoredFile { repo: string; path: string; deleted?: true; link?: string; executable?: true; content?: () => AsyncIterable<Buffer> }
+
+const noticeKey = (taskId: string) => `checkpoint-notice:${taskId}`;
+
+function refusalNotice(error: CheckpointRefusedError): string {
+  const files = error.files.map(file => `- ${file.path}${file.bytes !== undefined ? ` (${formatBytes(file.bytes)})` : ''}${file.reason ? ` — ${file.reason}` : ''}`);
+  return [`Your uncommitted work could not be checkpointed: ${error.message}.`,
+    ...(files.length ? ['', ...files, ''] : []),
+    'Until it can be, this task\'s sandbox cannot hibernate and its uncommitted work exists only there. Commit what belongs in the repository, add generated or downloaded files to .gitignore, or move large data out of the task world (for example into a project resource).'].join('\n');
+}
+
+function omittedNotice(omitted: Array<{ path: string; reason: string }>): string {
+  return ['These paths were left out of the last checkpoint because they have no portable contents, so they would be lost if the sandbox is lost:',
+    ...omitted.slice(0, 20).map(file => `- ${file.path} — ${file.reason}`),
+    'Commit their contents, or move them out of the task world if they matter.'].join('\n');
 }
 
 // Replaces whatever is at the path; the target bytes are never resolved.
@@ -491,31 +539,48 @@ for (const file of JSON.parse(process.argv[1])) {
   if (stat.isSymbolicLink()) fs.unlinkSync(file);
 }`;
 
-/** Deletions are already applied. One bounded exec per batch replaces links at
- * regular-file paths before any content is written (WD-33). */
-async function writeDeltaFiles(world: World, writes: Array<[string, DeltaFile]>, signal?: AbortSignal): Promise<void> {
-  const regular = writes.flatMap(([relative, file]) => file.symlink ? [] : [relative]);
-  for (let index = 0; index < regular.length;) {
+// Adds execute permission wherever read permission is set, like `chmod +x`.
+const EXECUTABLE = `const fs = require('node:fs');
+for (const file of JSON.parse(process.argv[1])) {
+  const stat = fs.lstatSync(file);
+  if (stat.isFile()) fs.chmodSync(file, stat.mode | ((stat.mode & 0o444) >> 2));
+}`;
+
+async function batchedExec(world: World, script: string, paths: string[], signal?: AbortSignal): Promise<void> {
+  for (let index = 0; index < paths.length;) {
     const batch: string[] = [];
     let names = 0;
-    while (index < regular.length && (!batch.length || (batch.length < 128 && names + regular[index]!.length <= 8192))) {
-      names += regular[index]!.length; batch.push(regular[index++]!);
+    while (index < paths.length && (!batch.length || (batch.length < 128 && names + paths[index]!.length <= 8192))) {
+      names += paths[index]!.length; batch.push(paths[index++]!);
     }
     signal?.throwIfAborted();
-    const unlinked = await world.exec('node', ['-e', UNLINK, JSON.stringify(batch)], { cwd: world.handle.root });
-    if (unlinked.code !== 0) throw new Error(`could not replace links: ${unlinked.stderr}`);
+    const result = await world.exec('node', ['-e', script, JSON.stringify(batch)], { cwd: world.handle.root });
+    if (result.code !== 0) throw new Error(`could not restore checkpoint files: ${result.stderr}`);
   }
+}
+
+/** Deletions are already applied. One bounded exec per batch replaces links at
+ * regular-file paths before any content is written (WD-33). A file streams in
+ * chunk by chunk, appended in place. */
+async function writeDeltaFiles(world: World, writes: Array<[string, RestoredFile]>, signal?: AbortSignal): Promise<void> {
+  await batchedExec(world, UNLINK, writes.flatMap(([relative, file]) => file.link !== undefined ? [] : [relative]), signal);
+  let compress: boolean | undefined;
   for (const [relative, file] of writes) {
     signal?.throwIfAborted();
-    if (file.symlink) {
-      const linked = await world.exec('node', ['-e', SYMLINK, file.data ?? '', relative], { cwd: world.handle.root });
+    if (file.link !== undefined) {
+      const linked = await world.exec('node', ['-e', SYMLINK, file.link, relative], { cwd: world.handle.root });
       if (linked.code !== 0) throw new Error(`could not restore link: ${file.path}`);
       continue;
     }
-    const content = Buffer.from(file.data ?? '', 'base64');
-    if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
-    else await world.writeFile(relative, content.toString('utf8'));
+    let offset = 0;
+    for await (const data of file.content!()) {
+      if (compress === undefined && data.length >= 256 * 1024) compress = world.handle.kind === 'e2b'
+        && (await world.exec('bash', ['-lc', 'command -v gzip >/dev/null'], { cwd: world.handle.root })).code === 0;
+      await transferResourceChunk(world, relative, data, offset, { compress, signal });
+      offset += data.length;
+    }
   }
+  await batchedExec(world, EXECUTABLE, writes.flatMap(([relative, file]) => file.executable ? [relative] : []), signal);
 }
 
 function parseStatus(value: string): Array<{ path: string; deleted: boolean }> {

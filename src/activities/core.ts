@@ -1,3 +1,4 @@
+import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { createHash } from 'node:crypto';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
@@ -1183,7 +1184,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           } catch (error) {
             if (error === deferred) return;
             if (ctx?.cancellationSignal.aborted) throw error;
-            (await record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) }));
+            (await record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error),
+              ...(error instanceof CheckpointRefusedError && error.files.length ? { files: error.files } : {}) }));
             // The world still parks, but hibernation must not trust an older checkpoint.
             await markCheckpointStale(store, waitingWorld, error instanceof Error ? error.message : String(error));
           }
@@ -2427,6 +2429,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           session = undefined;
           deliveredMessages = 0;
         }
+      }
+      // A checkpoint refused (or incomplete) since the agent last worked: name the
+      // files, so it can commit, ignore or move them. Rides on the newest message
+      // the agent has not read yet; the workflow's message indices are unchanged.
+      if (args.role === 'do' && !resumedActivityAttempt && messages.length > (deliveredMessages ?? 0)) {
+        const notice = await deps.checkpoints?.takeNotice(args.taskId).catch(() => undefined);
+        const last = messages.length - 1;
+        if (notice) messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n(${notice})` } : message);
       }
       /** Compatibility publisher for immutable v1 histories. Those workflows
        * clear their in-memory account wait after a grant but cannot schedule a
@@ -4778,6 +4788,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               landingOwner: 'karmax',
             };
           }
+          // A failed read is not GitHub computing: a `waiting` here is watched
+          // through preflights, which can read the same as before the failure.
+          if (!readiness && readinessError) return errorDecision(readinessError, current);
           if (!readiness || readiness.mergeable === 'UNKNOWN' || readiness.mergeStateStatus === 'UNKNOWN') {
             return {
               status: 'waiting', prs: current, actorUserId,
