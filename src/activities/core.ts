@@ -3509,6 +3509,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       finally { clearInterval(pulse); }
     },
 
+    /** Snapshot staged path candidates while the producing world is still live.
+     * Only the final attempt gives up on a candidate (discarding it with its
+     * reason); earlier failures retry with what is already staged kept. */
+    async stageResourceCandidates(taskId: string): Promise<{ staged: number; failed: number }> {
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct tests */ }
+      const pulse = setInterval(() => {
+        try { context?.heartbeat({ taskId, operation: 'staging-resources' }); } catch { /* activity completion/cancellation */ }
+      }, 5_000);
+      try {
+        const info = context?.info;
+        const maximumAttempts = info?.retryPolicy?.maximumAttempts ?? 0;
+        const result = await deps.resources?.stageCandidates(taskId, {
+          final: !info || (maximumAttempts > 0 && info.attempt >= maximumAttempts),
+          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); },
+        });
+        return { staged: result?.staged.length ?? 0, failed: result?.failed.length ?? 0 };
+      } finally { clearInterval(pulse); }
+    },
+
     async pendingResourceCandidates(taskId: string): Promise<number> {
       return (await store.listResourceCandidates(taskId)).filter((candidate) =>
         candidate.state === 'pending' || candidate.state === 'discarding').length;

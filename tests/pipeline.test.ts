@@ -220,15 +220,23 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'weights/weights.bin'), Buffer.from('updated weights'));
     const proposed = await h.resources.proposePath(task.id, { path: 'model.bin', name: 'Installed model',
       target: { kind: 'path', path: 'data/model.bin' }, access: 'read' });
+    // The snapshot is taken at the end of Do, so later writes in the turn count.
+    expect(proposed.revision).toBeUndefined();
+    fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'model.bin'), Buffer.alloc(2048, 9));
     await expect.poll(() => Boolean(gates.releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
     gates.resourceCandidateTurnReleased = true;
     gates.releaseResourceCandidateTurn!();
     gates.releaseResourceCandidateTurn = undefined;
 
-    await expect.poll(async () => (await view(handle)).actions.map((action: any) => action.name), { timeout: 30_000 })
-      .toContain('confirm');
-    expect((await view(handle)).stage).toBe('review');
-    expect((await h.store.getResourceAttachment(proposed.attachment.id))?.enabled).toBe(false);
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.waitingFor?.kind}`;
+    }, { timeout: 30_000 }).toBe('review/human');
+    expect((await view(handle)).actions.map((action: any) => action.name)).toContain('confirm');
+    expect((await view(handle)).state.stagingResources).toBeUndefined();
+    const stagedAttachment = (await h.store.getResourceAttachment(proposed.attachment.id))!;
+    expect(stagedAttachment.enabled).toBe(false);
+    expect((await h.store.getResourceRevision(stagedAttachment.currentRevisionId!))?.bytes).toBe(2048);
     await expect.poll(async () => (await h.store.getTask(task.id))?.lastView?.stage).toBe('review');
     const gateway = await h.startGateway();
     const session: any = await fetch(`${gateway.url}/api/session`).then((r) => r.json());
@@ -264,6 +272,115 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     else expect((await h.store.getResourceRevision(current!))?.bytes).toBe(Buffer.byteLength('updated weights'));
     if (!excluded) expect((await h.store.getResourceAttachment(proposed.attachment.id))).toMatchObject({ enabled: true });
   }, 120_000);
+
+  it('a proposed output that cannot be snapshotted is reported in Review and never fails the task', async () => {
+    gates.resourceCandidateTurnReleased = false;
+    const repo = await h.makeRepo('resource-candidate-stage-failure');
+    const project = (await h.store.createProject('Resource staging failure', { repos: [repo] }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Build data', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'build it' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [input({ taskId: task.id, projectId: project.id, repo, title: task.title,
+        prompt: '@resource-candidate-regression\n@write .gitignore ::data/\n'
+          + '@write build.js :: export const built = true;\n'
+          + '@run git add .gitignore build.js && git commit -q -m "build"\n@review Built data' })],
+    });
+    await expect.poll(() => Boolean(gates.releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
+    const taskWorld = (await h.store.currentWorld(task.id))!;
+    const dataDir = path.join(taskWorld.workdir ?? taskWorld.root, 'data');
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'records.json'), '{}');
+    const proposed = await h.resources.proposePath(task.id, { path: 'data', name: 'Built data',
+      target: { kind: 'path', path: 'data' }, access: 'write', publish: 'review' });
+    fs.rmSync(dataDir, { recursive: true, force: true }); // gone before the turn ends
+    gates.resourceCandidateTurnReleased = true;
+    gates.releaseResourceCandidateTurn!();
+    gates.releaseResourceCandidateTurn = undefined;
+
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.waitingFor?.kind}`;
+    }, { timeout: 60_000 }).toBe('review/human');
+    const failed = (await h.store.getResourceCandidate(proposed.candidate.id))!;
+    expect(failed).toMatchObject({ state: 'discarded', resolvedBy: 'system:resource-stage-failed' });
+    expect(failed.error).toMatch(/no longer exists/);
+    const gateway = await h.startGateway();
+    const session: any = await fetch(`${gateway.url}/api/session`).then((r) => r.json());
+    const rows: any = await fetch(`${gateway.url}/api/tasks/${task.id}/resources?summary=metadata`,
+      { headers: { authorization: `Bearer ${session.token}` } }).then((r) => r.json());
+    expect(rows).toContainEqual(expect.objectContaining({
+      candidate: expect.objectContaining({ id: proposed.candidate.id, sourcePath: 'data', error: failed.error }) }));
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+  }, 120_000);
+
+  it.each(['confirm', 'cancel', 'cancel after confirm'] as const)('staging resources: %s while it runs', async (scenario) => {
+    gates.resourceCandidateTurnReleased = false;
+    const repo = await h.makeRepo(`resource-candidate-stage-${scenario.replaceAll(' ', '-')}`);
+    const project = (await h.store.createProject(`Resource staging ${scenario}`, { repos: [repo] }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Build data', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'build it' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [input({ taskId: task.id, projectId: project.id, repo, title: task.title,
+        prompt: '@resource-candidate-regression\n@write .gitignore ::data/\n'
+          + '@write build.js :: export const built = true;\n'
+          + '@run git add .gitignore build.js && git commit -q -m "build"\n@review Built data' })],
+    });
+    await expect.poll(() => Boolean(gates.releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
+    const taskWorld = (await h.store.currentWorld(task.id))!;
+    fs.mkdirSync(path.join(taskWorld.workdir ?? taskWorld.root, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'data/records.json'), '{}');
+    const proposed = await h.resources.proposePath(task.id, { path: 'data', name: 'Built data', target: { kind: 'path', path: 'data' } });
+    // Hold a staging call open the way a multi-GB upload would.
+    const stage = h.resources.stageCandidates.bind(h.resources);
+    let hold = scenario !== 'cancel after confirm';
+    let running = false;
+    let stopped = false;
+    h.resources.stageCandidates = async (taskId, options = {}) => {
+      running = hold;
+      while (hold) {
+        try { await options.checkContinue?.(); } catch (error) { stopped = true; throw error; }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return stage(taskId, options);
+    };
+    const reviewWaits = () => expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.waitingFor?.kind}`;
+    }, { timeout: 60_000 }).toBe('review/human');
+    try {
+      gates.resourceCandidateTurnReleased = true;
+      gates.releaseResourceCandidateTurn!();
+      gates.releaseResourceCandidateTurn = undefined;
+      if (scenario === 'cancel after confirm') {
+        await reviewWaits();
+        hold = true; // the refresh before applying
+        await handle.signal('confirm');
+      }
+      await expect.poll(() => running, { timeout: 60_000 }).toBe(true);
+      expect((await view(handle)).state.stagingResources).toBe(true);
+      expect((await view(handle)).actions).toEqual([]);
+      if (scenario === 'confirm') {
+        // A click that raced the button away still counts once the snapshot exists.
+        await handle.signal('confirm');
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        hold = false;
+        expect(await handle.result()).toMatchObject({ stage: 'done' });
+        expect((await h.store.getResourceCandidate(proposed.candidate.id))?.state).toBe('adopted');
+      } else {
+        await handle.signal('cancel');
+        // The run ends only once the upload has stopped (a heartbeat delivers the cancel).
+        expect(await handle.result()).toMatchObject({ stage: 'cancelled' });
+        expect(stopped).toBe(true); // the workflow waited for staging to stop
+        expect((await h.store.getResourceCandidate(proposed.candidate.id))?.state).toBe('pending');
+        expect((await h.store.getResourceAttachment(proposed.attachment.id))?.enabled).toBe(false);
+      }
+    } finally { hold = false; h.resources.stageCandidates = stage; }
+  }, 180_000);
 
   it('v1.13 waits for input until Open PR is explicitly requested', async () => {
     const repo = await h.makeRepo('explicit-open-pr');

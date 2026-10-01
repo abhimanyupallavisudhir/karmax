@@ -8564,8 +8564,14 @@ async function wireResourceInventory(v, force = false) {
     wrap.querySelector('[data-inventory-retry]')?.addEventListener('click', () => wireResourceInventory(v, true));
   }
 }
-function resourceReviewNeedsAction(item) {
-  if (item.candidate) return ['pending', 'discarding'].includes(item.candidate.state);
+// A candidate the platform could not snapshot stays visible (as "Not saved")
+// until the same path is proposed again.
+function resourceReviewNeedsAction(item, all = []) {
+  const candidate = item.candidate;
+  if (candidate?.state === 'discarded' && candidate.error)
+    return !all.some((other) => other.candidate && other.candidate.id !== candidate.id
+      && other.candidate.sourcePath === candidate.sourcePath && other.candidate.createdAt > candidate.createdAt);
+  if (candidate) return ['pending', 'discarding'].includes(candidate.state);
   if (item.discarded) return false;
   if (item.pendingInspection) return true;
   if (item.error) return true;
@@ -8578,7 +8584,8 @@ async function wireResourceReview(v, force = false) {
   if (!wrap || v.stage !== 'review') return;
   const isCurrent = beginAsyncElementRender(wrap);
   try {
-    const items = (await loadResourceReview(v, force)).filter(resourceReviewNeedsAction);
+    const all = await loadResourceReview(v, force);
+    const items = all.filter((item) => resourceReviewNeedsAction(item, all));
     if (!isCurrent()) return;
     if (!items.length) {
       wrap.classList.add('hidden');
@@ -8589,6 +8596,8 @@ async function wireResourceReview(v, force = false) {
     const atBottom = thread && thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2;
     wrap.classList.remove('hidden');
     wrap.innerHTML = `<div class="resource-review-heading"><b>Resources</b>${items.some((item) => item.automaticReview === false) ? '' : '<span class="task-sub">Included on confirmation</span>'}</div><div class="resource-review-list">${items.map((item) => {
+      if (item.candidate?.state === 'discarded')
+        return `<div class="resource-review-row"><div class="resource-review-name"><b>${esc(item.candidate.sourcePath || item.resource.name)}</b></div><div class="resource-review-controls"><span class="task-sub" style="color:var(--danger)" title="${esc(`Couldn’t save a snapshot: ${item.candidate.error}`)}">Not saved</span></div></div>`;
       const resource = item.resource;
       const target = resource.target?.kind === 'path' ? resource.target.path : resource.target?.name;
       const detail = item.error || (item.candidate ? 'New resource' : 'Update if changed');
@@ -10881,6 +10890,7 @@ function taskActionLabel(v, action) {
 // proposal / confirmation / cancellation controls are always one click away.
 function taskActions(v) {
   if (v.state?.applyingResources && v.status === 'active') return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Applying resources…</button></div>`;
+  if (v.state?.stagingResources && v.status === 'active') return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Saving resources…</button></div>`;
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);

@@ -66,6 +66,14 @@ export interface ProposedResourceCandidate {
   revision?: ResourceRevision;
 }
 
+/** A candidate that no retry can stage: its world or path is gone. */
+class UnstageableCandidate extends Error {}
+
+export interface StagedResourceCandidates {
+  staged: string[];
+  failed: Array<{ candidateId: string; sourcePath?: string; error: string }>;
+}
+
 /** Replaceable snapshot data-plane contract (SPEC §11.4). The built-in engine
  * keeps the first release self-contained; production deployments can substitute
  * Kopia without changing resource, lease, or workflow records. */
@@ -85,7 +93,8 @@ export interface SnapshotEngine {
     options?: { signal?: AbortSignal }): Promise<void>;
   manifest(revision: ResourceRevision): Promise<SnapshotManifest>;
   verify?(revision: ResourceRevision, offset: number, limit: number): Promise<SnapshotVerification>;
-  delete?(revision: ResourceRevision): Promise<void>;
+  /** `owner` releases a capture whose attachment row is already gone. */
+  delete?(revision: ResourceRevision, owner?: ResourceAttachment): Promise<void>;
 }
 
 /** Tenant-keyed, encrypted content-addressed engine over the configured object
@@ -263,14 +272,14 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     return result;
   }
 
-  async manifest(revision: ResourceRevision): Promise<SnapshotManifest> {
-    const attachment = (await this.attachmentFor(revision));
+  async manifest(revision: ResourceRevision, owner?: ResourceAttachment): Promise<SnapshotManifest> {
+    const attachment = (await this.attachmentFor(revision, owner));
     const ref = JSON.parse(revision.sealedRef) as SnapshotRef;
     if (typeof ref.objectKey !== 'string'
       || !ref.objectKey.startsWith(`resources/${attachment.organizationId}/manifests/${attachment.id}/`)
       || ref.objectKey.includes('..') || (ref.storageLocationId && ref.storageLocationId !== revision.storageLocationId))
       throw new Error('resource reference does not match revision');
-    const encrypted = await (await this.objectsForRevision(revision, ref)).get(ref.objectKey);
+    const encrypted = await (await this.objectsForRevision(revision, ref, owner)).get(ref.objectKey);
     if (sha256(encrypted) !== ref.sha256) throw new Error('resource manifest integrity mismatch');
     const manifest = JSON.parse(openRandom(await this.key(attachment.organizationId, false), encrypted).toString('utf8')) as SnapshotManifest;
     if (manifest.version !== 1 || manifest.attachmentId !== attachment.id || manifest.rootDigest !== revision.rootDigest)
@@ -295,18 +304,19 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     return manifest;
   }
 
-  async delete(revision: ResourceRevision): Promise<void> {
-    const attachment = (await this.attachmentFor(revision));
-    const manifest = await this.manifest(revision);
+  async delete(revision: ResourceRevision, owner?: ResourceAttachment): Promise<void> {
+    const attachment = (await this.attachmentFor(revision, owner));
+    const manifest = await this.manifest(revision, owner);
     const ref = JSON.parse(revision.sealedRef) as SnapshotRef;
-    const objects = (await this.objectsForRevision(revision, ref));
+    const objects = (await this.objectsForRevision(revision, ref, owner));
     await objects.delete(ref.objectKey);
     const zero = (await this.chunkAccounting?.release(attachment.organizationId,
       [...new Set(manifest.files.flatMap((file) => file.chunks))])) ?? [];
     for (const chunkId of zero) await objects.delete(chunkObjectKey(attachment.organizationId, chunkId));
   }
 
-  private async attachmentFor(revision: ResourceRevision): Promise<ResourceAttachment> {
+  private async attachmentFor(revision: ResourceRevision, owner?: ResourceAttachment): Promise<ResourceAttachment> {
+    if (owner?.id === revision.attachmentId) return owner;
     const attachment = (await this.attachmentResolver?.(revision.attachmentId));
     if (!attachment) throw new Error('resource attachment no longer exists');
     return attachment;
@@ -319,10 +329,10 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   };
   setChunkAccounting(value: NonNullable<ObjectSnapshotEngine['chunkAccounting']>): void { this.chunkAccounting = value; }
 
-  private async objectsForRevision(revision: ResourceRevision, ref?: SnapshotRef): Promise<ObjectStore> {
+  private async objectsForRevision(revision: ResourceRevision, ref?: SnapshotRef, owner?: ResourceAttachment): Promise<ObjectStore> {
     const locationId = ref?.storageLocationId ?? revision.storageLocationId;
     if (locationId && this.storageLocations)
-      (await this.storageLocations.requireForOrganization((await this.attachmentFor(revision)).organizationId, locationId));
+      (await this.storageLocations.requireForOrganization((await this.attachmentFor(revision, owner)).organizationId, locationId));
     return locationId && this.storageLocations ? (await this.storageLocations.objectStore(locationId)) : this.objects;
   }
 
@@ -745,9 +755,11 @@ export class ProjectResourceService {
     (await this.broker.deleteHandle(organizationKeyHandle(organizationId)));
   }
 
-  /** Stage a declared non-secret path from the caller's current generation.
-   * The disabled attachment reserves its accepted shape, while the encrypted
-   * revision makes the bytes durable before a reviewer decides. */
+  /** Declare a non-secret path from the caller's current generation. The
+   * disabled attachment reserves its accepted shape; the bytes are snapshotted
+   * later by {@link stageCandidates}, which the workflow runs as a durable
+   * activity at the end of Do. A multi-GB snapshot must not depend on the
+   * agent's HTTP call, its turn, or the gateway process staying up. */
   async proposePath(taskId: string, input: { path: string; name: string; target: ResourceTarget;
     access?: ResourceAccess; publish?: ResourcePublishPolicy; driver?: 'volume@1' | 'object-tree@1' }): Promise<ProposedResourceCandidate> {
     const { task, project, handle, world } = await this.currentTaskWorld(taskId);
@@ -773,30 +785,98 @@ export class ProjectResourceService {
       name: input.name, driver: input.driver ?? 'volume@1', target: input.target, access, isolation: 'fork',
       source: { candidate: true, createdByTaskId: task.id, sourcePath, shape: kind.stdout === 'file' ? 'file' : 'directory' },
       credentialHandles: [], publish, enabled: false }));
-    // Create the task/world-generation ownership record before the potentially
-    // long snapshot. If the control plane stops mid-stream, Review can still
-    // see and discard the incomplete attachment instead of leaking an orphan.
-    const candidate = (await this.store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
-      taskId, worldId: handle.id, worldGeneration: handle.generation ?? 1, attachmentId: attachment.id,
-      sourceKind: 'path', sourcePath }));
     try {
-      const captured = await this.engine.capture(attachment, filesFromWorld(world, sourcePath, attachment));
-      const revision = (await this.store.saveResourceRevision({ attachmentId: attachment.id, engine: this.engine.id,
-        ...captured, metadata: { candidate: true, sourcePath }, createdByTaskId: task.id }));
-      (await this.store.promoteResourceRevision(attachment.id, revision.id));
-      (await this.store.recordUsage({ organizationId: project.organizationId!, projectId: project.id, taskId,
-        worldId: handle.id, provider: this.engine.id, kind: 'resource.storage', quantity: captured.bytes, unit: 'byte',
-        costMicros: 0, fundingSource: (await this.store.getStorageLocation(captured.storageLocationId ?? ''))?.kind === 's3' ? 'byok' : 'managed',
-        startedAt: candidate.createdAt, endedAt: candidate.createdAt,
-        metadata: { candidateId: candidate.id, attachmentId: attachment.id, revisionId: revision.id, files: captured.files } }));
-      (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
-        scopeKey: `project:${project.id}`, detail: { candidateId: candidate.id, attachmentId: attachment.id,
-          sourcePath, worldGeneration: candidate.worldGeneration, bytes: captured.bytes, files: captured.files } }));
-      return { candidate, attachment: (await this.store.getResourceAttachment(attachment.id))!, revision };
+      const candidate = (await this.store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
+        taskId, worldId: handle.id, worldGeneration: handle.generation ?? 1, attachmentId: attachment.id,
+        sourceKind: 'path', sourcePath }));
+      return { candidate, attachment };
     } catch (error) {
-      await this.discardCandidate(taskId, candidate.id, 'system:resource-stage-failed').catch(() => undefined);
+      (await this.store.deleteResourceAttachment(attachment.id));
       throw error;
     }
+  }
+
+  /** Snapshot every pending path candidate from the world generation that
+   * proposed it, so Review shows, and Confirm adopts, the output as it is now.
+   * A staged candidate is refreshed incrementally: unchanged files are neither
+   * read nor uploaded. A transient failure is retried by the activity with the
+   * other candidates still staged; a candidate with no snapshot whose world or
+   * path is gone, or that still fails on the `final` attempt, is discarded with
+   * its reason, which Review shows. An earlier snapshot is never thrown away. */
+  async stageCandidates(taskId: string, options: { final?: boolean; checkContinue?: () => Promise<void> } = {}): Promise<StagedResourceCandidates> {
+    const result: StagedResourceCandidates = { staged: [], failed: [] };
+    const transient: unknown[] = [];
+    for (const candidate of await this.store.listResourceCandidates(taskId, false)) {
+      if (candidate.sourceKind !== 'path') continue;
+      await options.checkContinue?.();
+      try {
+        if (await this.stageCandidate(taskId, candidate, options.checkContinue)) result.staged.push(candidate.id);
+      } catch (error) {
+        await options.checkContinue?.(); // cancellation is not a staging failure
+        if ((await this.store.getResourceCandidate(candidate.id))?.state !== 'pending') continue;
+        if (!options.final && !(error instanceof UnstageableCandidate)) { transient.push(error); continue; }
+        // A refresh that still fails keeps the snapshot already taken.
+        if ((await this.store.getResourceAttachment(candidate.attachmentId))?.currentRevisionId) continue;
+        const reason = error instanceof Error ? error.message : String(error);
+        await this.discardCandidate(taskId, candidate.id, 'system:resource-stage-failed', reason);
+        result.failed.push({ candidateId: candidate.id, sourcePath: candidate.sourcePath, error: reason });
+      }
+    }
+    if (transient.length) throw transient[0];
+    return result;
+  }
+
+  /** True when a new revision was promoted. */
+  private async stageCandidate(taskId: string, candidate: ResourceCandidate,
+    checkContinue?: () => Promise<void>): Promise<boolean> {
+    const attachment = await this.store.getResourceAttachment(candidate.attachmentId);
+    if (!attachment) throw new UnstageableCandidate('resource candidate attachment is unavailable');
+    const baseline = attachment.currentRevisionId ? await this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
+    const current = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
+    if (!current || candidate.worldId !== current.id || candidate.worldGeneration !== (current.generation ?? 1)) {
+      if (baseline) return false; // keep the snapshot taken while the world lived
+      throw new UnstageableCandidate('the task world that produced this output no longer exists');
+    }
+    const { project, handle, world } = await this.currentTaskWorld(taskId);
+    const sourcePath = candidate.sourcePath!;
+    // A vanished path would otherwise capture as an empty, "successful" snapshot.
+    const present = await world.exec('bash', ['-lc', `if test -e ${quote(sourcePath)}; then echo present; else echo absent; fi`]);
+    if (present.code !== 0 || !['present', 'absent'].includes(present.stdout.trim()))
+      throw new Error(`could not inspect ${sourcePath}: ${present.stderr || present.stdout || `exit ${present.code}`}`);
+    if (present.stdout.trim() === 'absent') {
+      if (baseline) return false;
+      throw new UnstageableCandidate(`${sourcePath} no longer exists in the task world`);
+    }
+    const stampsKey = `resource-candidate-observed:${candidate.id}`;
+    const { unchanged, observed, ...captured } = await this.engine.capture(attachment,
+      filesFromWorld(world, sourcePath, attachment, checkContinue),
+      { baseline, observed: baseline ? (await this.store.kvGet(stampsKey)) : undefined });
+    if (unchanged && baseline) {
+      if (observed) (await this.store.kvSet(stampsKey, observed));
+      return false;
+    }
+    let revision: ResourceRevision;
+    try {
+      revision = (await this.store.saveAndPromoteResourceRevision({ attachmentId: attachment.id, parentRevisionId: baseline?.id,
+        engine: this.engine.id, ...captured, metadata: { candidate: true, sourcePath }, createdByTaskId: taskId }, baseline?.id));
+    } catch (error) {
+      // Discarded or staged by someone else meanwhile. Nothing was recorded, so
+      // this upload's own references are released, and only these.
+      await this.engine.delete?.({ id: 'unsaved', attachmentId: attachment.id, engine: this.engine.id,
+        ...captured, createdAt: Date.now() }, attachment).catch(() => undefined);
+      throw error;
+    }
+    if (observed) (await this.store.kvSet(stampsKey, observed));
+    (await this.store.recordUsage({ organizationId: project.organizationId!, projectId: project.id, taskId,
+      worldId: handle.id, provider: this.engine.id, kind: 'resource.storage', quantity: captured.bytes, unit: 'byte',
+      costMicros: 0, fundingSource: (await this.store.getStorageLocation(captured.storageLocationId ?? ''))?.kind === 's3' ? 'byok' : 'managed',
+      startedAt: candidate.createdAt, endedAt: Date.now(),
+      metadata: { candidateId: candidate.id, attachmentId: attachment.id, revisionId: revision.id, files: captured.files } }));
+    (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
+      scopeKey: `project:${project.id}`, detail: { candidateId: candidate.id, attachmentId: attachment.id,
+        sourcePath, worldGeneration: candidate.worldGeneration, bytes: captured.bytes, files: captured.files,
+        ...(baseline ? { refreshedFrom: baseline.id } : {}) } }));
+    return true;
   }
 
   /** Create a reviewable projection of a vault item without resolving its
@@ -836,6 +916,7 @@ export class ProjectResourceService {
       return { candidate, attachment, revision };
     }
     const adopted = (await this.store.adoptResourceCandidate(candidate.id, taskId, resolvedBy));
+    (await this.store.kvDelete(`resource-candidate-observed:${candidate.id}`));
     const revision = adopted.attachment.currentRevisionId
       ? (await this.store.getResourceRevision(adopted.attachment.currentRevisionId)) : undefined;
     (await this.store.appendAudit({ principalId: resolvedBy, action: 'resource:candidate-adopt',
@@ -844,16 +925,17 @@ export class ProjectResourceService {
     return { ...adopted, revision };
   }
 
-  async discardCandidate(taskId: string, candidateId: string, resolvedBy: string): Promise<ResourceCandidate> {
+  async discardCandidate(taskId: string, candidateId: string, resolvedBy: string, error?: string): Promise<ResourceCandidate> {
     const existing = (await this.store.getResourceCandidate(candidateId));
     if (!existing || existing.taskId !== taskId) throw new Error('resource candidate does not belong to task');
     if (existing.state === 'discarded') return existing;
     const candidate = (await this.store.beginDiscardResourceCandidate(candidateId, taskId));
     await this.deleteAttachment(candidate.attachmentId);
-    const discarded = (await this.store.resolveResourceCandidate(candidate.id, 'discarded', resolvedBy));
+    const discarded = (await this.store.resolveResourceCandidate(candidate.id, 'discarded', resolvedBy, error));
+    (await this.store.kvDelete(`resource-candidate-observed:${candidate.id}`));
     (await this.store.appendAudit({ principalId: resolvedBy, action: 'resource:candidate-discard',
       scopeKey: `project:${candidate.projectId}`, detail: { candidateId, attachmentId: candidate.attachmentId,
-        taskId, worldId: candidate.worldId, worldGeneration: candidate.worldGeneration } }));
+        taskId, worldId: candidate.worldId, worldGeneration: candidate.worldGeneration, ...(error ? { error } : {}) } }));
     return discarded;
   }
 
@@ -951,6 +1033,12 @@ export class ProjectResourceService {
     for (const candidate of candidates) {
       if (candidate.state === 'discarding' || (candidate.state === 'pending' && excluded.has(candidate.attachmentId)))
         await this.discardCandidate(taskId, candidate.id, principal);
+      else if (candidate.state === 'pending' && candidate.sourceKind === 'path'
+        && !(await this.store.getResourceAttachment(candidate.attachmentId))?.currentRevisionId)
+        // Staging never finished (or a pre-staging workflow lost it). There are
+        // no bytes to adopt; failing the confirmed task over it helps no one.
+        await this.discardCandidate(taskId, candidate.id, 'system:resource-stage-failed',
+          'its snapshot never completed');
       else if (candidate.state === 'pending') await this.adoptCandidate(taskId, candidate.id, principal);
     }
     const world = await this.store.currentWorld(taskId) as WorldHandle | undefined;
@@ -1232,6 +1320,7 @@ async function* filesFromWorld(world: World, target: string, attachment?: Resour
     const [size, mtime, ctime, inode, ...name] = record.split(' ');
     return { file: name.join(' '), bytes: Number(size), stamp: `${size}:${mtime}:${ctime}:${inode}`, changedAt: Number(ctime) };
   }).sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
+  const names = new Set(entries.map((entry) => entry.file));
   for (const entry of entries) {
     await checkContinue?.();
     const relative = single ? path.posix.basename(target)
@@ -1242,8 +1331,11 @@ async function* filesFromWorld(world: World, target: string, attachment?: Resour
     // from the listing's last timestamp tick (coarse filesystems tick in 1-2 s),
     // so only an older ctime, which no one can set back, is trusted. SQLite can
     // change through its WAL alone and goes through a transactional copy.
+    // With no WAL or rollback journal beside it, a SQLite file is the whole
+    // database, so its stamp is trustworthy too.
     const sqlite = /\.(?:sqlite3?|db)$/i.test(entry.file);
-    const stable = !sqlite && Number.isFinite(listedAt) && entry.changedAt < listedAt - 2;
+    const sidecar = single || names.has(`${entry.file}-wal`) || names.has(`${entry.file}-journal`);
+    const stable = (!sqlite || !sidecar) && Number.isFinite(listedAt) && entry.changedAt < listedAt - 2;
     yield { path: safePath(relative), ...(sqlite ? {} : { bytes: entry.bytes }), ...(stable ? { observed: entry.stamp } : {}),
       data: worldFileChunks(world, entry.file, sqlite ? undefined : entry.bytes, checkContinue) };
   }
@@ -1256,7 +1348,13 @@ async function* worldFileChunks(world: World, file: string, bytes: number | unde
     const sized = await world.exec('stat', ['-c', '%s', captured.path]);
     size = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
   }
-  yield* cleanupChunks(readResourceChunks(world, captured.path, Number.isFinite(size) ? size : undefined, checkContinue), captured.cleanup);
+  try {
+    for await (const chunk of readResourceChunks(world, captured.path, Number.isFinite(size) ? size : undefined, checkContinue)) {
+      yield chunk;
+      await captured.renew?.();
+    }
+    await captured.verify?.();
+  } finally { await captured.cleanup?.(); }
 }
 
 async function manifestFromWorld(attachment: ResourceAttachment, world: World, target: string): Promise<SnapshotManifest> {
@@ -1314,21 +1412,83 @@ async function* asAsync(values: Iterable<SnapshotInputFile> | AsyncIterable<Snap
   for await (const value of values as AsyncIterable<SnapshotInputFile>) yield value;
 }
 
-async function transactionalSnapshotPath(world: World, file: string): Promise<{ path: string; cleanup?: () => Promise<void> }> {
+async function transactionalSnapshotPath(world: World, file: string): Promise<{ path: string; cleanup?: () => Promise<void>;
+  verify?: () => Promise<void>; renew?: () => Promise<void> }> {
   if (!/\.(?:sqlite3?|db)$/i.test(file)) return { path: file };
   const magic = await world.exec('bash', ['-lc', `head -c 16 ${quote(file)} | base64 -w0`]);
   if (magic.code !== 0 || Buffer.from(magic.stdout.trim(), 'base64').toString('binary') !== 'SQLite format 3\0') return { path: file };
   const temporary = `.karmax-injection/sqlite-backup-${crypto.randomBytes(8).toString('hex')}.db`;
+  // The consistent copy is as large as the database.
+  const space = await world.exec('bash', ['-lc', `mkdir -p .karmax-injection && printf '%s %s' "$(stat -L -c %s ${quote(file)})" "$(df -B1 --output=avail .karmax-injection | tail -1)"`]);
+  const [size, free] = space.stdout.trim().split(/\s+/).map(Number);
+  if (space.code === 0 && Number.isFinite(size) && Number.isFinite(free) && size! > free!) {
+    const locked = await sqliteReadLock(world, file);
+    if (locked) return locked;
+    throw new Error(`snapshotting SQLite database ${file} consistently needs ${formatGiB(size!)} of free disk in the task world, `
+      + `but only ${formatGiB(free!)} is free (or the database must be idle); free up space and propose it again`);
+  }
   const script = 'import os,sqlite3,sys; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); s=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()';
   const backup = await world.exec('python3', ['-c', script, file, temporary], { timeoutMs: 30 * 60_000 });
-  if (backup.code !== 0) throw new Error(`could not transactionally snapshot SQLite database ${file}: ${backup.stderr || backup.stdout}`);
+  if (backup.code !== 0) {
+    await world.exec('rm', ['-f', temporary]); // a partial copy must not keep the disk full
+    throw new Error(`could not transactionally snapshot SQLite database ${file}: ${backup.stderr || backup.stdout}`);
+  }
   return { path: temporary, cleanup: async () => { await world.exec('rm', ['-f', temporary]); } };
 }
 
-async function* cleanupChunks(chunks: AsyncIterable<Buffer>, cleanup?: () => Promise<void>): AsyncGenerator<Buffer> {
-  try { yield* chunks; }
-  finally { await cleanup?.(); }
+/** Read a database in place, without a copy, while a background process holds
+ * a SQLite read transaction on it, so no rollback-journal writer can change the
+ * file meanwhile. (In WAL mode a checkpoint still could; the stamp check then
+ * rejects the snapshot.) The file's size/mtime/ctime/inode stamp and the holder
+ * are checked again before the lock is released. The holder keeps its lock only
+ * while the reader renews a short lease, so a reader that dies cannot leave a
+ * database locked. Undefined when the lock cannot be taken (a writer is
+ * active), the file is a symlink, or the database still has a WAL. */
+async function sqliteReadLock(world: World, file: string): Promise<{ path: string; cleanup: () => Promise<void>;
+  verify: () => Promise<void>; renew: () => Promise<void> } | undefined> {
+  const ready = `.karmax-injection/sqlite-lock-${crypto.randomBytes(8).toString('hex')}`;
+  const holder = 'import os,sqlite3,sys,time,urllib.parse\n'
+    + 'db,ready=sys.argv[1],sys.argv[2]\n'
+    + 'c=sqlite3.connect("file:"+urllib.parse.quote(db)+"?mode=ro",uri=True,timeout=0,isolation_level=None)\n'
+    + 'c.execute("BEGIN"); c.execute("SELECT count(*) FROM sqlite_master").fetchone()\n'
+    + 'open(ready+".tmp","w").write("locked"); os.rename(ready+".tmp",ready)\n'
+    + 'while True:\n'
+    + '  try:\n'
+    + '    if time.time()-os.path.getmtime(ready)>' + String(SQLITE_LOCK_LEASE_SECONDS) + ': break\n'
+    + '  except OSError: break\n'
+    + '  time.sleep(0.5)\n';
+  const quoted = quote(file);
+  const started = await world.exec('bash', ['-lc', `test ! -L ${quoted} && test ! -e ${quote(`${file}-wal`)} && mkdir -p .karmax-injection || exit 1; `
+    + `setsid nohup python3 -c ${quote(holder)} ${quoted} ${quote(ready)} </dev/null >/dev/null 2>${quote(`${ready}.err`)} & echo $!; `
+    + `for i in $(seq 1 100); do test -s ${quote(ready)} && exit 0; test -s ${quote(`${ready}.err`)} && exit 1; sleep 0.1; done; exit 1`]);
+  const pid = Number(started.stdout.trim().split('\n')[0]);
+  // The lock is gone once this returns: the holder is stopped, not just told to stop.
+  const release = async () => { await world.exec('bash', ['-lc', `rm -f ${quote(ready)} ${quote(`${ready}.err`)} ${quote(`${ready}.tmp`)}`
+    + (Number.isInteger(pid) && pid > 1 ? `; kill ${pid} 2>/dev/null; for i in $(seq 1 50); do kill -0 ${pid} 2>/dev/null || exit 0; sleep 0.1; done` : '')]); };
+  if (started.code !== 0 || !Number.isInteger(pid)) { await release(); return undefined; }
+  const stamp = async () => (await world.exec('bash', ['-lc',
+    `kill -0 ${pid} && test -e ${quote(ready)} && find ${quoted} -maxdepth 0 -printf '%s %T@ %C@ %i'`])).stdout;
+  const before = await stamp();
+  if (!before) { await release(); return undefined; }
+  let renewedAt = Date.now();
+  return { path: file, cleanup: release,
+    renew: async () => {
+      if (Date.now() - renewedAt < SQLITE_LOCK_LEASE_SECONDS * 250) return;
+      renewedAt = Date.now();
+      await world.exec('touch', ['-c', ready]);
+    },
+    verify: async () => {
+      if ((await stamp()) !== before) throw new Error(`SQLite database ${file} changed while it was being snapshotted`);
+    } };
 }
+
+/** How long the lock holder outlives its reader's last sign of life. */
+const SQLITE_LOCK_LEASE_SECONDS = 120;
+
+function formatGiB(bytes: number): string {
+  return `${(bytes / 2 ** 30).toFixed(1)} GiB`;
+}
+
 function isSecretLike(value: ResourceAttachment): boolean { return credentialResource(value); }
 /** Projections are physical, world-root-relative paths, pinned for the lifetime
  * of a generation. Honor historical root projections even if the agent cwd has

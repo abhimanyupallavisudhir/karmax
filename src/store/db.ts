@@ -574,7 +574,7 @@ export class Store {
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, worldGeneration INTEGER NOT NULL,
         attachmentId TEXT NOT NULL UNIQUE, sourceKind TEXT NOT NULL, sourcePath TEXT,
         vaultItemId TEXT, vaultField TEXT, state TEXT NOT NULL, createdAt INTEGER NOT NULL,
-        resolvedAt INTEGER, resolvedBy TEXT
+        resolvedAt INTEGER, resolvedBy TEXT, error TEXT
       );
       CREATE TABLE IF NOT EXISTS runner_pools (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL,
@@ -904,6 +904,8 @@ export class Store {
     // installs pick it up without a re-create.
     const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
+    const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
+    if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
     const scopedTokenCols = await this.db.prepare('PRAGMA table_info(scoped_tokens)').all() as Array<{ name: string }>;
     if (!scopedTokenCols.some((column) => column.name === 'principal'))
@@ -5996,7 +5998,7 @@ export class Store {
     return (rows as any[]).map(resourceCandidateRow);
   }
 
-  async resolveResourceCandidate(id: string, state: 'adopted' | 'discarded', resolvedBy: string): Promise<ResourceCandidate> {
+  async resolveResourceCandidate(id: string, state: 'adopted' | 'discarded', resolvedBy: string, error?: string): Promise<ResourceCandidate> {
     return this.db.transaction(async () => {
 
     const current = (await this.getResourceCandidate(id));
@@ -6004,8 +6006,8 @@ export class Store {
     const expected = state === 'discarded' ? 'discarding' : 'pending';
     if (current.state !== expected) throw new Error(`resource candidate is already ${current.state}`);
     const now = Date.now();
-    (await this.db.prepare('UPDATE resource_candidates SET state=?, resolvedAt=?, resolvedBy=? WHERE id=? AND state=?')
-      .run(state, now, resolvedBy, id, expected));
+    (await this.db.prepare('UPDATE resource_candidates SET state=?, resolvedAt=?, resolvedBy=?, error=? WHERE id=? AND state=?')
+      .run(state, now, resolvedBy, error ?? null, id, expected));
     return (await this.getResourceCandidate(id))!;
   
     });
@@ -6052,6 +6054,17 @@ export class Store {
     }
     return { candidate: (await this.getResourceCandidate(id))!, attachment: (await this.getResourceAttachment(attachment.id))! };
   
+    });
+  }
+
+  /** Record a revision and make it current in one step: when the baseline moved
+   * (or the attachment is gone), nothing is recorded. */
+  async saveAndPromoteResourceRevision(input: Omit<ResourceRevision, 'id' | 'createdAt'>,
+    expectedRevisionId: string | undefined): Promise<ResourceRevision> {
+    return this.db.transaction(async () => {
+      const revision = (await this.saveResourceRevision(input));
+      (await this.promoteResourceRevision(input.attachmentId, revision.id, expectedRevisionId));
+      return revision;
     });
   }
 
@@ -8221,7 +8234,8 @@ function resourceCandidateRow(row: any): ResourceCandidate {
     attachmentId: row.attachmentId, sourceKind: row.sourceKind,
     sourcePath: row.sourcePath ?? undefined, vaultItemId: row.vaultItemId ?? undefined,
     vaultField: row.vaultField ?? undefined, state: row.state, createdAt: Number(row.createdAt),
-    resolvedAt: row.resolvedAt == null ? undefined : Number(row.resolvedAt), resolvedBy: row.resolvedBy ?? undefined };
+    resolvedAt: row.resolvedAt == null ? undefined : Number(row.resolvedAt), resolvedBy: row.resolvedBy ?? undefined,
+    ...(row.error ? { error: row.error } : {}) };
 }
 
 async function selectRows(db: SqlDatabase, table: string, where: string, args: any[]): Promise<any[]> {

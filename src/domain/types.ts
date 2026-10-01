@@ -695,6 +695,8 @@ export interface ResourceCandidate {
   createdAt: number;
   resolvedAt?: number;
   resolvedBy?: string;
+  /** Why the platform discarded it: its snapshot could not be taken. */
+  error?: string;
 }
 
 export interface IgnoredResourceInventory {
