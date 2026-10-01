@@ -1079,7 +1079,9 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .approval-request-main { flex: 1; min-width: 0; }
 .approval-request-title { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-weight: 650; margin-bottom: 4px; }
 .approval-request-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
-.approval-request-actions select { max-width: 220px; padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); }
+.approval-request-actions .vreq-pick { gap: 8px; max-width: 260px; }
+.approval-request-actions .vreq-pick .tf-vault-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.approval-request-actions .vreq-add { font-size: 12px; white-space: nowrap; }
 .approval-request-help { margin-top: 7px; color: var(--ink-2); font-size: 12px; }
 .approval-empty { padding: 24px 14px; border: 1px dashed var(--line); border-radius: var(--r); color: var(--ink-3); text-align: center; }
 .approval-history { margin-top: 14px; }
@@ -1087,7 +1089,6 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 @media (max-width: 760px) {
   .approval-request { align-items: stretch; flex-direction: column; }
   .approval-request-actions { justify-content: flex-start; }
-  .approval-request-actions select { width: 100%; max-width: none; }
 }
 .diff { font-family: var(--font-mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; white-space: pre; }
 .diff .add { color: var(--merged); }

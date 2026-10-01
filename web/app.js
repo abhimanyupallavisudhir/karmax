@@ -5849,7 +5849,9 @@ function vaultItemSearchText(item) {
 // Full vault-item chooser used by the compact task-form button. It mirrors the
 // password-manager import panel, while allowing sparse policy overrides for this
 // task. "Inherit" deliberately stays sparse so global policy edits keep flowing.
-function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
+// `single` picks exactly one item (binding a credential request): radios, and no
+// Select all or policy overrides, since the request's own decision sets those.
+function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply, { single = false } = {}) {
   // Sort on open; keep rows steady while the user changes checkboxes.
   items = sortVaultItems(items, selectedIds);
   const localPolicies = JSON.parse(JSON.stringify(policyOverrides || {}));
@@ -5857,10 +5859,10 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `<div class="modal-card vault-grant-modal" role="dialog" aria-modal="true" aria-labelledby="vault-grant-title">
     <div class="section-h" id="vault-grant-title">Vault credentials</div>
-    <p class="vault-grant-help">Choose which credentials agents working on this task may use.</p>
+    <p class="vault-grant-help">${single ? 'Choose the credential to grant.' : 'Choose which credentials agents working on this task may use.'}</p>
     <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
     <div class="vault-grant-box">
-      <label class="vault-grant-head">
+      <label class="vault-grant-head" ${single ? 'hidden' : ''}>
         <input type="checkbox" class="vault-grant-all" ${items.length ? '' : 'disabled'} />
         <span>Select all</span>
         <span class="vault-grant-selected"></span>
@@ -5877,16 +5879,16 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
             ].map(([value, label]) => `<option value="${value}" ${override.reveal === value || (!override.reveal && !value) ? 'selected' : ''}>${label}</option>`).join('');
             return `<div class="vault-grant-item" data-vault-item="${esc(item.id)}">
               <label class="vault-grant-choice">
-                <input type="checkbox" class="vault-grant-pick" value="${esc(item.id)}" ${selectedIds.has(item.id) ? 'checked' : ''} />
+                <input type="${single ? 'radio' : 'checkbox'}" ${single ? 'name="vault-grant-pick"' : ''} class="vault-grant-pick" value="${esc(item.id)}" ${selectedIds.has(item.id) ? 'checked' : ''} />
                 <span class="vault-grant-item-text">
                   <span>${esc(item.label)}</span>
                   <span class="vault-grant-meta mono">${esc(item.type)}${item.username ? ` · ${esc(item.username)}` : ''}${item.domains?.length ? ` · ${esc(item.domains.join(', '))}` : ''}</span>
                 </span>
               </label>
-              <span class="vault-grant-policies">
+              ${single ? '' : `<span class="vault-grant-policies">
                 <label title="${esc(POL_USE_TIP)}">blind use <select class="vault-task-use" ${selectedIds.has(item.id) ? '' : 'disabled'}>${useOptions}</select></label>
                 <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vault-task-reveal" ${selectedIds.has(item.id) ? '' : 'disabled'}>${revealOptions}</select></label>
-              </span>
+              </span>`}
             </div>`;
           }).join('')
           // Name the section that actually exists: the vault lives under
@@ -15438,12 +15440,19 @@ function credentialRequestTaskLink(request) {
     : `<span>${esc(label)}</span>`;
 }
 
-function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true } = {}) {
+// The vault item chosen for each unbound credential request, by request id. It
+// lives outside the row so a re-render of the approvals list keeps the choice.
+const credentialRequestBindings = new Map();
+
+function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true, addLink = true } = {}) {
   const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.length
-    ? pending.map((request) => `<div class="approval-request" data-vreq="${esc(request.id)}">
+    ? pending.map((request) => {
+      const bound = request.itemId ? undefined : credentialRequestBindings.get(request.id);
+      const unbound = !request.itemId && !bound;
+      return `<div class="approval-request" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
         <div class="approval-request-main">
           <div class="approval-request-title">${request.itemId
             ? esc(itemLabel(request.itemId))
@@ -15454,10 +15463,11 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>` : ''}
         </div>
         <div class="approval-request-actions">
-          ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${sortVaultItems(items).map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
-          <button class="btn sm" data-vreq-act="once">Once</button>
-          <button class="btn sm" data-vreq-act="task">This task</button>
-          <button class="btn sm" data-vreq-act="always">Always</button>
+          ${request.itemId ? '' : `${addLink ? `<a class="vreq-add" data-spa href="${globalRoute('organization')}#settings-payments" title="Add it in Settings → Passwords &amp; payments">Add to vault</a>` : ''}
+          <button type="button" class="btn sm vreq-pick" aria-haspopup="dialog"><span>Vault credentials</span><span class="tf-vault-count">${bound ? esc(bound.label) : 'Choose…'}</span></button>`}
+          <button class="btn sm" data-vreq-act="once" ${unbound ? 'disabled' : ''}>Once</button>
+          <button class="btn sm" data-vreq-act="task" ${unbound ? 'disabled' : ''}>This task</button>
+          <button class="btn sm" data-vreq-act="always" ${unbound ? 'disabled' : ''}>Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
           ${policyTip(`Once: ${items.find((item) => item.id === request.itemId)?.type === 'passkey'
             ? 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.'
@@ -15469,7 +15479,8 @@ Always: Does the same as “This task” and sets this credential’s ${request.
 
 Deny: Rejects this request.`, '?')}
         </div>
-      </div>`).join('')
+      </div>`;
+    }).join('')
     : showEmpty ? '<div class="approval-empty">No pending approval requests.</div>' : '';
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
@@ -15579,14 +15590,34 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
 
 function wireCredentialRequestActions(root, organizationId, onResolved) {
   if (!root) return;
+  const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
+  // Load the vault when the picker opens, so an item just added elsewhere (the
+  // "Add to vault" link, another tab) is there to choose without a reload.
+  root.querySelectorAll('[data-vreq] .vreq-pick').forEach((button) => button.addEventListener('click', async () => {
+    const row = button.closest('[data-vreq]');
+    button.disabled = true;
+    let items;
+    try { items = await api(`/api/vault/items${oq}`); } catch (error) { toast(error.message, true); return; } finally { button.disabled = false; }
+    const current = row.dataset.vreqItem;
+    openVaultGrantPicker(items, new Set(current ? [current] : []), {}, (selected) => {
+      const [itemId] = selected;
+      const item = items.find((candidate) => candidate.id === itemId);
+      if (!item) return;
+      credentialRequestBindings.set(row.dataset.vreq, { id: item.id, label: item.label });
+      row.dataset.vreqItem = item.id;
+      button.querySelector('.tf-vault-count').textContent = item.label;
+      row.querySelectorAll('[data-vreq-act]').forEach((action) => { action.disabled = false; });
+    }, { single: true });
+  }));
   root.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((button) => button.addEventListener('click', async () => {
-    const itemId = row.querySelector('.vreq-bind')?.value || undefined;
+    const itemId = row.dataset.vreqItem || undefined;
     button.disabled = true;
     try {
-      const result = await api(`/api/vault/requests/${row.dataset.vreq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
+      const result = await api(`/api/vault/requests/${row.dataset.vreq}/resolve${oq}`, {
         method: 'POST',
         body: JSON.stringify({ action: button.dataset.vreqAct, itemId }),
       });
+      credentialRequestBindings.delete(row.dataset.vreq);
       const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
       toast(result.resume?.resumed ? `${decision} — task resumed automatically`
         : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`, !result.resume?.resumed && !!result.resume?.reason);
@@ -16376,7 +16407,7 @@ async function wireVaultCards(organizationId) {
     let requests = [];
     let items = [];
     try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
-    rbox.innerHTML = credentialRequestRows(requests, items);
+    rbox.innerHTML = credentialRequestRows(requests, items, { addLink: false });
     wireCredentialRequestActions(rbox, organizationId, renderRequests);
   };
   refreshVaultRequests = renderRequests; // live: a new/resolved approval repaints this list (connectWs)

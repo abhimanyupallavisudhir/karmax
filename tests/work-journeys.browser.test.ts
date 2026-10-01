@@ -127,7 +127,13 @@ describe('self-hosted console journeys (real gateway, mock agent)', () => {
       await add.locator('.vi-secret[data-field="password"]').fill('correct horse battery staple');
       await add.locator('.vi-use').selectOption('ask');
       await add.locator('.vi-add').click();
-      await step('bind the new login to the request', () => request.locator('.vreq-bind').selectOption({ label: 'Staging login' }));
+      await step('bind the new login to the request', async () => {
+        await request.getByRole('button', { name: /Vault credentials/ }).click();
+        const picker = page.getByRole('dialog', { name: 'Vault credentials' });
+        await picker.getByRole('searchbox').fill('staging');
+        await picker.getByRole('radio', { name: /Staging login/ }).check();
+        await picker.getByRole('button', { name: 'Apply' }).click();
+      });
       await request.locator('[data-vreq-act="task"]').click();
       await step('the grant resumes the task', () => page.getByText('Granted — task resumed automatically').waitFor());
 
