@@ -329,8 +329,10 @@ describe('project resources', () => {
     expect(proposed.candidate).toMatchObject({ taskId: task.id, worldId: world.handle.id,
       worldGeneration: world.handle.generation ?? 1, state: 'pending', sourceKind: 'path', sourcePath: 'downloads' });
     expect(proposed.attachment.enabled).toBe(false);
-    expect(proposed.revision).toMatchObject({ bytes: Buffer.byteLength('agent-created-model'), files: 1,
-      createdByTaskId: task.id });
+    // Proposing only validates; the snapshot is taken when the workflow stages
+    // it at the end of Do, so it holds the output's final content.
+    expect(proposed.revision).toBeUndefined();
+    await world.writeFileBuffer!('downloads/model.bin', Buffer.from('agent-created-model, final'));
 
     await world.writeFile('omitted.bin', 'omitted');
     await world.writeFile('also-omitted.bin', 'also omitted');
@@ -345,6 +347,12 @@ describe('project resources', () => {
       resources.setReviewExcluded(task.id, alsoOmitted.attachment.id, true),
     ]);
     expect((await resources.reviewExclusions(task.id)).sort()).toEqual([omitted.attachment.id, alsoOmitted.attachment.id].sort());
+    expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [proposed.candidate.id,
+      omitted.candidate.id, alsoOmitted.candidate.id], failed: [] });
+    const staged = (await store.getResourceAttachment(proposed.attachment.id))!;
+    expect((await store.getResourceRevision(staged.currentRevisionId!))).toMatchObject({
+      bytes: Buffer.byteLength('agent-created-model, final'), files: 1, createdByTaskId: task.id });
+    expect(await resources.stageCandidates(task.id)).toEqual({ staged: [], failed: [] }); // a retry keeps them
     await world.destroy(); // staged output remains usable without the producer world
     await resources.settleReview(task.id);
     expect((await store.getResourceCandidate(omitted.candidate.id))?.state).toBe('discarded');
@@ -359,9 +367,158 @@ describe('project resources', () => {
       workflowVersion: '1.0.0', params: { prompt: 'use it' } }));
     const consumerWorld = await worlds.create('worktree', { taskId: consumer.id, repo, base: 'main' });
     consumerWorld.handle = await resources.materialize(project.id, consumer.id, consumerWorld, 1);
-    expect(await consumerWorld.readFileBuffer('models/downloaded/model.bin')).toEqual(Buffer.from('agent-created-model'));
+    expect(await consumerWorld.readFileBuffer('models/downloaded/model.bin')).toEqual(Buffer.from('agent-created-model, final'));
     await resources.release(consumerWorld.handle); await consumerWorld.destroy();
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function candidateFixture(name: string) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-resource-${name}-`));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'data/\nraw/\n');
+    await git(repo, ['add', '-A']); await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
+    const store = (await Store.create(':memory:')); const project = (await store.createProject('Staging', { repos: [repo] }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Build data', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'build it' } }));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
+    await world.exec('mkdir', ['-p', 'data', 'raw']);
+    await world.writeFile('data/records.json', '{"records":1}');
+    await world.writeFile('raw/page.txt', 'scanned page');
+    const cleanup = async () => { await world.destroy(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); };
+    return { store, task, resources, world, cleanup };
+  }
+
+  it('retries a transient snapshot failure and discards a candidate whose path is gone, with its reason', async () => {
+    const { store, task, resources, world, cleanup } = await candidateFixture('stage-failure');
+    try {
+      const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
+      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      // A transient failure is retried with the candidate kept…
+      const exec = world.exec.bind(world);
+      const flaky = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
+        command === 'bash' && String(args?.[1]).includes('find -H') ? { code: 1, stdout: '', stderr: 'sandbox unavailable' }
+          : exec(command, args, options));
+      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
+      await expect(resources.stageCandidates(task.id)).rejects.toThrow('sandbox unavailable');
+      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('pending');
+      flaky.mockRestore();
+      // …but a vanished path is final at once.
+      await world.exec('rm', ['-rf', 'data']);
+      const result = await resources.stageCandidates(task.id);
+      expect(result.staged).toEqual([raw.candidate.id]);
+      expect(result.failed).toEqual([expect.objectContaining({ candidateId: data.candidate.id, sourcePath: 'data' })]);
+      const failed = (await store.getResourceCandidate(data.candidate.id))!;
+      expect(failed).toMatchObject({ state: 'discarded', resolvedBy: 'system:resource-stage-failed',
+        error: result.failed[0]!.error });
+      expect(failed.error).toBeTruthy();
+      expect(await store.getResourceAttachment(data.attachment.id)).toBeUndefined();
+      expect((await store.getResourceAttachment(raw.attachment.id))?.currentRevisionId).toBeTruthy();
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  });
+
+  it('settles a candidate whose snapshot never completed by discarding it, not by failing the confirmation', async () => {
+    const { store, task, resources, cleanup } = await candidateFixture('settle-unstaged');
+    try {
+      const unstaged = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
+      // Stage only `data`, as if `raw`'s snapshot was cut off by a restart.
+      const attachment = (await store.getResourceAttachment(unstaged.attachment.id))!;
+      vi.spyOn(store, 'listResourceCandidates').mockImplementationOnce(async () => [data.candidate]);
+      await resources.stageCandidates(task.id, { final: true });
+      expect(attachment.currentRevisionId).toBeUndefined();
+      await resources.beginReview(task.id);
+      await resources.settleReview(task.id);
+      expect((await store.getResourceCandidate(unstaged.candidate.id))).toMatchObject({ state: 'discarded',
+        error: 'its snapshot never completed' });
+      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('adopted');
+      await resources.settleReview(task.id); // an activity retry is a no-op
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  });
+
+  it('explains a SQLite snapshot that cannot fit and never leaves a partial copy behind', async () => {
+    const { store, task, resources, world, cleanup } = await candidateFixture('stage-sqlite-space');
+    try {
+      const root = world.handle.workdir ?? world.handle.root;
+      const db = new DatabaseSync(path.join(root, 'data/records.db'));
+      db.exec('CREATE TABLE t (v TEXT); INSERT INTO t VALUES (\'row\')'); db.close();
+      const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
+      const exec = world.exec.bind(world);
+      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
+      const tight = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
+        command === 'bash' && String(args?.[1]).includes('df -B1') ? { code: 0, stdout: `${8 * 2 ** 30} ${5 * 2 ** 30}`, stderr: '' }
+          : exec(command, args, options));
+      await expect(resources.stageCandidates(task.id)).rejects.toThrow(
+        'needs 8.0 GiB of free disk in the task world, but only 5.0 GiB is free');
+      tight.mockRestore();
+      // A copy that dies part-way (disk full) is removed, not left filling the disk.
+      vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) => {
+        if (command !== 'python3') return exec(command, args, options);
+        await exec('bash', ['-lc', `head -c 4096 /dev/zero > ${String(args?.[3])}`]);
+        return { code: 1, stdout: '', stderr: 'sqlite3.OperationalError: database or disk is full' };
+      });
+      const result = await resources.stageCandidates(task.id, { final: true });
+      expect(result.failed).toEqual([expect.objectContaining({ candidateId: data.candidate.id,
+        error: expect.stringContaining('database or disk is full') })]);
+      expect(fs.readdirSync(path.join(root, '.karmax-injection')).filter((name) => name.startsWith('sqlite-backup-'))).toEqual([]);
+      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('discarded');
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  });
+
+  it('reads a settled SQLite database in place, without a copy, and rejects one that changes mid-read', async () => {
+    const { store, task, resources, world, cleanup } = await candidateFixture('stage-sqlite-in-place');
+    try {
+      const root = world.handle.workdir ?? world.handle.root;
+      const file = path.join(root, 'data/records.db');
+      const db = new DatabaseSync(file);
+      db.exec('CREATE TABLE t (v TEXT); INSERT INTO t VALUES (\'settled\')'); db.close();
+      await new Promise((resolve) => setTimeout(resolve, 2_200)); // older than the racy-clean window
+      const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
+      const exec = world.exec.bind(world);
+      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
+      const calls = vi.spyOn(world, 'exec');
+      // A write landing while the bytes are read is caught by the stamp check.
+      let wrote = false;
+      calls.mockImplementation(async (command, args, options) => {
+        const result = await exec(command, args, options);
+        if (!wrote && command === 'bash' && String(args?.[1]).includes('records.db') && String(args?.[1]).includes('dd ')) {
+          wrote = true;
+          const writer = new DatabaseSync(file); writer.exec('INSERT INTO t VALUES (\'late\')'); writer.close();
+        }
+        return result;
+      });
+      await expect(resources.stageCandidates(task.id)).rejects.toThrow('changed while it was being snapshotted');
+      expect(wrote).toBe(true);
+      calls.mockClear();
+      calls.mockImplementation(exec);
+      await new Promise((resolve) => setTimeout(resolve, 2_200));
+      expect(await resources.stageCandidates(task.id, { final: true })).toMatchObject({ staged: [data.candidate.id] });
+      expect(calls.mock.calls.some(([command]) => command === 'python3')).toBe(false);
+      const revision = (await store.getResourceRevision((await store.getResourceAttachment(data.attachment.id))!.currentRevisionId!))!;
+      const restored = path.join(root, 'restored'); fs.mkdirSync(restored);
+      await resources['engine'].restore(revision, async (file: string, bytes: Buffer, offset: number) => {
+        fs.mkdirSync(path.dirname(path.join(restored, file)), { recursive: true });
+        fs.writeFileSync(path.join(restored, file), bytes, { flag: offset ? 'a' : 'w' });
+      });
+      const copy = new DatabaseSync(path.join(restored, 'records.db'));
+      expect(copy.prepare('SELECT v FROM t ORDER BY rowid').all()).toEqual([{ v: 'settled' }, { v: 'late' }]);
+      copy.close();
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  }, 30_000);
+
+  it('stages a candidate once when two attempts race', async () => {
+    const { store, task, resources, cleanup } = await candidateFixture('stage-race');
+    try {
+      const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
+      await Promise.all([resources.stageCandidates(task.id, { final: true }), resources.stageCandidates(task.id, { final: true })]);
+      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('pending');
+      expect((await store.getResourceAttachment(data.attachment.id))?.currentRevisionId).toBeTruthy();
+    } finally { await cleanup(); }
   });
 
   it('discards staged candidates, preserves vault items, and inventories undeclared ignored paths without content', async () => {

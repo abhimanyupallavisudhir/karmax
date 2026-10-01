@@ -25,6 +25,11 @@ import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
 });
+// See software-dev: multi-GB snapshots; a retry keeps what is already staged.
+const resourceStaging = proxyActivities<coreActivities>({
+  startToCloseTimeout: '12 hours', heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 3, initialInterval: '30 seconds' },
+});
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 // An agent turn has no wall-clock limit: long investigations and builds are
 // normal work. The 2-minute heartbeat timeout is what detects a dead worker or
@@ -139,6 +144,7 @@ async function justDoImpl(
   let awaitingResourceDecision = false;
   let resourceReviewSequence = 0;
   let applyingResources = false;
+  let stagingResources = false;
   let world: WorldHandleLike | undefined;
   let session: string | undefined;
   let reviewInfo: ReviewInfo | undefined;
@@ -156,7 +162,7 @@ async function justDoImpl(
   const confirmLayers = confirmLayersOf(input.confirm);
 
   function actions(): DeclaredAction[] {
-    if (finalizing || applyingResources) return [];
+    if (finalizing || applyingResources || stagingResources) return [];
     const followUp: DeclaredAction = { name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true, args: [{ name: 'text', type: 'text', required: true }] };
     const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true };
     const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: 'Done', enabled: true };
@@ -167,9 +173,20 @@ async function justDoImpl(
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'just-do', stage, status, messages: msgs, reviewInfo,
-      actions: actions(), state: { worldReady: !!world, ...(applyingResources ? { applyingResources: true } : {}), ...(finalizing ? { finalizing: true } : {}) }, branch: world?.branch, base,
+      actions: actions(), state: { worldReady: !!world, ...(applyingResources ? { applyingResources: true } : {}), ...(stagingResources ? { stagingResources: true } : {}), ...(finalizing ? { finalizing: true } : {}) }, branch: world?.branch, base,
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
+  }
+  /** Snapshot proposed outputs while their world is live (see software-dev). */
+  async function stageResources(): Promise<void> {
+    if (!resourceCandidateReview || !patched('resource-candidate-staging-v1')) return;
+    stagingResources = true;
+    const priorStatus = status;
+    status = 'active';
+    await publish();
+    try { await resourceStaging.stageResourceCandidates(taskId); }
+    catch (err) { if (cancelled || isCancellation(err)) throw err; }
+    finally { stagingResources = false; status = priorStatus; }
   }
   const publishConversation = conversationPublisher(workflowInfo().runId,
     (snapshot, reference) => publishTaskView(core, taskId, snapshot, reference));
@@ -252,7 +269,7 @@ async function justDoImpl(
     resourceResolutionEpoch++;
   });
   setHandler(confirmSignal, () => {
-    if (awaitingResourceDecision) return;
+    if (awaitingResourceDecision || stagingResources) return;
     confirmed = true;
   });
   setHandler(cancelSignal, () => {
@@ -381,6 +398,7 @@ async function justDoImpl(
     let backToDo = false;
     const automaticResources = resourceCandidateReview && patched('automatic-resource-review-v1');
     if (automaticResources) await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
+    await stageResources();
     if (resourceCandidateReview && !automaticResources) {
       let resolutionAtWait = resourceResolutionEpoch;
       let pending = await core.pendingResourceCandidates(taskId);
@@ -437,6 +455,7 @@ async function justDoImpl(
     if (!backToDo) {
       approved = true;
       if (automaticResources) {
+        await stageResources();
         applyingResources = true;
         status = 'active';
         await publish();

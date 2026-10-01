@@ -190,6 +190,24 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('adds the candidate failure reason to an existing database and round-trips it', async () => {
+    (await Store.create(url!).then((store) => store.close()));
+    await admin!.query('ALTER TABLE resource_candidates DROP COLUMN error'); // as deployed before the column
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Candidates');
+      const task = await store.createTask({ projectId: project.id, title: 'Data', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'fixture' } });
+      const attachment = await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+        name: 'Data', driver: 'object-tree@1', target: { kind: 'path', path: 'data' }, access: 'read', isolation: 'fork',
+        source: { candidate: true }, credentialHandles: [], publish: 'discard', enabled: false });
+      const candidate = await store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
+        taskId: task.id, worldId: task.id, worldGeneration: 1, attachmentId: attachment.id, sourceKind: 'path', sourcePath: 'data' });
+      await store.beginDiscardResourceCandidate(candidate.id, task.id);
+      await store.resolveResourceCandidate(candidate.id, 'discarded', 'system:resource-stage-failed', 'disk is full');
+      expect(await store.getResourceCandidate(candidate.id)).toMatchObject({ state: 'discarded', error: 'disk is full' });
+    } finally { await store.close(); }
+  });
+
   it('selects only unsettled attempt metadata for reconciliation', async () => {
     const store = await Store.create(url!);
     try {
