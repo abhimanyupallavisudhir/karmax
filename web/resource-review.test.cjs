@@ -34,7 +34,7 @@ function setup(api) {
   const inventory = panel();
   const context = vm.createContext({ api, resourceReviewCache: new Map(), resourceInventoryCache: new Map(), resourceChoiceWrites: new Map(), asyncElementRenderEpoch: new WeakMap(),
     document: { getElementById: (id) => id === 'review-resource-inventory' ? inventory : wrap }, esc: String, formatBytes: String, confirm: () => true, toast: () => {},
-    S: {}, ICON: {}, siteNameMarkup: () => 'Karmax', markdownEnabled: () => false, conversationMathEnabled: () => true, renderAgentMessageBody: String, explainMessageAffordance: () => '',
+    S: {}, ICON: {}, siteNameMarkup: () => 'Karmax', markdownEnabled: () => false, mathjaxEnabled: () => true, renderAgentMessageBody: String, explainMessageAffordance: () => '',
     waitingText: () => 'Waiting', liveRoleFor: () => 'do', conversationPresence: () => ({ tone: 'waiting', label: 'Waiting' }),
     conversationEntries: () => [], subTasksSection: () => '', agentForksSection: () => '', pipelineLarge: () => '',
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
