@@ -529,6 +529,11 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .project-help-callout { display:flex; gap:10px; align-items:flex-start; margin:10px 0 14px; padding:11px 12px; border:1px solid var(--line); border-radius:10px; background:var(--surface-2); color:var(--ink-2); font-size:12px; line-height:1.5; }
 .project-help-callout b { color:var(--ink); }
 .project-help-callout .callout-mark { color:var(--accent); font-weight:700; }
+.vault-risk { display:flex; gap:10px; align-items:flex-start; margin:0 0 14px; padding:10px 12px; border:1px solid color-mix(in srgb, var(--danger) 30%, var(--line)); border-radius:10px; background:var(--danger-weak); color:var(--ink-2); font-size:12px; line-height:1.5; }
+.vault-risk b { color:var(--ink); }
+.vault-risk ul { margin:4px 0; padding-left:18px; }
+.vault-risk li + li { margin-top:3px; }
+.vault-risk-mark { flex:none; display:grid; place-items:center; width:18px; height:18px; margin-top:1px; border-radius:50%; background:var(--danger); color:#fff; font-weight:800; line-height:1; }
 .project-empty { margin:8px 0 14px; padding:14px; border:1px dashed var(--line-strong); border-radius:10px; color:var(--ink-3); font-size:12px; line-height:1.5; }
 .project-form-actions { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:12px; }
 .service-fields[hidden] { display:none; }
@@ -1086,6 +1091,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .approval-request-actions .vreq-pick .tf-vault-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .approval-request-actions .vreq-add { font-size: 12px; white-space: nowrap; }
 .approval-request-help { margin-top: 7px; color: var(--ink-2); font-size: 12px; }
+.approval-request-warn { margin-top: 7px; color: var(--danger); font-size: 12px; }
+.approval-request-warn.caution { color: var(--ink-2); }
 .approval-empty { padding: 24px 14px; border: 1px dashed var(--line); border-radius: var(--r); color: var(--ink-3); text-align: center; }
 .approval-history { margin-top: 14px; }
 .approval-history-row { display: flex; align-items: center; gap: 8px; padding: 6px 2px; border-bottom: 1px solid var(--line); }
