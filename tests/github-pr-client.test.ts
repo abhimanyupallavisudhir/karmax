@@ -162,6 +162,15 @@ describe('GitHub PR client', () => {
     await expect(api.readiness(SLUG, 404)).rejects.toMatchObject({ status: 404, message: 'GitHub pull request acme/app#404 was not found' });
   });
 
+  it('reports the live target tip, not the PR\'s stale baseRefOid, so a moved target is a new observation', async () => {
+    const readiness = (pullRequest: Record<string, unknown>) => github(on('POST', '/graphql', () => json(200, { data: {
+      repository: { pullRequest: { id: 'PR_1', url: 'u', state: 'OPEN', isDraft: false, merged: false, headRefOid: 'h',
+        mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', baseRefOid: 'opened-on', ...pullRequest } },
+    } }))).api.readiness(SLUG, 1);
+    expect((await readiness({ baseRef: { target: { oid: 'moved-to' } } })).baseSha).toBe('moved-to');
+    expect((await readiness({ baseRef: null })).baseSha).toBe('opened-on');
+  });
+
   it('derives the check state from the newest run of each check when duplicates were collapsed', async () => {
     const run = (conclusion: string, suiteCreatedAt: string, extra: Record<string, unknown> = {}) => ({ __typename: 'CheckRun',
       name: 'test', status: 'COMPLETED', conclusion, checkSuite: { app: { id: 'actions' }, createdAt: suiteCreatedAt }, ...extra });
