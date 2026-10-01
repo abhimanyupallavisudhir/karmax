@@ -33,6 +33,7 @@ const context = vm.createContext({
 });
 vm.runInContext(
   [
+    extractFunction('patchLifecycleView'),
     extractFunction('patchTaskListFromEvent'),
     extractFunction('pendingCancellationView'),
     extractFunction('waitingLabel'),
@@ -52,6 +53,7 @@ vm.runInContext(
 );
 
 const stageLabel = context.stageLabel as (view: Record<string, any>) => string;
+const waitDeadline = context.waitDeadline as (until: number) => string;
 const waitingText = context.waitingText as (wait: Record<string, any>) => string;
 const agentTurnStateText = context.agentTurnStateText as (view: Record<string, any>) => string;
 const humanWaitDetail = context.humanWaitDetail as (view: Record<string, any>) => string;
@@ -348,5 +350,24 @@ describe('waiting labels in task summaries', () => {
       summary: 'GitHub Actions is disabled',
     });
     expect(stageLabel(context.S.tasks[0].lastView)).toBe('GitHub Actions is disabled');
+
+    // A new question on the same hold is a new label, not a duplicate frame.
+    expect(patchTaskListFromEvent({
+      taskId: 'task-1', type: 'view.updated',
+      payload: { stage: 'merge', status: 'waiting', waitingFor: 'human', waitingSummary: 'Approve the deploy?' },
+    })).toBe(true);
+    expect(stageLabel(context.S.tasks[0].lastView)).toBe('Approve the deploy?');
+  });
+
+  it('keeps a pause deadline in compact live task updates', () => {
+    const until = new Date();
+    until.setHours(23, 45, 0, 0);
+    context.S.tasks = [{ id: 'task-1', lastView: { stage: 'do', status: 'active' } }];
+    const pause = (payload: Record<string, unknown>) => patchTaskListFromEvent({ taskId: 'task-1', type: 'view.updated',
+      payload: { stage: 'do', status: 'waiting', agentTurn: null, ...payload } });
+    expect(pause({ waitingFor: 'timer', waitingUntil: until.getTime() })).toBe(true);
+    expect(stageLabel(context.S.tasks[0].lastView)).toBe(`Paused until ${waitDeadline(until.getTime())}`);
+    expect(pause({ waitingFor: 'job', waitingUntil: until.getTime() + 60_000 })).toBe(true);
+    expect(stageLabel(context.S.tasks[0].lastView)).toMatch(/^Waiting for job until /);
   });
 });

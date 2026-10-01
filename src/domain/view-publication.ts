@@ -177,6 +177,7 @@ export function lifecycleEventPayload(view: Pick<TaskView, 'stage' | 'status' | 
     waitingSummary: view.waitingFor?.summary ?? null,
     waitingProvider: view.waitingFor?.provider ?? null,
     waitingResetAt: view.waitingFor?.earliestResetAt ?? null,
+    waitingUntil: view.waitingFor?.until ?? null,
     agentTurn: view.agentTurn?.state ?? null,
     agentRole: view.agentTurn?.role ?? null,
   };

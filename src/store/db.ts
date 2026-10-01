@@ -86,6 +86,14 @@ import { lifecycleEventPayload } from '../domain/view-publication.js';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
+function foreignRows(rows: any[]): { seqs: number[]; events: Array<KarmaxEvent & { seq: number }> } {
+  return {
+    seqs: rows.map(row => Number(row.seq)),
+    events: rows.filter(row => row.origin !== PROCESS_EVENT_ORIGIN).map(row => ({
+      seq: Number(row.seq), taskId: row.taskId, type: row.type, ts: Number(row.ts), payload: JSON.parse(row.payload),
+    })),
+  };
+}
 
 export type CollaborationRequestStatus = 'pending' | 'completed' | 'failed';
 
@@ -5757,17 +5765,19 @@ export class Store {
    * Local publishers already emit on this process's bus. Origin is transport
    * metadata and is deliberately absent from public event representations. */
   async nextForeignEventPage(seq: number, limit = 128): Promise<{
-    cursor: number; scanned: number; events: Array<KarmaxEvent & { seq: number }>;
+    cursor: number; scanned: number; seqs: number[]; events: Array<KarmaxEvent & { seq: number }>;
   }> {
     const rows = await this.readRows<any>('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?',
       [seq, Math.max(1, Math.min(500, Math.floor(limit)))]);
-    return {
-      cursor: rows.length ? Number(rows[rows.length - 1].seq) : seq,
-      scanned: rows.length,
-      events: rows.filter(row => row.origin !== PROCESS_EVENT_ORIGIN).map(row => ({
-        seq: Number(row.seq), taskId: row.taskId, type: row.type, ts: Number(row.ts), payload: JSON.parse(row.payload),
-      })),
-    };
+    return { cursor: rows.length ? Number(rows[rows.length - 1].seq) : seq, scanned: rows.length, ...foreignRows(rows) };
+  }
+
+  /** The rows among `seqs` that exist now, and the other processes' events
+   *  among them: how the relay finds rows that committed after it read past. */
+  async foreignEventsAt(seqs: readonly number[]): Promise<{ seqs: number[]; events: Array<KarmaxEvent & { seq: number }> }> {
+    if (!seqs.length) return { seqs: [], events: [] };
+    return foreignRows(await this.readRows<any>(
+      `SELECT * FROM events WHERE seq IN (${seqs.map(() => '?').join(',')}) ORDER BY seq`, [...seqs]));
   }
 
   /** Event routing needs ownership, never a conversation or reviewer expansion. */
