@@ -4542,12 +4542,19 @@ export class Store {
   async syncStorageInbox(organizationId: string, userIds: string[],
     notice: { stage: string; retainedBytes: number; quotaBytes: number; deleteAt: number } | undefined, createdAt = Date.now()): Promise<void> {
     return this.db.transaction(async () => {
-      const ids = new Set<string>();
-      if (notice) for (const userId of new Set(userIds)) {
-        const id = `inbox_storage_${crypto.createHash('sha256')
-          .update(JSON.stringify([organizationId, userId, notice.stage, notice.deleteAt])).digest('hex').slice(0, 24)}`;
-        ids.add(id);
-        const urgency = notice.stage === '7d' || notice.stage === 'deleted' ? 'critical' : 'high';
+      const ids = new Map<string, string>();
+      if (notice) for (const userId of new Set(userIds)) ids.set(`inbox_storage_${crypto.createHash('sha256')
+        .update(JSON.stringify([organizationId, userId, notice.stage, notice.deleteAt])).digest('hex').slice(0, 24)}`, userId);
+      // Withdraw the previous stage first: one row per owner and task id.
+      const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='storage'`)
+        .all(organizationId)) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !ids.has(id));
+      if (stale.length) {
+        (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+        (await deleteRows(this.db, 'inbox', 'id', stale));
+      }
+      if (!notice) return;
+      const urgency = notice.stage === '7d' || notice.stage === 'deleted' ? 'critical' : 'high';
+      for (const [id, userId] of ids) {
         const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
           (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
           VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
@@ -4559,12 +4566,6 @@ export class Store {
           (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
             (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
             .run(newId('delivery'), id, channel, createdAt, createdAt));
-      }
-      const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='storage'`)
-        .all(organizationId)) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !ids.has(id));
-      if (stale.length) {
-        (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
-        (await deleteRows(this.db, 'inbox', 'id', stale));
       }
     });
   }

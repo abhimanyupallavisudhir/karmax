@@ -11,6 +11,7 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ManagedStorageService, STORAGE_POLICY, type StorageNotice } from '../src/world/managed-storage.js';
+import { storageNotifier } from '../src/world/storage-notices.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 const dirs: string[] = [];
@@ -222,6 +223,35 @@ describe.each(BACKENDS)('%s', (name) => {
       expect((await f.store.storageOverQuota(f.organizationId))).toBeDefined();
     });
   });
+
+    describe('owner notices', () => {
+      it('puts one current notice in each owner\'s inbox, emails them, and withdraws it once resolved', async () => {
+        const f = (await fixture());
+        (await f.store.setOrganizationMembership(f.organizationId, 'owner-1', 'owner'));
+        (await f.store.setOrganizationMembership(f.organizationId, 'member-1', 'member'));
+        const sent: Array<{ to: string; subject: string; text: string }> = [];
+        const notify = storageNotifier({ store: f.store, publicUrl: 'https://tavya.test/',
+          email: { configured: async () => true, send: async (message) => { sent.push(message); } },
+          userEmail: async (userId) => `${userId}@example.com`, siteName: async () => 'tavya' });
+        const notice = (stage: StorageNotice['stage']): StorageNotice => ({ organizationId: f.organizationId, stage,
+          retainedBytes: 6 * 1024 ** 3, quotaBytes: 5 * 1024 ** 3, overSince: Date.parse('2026-10-01T00:00:00Z'),
+          deleteAt: Date.parse('2027-10-01T00:00:00Z') });
+
+        await notify(notice('over'));
+        await notify(notice('30d'));
+        const inbox = (await f.store.listInbox('owner-1', f.organizationId));
+        expect(inbox).toHaveLength(1);
+        expect(inbox[0]!.subject).toMatchObject({ kind: 'storage', stage: '30d', deleteAt: Date.parse('2027-10-01T00:00:00Z') });
+        expect((await f.store.listInbox('member-1', f.organizationId))).toHaveLength(0);
+        expect(sent.map((message) => message.to)).toEqual(['owner-1@example.com', 'owner-1@example.com']);
+        expect(sent[1]).toMatchObject({ subject: expect.stringMatching(/over its tavya storage limit/) });
+        expect(sent[1]!.text).toMatch(/6\.0 GB of 5\.0 GB[\s\S]*before on 2027-10-01 \(30 days\)[\s\S]*https:\/\/tavya\.test\/settings/);
+
+        await notify(notice('resolved'));
+        expect((await f.store.listInbox('owner-1', f.organizationId))).toHaveLength(0);
+        expect(sent).toHaveLength(2);
+      });
+    });
 
   describe('storage page', () => {
     it('groups what an organization stores by project and lets an owner clear history', async () => {
