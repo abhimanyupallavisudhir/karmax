@@ -556,6 +556,10 @@ const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
  * when nothing in this process has changed authorization: the bound for
  * revocations made by another replica. */
 const SOCKET_DECISION_TTL_MS = 5_000;
+/** A browser's event socket can die without a close (sleep, network change,
+ * NAT expiry). Each side checks the other this often: the gateway with protocol
+ * pings, the console with an application `ping` it can see answered. */
+const EVENT_SOCKET_PING_MS = 30_000;
 /** Past this much unsent data a socket gets only the latest streamed text. */
 const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
 /** A watching socket gets these only for the task it shows (RQ-16)… */
@@ -734,10 +738,25 @@ export class Gateway {
     if (lifetime.closed) return;
     // What this tab shows (RQ-16). Until it says, it gets every readable event.
     let watch: { projectId: string | null; taskId: string | null } | undefined;
+    let answered = true;
+    ws.on('pong', () => { answered = true; });
+    const pinger = setInterval(() => {
+      try {
+        if (!answered) { ws.terminate(); return; }
+        answered = false;
+        ws.ping();
+      } catch { /* closing */ }
+    }, EVENT_SOCKET_PING_MS);
+    pinger.unref?.();
+    lifetime.add(() => clearInterval(pinger));
     ws.on('message', async data => {
       if (data.toString().length > 1024) return;
       try {
         const message = JSON.parse(data.toString());
+        if (message?.type === 'ping') {
+          if (ws.readyState === WebSocketClient.OPEN) ws.send('{"type":"pong"}');
+          return;
+        }
         if (message?.type === 'watch') {
           const id = (value: unknown) => value == null ? null : typeof value === 'string' ? value : undefined;
           const projectId = id(message.projectId), taskId = id(message.taskId);

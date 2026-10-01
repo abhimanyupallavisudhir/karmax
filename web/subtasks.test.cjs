@@ -19,6 +19,7 @@ function extractFn(name) {
 
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 global.S = {
+  cancelling: new Set(),
   attemptGroup: null,
   attention: [],
   schema: [],
@@ -32,7 +33,7 @@ global.S = {
 global.stageLabel = (v) => v.stage || 'setup';
 global.pipeline = (v) => `<i class="test-pipeline">${esc(v.stage || 'setup')}</i>`;
 
-for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'subTaskState', 'subTasksSection', 'patchSubTaskSummaryFromEvent']) eval(extractFn(name));
+for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'subTaskState', 'subTasksSection', 'patchLifecycleView', 'pendingCancellationView', 'patchSubTaskSummaryFromEvent']) eval(extractFn(name));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {

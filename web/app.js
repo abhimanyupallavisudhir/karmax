@@ -2831,6 +2831,7 @@ async function checkConsoleRevision() {
 
 function resumeVisibleUpdates() {
   if (document.hidden) return;
+  checkWsLiveness(true);
   if (S.liveUpdatesStale) {
     S.liveUpdatesStale = false;
     resourceReviewCache.clear(); resourceInventoryCache.clear();
@@ -2982,6 +2983,7 @@ async function boot() {
     refreshOnboarding(),
   ]);
   connectWs();
+  watchWsLiveness();
   renderShell();
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
   installShellListeners();
@@ -3423,29 +3425,11 @@ const LIST_RELOAD_EVENTS = new Set([
 // every event on the global stream.
 /** Keep the open parent's Sub-tasks panel current from its children's events;
  * true when a visible field changed. */
-function patchSubTaskSummaryFromEvent(ev) {
-  if (ev.type !== 'view.updated' || !ev.taskId) return false;
-  const summary = (S.view?.subTaskSummaries || []).find((candidate) => candidate.id === ev.taskId);
-  if (!summary) return false;
+// A `view.updated` carries the lifecycle fields of the view, flattened. Apply it
+// to a row's last view; true when anything its label is derived from changed.
+function patchLifecycleView(record, ev) {
   const payload = ev.payload || {};
-  const previous = summary.lastView || {};
-  const next = {
-    ...previous,
-    ...(payload.stage ? { stage: payload.stage } : {}),
-    ...(payload.status ? { status: payload.status } : {}),
-    waitingFor: payload.waitingFor ? { kind: payload.waitingFor } : undefined,
-  };
-  summary.lastView = next;
-  return previous.stage !== next.stage || previous.status !== next.status
-    || previous.waitingFor?.kind !== next.waitingFor?.kind;
-}
-
-function patchTaskListFromEvent(ev) {
-  if (ev.type !== 'view.updated' || !ev.taskId) return false;
-  const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
-  if (!task) return false;
-  const payload = ev.payload || {};
-  const previous = task.lastView || {};
+  const previous = record.lastView || {};
   const waitingField = (payloadName, viewName) => {
     const value = Object.prototype.hasOwnProperty.call(payload, payloadName)
       ? payload[payloadName]
@@ -3461,6 +3445,7 @@ function patchTaskListFromEvent(ev) {
         ...waitingField('waitingSummary', 'summary'),
         ...waitingField('waitingProvider', 'provider'),
         ...waitingField('waitingResetAt', 'earliestResetAt'),
+        ...waitingField('waitingUntil', 'until'),
       }
     : undefined;
   const agentTurn = payload.agentTurn
@@ -3477,20 +3462,31 @@ function patchTaskListFromEvent(ev) {
     waitingFor,
     agentTurn,
   }, ev.taskId);
-  task.lastView = next;
+  record.lastView = next;
   // A retrying or accidentally hot-looping workflow can publish an identical
   // compact view many times per second. Updating the in-memory record is cheap;
   // replacing the entire list DOM is not, and can remove a row between pointer
-  // down/up so its click never fires. Repaint only when a visible list field
-  // actually changed.
+  // down/up so its click never fires. Repaint only when a visible field changed.
   const waitKey = (value) => value
-    ? [value.kind, value.detail, value.provider, value.earliestResetAt].join('\u0000')
+    ? [value.kind, value.detail, value.summary, value.provider, value.earliestResetAt, value.until].join('\u0000')
     : '';
   const turnKey = (value) => value ? [value.state, value.role].join('\u0000') : '';
   return previous.stage !== next.stage
     || previous.status !== next.status
     || waitKey(previous.waitingFor) !== waitKey(next.waitingFor)
     || turnKey(previous.agentTurn) !== turnKey(next.agentTurn);
+}
+
+function patchSubTaskSummaryFromEvent(ev) {
+  if (ev.type !== 'view.updated' || !ev.taskId) return false;
+  const summary = (S.view?.subTaskSummaries || []).find((candidate) => candidate.id === ev.taskId);
+  return !!summary && patchLifecycleView(summary, ev);
+}
+
+function patchTaskListFromEvent(ev) {
+  if (ev.type !== 'view.updated' || !ev.taskId) return false;
+  const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
+  return !!task && patchLifecycleView(task, ev);
 }
 
 function scheduleTaskListReload() {
@@ -3506,12 +3502,15 @@ function connectWs() {
     S.ws.onclose = S.ws.onmessage = S.ws.onopen = null;
     S.ws.close();
   }
+  wsPingSentAt = 0;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   S.ws = ws;
   ws.onmessage = (m) => {
+    wsHeardAt = Date.now(); wsPingSentAt = 0;
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
+    if (ev.type === 'pong') return;
     if (ev.type === 'timing.setting') { applyTimingSetting(ev.enabled); return; }
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
     if (document.hidden) { S.liveUpdatesStale = true; return; }
@@ -3589,6 +3588,7 @@ function connectWs() {
   // gap were never re-fetched. Surface the gap, and backfill on reconnect.
   ws.onopen = () => {
     wsRetryMs = 1500;
+    wsHeardAt = Date.now();
     setWsOnline(true);
     syncLiveWatch();
     if (wsHadDropped) checkConsoleRevision();
@@ -3623,6 +3623,38 @@ function syncLiveWatch() {
 
 let wsHadDropped = false;
 let wsRetryMs = 1500; // reconnect delay; doubles per failed attempt up to 30 s, reset on open
+
+// A socket can die without a close — the laptop slept, the network changed —
+// and then looks open while every update goes missing, so labels froze until a
+// reload. Browsers never see protocol pings: when the socket has been quiet,
+// ask with an application ping; no answer means reconnect, which backfills.
+const WS_PING_MS = 30_000;
+const WS_PONG_WAIT_MS = 10_000;
+let wsHeardAt = 0;
+let wsPingSentAt = 0; // 0 while no ping is outstanding
+function checkWsLiveness(force = false) {
+  const ws = S.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (wsPingSentAt) {
+    if (Date.now() - wsPingSentAt >= WS_PONG_WAIT_MS) reconnectWs();
+    return;
+  }
+  if (!force && Date.now() - wsHeardAt < WS_PING_MS) return;
+  wsPingSentAt = Date.now();
+  try { ws.send('{"type":"ping"}'); } catch { reconnectWs(); }
+}
+function reconnectWs() {
+  wsHadDropped = true;
+  setWsOnline(false);
+  connectWs();
+}
+function watchWsLiveness() {
+  if (watchWsLiveness.started) return;
+  watchWsLiveness.started = true;
+  setInterval(checkWsLiveness, 5_000);
+  // Back on a network: the old connection belonged to the previous one.
+  window.addEventListener('online', () => { if (S.ws) reconnectWs(); });
+}
 function setWsOnline(online) {
   S.wsOnline = online;
   document.getElementById('ws-offline')?.classList.toggle('hidden', online);
