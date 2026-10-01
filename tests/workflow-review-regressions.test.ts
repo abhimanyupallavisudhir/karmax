@@ -379,7 +379,7 @@ function repeatedLandingFailure() {
   Object.assign(wf.activities, {
     accountPoolSize: vi.fn(async () => 0),
     checkProposal: vi.fn(async () => ({ ready: true })), openPr: vi.fn(async () => prs),
-    settleResourceReview: vi.fn(async () => ({ settled: true })), closePrs: vi.fn(async () => prs),
+    settleResourceReview: vi.fn(async () => ({ settled: true })), stageResourceCandidates: vi.fn(async () => ({ staged: 0, failed: 0 })), closePrs: vi.fn(async () => prs),
     mergeGithubPrs: vi.fn(async () => failure),
     withdrawGithubPrs: vi.fn(async () => ({ withdrawn: [], reconciled: prs })),
     enqueueMerge: vi.fn(async () => wf.handlers.get('mergeGranted')!()),

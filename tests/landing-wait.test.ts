@@ -22,7 +22,7 @@ it.each(['preflight', 'fallback', 'repeated-failure'])('keeps unchanged %s waits
     maxCachedWorkflows: 2, maxConcurrentWorkflowTaskExecutions: 2, maxConcurrentActivityTaskExecutions: 2, reuseV8Context: true,
     activities: {
       publishView: async () => { publications++; return 'fence'; }, parkWaitingWorld: async () => { parks++; },
-      recordEvent: async () => {}, settleResourceReview: async () => ({ settled: true }), restoreChildTasks: async () => [], accountPoolSize: async () => 0,
+      recordEvent: async () => {}, settleResourceReview: async () => ({ settled: true }), stageResourceCandidates: async () => ({ staged: 0, failed: 0 }), pendingResourceCandidates: async () => 0, restoreChildTasks: async () => [], accountPoolSize: async () => 0,
       checkProposal: async () => ({ ready: true }), openPr: async () => prs,
       buildReview: async () => ({ summary: 'fixture', changedFiles: [] }),
       mergeGithubPrs: async (_world: unknown, _prs: unknown, options: { mode?: string }) => {

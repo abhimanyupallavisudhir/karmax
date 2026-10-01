@@ -32,7 +32,7 @@ const common: StubActivities = {
   agentUsesHostCapacity: async () => false, pendingServiceConnections: async () => 0,
   buildReview: async () => ({ summary: 'fixture', changedFiles: [] }), checkProposal: async () => ({ ready: true }),
   suspendWorldForRecovery: async () => {}, closePrs: async () => prs, destroyWorld: async () => {},
-  settleResourceReview: async () => ({ settled: true }), openPr: async () => prs,
+  settleResourceReview: async () => ({ settled: true }), stageResourceCandidates: async () => ({ staged: 0, failed: 0 }), pendingResourceCandidates: async () => 0, openPr: async () => prs,
   withdrawGithubPrs: async () => ({ withdrawn: [], reconciled: prs }),
   // Landing takes the Karmax slot at once; the merge-queue wait never gets it.
   enqueueMerge: async (_domain: string, taskId: string) => {

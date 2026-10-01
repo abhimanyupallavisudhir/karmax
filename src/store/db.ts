@@ -6056,6 +6056,17 @@ export class Store {
     });
   }
 
+  /** Record a revision and make it current in one step: when the baseline moved
+   * (or the attachment is gone), nothing is recorded. */
+  async saveAndPromoteResourceRevision(input: Omit<ResourceRevision, 'id' | 'createdAt'>,
+    expectedRevisionId: string | undefined): Promise<ResourceRevision> {
+    return this.db.transaction(async () => {
+      const revision = (await this.saveResourceRevision(input));
+      (await this.promoteResourceRevision(input.attachmentId, revision.id, expectedRevisionId));
+      return revision;
+    });
+  }
+
   async promoteResourceRevision(attachmentId: string, revisionId: string, expectedRevisionId?: string): Promise<ResourceAttachment> {
     return this.db.transaction(async () => {
 

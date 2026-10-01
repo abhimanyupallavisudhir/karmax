@@ -73,8 +73,11 @@ const resourceActivities = proxyActivities<coreActivities>({
 // Snapshots move at a few MB/s out of a remote sandbox, so a multi-GB output
 // takes most of an hour. A retry keeps every candidate already staged.
 const resourceStaging = proxyActivities<coreActivities>({
-  startToCloseTimeout: '12 hours', heartbeatTimeout: '2 minutes',
+  // Heartbeats carry a cancel to the activity; a short timeout delivers it soon.
+  startToCloseTimeout: '12 hours', heartbeatTimeout: '30 seconds',
   retry: { maximumAttempts: 3, initialInterval: '30 seconds' },
+  // A cancel must not move on to suspend or destroy the world mid-upload.
+  cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -846,6 +849,7 @@ async function softwareDevImpl(
   // signal aborts the in-flight agent turn instead of waiting for it to finish.
   let activeTurn: CancellationScope | undefined;
   let activeSetup: CancellationScope | undefined;
+  let activeStaging: CancellationScope | undefined;
 
   const kind = input.project.worldProvider ?? 'worktree';
 
@@ -1184,21 +1188,33 @@ async function softwareDevImpl(
 
   /** Snapshot proposed outputs while their world is still live: at the start
    * of Review (before the world parks), and again before applying them, which
-   * also covers a restored approval and candidates from older executions. A
-   * failure here never fails the task; settlement discards what is unstaged. */
-  async function stageResources(): Promise<void> {
-    if (!resourceCandidateReview || !patched('resource-candidate-staging-v1')) return;
+   * refreshes anything changed and covers a restored approval and candidates
+   * from older executions. A failure never fails the task; settlement discards
+   * what is unstaged. A cancel or replacement interrupts staging at once and
+   * leaves the candidates pending for a restore. True when staging is part of
+   * this execution. */
+  async function stageResources(): Promise<boolean> {
+    if (!resourceCandidateReview || !patched('resource-candidate-staging-v1')) return false;
+    if (cancelled) return true;
+    // Most tasks propose none. If even the count fails, staging reports for itself.
+    const pending = await core.pendingResourceCandidates(taskId)
+      .catch((err) => { if (isCancellation(err)) throw err; return 1; });
+    if (!pending) return true;
     stagingResources = true;
     const priorStatus = status;
     status = 'active';
     await publish();
-    try { await resourceStaging.stageResourceCandidates(taskId); }
-    catch (err) { if (cancelled || isCancellation(err)) throw err; }
-    finally { stagingResources = false; status = priorStatus; }
+    const scope = new CancellationScope({ cancellable: true });
+    activeStaging = scope; // from here a cancel reaches the activity; before, it is seen below
+    try { if (!cancelled) await scope.run(() => resourceStaging.stageResourceCandidates(taskId)); }
+    catch (err) { if (isCancellation(err) && !cancelled) throw err; }
+    finally { activeStaging = undefined; stagingResources = false; status = priorStatus; }
+    return true;
   }
 
-  async function applyReviewedResources(): Promise<void> {
-    await stageResources();
+  /** False when a cancel stopped staging: nothing is adopted for a cancelled task. */
+  async function applyReviewedResources(): Promise<boolean> {
+    if (await stageResources() && cancelled) return false;
     applyingResources = true;
     status = 'active';
     await publish();
@@ -1206,6 +1222,7 @@ async function softwareDevImpl(
       await runLandingActivity(() => resourceActivities.settleResourceReview(taskId));
       resourcesApplied = true;
     } finally { applyingResources = false; }
+    return true;
   }
 
   /** Play the one canonical Review route. Restored proposals call this after
@@ -1223,7 +1240,7 @@ async function softwareDevImpl(
 
     const automaticResources = resourceCandidateReview && patched('automatic-resource-review-v1');
     if (automaticResources) await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
-    await stageResources();
+    if (await stageResources() && cancelled) return 'cancelled';
     if (resourceCandidateReview && !automaticResources) {
       let resolutionAtWait = resourceResolutionEpoch;
       let pending = await core.pendingResourceCandidates(taskId);
@@ -1334,7 +1351,7 @@ async function softwareDevImpl(
       }
     }
 
-    if (automaticResources) await applyReviewedResources();
+    if (automaticResources && !(await applyReviewedResources())) return 'cancelled';
     confirmed = true;
     if (intentAuthorizedLanding) {
       landing = {
@@ -1429,7 +1446,7 @@ async function softwareDevImpl(
     await landingWatcher?.signal('providerChanged').catch(() => undefined);
   });
   setHandler(confirmSignal, () => {
-    if (awaitingResourceDecision || stagingResources) return;
+    if (awaitingResourceDecision) return;
     if (stage === 'escalated' && escalationAction) {
       if (escalationAction === 'confirm') manualEscalationRequested = true;
       return;
@@ -1465,6 +1482,7 @@ async function softwareDevImpl(
       cancelled = true;
       activeSetup?.cancel(); // abort provider allocation/provisioning during Setup
       activeTurn?.cancel(); // abort an in-flight agent turn immediately (SPEC §5.6)
+      activeStaging?.cancel();
       cancelChildren(); // and tear down any running sub-task agents
     }
   });
@@ -1474,6 +1492,7 @@ async function softwareDevImpl(
       cancelled = true;
       activeSetup?.cancel();
       activeTurn?.cancel();
+      activeStaging?.cancel();
       if (!patched('software-dev-preserve-replacement-children-v1')) cancelChildren();
     }
   });
@@ -3580,7 +3599,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   // Recovery may carry an already-approved proposal across a replacement run
   // and bypass the review gate. Finish any interrupted resource publication too.
   if (restoredReviewApproved && resourceCandidateReview && !resourcesApplied
-    && patched('automatic-resource-review-restored-v1')) await applyReviewedResources();
+    && patched('automatic-resource-review-restored-v1') && !(await applyReviewedResources())) return await abort();
 
   if (repositoryless) {
     stage = 'done';

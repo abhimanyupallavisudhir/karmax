@@ -391,7 +391,7 @@ describe('project resources', () => {
     await world.writeFile('data/records.json', '{"records":1}');
     await world.writeFile('raw/page.txt', 'scanned page');
     const cleanup = async () => { await world.destroy(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); };
-    return { store, task, resources, world, cleanup };
+    return { store, task, resources, world, cleanup, objects: path.join(dir, 'objects') };
   }
 
   it('retries a transient snapshot failure and discards a candidate whose path is gone, with its reason', async () => {
@@ -402,16 +402,25 @@ describe('project resources', () => {
       // A transient failure is retried with the candidate kept…
       const exec = world.exec.bind(world);
       const flaky = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
-        command === 'bash' && String(args?.[1]).includes('find -H') ? { code: 1, stdout: '', stderr: 'sandbox unavailable' }
+        command === 'bash' && String(args?.[1]).includes("find -H 'data'") ? { code: 1, stdout: '', stderr: 'sandbox unavailable' }
           : exec(command, args, options));
       vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
       await expect(resources.stageCandidates(task.id)).rejects.toThrow('sandbox unavailable');
       expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('pending');
+      // …without holding up the other candidates…
+      expect((await store.getResourceAttachment(raw.attachment.id))?.currentRevisionId).toBeTruthy();
       flaky.mockRestore();
-      // …but a vanished path is final at once.
+      // …and so is a sandbox that cannot answer whether the path exists…
+      const silent = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
+        command === 'bash' && String(args?.[1]).includes('echo present') ? { code: -1, stdout: '', stderr: 'sandbox paused' }
+          : exec(command, args, options));
+      await expect(resources.stageCandidates(task.id)).rejects.toThrow('sandbox paused');
+      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('pending');
+      silent.mockRestore();
+      // …but a path that is really gone is final at once.
       await world.exec('rm', ['-rf', 'data']);
       const result = await resources.stageCandidates(task.id);
-      expect(result.staged).toEqual([raw.candidate.id]);
+      expect(result.staged).toEqual([]);
       expect(result.failed).toEqual([expect.objectContaining({ candidateId: data.candidate.id, sourcePath: 'data' })]);
       const failed = (await store.getResourceCandidate(data.candidate.id))!;
       expect(failed).toMatchObject({ state: 'discarded', resolvedBy: 'system:resource-stage-failed',
@@ -441,83 +450,119 @@ describe('project resources', () => {
     } finally { vi.restoreAllMocks(); await cleanup(); }
   });
 
-  it('explains a SQLite snapshot that cannot fit and never leaves a partial copy behind', async () => {
-    const { store, task, resources, world, cleanup } = await candidateFixture('stage-sqlite-space');
-    try {
-      const root = world.handle.workdir ?? world.handle.root;
-      const db = new DatabaseSync(path.join(root, 'data/records.db'));
-      db.exec('CREATE TABLE t (v TEXT); INSERT INTO t VALUES (\'row\')'); db.close();
-      const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
-      const exec = world.exec.bind(world);
-      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
-      const tight = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
-        command === 'bash' && String(args?.[1]).includes('df -B1') ? { code: 0, stdout: `${8 * 2 ** 30} ${5 * 2 ** 30}`, stderr: '' }
-          : exec(command, args, options));
-      await expect(resources.stageCandidates(task.id)).rejects.toThrow(
-        'needs 8.0 GiB of free disk in the task world, but only 5.0 GiB is free');
-      tight.mockRestore();
-      // A copy that dies part-way (disk full) is removed, not left filling the disk.
-      vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) => {
-        if (command !== 'python3') return exec(command, args, options);
-        await exec('bash', ['-lc', `head -c 4096 /dev/zero > ${String(args?.[3])}`]);
-        return { code: 1, stdout: '', stderr: 'sqlite3.OperationalError: database or disk is full' };
-      });
-      const result = await resources.stageCandidates(task.id, { final: true });
-      expect(result.failed).toEqual([expect.objectContaining({ candidateId: data.candidate.id,
-        error: expect.stringContaining('database or disk is full') })]);
-      expect(fs.readdirSync(path.join(root, '.karmax-injection')).filter((name) => name.startsWith('sqlite-backup-'))).toEqual([]);
-      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('discarded');
-    } finally { vi.restoreAllMocks(); await cleanup(); }
-  });
-
-  it('reads a settled SQLite database in place, without a copy, and rejects one that changes mid-read', async () => {
-    const { store, task, resources, world, cleanup } = await candidateFixture('stage-sqlite-in-place');
+  it('reads a SQLite database too large to copy in place, under a read lock, and never leaves a partial copy', async () => {
+    const { store, task, resources, world, cleanup } = await candidateFixture('stage-sqlite');
     try {
       const root = world.handle.workdir ?? world.handle.root;
       const file = path.join(root, 'data/records.db');
       const db = new DatabaseSync(file);
-      db.exec('CREATE TABLE t (v TEXT); INSERT INTO t VALUES (\'settled\')'); db.close();
-      await new Promise((resolve) => setTimeout(resolve, 2_200)); // older than the racy-clean window
+      db.exec('CREATE TABLE t (v TEXT); INSERT INTO t VALUES (\'kept\')'); db.close();
       const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
       const exec = world.exec.bind(world);
       vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
-      const calls = vi.spyOn(world, 'exec');
-      // A write landing while the bytes are read is caught by the stamp check.
-      let wrote = false;
+      const tight = (command: string, args?: string[]) => command === 'bash' && String(args?.[1]).includes('df -B1')
+        ? { code: 0, stdout: `${8 * 2 ** 30} ${5 * 2 ** 30}`, stderr: '' } : undefined;
+      // A writer holding the database keeps the lock from being taken: say why.
+      const writer = new DatabaseSync(file);
+      writer.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; INSERT INTO t VALUES (\'uncommitted\')');
+      const calls = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
+        tight(command, args) ?? exec(command, args, options));
+      await expect(resources.stageCandidates(task.id)).rejects.toThrow(
+        'needs 8.0 GiB of free disk in the task world, but only 5.0 GiB is free (or the database must be idle)');
+      writer.exec('ROLLBACK'); writer.close();
+      // Idle, it is read in place: no copy, and a write attempted meanwhile waits for the lock.
+      let blocked = false;
       calls.mockImplementation(async (command, args, options) => {
+        const answer = tight(command, args);
+        if (answer) return answer;
         const result = await exec(command, args, options);
-        if (!wrote && command === 'bash' && String(args?.[1]).includes('records.db') && String(args?.[1]).includes('dd ')) {
-          wrote = true;
-          const writer = new DatabaseSync(file); writer.exec('INSERT INTO t VALUES (\'late\')'); writer.close();
+        if (!blocked && command === 'bash' && String(args?.[1]).includes('records.db') && String(args?.[1]).includes('dd ')) {
+          const late = new DatabaseSync(file);
+          try { late.exec('INSERT INTO t VALUES (\'late\')'); } catch (error) { blocked = /locked/.test(String(error)); }
+          late.close();
         }
         return result;
       });
-      await expect(resources.stageCandidates(task.id)).rejects.toThrow('changed while it was being snapshotted');
-      expect(wrote).toBe(true);
-      calls.mockClear();
-      calls.mockImplementation(exec);
-      await new Promise((resolve) => setTimeout(resolve, 2_200));
-      expect(await resources.stageCandidates(task.id, { final: true })).toMatchObject({ staged: [data.candidate.id] });
+      expect(await resources.stageCandidates(task.id, { final: true })).toMatchObject({ staged: [data.candidate.id], failed: [] });
+      expect(blocked).toBe(true);
       expect(calls.mock.calls.some(([command]) => command === 'python3')).toBe(false);
+      expect(fs.readdirSync(path.join(root, '.karmax-injection')).filter((name) => name.startsWith('sqlite-'))).toEqual([]);
       const revision = (await store.getResourceRevision((await store.getResourceAttachment(data.attachment.id))!.currentRevisionId!))!;
       const restored = path.join(root, 'restored'); fs.mkdirSync(restored);
-      await resources['engine'].restore(revision, async (file: string, bytes: Buffer, offset: number) => {
-        fs.mkdirSync(path.dirname(path.join(restored, file)), { recursive: true });
-        fs.writeFileSync(path.join(restored, file), bytes, { flag: offset ? 'a' : 'w' });
+      await resources['engine'].restore(revision, async (name: string, bytes: Buffer, offset: number) => {
+        fs.mkdirSync(path.dirname(path.join(restored, name)), { recursive: true });
+        fs.writeFileSync(path.join(restored, name), bytes, { flag: offset ? 'a' : 'w' });
       });
       const copy = new DatabaseSync(path.join(restored, 'records.db'));
-      expect(copy.prepare('SELECT v FROM t ORDER BY rowid').all()).toEqual([{ v: 'settled' }, { v: 'late' }]);
+      expect(copy.prepare('SELECT v FROM t ORDER BY rowid').all()).toEqual([{ v: 'kept' }]);
       copy.close();
+      // With room to copy, a failed copy (disk full) is removed, not left filling the disk.
+      await world.exec('bash', ['-lc', 'echo more > data/more.txt']);
+      calls.mockImplementation(async (command, args, options) => {
+        if (command !== 'python3') return exec(command, args, options);
+        await exec('bash', ['-lc', `head -c 4096 /dev/zero > ${String(args?.[3])}`]);
+        return { code: 1, stdout: '', stderr: 'sqlite3.OperationalError: database or disk is full' };
+      });
+      const writerAgain = new DatabaseSync(file); writerAgain.exec('INSERT INTO t VALUES (\'changed\')'); writerAgain.close();
+      await expect(resources.stageCandidates(task.id)).rejects.toThrow('database or disk is full');
+      expect(fs.readdirSync(path.join(root, '.karmax-injection')).filter((name) => name.startsWith('sqlite-'))).toEqual([]);
+      // The snapshot already taken is kept when a refresh keeps failing.
+      await resources.stageCandidates(task.id, { final: true });
+      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('pending');
+      expect((await store.getResourceAttachment(data.attachment.id))?.currentRevisionId).toBe(revision.id);
     } finally { vi.restoreAllMocks(); await cleanup(); }
   }, 30_000);
 
-  it('stages a candidate once when two attempts race', async () => {
-    const { store, task, resources, cleanup } = await candidateFixture('stage-race');
+  it('refreshes a staged candidate that changed, reading only what changed', async () => {
+    const { store, task, resources, world, cleanup } = await candidateFixture('stage-refresh');
+    try {
+      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      await world.writeFile('raw/old.txt', 'settled');
+      await new Promise((resolve) => setTimeout(resolve, 2_200)); // past the racy-clean window
+      await resources.stageCandidates(task.id, { final: true });
+      const first = (await store.getResourceAttachment(raw.attachment.id))!.currentRevisionId!;
+      expect(await resources.stageCandidates(task.id)).toEqual({ staged: [], failed: [] });
+      expect((await store.getResourceAttachment(raw.attachment.id))!.currentRevisionId).toBe(first);
+      await world.writeFile('raw/page.txt', 'rescanned page');
+      const exec = world.exec.bind(world);
+      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
+      const reads = vi.spyOn(world, 'exec').mockImplementation(exec);
+      expect(await resources.stageCandidates(task.id)).toEqual({ staged: [raw.candidate.id], failed: [] });
+      expect(reads.mock.calls.some(([, args]) => String(args?.[1]).includes('dd ') && String(args?.[1]).includes('old.txt'))).toBe(false);
+      const second = (await store.getResourceRevision((await store.getResourceAttachment(raw.attachment.id))!.currentRevisionId!))!;
+      expect(second).toMatchObject({ parentRevisionId: first, files: 2,
+        bytes: Buffer.byteLength('settled') + Buffer.byteLength('rescanned page') });
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  }, 30_000);
+
+  it('releases an upload whose candidate was discarded while it ran', async () => {
+    const { store, task, resources, cleanup, objects } = await candidateFixture('stage-discard-race');
     try {
       const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
-      await Promise.all([resources.stageCandidates(task.id, { final: true }), resources.stageCandidates(task.id, { final: true })]);
+      const engine = resources['engine'];
+      const capture = engine.capture.bind(engine);
+      vi.spyOn(engine, 'capture').mockImplementation(async (...args: Parameters<typeof capture>) => {
+        const captured = await capture(...args);
+        await resources.discardCandidate(task.id, data.candidate.id, 'user:reviewer');
+        return captured;
+      });
+      expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [], failed: [] });
+      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('discarded');
+      expect(allFiles(objects)).toHaveLength(0);
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  });
+
+  it('stages a candidate once when two attempts race', async () => {
+    const { store, task, resources, cleanup, objects } = await candidateFixture('stage-race');
+    try {
+      const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
+      await Promise.allSettled([resources.stageCandidates(task.id), resources.stageCandidates(task.id)]);
       expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('pending');
       expect((await store.getResourceAttachment(data.attachment.id))?.currentRevisionId).toBeTruthy();
+      // The loser recorded nothing, so the candidate still discards cleanly.
+      expect(await store.listResourceRevisions(data.attachment.id)).toHaveLength(1);
+      await resources.discardCandidate(task.id, data.candidate.id, 'user:reviewer');
+      expect(allFiles(objects)).toHaveLength(0);
     } finally { await cleanup(); }
   });
 
