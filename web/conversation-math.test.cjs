@@ -34,7 +34,8 @@ const context = vm.createContext({
 });
 vm.runInContext(src.match(/^function renderFlag\([\s\S]*?^}\n/m)[0], context);
 vm.runInContext(src.match(/^const mathjaxEnabled = .*$/m)[0].replace('const ', 'globalThis.'), context);
-for (const name of ['setMathjaxEnabled', 'renderMessageBody', 'typesetMath', 'wireExplainMessages']) {
+vm.runInContext(src.match(/^const markdownSurfaces = .*$/m)[0].replace('const ', 'globalThis.'), context);
+for (const name of ['setMathjaxEnabled', 'renderMessageBody', 'typesetMath', 'wireExplainMessages', 'wireTexToggles', 'mountMarkdownSurface', 'paintMarkdownSurface']) {
   vm.runInContext(extractFn(name), context);
 }
 assert.equal(src.includes('conversationMath'), false, 'no per-conversation math override remains');
@@ -48,10 +49,12 @@ assert.equal(store.get('karmax-mathjax'), '1');
 assert.equal(context.renderMessageBody('$x$'), '<math>$x$</math>');
 assert.equal(rerenders, 2, 'each change refreshes the open conversation');
 
-let click, focused = false, bindings = 0;
-const control = { addEventListener: (_, handler) => { bindings++; click = handler; }, focus: () => { focused = true; } };
-const toolbar = { dataset: { role: 'merge', sourceKey: 'message:1' }, querySelector: (selector) => selector === '.conversation-math' ? control : null };
+let click, bindings = 0;
+const control = { dataset: {}, isConnected: true, setAttribute: () => {}, addEventListener: (_, handler) => { bindings++; click = handler; } };
+const toolbar = { dataset: { role: 'merge', sourceKey: 'message:1' }, querySelector: () => null,
+  querySelectorAll: (selector) => selector === '.tex-toggle' ? [control] : [] };
 context.$ = () => ({ querySelectorAll: () => [toolbar] });
+context.document = { querySelectorAll: () => [control] };
 const a = { taskId: 'a' };
 context.wireExplainMessages(a);
 context.wireExplainMessages({ ...a });
@@ -60,7 +63,21 @@ click();
 assert.equal(store.get('karmax-mathjax'), '0', 'button click toggles the global preference');
 click();
 assert.equal(store.get('karmax-mathjax'), '1', 'a second click turns it back on');
-assert.equal(focused, true, 'button retains keyboard focus after repaint');
+
+// A Markdown preview repaints in place when the preference flips, and is
+// forgotten once it leaves the page.
+const preview = { isConnected: true, innerHTML: '', querySelector: () => null };
+let wired = 0;
+context.mountMarkdownSurface(preview, (math) => (math ? 'math:' : 'plain:') + '$x$', () => wired++);
+assert.equal(preview.innerHTML, 'math:$x$');
+context.setMathjaxEnabled(false);
+assert.equal(preview.innerHTML, 'plain:$x$', 'turning math off repaints the preview');
+assert.equal(wired, 2, 'each paint re-wires the preview content');
+preview.isConnected = false;
+context.setMathjaxEnabled(true);
+assert.equal(preview.innerHTML, 'plain:$x$', 'a detached preview is not repainted');
+assert.equal(context.markdownSurfaces.size, 0, 'a detached preview is released');
+context.document = undefined;
 
 (async () => {
   const math = [{ dataset: {} }];

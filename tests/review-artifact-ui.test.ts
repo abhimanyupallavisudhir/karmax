@@ -44,7 +44,7 @@ describe('review artifact reader', () => {
         body: { appendChild: vi.fn() },
         addEventListener: (_name: string, handler: (event: any) => void) => { shellKeydown = handler; } },
       URL: { createObjectURL: () => 'blob:test' }, esc: (s: string) => s,
-      renderMarkdown: () => '', closeTask, S: state,
+      renderMarkdown: () => '', texToggleHtml: () => '', mountMarkdownSurface: vi.fn(), wireTexToggles: vi.fn(), closeTask, S: state,
       $: select, resetChord: vi.fn(), inRail: () => false,
       focusedEnterAction: () => null,
     });

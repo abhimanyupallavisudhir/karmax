@@ -2637,10 +2637,51 @@ function renderFlag(key, dflt) {
 const markdownEnabled = () => renderFlag('karmax-md-render', true);
 const mathjaxEnabled = () => renderFlag('karmax-mathjax', true);
 
-// One preference, set from Appearance or any conversation's TeX button.
+// One preference, set from Appearance or any TeX button. Conversations repaint
+// with the task page; every other Markdown surface repaints in place.
 function setMathjaxEnabled(on) {
   try { localStorage.setItem('karmax-mathjax', on ? '1' : '0'); } catch {}
+  for (const el of markdownSurfaces) {
+    if (el.isConnected) paintMarkdownSurface(el);
+    else markdownSurfaces.delete(el);
+  }
+  if (typeof document !== 'undefined') {
+    document.querySelectorAll('.tex-toggle').forEach((btn) => btn.setAttribute('aria-pressed', String(on)));
+  }
   if (S.taskTab === 'checkin') renderTaskPage();
+}
+
+// Markdown outside a conversation (file previews, wiki pages): `render(math)`
+// returns its HTML, `after(el)` re-wires its content after each paint.
+const markdownSurfaces = new Set();
+function mountMarkdownSurface(el, render, after) {
+  if (!el) return;
+  el.markdownSurface = { render, after };
+  markdownSurfaces.add(el);
+  paintMarkdownSurface(el);
+}
+function paintMarkdownSurface(el) {
+  window.MathJax?.typesetClear?.([el]);
+  el.innerHTML = el.markdownSurface.render(mathjaxEnabled());
+  el.markdownSurface.after?.(el);
+  typesetMath(el);
+}
+
+// The TeX button beside every conversation message and Markdown preview.
+function texToggleHtml(disabled = false) {
+  return `<button type="button" class="tex-toggle" aria-label="Typeset math" aria-pressed="${mathjaxEnabled()}" title="${disabled ? 'Enable Markdown in Appearance to typeset math' : 'Typeset math everywhere'}" ${disabled ? 'disabled' : ''}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>`;
+}
+function wireTexToggles(root) {
+  root?.querySelectorAll('.tex-toggle').forEach((btn) => {
+    if (btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', () => {
+      const at = [...document.querySelectorAll('.tex-toggle')].indexOf(btn);
+      setMathjaxEnabled(!mathjaxEnabled());
+      // A conversation repaint replaces this button; keep focus on its successor.
+      if (!btn.isConnected) document.querySelectorAll('.tex-toggle')[at]?.focus({ preventScroll: true });
+    });
+  });
 }
 
 // A message body: Markdown when enabled, otherwise the previous plain-escaped
@@ -2689,7 +2730,7 @@ function ensureMathJax() {
 }
 function typesetMath(root) {
   const scope = root || document.getElementById('ck-thread');
-  const enabled = () => mathjaxEnabled() && markdownEnabled();
+  const enabled = () => mathjaxEnabled();
   if (!scope || !enabled() || !scope.querySelector('.md-math')) return;
   ensureMathJax().then(() => {
     if (!scope.isConnected || !enabled() || !window.MathJax || !window.MathJax.typesetPromise) return;
@@ -5881,7 +5922,9 @@ function vaultItemSearchText(item) {
 // Full vault-item chooser used by the compact task-form button. It mirrors the
 // password-manager import panel, while allowing sparse policy overrides for this
 // task. "Inherit" deliberately stays sparse so global policy edits keep flowing.
-function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
+// `single` picks exactly one item (binding a credential request): radios, and no
+// Select all or policy overrides, since the request's own decision sets those.
+function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply, { single = false } = {}) {
   // Sort on open; keep rows steady while the user changes checkboxes.
   items = sortVaultItems(items, selectedIds);
   const localPolicies = JSON.parse(JSON.stringify(policyOverrides || {}));
@@ -5889,10 +5932,10 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `<div class="modal-card vault-grant-modal" role="dialog" aria-modal="true" aria-labelledby="vault-grant-title">
     <div class="section-h" id="vault-grant-title">Vault credentials</div>
-    <p class="vault-grant-help">Choose which credentials agents working on this task may use.</p>
+    <p class="vault-grant-help">${single ? 'Choose the credential to grant.' : 'Choose which credentials agents working on this task may use.'}</p>
     <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
     <div class="vault-grant-box">
-      <label class="vault-grant-head">
+      <label class="vault-grant-head" ${single ? 'hidden' : ''}>
         <input type="checkbox" class="vault-grant-all" ${items.length ? '' : 'disabled'} />
         <span>Select all</span>
         <span class="vault-grant-selected"></span>
@@ -5909,16 +5952,16 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
             ].map(([value, label]) => `<option value="${value}" ${override.reveal === value || (!override.reveal && !value) ? 'selected' : ''}>${label}</option>`).join('');
             return `<div class="vault-grant-item" data-vault-item="${esc(item.id)}">
               <label class="vault-grant-choice">
-                <input type="checkbox" class="vault-grant-pick" value="${esc(item.id)}" ${selectedIds.has(item.id) ? 'checked' : ''} />
+                <input type="${single ? 'radio' : 'checkbox'}" ${single ? 'name="vault-grant-pick"' : ''} class="vault-grant-pick" value="${esc(item.id)}" ${selectedIds.has(item.id) ? 'checked' : ''} />
                 <span class="vault-grant-item-text">
                   <span>${esc(item.label)}</span>
                   <span class="vault-grant-meta mono">${esc(item.type)}${item.username ? ` · ${esc(item.username)}` : ''}${item.domains?.length ? ` · ${esc(item.domains.join(', '))}` : ''}</span>
                 </span>
               </label>
-              <span class="vault-grant-policies">
+              ${single ? '' : `<span class="vault-grant-policies">
                 <label title="${esc(POL_USE_TIP)}">blind use <select class="vault-task-use" ${selectedIds.has(item.id) ? '' : 'disabled'}>${useOptions}</select></label>
                 <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vault-task-reveal" ${selectedIds.has(item.id) ? '' : 'disabled'}>${revealOptions}</select></label>
-              </span>
+              </span>`}
             </div>`;
           }).join('')
           // Name the section that actually exists: the vault lives under
@@ -8405,12 +8448,13 @@ function showArtifactReader(text, kind, name, blob) {
   dialog.className = 'modal-card artifact-reader';
   dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
   dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="artifact-reader-title">${esc(name)}</h2>
-    <a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
+    ${kind === 'markdown' ? texToggleHtml() : ''}<a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
     <div class="artifact-reader-content" tabindex="0"></div>`;
   const content = dialog.querySelector('.artifact-reader-content');
   if (kind === 'markdown') {
     content.classList.add('msg-text', 'md');
-    content.innerHTML = renderMarkdown(text);
+    mountMarkdownSurface(content, (math) => renderMarkdown(text, { math }));
+    wireTexToggles(dialog);
   } else {
     const pre = document.createElement('pre');
     pre.textContent = text;
@@ -9511,7 +9555,7 @@ function explainMessageAffordance(entry, v) {
   return `<div class="explain-tools" data-source-key="${key}" data-role="${role}">
     <button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
     <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>
-    <button type="button" class="conversation-math" aria-label="Typeset math" aria-pressed="${mathjaxEnabled()}" title="${markdownEnabled() ? 'Typeset math in all conversations' : 'Enable Markdown in Appearance to typeset math'}" ${markdownEnabled() ? '' : 'disabled'}><span class="tex-mark" aria-hidden="true">T<span>E</span>X</span></button>
+    ${texToggleHtml(!markdownEnabled())}
     ${error}
   </div>`;
 }
@@ -9604,13 +9648,7 @@ function wireExplainMessages(v) {
     tools.dataset.wired = '1';
     const sourceKey = tools.dataset.sourceKey;
     const role = tools.dataset.role || 'do';
-    tools.querySelector('.conversation-math')?.addEventListener('click', () => {
-      setMathjaxEnabled(!mathjaxEnabled());
-      // The repaint replaces this button; keep keyboard focus on its successor.
-      const replacement = [...$('#main').querySelectorAll('.explain-tools')]
-        .find((el) => el.dataset.sourceKey === sourceKey && el.dataset.role === role);
-      replacement?.querySelector('.conversation-math')?.focus({ preventScroll: true });
-    });
+    wireTexToggles(tools);
     tools.querySelector('.explain-run')?.addEventListener('click', () => runExplanation(tools.conversationView, role, sourceKey));
     tools.querySelector('.explain-more')?.addEventListener('click', () => openExplanationForm(tools.conversationView, role, sourceKey));
   });
@@ -13399,18 +13437,20 @@ function wireWikiLocalLinks(root, proj) {
 // Index: exactly what agents receive each turn — every unconditional entry in
 // full, then the rendered table of contents (importance order, [more…] folds).
 function renderWikiHome(info, proj, pane, data) {
+  const bodies = [...(data.unconditional || []).map((u) => u.body || ''), ...(data.tocText ? [data.tocText] : [])];
   pane.innerHTML = (data.unconditional || []).map((u) => `
     <div class="card wiki-uncond">
       <div class="wiki-uncond-head"><b>${esc(u.name)}</b>${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
-        ${data.view?.writable === false || u.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}</div>
-      <div class="msg-text md wiki-md">${renderMessageBody(u.body || '')}</div>
+        ${data.view?.writable === false || u.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}${texToggleHtml(!markdownEnabled())}</div>
+      <div class="msg-text md wiki-md"></div>
     </div>`).join('') + (data.tocText ? `
     <div class="card wiki-uncond">
-      <div class="wiki-uncond-head"><b>Table of contents</b><span class="chip" title="Sent to agents as names and descriptions only; they open entries with read_wiki">titles only</span></div>
-      <div class="msg-text md wiki-md">${renderMessageBody(data.tocText)}</div>
+      <div class="wiki-uncond-head"><b>Table of contents</b><span class="chip" title="Sent to agents as names and descriptions only; they open entries with read_wiki">titles only</span><span class="grow"></span>${texToggleHtml(!markdownEnabled())}</div>
+      <div class="msg-text md wiki-md"></div>
     </div>` : '');
-  typesetMath(pane);
-  wireWikiLocalLinks(pane, proj);
+  pane.querySelectorAll('.wiki-md').forEach((el, i) =>
+    mountMarkdownSurface(el, (math) => renderMessageBody(bodies[i], math), (body) => wireWikiLocalLinks(body, proj)));
+  wireTexToggles(pane);
   pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
     try {
       const read = await api(wikiUrl(info, '', { path: b.dataset.path }));
@@ -13435,12 +13475,12 @@ function renderWikiPage(info, proj, pane, page) {
       ${page.overridden ? '<span class="chip">customized</span>' : ''}
       ${page.description ? `<small>${esc(page.description)}</small>` : ''}</div></div>
     <div class="card">
-      <div class="msg-text md wiki-md">${renderMessageBody(wikiBody(page.content))}</div>
+      <div class="msg-text md wiki-md"></div>
       ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}</div>
+      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}${texToggleHtml(!markdownEnabled())}</div>
     </div>`;
-  typesetMath(pane);
-  wireWikiLocalLinks(pane, proj);
+  mountMarkdownSurface(pane.querySelector('.wiki-md'), (math) => renderMessageBody(wikiBody(page.content), math), (body) => wireWikiLocalLinks(body, proj));
+  wireTexToggles(pane);
   $('#wiki-page-delete')?.addEventListener('click', async () => {
     const q = page.builtin
       ? `Restore the built-in default for “${page.name}”? Your customized text is discarded.`
@@ -13490,6 +13530,7 @@ function renderWikiEditor(info, proj, pane, page) {
         <button class="wiki-body-tab active" id="wiki-tab-write" type="button">Write</button>
         <button class="wiki-body-tab" id="wiki-tab-preview" type="button">Preview</button>
         <span class="grow"></span>
+        ${texToggleHtml(!markdownEnabled())}
         <label class="switch"><input type="checkbox" id="wiki-yaml"><span>YAML</span></label>
       </div>
       <textarea id="wiki-body" rows="16">${esc(body)}</textarea>
@@ -13546,11 +13587,12 @@ function renderWikiEditor(info, proj, pane, page) {
     $('#wiki-tab-preview').classList.add('active');
     $('#wiki-tab-write').classList.remove('active');
     const preview = $('#wiki-preview');
-    preview.innerHTML = renderMessageBody($('#wiki-body').value) || '<span class="task-sub">Nothing to preview.</span>';
+    const source = $('#wiki-body').value;
+    mountMarkdownSurface(preview, (math) => renderMessageBody(source, math) || '<span class="task-sub">Nothing to preview.</span>');
     $('#wiki-body').hidden = true;
     preview.hidden = false;
-    typesetMath(preview);
   });
+  wireTexToggles(pane);
 
   $('#wiki-cancel').addEventListener('click', () => { S.wikiEditing = null; wireWikiView(proj); });
   $('#wiki-save').addEventListener('click', async () => {
@@ -15470,12 +15512,19 @@ function credentialRequestTaskLink(request) {
     : `<span>${esc(label)}</span>`;
 }
 
-function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true } = {}) {
+// The vault item chosen for each unbound credential request, by request id. It
+// lives outside the row so a re-render of the approvals list keeps the choice.
+const credentialRequestBindings = new Map();
+
+function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true, addLink = true } = {}) {
   const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
   const pendingHtml = pending.length
-    ? pending.map((request) => `<div class="approval-request" data-vreq="${esc(request.id)}">
+    ? pending.map((request) => {
+      const bound = request.itemId ? undefined : credentialRequestBindings.get(request.id);
+      const unbound = !request.itemId && !bound;
+      return `<div class="approval-request" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
         <div class="approval-request-main">
           <div class="approval-request-title">${request.itemId
             ? esc(itemLabel(request.itemId))
@@ -15486,10 +15535,11 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>` : ''}
         </div>
         <div class="approval-request-actions">
-          ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${sortVaultItems(items).map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
-          <button class="btn sm" data-vreq-act="once">Once</button>
-          <button class="btn sm" data-vreq-act="task">This task</button>
-          <button class="btn sm" data-vreq-act="always">Always</button>
+          ${request.itemId ? '' : `${addLink ? `<a class="vreq-add" data-spa href="${globalRoute('organization')}#settings-payments" title="Add it in Settings → Passwords &amp; payments">Add to vault</a>` : ''}
+          <button type="button" class="btn sm vreq-pick" aria-haspopup="dialog"><span>Vault credentials</span><span class="tf-vault-count">${bound ? esc(bound.label) : 'Choose…'}</span></button>`}
+          <button class="btn sm" data-vreq-act="once" ${unbound ? 'disabled' : ''}>Once</button>
+          <button class="btn sm" data-vreq-act="task" ${unbound ? 'disabled' : ''}>This task</button>
+          <button class="btn sm" data-vreq-act="always" ${unbound ? 'disabled' : ''}>Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
           ${policyTip(`Once: ${items.find((item) => item.id === request.itemId)?.type === 'passkey'
             ? 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.'
@@ -15501,7 +15551,8 @@ Always: Does the same as “This task” and sets this credential’s ${request.
 
 Deny: Rejects this request.`, '?')}
         </div>
-      </div>`).join('')
+      </div>`;
+    }).join('')
     : showEmpty ? '<div class="approval-empty">No pending approval requests.</div>' : '';
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
@@ -15611,14 +15662,34 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
 
 function wireCredentialRequestActions(root, organizationId, onResolved) {
   if (!root) return;
+  const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
+  // Load the vault when the picker opens, so an item just added elsewhere (the
+  // "Add to vault" link, another tab) is there to choose without a reload.
+  root.querySelectorAll('[data-vreq] .vreq-pick').forEach((button) => button.addEventListener('click', async () => {
+    const row = button.closest('[data-vreq]');
+    button.disabled = true;
+    let items;
+    try { items = await api(`/api/vault/items${oq}`); } catch (error) { toast(error.message, true); return; } finally { button.disabled = false; }
+    const current = row.dataset.vreqItem;
+    openVaultGrantPicker(items, new Set(current ? [current] : []), {}, (selected) => {
+      const [itemId] = selected;
+      const item = items.find((candidate) => candidate.id === itemId);
+      if (!item) return;
+      credentialRequestBindings.set(row.dataset.vreq, { id: item.id, label: item.label });
+      row.dataset.vreqItem = item.id;
+      button.querySelector('.tf-vault-count').textContent = item.label;
+      row.querySelectorAll('[data-vreq-act]').forEach((action) => { action.disabled = false; });
+    }, { single: true });
+  }));
   root.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((button) => button.addEventListener('click', async () => {
-    const itemId = row.querySelector('.vreq-bind')?.value || undefined;
+    const itemId = row.dataset.vreqItem || undefined;
     button.disabled = true;
     try {
-      const result = await api(`/api/vault/requests/${row.dataset.vreq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
+      const result = await api(`/api/vault/requests/${row.dataset.vreq}/resolve${oq}`, {
         method: 'POST',
         body: JSON.stringify({ action: button.dataset.vreqAct, itemId }),
       });
+      credentialRequestBindings.delete(row.dataset.vreq);
       const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
       toast(result.resume?.resumed ? `${decision} — task resumed automatically`
         : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`, !result.resume?.resumed && !!result.resume?.reason);
@@ -16408,7 +16479,7 @@ async function wireVaultCards(organizationId) {
     let requests = [];
     let items = [];
     try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
-    rbox.innerHTML = credentialRequestRows(requests, items);
+    rbox.innerHTML = credentialRequestRows(requests, items, { addLink: false });
     wireCredentialRequestActions(rbox, organizationId, renderRequests);
   };
   refreshVaultRequests = renderRequests; // live: a new/resolved approval repaints this list (connectWs)
@@ -17341,7 +17412,7 @@ function profileView() {
       <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
       <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
       <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
-      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
+      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">Per-browser display choices.</p>
     </div>
     ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><p class="task-sub">Paid-plan subscriptions started through your account. Organization owners can change or cancel them in Plans &amp; billing.</p><div id="profile-paid-subscriptions" aria-live="polite">Loading subscriptions…</div></div>' : ''}
     <div class="card data-export-card">

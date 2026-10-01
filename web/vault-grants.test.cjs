@@ -9,8 +9,15 @@ const css = fs.readFileSync(path.join(__dirname, 'styles.css'), 'utf8');
 function extractFn(name, async = false) {
   const start = src.indexOf(`${async ? 'async ' : ''}function ${name}(`);
   if (start < 0) throw new Error(`${name} not found`);
+  // Skip the parameter list: it may destructure options (`{ single = false }`).
+  let parens = 0;
+  let body = -1;
+  for (let i = src.indexOf('(', start); i < src.length; i++) {
+    if (src[i] === '(') parens++;
+    else if (src[i] === ')') parens--;
+    else if (src[i] === '{' && parens === 0) { body = i; break; }
+  }
   let depth = 0;
-  const body = src.indexOf('{', start);
   for (let i = body; i < src.length; i++) {
     if (src[i] === '{') depth++;
     else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1);

@@ -18,14 +18,14 @@ describe('conversation TeX button', () => {
       };
       renderTaskPage();
     `);
-    const pressed = () => ui.page.locator('.conversation-math').evaluateAll((els: any[]) => els.map((el) => el.getAttribute('aria-pressed')));
+    const pressed = () => ui.page.locator('.tex-toggle').evaluateAll((els: any[]) => els.map((el) => el.getAttribute('aria-pressed')));
     const preference = () => ui.run<string | null>("localStorage.getItem('karmax-mathjax')");
     expect(await pressed()).toEqual(['true', 'true']);
-    await ui.page.locator('[data-agent="merge"] .conversation-math').click();
+    await ui.page.locator('[data-agent="merge"] .tex-toggle').click();
     expect(await preference()).toBe('0');
     expect(await pressed()).toEqual(['false', 'false']);
     expect(await ui.page.evaluate(() => (globalThis as any).document.activeElement?.closest('[data-agent]')?.getAttribute('data-agent'))).toBe('merge');
-    await ui.page.locator('[data-agent="do"] .conversation-math').click();
+    await ui.page.locator('[data-agent="do"] .tex-toggle').click();
     expect(await preference()).toBe('1');
     expect(await pressed()).toEqual(['true', 'true']);
     expect(ui.errors).toEqual([]);

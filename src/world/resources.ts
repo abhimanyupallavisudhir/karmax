@@ -1132,14 +1132,30 @@ export class ProjectResourceService {
     // serialized operation is the tiny baseline pointer CAS, so a multi-GB model
     // upload cannot block another publication merely while bytes are moving.
     const captured = await this.engine.capture(attachment, filesFromWorld(world, target, attachment));
-    const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: lease.revisionId,
+    const baseline = await this.publicationBaseline(taskId, attachment.currentRevisionId, lease.revisionId);
+    const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: baseline,
       engine: this.engine.id, ...captured, metadata: { summary }, createdByTaskId: taskId }));
     return this.serializePublish(attachmentId, taskId, async () => {
-      const promoted = (await this.store.promoteResourceRevision(attachmentId, revision.id, lease.revisionId));
+      const promoted = (await this.store.promoteResourceRevision(attachmentId, revision.id, baseline));
       (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:promote',
-        scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, from: lease.revisionId, to: revision.id, summary } }));
+        scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, from: baseline, to: revision.id, summary } }));
       return { attachment: promoted, revision, summary };
     });
+  }
+
+  /** The revision a publication must replace. A task that already published
+   * since it forked fast-forwards over its own publications; anything another
+   * task published in between keeps the fork's revision, so the CAS fails. */
+  private async publicationBaseline(taskId: string, currentId: string | undefined, forkedId: string | undefined) {
+    const visited = new Set<string>();
+    let id = currentId;
+    while (id && id !== forkedId && !visited.has(id)) {
+      visited.add(id);
+      const published = await this.store.getResourceRevision(id);
+      if (published?.createdByTaskId !== taskId) return forkedId;
+      id = published.parentRevisionId;
+    }
+    return id === forkedId ? currentId : forkedId;
   }
 
   async discard(taskId: string, attachmentId: string): Promise<void> {
