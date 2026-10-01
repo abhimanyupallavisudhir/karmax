@@ -29,20 +29,37 @@ import { liveEnabled } from './helpers/live-gate.js';
  * (the Write/Edit tools can't produce one), so if the adapter regresses to
  * `acceptEdits` the harness gates Bash, no commit lands, and this fails.
  *
- * Gated on an ambient Claude Code login (the SDK path) + KARMAX_RUN_LIVE=1.
- * Costs real tokens, so it is skipped in the hermetic suite. Run with:
- *   KARMAX_RUN_LIVE=1 npx vitest run tests/claude-permission.test.ts
+ * Gated on KARMAX_RUN_LIVE=1 and a Claude Code login: a captured setup-token
+ * (CLAUDE_CODE_OAUTH_TOKEN or any karmax claude config home), run the way
+ * production leases one — a fresh config home plus the token — or else the
+ * ambient login. The token is what `live.yml` provides; gating on the ambient
+ * login alone skipped this test there. Costs real tokens, so it is skipped in
+ * the hermetic suite. Run with:
+ *   KARMAX_RUN_LIVE=1 CLAUDE_CODE_OAUTH_TOKEN=… npx vitest run tests/claude-permission.test.ts
  */
-const LIVE = liveEnabled() && ClaudeAdapter.hasAmbientLogin();
+function freshLoginToken(): string | undefined {
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) return process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const root = paths().configHomes;
+  if (!fs.existsSync(root)) return undefined;
+  for (const name of fs.readdirSync(root)) {
+    if (!name.startsWith('claude-')) continue;
+    const tok = capturedToken(path.join(root, name));
+    if (tok) return tok;
+  }
+  return undefined;
+}
+const FRESH_TOKEN = freshLoginToken();
+const LIVE = liveEnabled() && (!!FRESH_TOKEN || ClaudeAdapter.hasAmbientLogin());
 
 describe.skipIf(!LIVE)('claude agent executes commands headless (permission seam)', () => {
   it('runs a shell command — proven by a git commit only Bash can make', async () => {
-    // Force the Agent SDK path (the one carrying permissionMode): with no API key
-    // and an ambient login, runTurn dispatches to runAgentSdk rather than the
-    // Messages API (which has no permission gating and wouldn't cover the bug).
+    // Force the Agent SDK path (the one carrying permissionMode): a config home, or
+    // no API key and an ambient login, makes runTurn dispatch to runAgentSdk rather
+    // than the Messages API (which has no permission gating and wouldn't cover the bug).
     const savedKey = process.env.ANTHROPIC_API_KEY;
     delete process.env.ANTHROPIC_API_KEY;
 
+    const configHome = FRESH_TOKEN ? fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-perm-cfg-')) : undefined;
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-perm-worlds-'));
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-perm-repo-'));
     let world: Awaited<ReturnType<WorktreeProvider['create']>> | undefined;
@@ -102,6 +119,7 @@ describe.skipIf(!LIVE)('claude agent executes commands headless (permission seam
         messages,
         role: 'do',
         systemPrompt: 'You are a headless coding agent. Follow the instruction exactly.',
+        ...(configHome ? { resolvedAuth: { configHome, oauthToken: FRESH_TOKEN } } : {}),
       };
 
       await new ClaudeAdapter().runTurn(input, ctx);
@@ -110,6 +128,7 @@ describe.skipIf(!LIVE)('claude agent executes commands headless (permission seam
       expect(log.split('\n')).toContain(marker);
     } finally {
       if (world) await world.destroy().catch(() => {});
+      if (configHome) fs.rmSync(configHome, { recursive: true, force: true });
       fs.rmSync(home, { recursive: true, force: true });
       fs.rmSync(repo, { recursive: true, force: true });
       if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
@@ -133,7 +152,7 @@ describe.skipIf(!LIVE)('claude agent executes commands headless (permission seam
  * edge case.) The fix is a `canUseTool` callback: the SDK's programmatic approver,
  * which handles the `default`-mode prompts and is not gated by the policy.
  *
- * The ambient-login test above can't catch this: `git commit` runs via Bash whose
+ * The test above can't catch this: `git commit` runs via Bash whose
  * approval path differs, and that test never seeds the policy. This test reproduces
  * the exact production condition — a fresh config home carrying the disable policy,
  * authenticated by a captured setup-token — and asserts a Write actually lands.
@@ -143,24 +162,12 @@ describe.skipIf(!LIVE)('claude agent executes commands headless (permission seam
  * config home) + KARMAX_RUN_LIVE=1. Run with:
  *   KARMAX_RUN_LIVE=1 npx vitest run tests/claude-permission.test.ts -t "FRESH config home"
  */
-function freshLoginToken(): string | undefined {
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) return process.env.CLAUDE_CODE_OAUTH_TOKEN;
-  const root = paths().configHomes;
-  if (!fs.existsSync(root)) return undefined;
-  for (const name of fs.readdirSync(root)) {
-    if (!name.startsWith('claude-')) continue;
-    const tok = capturedToken(path.join(root, name));
-    if (tok) return tok;
-  }
-  return undefined;
-}
-const FRESH_TOKEN = freshLoginToken();
 const FRESH_LIVE = liveEnabled() && !!FRESH_TOKEN;
 
 describe.skipIf(!FRESH_LIVE)('claude agent writes files in a FRESH config home (bypass-downgrade seam)', () => {
   it('writes a file that lands in the world — fails if the policy downgrade has no canUseTool approver', async () => {
-    // No API key + ambient login present ⇒ runTurn dispatches to runAgentSdk;
-    // resolvedAuth then redirects it to a fresh config home + the captured token.
+    // resolvedAuth.configHome makes runTurn dispatch to runAgentSdk in a fresh
+    // config home authenticated by the captured token.
     const savedKey = process.env.ANTHROPIC_API_KEY;
     delete process.env.ANTHROPIC_API_KEY;
 
