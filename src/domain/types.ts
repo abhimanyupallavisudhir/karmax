@@ -289,7 +289,12 @@ export interface WorldCheckpoint {
     targetPinned?: boolean;
     role?: 'project-wiki';
   }>;
-  filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
+  /** `format: 2` is a sealed manifest of chunks in `storageLocationId`
+   * (src/world/checkpoint-chunks.ts); without it, one legacy KMX1 document. */
+  filesystemDelta?: { objectKey: string; sha256: string; bytes: number;
+    format?: 2; storageLocationId?: string; files?: number; contentBytes?: number };
+  /** Changed paths with no portable bytes (a nested repository, a socket). */
+  omitted?: Array<{ path: string; reason: string }>;
   resources?: Array<{ attachmentId: string; revisionId: string }>;
   /** Metadata-only inventory of ignored paths omitted from the portable delta.
    * Contents are never read or uploaded by this safety net. */

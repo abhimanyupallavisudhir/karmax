@@ -155,3 +155,58 @@ it('refuses an id that does not name exactly one tenant directory, before removi
   await expect(api.removeTenantContent({ projectIds: [project.id, '..'] })).rejects.toThrow(/refusing/);
   expect(exists(content.paths)).toEqual(all(content.paths, true));
 });
+
+it('deleting a project releases its chunked checkpoints and their chunks, and a sibling keeps its own', async () => {
+  const { LocalObjectStore } = await import('../src/store/objects.js');
+  const { Vault } = await import('../src/autonomy/vault.js');
+  const { CredentialBroker } = await import('../src/autonomy/broker.js');
+  const { StorageLocationService } = await import('../src/store/storage-locations.js');
+  const { ObjectSnapshotEngine, ProjectResourceService } = await import('../src/world/resources.js');
+  const { WorldCheckpointService } = await import('../src/world/checkpoint.js');
+  const { WorktreeProvider } = await import('../src/world/worktree.js');
+  const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(directory, 'worlds')));
+  const broker = new CredentialBroker(new Vault(path.join(directory, 'vault')));
+  const objects = new LocalObjectStore(path.join(directory, 'objects'));
+  const locations = new StorageLocationService(store, objects, broker);
+  const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker, locations), broker, undefined, locations);
+  const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, resources);
+  const tokens = new TokenAuthority();
+  const client = { workflow: { getHandle: () => ({ terminate }) } } as any;
+  const gateway = await Gateway.create({ store, tokens, worlds, client, objects, resources, checkpoints, broker,
+    api: new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: directory }),
+    authorization: await AuthorizationService.create(store), taskQueue: 'test', staticDir: path.resolve('web'),
+    bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(),
+    agentInfo: { provider: 'mock', reason: 'chunked checkpoint deletion' } });
+  const local = await gateway.listen(await findFreePortFrom(port += 10));
+  const { token } = await (await fetch(`${local.url}/api/session`)).json() as { token: string };
+  const organization = await store.createOrganization({ name: 'Checkpoints', ownerUserId: 'me' });
+  const shared = Buffer.alloc(5 * 1024 * 1024, 3);
+  const checkpointOf = async (name: string) => {
+    const project = await store.createProject(name, { worldProvider: 'worktree' }, organization.id);
+    const task = await store.createTask({ projectId: project.id, title: name, workflow: 'just-do', workflowVersion: '1', params: { prompt: 'x' } });
+    const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+    world.handle.meta = { projectId: project.id };
+    world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+    await world.writeFileBuffer!('weights.bin', shared);
+    await world.writeFile('notes.txt', `notes of ${name}`);
+    const checkpoint = await checkpoints.checkpoint(world.handle);
+    await world.destroy();
+    return { project, checkpoint };
+  };
+  try {
+    const removed = await checkpointOf('Removed');
+    const kept = await checkpointOf('Kept');
+    const chunks = path.join(directory, 'objects', 'resources', organization.id, 'chunks');
+    expect(fs.readdirSync(chunks)).toHaveLength(4); // two shared weight chunks, one pack each
+
+    const response = await fetch(`${local.url}/api/projects/${removed.project.id}`, { method: 'DELETE',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' } });
+    expect(response.status).toBe(200);
+    expect(fs.existsSync(path.join(directory, 'objects', removed.checkpoint.filesystemDelta!.objectKey))).toBe(false);
+    expect(fs.readdirSync(chunks)).toHaveLength(3);
+    expect(await store.listProjectCheckpoints(removed.project.id)).toEqual([]);
+    const restored = await checkpoints.restore(kept.checkpoint.id, 'worktree');
+    expect(fs.readFileSync(path.join(restored.root, 'weights.bin')).equals(shared)).toBe(true);
+    expect(fs.readFileSync(path.join(restored.root, 'notes.txt'), 'utf8')).toBe('notes of Kept');
+  } finally { await local.close(); }
+});

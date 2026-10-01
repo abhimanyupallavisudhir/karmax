@@ -3,7 +3,6 @@ import type { PasskeyCredential } from '../autonomy/passkey.js';
 import { ExecutionOutput } from './execution-output.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
-import { checkpointEncodingStats } from '../world/checkpoint-executor.js';
 import { GatewayMetrics } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
@@ -138,6 +137,8 @@ export interface GatewayDeps {
   worldAccess?: import('../world/access.js').WorldAccessService;
   objects?: ObjectStore;
   resources?: import('../world/resources.js').ProjectResourceService;
+  /** Releases chunked task checkpoints when their project is deleted. */
+  checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
   subscriptions?: import('../billing/subscriptions.js').SubscriptionBillingService;
   paidLaunchSettings?: import('../launch/settings.js').PaidLaunchSettingsService;
   cellId?: string;
@@ -3400,13 +3401,10 @@ export class Gateway {
       }
       if (p === '/api/metrics' && method === 'GET') {
         const pool = store.asyncReadStats;
-        const checkpoints = checkpointEncodingStats();
         const value = prometheusMetrics((await store.operationalSnapshot())) + (this.operationalMetrics?.prometheus() ?? '')
           + `# TYPE karmax_database_pending gauge\nkarmax_database_pending ${pool.pending}\n`
           + `# TYPE karmax_database_connections gauge\nkarmax_database_connections ${pool.connections}\n`
-          + `# TYPE karmax_database_waiting gauge\nkarmax_database_waiting ${pool.waiting}\n`
-          + `# TYPE karmax_checkpoint_encoders_active gauge\nkarmax_checkpoint_encoders_active ${checkpoints.active}\n`
-          + `# TYPE karmax_checkpoint_encoders_waiting gauge\nkarmax_checkpoint_encoders_waiting ${checkpoints.waiting}\n`;
+          + `# TYPE karmax_database_waiting gauge\nkarmax_database_waiting ${pool.waiting}\n`;
         res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8',
           'content-length': String(Buffer.byteLength(value)), 'cache-control': 'no-store' });
         return void res.end(value);
@@ -8739,6 +8737,9 @@ export class Gateway {
       } catch (error) { if (!isWorldGone(error)) throw error; }
     }
     await this.deps.resources?.deleteProject(projectId);
+    if (this.deps.checkpoints) await this.deps.checkpoints.deleteProject(projectId);
+    else if ((await this.deps.store.listProjectCheckpoints(projectId)).some(checkpoint => checkpoint.filesystemDelta?.format === 2))
+      throw new Error('checkpoint storage is unavailable; project checkpoints were not deleted');
     if (resources.objectKeys.length && !this.deps.objects)
       throw new Error('object store is unavailable; project resources were not fully deleted');
     for (const key of resources.objectKeys) await this.deps.objects!.delete(key);

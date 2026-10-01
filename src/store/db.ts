@@ -2147,7 +2147,8 @@ export class Store {
     }
     const objectKeys = new Set<string>();
     for (const row of (await this.db.prepare('SELECT manifest FROM world_checkpoints WHERE projectId=?').all(projectId)) as any[]) {
-      try { const checkpoint = JSON.parse(row.manifest) as WorldCheckpoint; if (checkpoint.filesystemDelta?.objectKey) objectKeys.add(checkpoint.filesystemDelta.objectKey); } catch {}
+      // Chunked checkpoints are released through WorldCheckpointService.deleteProject.
+      try { const checkpoint = JSON.parse(row.manifest) as WorldCheckpoint; if (checkpoint.filesystemDelta?.objectKey && checkpoint.filesystemDelta.format !== 2) objectKeys.add(checkpoint.filesystemDelta.objectKey); } catch {}
     }
     for (const row of (await this.db.prepare('SELECT objectKey FROM promoted_artifacts WHERE projectId=?').all(projectId)) as any[])
       objectKeys.add(String(row.objectKey));
@@ -6152,8 +6153,9 @@ export class Store {
     if (!value) return undefined;
     const refs = Number(((await this.db.prepare(`SELECT
       (SELECT COUNT(*) FROM resource_attachments WHERE storageLocationId=?) +
-      (SELECT COUNT(*) FROM resource_revisions WHERE storageLocationId=?) AS n`).get(id, id)) as any)?.n ?? 0);
-    if (refs) throw new Error('storage location is still used by project resources or revisions');
+      (SELECT COUNT(*) FROM resource_revisions WHERE storageLocationId=?) +
+      (SELECT COUNT(*) FROM world_checkpoints WHERE json_extract(manifest, '$.filesystemDelta.storageLocationId')=?) AS n`).get(id, id, id)) as any)?.n ?? 0);
+    if (refs) throw new Error('storage location is still used by project resources, revisions or task checkpoints');
     (await this.db.prepare('DELETE FROM storage_locations WHERE id=?').run(id));
     return value;
   
@@ -6170,9 +6172,14 @@ export class Store {
       retainedBytes += Number(((await this.db.prepare('SELECT COALESCE(SUM(bytes), 0) bytes FROM promoted_artifacts WHERE organizationId=?')
         .get(location.organizationId)) as any)?.bytes ?? 0);
       retainedBytes += Number(((await this.db.prepare(`SELECT COALESCE(SUM(CAST(json_extract(manifest, '$.filesystemDelta.bytes') AS INTEGER)), 0) bytes
-        FROM world_checkpoints WHERE projectId IN (SELECT id FROM projects WHERE organizationId=?)`)
+        FROM world_checkpoints WHERE projectId IN (SELECT id FROM projects WHERE organizationId=?)
+        AND json_extract(manifest, '$.filesystemDelta.storageLocationId') IS NULL`)
         .get(location.organizationId)) as any)?.bytes ?? 0);
     }
+    // A chunked checkpoint's chunks are counted above; its manifest is counted here.
+    retainedBytes += Number(((await this.db.prepare(`SELECT COALESCE(SUM(CAST(json_extract(manifest, '$.filesystemDelta.bytes') AS INTEGER)), 0) bytes
+      FROM world_checkpoints WHERE json_extract(manifest, '$.filesystemDelta.storageLocationId')=?`)
+      .get(locationId)) as { bytes?: number } | undefined)?.bytes ?? 0);
     return { locationId, retainedBytes, quotaBytes: location.quotaBytes,
       ...(location.quotaBytes == null ? {} : { availableBytes: Math.max(0, location.quotaBytes - retainedBytes) }) };
   }
@@ -6406,7 +6413,8 @@ export class Store {
       for (const checkpoint of checkpoints.slice(2)) {
         if (pinned.has(checkpoint.id)) continue;
         if (checkpoint.filesystemDelta) await this.kvSet(`checkpoint-gc:${checkpoint.id}`,
-          JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta.objectKey }));
+          JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta.objectKey,
+            ...(checkpoint.filesystemDelta.format === 2 ? { projectId: checkpoint.projectId, filesystemDelta: checkpoint.filesystemDelta } : {}) }));
       }
     });
   }
@@ -6418,11 +6426,19 @@ export class Store {
     });
   }
 
-  async completeCheckpointDeletion(checkpointId: string): Promise<void> {
-    await this.db.transaction(async () => {
-      await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpointId);
+  /** True for exactly one caller: the one whose call removed the record. */
+  async completeCheckpointDeletion(checkpointId: string): Promise<boolean> {
+    return this.db.transaction(async () => {
+      const removed = await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpointId);
       await this.kvDelete(`checkpoint-gc:${checkpointId}`);
+      return Number(removed.changes) === 1;
     });
+  }
+
+  /** Every checkpoint of a project, including those waiting for collection. */
+  async listProjectCheckpoints(projectId: string): Promise<WorldCheckpoint[]> {
+    return ((await this.db.prepare('SELECT manifest FROM world_checkpoints WHERE projectId=?').all(projectId)) as Array<{ manifest: string }>)
+      .map(row => JSON.parse(row.manifest) as WorldCheckpoint);
   }
 
   async getWorldCheckpoint(id: string): Promise<WorldCheckpoint | undefined> {
