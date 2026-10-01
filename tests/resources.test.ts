@@ -193,6 +193,66 @@ describe('project resources', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // Task legibench3#10 (2026-10-01): a task that had already published its
+  // spend ledger once could never publish it again. Every later confirmation
+  // fenced on the lease's original revision, which its own first publication
+  // had replaced, so the workflow failed "resource baseline changed".
+  it('publishes again on top of the task\'s own earlier publication', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-republish-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'resources/\n');
+    await git(repo, ['add', '-A']); await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Ledger', { repos: [repo] }));
+    const task = (await store.createTask({ projectId: project.id, title: 'Run', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'run' } }));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const ledger = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'Ledger', driver: 'volume@1', target: { kind: 'path', path: 'resources/ledger' }, access: 'write',
+      isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
+    const initial = await resources.importFiles(ledger.id, [{ path: 'spend.txt', data: Buffer.from('0') }]);
+    const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
+    world.handle = await resources.materialize(project.id, task.id, world, 1);
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
+    const current = async () => (await store.getResourceRevision((await store.getResourceAttachment(ledger.id))!.currentRevisionId!))!;
+
+    await world.writeFileBuffer!('resources/ledger/spend.txt', Buffer.from('10'));
+    await resources.beginReview(task.id, 'first');
+    await resources.settleReview(task.id);
+    const first = await current();
+    expect(first.parentRevisionId).toBe(initial.id);
+
+    await world.writeFileBuffer!('resources/ledger/spend.txt', Buffer.from('25'));
+    expect((await resources.summarize(task.id, ledger.id)).promoted).not.toBe(true);
+    await resources.beginReview(task.id, 'second');
+    await resources.settleReview(task.id);
+    const second = await current();
+    expect(second.id).not.toBe(first.id);
+    expect(second.parentRevisionId).toBe(first.id);
+    expect((await resources.summarize(task.id, ledger.id)).promoted).toBe(true);
+
+    // Another task's publication in between is still a conflict.
+    const other = (await store.createTask({ projectId: project.id, title: 'Other', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'other' } }));
+    const otherWorld = await worlds.create('worktree', { taskId: other.id, repo, base: 'main' });
+    otherWorld.handle = await resources.materialize(project.id, other.id, otherWorld, 1);
+    otherWorld.handle = (await store.registerWorld(otherWorld.handle, project.id)) as typeof otherWorld.handle;
+    await otherWorld.writeFileBuffer!('resources/ledger/spend.txt', Buffer.from('40'));
+    await resources.promote(other.id, ledger.id);
+    await world.writeFileBuffer!('resources/ledger/spend.txt', Buffer.from('30'));
+    await resources.beginReview(task.id, 'third');
+    await expect(resources.settleReview(task.id)).rejects.toThrow(/baseline changed/);
+
+    await resources.release(otherWorld.handle); await otherWorld.destroy();
+    await resources.release(world.handle); await world.destroy();
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('validates unsafe targets and shared-write publication', async () => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Safety'));
