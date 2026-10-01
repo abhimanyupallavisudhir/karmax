@@ -6546,11 +6546,11 @@ export class Store {
     return this.db.transaction(async () => {
       const revision = (await this.getResourceRevision(id));
       if (!revision) return undefined;
-      const referenced = (await this.referencedResourceRevisionIds());
+      // Targeted checks, not referencedResourceRevisionIds(): this runs once
+      // per deletion while holding the Store's write lock.
       const attachment = (await this.getResourceAttachment(revision.attachmentId));
       const current = attachment?.currentRevisionId === id;
-      if (referenced.has(id) && !(options.allowCurrent && current
-        && !(await this.resourceRevisionReferencedBesidesCurrent(id)))) return undefined;
+      if ((current && !options.allowCurrent) || (await this.resourceRevisionReferencedBesidesCurrent(id))) return undefined;
       if (current) (await this.db.prepare('UPDATE resource_attachments SET currentRevisionId=NULL, updatedAt=? WHERE id=?')
         .run(Date.now(), revision.attachmentId));
       (await this.db.prepare('DELETE FROM resource_revisions WHERE id=?').run(id));
