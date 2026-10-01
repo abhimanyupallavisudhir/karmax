@@ -21,6 +21,7 @@
     "test:coverage": "vitest run --coverage",
     "test:durations": "tsx scripts/test-durations.ts",
     "typecheck": "tsc --noEmit",
+    "typecheck:lowmem": "node scripts/typecheck-lowmem.mjs",
     "lint": "tsx scripts/lint.ts",
     "reset": "tsx src/scripts/reset.ts",
     "backup": "tsx src/scripts/backup.ts",

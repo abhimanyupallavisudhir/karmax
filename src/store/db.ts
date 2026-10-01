@@ -1034,6 +1034,8 @@ export class Store {
       (await this.db.exec("ALTER TABLE organizations ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'"));
     if (!organizationCols.some((c) => c.name === 'nameVisibility'))
       (await this.db.exec("ALTER TABLE organizations ADD COLUMN nameVisibility TEXT NOT NULL DEFAULT 'members'"));
+    if (!organizationCols.some((c) => c.name === 'storagePacks'))
+      (await this.db.exec('ALTER TABLE organizations ADD COLUMN storagePacks INTEGER NOT NULL DEFAULT 0'));
     const policyAcceptanceCols = (await this.db.prepare('PRAGMA table_info(policy_acceptances)').all()) as { name: string }[];
     if (!policyAcceptanceCols.some((c) => c.name === 'organizationId'))
       (await this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN organizationId TEXT'));
@@ -1776,7 +1778,28 @@ export class Store {
     const organization = (await this.getOrganization(organizationId));
     if (!organization) throw new Error(`no organization ${organizationId}`);
     return organizationEntitlements(organization.plan, this.hosted,
-      (await this.listOrganizationMemberships(organizationId)).length);
+      (await this.listOrganizationMemberships(organizationId)).length, organization.storagePacks ?? 0);
+  }
+
+  /** Billing's storage-pack mutation boundary, beside setOrganizationPlan: the
+   * count of packs a verified subscription carries (0 when it has none). */
+  async setOrganizationStoragePacks(organizationId: string, storagePacks: number): Promise<Organization> {
+    return this.db.transaction(async () => {
+      if (!Number.isSafeInteger(storagePacks) || storagePacks < 0) throw new Error('storage packs must be a non-negative integer');
+      if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
+      (await this.db.prepare('UPDATE organizations SET storagePacks=? WHERE id=?').run(storagePacks, organizationId));
+      this.notifyOrganizationEntitlementsChanged(organizationId);
+      return (await this.getOrganization(organizationId))!;
+    });
+  }
+
+  /** The quota a storage location enforces. A hosted organization's managed
+   * storage follows its plan, active users and packs; any other location keeps
+   * its own configured quota (a private operator's cap, or none). */
+  async storageLocationQuotaBytes(location: StorageLocation): Promise<number | undefined> {
+    if (location.kind === 'managed' && this.hosted)
+      return (await this.organizationEntitlements(location.organizationId)).storageQuotaBytes ?? undefined;
+    return location.quotaBytes;
   }
 
   /** Billing's sole plan mutation boundary. Pricing and limits remain in the
@@ -6173,8 +6196,9 @@ export class Store {
         FROM world_checkpoints WHERE projectId IN (SELECT id FROM projects WHERE organizationId=?)`)
         .get(location.organizationId)) as any)?.bytes ?? 0);
     }
-    return { locationId, retainedBytes, quotaBytes: location.quotaBytes,
-      ...(location.quotaBytes == null ? {} : { availableBytes: Math.max(0, location.quotaBytes - retainedBytes) }) };
+    const quotaBytes = (await this.storageLocationQuotaBytes(location));
+    return { locationId, retainedBytes, quotaBytes,
+      ...(quotaBytes == null ? {} : { availableBytes: Math.max(0, quotaBytes - retainedBytes) }) };
   }
 
   async backfillManagedStorageLocation(organizationId: string, locationId: string): Promise<void> {
@@ -6195,12 +6219,12 @@ export class Store {
     if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      const retained = (await this.storageLocationUsage(storageLocationId)).retainedBytes;
+      const { retainedBytes: retained, quotaBytes } = (await this.storageLocationUsage(storageLocationId));
       const total = retained + Number(((await this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
         FROM storage_upload_reservations WHERE storageLocationId=? AND uploadId<>?`)
         .get(storageLocationId, uploadId)) as any)?.bytes ?? 0) + bytes;
-      if (location.quotaBytes != null && total > location.quotaBytes)
-        throw new Error(`managed upload quota exceeded (${total} retained or pending bytes, ${location.quotaBytes} byte limit)`);
+      if (quotaBytes != null && total > quotaBytes)
+        throw new Error(`managed upload quota exceeded (${total} retained or pending bytes, ${quotaBytes} byte limit)`);
       (await this.db.prepare(`INSERT INTO storage_upload_reservations (uploadId, organizationId, storageLocationId, bytes, expiresAt)
         VALUES (?, ?, ?, ?, ?) ON CONFLICT(uploadId) DO UPDATE SET bytes=excluded.bytes, expiresAt=excluded.expiresAt`)
         .run(uploadId, organizationId, storageLocationId, bytes, expiresAt));
@@ -6230,10 +6254,11 @@ export class Store {
         if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
         const newBytes = (await __asyncCollections.reduce(chunks, async (sum, chunk) => sum + ((await this.db.prepare(
           'SELECT 1 FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?').get(organizationId, chunk.id)) ? 0 : chunk.bytes), 0));
-        const used = Number(((await this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes FROM resource_snapshot_chunks
-          WHERE organizationId=? AND storageLocationId=?`).get(organizationId, storageLocationId)) as any)?.bytes ?? 0);
-        if (location.quotaBytes != null && used + newBytes > location.quotaBytes)
-          throw new Error(`managed storage quota exceeded (${used + newBytes} bytes requested, ${location.quotaBytes} byte limit)`);
+        // The same total the quota is shown against: chunks, and for managed
+        // storage also artifacts and checkpoints.
+        const { retainedBytes: used, quotaBytes } = (await this.storageLocationUsage(storageLocationId));
+        if (quotaBytes != null && used + newBytes > quotaBytes)
+          throw new Error(`managed storage quota exceeded (${used + newBytes} bytes requested, ${quotaBytes} byte limit)`);
       }
       for (const chunk of chunks) (await insert.run(organizationId, chunk.id, storageLocationId ?? null, chunk.bytes));
       (await this.db.exec('COMMIT'));
@@ -8389,7 +8414,7 @@ function requiredTargets(policy: ConfirmationPolicy): number {
 
 function rowToOrganization(r: any): Organization {
   return { id: r.id, name: r.name, slug: r.slug, kind: r.kind, nameVisibility: r.nameVisibility === 'public' ? 'public' : 'members',
-    plan: isHostedPlanId(r.plan) ? r.plan : 'free', createdAt: r.createdAt };
+    plan: isHostedPlanId(r.plan) ? r.plan : 'free', storagePacks: Number(r.storagePacks ?? 0) || 0, createdAt: r.createdAt };
 }
 
 function rowToTeam(r: any): Team {

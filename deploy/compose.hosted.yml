@@ -35,9 +35,6 @@ services:
       KARMAX_S3_ENDPOINT: ${KARMAX_S3_ENDPOINT:?set S3 endpoint}
       KARMAX_S3_BUCKET: ${KARMAX_S3_BUCKET:?set S3 bucket}
       KARMAX_S3_REGION: ${KARMAX_S3_REGION:-us-east-1}
-      # Included physical snapshot storage per organization. 0 disables the
-      # ceiling; public SaaS operators should keep a finite value.
-      KARMAX_MANAGED_STORAGE_QUOTA_BYTES: ${KARMAX_MANAGED_STORAGE_QUOTA_BYTES:-5368709120}
       # Optional installation authorization boundary for platform-funded model
       # rails. Empty keeps managed model admission disabled regardless of org UI.
       KARMAX_MANAGED_MODEL_REQUEST_CEILINGS: ${KARMAX_MANAGED_MODEL_REQUEST_CEILINGS:-}

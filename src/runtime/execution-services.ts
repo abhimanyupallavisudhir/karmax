@@ -66,10 +66,11 @@ export async function createExecutionServices(input: {
         secretAccessKey: requiredEnv('KARMAX_S3_SECRET_ACCESS_KEY'), sessionToken: process.env.KARMAX_S3_SESSION_TOKEN,
       })
     : new LocalObjectStore(p.objects);
-  const configuredStorageQuota = process.env.KARMAX_MANAGED_STORAGE_QUOTA_BYTES;
-  const managedStorageQuotaBytes = configuredStorageQuota == null
-    ? (deployment.hosted ? 5 * 1024 * 1024 * 1024 : undefined)
-    : Number(configuredStorageQuota) > 0 ? Math.floor(Number(configuredStorageQuota)) : undefined;
+  // Hosted managed storage follows each organization's plan; this cap is for
+  // private installations only.
+  const configuredStorageQuota = deployment.hosted ? undefined : process.env.KARMAX_MANAGED_STORAGE_QUOTA_BYTES;
+  const managedStorageQuotaBytes = configuredStorageQuota != null && Number(configuredStorageQuota) > 0
+    ? Math.floor(Number(configuredStorageQuota)) : undefined;
   const storageLocations = new StorageLocationService(store, objectStore, broker, managedStorageQuotaBytes,
     !deployment.hosted);
   if (bootstrap) for (const organization of (await store.listOrganizations())) (await storageLocations.ensureManaged(organization.id));

@@ -13,7 +13,9 @@ export function managedStorageLocationId(organizationId: string): string {
 }
 
 /** Organization storage control plane. The operator store remains the bounded,
- * zero-configuration default; customer S3 credentials never enter SQLite. */
+ * zero-configuration default; customer S3 credentials never enter SQLite.
+ * `managedQuotaBytes` is a private operator's cap: a hosted organization's
+ * managed quota follows its plan (`Store.storageLocationQuotaBytes`). */
 export class StorageLocationService {
   private stores = new Map<string, ObjectStore>();
 
@@ -38,17 +40,19 @@ export class StorageLocationService {
 
   async list(organizationId: string): Promise<Array<Omit<StorageLocation, 'credentialHandle'> & { credentialConfigured: boolean; usage: StorageLocationUsage }>> {
     (await this.ensureManaged(organizationId));
-    return (await __asyncCollections.map((await this.store.listStorageLocations(organizationId)), async ({ credentialHandle, ...location }) => ({
-      ...location, credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)),
-      usage: (await this.store.storageLocationUsage(location.id)),
-    })));
+    return (await __asyncCollections.map((await this.store.listStorageLocations(organizationId)), async ({ credentialHandle, ...location }) => {
+      const usage = (await this.store.storageLocationUsage(location.id));
+      return { ...location, quotaBytes: usage.quotaBytes,
+        credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)), usage };
+    }));
   }
 
   async view(organizationId: string, id: string): Promise<Omit<StorageLocation, 'credentialHandle'>
     & { credentialConfigured: boolean; usage: StorageLocationUsage }> {
     const { credentialHandle, ...location } = (await this.ownedLocation(organizationId, id));
-    return { ...location, credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)),
-      usage: (await this.store.storageLocationUsage(id)) };
+    const usage = (await this.store.storageLocationUsage(id));
+    return { ...location, quotaBytes: usage.quotaBytes,
+      credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)), usage };
   }
 
   async defaultLocation(organizationId: string): Promise<StorageLocation> {

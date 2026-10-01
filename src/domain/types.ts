@@ -48,6 +48,8 @@ export interface Organization {
   kind: 'personal' | 'team';
   /** Hosted billing selection. Private installations ignore monetization plans. */
   plan: HostedPlanId;
+  /** Paid storage packs billing has verified; ignored on Free. */
+  storagePacks?: number;
   createdAt: number;
 }
 

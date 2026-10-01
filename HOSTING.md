@@ -29,7 +29,7 @@ file an operator setting lives only as long as the shell that exported it, and
 | `KARMAX_HOME`, `KARMAX_HOST`, `KARMAX_PORT`, `KARMAX_PUBLIC_URL`, `KARMAX_PREVIEW_ORIGIN` | operator | Infrastructure and origins. |
 | `KARMAX_AUTH_SECRET`, `KARMAX_VAULT_KEY`, `KARMAX_WORLD_REF_KEY` | operator | Stable keys. Hosted startup refuses to boot without all three at ≥ 32 chars. New sandbox references are sealed with the vault's `world-reference:key:v2` (`WorldReferenceKeys`); `KARMAX_WORLD_REF_KEY` still opens references sealed before it. |
 | `KARMAX_DATABASE_URL`, `KARMAX_TEMPORAL_*`, `KARMAX_OBJECT_STORE`, `KARMAX_S3_*` | operator | Durability. Hosted requires PostgreSQL and a real Temporal address; managed cells require S3. |
-| `KARMAX_MANAGED_STORAGE_QUOTA_BYTES` | operator | Hard physical snapshot-byte allowance per organization. Hosted defaults to 5 GiB; `0` means unlimited and is unsuitable for open registration. |
+| `KARMAX_MANAGED_STORAGE_QUOTA_BYTES` | operator | Private installations only: a managed-storage cap per organization (unset or `0` means none). Hosted managed storage follows each organization's plan and storage packs (`HOSTED_PLANS`, `STORAGE_PACK` in `src/domain/entitlements.ts`). |
 | `KARMAX_MANAGED_MODEL_REQUEST_CEILINGS` | operator | Optional JSON map of `provider/model` (or `provider/*`) to a conservative per-request micro-dollar ceiling. Empty means BYOK-only. It authorizes bounded admission, not provider credits. |
 | `KARMAX_MANAGED_MODEL_PRICING` | operator | Optional JSON map using the same keys and `{inputMicrosPerMillionTokens, outputMicrosPerMillionTokens, cacheReadMicrosPerMillionTokens, cacheWriteMicrosPerMillionTokens}`. Complete provider-reported counters become incurred cost; otherwise the request ceiling is retained and shown explicitly as an estimate. |
 | `KARMAX_OIDC_*` | operator | Optional enterprise SSO (PKCE and issuer validation enforced). Register `https://<your-karmax-origin>/api/auth/callback/enterprise` as the redirect URI at the IdP (before the better-auth 1.7 upgrade it was `/api/auth/oauth2/callback/enterprise`). |
@@ -177,9 +177,9 @@ knowing:
 
 - **Compute and managed project storage are bounded.** A new tenant has no agent
   credential and no cloud-world provider, so they cannot spend your model tokens
-  or boot a sandbox — every turn fails closed. Versioned project data is admitted
-  against `KARMAX_MANAGED_STORAGE_QUOTA_BYTES` using physical encrypted-chunk
-  accounting. The hosted default is 5 GiB per organization. Wiki/metadata growth
+  or boot a sandbox — every turn fails closed. Versioned project data, review
+  artifacts and checkpoints are admitted against the organization's plan quota
+  (Free 5 GiB) using physical encrypted-byte accounting. Wiki/metadata growth
   remains small-row database traffic and should still be covered by deployment
   disk monitoring and abuse controls.
 - **Platform-funded model use is opt-in, never a balance.** A hosted organization
