@@ -26,8 +26,10 @@ function decl(name) {
 
 const FUNCTIONS = ['wikiScopeInfo', 'wikiView', 'wikiViewOptionsHtml', 'loadWikiRefs', 'wikiUrl', 'wikiRead',
   'forgetWikiReads', 'paintWikiRead', 'openWikiEntry', 'wikiEnclosingEntry', 'wikiTreeHtml', 'wireWikiView',
-  'wikiBody', 'renderWikiHome', 'renderWikiPage', 'wireWikiLocalLinks', 'wikiRoute', 'wikiViewFromQuery', 'isNewTabClick', 'decodeRoutePart'];
-const DECLS = ['wikiReadCache', 'wikiReadsInFlight', 'wikiIsDefault', 'wikiGlyph', 'wikiTaskIds', 'wikiGeneration'];
+  'wikiBody', 'renderWikiHome', 'renderWikiPage', 'wireWikiLocalLinks', 'wikiRoute', 'wikiViewFromQuery', 'isNewTabClick', 'decodeRoutePart',
+  'renderFlag', 'setMathjaxEnabled', 'mountMarkdownSurface', 'paintMarkdownSurface', 'texToggleHtml', 'wireTexToggles'];
+const DECLS = ['wikiReadCache', 'wikiReadsInFlight', 'wikiIsDefault', 'wikiGlyph', 'wikiTaskIds', 'wikiGeneration',
+  'markdownEnabled', 'mathjaxEnabled', 'markdownSurfaces'];
 
 const index = (label) => ({
   toc: { children: [
