@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { Pool } from 'pg';
 import crypto from 'node:crypto';
 import { BillingRequestRejected, PaddleSubscriptionProvider, type PaddleRuntimeConfig } from '../src/billing/paddle.js';
 import { FakeSubscriptionProvider, StripeSubscriptionProvider, SubscriptionBillingService,
@@ -14,9 +15,9 @@ const event = (id: string, type: string, object: any, created: number) =>
 
 /** An organization whose Team (or Individual) subscription was verified
  * through the stub provider, with `packs` storage packs on it. */
-async function subscribed(plan: 'individual' | 'team' = 'team', packs = 0) {
-  const store = await Store.create(':memory:', { hosted: true });
-  const organization = await store.createOrganization({ name: 'Packs', ownerUserId: 'owner' });
+async function subscribed(plan: 'individual' | 'team' = 'team', packs = 0, location = ':memory:') {
+  const store = await Store.create(location, { hosted: true });
+  const organization = await store.createOrganization({ name: `Packs ${crypto.randomUUID().slice(0, 8)}`, ownerUserId: 'owner' });
   const provider = new FakeSubscriptionProvider();
   const billing = new SubscriptionBillingService(store, provider, true);
   await billing.checkout(organization.id, plan, urls, `checkout-${organization.id}`);
@@ -86,6 +87,31 @@ describe('storage packs from verified subscription state', () => {
     await expect(f.deliver('customer.subscription.updated', object)).rejects.toThrow(/duplicate storage pack/);
     expect(await f.granted()).toBe(0);
     await f.store.close();
+  });
+});
+
+const postgres = process.env.KARMAX_TEST_POSTGRES_URL;
+(postgres ? describe : describe.skip)('storage packs on PostgreSQL', () => {
+  it('persists verified packs and adds the column to an existing billing table', async () => {
+    const admin = new Pool({ connectionString: postgres });
+    try {
+      await admin.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
+      let f = await subscribed('team', 2, postgres);
+      expect(await f.billing.current(f.organization.id)).toMatchObject({ storagePacks: 2 });
+      await f.store.close();
+      await admin.query('ALTER TABLE subscription_billing_accounts DROP COLUMN "storagePacks"');
+      const store = await Store.create(postgres!, { hosted: true });
+      expect(await new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true).current(f.organization.id))
+        .toMatchObject({ plan: 'team', storagePacks: 0 });
+      await store.close();
+      await admin.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
+      f = await subscribed('individual', 1, postgres);
+      expect(await f.granted()).toBe(1);
+      await f.store.close();
+    } finally {
+      await admin.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
+      await admin.end();
+    }
   });
 });
 
