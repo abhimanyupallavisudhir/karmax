@@ -62,4 +62,15 @@ describe('credential attention notifications', () => {
     await notifyCredentialAttention({ store, configHomes: homes }, NOW + 7_200_000);
     expect(await inbox()).toEqual([]);
   });
+
+  it('replaces the expiring notice when the login then signs out', async () => {
+    const { homes, store, login } = await setup();
+    login('lapsing', signedIn(NOW + 2 * DAY));
+    await notifyCredentialAttention({ store, configHomes: homes }, NOW);
+    login('lapsing', { accessToken: '', refreshToken: '', expiresAt: 0, refreshTokenExpiresAt: NOW + 2 * DAY });
+    await notifyCredentialAttention({ store, configHomes: homes }, NOW + 3 * DAY);
+    expect(await store.listInbox('owner', 'org_personal', { limit: 50 })).toEqual([
+      expect.objectContaining({ subject: expect.objectContaining({ credentialKey: 'login:claude:lapsing', reason: 'signed-out' }) }),
+    ]);
+  });
 });

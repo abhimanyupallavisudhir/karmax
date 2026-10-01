@@ -4508,11 +4508,21 @@ export class Store {
     createdAt = Date.now()): Promise<void> {
     return this.db.transaction(async () => {
 
-    const ids = new Set<string>();
-    for (const notice of notices) for (const userId of new Set(userIds)) {
-      const id = `inbox_credential_${crypto.createHash('sha256')
-        .update(JSON.stringify([organizationId, userId, notice.credentialKey, notice.reason, notice.expiresAt])).digest('hex').slice(0, 24)}`;
-      ids.add(id);
+    const rows = new Map<string, { userId: string; notice: CredentialNotice }>();
+    for (const notice of notices) for (const userId of new Set(userIds))
+      rows.set(`inbox_credential_${crypto.createHash('sha256')
+        .update(JSON.stringify([organizationId, userId, notice.credentialKey, notice.reason, notice.expiresAt])).digest('hex').slice(0, 24)}`,
+        { userId, notice });
+    // Withdraw notices that no longer apply first: the inbox keeps one live row
+    // per (user, task id, kind), so an expiring login's notice would otherwise
+    // block its signed-out successor and then be swept, leaving none.
+    const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='credential'`)
+      .all(organizationId)) as any[]).map((row) => String(row.id)).filter((id) => !rows.has(id));
+    if (stale.length) {
+      (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+      (await deleteRows(this.db, 'inbox', 'id', stale));
+    }
+    for (const [id, { userId, notice }] of rows) {
       const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
         (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
         VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
@@ -4525,12 +4535,6 @@ export class Store {
       for (const channel of channels) (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
         (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
         .run(newId('delivery'), id, channel, createdAt, createdAt));
-    }
-    const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='credential'`)
-      .all(organizationId)) as any[]).map((row) => String(row.id)).filter((id) => !ids.has(id));
-    if (stale.length) {
-      (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
-      (await deleteRows(this.db, 'inbox', 'id', stale));
     }
 
     });
