@@ -29,14 +29,18 @@ import { ensureRemoteBrowser, installedClaudeCodeVersion, materializeRemoteSessi
   reconcileRemoteCodexSessionCopies, RemoteSpawnedProcess, CODEX_REMOTE_REFRESH_SENTINEL, installMemoryGuard,
   spawnRemoteAgentProcess } from '../src/agent/remote-process.js';
 import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
-import { classifyProviderTurnError, isTransportError, ProviderOutage } from '../src/agent/limits.js';
+import { classifyProviderTurnError, isTransportError, ProviderFailure, ProviderOutage, SandboxProviderFailure } from '../src/agent/limits.js';
 import type { World, WorldPty, WorldPtySpec, WorldPtyTermination } from '../src/world/types.js';
 
-const codexIdToken = (expiresAt: number) =>
+const codexJwt = (expiresAt: number) =>
   `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(expiresAt / 1000) })).toString('base64url')}.signature`;
 const freshCodexAuth = () => JSON.stringify({
   auth_mode: 'chatgpt',
-  tokens: { id_token: codexIdToken(Date.now() + 60 * 60_000), access_token: 'access', refresh_token: 'host-authority' },
+  tokens: {
+    id_token: codexJwt(Date.now() + 60 * 60_000),
+    access_token: codexJwt(Date.now() + 10 * 24 * 60 * 60_000),
+    refresh_token: 'host-authority',
+  },
 });
 
 describe('remote subscription agents', () => {
@@ -843,12 +847,44 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(2);
   });
 
-  it('refreshes an expired canonical ID token before seeding a remote Codex process', async () => {
+  it('reports the host-confirmed sign-out when mid-turn recovery finds the login revoked', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-revoked-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
+    const usageStub = path.join(localHome, 'revoked-stub.cjs');
+    fs.writeFileSync(usageStub, `#!/usr/bin/env node
+const readline = require('readline');
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') send({ id: request.id, result: {} });
+  else if (request.method === 'account/read') send({ id: request.id, result: { account: null, requiresOpenaiAuth: true } });
+  else if (request.method === 'account/rateLimits/read') send({ id: request.id, result: { rateLimits: {} } });
+});`);
+    fs.chmodSync(usageStub, 0o755);
+    process.env.KARMAX_CODEX_USAGE_CMD = usageStub;
+    const world = fakeWorld(true, false, true);
+
+    const failure = await new CodexAdapter().runTurn({
+      profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
+      world, messages: [{ id: 'm', role: 'user', text: 'continue safely', ts: 0 }],
+      systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity() {}, platformRequest: async () => [{ type: 'ok' }] } as any).catch(error => error);
+
+    // Still a sandbox-turn failure (AD-7), but it now says what the host found;
+    // the host probe then confirms the sign-out (see usage.test.ts).
+    expect(failure).toBeInstanceOf(SandboxProviderFailure);
+    expect(failure.failure).toBeInstanceOf(ProviderFailure);
+    expect(failure.failure.metadata).toMatchObject({ kind: 'credential', permanence: 'hard', provider: 'codex' });
+    expect(failure.message).toMatch(/signed out by OpenAI/);
+    expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('refreshes a nearly expired canonical access token before seeding a remote Codex process', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-preflight-'));
-    const expiredIdToken = codexIdToken(Date.now() - 60_000);
+    const expiringAccessToken = codexJwt(Date.now() + 60 * 60_000);
     fs.writeFileSync(path.join(localHome, 'auth.json'), JSON.stringify({
       auth_mode: 'chatgpt',
-      tokens: { id_token: expiredIdToken, access_token: 'still-valid', refresh_token: 'host-authority' },
+      tokens: { id_token: codexJwt(Date.now() - 60_000), access_token: expiringAccessToken, refresh_token: 'host-authority' },
     }));
     const usageStub = path.join(localHome, 'preflight-stub.cjs');
     fs.writeFileSync(usageStub, `#!/usr/bin/env node
@@ -856,13 +892,15 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+const jwt = (seconds) => 'e30.' + Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + seconds })).toString('base64url') + '.signature';
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const request = JSON.parse(line);
   if (request.method === 'initialize') send({ id: request.id, result: {} });
   else if (request.method === 'account/read') {
     const authPath = path.join(process.env.CODEX_HOME, 'auth.json');
     const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
-    auth.tokens.id_token = 'e30.' + Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url') + '.signature';
+    auth.tokens.id_token = jwt(3600);
+    auth.tokens.access_token = jwt(10 * 24 * 3600);
     fs.writeFileSync(authPath, JSON.stringify(auth));
     send({ id: request.id, result: { account: { type: 'chatgpt' } } });
   } else if (request.method === 'account/rateLimits/read') send({ id: request.id, result: { rateLimits: {} } });
@@ -882,12 +920,48 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 
     const remoteHome = remoteAgentHomeRelative('codex', localHome);
     const projected = JSON.parse(world.files.get(`${remoteHome}/auth.json`)!.toString());
-    expect(projected.tokens.id_token).not.toBe(expiredIdToken);
+    expect(projected.tokens.access_token).not.toBe(expiringAccessToken);
     expect(projected.tokens.refresh_token).toBe(CODEX_REMOTE_REFRESH_SENTINEL);
     expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
     expect(activities).toContainEqual(expect.objectContaining({
       id: 'codex-credential-preflight', phase: 'completed',
     }));
+  });
+
+  // Task legibench3#10 (2026-10-01 18:53): during an OpenAI sign-in outage the
+  // pre-turn refresh of an expired one-hour ID token silently renewed nothing,
+  // and the turn failed although the access token Codex uses had 225 hours left.
+  it('runs a remote Codex turn on a valid access token even when the ID token expired and refresh is down', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-id-expired-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: {
+        id_token: codexJwt(Date.now() - 14 * 60 * 60_000),
+        access_token: codexJwt(Date.now() + 225 * 60 * 60_000),
+        refresh_token: 'host-authority',
+      },
+    }));
+    const marker = path.join(localHome, 'unexpected-refresh');
+    const usageStub = path.join(localHome, 'outage-stub.cjs');
+    fs.writeFileSync(usageStub, `#!/usr/bin/env node
+require('fs').writeFileSync(${JSON.stringify(marker)}, 'refresh attempted');
+process.exit(1);`);
+    fs.chmodSync(usageStub, 0o755);
+    process.env.KARMAX_CODEX_USAGE_CMD = usageStub;
+    const world = fakeWorld(true);
+    const activities: any[] = [];
+
+    const result = await new CodexAdapter().runTurn({
+      profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
+      world,
+      messages: [{ id: 'm', role: 'user', text: 'continue safely', ts: 0 }],
+      systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity: (activity: any) => activities.push(activity),
+      platformRequest: async () => [{ type: 'ok' }] } as any);
+
+    expect(result).toMatchObject({ termination: { kind: 'success' } });
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(activities.filter((activity) => activity.id === 'codex-credential-preflight')).toEqual([]);
   });
 
   it.each([

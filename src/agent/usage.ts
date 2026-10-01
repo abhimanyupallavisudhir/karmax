@@ -15,7 +15,7 @@ import { CodexAppServerClient } from './codex-app-server-client.js';
 import { localProviderCli } from './provider-cli.js';
 import { createCustodyEnv, killAgent } from './custody.js';
 import { BRAND } from '../domain/brand.js';
-import { providerFailure } from './limits.js';
+import { ProviderFailure, ProviderOutage, providerFailure } from './limits.js';
 
 /**
  * Proactive quota (RESOLVE-PLAN §2 / #6). `claude -p '/usage'` prints a parseable
@@ -77,9 +77,16 @@ export type UsageRunner = (configDir: string) => Promise<string>;
 export type CodexUsageRunner = () => Promise<unknown>;
 const codexRefreshes = new Map<string, { promise: Promise<unknown>; force: boolean }>();
 const claudeRefreshes = new Map<string, Promise<string>>();
-/** Leave enough lifetime for sandbox startup and the initial Responses stream.
- * Long turns remain protected by the bounded terminal-401 recovery in codex.ts. */
-export const CODEX_REMOTE_ID_TOKEN_SAFETY_MS = 10 * 60_000;
+/** Codex authenticates with its access token (about ten days) and refreshes it
+ * only in its last five minutes; it never reads the one-hour ID token's expiry.
+ * A remote projection cannot refresh, so the host renews it a day ahead, which
+ * leaves a failed early refresh (a provider sign-in outage) a day to recover. */
+export const CODEX_REMOTE_ACCESS_TOKEN_REFRESH_AHEAD_MS = 24 * 60 * 60_000;
+/** Enough access-token lifetime for sandbox startup and the first Responses
+ * stream. Long turns remain protected by the bounded terminal-401 recovery in codex.ts. */
+export const CODEX_REMOTE_ACCESS_TOKEN_SAFETY_MS = 10 * 60_000;
+/** Codex's own fallback when an access token carries no readable expiry. */
+const CODEX_TOKEN_REFRESH_INTERVAL_MS = 8 * 24 * 60 * 60_000;
 /** Leave enough access-token lifetime for sandbox startup and the first Claude
  * request. Mid-turn expiry is handled by the adapter's bounded recovery. */
 export const CLAUDE_REMOTE_ACCESS_TOKEN_SAFETY_MS = 10 * 60_000;
@@ -343,6 +350,7 @@ export async function probeCodexUsage(
     });
     return parseCodexRateLimits(payload, now);
   } catch (e) {
+    if (e instanceof ProviderFailure && e.metadata.kind === 'credential') return { ok: false, at: now, reason: 'logged-out' };
     return { ok: false, at: now, reason: `probe-failed: ${String((e as Error).message ?? e)}` };
   }
 }
@@ -484,14 +492,15 @@ export async function refreshCodexLogin(
   return created;
 }
 
-/** A remote Codex projection has no usable refresh credential, so ensure its
- * short-lived ID token remains valid before launch. Refresh the one canonical
- * host home before projection; the sandbox still never receives refresh
- * authority. Returns whether a refresh was performed. */
+/** A remote Codex projection has no usable refresh credential, so renew the one
+ * canonical host login before projecting it once its access token nears expiry;
+ * the sandbox still never receives refresh authority. A failed early refresh
+ * keeps a still-usable token. Returns whether the token was renewed. */
 export async function ensureCodexLoginFresh(
   opts: {
     configHome?: string;
     now?: number;
+    refreshAheadMs?: number;
     minValidityMs?: number;
     timeoutMs?: number;
     run?: CodexUsageRunner;
@@ -499,35 +508,61 @@ export async function ensureCodexLoginFresh(
   } = {},
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
-  const minValidityMs = opts.minValidityMs ?? CODEX_REMOTE_ID_TOKEN_SAFETY_MS;
-  const expiresAt = codexIdTokenExpiresAt(opts.configHome);
-  if (expiresAt !== undefined && expiresAt - now >= minValidityMs) return false;
+  const refreshAheadMs = opts.refreshAheadMs ?? CODEX_REMOTE_ACCESS_TOKEN_REFRESH_AHEAD_MS;
+  const minValidityMs = opts.minValidityMs ?? CODEX_REMOTE_ACCESS_TOKEN_SAFETY_MS;
+  const usable = (expiresAt: number | undefined) => expiresAt !== undefined && expiresAt - now >= minValidityMs;
+  const expiresAt = codexAccessTokenExpiresAt(opts.configHome);
+  if (expiresAt !== undefined && expiresAt - now >= refreshAheadMs) return false;
   opts.onRefresh?.();
-  await refreshCodexLogin({
-    configHome: opts.configHome,
-    timeoutMs: opts.timeoutMs,
-    run: opts.run,
-    force: true,
-  });
-  const refreshedExpiry = codexIdTokenExpiresAt(opts.configHome);
-  if (refreshedExpiry === undefined || refreshedExpiry - now < minValidityMs) {
-    throw new Error('Codex login refresh completed without a fresh ID token');
+  let refreshError: unknown;
+  try {
+    await refreshCodexLogin({
+      configHome: opts.configHome,
+      timeoutMs: opts.timeoutMs,
+      run: opts.run,
+      force: true,
+    });
+  } catch (error) {
+    // A login the provider signed out cannot launch, however long its token lasts.
+    if (error instanceof ProviderFailure) throw error;
+    refreshError = error;
   }
-  return true;
+  const refreshedExpiry = codexAccessTokenExpiresAt(opts.configHome);
+  if (usable(refreshedExpiry)) return refreshedExpiry! > (expiresAt ?? -Infinity);
+  // `account/read` swallows refresh errors, so a stale token after it means the
+  // provider's sign-in service failed (2026-10-01: an OpenAI login outage).
+  throw new ProviderOutage(`OpenAI did not renew the Codex login before this remote turn; ${BRAND} will keep retrying.`,
+    { cause: refreshError });
 }
 
-function codexIdTokenExpiresAt(configHome?: string): number | undefined {
+/** When the sandbox's Codex will consider the access token expired: its JWT
+ * `exp`, else Codex's eight-day refresh interval from `last_refresh`. */
+function codexAccessTokenExpiresAt(configHome?: string): number | undefined {
   try {
     const auth = JSON.parse(fs.readFileSync(codexCredentialPath(configHome), 'utf8'));
-    const token = auth?.tokens?.id_token ?? auth?.tokens?.idToken ?? auth?.id_token ?? auth?.idToken;
+    const token = auth?.tokens?.access_token ?? auth?.tokens?.accessToken;
     if (typeof token !== 'string') return undefined;
-    const payload = token.split('.')[1];
-    if (!payload) return undefined;
-    const exp = Number(JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))?.exp);
-    return Number.isFinite(exp) && exp > 0 ? exp * 1000 : undefined;
+    try {
+      const exp = Number(JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8'))?.exp);
+      if (Number.isFinite(exp) && exp > 0) return exp * 1000;
+    } catch { /* an opaque token: fall back to Codex's refresh interval */ }
+    const lastRefresh = Date.parse(auth?.last_refresh);
+    return Number.isFinite(lastRefresh) ? lastRefresh + CODEX_TOKEN_REFRESH_INTERVAL_MS : undefined;
   } catch {
     return undefined;
   }
+}
+
+function codexSignedOut(configHome?: string) {
+  const account = path.basename(path.resolve(configHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex')))
+    .replace(/^codex-/, '');
+  const message = `Codex login codex:${account} was signed out by OpenAI (its sign-in expired or was revoked); sign in again in Settings → Codex/Claude`;
+  return providerFailure(message, {
+    kind: 'credential',
+    permanence: 'hard',
+    provider: 'codex',
+    diagnostic: { message, operation: 'oauth refresh' },
+  });
 }
 
 async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number, force: boolean): Promise<unknown> {
@@ -569,7 +604,10 @@ async function runCodexUsageCli(configHome: string | undefined, timeoutMs: numbe
     }
     // This host home is the sole owner of the rotating refresh credential;
     // remote task projections never receive it.
-    await withTimeout(client.request('account/read', { refreshToken: true }), timeoutMs);
+    // app-server reports no refresh error; a permanent one leaves no account.
+    const account = await withTimeout(client.request('account/read', { refreshToken: true }), timeoutMs) as
+      { account?: unknown } | undefined;
+    if (account?.account === null) throw codexSignedOut(configHome);
     return await withTimeout(client.request('account/rateLimits/read'), timeoutMs);
   } finally {
     client.close();
