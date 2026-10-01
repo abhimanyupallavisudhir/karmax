@@ -171,6 +171,30 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('accounts chunked checkpoints by storage location and collects each exactly once', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Checkpoints');
+      const organizationId = project.organizationId!;
+      const now = Date.now();
+      for (const id of ['storage-managed-x', 'storage-s3-x']) await store.saveStorageLocation({ id, organizationId, name: id,
+        kind: id.includes('s3') ? 's3' : 'managed', config: {}, isDefault: !id.includes('s3'), status: 'ready', createdAt: now, updatedAt: now });
+      const checkpoint = (id: string, filesystemDelta: Record<string, unknown>) => store.saveWorldCheckpoint({ id, worldId: 'world',
+        generation: 1, projectId: project.id, runnerPoolId: 'local', environmentDigest: 'local', repos: [], createdAt: now,
+        filesystemDelta: filesystemDelta as any });
+      await checkpoint('legacy', { objectKey: 'legacy', sha256: 'a', bytes: 1000 });
+      await checkpoint('chunked', { objectKey: 'chunked', sha256: 'b', bytes: 70, format: 2, storageLocationId: 'storage-s3-x' });
+      await store.retainResourceChunks(organizationId, [{ id: 'c'.repeat(64), bytes: 4096 }], 'storage-s3-x');
+      expect((await store.storageLocationUsage('storage-managed-x')).retainedBytes).toBe(1000);
+      expect((await store.storageLocationUsage('storage-s3-x')).retainedBytes).toBe(4096 + 70);
+      await expect(store.deleteStorageLocation('storage-s3-x')).rejects.toThrow(/task checkpoints/);
+      expect((await store.listProjectCheckpoints(project.id)).map(row => row.id).sort()).toEqual(['chunked', 'legacy']);
+      expect(await Promise.all([store.completeCheckpointDeletion('chunked'), store.completeCheckpointDeletion('chunked')]))
+        .toEqual(expect.arrayContaining([true, false]));
+      expect((await store.storageLocationUsage('storage-s3-x')).retainedBytes).toBe(4096);
+    } finally { await store.close(); }
+  });
+
   it('scans only literal kv key prefixes', async () => {
     const store = await Store.create(url!);
     try {

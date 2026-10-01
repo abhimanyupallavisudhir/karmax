@@ -25,9 +25,9 @@ import { VaultItems, itemHandle, type VaultFieldName } from '../autonomy/vault-i
 import { ensureWorldExcluded } from './secret-exclude.js';
 import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
+import { CHUNK_BYTES, chunkId as contentChunkId, chunkObjectKey, fixedChunks, openDeterministic, openRandom,
+  organizationKey, organizationKeyHandle, sealDeterministic, sealRandom, sha256 } from './chunk-store.js';
 
-const CHUNK_BYTES = 4 * 1024 * 1024;
-const RESOURCE_KEY_PREFIX = 'resource-store:key:';
 const COPY_GLOB_SECRET_BYTES = 64 * 1024;
 
 interface SnapshotFile { path: string; bytes: number; sha256: string; chunks: string[] }
@@ -144,12 +144,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
         const digest = crypto.createHash('sha256');
         let fileBytes = 0;
         for await (const plain of fixedChunks(input.data)) {
-          const plainHash = sha256(plain);
-          // HMAC-scoped names deduplicate within a tenant without leaking a global
-          // plaintext hash to the object-store operator. Customer locations join
-          // the namespace so the same chunk can safely live in two buckets.
-          const chunkId = crypto.createHmac('sha256', key)
-            .update(chunkNamespace ? `${chunkNamespace}\0${plainHash}` : plainHash).digest('hex');
+          const chunkId = contentChunkId(key, chunkNamespace, plain);
           if (stored.has(chunkId)) {
             if (!retained.has(chunkId)) reused.set(chunkId, plain.length);
           } else {
@@ -157,7 +152,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
               await this.chunkAccounting?.retain(attachment.organizationId, [{ id: chunkId, bytes: plain.length }], storageLocationId);
               retained.set(chunkId, plain.length);
             }
-            await objects.put(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`, sealDeterministic(key, chunkId, plain));
+            await objects.put(chunkObjectKey(attachment.organizationId, chunkId), sealDeterministic(key, chunkId, plain));
           }
           chunks.push(chunkId);
           digest.update(plain);
@@ -187,7 +182,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
         ...(sealedStamps ? { observed: sealedStamps } : {}) };
     } catch (error) {
       const zero = (await this.chunkAccounting?.release(attachment.organizationId, [...retained.keys()])) ?? [];
-      await Promise.allSettled(zero.map((chunkId) => objects.delete(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`)));
+      await Promise.allSettled(zero.map((chunkId) => objects.delete(chunkObjectKey(attachment.organizationId, chunkId))));
       throw error;
     }
   }
@@ -226,7 +221,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     const digest = crypto.createHash('sha256');
     let bytes = 0;
     for (const chunkId of file.chunks) {
-      const encrypted = await timed('resource.chunk-read', () => objects.get(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`));
+      const encrypted = await timed('resource.chunk-read', () => objects.get(chunkObjectKey(attachment.organizationId, chunkId)));
       const data = openDeterministic(key, chunkId, encrypted);
       if (data.length !== Math.min(CHUNK_BYTES, file.bytes - bytes))
         throw new Error('resource chunk size mismatch');
@@ -308,7 +303,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     await objects.delete(ref.objectKey);
     const zero = (await this.chunkAccounting?.release(attachment.organizationId,
       [...new Set(manifest.files.flatMap((file) => file.chunks))])) ?? [];
-    for (const chunkId of zero) await objects.delete(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`);
+    for (const chunkId of zero) await objects.delete(chunkObjectKey(attachment.organizationId, chunkId));
   }
 
   private async attachmentFor(revision: ResourceRevision): Promise<ResourceAttachment> {
@@ -332,10 +327,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   }
 
   private async key(organizationId: string, create = true): Promise<Buffer> {
-    const handle = `${RESOURCE_KEY_PREFIX}${organizationId}`;
-    if (!create && !this.broker.hasHandle(handle)) throw new Error('resource key unavailable');
-    if (!this.broker.hasHandle(handle)) await this.broker.ensureHandle(handle, crypto.randomBytes(32).toString('base64'));
-    return Buffer.from(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
+    return organizationKey(this.broker, organizationId, create);
   }
 }
 
@@ -750,7 +742,7 @@ export class ProjectResourceService {
   }
 
   async deleteOrganizationKey(organizationId: string): Promise<void> {
-    (await this.broker.deleteHandle(`${RESOURCE_KEY_PREFIX}${organizationId}`));
+    (await this.broker.deleteHandle(organizationKeyHandle(organizationId)));
   }
 
   /** Stage a declared non-secret path from the caller's current generation.
@@ -1322,22 +1314,6 @@ async function* asAsync(values: Iterable<SnapshotInputFile> | AsyncIterable<Snap
   for await (const value of values as AsyncIterable<SnapshotInputFile>) yield value;
 }
 
-async function* fixedChunks(value: Buffer | AsyncIterable<Buffer>): AsyncGenerator<Buffer> {
-  const source = Buffer.isBuffer(value) ? (async function* () { yield value; })() : value;
-  let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-  let emitted = false;
-  for await (const raw of source) {
-    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
-    pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-    while (pending.length >= CHUNK_BYTES) {
-      emitted = true;
-      yield pending.subarray(0, CHUNK_BYTES);
-      pending = pending.subarray(CHUNK_BYTES);
-    }
-  }
-  if (pending.length || !emitted) yield pending;
-}
-
 async function transactionalSnapshotPath(world: World, file: string): Promise<{ path: string; cleanup?: () => Promise<void> }> {
   if (!/\.(?:sqlite3?|db)$/i.test(file)) return { path: file };
   const magic = await world.exec('bash', ['-lc', `head -c 16 ${quote(file)} | base64 -w0`]);
@@ -1406,15 +1382,8 @@ function copyGlobRepoNames(sources: string[]): string[] {
 }
 function safePath(value: string): string { return worldRelativePath(value); }
 function writtenPrefix(handle: WorldHandle): string { return `${handle.id}\0${handle.generation ?? 1}\0`; }
-function sha256(value: Buffer): string { return crypto.createHash('sha256').update(value).digest('hex'); }
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }
 
-function sealRandom(key: Buffer, plain: Buffer): Buffer {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const body = Buffer.concat([cipher.update(plain), cipher.final()]);
-  return Buffer.concat([Buffer.from('KRS1'), iv, cipher.getAuthTag(), body]);
-}
 /** File stamps are world-local and never part of a revision: they live with
  * the lease's checkpoint pointer, sealed like a manifest (paths are private)
  * and bound to the content they describe. */
@@ -1427,25 +1396,4 @@ function openStamps(key: Buffer, sealed: string, attachmentId: string, rootDiges
     return value?.attachmentId === attachmentId && value.rootDigest === rootDigest && value.stamps && typeof value.stamps === 'object'
       ? value.stamps : undefined;
   } catch { return undefined; }
-}
-function openRandom(key: Buffer, blob: Buffer): Buffer {
-  if (blob.subarray(0, 4).toString() !== 'KRS1') throw new Error('invalid resource snapshot envelope');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, blob.subarray(4, 16));
-  decipher.setAuthTag(blob.subarray(16, 32));
-  return Buffer.concat([decipher.update(blob.subarray(32)), decipher.final()]);
-}
-function sealDeterministic(key: Buffer, id: string, plain: Buffer): Buffer {
-  const iv = crypto.createHmac('sha256', key).update(`iv:${id}`).digest().subarray(0, 12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  cipher.setAAD(Buffer.from(id));
-  const body = Buffer.concat([cipher.update(plain), cipher.final()]);
-  return Buffer.concat([Buffer.from('KRC1'), cipher.getAuthTag(), body]);
-}
-function openDeterministic(key: Buffer, id: string, blob: Buffer): Buffer {
-  if (blob.subarray(0, 4).toString() !== 'KRC1') throw new Error('invalid resource chunk envelope');
-  const iv = crypto.createHmac('sha256', key).update(`iv:${id}`).digest().subarray(0, 12);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAAD(Buffer.from(id));
-  decipher.setAuthTag(blob.subarray(4, 20));
-  return Buffer.concat([decipher.update(blob.subarray(20)), decipher.final()]);
 }

@@ -138,3 +138,32 @@ it('lists a project\'s saved resolutions in its own Resolve prompts only', async
   expect(await resolvePrompt(docs.id)).not.toContain('resolve/flaky-clone');
   world = undefined;
 });
+
+it('tells the next Do turn, once, which files its last checkpoint could not save', async () => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-review-'));
+  store = await Store.create(':memory:');
+  const project = await store.createProject('Notice');
+  const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
+  const worlds = new WorldRegistry();
+  world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+  vi.spyOn(worlds, 'open').mockResolvedValue(world);
+  let notice: string | undefined = 'Your uncommitted work could not be checkpointed: organization storage is full.';
+  const checkpoints = { takeNotice: vi.fn(async () => { const value = notice; notice = undefined; return value; }) };
+  const delivered: string[][] = [];
+  const core = makeCoreActivities({ store, worlds, contentDir: home, profiles: new ProfileResolver(store, 'mock'), checkpoints: checkpoints as any,
+    adapters: new Map([['mock', { provider: 'mock', runTurn: async (input: any) => {
+      delivered.push(input.messages.map((message: any) => message.text));
+      return { output: 'done', termination: { kind: 'success', status: 'fixture' } };
+    } }]]) as any });
+  const turn = (messages: Array<{ id: string; text: string }>, deliveredMessages: number) => core.runAgentTurn({ taskId: task.id, role: 'do',
+    agentSlotGranted: true, worldHandle: world.handle, deliveredMessages,
+    messages: messages.map((message, ts) => ({ ...message, role: 'user', ts })),
+    task: { taskId: task.id, projectId: project.id, title: 'Work', prompt: 'work', project: {}, agents: { do: { provider: 'mock' } } } } as any);
+  const history = [{ id: 'one', text: 'first' }, { id: 'two', text: 'please continue' }];
+  await turn(history, 1);
+  expect(delivered[0]![1]).toBe('please continue\n\n(Your uncommitted work could not be checkpointed: organization storage is full.)');
+  expect(delivered[0]![0]).toBe('first');
+  await turn([...history, { id: 'three', text: 'and again' }], 2);
+  expect(delivered[1]![2]).toBe('and again');
+  expect(checkpoints.takeNotice).toHaveBeenCalledTimes(2);
+});
