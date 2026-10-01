@@ -222,8 +222,10 @@ bucket while the app keeps running. It is resumable (objects already there are
 skipped), `--verify-only` checks without writing, `--concurrency N` bounds
 parallel transfers, and it never deletes anything. It ends with an inventory of
 local objects the database no longer references. To switch, run it once while
-serving, stop the app, run it again with `--verify-only`, set the variables
-above, and start.
+serving, stop the app, run it again, then with `--verify-only`, set the
+variables above, and start. Keep the local copy until the delay has passed: to
+go back, stop the app, copy what was written since with `--from-s3`, unset
+`KARMAX_OBJECT_STORE`, and start.
 
 ## Local development with a hosted control plane
 

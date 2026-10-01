@@ -2,13 +2,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from '../store/sql.js';
-import type { ObjectInfo } from '../store/objects.js';
+import { LocalObjectStore, type ObjectInfo } from '../store/objects.js';
 
-/** What the migration needs from the destination: an `S3ObjectStore`. */
+/** What the migration needs from the bucket: an `S3ObjectStore`. */
 export interface MigrationTarget {
   put(key: string, data: Buffer): Promise<void>;
   get(key: string): Promise<Buffer>;
   head(key: string): Promise<ObjectInfo | undefined>;
+  list?(prefix?: string): AsyncIterable<ObjectInfo & { key: string }>;
 }
 
 export interface LocalObject { key: string; file: string; bytes: number; modifiedAt: number }
@@ -55,15 +56,16 @@ export async function* localObjects(root: string): AsyncGenerator<LocalObject> {
 }
 
 /**
- * Copy every local object to the destination under the same key (or under
+ * Copy every local object to the bucket under the same key (or under
  * `prefix/`). Idempotent and resumable: an object already there is skipped
  * when its size matches and its ETag is the local MD5 (a single-part PUT);
  * otherwise it is downloaded and compared by SHA-256. A copy that differs is
- * reported and copied again. `verifyOnly` writes nothing. Nothing is ever
- * deleted, locally or remotely.
+ * reported and copied again. `verifyOnly` writes nothing. `fromS3` copies the
+ * other way, every object in the bucket into the local store, to roll back
+ * to it. Nothing is ever deleted, locally or remotely.
  */
 export async function migrateObjects(options: {
-  root: string; target: MigrationTarget; prefix?: string; verifyOnly?: boolean;
+  root: string; target: MigrationTarget; prefix?: string; verifyOnly?: boolean; fromS3?: boolean;
   /** Objects in flight at once. */
   concurrency?: number;
   /** Bytes held in memory at once; one larger object still runs, alone. */
@@ -86,15 +88,26 @@ export async function migrateObjects(options: {
     if (key && 'keys' in into && into.keys.length < KEYS_SHOWN) into.keys.push(key);
   };
 
-  const all: LocalObject[] = options.objects ?? [];
-  if (!options.objects) for await (const object of localObjects(options.root)) all.push(object);
-  const queue: LocalObject[] = [];
-  for (const object of all) {
-    if (TEMPORARY.test(object.key)) add(report.temporary, object.bytes);
-    else { queue.push(object); add(report.total, object.bytes); }
+  const queue: Array<{ key: string; bytes: number; file?: string; etag?: string }> = [];
+  const bucket = prefix ? `the bucket under ${prefix}/` : 'the bucket';
+  if (options.fromS3) {
+    if (!target.list) throw new Error('copying from S3 needs a store that can list');
+    for await (const remote of target.list(prefix ? `${prefix}/` : '')) {
+      const key = prefix ? remote.key.slice(prefix.length + 1) : remote.key;
+      if (key.startsWith('.karmax-connection-test/')) continue; // doctor's probes
+      queue.push({ ...remote, key });
+      add(report.total, remote.bytes);
+    }
+    log(`${verifyOnly ? 'verifying' : 'copying'} ${count(report.total)} from ${bucket} to ${options.root} (${concurrency} at a time)`);
+  } else {
+    const all: LocalObject[] = options.objects ?? [];
+    if (!options.objects) for await (const object of localObjects(options.root)) all.push(object);
+    for (const object of all) {
+      if (TEMPORARY.test(object.key)) add(report.temporary, object.bytes);
+      else { queue.push(object); add(report.total, object.bytes); }
+    }
+    log(`${verifyOnly ? 'verifying' : 'copying'} ${count(report.total)} from ${options.root} to ${bucket} (${concurrency} at a time)`);
   }
-  log(`${verifyOnly ? 'verifying' : 'copying'} ${count(report.total)} from ${options.root} to ${prefix ? `${prefix}/` : 'the bucket root'}`
-    + ` (${concurrency} at a time)`);
 
   const memory = weightedSemaphore(memoryBytes);
   let done = 0, doneBytes = 0;
@@ -104,14 +117,33 @@ export async function migrateObjects(options: {
   const timer = setInterval(progress, options.progressEveryMs ?? 10_000);
   timer.unref();
 
-  const migrate = async (object: LocalObject) => {
-    const key = remoteKey(object.key);
-    let data: Buffer;
-    try { data = await fs.promises.readFile(object.file); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return add(report.vanished, object.bytes);
-      throw error;
+  const readLocal = async (file: string) => {
+    try { return await fs.promises.readFile(file); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  };
+  const local = new LocalObjectStore(options.root);
+  // Bucket to local: the same comparison, with the roles swapped.
+  const restore = async (remote: { key: string; bytes: number; etag?: string }) => {
+    const key = remoteKey(remote.key);
+    const data = await readLocal(path.join(options.root, remote.key));
+    let stored: Buffer | undefined;
+    if (data && data.length === remote.bytes) {
+      if (remote.etag === md5(data)) return add(report.skipped, data.length);
+      stored = await retrying(() => target.get(key));
+      if (sha256(stored) === sha256(data)) return add(report.skipped, data.length);
     }
+    if (data) add(report.mismatched, remote.bytes, remote.key);
+    else if (verifyOnly) add(report.missing, remote.bytes, remote.key);
+    if (verifyOnly) return;
+    stored ??= await retrying(() => target.get(key));
+    await local.put(remote.key, stored);
+    add(report.copied, stored.length);
+  };
+
+  const migrate = async (object: { key: string; bytes: number; file?: string }) => {
+    const key = remoteKey(object.key);
+    const data = await readLocal(object.file!);
+    if (!data) return add(report.vanished, object.bytes);
     const remote = await retrying(() => target.head(key));
     if (!remote) {
       if (verifyOnly) return add(report.missing, data.length, object.key);
@@ -136,7 +168,7 @@ export async function migrateObjects(options: {
       while (next < queue.length) {
         const object = queue[next++]!;
         const release = await memory.acquire(object.bytes);
-        try { await migrate(object); }
+        try { await (options.fromS3 ? restore(object) : migrate(object)); }
         catch (error) {
           add(report.failed, object.bytes, object.key);
           log(`failed ${object.key}: ${error instanceof Error ? error.message : String(error)}`);

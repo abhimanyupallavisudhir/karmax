@@ -170,6 +170,31 @@ describe('object store migration', () => {
     expect([...s3.objects.keys()].sort()).toEqual(Object.keys(FILES).map((key) => `scratch/run-1/${key}`).sort());
   });
 
+  // Rolling back to the local store after the app has written to the bucket.
+  it('copies the bucket back into the local store, skipping what is already there', async () => {
+    const root = objectsDir({ 'checkpoints/org_a/proj_a/task_a/checkpoint_1.bin': 'checkpoint one' });
+    const s3 = await tracked();
+    s3.objects.set('checkpoints/org_a/proj_a/task_a/checkpoint_1.bin', Buffer.from('checkpoint one'));
+    s3.objects.set('artifacts/org_a/proj_a/task_b/new', Buffer.from('written after the cutover'));
+    s3.objects.set('resources/org_a/chunks/cccc.bin', Buffer.from('local copy is stale'));
+    fs.mkdirSync(path.join(root, 'resources/org_a/chunks'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'resources/org_a/chunks/cccc.bin'), 'stale');
+    s3.objects.set('.karmax-connection-test/abc', Buffer.from('probe'));
+    const verify = await migrateObjects({ root, target: s3.client, fromS3: true, verifyOnly: true, log: () => {} });
+    expect(verify).toMatchObject({ skipped: { count: 1 }, missing: { count: 1, keys: ['artifacts/org_a/proj_a/task_b/new'] },
+      mismatched: { count: 1, keys: ['resources/org_a/chunks/cccc.bin'] } });
+    expect(fs.existsSync(path.join(root, 'artifacts/org_a/proj_a/task_b/new'))).toBe(false);
+    const report = await migrateObjects({ root, target: s3.client, fromS3: true, log: () => {} });
+    expect(report).toMatchObject({ copied: { count: 2 }, skipped: { count: 1 }, mismatched: { count: 1 } });
+    expect(fs.readFileSync(path.join(root, 'artifacts/org_a/proj_a/task_b/new'), 'utf8')).toBe('written after the cutover');
+    expect(fs.readFileSync(path.join(root, 'resources/org_a/chunks/cccc.bin'), 'utf8')).toBe('local copy is stale');
+    expect(fs.statSync(path.join(root, 'artifacts/org_a/proj_a/task_b/new')).mode & 0o777).toBe(0o600);
+    expect(fs.existsSync(path.join(root, '.karmax-connection-test'))).toBe(false);
+    expect(s3.requests.some((request) => /^(PUT|DELETE) /.test(request))).toBe(false);
+    const again = await migrateObjects({ root, target: s3.client, fromS3: true, log: () => {} });
+    expect(again).toMatchObject({ copied: { count: 0 }, skipped: { count: 3 } });
+  });
+
   it('lists local objects by key, not following symbolic links out of the store', async () => {
     const root = objectsDir(FILES);
     fs.symlinkSync('/etc', path.join(root, 'outside'));
