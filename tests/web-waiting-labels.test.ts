@@ -17,6 +17,12 @@ function extractFunction(name: string): string {
   throw new Error(`${name} is unterminated`);
 }
 
+function extractConst(name: string): string {
+  const start = app.indexOf(`const ${name} =`);
+  if (start < 0) throw new Error(`${name} not found`);
+  return app.slice(start, app.indexOf(';', start) + 1);
+}
+
 const context = vm.createContext({
   esc: (value: unknown) => String(value),
   pipeline: () => '',
@@ -31,10 +37,12 @@ vm.runInContext(
     extractFunction('pendingCancellationView'),
     extractFunction('waitingLabel'),
     extractFunction('waitingText'),
+    extractFunction('waitDeadline'),
     extractFunction('agentTurnStateText'),
     extractFunction('humanWaitDetail'),
     extractFunction('conversationTextKey'),
     extractFunction('conversationInputRequest'),
+    extractConst('PARKED_WAITS'),
     extractFunction('stageLabel'),
     extractFunction('runSubRow'),
     extractFunction('runPageRow'),
@@ -160,15 +168,46 @@ describe('waiting labels in task summaries', () => {
       kind: 'responder',
       detail: 'The response agent is answering the working agent',
     })).toBe('Waiting for responder');
-    expect(waitingText({
-      kind: 'job',
-      detail: 'Waiting for job-0123abcd',
-      until: Date.now() + 3_600_000,
-    })).toBe('Waiting for job');
-    const until = Date.UTC(2026, 8, 29, 14, 5);
-    expect(waitingText({ kind: 'timer', detail: 'Paused for 30 min', until }))
-      .toBe(`Paused until ${new Date(until).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
+    // Noon today: "a minute from now" is tomorrow when the suite runs at 23:59.
+    const soon = new Date().setHours(12, 0, 0, 0);
+    const clock = (at: number) => new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    // A job wait names its deadline: the agent resumes by then even if the job hangs.
+    expect(waitingText({ kind: 'job', detail: 'Waiting for job-0123abcd', until: soon }))
+      .toBe(`Waiting for job until ${clock(soon)}`);
+    expect(waitingText({ kind: 'job', detail: 'Waiting for job-0123abcd' })).toBe('Waiting for job');
+    expect(waitingText({ kind: 'timer', until: soon }))
+      .toBe(`Paused until ${clock(soon)}`);
     expect(waitingText({ kind: 'timer' })).toBe('Paused');
+    // A pause may end on another day; a bare clock time would read as today.
+    const later = soon + 3 * 86_400_000;
+    const day = new Date(later).toLocaleDateString([], { weekday: 'short' });
+    expect(waitingText({ kind: 'timer', until: later })).toContain(day);
+  });
+
+  // Task 433 read "working" for nine hours while its agent had paused itself
+  // until the next morning; nothing was working, and nothing said when it would resume.
+  it('shows a pause the agent chose instead of "working"', () => {
+    const until = Date.now() + 525 * 60_000;
+    const timer = { kind: 'timer', detail: 'Paused for 525 min', until };
+    expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: timer }))
+      .toBe(waitingText(timer));
+    const job = { kind: 'job', detail: 'Waiting for job-5a1d7bab', until };
+    expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: job }))
+      .toBe(waitingText(job));
+    expect(stageLabel({ stage: 'do', status: 'active', state: {}, waitingFor: timer })).toBe('working');
+  });
+
+  // Likewise a turn that ended to wait on other tasks: the chip names them.
+  it('names the tasks a parked agent waits on', () => {
+    for (const [kind, label] of [['subtask', 'Waiting for sub-tasks'], ['collaboration', 'Waiting for collaborator'], ['parent', 'Waiting for parent']]) {
+      expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: { kind } })).toBe(label);
+    }
+    // A child held at Review for its parent is still in review.
+    expect(stageLabel({ stage: 'review', status: 'waiting', state: {}, waitingFor: { kind: 'parent' } })).toBe('review');
+    // Work still running inside the turn, or about to start one, is working.
+    for (const kind of ['agentSlot', 'subagent', 'shell']) {
+      expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: { kind } })).toBe('working');
+    }
   });
 
   it('keeps an actionable admission failure in the agent-turn card', () => {
@@ -241,7 +280,7 @@ describe('waiting labels in task summaries', () => {
         stage: 'do',
         status: 'waiting',
         state: {},
-        waitingFor: { kind: 'parent' },
+        waitingFor: { kind: 'agentSlot', detail: 'Starting agent' },
       },
     };
     expect(runSubRow(run)).toContain('<span class="chip waiting">working</span>');

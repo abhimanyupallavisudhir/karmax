@@ -39,6 +39,7 @@ function extractConst(name) {
   const code = [
     extractFn('waitingLabel'),
     extractFn('waitingText'),
+    extractFn('waitDeadline'),
     extractFn('conversationPresence'),
     // Stubbed: the real one walks the transcript list, which isn't what's under
     // test here — we only need it to agree that "do" is the live role.
