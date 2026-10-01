@@ -287,6 +287,13 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(GLOBAL_INSTRUCTIONS).toContain('Source code is not a human-readable output');
     expect(GLOBAL_INSTRUCTIONS).toMatch(/summaries of changes\/answers in your final response/i);
   });
+
+  it('steers agents to MCP connections and the wiki in global instructions', () => {
+    expect(GLOBAL_INSTRUCTIONS).toContain('(but prefer using MCPs to credentials, if available)');
+    expect(GLOBAL_INSTRUCTIONS).toContain('(and ask for their credential or ask to connect via MCP)');
+    expect(GLOBAL_INSTRUCTIONS).toContain('You are much more capable than you think you are.');
+    expect(GLOBAL_INSTRUCTIONS).toContain('Always use the wiki rather than any local memory files.');
+  });
 });
 
 // WF-29: time bounds evaluation (see 'bounds catastrophic regex evaluation'
