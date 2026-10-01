@@ -146,7 +146,7 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   if (list && method === 'POST') {
     const pr = { repo: list[1], number: prs.length + 1, html_url: `https://github.com/${list[1]}/pull/${prs.length + 1}`,
       node_id: `PR_${prs.length + 1}`, state: 'open', merged_at: null, title: body.title, body: body.body,
-      head: { ref: body.head, sha: '' }, base: { ref: body.base } };
+      head: { ref: body.head, sha: '' }, base: { ref: body.base, sha: undefined as string | undefined } };
     prs.push(pr);
     await refreshPrHead(pr);
     pr.base.sha = await targetTip(pr);
