@@ -19,7 +19,10 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { AgentChannelLost, ProviderPolicyFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
+import { markCheckpointStale } from '../world/checkpoint-staleness.js';
+import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -266,6 +269,9 @@ export interface CoreActivityDeps {
   contentDir?: string;
   /** Snapshot of whether this console is running on the user's own machine. */
   hostLocal?: boolean;
+  /** Host-side usage reading of a leased login, which decides whether a limit a
+   * sandbox reported may park it (defaults to the native usage probes; tests). */
+  probeUsage?: (login: { provider: Provider; configHome: string }) => Promise<UsageResult | undefined>;
 }
 
 /** What the PR stage puts on the pull request it opens for the task. */
@@ -1178,6 +1184,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (error === deferred) return;
             if (ctx?.cancellationSignal.aborted) throw error;
             (await record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) }));
+            // The world still parks, but hibernation must not trust an older checkpoint.
+            await markCheckpointStale(store, waitingWorld, error instanceof Error ? error.message : String(error));
           }
         }
 
@@ -2547,11 +2555,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // reservation retry-safe and binds every request to its org/project/task.
         if (profile.provider !== 'mock') {
           const turnId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}`;
-          const admissionId = activityAttempt > 1 ? `${turnId}:attempt:${activityAttempt}` : turnId;
+          const admissionId = admissionIdFor(turnId, activityAttempt);
           (await store.admitAgentUsage({ id: admissionId, organizationId, projectId: args.task.projectId,
             taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
             ...(activityAttempt > 1 ? { retryOf: Array.from({ length: activityAttempt - 1 },
-              (_, index) => index === 0 ? turnId : `${turnId}:attempt:${index + 1}`) } : {}),
+              (_, index) => admissionIdFor(turnId, index + 1)) } : {}),
             reservedCostMicros: managedReservationMicros }));
           // A rejected admission does not own the existing reservation and must
           // not release it in finally (it may belong to a different live turn).
@@ -2879,13 +2887,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // Tell the resumed attempt why it was interrupted, as for a sandbox freeze.
         if (err instanceof AgentChannelLost && turnSessionKey)
           (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify({ summary: err.summary })));
-        const failure = classifyTurnError(err, profile.provider);
+        // A limit reported from inside a sandbox changes shared login availability
+        // only when the host's own reading of the leased login confirms it (AD-7);
+        // otherwise it stays with this task, which waits instead of escalating.
+        let turnError = err;
+        if (err instanceof SandboxProviderFailure) {
+          const login = resolvedAuth?.configHome && (profile.provider === 'claude' || profile.provider === 'codex')
+            ? { provider: profile.provider, configHome: resolvedAuth.configHome } : undefined;
+          const probe = deps.probeUsage ?? (({ provider, configHome }) => provider === 'codex'
+            ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }));
+          turnError = await confirmSandboxFailure(err, async () => (login ? probe(login) : undefined), Date.now());
+        }
+        const failure = classifyTurnError(turnError, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else
         // in a remote world may be the sandbox's fault, which its metrics can show.
         if (!world.diagnose || !(failure instanceof ApplicationFailure) || !['agent-error', 'agent-infra'].includes(failure.type ?? '')) throw failure;
         const diagnosis = await world.diagnose({ since: attemptStarted }).catch(() => undefined);
         if (diagnosis && turnSessionKey) (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify(diagnosis)));
-        throw classifyTurnError(err, profile.provider, { diagnosis });
+        throw classifyTurnError(turnError, profile.provider, { diagnosis });
       } finally {
         try {
           if (usageAdmissionId && !usageAdmissionFinished) {

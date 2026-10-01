@@ -9,6 +9,7 @@ import { activateProjectRuntime } from '../src/world/project-runtime.js';
 import type { World } from '../src/world/types.js';
 import { buildEnvironment, bootCommands, environmentDockerfile, environmentArtifactName, setupCommands, type BuilderSandbox } from '../src/world/environment-build.js';
 import { ProjectServices, composeServiceProposals } from '../src/store/project-services.js';
+import { DEFAULT_E2B_TEMPLATE } from '../src/world/e2b-template.js';
 import { launchWorldServices } from '../src/world/services.js';
 
 function memoryKv() {
@@ -122,11 +123,38 @@ describe('project environment proposals and builds', () => {
     };
     expect(await buildEnvironment({ provider: 'e2b', projectId: 'p', digest: 'd', buildId: 'attempt-1',
       spec: { image: 'node:22-slim', setup: ['npm ci'] }, connection: { template: 'compute-template' },
-      createBuilderSandbox: async (base) => { builderBase = base; return builder; } })).toEqual({ ref: 'snapshot-1' });
+      createBuilderSandbox: async (base) => { builderBase = base; return builder; } })).toEqual({ ref: 'snapshot-1', base: 'compute-template' });
     expect(builderBase).toBe('compute-template');
     expect(calls).toContain('npm ci');
     expect(calls).toContain(environmentArtifactName('p', 'd', 'attempt-1'));
     expect(killed).toBe(true);
+  });
+
+  // With no template under Compute, E2B would start the builder from its stock
+  // 512 MiB `base` image, without the baked browser or overcommit that task
+  // worlds rely on, and every world made from the snapshot inherits that
+  // (2026-09-30: "MCP connections could not start: chrome-devtools" on each
+  // resumed turn, in 478 MiB sandboxes). Build on what task worlds boot from.
+  it.each([
+    ['the default task-world template', undefined, DEFAULT_E2B_TEMPLATE],
+    ['the installation template', ' installation-template ', 'installation-template'],
+  ])('builds an E2B environment on %s when Compute names none', async (_case, installation, expected) => {
+    const saved = process.env.KARMAX_E2B_TEMPLATE;
+    if (installation === undefined) process.env.KARMAX_E2B_TEMPLATE = ''; else process.env.KARMAX_E2B_TEMPLATE = installation;
+    try {
+      let builderBase: string | undefined;
+      const builder: BuilderSandbox = {
+        async run() { return { exitCode: 0, stderr: '', stdout: '' }; },
+        async createSnapshot() { return { snapshotId: 'snapshot-2' }; },
+        async kill() {},
+      };
+      expect(await buildEnvironment({ provider: 'e2b', projectId: 'p', digest: 'd', spec: { setup: ['true'] },
+        connection: {}, createBuilderSandbox: async (base) => { builderBase = base; return builder; } }))
+        .toEqual({ ref: 'snapshot-2', base: expected });
+      expect(builderBase).toBe(expected);
+    } finally {
+      if (saved === undefined) delete process.env.KARMAX_E2B_TEMPLATE; else process.env.KARMAX_E2B_TEMPLATE = saved;
+    }
   });
 
   it('always kills a failed remote builder and identifies the setup command', async () => {

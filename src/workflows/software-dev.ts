@@ -32,6 +32,7 @@ import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { renderRespondPrompt } from '../domain/respond-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
+import { resetAtFromHint } from '../agent/limits.js';
 import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS } from './failures.js';
 import {
   TaskInput,
@@ -1682,6 +1683,22 @@ async function softwareDevImpl(
               // quota or a sign-in, not a failed attempt (task 381 escalated after
               // two early quota retries).
               if (providerLimit && limitReportedToCoordinator && patched('software-dev-provider-limit-wait-v1')) attempt--;
+              // An unconfirmed limit from inside a sandbox parks nothing shared, so
+              // this task waits for the reported reset itself (audit R-4). A person's
+              // Retry or a cancel ends the wait early.
+              if (providerLimit?.taskScoped && !providerLimit.hard && patched('software-dev-task-scoped-limit-wait-v1')) {
+                attempt--;
+                const until = resetAtFromHint(providerLimit.resetHint, providerLimit.window ?? '5h', Date.now());
+                const resumeStatus = status;
+                status = 'waiting';
+                waitingFor = { kind: 'account', ...(providerLimit.provider ? { provider: providerLimit.provider } : {}), earliestResetAt: until };
+                await publish();
+                await condition(() => cancelled || retryRequested, Math.max(1_000, until - Date.now()));
+                if (cancelled) throw new Cancelled();
+                retryRequested = false;
+                waitingFor = undefined;
+                status = resumeStatus;
+              }
               continue;
             }
             // Scripted recovery missed. With the process-wide Resolve-agent flag
@@ -2084,7 +2101,11 @@ async function softwareDevImpl(
       // failure is flagged needs-attention (won't self-refresh → a human must act).
       if (grant && !passthrough && !cancelled && !isCancellation(err)) {
         const cls = limitFailureClassification(err);
-        if (cls?.hard) {
+        // A sandbox's unconfirmed report never changes the shared login (AD-7);
+        // withResolve makes this task wait instead.
+        if (cls?.taskScoped) {
+          // nothing to report
+        } else if (cls?.hard) {
           limitReportedToCoordinator = await coordinator.setAccountAvailability({
             accountId: grant.accountId,
             status: 'needs-attention',

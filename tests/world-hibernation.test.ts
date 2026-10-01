@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorldLifecycleManager } from '../src/world/runners.js';
+import { markCheckpointStale } from '../src/world/checkpoint-staleness.js';
 import type { WorldHandle } from '../src/world/types.js';
 
 const stores: Store[] = [];
@@ -211,4 +212,32 @@ it('backs off provider teardown failures the same way (WD-2)', async () => {
   expect(f.destroy).toHaveBeenCalledOnce();
   await f.lifecycle.sweep(start + 5 * 60_000);
   expect(f.destroy).toHaveBeenCalledTimes(2);
+});
+
+// Audit R-6: a park checkpoint that hit a size cap only logged a warning, and
+// hibernation then destroyed the sandbox against the older checkpoint, losing
+// whatever changed since. A recorded failure makes hibernation re-checkpoint first.
+it('re-checkpoints a world whose last park checkpoint failed before destroying it', async () => {
+  const f = await fixture();
+  await markCheckpointStale(f.store, f.handle, 'checkpoint total size limit exceeded');
+  expect(await f.lifecycle.sweep(Date.now() + 1)).toBe(1);
+  expect(f.checkpointWorld).toHaveBeenCalledTimes(1);
+  expect(f.destroy).toHaveBeenCalledTimes(1);
+});
+
+it('keeps a world whose newest state cannot be checkpointed', async () => {
+  const f = await fixture();
+  await markCheckpointStale(f.store, f.handle, 'checkpoint total size limit exceeded');
+  f.checkpointWorld.mockRejectedValue(new Error('checkpoint total size limit exceeded'));
+  expect(await f.lifecycle.sweep(Date.now() + 1)).toBe(0);
+  expect(f.destroy).not.toHaveBeenCalled();
+  expect(await f.store.worldState(f.handle.id)).toBe('parked');
+});
+
+it('trusts the latest checkpoint when no failure was recorded for this generation', async () => {
+  const f = await fixture();
+  await markCheckpointStale(f.store, { ...f.handle, generation: 7 }, 'an earlier generation');
+  expect(await f.lifecycle.sweep(Date.now() + 1)).toBe(1);
+  expect(f.checkpointWorld).not.toHaveBeenCalled();
+  expect(f.destroy).toHaveBeenCalledTimes(1);
 });

@@ -25,6 +25,7 @@ import {
   isTransportError,
   providerErrorFromMessage,
   providerFailure,
+  SandboxProviderFailure,
 } from './limits.js';
 import { spawn } from 'node:child_process';
 import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './custody.js';
@@ -261,9 +262,9 @@ export class ClaudeAdapter implements AgentAdapter {
     try { return await this.runAgentSdkWithRecovery(input, ctx); }
     catch (error) {
       // A sandbox controls its PTY bytes. Preserve its turn failure, but shared
-      // account health must come from a host-side provider request or probe.
+      // account health must come from a host-side check (confirmSandboxFailure).
       if (isRemoteAgentWorld(input.world) && error instanceof ProviderFailure)
-        throw new Error(error.message, { cause: error });
+        throw new SandboxProviderFailure(error);
       throw error;
     }
   }

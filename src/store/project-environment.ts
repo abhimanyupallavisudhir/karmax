@@ -74,7 +74,8 @@ export class ProjectEnvironment {
     });
   }
 
-  async readyBuild(projectId: string, provider: string, digest: string): Promise<EnvironmentBuildRecord | undefined> {
+  /** With `base`, a build made on any other provider template is not ready. */
+  async readyBuild(projectId: string, provider: string, digest: string, base?: string): Promise<EnvironmentBuildRecord | undefined> {
     const record = (await this.builds(projectId)).find((candidate) =>
       candidate.provider === provider && candidate.digest === digest);
     if (!record?.buildId && await this.store.kvGet(recoveryKey(projectId, provider, digest))) return undefined;
@@ -85,6 +86,7 @@ export class ProjectEnvironment {
       if ((await this.store.getProject?.(projectId))?.organizationId !== record.organizationId
         || (generation ?? '') !== record.transferGeneration) return undefined;
     } else if (generation) return undefined;
+    if (base !== undefined && record?.base !== base) return undefined;
     return record?.status === 'ready' && record.ref ? record : undefined;
   }
 }
@@ -129,7 +131,7 @@ export async function beginEnvironmentBuild(store: Store, projectId: string, sco
 /** Success and failure use the same fence. A deleted/superseded attempt cannot
  * recreate build metadata or overwrite a newer destination build. */
 export async function finishEnvironmentBuild(store: Store, attempt: EnvironmentBuildAttempt,
-  result: { status: 'ready'; ref: string } | { status: 'failed'; error: string }): Promise<boolean> {
+  result: { status: 'ready'; ref: string; base?: string } | { status: 'failed'; error: string }): Promise<boolean> {
   return buildTransaction(store, attempt.projectId, async () => {
     if (!await sameBuildScope(store, attempt.projectId, attempt)) return false;
     const environments = new ProjectEnvironment(store);
