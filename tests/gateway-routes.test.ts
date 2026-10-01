@@ -69,6 +69,13 @@ describe('gateway route capability binding', () => {
     expect(cap('GET', '/api/organizations/o1')).toBe('organization:read');
   });
 
+  it('gates the organization storage contents and clean-up above the project-grant ceiling', () => {
+    expect(cap('GET', '/api/organizations/o1/storage-contents')).toBe('organization:edit');
+    expect(cap('DELETE', '/api/organizations/o1/storage-contents/resources/r1/older-versions')).toBe('organization:edit');
+    expect(cap('DELETE', '/api/organizations/o1/storage-contents/projects/p1/finished-workspaces')).toBe('organization:edit');
+    expect(cap('GET', '/api/organizations/o1/storage')).toBe('organization:read');
+  });
+
   it('exposes plan entitlements as organization-scoped read data', () => {
     expect(cap('GET', '/api/organizations/o1/entitlements')).toBe('organization:read');
   });

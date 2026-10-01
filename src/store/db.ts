@@ -4536,6 +4536,39 @@ export class Store {
     });
   }
 
+  /** The organization owners' storage notice (one current stage at a time),
+   * or none once the organization is back within its quota. Email is sent by
+   * the notifier itself, so only browser and Slack delivery are queued here. */
+  async syncStorageInbox(organizationId: string, userIds: string[],
+    notice: { stage: string; retainedBytes: number; quotaBytes: number; deleteAt: number } | undefined, createdAt = Date.now()): Promise<void> {
+    return this.db.transaction(async () => {
+      const ids = new Set<string>();
+      if (notice) for (const userId of new Set(userIds)) {
+        const id = `inbox_storage_${crypto.createHash('sha256')
+          .update(JSON.stringify([organizationId, userId, notice.stage, notice.deleteAt])).digest('hex').slice(0, 24)}`;
+        ids.add(id);
+        const urgency = notice.stage === '7d' || notice.stage === 'deleted' ? 'critical' : 'high';
+        const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+          (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
+          VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
+          id, organizationId, userId, createdAt * 1000, `storage:${organizationId}`, urgencyRank(urgency), createdAt,
+          JSON.stringify({ kind: 'storage', ...notice })));
+        if (!Number(inserted.changes)) continue;
+        const preferences = (await this.getDeliveryPreferences(userId, organizationId));
+        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
+          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+            .run(newId('delivery'), id, channel, createdAt, createdAt));
+      }
+      const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='storage'`)
+        .all(organizationId)) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !ids.has(id));
+      if (stale.length) {
+        (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+        (await deleteRows(this.db, 'inbox', 'id', stale));
+      }
+    });
+  }
+
   async removeAuthorizationInbox(requestId: string): Promise<void> {
     (await this.deleteInbox("kind='approval-requested' AND json_extract(subject, '$.requestId')=?", [requestId]));
   }
@@ -6192,8 +6225,11 @@ export class Store {
     if (location.kind === 'managed') {
       retainedBytes += Number(((await this.db.prepare('SELECT COALESCE(SUM(bytes), 0) bytes FROM promoted_artifacts WHERE organizationId=?')
         .get(location.organizationId)) as any)?.bytes ?? 0);
+      // A checkpoint queued for deletion no longer counts: its object goes with
+      // the next lifecycle sweep.
       retainedBytes += Number(((await this.db.prepare(`SELECT COALESCE(SUM(CAST(json_extract(manifest, '$.filesystemDelta.bytes') AS INTEGER)), 0) bytes
-        FROM world_checkpoints WHERE projectId IN (SELECT id FROM projects WHERE organizationId=?)`)
+        FROM world_checkpoints WHERE projectId IN (SELECT id FROM projects WHERE organizationId=?)
+          AND id NOT IN (SELECT substr(k, 15) FROM kv WHERE k LIKE 'checkpoint-gc:%')`)
         .get(location.organizationId)) as any)?.bytes ?? 0);
     }
     const quotaBytes = (await this.storageLocationQuotaBytes(location));
@@ -6210,8 +6246,11 @@ export class Store {
     });
   }
 
+  /** Reserve bytes for an upload. `enforceQuota: false` still counts them but
+   * never refuses: work-in-progress checkpoints must save even over quota,
+   * because a world that cannot checkpoint cannot park (it keeps running). */
   async reserveStorageUpload(uploadId: string, organizationId: string, storageLocationId: string,
-    bytes: number, expiresAt: number): Promise<void> {
+    bytes: number, expiresAt: number, options: { enforceQuota?: boolean } = {}): Promise<void> {
     return this.db.transaction(async () => {
 
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('invalid storage upload reservation');
@@ -6223,7 +6262,7 @@ export class Store {
       const total = retained + Number(((await this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
         FROM storage_upload_reservations WHERE storageLocationId=? AND uploadId<>?`)
         .get(storageLocationId, uploadId)) as any)?.bytes ?? 0) + bytes;
-      if (quotaBytes != null && total > quotaBytes)
+      if (options.enforceQuota !== false && quotaBytes != null && total > quotaBytes)
         throw new Error(`managed upload quota exceeded (${total} retained or pending bytes, ${quotaBytes} byte limit)`);
       (await this.db.prepare(`INSERT INTO storage_upload_reservations (uploadId, organizationId, storageLocationId, bytes, expiresAt)
         VALUES (?, ?, ?, ?, ?) ON CONFLICT(uploadId) DO UPDATE SET bytes=excluded.bytes, expiresAt=excluded.expiresAt`)
@@ -6242,14 +6281,15 @@ export class Store {
     });
   }
 
-  async retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): Promise<void> {
+  async retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string,
+    options: { enforceQuota?: boolean } = {}): Promise<void> {
     return this.db.transaction(async () => {
 
     const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes)
       VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=resource_snapshot_chunks.refs+1`);
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      if (storageLocationId) {
+      if (storageLocationId && options.enforceQuota !== false) {
         const location = (await this.getStorageLocation(storageLocationId));
         if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
         const newBytes = (await __asyncCollections.reduce(chunks, async (sum, chunk) => sum + ((await this.db.prepare(
@@ -6434,6 +6474,142 @@ export class Store {
           JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta.objectKey }));
       }
     });
+  }
+
+  /** Queue for deletion the checkpoints of done or cancelled tasks finished
+   * before `olderThan`, whose newest checkpoint is also older and whose world
+   * isn't live. Fork pins are kept. Committed work is on the task branch;
+   * these hold only the uncommitted leftovers. Failed tasks keep theirs:
+   * recovery restores them. Returns how many checkpoints were queued. */
+  async expireFinishedWorldCheckpoints(olderThan: number,
+    options: { limit?: number; organizationId?: string; projectId?: string } = {}): Promise<number> {
+    const { limit = 200, organizationId, projectId } = options;
+    const worlds = ((await this.db.prepare(`SELECT w.worldId AS worldId FROM world_checkpoints w
+      JOIN tasks t ON t.id=w.worldId
+      WHERE json_extract(t.lastView, '$.status') IN ('done', 'cancelled') AND COALESCE(t.completedAt, 0) < ?
+        ${organizationId ? 'AND w.projectId IN (SELECT id FROM projects WHERE organizationId=?)' : ''}
+        ${projectId ? 'AND w.projectId=?' : ''}
+        AND NOT EXISTS (SELECT 1 FROM world_instances wi WHERE wi.worldId=w.worldId AND wi.state IN ('ready', 'parked')
+          AND wi.generation=(SELECT MAX(x.generation) FROM world_instances x WHERE x.worldId=w.worldId))
+      GROUP BY w.worldId HAVING MAX(w.createdAt) < ? ORDER BY MAX(w.createdAt) LIMIT ?`)
+      .all(olderThan, ...(organizationId ? [organizationId] : []), ...(projectId ? [projectId] : []), olderThan, limit)) as Array<{ worldId: string }>)
+      .map((row) => String(row.worldId));
+    if (!worlds.length) return 0;
+    const pinned = new Set((await this.kvEntries('fork-checkpoint:')).map((row) => row.value));
+    let queued = 0;
+    for (const worldId of worlds) await this.db.transaction(async () => {
+      const rows = (await this.db.prepare('SELECT id, manifest FROM world_checkpoints WHERE worldId=?').all(worldId)) as Array<{ id: string; manifest: string }>;
+      for (const row of rows) {
+        if (pinned.has(String(row.id))) continue;
+        const checkpoint = JSON.parse(row.manifest) as WorldCheckpoint;
+        if (checkpoint.filesystemDelta) {
+          if (await this.kvGet(`checkpoint-gc:${checkpoint.id}`)) continue;
+          await this.kvSet(`checkpoint-gc:${checkpoint.id}`, JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta.objectKey }));
+        } else await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpoint.id);
+        queued++;
+      }
+    });
+    return queued;
+  }
+
+  /** Revision ids that something can still read: an attachment's current
+   * revision, an unreleased lease's base, a retained world checkpoint, or a
+   * park's incremental baseline. */
+  private async referencedResourceRevisionIds(): Promise<Set<string>> {
+    const ids = new Set<string>();
+    for (const row of (await this.db.prepare('SELECT currentRevisionId FROM resource_attachments WHERE currentRevisionId IS NOT NULL').all()) as Array<{ currentRevisionId: string }>)
+      ids.add(String(row.currentRevisionId));
+    for (const row of (await this.db.prepare("SELECT revisionId FROM resource_leases WHERE state<>'released' AND revisionId IS NOT NULL").all()) as Array<{ revisionId: string }>)
+      ids.add(String(row.revisionId));
+    for (const row of (await this.db.prepare(`SELECT manifest FROM world_checkpoints WHERE manifest LIKE '%"resources"%'`).all()) as Array<{ manifest: string }>)
+      for (const ref of (JSON.parse(row.manifest) as WorldCheckpoint).resources ?? []) ids.add(ref.revisionId);
+    for (const entry of (await this.kvEntries('resource-checkpoint:'))) {
+      try { const revisionId = JSON.parse(entry.value)?.revisionId; if (revisionId) ids.add(String(revisionId)); } catch {}
+    }
+    return ids;
+  }
+
+  /** Park-time captures of a task's private resource copy (`metadata.checkpoint`)
+   * created before `olderThan` that nothing references any more: the world
+   * checkpoint that pointed at them was pruned, or the task ended. */
+  async unreferencedCheckpointRevisions(olderThan: number, limit = 100): Promise<ResourceRevision[]> {
+    const referenced = (await this.referencedResourceRevisionIds());
+    return ((await this.db.prepare(`SELECT * FROM resource_revisions WHERE metadata LIKE '%"checkpoint":true%'
+      AND createdAt < ? ORDER BY createdAt`).all(olderThan)) as Parameters<typeof resourceRevisionRow>[0][])
+      .map(resourceRevisionRow).filter((revision) => !referenced.has(revision.id)).slice(0, limit);
+  }
+
+  /** Delete a revision row only if nothing references it now. The caller then
+   * deletes its objects; a failure there leaks bytes, never a dangling row.
+   * `allowCurrent` also clears it as its attachment's current revision. */
+  async deleteResourceRevisionIfUnreferenced(id: string, options: { allowCurrent?: boolean } = {}): Promise<ResourceRevision | undefined> {
+    return this.db.transaction(async () => {
+      const revision = (await this.getResourceRevision(id));
+      if (!revision) return undefined;
+      const referenced = (await this.referencedResourceRevisionIds());
+      const attachment = (await this.getResourceAttachment(revision.attachmentId));
+      const current = attachment?.currentRevisionId === id;
+      if (referenced.has(id) && !(options.allowCurrent && current
+        && !(await this.resourceRevisionReferencedBesidesCurrent(id)))) return undefined;
+      if (current) (await this.db.prepare('UPDATE resource_attachments SET currentRevisionId=NULL, updatedAt=? WHERE id=?')
+        .run(Date.now(), revision.attachmentId));
+      (await this.db.prepare('DELETE FROM resource_revisions WHERE id=?').run(id));
+      return revision;
+    });
+  }
+
+  private async resourceRevisionReferencedBesidesCurrent(id: string): Promise<boolean> {
+    if ((await this.db.prepare("SELECT 1 FROM resource_leases WHERE state<>'released' AND revisionId=?").get(id))) return true;
+    if ((await this.db.prepare('SELECT 1 FROM world_checkpoints WHERE manifest LIKE ?').get(`%"revisionId":"${id}"%`))) return true;
+    return (await this.kvEntries('resource-checkpoint:')).some((entry) => entry.value.includes(`"revisionId":"${id}"`));
+  }
+
+  /** Everything an organization keeps in storage, for the storage page and the
+   * over-quota policy. Sizes are logical bytes: revisions share unchanged
+   * chunks, so deleting one frees only what is unique to it. */
+  async organizationStorageContents(organizationId: string): Promise<{
+    attachments: Array<Pick<ResourceAttachment, 'id' | 'projectId' | 'name' | 'storageLocationId' | 'currentRevisionId'>>;
+    revisions: Array<Pick<ResourceRevision, 'id' | 'attachmentId' | 'bytes' | 'createdAt' | 'storageLocationId' | 'createdByTaskId'> & { checkpoint: boolean }>;
+    checkpoints: Array<{ id: string; projectId: string; worldId: string; bytes: number; createdAt: number; taskStatus?: string }>;
+    artifacts: PromotedArtifact[];
+  }> {
+    const attachments = ((await this.db.prepare(`SELECT id, projectId, name, storageLocationId, currentRevisionId
+      FROM resource_attachments WHERE organizationId=? ORDER BY createdAt`).all(organizationId)) as Array<{ id: string; projectId: string;
+        name: string; storageLocationId: string | null; currentRevisionId: string | null }>)
+      .map((row) => ({ id: String(row.id), projectId: String(row.projectId), name: String(row.name),
+        storageLocationId: row.storageLocationId ?? undefined, currentRevisionId: row.currentRevisionId ?? undefined }));
+    const revisions = ((await this.db.prepare(`SELECT r.* FROM resource_revisions r JOIN resource_attachments a ON a.id=r.attachmentId
+      WHERE a.organizationId=? ORDER BY r.createdAt`).all(organizationId)) as Parameters<typeof resourceRevisionRow>[0][]).map(resourceRevisionRow)
+      .map((revision) => ({ id: revision.id, attachmentId: revision.attachmentId, bytes: revision.bytes, createdAt: revision.createdAt,
+        storageLocationId: revision.storageLocationId, createdByTaskId: revision.createdByTaskId,
+        checkpoint: revision.metadata?.checkpoint === true }));
+    const checkpoints = ((await this.db.prepare(`SELECT w.id, w.projectId, w.worldId, w.manifest, w.createdAt,
+      json_extract(t.lastView, '$.status') AS taskStatus
+      FROM world_checkpoints w JOIN projects p ON p.id=w.projectId LEFT JOIN tasks t ON t.id=w.worldId
+      WHERE p.organizationId=? ORDER BY w.createdAt`).all(organizationId)) as Array<{ id: string; projectId: string; worldId: string;
+        manifest: string; createdAt: number; taskStatus: string | null }>)
+      .map((row) => ({ id: String(row.id), projectId: String(row.projectId), worldId: String(row.worldId),
+        bytes: Number((JSON.parse(row.manifest) as WorldCheckpoint).filesystemDelta?.bytes ?? 0), createdAt: Number(row.createdAt),
+        ...(row.taskStatus ? { taskStatus: String(row.taskStatus) } : {}) }));
+    const queued = new Set((await this.kvEntries('checkpoint-gc:')).map((entry) => entry.key.slice('checkpoint-gc:'.length)));
+    const artifacts = ((await this.db.prepare('SELECT * FROM promoted_artifacts WHERE organizationId=? ORDER BY createdAt').all(organizationId)) as Array<
+      Omit<PromotedArtifact, 'expiresAt'> & { expiresAt: number | null }>)
+      .map((row) => ({ ...row, bytes: Number(row.bytes), createdAt: Number(row.createdAt), expiresAt: row.expiresAt == null ? undefined : Number(row.expiresAt) }));
+    return { attachments, revisions, checkpoints: checkpoints.filter((checkpoint) => !queued.has(checkpoint.id)), artifacts };
+  }
+
+  /** When an organization's managed storage first exceeded its quota, and which
+   * notices it has been sent; undefined while it is within its quota. */
+  async storageOverQuota(organizationId: string): Promise<{ since: number; notices: string[] } | undefined> {
+    const raw = (await this.kvGet(`storage-over-quota:${organizationId}`));
+    if (!raw) return undefined;
+    try { const value = JSON.parse(raw); return { since: Number(value.since), notices: Array.isArray(value.notices) ? value.notices.map(String) : [] }; }
+    catch { return undefined; }
+  }
+
+  async setStorageOverQuota(organizationId: string, value: { since: number; notices: string[] } | undefined): Promise<void> {
+    if (value) (await this.kvSet(`storage-over-quota:${organizationId}`, JSON.stringify(value)));
+    else (await this.kvDelete(`storage-over-quota:${organizationId}`));
   }
 
   async pinWorldCheckpointForFork(taskId: string, checkpointId: string): Promise<void> {

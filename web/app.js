@@ -8,6 +8,26 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// Organization storage page: the over-limit state of managed storage and what
+// uses it, with the clean-up an owner can do. `contents` is null without
+// organization:edit.
+function storageOverQuotaMarkup(contents) {
+  if (!contents?.overQuota) return '';
+  const date = new Date(contents.overQuota.deleteAt).toLocaleDateString();
+  return `<p class="task-sub storage-over">Over the limit: adding data is paused. ${policyTip(`Free space or upgrade by ${date}. After that, stored data is deleted, older versions first, until it fits.`)}</p>`;
+}
+function storageContentsMarkup(contents) {
+  const projects = (contents?.projects || []).filter((project) => project.bytes > 0);
+  if (!projects.length) return '';
+  const rows = projects.map((project) => {
+    const resources = project.resources.map((resource) => `<div class="member-row storage-item"><span>${esc(resource.name)}</span><span>${formatBytes(resource.currentBytes)}${resource.olderVersions ? ` · ${resource.olderVersions} older version${resource.olderVersions === 1 ? '' : 's'} ${formatBytes(resource.olderBytes)}` : ''}${resource.taskCopies ? ` · task copies ${formatBytes(resource.taskCopyBytes)}` : ''}</span>${resource.olderVersions ? `<button class="btn sm" data-older-versions="${esc(resource.id)}">Delete older versions</button>` : ''}</div>`).join('');
+    const workspaces = project.checkpoints.count ? `<div class="member-row storage-item"><span>Saved task workspaces ${policyTip(`Uncommitted files of parked tasks. A finished task's are deleted ${contents.policy.finishedTaskCheckpointDays} days after it ends.`)}</span><span>${formatBytes(project.checkpoints.bytes)}</span>${project.checkpoints.finishedCount ? `<button class="btn sm" data-finished-workspaces="${esc(project.projectId)}">Delete finished (${formatBytes(project.checkpoints.finishedBytes)})</button>` : ''}</div>` : '';
+    const artifacts = project.artifacts.count ? `<div class="member-row storage-item"><span>Review files ${policyTip('Files attached to reviews. They are deleted automatically when they expire.')}</span><span>${formatBytes(project.artifacts.bytes)}</span></div>` : '';
+    return `<div class="storage-project"><div class="member-row"><b>${esc(project.name)}</b><span>${formatBytes(project.bytes)}</span></div>${resources}${workspaces}${artifacts}</div>`;
+  }).join('');
+  return `<details class="settings-disclosure compact"><summary><b>What's using space</b> ${policyTip('Sizes before sharing: versions share unchanged files, so deleting one frees only what is unique to it.')}</summary>${rows}</details>`;
+}
+
 function formatBytes(value) {
   const bytes = Number(value);
   if (!Number.isFinite(bytes) || bytes < 0) return '—';
@@ -16777,6 +16797,9 @@ function inboxTabs() {
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
+  if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
+    ? 'Stored data deleted to fit the limit'
+    : `Over the storage limit — free space by ${new Date(item.subject.deleteAt).toLocaleDateString()}`;
   if (item.subject?.kind === 'credential') {
     if (item.subject.reason === 'signed-out') return 'Signed out — sign in again';
     const days = Math.max(0, Math.ceil((item.subject.expiresAt - Date.now()) / 86_400_000));
@@ -16787,6 +16810,7 @@ function inboxRowLabel(item) {
 // What a row is about, for rows that are not a task's (resource asks, logins).
 function inboxTitle(item, fallback = item.kind) {
   if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
+  if (item.subject?.kind === 'storage') return `Storage · ${formatBytes(item.subject.retainedBytes)} of ${formatBytes(item.subject.quotaBytes)}`;
   return item.task?.title || item.resource?.name || fallback;
 }
 // Every priority is explicit; color and bars make the urgent levels scannable.
@@ -17039,6 +17063,9 @@ async function openInboxItem(item) {
   }
   if (item.subject?.kind === 'credential') {
     return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-agents`);
+  }
+  if (item.subject?.kind === 'storage') {
+    return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-storage`);
   }
   if (item.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId); if (!project) return;
@@ -18411,10 +18438,11 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await refresh('compute'); } catch (e) { toast(e.message, true); } }));
     },
     async storage() {
-      const storageLocations = await read('storage').catch(() => []);
+      const [storageLocations, contents] = await Promise.all([read('storage').catch(() => []), read('storage-contents').catch(() => null)]);
       if (!live('storage')) return;
       $('#org-storage').innerHTML = `
-        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress${pct >= 100 ? ' over' : ''}"><i style="width:${pct}%"></i></div>` : ''}${location.kind === 'managed' ? storageOverQuotaMarkup(contents) : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+        ${storageContentsMarkup(contents)}
         <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
           <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
           <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-tavya"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
@@ -18432,6 +18460,20 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
           toast('Customer storage connected'); await refresh('storage');
         } catch (error) { toast(error.message, true); }
       });
+      $('#org-storage')?.querySelectorAll('[data-older-versions]').forEach((button) => button.addEventListener('click', async () => {
+        if (!confirm('Delete the older versions of this data? The current version is kept.')) return;
+        try {
+          const result = await api(`/api/organizations/${organizationId}/storage-contents/resources/${encodeURIComponent(button.dataset.olderVersions)}/older-versions`, { method: 'DELETE' });
+          toast(`Deleted ${result.deleted} older version${result.deleted === 1 ? '' : 's'}`); reads.delete('storage'); reads.delete('storage-contents'); await refresh('storage');
+        } catch (error) { toast(error.message, true); }
+      }));
+      $('#org-storage')?.querySelectorAll('[data-finished-workspaces]').forEach((button) => button.addEventListener('click', async () => {
+        if (!confirm('Delete the saved workspaces of finished tasks in this project? Their committed work stays on their branches.')) return;
+        try {
+          await api(`/api/organizations/${organizationId}/storage-contents/projects/${encodeURIComponent(button.dataset.finishedWorkspaces)}/finished-workspaces`, { method: 'DELETE' });
+          toast('Deleted'); reads.delete('storage'); reads.delete('storage-contents'); await refresh('storage');
+        } catch (error) { toast(error.message, true); }
+      }));
       $('#org-storage')?.querySelectorAll('[data-storage]').forEach((row) => {
         const id = encodeURIComponent(row.dataset.storage);
         row.querySelector('.storage-test')?.addEventListener('click', async () => { try {
