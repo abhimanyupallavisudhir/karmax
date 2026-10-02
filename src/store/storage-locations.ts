@@ -2,6 +2,7 @@ import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { organizationScope } from '../autonomy/vault-keys.js';
 import type { StorageLocation, StorageLocationUsage } from '../domain/types.js';
 import type { Store } from './db.js';
 import { S3ObjectStore, type ObjectStore } from './objects.js';
@@ -83,7 +84,7 @@ export class StorageLocationService {
     if (input.accessKeyId || input.secretAccessKey) {
       if (!input.accessKeyId || !input.secretAccessKey) throw new Error('both S3 access key fields are required');
       (await this.broker.registerHandle(handle, JSON.stringify({ accessKeyId: input.accessKeyId,
-        secretAccessKey: input.secretAccessKey, sessionToken: input.sessionToken })));
+        secretAccessKey: input.secretAccessKey, sessionToken: input.sessionToken }), organizationScope(organizationId)));
     } else if (!this.broker.hasHandle(handle)) throw new Error('S3 access key is required');
     const value = (await this.store.saveStorageLocation({ id, organizationId, name: input.name.trim() || 'Customer S3', kind: 's3',
       config: { endpoint, bucket, region: input.region?.trim() || 'us-east-1', prefix }, credentialHandle: handle,

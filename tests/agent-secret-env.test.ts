@@ -14,6 +14,7 @@ import { LocalObjectStore } from '../src/store/objects.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 describe('agent project-secret delivery', () => {
   it('resolves attachment and service handles JIT into the dedicated turn channel', async () => {
@@ -33,7 +34,7 @@ describe('agent project-secret delivery', () => {
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     const credential = resourceSecretHandle('resource_agent_token');
-    (await broker.registerHandle(credential, 'secret-project-token'));
+    (await broker.registerHandle(credential, 'secret-project-token', INSTALLATION_SCOPE));
     const initial = (await store.createResourceAttachment({ id: 'resource_agent_token', organizationId: project.organizationId!, projectId: project.id,
       name: 'Agent token', driver: 'secret@1', target: { kind: 'environment', name: 'PROJECT_TOKEN' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [credential], publish: 'discard' }));
@@ -49,12 +50,12 @@ describe('agent project-secret delivery', () => {
     const core = makeCoreActivities({ store, worlds, resources, broker,
       adapters: new Map([['mock', adapter]]), profiles: new ProfileResolver(store, 'mock') });
     let handle = await core.createWorld({ taskId: task.id, projectId: project.id, kind: 'memory', base: 'main' });
-    const serviceHandle = await resources.registerServiceEnvironment(handle, { DATABASE_URL: 'postgres://task-service' });
+    const serviceHandle = await resources.registerServiceEnvironment(handle, { DATABASE_URL: 'postgres://task-service' }, 'org_personal');
     handle = (await store.updateWorldMeta(handle, {
       serviceEnvironmentHandles: serviceHandle.meta?.serviceEnvironmentHandles,
     }));
     try {
-      await broker.registerHandle('leased:model-key', 'leased-secret');
+      await broker.registerHandle('leased:model-key', 'leased-secret', INSTALLATION_SCOPE);
       await core.runAgentTurn({
         taskId: task.id,
         accountApiKeyHandle: 'leased:model-key',
@@ -86,7 +87,7 @@ describe('agent project-secret delivery', () => {
       } finally { vaultEnvironment.mockRestore(); }
       // A resumed turn opens the same world, without materializing its files again.
       const lateHandle = resourceSecretHandle('resource_late_token');
-      (await broker.registerHandle(lateHandle, 'late-project-token'));
+      (await broker.registerHandle(lateHandle, 'late-project-token', INSTALLATION_SCOPE));
       const late = (await store.createResourceAttachment({ id: 'resource_late_token', organizationId: project.organizationId!, projectId: project.id,
         name: 'Late token', driver: 'secret@1', target: { kind: 'environment', name: 'LATE_TOKEN' },
         access: 'read', isolation: 'fork', source: {}, credentialHandles: [lateHandle], publish: 'discard' }));
@@ -100,7 +101,7 @@ describe('agent project-secret delivery', () => {
       await resume();
       expect((await store.listResourceLeases(handle.id, handle.generation))).toEqual(leases);
       (await store.updateResourceAttachment(initial.id, { enabled: false }));
-      (await broker.registerHandle(lateHandle, 'rotated-project-token'));
+      (await broker.registerHandle(lateHandle, 'rotated-project-token', INSTALLATION_SCOPE));
       await resume();
       expect(received?.secretEnv).toEqual({ DATABASE_URL: 'postgres://task-service', LATE_TOKEN: 'rotated-project-token' });
       (await store.updateResourceLease(leases.find((lease) => lease.attachmentId === late.id)!.id, 'released'));
@@ -115,7 +116,7 @@ describe('agent project-secret delivery', () => {
         for (const target of [{ kind: 'environment', name: 'MID_TURN_TOKEN' }, { kind: 'path', path: '.mid-turn-key' }] as const) {
           // Each resource owns its own copy of the value.
           const id = `resource_mid_${target.kind}`;
-          (await broker.registerHandle(resourceSecretHandle(id), 'mid-turn-token'));
+          (await broker.registerHandle(resourceSecretHandle(id), 'mid-turn-token', INSTALLATION_SCOPE));
           (await store.createResourceAttachment({ id, organizationId: project.organizationId!, projectId: project.id,
             name: target.kind, driver: 'secret@1', target, access: 'read', isolation: 'fork', source: {},
             credentialHandles: [resourceSecretHandle(id)], publish: 'discard' }));
@@ -165,7 +166,7 @@ describe('agent output archiving', () => {
     const worlds = new WorldRegistry();
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
-    (await broker.registerHandle(resourceSecretHandle('resource_db'), 'postgres://admin:hunter2-db-pass@db.internal/app'));
+    (await broker.registerHandle(resourceSecretHandle('resource_db'), 'postgres://admin:hunter2-db-pass@db.internal/app', INSTALLATION_SCOPE));
     (await store.createResourceAttachment({ id: 'resource_db', organizationId: project.organizationId!, projectId: project.id,
       name: 'Database', driver: 'secret@1', target: { kind: 'environment', name: 'DATABASE_URL' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [resourceSecretHandle('resource_db')], publish: 'discard' }));
@@ -246,7 +247,7 @@ describe('streamed partial text', () => {
     const worlds = new WorldRegistry();
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
-    (await broker.registerHandle(resourceSecretHandle('resource_key'), secret));
+    (await broker.registerHandle(resourceSecretHandle('resource_key'), secret, INSTALLATION_SCOPE));
     (await store.createResourceAttachment({ id: 'resource_key', organizationId: project.organizationId!, projectId: project.id,
       name: 'Key', driver: 'secret@1', target: { kind: 'environment', name: 'API_KEY' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [resourceSecretHandle('resource_key')], publish: 'discard' }));

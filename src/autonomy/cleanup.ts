@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { Store } from '../store/db.js';
 import type { CredentialBroker } from './broker.js';
 import { VaultItems } from './vault-items.js';
+import { organizationScope } from './vault-keys.js';
 import { paths } from '../config/paths.js';
 
 export async function deleteAgentMail(store: Store, broker: CredentialBroker | undefined, organizationId: string): Promise<void> {
@@ -41,4 +42,7 @@ export async function deleteOrganizationAutonomy(store: Store, broker: Credentia
   }
   for (const key of [`vault:items:${organizationId}`, `vault:requests:${organizationId}`, `vault:write-outbox:${organizationId}`]) await store.kvDelete(key);
   fs.rmSync(path.join(home, 'connectors', 'pass-git', organizationId.replace(/[^a-zA-Z0-9._-]/g, '_')), { recursive: true, force: true });
+  // Last, after every cleanup that needed a credential: crypto-shred whatever
+  // the organization still owns in the vault, revisions and quarantine included (SS-1).
+  await broker?.destroyScope(organizationScope(organizationId));
 }

@@ -8,6 +8,7 @@ import { createBackup, restoreBackup, verifyBackup, recordRestores, signChecksum
 import { localSigningFingerprint } from '../src/ops/backup-signing.js';
 import crypto from 'node:crypto';
 import { Vault } from '../src/autonomy/vault.js';
+import { organizationScope } from '../src/autonomy/vault-keys.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -27,15 +28,18 @@ describe('control-plane backup', () => {
       const secret = 'synthetic-recovery-fixture-not-a-provider-credential';
       try {
         await store.kvSet('recovery-handle', handle);
-        await vault.put(handle, secret);
+        await vault.put(handle, secret, organizationScope('org_personal'));
       } finally { await store.close(); }
 
       const { directory, signedBy } = await createBackup({ home: original, destination: path.join(root, 'snapshot'),
         externalTemporal: true });
       // Prove recovery uses the snapshot, not the source's current state.
-      await vault.put(handle, 'changed-after-backup');
-      // Another host trusts the signing key by the fingerprint kept off-host.
-      await restoreBackup(directory, { home: recovered, trustKeys: [signedBy] });
+      await vault.put(handle, 'changed-after-backup', organizationScope('org_personal'));
+      // Another host trusts the signing key by the fingerprint kept off-host,
+      // and is given the vault key kept off-host: backups never carry it (SS-2).
+      const keptKey = path.join(root, 'kept-vault.key');
+      fs.copyFileSync(path.join(original, 'vault', 'vault.key'), keptKey);
+      await restoreBackup(directory, { home: recovered, trustKeys: [signedBy], vaultKeyFile: keptKey });
       const restored = await Store.create(path.join(recovered, 'state', 'karmax.db'));
       try {
         const restoredHandle = await restored.kvGet('recovery-handle');
@@ -240,7 +244,10 @@ describe('control-plane backup', () => {
     fs.writeFileSync(path.join(home, 'vault', 'vault.json'), 'ciphertext');
     fs.writeFileSync(path.join(home, 'state', 'auth.db.secret'), 'AUTH');
 
-    const withSecrets = await createBackup({ home, destination: path.join(root, 'a'), externalTemporal: true });
+    // Since SS-2 the vault key travels only when asked for.
+    expect(fs.existsSync(path.join((await createBackup({ home, destination: path.join(root, 'default'), externalTemporal: true })).directory,
+      'payload', 'vault', 'vault.key'))).toBe(false);
+    const withSecrets = await createBackup({ home, destination: path.join(root, 'a'), externalTemporal: true, includeVaultKey: true });
     expect(withSecrets.manifest.secretsIncluded).toBe(true);
     expect(fs.existsSync(path.join(root, 'a', 'payload', 'vault', 'vault.key'))).toBe(true);
     expect(fs.existsSync(path.join(root, 'a', 'payload', 'vault', 'vault.key.123.fixture.tmp'))).toBe(false);
@@ -302,13 +309,15 @@ describe('control-plane backup', () => {
     fs.writeFileSync(path.join(home, 'vault', 'vault.json'), 'source-ciphertext');
     fs.writeFileSync(path.join(home, 'state', 'auth.db.secret'), 'SOURCE-AUTH');
     const destination = path.join(root, 'snapshot');
-    await createBackup({ home, destination, externalTemporal: true });
+    await createBackup({ home, destination, externalTemporal: true, includeVaultKey: true });
 
     // Age the manifest back to what a pre-`secretsIncluded` karmax wrote: an
     // unsigned version 1, same file list, field absent.
     const manifestFile = path.join(destination, 'manifest.json');
     const aged = JSON.parse(fs.readFileSync(manifestFile, 'utf8')) as Record<string, unknown>;
     delete aged.secretsIncluded;
+    delete aged.vaultKeyIncluded;
+    delete aged.vaultKeyIds;
     aged.version = 1;
     fs.writeFileSync(manifestFile, `${JSON.stringify(aged, null, 2)}\n`);
     fs.rmSync(path.join(destination, 'manifest.sig'));
@@ -723,6 +732,88 @@ describe('signed deployment backups (DB-10)', () => {
     const file = path.join(b.directory, 'control-plane', 'payload', manifest.files[0].path);
     fs.appendFileSync(file, 'tampered');
     expect(() => verifyDeploymentBackup(b.directory, { home: b.home, acceptUnsignedV1: true })).toThrow(/integrity check failed/);
+  });
+});
+
+// SS-2: a backup never carries the key encryption key unless asked to; its
+// manifest names the key the vault needs, and restore refuses any other key
+// before it changes anything.
+describe('backups without the vault key (SS-2)', () => {
+  async function vaultHome(label: string, secret = 'tenant-secret') {
+    const { root, home } = makeHome(`kx-backup-kek-${label}-`);
+    fs.mkdirSync(path.join(home, 'state'), { recursive: true });
+    const vault = new Vault(path.join(home, 'vault'));
+    await vault.put('item:1:password', secret, organizationScope('org_a'));
+    return { root, home, kek: vault.keyStatus().kek };
+  }
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('excludes vault/vault.key by default and records the key id', async () => {
+    vi.stubEnv('KARMAX_VAULT_KEY', '');
+    const { root, home, kek } = await vaultHome('default');
+    const made = await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    expect(fs.existsSync(path.join(root, 'snapshot', 'payload', 'vault', 'vault.key'))).toBe(false);
+    expect(made.manifest.files.map((file) => file.path)).not.toContain('vault/vault.key');
+    expect(made.manifest).toMatchObject({ vaultKeyIncluded: false, vaultKeyIds: [kek] });
+    // The keyrings travel; they are useless without the key.
+    expect(made.manifest.files.some((file) => file.path.startsWith('vault/keys/'))).toBe(true);
+    const opted = await createBackup({ home, destination: path.join(root, 'opted'), externalTemporal: true, includeVaultKey: true });
+    expect(opted.manifest).toMatchObject({ vaultKeyIncluded: true, vaultKeyIds: [kek] });
+    expect(fs.existsSync(path.join(root, 'opted', 'payload', 'vault', 'vault.key'))).toBe(true);
+  });
+
+  it('records the id of a KARMAX_VAULT_KEY, and restores with it', async () => {
+    vi.stubEnv('KARMAX_VAULT_KEY', 'hosted-deployment-key-material-0123456789');
+    const { root, home, kek } = await vaultHome('env');
+    const made = await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    expect(made.manifest.vaultKeyIds).toEqual([kek]);
+    const target = path.join(root, 'target');
+    await restoreBackup(made.directory, { home: target, trustKeys: [made.signedBy] });
+    expect(new Vault(path.join(target, 'vault')).reveal('item:1:password')).toBe('tenant-secret');
+  });
+
+  it('refuses to restore under a different key before changing anything, and restores with the supplied one', async () => {
+    vi.stubEnv('KARMAX_VAULT_KEY', '');
+    const source = await vaultHome('source', 'source-secret');
+    const made = await createBackup({ home: source.home, destination: path.join(source.root, 'snapshot'), externalTemporal: true });
+    const target = await vaultHome('target', 'target-secret');
+    await expect(restoreBackup(made.directory, { home: target.home, trustKeys: [made.signedBy] }))
+      .rejects.toThrow(new RegExp(`vault is encrypted under ${source.kek}.*the vault key here is ${target.kek}`));
+    expect(new Vault(path.join(target.home, 'vault')).reveal('item:1:password')).toBe('target-secret');
+    // A wrong KARMAX_VAULT_KEY is refused the same way.
+    vi.stubEnv('KARMAX_VAULT_KEY', 'some-other-deployment-key-material-000000');
+    await expect(restoreBackup(made.directory, { home: target.home, trustKeys: [made.signedBy] })).rejects.toThrow(/vault key here is vk-/);
+    vi.stubEnv('KARMAX_VAULT_KEY', '');
+    // No key at all: refused, with the way out named.
+    const fresh = path.join(target.root, 'fresh');
+    await expect(restoreBackup(made.directory, { home: fresh, trustKeys: [made.signedBy] })).rejects.toThrow(/--vault-key-file/);
+    expect(fs.existsSync(path.join(fresh, 'vault'))).toBe(false);
+    // The key kept off-host opens it.
+    const kept = path.join(source.root, 'kept-vault.key');
+    fs.copyFileSync(path.join(source.home, 'vault', 'vault.key'), kept);
+    await restoreBackup(made.directory, { home: target.home, trustKeys: [made.signedBy], vaultKeyFile: kept });
+    expect(new Vault(path.join(target.home, 'vault')).reveal('item:1:password')).toBe('source-secret');
+    // And onto the home it came from, the live key is kept.
+    await restoreBackup(made.directory, { home: source.home });
+    expect(new Vault(path.join(source.home, 'vault')).reveal('item:1:password')).toBe('source-secret');
+  });
+
+  it('checks the key when verifying, through npm run restore', async () => {
+    vi.stubEnv('KARMAX_VAULT_KEY', 'hosted-deployment-key-material-0123456789');
+    const { root, home } = await vaultHome('cli');
+    const made = await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    const keyFile = path.join(root, 'vault_key');
+    const run = (material: string) => {
+      fs.writeFileSync(keyFile, `${material}\n`);
+      return spawnSync(process.execPath, ['--import', 'tsx', 'src/scripts/restore.ts', '--verify', '--check-vault-key',
+        '--trust-key', made.signedBy, made.directory], { encoding: 'utf8',
+        env: { ...process.env, KARMAX_VAULT_KEY: '', KARMAX_VAULT_KEY_FILE: keyFile, KARMAX_HOME: path.join(root, 'elsewhere') } });
+    };
+    const good = run('hosted-deployment-key-material-0123456789');
+    expect(good.status, good.stderr).toBe(0);
+    const bad = run('a-different-deployment-key-material-99999');
+    expect(bad.status).not.toBe(0);
+    expect(bad.stderr).toMatch(/vault key here is vk-/);
   });
 });
 

@@ -12,6 +12,7 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitProfiles, gitHandle, inheritPersonalGithubProfile, userGitScope } from '../src/autonomy/git-profiles.js';
 import { remotePolicyOf } from '../src/domain/types.js';
 import { Store } from '../src/store/db.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 /** Git & GitHub configuration (wiki plans/PLAN-git-config): the GitProfile registry,
  *  worktree-scoped identity materialization, JIT credential env, remote policy. */
@@ -449,7 +450,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
       const store2 = (await Store.create(':memory:'));
       const organization = (await store2.createOrganization({ name: 'Acme' }));
       const project = (await store2.createProject('Acme project', {}, organization.id));
-      (await broker.registerHandle('claude:personal-key', 'must-not-leak'));
+      (await broker.registerHandle('claude:personal-key', 'must-not-leak', INSTALLATION_SCOPE));
       const worlds = new WorldRegistry();
       worlds.register(new WorktreeProvider(path.join(tmp, 'tenant-worlds')));
       const core = makeCoreActivities({
@@ -469,7 +470,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
       expect(order).not.toContain('key:handle:claude:personal-key');
 
       const organizationHandle = `claude:${organization.id}:work`;
-      (await broker.registerHandle(organizationHandle, 'tenant-key'));
+      (await broker.registerHandle(organizationHandle, 'tenant-key', INSTALLATION_SCOPE));
       (await store2.upsertProfile({
         id: 'do-default',
         name: 'Do',

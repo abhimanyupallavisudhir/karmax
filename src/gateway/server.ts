@@ -89,6 +89,7 @@ import { worldRepos, worldWorkingRelativePath, type WorldHandle } from '../world
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
+import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { AuthorizationRequests } from '../platform/authorization-requests.js';
@@ -4008,7 +4009,7 @@ export class Gateway {
                 // handle may name someone else's (AU-40).
                 const handle = entry.value ? resourceSecretHandle(existing.id)
                   : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
-                if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value));
+                if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.updateResourceAttachment(existing.id, {
                   target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
                   credentialHandles: [handle], enabled: true,
@@ -4017,7 +4018,7 @@ export class Gateway {
               } else {
                 if (!entry.value) continue;
                 const id = newId('resource'), handle = `resource:${id}:credential`;
-                (await this.deps.broker.registerHandle(handle, entry.value));
+                (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.createResourceAttachment({ id, organizationId: project.organizationId,
                   projectId: project.id, name: entry.name, driver: 'secret@1',
                   target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
@@ -4197,7 +4198,7 @@ export class Gateway {
             if (!secret) return this.json(res, 400, { error: 'secret value is required for this resource driver' });
             if (!this.deps.broker) return this.json(res, 503, { error: 'credential broker is unavailable' });
             const handle = resourceSecretHandle(id);
-            (await this.deps.broker.registerHandle(handle, secret));
+            (await this.deps.broker.registerHandle(handle, secret, organizationScope(project.organizationId)));
             credentialHandles.push(handle);
           }
           try {
@@ -4320,7 +4321,7 @@ export class Gateway {
                 : {}),
               ...(b.credentialHandles ? { credentialHandles: b.credentialHandles } : {}),
             }));
-            if (secretUpdate) (await this.deps.broker!.registerHandle(secretUpdate.handle, secretUpdate.value));
+            if (secretUpdate) (await this.deps.broker!.registerHandle(secretUpdate.handle, secretUpdate.value, organizationScope(resource.organizationId)));
             return this.json(res, 200, redactResource(next));
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
@@ -7115,7 +7116,7 @@ export class Gateway {
             // The provider secret (AgentMail key / IMAP password) → the vault under
             // an org-scoped handle the poller resolves; never echoed or stored raw.
             const apiKeyHandle = this.mailboxSecretHandle(organizationId, String(b.provider));
-            if (b.apiKey && this.deps.broker) (await this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey)));
+            if (b.apiKey && this.deps.broker) (await this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey), organizationScope(organizationId)));
             // REPLACE (not merge) so switching providers can't leave a stale field.
             const config = { ...result.config, ...(b.apiKey ? { apiKeyHandle } : {}) };
             (await this.setMailboxConfig(organizationId, config));
@@ -7154,7 +7155,7 @@ export class Gateway {
         });
         if (result.status === 'connected' && result.config) {
           const handle = 'email:outbound:auth';
-          if (b.secret && this.deps.broker) (await this.deps.broker.registerHandle(handle, String(b.secret)));
+          if (b.secret && this.deps.broker) (await this.deps.broker.registerHandle(handle, String(b.secret), INSTALLATION_SCOPE));
           // REPLACE, not merge, so switching providers can't leave a stale field.
           (await this.setOutboundEmailConfig({ ...result.config, secretHandle: handle }));
         }
@@ -7305,7 +7306,7 @@ export class Gateway {
         const handle = resourceOrganizationId === 'org_personal'
           ? `${provider}:${account}`
           : `${provider}:${resourceOrganizationId}:${account}`;
-        (await this.deps.broker.registerHandle(handle, String(b.apiKey)));
+        (await this.deps.broker.registerHandle(handle, String(b.apiKey), organizationScope(resourceOrganizationId)));
         await this.refreshLoginPool();
         return this.json(res, 200, { handle }); // never echoes the secret
       }
@@ -7338,7 +7339,7 @@ export class Gateway {
         if (nextHandle !== handle && this.deps.broker.hasHandle(nextHandle))
           return this.json(res, 409, { error: `API key ${provider}:${nextAccount} already exists` });
         const replacement = b.apiKey === undefined || b.apiKey === '' ? undefined : String(b.apiKey);
-        (await this.deps.broker.updateHandle(handle, nextHandle, replacement));
+        (await this.deps.broker.updateHandle(handle, nextHandle, organizationScope(resourceOrganizationId), replacement));
         if (nextHandle !== handle)
           (await this.remapCredentialPolicies(resourceOrganizationId, credentialKey, `key:handle:${nextHandle}`));
         await this.refreshLoginPool();

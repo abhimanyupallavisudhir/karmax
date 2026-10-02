@@ -18,6 +18,7 @@ import { itemHandle, VaultItems } from '../src/autonomy/vault-items.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { CapabilityError, KarmaxApi } from '../src/platform/api.js';
 import { worldWorkingRelativePath } from '../src/world/types.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
@@ -108,7 +109,7 @@ describe('project resources', () => {
       isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
     const initial = await resources.importFiles(volume.id, [{ path: 'model.bin', data: Buffer.from('base-model') }]);
     const secretHandle = resourceSecretHandle('resource_training_token');
-    (await broker.registerHandle(secretHandle, 'secret-token'));
+    (await broker.registerHandle(secretHandle, 'secret-token', INSTALLATION_SCOPE));
     (await store.createResourceAttachment({ id: 'resource_training_token', organizationId: project.organizationId!, projectId: project.id,
       name: 'Training token', driver: 'secret@1', target: { kind: 'environment', name: 'TRAINING_TOKEN' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [secretHandle], publish: 'discard' }));
@@ -116,7 +117,7 @@ describe('project resources', () => {
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = await resources.materialize(project.id, task.id, world, 1);
     world.handle = await resources.registerServiceEnvironment(world.handle,
-      { DATABASE_URL: 'postgres://private-per-world-endpoint' });
+      { DATABASE_URL: 'postgres://private-per-world-endpoint' }, project.organizationId!);
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     expect(await world.readFile('resources/model/model.bin')).toBe('base-model');
     const leasesBeforeVerification = (await store.listResourceLeases(world.handle.id));
@@ -661,7 +662,7 @@ describe('project resources', () => {
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
 
     const handle = itemHandle('vi_generated', 'secret');
-    (await broker.registerHandle(handle, 'generated-api-key'));
+    (await broker.registerHandle(handle, 'generated-api-key', INSTALLATION_SCOPE));
     const credential = await resources.proposeCredential(task.id, {
       itemId: 'vi_generated', field: 'secret', credentialHandle: handle, name: 'Generated API key',
       driver: 'secret@1', target: { kind: 'environment', name: 'GENERATED_API_KEY' }, access: 'read',

@@ -13,6 +13,7 @@ import { paths } from '../src/config/paths.js';
 import { Gateway } from '../src/gateway/server.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
+import { INSTALLATION_SCOPE, userScope } from '../src/autonomy/vault-keys.js';
 
 describe('project wiki remote provisioning', () => {
   let home: string;
@@ -55,7 +56,7 @@ describe('project wiki remote provisioning', () => {
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' },
       publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE));
     // The operator's user OAuth token has expired. The App installation can
     // still mint its own short-lived token.
     const githubCalls: Array<{ path: string; method: string }> = [];
@@ -66,7 +67,7 @@ describe('project wiki remote provisioning', () => {
         return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
       return new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
     };
-    (await broker.registerHandle('github-app:user:owner:authorization', JSON.stringify({ accessToken: 'expired-token' })));
+    (await broker.registerHandle('github-app:user:owner:authorization', JSON.stringify({ accessToken: 'expired-token' }), userScope('owner')));
     const githubApp = (await GitHubAppService.create(store, broker,
       { appId: '123', clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
 
