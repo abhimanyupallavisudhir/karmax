@@ -205,14 +205,19 @@ def _read_claude_content(value: Any, conv: dict[str, Any], index: int) -> list[d
             )
         elif kind == "tool_result":
             content = item.get("content", "")
+            images: list[dict[str, Any]] = []
             if isinstance(content, list):
-                content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
+                images = [{"type": "image", "source": part.get("source")} for part in content
+                          if isinstance(part, dict) and part.get("type") == "image"]
+                content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part)
+                                    for part in content if not (isinstance(part, dict) and part.get("type") == "image"))
             blocks.append(
                 {
                     "type": "tool_result",
                     "tool_call_id": str(item.get("tool_use_id") or "unknown"),
                     "content": str(content),
                     "is_error": bool(item.get("is_error", False)),
+                    **({"images": images} if images else {}),
                 }
             )
         elif kind == "image":
@@ -244,10 +249,14 @@ def read_codex(text: str, *, source_uri: str | None = None, **_: Any) -> dict[st
         "native_metadata",
     ]
     pending_tools: list[str] = []
+    compacted_at: int | None = None
     for index, record in jsonl_records(text, lambda index: warning(conv, "truncated_final_record", "Incomplete final JSONL record was skipped.", path=f"records[{index}]")):
         timestamp = record.get("timestamp")
         record_type = record.get("type")
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if record_type == "compacted":
+            compacted_at = len(conv["messages"])
+            continue
         if record_type == "session_meta":
             session_id = payload.get("id") or payload.get("session_id")
             if session_id:
@@ -323,9 +332,7 @@ def read_codex(text: str, *, source_uri: str | None = None, **_: Any) -> dict[st
             _attach_codex_upstream(converted, payload)
             conv["messages"].append(converted)
         elif payload_type in {"function_call_output", "custom_tool_call_output", "local_shell_call_output"}:
-            output = payload.get("output", "")
-            if not isinstance(output, str):
-                output = json.dumps(output, ensure_ascii=False)
+            output, images = _read_codex_tool_output(payload.get("output", ""), conv, index)
             call_id = str(payload.get("call_id") or (pending_tools[0] if pending_tools else "unknown"))
             if call_id in pending_tools:
                 pending_tools.remove(call_id)
@@ -333,7 +340,8 @@ def read_codex(text: str, *, source_uri: str | None = None, **_: Any) -> dict[st
                 warning(conv, "codex_unpaired_tool_result", "A Codex tool result had no matching call.", path=f"records[{index}]")
             converted = message(
                 role="tool",
-                content=[{"type": "tool_result", "tool_call_id": call_id, "content": output, "is_error": False}],
+                content=[{"type": "tool_result", "tool_call_id": call_id, "content": output, "is_error": False,
+                          **({"images": images} if images else {})}],
                 source_format="codex-jsonl",
                 source_id=payload.get("call_id"),
                 message_id=f"tool-result:{call_id}:{index}",
@@ -369,8 +377,52 @@ def read_codex(text: str, *, source_uri: str | None = None, **_: Any) -> dict[st
                 path=f"records[{index}]",
             )
         conv["updated_at"] = normalize_timestamp(timestamp) or conv["updated_at"]
+    if compacted_at is not None:
+        conv["messages"] = _compaction_digest(conv["messages"][:compacted_at]) + conv["messages"][compacted_at:]
+        warning(
+            conv,
+            "codex_compaction_digest",
+            "Before Codex's last compaction only user and assistant messages were kept: Codex itself no longer saw "
+            "the tool calls, outputs and reasoning, and its own summary of them is encrypted.",
+        )
     conv["capabilities"]["represented"].extend(["tool_calls", "tool_results", "native_metadata"])
     return validate_conversation(conv)
+
+
+def _compaction_digest(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What a compacted span keeps: the conversation's own messages, without tool work."""
+    digest: list[dict[str, Any]] = []
+    for item in messages:
+        if item["role"] not in {"user", "assistant"}:
+            continue
+        blocks = [block for block in item["content"] if block["type"] in {"text", "code", "image"}]
+        if blocks:
+            digest.append({**item, "content": blocks})
+    return digest
+
+
+def _read_codex_tool_output(value: Any, conv: dict[str, Any], index: int) -> tuple[str, list[dict[str, Any]]]:
+    """A tool output's text, and its images as image blocks (never as base64 text)."""
+    if isinstance(value, str):
+        return value, []
+    if not isinstance(value, list):
+        return json.dumps(value, ensure_ascii=False), []
+    texts: list[str] = []
+    images: list[dict[str, Any]] = []
+    for part_index, part in enumerate(value):
+        kind = part.get("type") if isinstance(part, dict) else None
+        if kind in {"input_text", "output_text", "text"}:
+            texts.append(str(part.get("text", "")))
+        elif kind in {"input_image", "image_url"} and (part.get("image_url") or part.get("url")):
+            images.append({"type": "image", "source": part.get("image_url") or part.get("url")})
+        else:
+            warning(
+                conv,
+                "codex_block_not_represented",
+                f"Codex tool output part {kind!r} was not represented.",
+                path=f"records[{index}].payload.output[{part_index}]",
+            )
+    return "\n".join(texts), images
 
 
 def _read_codex_message_content(value: Any, conv: dict[str, Any], index: int) -> list[dict[str, Any]]:

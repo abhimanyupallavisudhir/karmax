@@ -38,6 +38,9 @@ import { platformToolHandlers } from './tools.js';
  *                                   transient-infra retry path — no Resolve)
  *   @failworld <message>            throw on this and every later turn in this world, the
  *                                   retries' resume prompts included (a fault that persists)
+ *   @overflow [always]              fail as a context overflow while resuming a session
+ *                                   (`always`: in a fresh one too); in a fresh session
+ *                                   report `fresh session` and go on
  *   @decide <action> :: <reason>    resolve agent verdict (resume/retryStage/gotoStage/parkUntil/escalate)
  *   @confirm <action> [:: text]     confirm agent verdict (confirm/revise/reject)
  *   @openpr                         explicitly request the PR/Review cycle
@@ -276,6 +279,10 @@ export class MockAdapter implements AgentAdapter {
         // may park a login (AD-2/AD-7); anything else stays a plain Error.
         case 'fail':
           throw providerErrorFromMessage('mock', rest || 'mock failure');
+        case 'overflow':
+          if (input.session || rest === 'always') throw providerErrorFromMessage('mock', 'prompt is too long: 1200000 tokens > 1000000 maximum');
+          outputs.push('fresh session');
+          break;
         case 'failworld':
           failingWorlds.set(input.world.handle.id, rest || 'mock persistent failure');
           throw providerErrorFromMessage('mock', failingWorlds.get(input.world.handle.id)!);

@@ -4,6 +4,7 @@ import {
   isProviderPolicyRejection,
   classifyProviderTurnError,
   classifyLimitError,
+  isContextOverflow,
   isTransportError,
   isResourceKill,
   nativeProviderDiagnostic,
@@ -392,5 +393,24 @@ describe('confirmSandboxFailure (limits reported from inside a sandbox)', () => 
     const result = await confirmSandboxFailure(policy, async () => { throw new Error('must not probe'); }, now);
     expect(classifyProviderTurnError(result).classification.limited).toBe(false);
     expect((result as Error).message).toBe('stream ended');
+  });
+});
+
+// legibench3#18: a conversation larger than the model's window fails the same way
+// on every resume, so it is neither transport nor a usage limit.
+describe('isContextOverflow', () => {
+  it.each([
+    'Claude provider invalid_request: Prompt is too long',
+    'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 11922478 tokens > 1000000 maximum"}}',
+    "This model's maximum context length is 400000 tokens. However, your messages resulted in 512000 tokens.",
+    'context_length_exceeded',
+    "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+  ])('recognises %s', (message) => {
+    expect(isContextOverflow(message)).toBe(true);
+    expect(isTransportError(message)).toBe(false);
+    expect(classifyLimitError(message).limited).toBe(false);
+  });
+  it('leaves an agent\'s own output about long prompts alone', () => {
+    expect(isContextOverflow('npm test: 3 failed')).toBe(false);
   });
 });

@@ -20,7 +20,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -177,6 +177,9 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
       ...(metadata ? { details: [metadata] } : {}),
     });
   }
+  // Not the agent's mistake and not transient: the session no longer fits the
+  // model. The workflow restarts the stage on a fresh session (agent-context).
+  if (isContextOverflow(msg)) return ApplicationFailure.create({ message: msg, type: 'agent-context', nonRetryable: true, cause });
   // A remote sandbox's own metrics outrank any reading of the error text: a
   // frozen sandbox fails with whatever the next provider call happens to say
   // (tasks 348/349: an exit "-1", "Sandbox is probably not running anymore").

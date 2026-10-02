@@ -1651,6 +1651,7 @@ async function softwareDevImpl(
     for (;;) {
       let attempt = 0;
       let infraRetries = 0;
+      let freshContext = false;
       for (; attempt <= MAX_RESOLVE_ATTEMPTS; attempt++) {
         limitReportedToCoordinator = false;
         try {
@@ -1661,6 +1662,24 @@ async function softwareDevImpl(
           // decision is task-local: never rotate accounts or ask Resolve to retry.
           if (failureHasType(err, 'agent-policy')) {
             lastError = describeError(err);
+            error = lastError;
+            break;
+          }
+          // A Do session the provider rejects as larger than the model's context
+          // fails the same way on every retry and follow-up (legibench3#18). Run
+          // the stage once more on a fresh session, which rebuilds its context from
+          // the task's transcript and a fork's source, as after a login change. If
+          // that overflows too, only a person can narrow the work: no Resolve turn.
+          if (failureHasType(err, 'agent-context') && stageName === 'do'
+            && patched('software-dev-context-overflow-fresh-session-v1')) {
+            if (!freshContext && session) {
+              freshContext = true;
+              session = undefined;
+              sessionHome = undefined;
+              attempt--;
+              continue;
+            }
+            lastError = `${describeError(err)} — the conversation is larger than the model's context window even in a fresh session; send a narrower follow-up or start a new task`;
             error = lastError;
             break;
           }
