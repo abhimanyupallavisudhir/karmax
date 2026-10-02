@@ -354,6 +354,17 @@ export function isTransportError(error: unknown): boolean {
 }
 
 /**
+ * The provider refused the request as larger than the model's context window:
+ * the conversation itself is too big, so resuming the same session fails the
+ * same way on every retry and every follow-up (legibench3#18: "prompt is too
+ * long: 11922478 tokens > 1000000 maximum", after Claude Code's own compaction).
+ */
+export function isContextOverflow(message: string): boolean {
+  return /prompt is too long|context[_ ]length[_ ]exceeded|maximum context length|exceeds the (?:model'?s )?context window|ran out of room in the model'?s context window/i
+    .test(String(message ?? ''));
+}
+
+/**
  * A signal-9 / OOM-signature kill: the model subprocess was reaped by SIGKILL
  * (signal 9) or an explicit out-of-memory error surfaced — nothing the agent said
  * or did. The Claude Agent SDK surfaces this as the opaque "Claude Code process
