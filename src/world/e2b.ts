@@ -34,6 +34,7 @@ import { serviceHomeLabel } from './services.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
 import { taskBranch } from '../domain/brand.js';
+import { isTransportError } from '../agent/limits.js';
 
 const HOME = '/home/user';
 const ROOT = '/home/user/karmax';
@@ -63,6 +64,9 @@ export interface E2BSandboxLike {
   commands: {
     run(command: string, options?: Record<string, unknown>): Promise<any>;
   };
+  /** Signed URLs for a file transfer over a connection of its own (E2BWorld.transfer). */
+  uploadUrl?(path: string, options?: { useSignatureExpiration?: number }): Promise<string>;
+  downloadUrl?(path: string, options?: { useSignatureExpiration?: number }): Promise<string>;
   files: {
     read(path: string, options?: Record<string, unknown>): Promise<string | Uint8Array | ArrayBuffer>;
     write(path: string, data: string | Uint8Array): Promise<unknown>;
@@ -484,46 +488,87 @@ class E2BWorld implements World {
   }
 
   async readFile(relPath: string): Promise<string> {
-    const value = await this.sandbox.files.read(this.filePath(relPath), { format: 'text' });
-    return typeof value === 'string' ? value : Buffer.from(toBytes(value)).toString('utf8');
+    return (await this.readFileBuffer(relPath)).toString('utf8');
   }
 
   async readFileBuffer(relPath: string): Promise<Buffer> {
-    const value = await this.sandbox.files.read(this.filePath(relPath), { format: 'bytes' });
-    return typeof value === 'string' ? Buffer.from(value) : Buffer.from(toBytes(value));
+    const file = this.filePath(relPath);
+    return this.transfer(async () => {
+      const value = await this.sandbox.files.read(file, { format: 'bytes' });
+      return typeof value === 'string' ? Buffer.from(value) : Buffer.from(toBytes(value));
+    }, async () => Buffer.from(await (await this.directTransfer('read', file)).arrayBuffer()));
   }
 
   async readFilePrefix(relPath: string, maxBytes: number): Promise<Buffer> {
+    const file = this.filePath(relPath);
     const abort = new AbortController();
-    const stream = await this.sandbox.files.read(this.filePath(relPath),
-      { format: 'stream', signal: abort.signal }) as unknown as ReadableStream<Uint8Array>;
-    const reader = stream.getReader();
-    const chunks: Buffer[] = [];
-    let length = 0, finished = false;
-    try {
-      while (length < maxBytes) {
-        const { done, value } = await reader.read();
-        if (done) { finished = true; break; }
-        const chunk = Buffer.from(value.buffer, value.byteOffset, Math.min(value.byteLength, maxBytes - length));
-        chunks.push(chunk);
-        length += chunk.length;
-      }
-    } finally {
-      // Stop the download at the limit instead of draining the rest.
-      if (!finished) {
-        await reader.cancel().catch(() => undefined);
-        abort.abort();
-      }
-    }
-    return Buffer.concat(chunks, length);
+    return this.transfer(async () => readPrefix(await this.sandbox.files.read(file,
+      { format: 'stream', signal: abort.signal }) as unknown as ReadableStream<Uint8Array>, maxBytes, abort),
+    async () => {
+      const direct = new AbortController();
+      const response = await this.directTransfer('read', file, undefined, direct.signal);
+      return readPrefix(response.body ?? new Blob([]).stream(), maxBytes, direct);
+    });
   }
 
   async writeFile(relPath: string, content: string): Promise<void> {
-    await this.sandbox.files.write(this.filePath(relPath), content);
+    await this.writeFileBuffer(relPath, Buffer.from(content));
   }
 
   async writeFileBuffer(relPath: string, content: Buffer): Promise<void> {
-    await this.sandbox.files.write(this.filePath(relPath), content);
+    const file = this.filePath(relPath);
+    await this.transfer(() => this.sandbox.files.write(file, content), () => this.directTransfer('write', file, content));
+  }
+
+  /**
+   * The SDK sends every file transfer to a sandbox over one process-wide HTTP/2
+   * session. After a large upload E2B's edge can reset that session's streams
+   * (NGHTTP2_ENHANCE_YOUR_CALM), and every later transfer on it fails until the
+   * worker restarts — 18 identical failed turns in legibench3#18, while a fresh
+   * process reached the same sandbox at once. A transfer that fails on transport
+   * is therefore sent once more through the sandbox's signed file URL, on a
+   * connection of its own, and so is every later transfer to that sandbox from
+   * this process. A failure the sandbox reported (a missing file, a permission)
+   * is not transport, so it is never rerouted.
+   */
+  private async transfer<T>(viaSession: () => Promise<T>, direct: () => Promise<T>): Promise<T> {
+    const id = this.sandbox.sandboxId;
+    const available = !!this.sandbox.uploadUrl && !!this.sandbox.downloadUrl;
+    if (available && droppedTransferSessions.has(id)) return direct();
+    try {
+      return await viaSession();
+    } catch (error) {
+      if (!available || !isTransportError(error)) throw error;
+      droppedTransferSessions.add(id);
+      return direct();
+    }
+  }
+
+  private async directTransfer(operation: 'read', file: string, content?: undefined, signal?: AbortSignal): Promise<Response>;
+  private async directTransfer(operation: 'write', file: string, content: Buffer): Promise<Response>;
+  private async directTransfer(operation: 'read' | 'write', file: string, content?: Buffer, signal?: AbortSignal): Promise<Response> {
+    const sign = (operation === 'write' ? this.sandbox.uploadUrl! : this.sandbox.downloadUrl!).bind(this.sandbox);
+    // Only a secured sandbox signs its URLs, and only a signed URL can expire.
+    const url = await sign(file, { useSignatureExpiration: SIGNED_FILE_URL_SECONDS })
+      .catch((error: unknown) => { if ((error as Error)?.name === 'InvalidArgumentError') return sign(file); throw error; });
+    let body: FormData | undefined;
+    if (content) {
+      body = new FormData();
+      body.append('file', new Blob([content]), path.posix.basename(file));
+    }
+    // The URL carries a signature: it must never reach an error message or a log.
+    const response = await fetch(url, { method: content ? 'POST' : 'GET', ...(body ? { body } : {}),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(DIRECT_TRANSFER_TIMEOUT_MS)]) : AbortSignal.timeout(DIRECT_TRANSFER_TIMEOUT_MS) })
+      .catch((error: unknown) => { throw new Error(`E2B file ${operation} failed: ${describeTransport(error)}`, { cause: error }); });
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => '')).trim().slice(0, 500);
+      // No `status` property: a missing FILE must never read as a missing sandbox
+      // (isMissingSandbox), which would authorize reaping the world.
+      const failure = new Error(`E2B file ${operation} failed: HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
+      if (response.status === 404) failure.name = 'FileNotFoundError';
+      throw failure;
+    }
+    return response;
   }
 
   async listFiles(): Promise<string[]> {
@@ -927,6 +972,41 @@ function defaultE2BFactory(): E2BFactory {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Sandboxes whose SDK transfer session this process saw drop; see E2BWorld.transfer. */
+const droppedTransferSessions = new Set<string>();
+const SIGNED_FILE_URL_SECONDS = 15 * 60;
+const DIRECT_TRANSFER_TIMEOUT_MS = 15 * 60_000;
+
+/** The first `maxBytes` of a download, cancelling the rest instead of draining it. */
+async function readPrefix(stream: ReadableStream<Uint8Array>, maxBytes: number, abort: AbortController): Promise<Buffer> {
+  const reader = stream.getReader();
+  const chunks: Buffer[] = [];
+  let length = 0, finished = false;
+  try {
+    while (length < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) { finished = true; break; }
+      const chunk = Buffer.from(value.buffer, value.byteOffset, Math.min(value.byteLength, maxBytes - length));
+      chunks.push(chunk);
+      length += chunk.length;
+    }
+  } finally {
+    if (!finished) {
+      await reader.cancel().catch(() => undefined);
+      abort.abort();
+    }
+  }
+  return Buffer.concat(chunks, length);
+}
+
+/** A transport failure's message chain, which (unlike the request) names no URL. */
+function describeTransport(error: unknown): string {
+  const parts: string[] = [];
+  for (let current = error, depth = 0; current && depth < 4; current = (current as { cause?: unknown }).cause, depth++)
+    parts.push(current instanceof Error ? current.message : String(current));
+  return parts.join(' → ');
 }
 
 function toBytes(value: Uint8Array | ArrayBuffer): Uint8Array {

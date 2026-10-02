@@ -4993,6 +4993,8 @@ function stageLabel(v) {
   if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
   // So is a turn parked on its credential or quota: nothing is working.
   if (v.status === 'waiting' && v.waitingFor?.kind === 'account') return waitingText(v.waitingFor);
+  // Nor is a stage between attempts after an infrastructure failure.
+  if (v.status === 'waiting' && v.waitingFor?.kind === 'retry') return waitingText(v.waitingFor);
   // Nor is an agent that ended its turn to wait for a job, a time or other tasks
   // (task 433 read "working" for hours while paused until the next morning).
   if (v.stage === 'do' && v.status === 'waiting' && PARKED_WAITS.has(v.waitingFor?.kind)) return waitingText(v.waitingFor);
@@ -10155,6 +10157,7 @@ function waitingLabel(w) {
     case 'confirm': return 'review';
     case 'responder': return 'responder';
     case 'job': return 'job';
+    case 'retry': return 'retry';
     default: return 'progress';
   }
 }
@@ -10169,6 +10172,7 @@ function waitingText(w) {
   }
   if (w?.kind === 'human') return 'Needs input';
   if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Paused until ${waitDeadline(w.until)}` : 'Paused';
+  if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
   // The deadline is when the agent resumes even if the job never finishes.
   if (w?.kind === 'job' && Number.isFinite(w.until)) return `Waiting for job until ${waitDeadline(w.until)}`;
   const label = waitingLabel(w);

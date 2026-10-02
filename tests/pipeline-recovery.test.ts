@@ -427,6 +427,35 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     expect(result.stage).toBe('cancelled');
   });
 
+  // legibench3#18: between infrastructure retries nothing runs, yet the task read
+  // "working" for 23 minutes. It waits, says until when, and a Retry ends the wait.
+  it('waits visibly between infrastructure retries, and a person\'s Retry ends the wait', async () => {
+    const repo = await h.makeRepo('app-infra-retry-wait');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Infra', prompt: '@failworld fetch failed', resolveAgentEnabled: false })],
+    });
+    // Three activity attempts (10 s and 20 s apart), then the first 30 s wait.
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 60_000, interval: 500 }).toBe('retry');
+    const waiting = await view(handle);
+    expect(waiting).toMatchObject({ stage: 'do', status: 'waiting', waitingFor: { kind: 'retry', detail: 'Retry 1 of 5' } });
+    expect(waiting.waitingFor.until).toBeGreaterThan(Date.now());
+    expect(waiting.waitingFor.until).toBeLessThanOrEqual(Date.now() + 30_000);
+    expect(waiting.error).toMatch(/^infrastructure: .*fetch failed — retrying do in 30s \(1\/5\)$/);
+    const lifecycle = (await h.store.eventsSince(taskId, 0)).findLast((event) => event.type === 'view.updated')?.payload;
+    expect(lifecycle).toMatchObject({ status: 'waiting', waitingFor: 'retry', waitingUntil: waiting.waitingFor.until });
+    await handle.signal('retry');
+    // The stage runs again at once: its next attempt is admitted, not parked.
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 15_000, interval: 200 }).not.toBe('retry');
+    expect((await view(handle)).error).toBeUndefined();
+    await handle.signal('cancel');
+    const cancelled = await handle.result();
+    expect(cancelled.stage).toBe('cancelled');
+    expect(cancelled.waitingFor).toBeUndefined();
+  }, 120_000);
+
   it('restores the failed stage as soon as an escalated task is retried', async () => {
     const repo = await h.makeRepo('app-escalation-retry-stage');
     const taskId = newId('task');
