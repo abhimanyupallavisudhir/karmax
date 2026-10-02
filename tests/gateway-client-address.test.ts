@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { afterEach, expect, it, vi } from 'vitest';
-import { defaultGateway, resolveTrustedProxy } from '../src/gateway/client-address.js';
+import { ClientRequestLimits, defaultGateway, resolveTrustedProxy } from '../src/gateway/client-address.js';
 import { stubGateway } from './helpers/stub-gateway.js';
 
 // /proc/net/route inside a container on a Compose bridge (gateway 172.18.0.1),
@@ -47,6 +47,21 @@ it('shares login lockout and request budgets within a /64 but isolates other cli
     expect((await probe('2001:db8:3::ff')).status).toBe(429);
     expect((await probe('2001:db8:4::1')).status).not.toBe(429);
   } finally { await h.close(); }
+});
+
+it('meters only grouped IPv6 prefixes, leaving single addresses to the edge (CI-8)', () => {
+  // Caddy's zones already meter each address exactly; the gateway adds the one
+  // bound Caddy cannot, a /64 shared by rotating privacy addresses. Metering a
+  // single address twice would also throttle everything reaching the app
+  // directly (a console page load is dozens of static requests).
+  const limits = new ClientRequestLimits();
+  const now = 1_000_000;
+  for (let n = 0; n < 700; n++) expect(limits.allow('198.51.100.5', '/app.js', now)).toBe(true);
+  for (let n = 0; n < 20; n++) expect(limits.allow('198.51.100.5', '/api/signup', now)).toBe(true);
+  for (let n = 0; n < 600; n++) expect(limits.allow('2001:0db8:0001:0000::/64', '/app.js', now)).toBe(true);
+  expect(limits.allow('2001:0db8:0001:0000::/64', '/app.js', now)).toBe(false);
+  expect(limits.allow('2001:0db8:0002:0000::/64', '/app.js', now)).toBe(true);
+  expect(limits.allow('2001:0db8:0001:0000::/64', '/app.js', now + 60_000)).toBe(true);
 });
 
 it('reads the default gateway from the kernel route table (CI-8)', () => {

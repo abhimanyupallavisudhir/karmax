@@ -59,12 +59,14 @@ export function clientAddress(req: IncomingMessage): string {
   return address?.includes(':') ? `${address.split(':').slice(0, 4).join(':')}::/64` : address ?? 'unknown';
 }
 
-/** A second bound groups IPv6 privacy addresses which the edge meters individually. */
+/** A second bound groups IPv6 privacy addresses which the edge meters individually.
+ *  A single address already gets exactly these budgets from Caddy's zones. */
 export class ClientRequestLimits {
   private buckets = new Map<string, { count: number; until: number }>();
   private sweepAt = 0;
 
   allow(address: string, pathname: string, now = Date.now()): boolean {
+    if (!address.endsWith('::/64')) return true;
     if (now >= this.sweepAt) {
       for (const [key, value] of this.buckets) if (value.until <= now) this.buckets.delete(key);
       this.sweepAt = now + 60_000;
