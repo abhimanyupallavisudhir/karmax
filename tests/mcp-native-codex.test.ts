@@ -40,6 +40,16 @@ describe.skipIf(!available)('Native Codex MCP startup (no login or model calls)'
         return Object.keys(inventory.data.find((s: any) => s.name === c.id)?.tools ?? {});
       }, { timeout: 20_000, interval: 250 }).toContain('echo');
       expect(fs.existsSync(legacyMarker)).toBe(false);
-    } finally { child?.kill(); await cleanup?.(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally {
+      // Codex keeps cloning its plugins in the background; wait for it to exit
+      // before deleting the folder it writes into (CI #1430: ENOTEMPTY).
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((resolve) => child!.once('exit', resolve));
+        child.kill();
+        await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5000))]);
+      }
+      await cleanup?.(); (await store.close());
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
   }, 30_000);
 });
