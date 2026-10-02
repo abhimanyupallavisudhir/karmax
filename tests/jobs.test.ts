@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import type { World } from '../src/world/types.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
@@ -14,6 +15,14 @@ const until = async (check: () => Promise<boolean>, ms = 10_000) => {
   while (Date.now() < end) { if (await check()) return; await new Promise((r) => setTimeout(r, 100)); }
   throw new Error('condition not met');
 };
+
+/** /proc/<pid>/stat after the command name: [state, ppid, pgrp, session, …]. */
+const procStat = (pid: string) => { const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return stat.slice(stat.lastIndexOf(') ') + 2).split(' '); };
+/** Live processes whose argv[0] is `name` (set with `exec -a`); zombies hold nothing. */
+const named = (name: string) => fs.readdirSync('/proc').filter((e) => /^\d+$/.test(e)).filter((e) => {
+  try { return procStat(e)[0] !== 'Z' && fs.readFileSync(`/proc/${e}/cmdline`, 'utf8').split('\0')[0] === name; } catch { return false; }
+});
+const marker = () => `karmax-test-${Math.random().toString(36).slice(2, 10)}`;
 
 describe('durable jobs (real worktree world)', () => {
   let home: string;
@@ -90,6 +99,57 @@ describe('durable jobs (real worktree world)', () => {
       try { return fs.readFileSync(`/proc/${e}/stat`, 'utf8').split(') ')[1]!.split(' ')[2] === String(pid); } catch { return false; }
     });
     expect(survivors).toEqual([]);
+  });
+
+  // #466: a vitest fork worker outlived stop_job twice. The job's session
+  // leader died on SIGTERM at once, so the stop never followed up with SIGKILL.
+  it('kills a child that ignores SIGTERM', async () => {
+    const m = marker();
+    const job = await startJob(world, { command: `bash -c 'trap "" TERM; exec -a ${m} sleep 120' & wait` });
+    await until(async () => named(m).length === 1);
+    await stopJobs(world, [job.id]);
+    expect(named(m)).toEqual([]);
+  });
+
+  it('kills children that left its process group or its session', async () => {
+    const m = marker();
+    const job = await startJob(world, { command: [
+      `(set -m; bash -c 'exec -a ${m}-group sleep 120' & wait) &`,
+      `setsid bash -c 'exec -a ${m}-session sleep 120' &`,
+      `setsid bash -c 'setsid bash -c "trap \\"\\" TERM; exec -a ${m}-deep sleep 120" & wait' &`,
+      'wait',
+    ].join('\n') });
+    const kinds = ['group', 'session', 'deep'];
+    await until(async () => kinds.every((kind) => named(`${m}-${kind}`).length === 1));
+    const pid = fs.readFileSync(path.join(world.handle.root, '.karmax-injection/jobs', job.id, 'pid'), 'utf8').trim();
+    const [group, session, deep] = kinds.map((kind) => procStat(named(`${m}-${kind}`)[0]!));
+    // They really escaped: a group of its own, then sessions of their own.
+    expect(group![2]).not.toBe(pid);
+    expect(group![3]).toBe(pid);
+    expect(session![3]).not.toBe(pid);
+    expect(deep![3]).not.toBe(pid);
+    await stopJobs(world, [job.id]);
+    expect(kinds.flatMap((kind) => named(`${m}-${kind}`))).toEqual([]);
+  });
+
+  it('stops what an exited job left running, and nothing that is not its own', async () => {
+    const m = marker();
+    const job = await startJob(world, { command: `setsid bash -c 'exec -a ${m}-left sleep 120' & echo started` });
+    const other = await startJob(world, { command: `exec -a ${m}-other sleep 120` });
+    const stranger = spawn('bash', ['-c', `exec -a ${m}-stranger sleep 120`], { stdio: 'ignore' });
+    try {
+      await until(async () => (await jobStatuses(world, [job.id]))[0]!.state === 'exited'
+        && ['left', 'other', 'stranger'].every((kind) => named(`${m}-${kind}`).length === 1));
+      await stopJobs(world, [job.id]);
+      expect(named(`${m}-left`)).toEqual([]);
+      expect(named(`${m}-other`)).toHaveLength(1);
+      expect(named(`${m}-stranger`)).toHaveLength(1);
+      expect((await jobStatuses(world, [other.id]))[0]!.state).toBe('running');
+      // A world's teardown stops every job it ever ran.
+      await stopJobs(world);
+      expect(named(`${m}-other`)).toEqual([]);
+      expect(named(`${m}-stranger`)).toHaveLength(1);
+    } finally { stranger.kill('SIGKILL'); }
   });
 
   it('a waiter process exits when the jobs finish, or at its deadline', async () => {
@@ -228,7 +288,25 @@ describe('durable jobs (real worktree world)', () => {
       expect(reply).toContain(`Stopped ${runaway.id}.`);
       expect((await jobStatuses(world, [runaway.id]))[0]!.state).not.toBe('running');
       expect(await t.stop_job!({ jobs: [runaway.id] })).toBe(`${runaway.id} had already stopped.`);
+
+      const m = marker();
+      const leaver = await startJob(world, { command: `bash -c 'exec -a ${m} sleep 120' &` });
+      await until(async () => (await jobStatuses(world, [leaver.id]))[0]!.state === 'exited' && named(m).length === 1);
+      expect(await t.stop_job!({ jobs: [leaver.id] })).toBe(`${leaver.id} had already exited; ended the 1 process it left running.`);
+      expect(named(m)).toEqual([]);
     });
+  });
+
+  it('stop_job names processes that survive SIGKILL', async () => {
+    const id = 'job-0000000b';
+    const fake = { handle: world.handle, exec: async (_cmd: string, args: string[]) => {
+      if (args[2] === 'karmax-job-stop') return { code: 0, stdout: `stopped ${id} 3\nsurvivor ${id} 41\nsurvivor ${id} 42\n`, stderr: '' };
+      const boundary = args[3];
+      return { code: 0, stdout: `${boundary} ${id} lost 1 \n\n\n${boundary} end\n`, stderr: '' };
+    } } as unknown as World;
+    expect(await stopJobs(fake, [id])).toEqual([{ id, processes: 3, survivors: [41, 42] }]);
+    const t = platformToolHandlers(fake, { emit: () => {} } as any);
+    expect(await t.stop_job!({ jobs: [id] })).toBe(`${id}: processes 41, 42 survived SIGKILL.`);
   });
 
   it('describes jobs for the resumed agent', () => {
