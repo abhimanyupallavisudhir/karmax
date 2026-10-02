@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
 import { serviceHomeLabel } from '../src/world/services.js';
+import { isMissingSandbox } from '../src/world/provider-errors.js';
 
 describe('E2B cloud world provider', () => {
   it('rejects an unauthenticated legacy sandbox ID before any provider operation (WD-30)', async () => {
@@ -408,6 +409,86 @@ describe('E2B cloud world provider', () => {
     expect(commands.some((command) => command.includes('GIT_SSH_COMMAND=') && command.includes('git clone'))).toBe(true);
     expect(commands.at(-1)).toContain('rm -f /home/user/.ssh/karmax-auth*');
     expect(JSON.stringify(world.handle)).not.toContain('PRIVATE CLONE KEY');
+  });
+
+  // legibench3#18 (2026-10-01): the SDK carries every file transfer to a sandbox
+  // on one process-wide HTTP/2 session. Once E2B's edge resets that session's
+  // streams (NGHTTP2_ENHANCE_YOUR_CALM, after a large upload), every later
+  // transfer on it fails until the worker restarts: 18 identical failed turns.
+  describe('file transfers the SDK session dropped', () => {
+    const reset = () => Object.assign(new TypeError('fetch failed'),
+      { cause: new Error('Stream closed with error code NGHTTP2_ENHANCE_YOUR_CALM') });
+    const signed = (file: string) => `https://49983-sbx.e2b.test/files?path=${encodeURIComponent(file)}&signature=v1_secret`;
+
+    async function droppedSession(respond?: (file: string, init?: RequestInit) => Response | undefined) {
+      const sandbox = fakeSandbox(() => undefined) as E2BSandboxLike & Record<string, unknown>;
+      const world = await new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox })
+        .create({ taskId: 'h2-reset', base: 'main' });
+      const sdk: string[] = [];
+      sandbox.files.write = async (file) => { sdk.push(`write ${file}`); throw reset(); };
+      sandbox.files.read = async (file) => { sdk.push(`read ${file}`); throw reset(); };
+      sandbox.uploadUrl = async (file: string) => signed(file);
+      sandbox.downloadUrl = async (file: string) => signed(file);
+      const stored = new Map<string, Buffer>();
+      const requests: string[] = [];
+      const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+        const file = new URL(String(input)).searchParams.get('path')!;
+        requests.push(`${init?.method ?? 'GET'} ${file}`);
+        const custom = respond?.(file, init);
+        if (custom) return custom;
+        if (init?.method === 'POST') {
+          stored.set(file, Buffer.from(await ((init.body as FormData).get('file') as Blob).arrayBuffer()));
+          return Response.json([{ path: file }]);
+        }
+        const data = stored.get(file);
+        return data ? new Response(data) : new Response('file not found', { status: 404 });
+      });
+      return { sandbox, world, sdk, requests, fetcher };
+    }
+
+    it('resends it on its own connection, and sends the rest of that sandbox\'s transfers there too', async () => {
+      const { world, sdk, requests, fetcher } = await droppedSession();
+      try {
+        await world.writeFileBuffer!('a.bin', Buffer.from('first'));
+        await world.writeFile('b.txt', 'second');
+        expect(await world.readFile('b.txt')).toBe('second');
+        expect((await world.readFileBuffer('a.bin')).toString()).toBe('first');
+        expect((await world.readFilePrefix!('a.bin', 3)).toString()).toBe('fir');
+        // Only the first transfer was tried on the dropped session.
+        expect(sdk).toEqual(['write /home/user/karmax/a.bin']);
+        expect(requests).toEqual(['POST /home/user/karmax/a.bin', 'POST /home/user/karmax/b.txt',
+          'GET /home/user/karmax/b.txt', 'GET /home/user/karmax/a.bin', 'GET /home/user/karmax/a.bin']);
+      } finally { fetcher.mockRestore(); }
+    });
+
+    it('never reroutes a failure the sandbox itself reported', async () => {
+      const { sandbox, world, requests, fetcher } = await droppedSession();
+      sandbox.files.write = async () => { throw new Error('500: error opening file: permission denied'); };
+      try {
+        await expect(world.writeFile('locked.txt', 'x')).rejects.toThrow('permission denied');
+        expect(requests).toEqual([]);
+      } finally { fetcher.mockRestore(); }
+    });
+
+    it('reports a failed direct transfer by its status, never by its signed URL', async () => {
+      const { world, fetcher } = await droppedSession(() => new Response('not enough disk space', { status: 507 }));
+      try {
+        const failure = await world.writeFile('full.txt', 'x').then(() => undefined, (error: Error) => error);
+        expect(failure?.message).toMatch(/507.*not enough disk space/);
+        expect(failure?.message).not.toContain('signature');
+        expect(failure?.message).not.toContain('v1_secret');
+      } finally { fetcher.mockRestore(); }
+    });
+
+    it('reports a missing file as a missing file, never as a missing sandbox', async () => {
+      const { world, fetcher } = await droppedSession();
+      try {
+        await world.writeFile('present.txt', 'x'); // the session drops; transfers go direct
+        const failure = await world.readFile('absent.txt').then(() => undefined, (error: Error) => error);
+        expect(failure).toMatchObject({ name: 'FileNotFoundError' });
+        expect(isMissingSandbox(failure)).toBe(false);
+      } finally { fetcher.mockRestore(); }
+    });
   });
 
   it('surfaces E2B command stderr instead of an opaque exit status', async () => {

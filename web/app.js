@@ -3483,6 +3483,13 @@ function patchSubTaskSummaryFromEvent(ev) {
   return !!summary && patchLifecycleView(summary, ev);
 }
 
+// An approval request carries no lifecycle fields to patch, and the child's
+// summary only learns its count from the server: refetch the open parent.
+function subTaskSummaryEventNeedsRefresh(ev) {
+  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved)$/.test(ev.type || '')) return false;
+  return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
+}
+
 function patchTaskListFromEvent(ev) {
   if (ev.type !== 'view.updated' || !ev.taskId) return false;
   const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
@@ -3565,6 +3572,7 @@ function connectWs() {
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
     if (S.selected && ev.taskId !== S.selected && patchSubTaskSummaryFromEvent(ev)) scheduleTaskPageRender();
+    if (S.selected && ev.taskId !== S.selected && subTaskSummaryEventNeedsRefresh(ev)) refreshTask('subtask.approval');
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
       && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask('attempt.sibling'); // its card, not our details
@@ -4993,6 +5001,8 @@ function stageLabel(v) {
   if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
   // So is a turn parked on its credential or quota: nothing is working.
   if (v.status === 'waiting' && v.waitingFor?.kind === 'account') return waitingText(v.waitingFor);
+  // Nor is a stage between attempts after an infrastructure failure.
+  if (v.status === 'waiting' && v.waitingFor?.kind === 'retry') return waitingText(v.waitingFor);
   // Nor is an agent that ended its turn to wait for a job, a time or other tasks
   // (task 433 read "working" for hours while paused until the next morning).
   if (v.stage === 'do' && v.status === 'waiting' && PARKED_WAITS.has(v.waitingFor?.kind)) return waitingText(v.waitingFor);
@@ -8792,32 +8802,33 @@ function parentTaskContext(v) {
   </button>`;
 }
 
-// Turn workflow vocabulary into the one short state phrase a person needs while
-// scanning delegated work. The pipeline still carries exact stage progression;
-// this copy carries meaning.
+// A child reads exactly as it does in the task list and on its own page: the
+// same stage label, the same status colour, the same "approval needed" flag. A
+// second vocabulary here ("In progress", "Ready to return") drifted from the
+// child's real state — "Waiting · working", "Ready to return" for a child the
+// parent had already approved, "In progress" for one waiting on an approval.
 function subTaskState(rec) {
   const v = rec?.lastView || {};
-  const status = v.status || 'active';
-  const stage = v.stage || 'setup';
-  if (status === 'done' || stage === 'done') return { label: 'Complete', tone: 'done', complete: true };
-  if (status === 'failed') return { label: 'Failed', tone: 'failed', complete: false };
-  if (status === 'cancelled') return { label: 'Cancelled', tone: 'cancelled', complete: false };
-  if (stage === 'escalated' || status === 'blocked') return { label: 'Needs direction', tone: 'blocked', complete: false };
-  if (stage === 'review') return { label: 'Ready to return', tone: 'waiting', complete: false };
-  if (v.waitingFor?.kind === 'parent') return { label: 'Waiting on parent', tone: 'waiting', complete: false };
-  if (status === 'waiting') return { label: 'Waiting', tone: 'waiting', complete: false };
-  return { label: 'In progress', tone: 'active', complete: false };
+  const done = v.status === 'done' || v.stage === 'done';
+  const tone = v.state?.draft ? 'draft' : done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
+  return { label: stageLabel(v), tone, complete: done, approval: !!v.approvalRequests };
+}
+
+function subTaskStateHtml(state, className) {
+  return `<span class="${className}">${esc(state.label)}${state.approval ? ' <span class="chip approval-needed">approval needed</span>' : ''}</span>`;
 }
 
 function subTasksSection(v) {
   // Every child the store records, not only those the current run spawned (a
   // replaced run forgets children that had already settled). A finished child is
-  // archived out of the live list, so the parent's view carries its summary.
+  // archived out of the live list, so the parent's view carries its summary —
+  // fetched with the parent and patched from the child's events, so it wins over
+  // any other copy of the child the console happens to hold.
   const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
   const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])];
   if (!ids.length) return '';
   const children = ids.map((id) => {
-    const rec = taskRecord(id) || summaries.get(id);
+    const rec = summaries.get(id) || taskRecord(id);
     const state = subTaskState(rec);
     return { id, rec, state };
   });
@@ -8830,7 +8841,7 @@ function subTasksSection(v) {
       <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
       <span class="subtask-identity">
         <span class="subtask-title">${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}<strong>${esc(title)}</strong></span>
-        <span class="subtask-copy">${esc(state.label)} <span aria-hidden="true">·</span> ${esc(stageLabel(childView))}</span>
+        ${subTaskStateHtml(state, 'subtask-copy')}
       </span>
       <span class="subtask-pipeline" aria-hidden="true">${pipeline(childView)}</span>
       <span class="subtask-arrow" aria-hidden="true">›</span>
@@ -8893,7 +8904,7 @@ function agentForksSection(v) {
         <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
         <span class="fork-identity">
           <span class="fork-title">${task.num != null ? `<span class="task-num">#${task.num}</span>` : ''}<strong>${esc(task.title)}</strong></span>
-          <span class="fork-state">${esc(state.label)}</span>
+          ${subTaskStateHtml(state, 'fork-state')}
         </span>
         <span class="fork-arrow" aria-hidden="true">›</span>
       </a>
@@ -10155,6 +10166,7 @@ function waitingLabel(w) {
     case 'confirm': return 'review';
     case 'responder': return 'responder';
     case 'job': return 'job';
+    case 'retry': return 'retry';
     default: return 'progress';
   }
 }
@@ -10167,12 +10179,20 @@ function waitingText(w) {
     const summary = w.summary.replace(/\s+/g, ' ').trim();
     if (summary) return summary.slice(0, 72);
   }
-  if (w?.kind === 'human') return 'Needs input';
-  if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Paused until ${waitDeadline(w.until)}` : 'Paused';
-  // The deadline is when the agent resumes even if the job never finishes.
-  if (w?.kind === 'job' && Number.isFinite(w.until)) return `Waiting for job until ${waitDeadline(w.until)}`;
+  // A paused agent's ask carries the time it carries on without an answer.
+  if (w?.kind === 'human') return Number.isFinite(w.until) ? `Needs input until ${waitDeadline(w.until)}` : 'Needs input';
+  if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Waiting until ${waitDeadline(w.until)}` : 'Waiting';
+  if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
+  // A job is shown by the name its agent gave it. The deadline is when the
+  // agent resumes even if the job never finishes.
+  if (w?.kind === 'job') {
+    const job = typeof w.summary === 'string' && w.summary.trim() ? w.summary.trim().slice(0, 72) : 'job';
+    return `Waiting for ${job}${Number.isFinite(w.until) ? ` until ${waitDeadline(w.until)}` : ''}`;
+  }
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
+  // A sub-task asking its parent carries on without an answer at `until`.
+  if (w?.kind === 'parent' && Number.isFinite(w.until)) return `Waiting for parent until ${waitDeadline(w.until)}`;
   return `Waiting for ${label}`;
 }
 
@@ -15423,9 +15443,9 @@ const VAULT_SECRET_LABELS = {
   note: [['note', 'note']],
 };
 // Short label + click-to-expand explanation for the two per-item policies.
-const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment. “ask” requires approval before each use.';
+const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
 const SESSION_EXCLUSIVE_TIP = 'For sites that sign other copies out when one is used. Other tasks wait until the task using it is done.';
-const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
+const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). It then travels to the model provider and may end up in training data. “never” forbids that entirely; “ask” requires your approval each time.';
 // `title` covers hover on desktop; the click handler is for touch, where there is
 // no hover. It used to call `alert()` — the only modal in a console that speaks in
 // toasts, and on desktop it fired *on top of* the native tooltip.
@@ -15533,7 +15553,9 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
           </div>
           <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
-          ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>` : ''}
+          ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
+            : request.mode === 'reveal' ? `<div class="approval-request-warn">The agent will see the plaintext: it travels to the model provider and may end up in training data.</div>`
+            : items.find((item) => item.id === request.itemId)?.type === 'passkey' ? '' : `<div class="approval-request-warn caution">Blind use is not foolproof: a misbehaving agent can still leak it, e.g. by entering it on a malicious site.</div>`}
         </div>
         <div class="approval-request-actions">
           ${request.itemId ? '' : `${addLink ? `<a class="vreq-add" data-spa href="${globalRoute('organization')}#settings-payments" title="Add it in Settings → Passwords &amp; payments">Add to vault</a>` : ''}
@@ -15907,6 +15929,15 @@ async function openConnectorEditor(query, changed, app, existing) {
 function passwordsCard() {
   return `<div class="card" id="vault-card">
     <div class="section-h">Passwords <span class="chip">organization resource</span></div>
+    <div class="vault-risk" role="note">
+      <span class="vault-risk-mark" aria-hidden="true">!</span>
+      <div><b>Connect your passwords and secrets at your own risk.</b>
+        <ul>
+          <li>Granting an agent <code>reveal</code> authorization (“agent sees”) to a password is dangerously insecure: it travels to the servers of the model provider (and who knows where else) and may find its way into model training data. We allow it because we know some of you happily paste secrets into agent chat, so we’ll just make that easier for you and accelerate natural selection.</li>
+          <li>Granting an agent <code>use</code> authorization (“blind use”) lets it pass your password into password forms without looking. This still does not guarantee safety: an agent gone bad (through misalignment, prompt injection or an accidental mistake) can still leak it, e.g. by entering it into a malicious server.</li>
+        </ul>
+        Always prefer to connect services via <a href="#settings-connections">MCP or Composio</a>, if available.</div>
+    </div>
     <button type="button" class="btn vault-manage-button" id="vault-manage-open" disabled>
       <span>Vault credentials</span>
       <span class="vault-manage-count">Loading…</span>
@@ -16202,7 +16233,7 @@ async function wireVaultCards(organizationId) {
     overlay.className = 'modal-overlay';
     let profileData = { profiles: [], defaultProfile: null };
     try { profileData = await api(`/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`); } catch {}
-    const storeFields = () => `      <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="git@github.com:you/password-store.git" autocomplete="off" /></div>
+    const storeFields = () => `      <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="https://github.com/you/password-store" autocomplete="off" /></div>
       <div class="form-row"><label>Password-store path in repository <span class="task-sub">(optional; auto-detected)</span></label><input class="git-pass-path" placeholder=".password-store" autocomplete="off" /></div>
       <div class="form-row"><label>Git profile <span class="task-sub">(used for private clone and push)</span></label><select class="git-pass-profile">
         <option value="">Organization default${profileData.defaultProfile ? ` — ${esc(profileData.defaultProfile)}` : ''}</option>

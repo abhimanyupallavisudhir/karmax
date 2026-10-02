@@ -4586,6 +4586,15 @@ export class Store {
     return runAudienceAsync(reviewAudience(task), async (sql, params) => (await this.db.prepare(sql).all(...params)));
   }
 
+  /** Who answers a blocked task: its reviewers, else its assignee, else whoever
+   * created it — the person the workflow's own escalation names. Never nobody. */
+  private async escalationAudience(task: TaskRecord): Promise<string[]> {
+    const users = (await this.reviewAudience(task));
+    if (!users.length && task.assignee) users.push(...(await this.expandPrincipal(task.assignee, task.projectId)));
+    if (!users.length) users.push(...(await this.humanAudience(task.id, ['@creator'])));
+    return users;
+  }
+
   private audienceReader() {
     const cache = new Map<string, Promise<any[]>>();
     return (sql: string, params: unknown[]) => {
@@ -4645,6 +4654,10 @@ export class Store {
     if (!task || !project?.organizationId) return;
     const status = ev.type === 'view.updated' ? String(ev.payload.status ?? '') : '';
     const finished = ['done', 'failed', 'cancelled'].includes(status);
+    // A workflow that has run out of retries and Resolve escalates with stage
+    // `escalated` and no `waitingFor`: it is blocked on a person all the same
+    // (legibench3#18 escalated this way and told nobody).
+    const escalated = ev.type === 'view.updated' && ev.payload.stage === 'escalated' && !finished;
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
     if (ev.type === 'credential.approval-resolved' || ev.type === 'connection.resolved' || ev.type === 'permission.approval-resolved'
@@ -4660,7 +4673,7 @@ export class Store {
     else if (ev.type === 'view.updated') {
       // The task is live again, so its last outcome has stopped being news — and
       // any ask it had parked on is answered unless it is STILL on a human.
-      const stale = ev.payload.waitingFor === 'human'
+      const stale = ev.payload.waitingFor === 'human' || escalated
         ? ["'update'"] : ["'update'", "'review-requested'", "'escalated'"];
       (await this.deleteInbox(`taskId=? AND kind IN (${stale.join(', ')})`, [task.id]));
     }
@@ -4690,10 +4703,9 @@ export class Store {
       kind = 'review-requested'; actionable = true; users = (await this.reviewAudience(task));
     } else if (ev.type.includes('escalat')) {
       kind = 'escalated'; actionable = true;
-      users = (await this.reviewAudience(task));
-      if (!users.length && task.assignee) users = (await this.expandPrincipal(task.assignee, task.projectId));
-    } else if (ev.type === 'view.updated' && ev.payload.waitingFor === 'human') {
-      // The one lifecycle state that is an ask: the task is parked ON a human.
+      users = (await this.escalationAudience(task));
+    } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated)) {
+      // The lifecycle states that are an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
       // already routed to exactly the people who can answer it.
       // A dismissed approval is still the reason for this hold; a lifecycle tick
@@ -4701,8 +4713,7 @@ export class Store {
       if ((await this.hasPendingApprovals(task.id, true))) return;
       kind = ev.payload.stage === 'review' ? 'review-requested' : 'escalated';
       actionable = true;
-      users = (await this.reviewAudience(task));
-      if (!users.length && task.assignee) users = (await this.expandPrincipal(task.assignee, task.projectId));
+      users = (await this.escalationAudience(task));
     } else if (finished) {
       kind = 'update';
       for (const subscriber of (await this.subscribersFor(task.id))) users.push(...(await this.expandPrincipal(subscriber, task.projectId)));
@@ -4759,7 +4770,8 @@ export class Store {
     dropped += (await this.deleteInbox(`kind='update' AND taskId IN (SELECT id FROM tasks
       WHERE COALESCE(json_extract(lastView, '$.status'), 'setup') NOT IN ('done', 'failed', 'cancelled'))`, []));
     dropped += (await this.deleteInbox(`kind IN ('review-requested', 'escalated') AND taskId IN (SELECT id FROM tasks
-      WHERE COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'human')`, []));
+      WHERE COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'human'
+        AND COALESCE(json_extract(lastView, '$.stage'), '') <> 'escalated')`, []));
     if ((await this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get())) {
       dropped += (await this.deleteInbox(`subject IS NULL AND kind='approval-requested' AND taskId NOT IN (
         SELECT e.taskId FROM events e
@@ -4768,7 +4780,29 @@ export class Store {
             AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []));
     }
+    (await this.backfillEscalations());
     return dropped;
+  }
+
+  /** The opening counterpart of the discharge above: a task escalated by a build
+   * that raised no ask for it is listed now. Quietly — the inbox shows it, but
+   * nobody is emailed about an escalation that may be weeks old. */
+  private async backfillEscalations(): Promise<void> {
+    const rows = (await this.db.prepare(`SELECT id FROM tasks WHERE json_extract(lastView, '$.stage')='escalated'
+      AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('done', 'failed', 'cancelled')
+      AND id NOT IN (SELECT taskId FROM inbox WHERE actionable=1)`).all()) as Array<{ id: string }>;
+    for (const row of rows) {
+      const task = (await this.getTaskShallow(String(row.id)));
+      const project = task && (await this.getProject(task.projectId));
+      if (!task || !project?.organizationId) continue;
+      const latest = (await this.db.prepare('SELECT MAX(seq) seq FROM events WHERE taskId=?').get(task.id)) as { seq?: number | string | null } | undefined;
+      const createdAt = Number(task.lastView?.updatedAt) || Date.now();
+      for (const userId of new Set(await this.escalationAudience(task)))
+        (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+          (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt)
+          VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?)`).run(newId('inbox'), project.organizationId, userId,
+            Number(latest?.seq ?? 0), task.id, urgencyRank(DEFAULT_URGENCY.escalated), createdAt));
+    }
   }
 
   async claimDelivery(now = Date.now()): Promise<{ id: string; inbox: InboxItem; channel: 'browser' | 'email' | 'slack'; attempts: number } | undefined> {

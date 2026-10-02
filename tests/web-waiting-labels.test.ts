@@ -177,9 +177,17 @@ describe('waiting labels in task summaries', () => {
     expect(waitingText({ kind: 'job', detail: 'Waiting for job-0123abcd', until: soon }))
       .toBe(`Waiting for job until ${clock(soon)}`);
     expect(waitingText({ kind: 'job', detail: 'Waiting for job-0123abcd' })).toBe('Waiting for job');
+    // A job the agent named is shown by its name.
+    expect(waitingText({ kind: 'job', detail: 'Waiting for job-0123abcd', summary: 'render', until: soon }))
+      .toBe(`Waiting for render until ${clock(soon)}`);
+    expect(waitingText({ kind: 'job', summary: 'render, test suite' })).toBe('Waiting for render, test suite');
+    // A timed pause reads like every other wait with a deadline.
     expect(waitingText({ kind: 'timer', until: soon }))
-      .toBe(`Paused until ${clock(soon)}`);
-    expect(waitingText({ kind: 'timer' })).toBe('Paused');
+      .toBe(`Waiting until ${clock(soon)}`);
+    expect(waitingText({ kind: 'timer' })).toBe('Waiting');
+    // An agent that paused for an answer needs input, and says when it carries on without one.
+    expect(waitingText({ kind: 'human', detail: 'Which region?', until: soon }))
+      .toBe(`Needs input until ${clock(soon)}`);
     // A pause may end on another day; a bare clock time would read as today.
     const later = soon + 3 * 86_400_000;
     const day = new Date(later).toLocaleDateString([], { weekday: 'short' });
@@ -190,13 +198,31 @@ describe('waiting labels in task summaries', () => {
   // until the next morning; nothing was working, and nothing said when it would resume.
   it('shows a pause the agent chose instead of "working"', () => {
     const until = Date.now() + 525 * 60_000;
-    const timer = { kind: 'timer', detail: 'Paused for 525 min', until };
+    const timer = { kind: 'timer', detail: 'Waiting 525 min', until };
     expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: timer }))
       .toBe(waitingText(timer));
     const job = { kind: 'job', detail: 'Waiting for job-5a1d7bab', until };
     expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: job }))
       .toBe(waitingText(job));
     expect(stageLabel({ stage: 'do', status: 'active', state: {}, waitingFor: timer })).toBe('working');
+    const ask = { kind: 'human', detail: 'Which region?', audience: ['@creator'], until };
+    expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: ask }))
+      .toBe(`Needs input until ${waitDeadline(until)}`);
+  });
+
+  // legibench3#18 read "working" through 23 minutes of identical infrastructure
+  // failures; between attempts nothing runs, and the chip says when it will.
+  it('shows when a stage that failed on infrastructure runs again, in any stage', () => {
+    const until = Date.now() + 10 * 60_000;
+    const retry = { kind: 'retry', detail: 'Retry 5 of 5', until };
+    expect(waitingText(retry)).toBe(`Retrying at ${waitDeadline(until)}`);
+    expect(waitingText({ kind: 'retry' })).toBe('Retrying');
+    for (const stage of ['setup', 'do', 'review', 'merge'])
+      expect(stageLabel({ stage, status: 'waiting', state: {}, waitingFor: retry })).toBe(waitingText(retry));
+    context.S.tasks = [{ id: 'task-1', lastView: { stage: 'do', status: 'active' } }];
+    expect(patchTaskListFromEvent({ taskId: 'task-1', type: 'view.updated',
+      payload: { stage: 'do', status: 'waiting', agentTurn: null, waitingFor: 'retry', waitingUntil: until } })).toBe(true);
+    expect(stageLabel(context.S.tasks[0].lastView)).toBe(`Retrying at ${waitDeadline(until)}`);
   });
 
   // Likewise a turn that ended to wait on other tasks: the chip names them.
@@ -204,6 +230,10 @@ describe('waiting labels in task summaries', () => {
     for (const [kind, label] of [['subtask', 'Waiting for sub-tasks'], ['collaboration', 'Waiting for collaborator'], ['parent', 'Waiting for parent']]) {
       expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: { kind } })).toBe(label);
     }
+    // A sub-task asking its parent says when it carries on without an answer.
+    const until = new Date().setHours(12, 0, 0, 0);
+    expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: { kind: 'parent', detail: 'Which region?', until } }))
+      .toBe(`Waiting for parent until ${waitDeadline(until)}`);
     // A child held at Review for its parent is still in review.
     expect(stageLabel({ stage: 'review', status: 'waiting', state: {}, waitingFor: { kind: 'parent' } })).toBe('review');
     // Work still running inside the turn, or about to start one, is working.
@@ -366,8 +396,12 @@ describe('waiting labels in task summaries', () => {
     const pause = (payload: Record<string, unknown>) => patchTaskListFromEvent({ taskId: 'task-1', type: 'view.updated',
       payload: { stage: 'do', status: 'waiting', agentTurn: null, ...payload } });
     expect(pause({ waitingFor: 'timer', waitingUntil: until.getTime() })).toBe(true);
-    expect(stageLabel(context.S.tasks[0].lastView)).toBe(`Paused until ${waitDeadline(until.getTime())}`);
+    expect(stageLabel(context.S.tasks[0].lastView)).toBe(`Waiting until ${waitDeadline(until.getTime())}`);
     expect(pause({ waitingFor: 'job', waitingUntil: until.getTime() + 60_000 })).toBe(true);
     expect(stageLabel(context.S.tasks[0].lastView)).toMatch(/^Waiting for job until /);
+    expect(pause({ waitingFor: 'job', waitingSummary: 'render', waitingUntil: until.getTime() })).toBe(true);
+    expect(stageLabel(context.S.tasks[0].lastView)).toMatch(/^Waiting for render until /);
+    expect(pause({ waitingFor: 'human', waitingDetail: 'Which region?', waitingUntil: until.getTime() })).toBe(true);
+    expect(stageLabel(context.S.tasks[0].lastView)).toBe(`Needs input until ${waitDeadline(until.getTime())}`);
   });
 });

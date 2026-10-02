@@ -292,6 +292,31 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
       && message.text.startsWith('Responder:'))).toBe(true);
   });
 
+  it('agent Responder answers a needs-input pause at once, instead of waiting out its deadline', async () => {
+    const repo = await h.makeRepo('responder-pause');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.24.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'AgentResponderPause', prompt: '@write paused.txt :: answered\n@pause 600 :: input -- Which region?' }),
+          responder: { kind: 'agent', provider: 'mock', prompt: 'Answer: {{question}}' },
+          confirm: { layers: [] },
+        },
+      ],
+    });
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:paused.txt'])).stdout).toContain('answered');
+    const v = await view(handle);
+    const responder = v.transcripts?.find((transcript: any) => transcript.role === 'responder');
+    expect(responder?.messages.some((message: any) => message.role === 'user' && message.text.includes('Answer: Which region?'))).toBe(true);
+    // It never parked on a person.
+    const kinds = (await h.store.eventsOfType(taskId, 'view.updated')).map((e: any) => e.payload.waitingFor);
+    expect(kinds).not.toContain('human');
+  });
+
   it('confirm layers: an agent review layer, then a final human confirmation (SPEC §5.2)', async () => {
     const repo = await h.makeRepo('confirm-layers');
     const taskId = newId('task');
@@ -426,6 +451,35 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     const result = await handle.result();
     expect(result.stage).toBe('cancelled');
   });
+
+  // legibench3#18: between infrastructure retries nothing runs, yet the task read
+  // "working" for 23 minutes. It waits, says until when, and a Retry ends the wait.
+  it('waits visibly between infrastructure retries, and a person\'s Retry ends the wait', async () => {
+    const repo = await h.makeRepo('app-infra-retry-wait');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Infra', prompt: '@failworld fetch failed', resolveAgentEnabled: false })],
+    });
+    // Three activity attempts (10 s and 20 s apart), then the first 30 s wait.
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 60_000, interval: 500 }).toBe('retry');
+    const waiting = await view(handle);
+    expect(waiting).toMatchObject({ stage: 'do', status: 'waiting', waitingFor: { kind: 'retry', detail: 'Retry 1 of 5' } });
+    expect(waiting.waitingFor.until).toBeGreaterThan(Date.now());
+    expect(waiting.waitingFor.until).toBeLessThanOrEqual(Date.now() + 30_000);
+    expect(waiting.error).toMatch(/^infrastructure: .*fetch failed — retrying do in 30s \(1\/5\)$/);
+    const lifecycle = (await h.store.eventsSince(taskId, 0)).findLast((event) => event.type === 'view.updated')?.payload;
+    expect(lifecycle).toMatchObject({ status: 'waiting', waitingFor: 'retry', waitingUntil: waiting.waitingFor.until });
+    await handle.signal('retry');
+    // The stage runs again at once: its next attempt is admitted, not parked.
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 15_000, interval: 200 }).not.toBe('retry');
+    expect((await view(handle)).error).toBeUndefined();
+    await handle.signal('cancel');
+    const cancelled = await handle.result();
+    expect(cancelled.stage).toBe('cancelled');
+    expect(cancelled.waitingFor).toBeUndefined();
+  }, 120_000);
 
   it('restores the failed stage as soon as an escalated task is retried', async () => {
     const repo = await h.makeRepo('app-escalation-retry-stage');

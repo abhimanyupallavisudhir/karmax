@@ -241,11 +241,13 @@ describe('prompt assembly surfaces the multi-repo layout', () => {
         { repository: 'only', root: '/w/t', commands: ['npm ci', 'npx playwright install --with-deps chromium'] },
       ] } } as any;
     const out = assemblePrompt({ profile: profile(), role: 'do', task, world });
-    expect(out).toContain('Before building or running tests, install this project\'s toolchain once per task: '
-      + 'in /w/t run `npm ci && npx playwright install --with-deps chromium`.');
-    expect(out).toContain('Project Settings → Environment');
+    // Agents kept "suggesting" steps the setting already had: they took the
+    // commands as already run, and did not know these ARE the setting.
+    expect(out).toContain('These are this project\'s install commands from Project Settings → Environment. They are not run for you: '
+      + 'before building or running tests, run all of them yourself, once per task: in /w/t run `npm ci && npx playwright install --with-deps chromium`.');
+    expect(out).toContain('check whether a command above covers it');
     const bare = assemblePrompt({ profile: profile(), role: 'do', task, world: { ...world, meta: { projectId: 'p' } } });
-    expect(bare).not.toContain('Before building or running tests');
-    expect(bare).toContain('Project Settings → Environment');
+    expect(bare).not.toContain('They are not run for you');
+    expect(bare).toContain('This project has no install commands in Project Settings → Environment');
   });
 });
