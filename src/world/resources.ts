@@ -25,6 +25,7 @@ import { VaultItems, itemHandle, type VaultFieldName } from '../autonomy/vault-i
 import { ensureWorldExcluded } from './secret-exclude.js';
 import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
+import { screenEnvironment, type SkippedEnv } from '../util/work-env.js';
 import { CHUNK_BYTES, chunkId as contentChunkId, chunkObjectKey, fixedChunks, openDeterministic, openRandom,
   organizationKey, organizationKeyHandle, sealDeterministic, sealRandom, sha256 } from './chunk-store.js';
 
@@ -464,24 +465,29 @@ export class ProjectResourceService {
 
   /** Resolve environment/service projections each time a world is opened. Raw
    * values live only in this wrapper and disappear with the activity. */
-  async environmentFor(handle: WorldHandle): Promise<Record<string, string>> {
+  async environmentFor(handle: WorldHandle, skipped?: SkippedEnv[]): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
     const serviceHandles = handle.meta?.serviceEnvironmentHandles;
     if (serviceHandles && typeof serviceHandles === 'object') {
+      const services: Record<string, string> = {};
       for (const [name, secretHandle] of Object.entries(serviceHandles as Record<string, unknown>)) {
         if (typeof secretHandle !== 'string') continue;
-        env[name] = this.broker.resolve(secretHandle, {
+        services[name] = this.broker.resolve(secretHandle, {
           taskId: handle.id,
           caps: [`use-credential:${secretHandle}`],
         });
       }
+      Object.assign(env, screenEnvironment(services, () => 'a world service', skipped));
     }
     for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
       if (lease.state !== 'active') continue;
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
       if (!attachment?.enabled || !isSecretLike(attachment)) continue;
+      // Every world command carries these (EnvironmentWorld), so a value the OS
+      // refuses would fail them all, the platform's own git included.
       if (attachment.target.kind === 'environment' || attachment.target.kind === 'service')
-        env[attachment.target.name] = await this.resolveSecret(attachment, lease.taskId);
+        Object.assign(env, screenEnvironment({ [attachment.target.name]: await this.resolveSecret(attachment, lease.taskId) },
+          () => `project secret "${attachment.name}"`, skipped));
     }
     return env;
   }

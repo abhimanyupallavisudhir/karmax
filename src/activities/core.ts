@@ -129,6 +129,7 @@ import {
 } from '../coordinators/names.js';
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 import { BRAND } from '../domain/brand.js';
+import { screenEnvironment, skippedEnvNotice, type SkippedEnv } from '../util/work-env.js';
 
 /** A retried turn's processes did not survive it; agents otherwise assume they did. */
 const INTERRUPTED_COMMANDS = 'Commands that were running in it, including run_in_background shells, were stopped: '
@@ -2659,6 +2660,61 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // turn was handed, including secrets that arrive mid-turn.
         const secrets = new SecretScrubber();
         secrets.add(token, resolvedAuth?.apiKey, resolvedAuth?.oauthToken);
+        // Git-profile credentials for the agent subprocess (wiki plans/PLAN-git-config
+        // §4B): an agent that pushes or runs `gh` acts as the project's account.
+        const skippedEnv: SkippedEnv[] = [];
+        const turnEnv = await (async () => {
+          // Remote provider tools receive repository credentials through the
+          // broker, but the local harness process must still have host Git
+          // credentials scrubbed for non-personal organizations.
+          const gitEnv = isRemote(args.worldHandle.kind) && organizationId === 'org_personal'
+            ? {}
+            : (await gitEnvFor(args.worldHandle, args.taskId));
+          // Granted `auto` vault items materialize into the work-command env
+          // (wiki plans/PLAN-passwords §5A): .env bags, API keys under their envVar,
+          // SSH keys as 0600 files inside the receiving world, removed when the
+          // turn ends (AU-33).
+          // Item resolution is per-organization (the tenant boundary), so bind
+          // to the task's org — not the module-level personal-org instance.
+          turnKeys = isRemote(args.worldHandle.kind) ? world : turnKeyDirectory();
+          const vaultEnv = await orgVaultItems.envFor(args.taskId, effective, turnKeys, skippedEnv);
+          // The platform MCP subprocess inherits this short-lived workflow
+          // token. The gateway accepts it directly and enforces its project +
+          // capability grant; no full-power browser session is ever acquired.
+          const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+          // Values are resolved from resource leases and broker handles only
+          // now, at the activity boundary. Keep application secrets separate
+          // from runtime env so they cannot change model auth or startup.
+          // Each source leaves out what a command cannot receive and says so;
+          // screening the merge again keeps any source that forgets from
+          // failing the whole turn (radnyee exten_epi #2).
+          const secretEnv = screenEnvironment({ ...(await deps.resources?.environmentFor(world.handle, skippedEnv)), ...vaultEnv },
+            () => 'a credential', skippedEnv);
+          secrets.add(...Object.values(secretEnv),
+            ...Object.entries(gitEnv).filter(([key]) => /token|password|secret|credential|key/i.test(key)).map(([, value]) => value));
+          // Project settings keep applying while the agent runs (a secret added
+          // after it started must reach the command it runs next), not only at
+          // the next world open.
+          const resources = deps.resources;
+          if (resources) pullSecretEnv = async () => {
+            const refreshed = screenEnvironment({ ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv },
+              () => 'a credential');
+            secrets.add(...Object.values(refreshed));
+            return refreshed;
+          };
+          return {
+            ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
+            ...(Object.keys(secretEnv).length ? { secretEnv } : {}),
+          };
+        })();
+        // Shown in the conversation, so whoever configured it can fix it.
+        if (skippedEnv.length) (await record(args.taskId, 'agent.activity', {
+          id: 'work-environment', kind: 'status', phase: 'failed',
+          title: `${skippedEnv.length} credential${skippedEnv.length === 1 ? '' : 's'} not given to the agent`,
+          detail: skippedEnv.map(({ source, reason }) => `${source}: ${reason}`).join('\n'),
+          role: args.role, attempt: activityAttempt, workflowRunId,
+          ...((args.agentTurnId ?? legacyAgentTurnId) ? { turnId: args.agentTurnId ?? legacyAgentTurnId } : {}),
+        }));
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2666,51 +2722,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           session,
           deliveredMessages,
           fork,
-          systemPrompt: systemPrompt + (profile.mcpConnections?.some(id => id.startsWith('composio:')) ? '\nSelected app accounts (use list_connections and the connection tools; existing sharing permissions still apply): ' + profile.mcpConnections.filter(id => id.startsWith('composio:')).map(id => id.slice(9)).join(', ') : ''),
+          systemPrompt: systemPrompt + skippedEnvNotice(skippedEnv) + (profile.mcpConnections?.some(id => id.startsWith('composio:')) ? '\nSelected app accounts (use list_connections and the connection tools; existing sharing permissions still apply): ' + profile.mcpConnections.filter(id => id.startsWith('composio:')).map(id => id.slice(9)).join(', ') : ''),
           role: args.role,
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),
-          // Git-profile credentials for the agent subprocess (wiki plans/PLAN-git-config
-          // §4B): an agent that pushes or runs `gh` acts as the project's account.
-          ...(await (async () => {
-            // Remote provider tools receive repository credentials through the
-            // broker, but the local harness process must still have host Git
-            // credentials scrubbed for non-personal organizations.
-            const gitEnv = isRemote(args.worldHandle.kind) && organizationId === 'org_personal'
-              ? {}
-              : (await gitEnvFor(args.worldHandle, args.taskId));
-            // Granted `auto` vault items materialize into the work-command env
-            // (wiki plans/PLAN-passwords §5A): .env bags, API keys under their envVar,
-            // SSH keys as 0600 files inside the receiving world, removed when the
-            // turn ends (AU-33).
-            // Item resolution is per-organization (the tenant boundary), so bind
-            // to the task's org — not the module-level personal-org instance.
-            turnKeys = isRemote(args.worldHandle.kind) ? world : turnKeyDirectory();
-            const vaultEnv = await orgVaultItems.envFor(args.taskId, effective, turnKeys);
-            // The platform MCP subprocess inherits this short-lived workflow
-            // token. The gateway accepts it directly and enforces its project +
-            // capability grant; no full-power browser session is ever acquired.
-            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
-            // Values are resolved from resource leases and broker handles only
-            // now, at the activity boundary. Keep application secrets separate
-            // from runtime env so they cannot change model auth or startup.
-            const secretEnv = { ...(await deps.resources?.environmentFor(world.handle)), ...vaultEnv };
-            secrets.add(...Object.values(secretEnv),
-              ...Object.entries(gitEnv).filter(([key]) => /token|password|secret|credential|key/i.test(key)).map(([, value]) => value));
-            // Project settings keep applying while the agent runs (a secret added
-            // after it started must reach the command it runs next), not only at
-            // the next world open.
-            const resources = deps.resources;
-            if (resources) pullSecretEnv = async () => {
-              const refreshed = { ...(await resources.refresh(world.withoutProjectEnvironment?.() ?? world)), ...vaultEnv };
-              secrets.add(...Object.values(refreshed));
-              return refreshed;
-            };
-            return {
-              ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
-              ...(Object.keys(secretEnv).length ? { secretEnv } : {}),
-            };
-          })()),
+          ...turnEnv,
           // MCP servers the workflow gives its agents (SPEC §7.5).
           agentMcp: [...(args.task.workflow ? manifest(args.task.workflow)?.agentMcp ?? [] : []), ...chosenMcp],
         } }, {
