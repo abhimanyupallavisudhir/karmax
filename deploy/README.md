@@ -219,14 +219,36 @@ release their execution lease when finished.
 ./deploy/karmax update              # backup, validate commit ancestry, rebuild
 ./deploy/karmax down                # preserves all volumes and certificates
 ./deploy/karmax restore BACKUP_DIR  # verified and signature-checked, explicit destructive prompt
+./deploy/karmax rotate-vault-key    # replace the vault's key encryption key (resumable)
 ```
 
 A backup includes PostgreSQL dumps of Karmax metadata, identity, and Temporal,
 plus a consistent online snapshot of the encrypted credential vault,
-attachments, local object/checkpoint data, and stable decryption/signing keys.
-Task VMs are deliberately excluded: Git plus encrypted portable checkpoints are
-their durable form. Copy backups to encrypted off-host storage. Anyone holding a
-backup can recover the vault, so protect it like production credentials.
+attachments, local object/checkpoint data, and the auth and world-reference
+secrets. Task VMs are deliberately excluded: Git plus encrypted portable
+checkpoints are their durable form.
+
+**A backup never contains the vault key** (`deploy/.secrets/vault_key`). Every
+secret in the vault is encrypted under a data key of the organization, user or
+installation that owns it, and those data keys are stored only wrapped under
+the vault key, so the backup's vault is unreadable without it. Keep a copy of
+`vault_key` off-host (a password manager, another machine): losing it makes the
+vault and every backup unreadable. `restore` checks, before it changes
+anything, that the key it will use is the one the backup's vault is wrapped
+under: this instance's own, or the copy you pass with `--vault-key FILE`. The
+rest of a backup (database dumps, provider logins in config homes, the auth
+secret) is still sensitive: copy backups to encrypted off-host storage and
+protect them like production credentials.
+
+`rotate-vault-key` replaces the vault key. It wraps every data key under a new
+key while the app serves, stops the app briefly to wrap whatever was created
+meanwhile and switch `vault_key`, starts it on the new key, then removes the
+previous key's wraps and leaves it as `.secrets/vault_key.retired-<UTC>`. Each
+step can be repeated, and the previous key keeps opening the vault until the
+last one, so an interrupted rotation is finished by running the command again
+(`doctor` warns about one). Backups taken before the rotation still need the
+retired key (`restore --vault-key .secrets/vault_key.retired-…`): copy it
+off-host, keep it as long as those backups, then delete it from the host.
 
 On Linux hosts with the util-linux `hardlink` command, completed backups share
 identical large files (object-store checkpoints, agent transcripts)
@@ -301,6 +323,25 @@ code and current data; it does **not** start the incompatible previous image.
 This deliberately trades availability for avoiding a misleading or destructive
 rollback. Same-epoch readiness failures retain the existing automatic rollback.
 Build and backup failures still leave the previous app running.
+
+Epoch 4 moves every vault secret under a data key of its owner (SS-1, wiki
+features/vault-encryption): `v3.` ciphertext, recorded with the organization,
+user or installation that owns it, whose data keys live in `vault/keys/`
+wrapped under the vault key. The first boot finds each secret's owner in the
+database (vault item indexes, resource attachments, cards, storage and
+provider connections, handles that name their organization or user) and
+re-encrypts it and its revisions; secrets no owner is found for stay under
+the installation's data key until a write names their owner, and the count is
+in the audit log (`vault.scopes.migrated`). Each entry is rewritten atomically,
+so an interrupted first boot finishes on the next one. The epoch 3 release
+cannot read the result (it refuses: "vault/vault.canary is missing or damaged,
+and the key opens none of the N entries"). **The way back is the pre-update
+backup with its code**; the vault key is unchanged, so it still opens that
+backup. Backups no longer carry the vault key: the epoch 3 `deploy/karmax
+restore` would generate a new one, so before restoring a backup taken by this
+release with the previous release's code, copy the key into it first:
+`cp deploy/.secrets/vault_key BACKUP/deployment-secrets/` (the checksums list
+only the files they cover, so this does not fail verification).
 
 Recover a failed epoch transition by repairing forward, or restore the pre-update
 backup with its matching application revision **and Temporal history**. Restoring

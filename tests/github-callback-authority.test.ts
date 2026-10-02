@@ -14,6 +14,7 @@ import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitHubAppService, GITHUB_APP_CLIENT_SECRET_HANDLE, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrations/github-app.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 /**
  * The GitHub callbacks are reached by URLs anyone can forge: a state proves only
@@ -52,7 +53,7 @@ describe('GitHub callbacks trust only what they can verify', () => {
         return new Response('not found', { status: 404 });
       }) as typeof fetch,
     });
-    if (options.configured !== false) await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
+    if (options.configured !== false) await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE);
     const organization = await store.createOrganization({ name: 'Attacker', ownerUserId: 'attacker' });
     const gateway = await Gateway.create({ store, githubApp: service, broker, hosted: options.hosted,
       identity: { session: async () => ({ user: { id: 'attacker' } }),
@@ -108,7 +109,7 @@ describe('GitHub callbacks trust only what they can verify', () => {
     (service as any).status = async () => ({ configured: true, oauthConfigured: true, userAuthorized: false,
       webhookConfigured: false, syncMode: 'on-demand' });
     (service as any).options.clientId = 'client';
-    await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret', INSTALLATION_SCOPE);
     const state = await store.createGithubInstallState(organization.id, 'attacker');
     const response = await fetch(`${base}/api/github/callback?installation_id=42&state=${state}`, { redirect: 'manual' });
     expect(response.status).toBe(303);

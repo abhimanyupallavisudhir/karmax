@@ -4,6 +4,7 @@ import zlib from 'node:zlib';
 import { promisify } from 'node:util';
 import { Context as activityContext } from '@temporalio/activity';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
 import type { WorldCheckpoint, WorldHandleRef } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
 import type { Store } from '../store/db.js';
@@ -493,7 +494,7 @@ export class WorldCheckpointService {
 
   private async key(): Promise<Buffer> {
     if (!this.broker.hasHandle(CHECKPOINT_KEY_HANDLE))
-      await this.broker.ensureHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
+      await this.broker.ensureHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'), INSTALLATION_SCOPE);
     return Buffer.from(this.broker.resolve(CHECKPOINT_KEY_HANDLE, { caps: [`use-credential:${CHECKPOINT_KEY_HANDLE}`] }), 'base64');
   }
 

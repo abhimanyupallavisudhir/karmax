@@ -7,6 +7,7 @@ import { newId } from '../util/id.js';
 import crypto from 'node:crypto';
 import { formatMinorUnits, minorUnitDigits } from '../util/currency.js';
 import type { CredentialBroker } from './broker.js';
+import { INSTALLATION_SCOPE, organizationScope, type VaultScope } from './vault-keys.js';
 import { BRAND } from '../domain/brand.js';
 
 /**
@@ -74,6 +75,17 @@ export const cardSecretHandle = (cardId: string) => `payment:card:${cardId}`;
  * resolves the CVC only to type it. */
 export const cardCvcHandle = (cardId: string) => `payment:card:${cardId}:cvc`;
 
+/** The organization that owns a card's vault secrets (SS-1). */
+export async function cardOwnerScope(store: Pick<Store, 'getProject'>, card: Pick<Card, 'scope' | 'scopeId'>): Promise<VaultScope> {
+  if (card.scope === 'organization') return organizationScope(card.scopeId!);
+  if (card.scope === 'project') {
+    const organizationId = (await store.getProject(card.scopeId!))?.organizationId;
+    if (!organizationId) throw new Error('card project no longer exists');
+    return organizationScope(organizationId);
+  }
+  return organizationScope('org_personal');
+}
+
 /** Move the CVC of every card stored before AU-31 out of its card secret,
  * dropping the card secret's history, which still holds it. Checked on every
  * boot, since a vault put back from before the split (a manual rollback)
@@ -88,10 +100,13 @@ export async function separateStoredCardCvcs(broker: CredentialBroker): Promise<
     catch { continue; } // not card details; never block boot on one entry
     if (details?.cvc === undefined) continue;
     const { cvc, ...rest } = details;
+    // The card's owner, as the data epoch 4 migration recorded it (it runs first).
+    const scope = broker.scopeOf(handle);
+    if (!scope) continue;
     // One card must not stop the rest, nor the boot that runs this.
     try {
-      (await broker.registerHandle(`${handle}:cvc`, String(cvc)));
-      (await broker.registerHandle(handle, JSON.stringify(rest), { history: false }));
+      (await broker.registerHandle(`${handle}:cvc`, String(cvc), scope));
+      (await broker.registerHandle(handle, JSON.stringify(rest), scope, { history: false }));
       separated++;
     } catch (error) { console.error(`[payments] could not separate the CVC of ${handle}: ${(error as Error).message}`); }
   }
@@ -309,8 +324,9 @@ export class VaultCardProvider implements PaymentProvider {
       last4: details.number.slice(-4), createdAt: Date.now(),
     };
     const { cvc, ...stored } = details;
-    (await this.broker.registerHandle(cardCvcHandle(card.id), cvc));
-    (await this.broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(stored)));
+    const scope = await cardOwnerScope(this.store, card);
+    (await this.broker.registerHandle(cardCvcHandle(card.id), cvc, scope));
+    (await this.broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(stored), scope));
     try { (await this.store.createCard(card)); }
     catch (error) {
       (await this.broker.deleteHandle(cardSecretHandle(card.id)));
@@ -453,8 +469,8 @@ export class StripeIssuingProvider implements PaymentProvider {
     if (!secretKey && !this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'))
       throw new Error('Stripe secret key is required');
     (await store.kvSet(STRIPE_CLIENT_ID_KEY, clientId));
-    if (secretKey) (await this.broker.registerHandle(STRIPE_SECRET_KEY_HANDLE, secretKey));
-    if (webhookSecret) (await this.broker.registerHandle(STRIPE_WEBHOOK_SECRET_HANDLE, webhookSecret));
+    if (secretKey) (await this.broker.registerHandle(STRIPE_SECRET_KEY_HANDLE, secretKey, INSTALLATION_SCOPE));
+    if (webhookSecret) (await this.broker.registerHandle(STRIPE_WEBHOOK_SECRET_HANDLE, webhookSecret, INSTALLATION_SCOPE));
     return (await this.platformStatus());
   }
   private requireStore(): Store {

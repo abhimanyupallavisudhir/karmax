@@ -74,14 +74,14 @@ describe('VaultCardProvider — the universal rail', () => {
 
   it('separates the CVC of a card stored before AU-31, once', async () => {
     const card = await provision();
-    (await broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details)));
+    (await broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details), broker.scopeOf(cardSecretHandle(card.id))!));
     (await broker.deleteHandle(cardCvcHandle(card.id)));
     expect(await separateStoredCardCvcs(broker)).toBe(1);
     expect(await separateStoredCardCvcs(broker)).toBe(0);
     // Every boot checks again: a vault put back from before the split (a
     // manual rollback) is split too, which a marker outside it would miss.
     const combined = JSON.stringify(details);
-    (await broker.registerHandle(cardSecretHandle(card.id), combined, { history: false }));
+    (await broker.registerHandle(cardSecretHandle(card.id), combined, broker.scopeOf(cardSecretHandle(card.id))!, { history: false }));
     expect(await separateStoredCardCvcs(broker)).toBe(1);
     expect(JSON.parse(broker.resolve(cardSecretHandle(card.id), { caps: ['use-credential:*'] }))).not.toHaveProperty('cvc');
     // …nor in the card secret's history, where `put` keeps earlier revisions.

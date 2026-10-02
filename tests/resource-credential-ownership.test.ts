@@ -18,6 +18,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { VaultItems, itemHandle } from '../src/autonomy/vault-items.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import type { World } from '../src/world/types.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 // A project resource once stored whatever vault handles a request named, and
 // resolved, overwrote and deleted them with a capability it granted itself. The
@@ -36,7 +37,7 @@ describe('project resource credentials', () => {
     store = await Store.create(':memory:');
     worlds = new WorldRegistry(); worlds.register(new MemoryWorldProvider());
     broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
-    await broker.registerHandle(PLATFORM_HANDLE, PLATFORM_SECRET);
+    await broker.registerHandle(PLATFORM_HANDLE, PLATFORM_SECRET, INSTALLATION_SCOPE);
     const objects = new Map<string, Buffer>();
     resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine({
       put: async (key: string, bytes: Buffer) => { objects.set(key, bytes); },

@@ -5,6 +5,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CredentialBroker } from './broker.js';
+import { organizationScope } from './vault-keys.js';
 import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
 import { newId } from '../util/id.js';
@@ -430,12 +431,12 @@ export class VaultItems {
       const value = args.secrets?.[field];
       // Pass notes are a complete snapshot, including an empty replacement.
       if (field === 'note' && value !== undefined) {
-        (await this.requireBroker().registerHandle(itemHandle(id, field), value));
+        (await this.requireBroker().registerHandle(itemHandle(id, field), value, organizationScope(this.organizationId)));
         fields.add(field);
         continue;
       }
       if (value?.trim()) {
-        (await this.requireBroker().registerHandle(itemHandle(id, field), value));
+        (await this.requireBroker().registerHandle(itemHandle(id, field), value, organizationScope(this.organizationId)));
         fields.add(field);
       }
     }

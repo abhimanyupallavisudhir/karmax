@@ -9,6 +9,8 @@ import { inspectVault } from '../autonomy/vault.js';
 // exit 3 (a secret the boot would quarantine) keeps the previous app serving
 // unless the operator passes --accept-vault-findings; exit 4 (a refused key, a
 // file it cannot read, a vault it cannot open: the boot would fail) always does.
+// Moving secrets under per-owner data keys (data epoch 4) is reported, not a
+// finding: the boot reads the owners from the database, which this cannot.
 // The key the app will use: $KARMAX_HOME/karmax.env, then KARMAX_VAULT_KEY_FILE
 // (all the turnkey app has), exactly as main.ts reads it. Only that secret: this
 // runs before the release has started, when others it never reads (the app's
@@ -28,6 +30,7 @@ if (report.key === 'refused') lines.push(`vault key REFUSED: ${report.refusal}`)
 else if (report.fatal) lines.push(`cannot open the vault: ${report.fatal}`);
 else {
   lines.push(`vault key accepted; ${report.bound ? 'already bound' : `${report.rebind} entr${report.rebind === 1 ? 'y' : 'ies'} to bind`}`);
+  if (report.toScopes) lines.push(`${report.toScopes} entr${report.toScopes === 1 ? 'y' : 'ies'} to move under per-owner data keys (data epoch 4)`);
   for (const entry of report.unreadable) lines.push(`cannot read ${entry.file} (${entry.error}): the first boot would stop`);
   for (const entry of report.quarantine) lines.push(`would quarantine ${entry.file}${entry.handle ? ` (${entry.handle})` : ''}: ${entry.reason}`);
   if (report.oversized?.length) lines.push(`note: ${report.oversized.length} secret(s) over 64 KiB (${report.oversized.join(', ')}) are kept; `

@@ -7,6 +7,7 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { roleCeiling } from '../src/contrib/manifests.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 describe('capability model + attenuation (SPEC §8.2)', () => {
   it('does not impose a second authorization tier on the Do role', () => {
@@ -101,7 +102,7 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
 
   it('stores secrets encrypted at rest and resolves only with capability', async () => {
     const vault = new Vault(dir);
-    (await vault.put('openai', 'sk-secret-123'));
+    (await vault.put('openai', 'sk-secret-123', INSTALLATION_SCOPE));
     // no file in the vault contains the plaintext secret
     const files = fs.readdirSync(dir, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile());
     expect(files.length).toBeGreaterThan(0);
@@ -121,14 +122,14 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
 
   it('write-back of a newly created account is resolvable later', async () => {
     const broker = new CredentialBroker(new Vault(dir));
-    (await broker.registerHandle('new-acct', 'pw-xyz'));
+    (await broker.registerHandle('new-acct', 'pw-xyz', INSTALLATION_SCOPE));
     expect(broker.resolve('new-acct', { caps: ['use-credential:*'] })).toBe('pw-xyz');
   });
 
   it('renames and rotates a handle without leaving the old credential behind', async () => {
     const broker = new CredentialBroker(new Vault(dir));
-    (await broker.registerHandle('openrouter:old', 'old-secret'));
-    (await broker.updateHandle('openrouter:old', 'openrouter:new', 'new-secret'));
+    (await broker.registerHandle('openrouter:old', 'old-secret', INSTALLATION_SCOPE));
+    (await broker.updateHandle('openrouter:old', 'openrouter:new', INSTALLATION_SCOPE, 'new-secret'));
     expect(broker.hasHandle('openrouter:old')).toBe(false);
     expect(broker.resolve('openrouter:new', { caps: ['use-credential:*'] })).toBe('new-secret');
   });

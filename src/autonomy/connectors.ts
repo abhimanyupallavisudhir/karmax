@@ -11,6 +11,7 @@ import type { Repository } from '../domain/types.js';
 import { git, gitOrThrow, isolatedGitEnvironment } from '../world/git.js';
 import { materializeGitCredential, type GitCredential } from '../world/git-credential.js';
 import { CredentialBroker } from './broker.js';
+import { organizationScope } from './vault-keys.js';
 import { connectorOutboxKey, readConnectorWrites, type PendingConnectorWrite } from './connector-writes.js';
 import { GitProfiles } from './git-profiles.js';
 import { ITEM_FIELDS, VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
@@ -1731,7 +1732,7 @@ export class Connectors {
       previous !== undefined &&
       gitPassRepositoryIdentity(previous) !== gitPassRepositoryIdentity(value);
     const validated = await connector.validateSecret?.(value);
-    (await this.broker.registerHandle(handle, value));
+    (await this.broker.registerHandle(handle, value, organizationScope(this.organizationId)));
     try {
       const info = validated ?? (await connector.describe());
       if (!info.available) throw new Error(info.detail);
@@ -1753,7 +1754,7 @@ export class Connectors {
       return { connector: info, newStore: previous === undefined || replacedGitPassStore };
     } catch (error) {
       if (previous === undefined) (await this.broker.deleteHandle(handle));
-      else (await this.broker.registerHandle(handle, previous));
+      else (await this.broker.registerHandle(handle, previous, organizationScope(this.organizationId)));
       throw error;
     }
   }
@@ -1970,6 +1971,7 @@ export class Connectors {
             fields: item.fields,
             secrets,
           }),
+          organizationScope(this.organizationId),
         ));
       }
     }

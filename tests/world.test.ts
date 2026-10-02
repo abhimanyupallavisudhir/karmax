@@ -17,6 +17,7 @@ import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
 import { LocalObjectStore } from '../src/store/objects.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 describe('WorktreeProvider (real git)', () => {
   let home: string;
@@ -238,7 +239,7 @@ describe('WorktreeProvider (real git)', () => {
       name: 'Dataset', driver: 'volume@1', target: { kind: 'path', path: 'data' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' }));
     await resources.importFiles(dataset.id, [{ path: 'packets.jsonl', data: Buffer.from('dataset') }]);
-    (await broker.registerHandle(resourceSecretHandle('resource_file_secret'), 'private-token'));
+    (await broker.registerHandle(resourceSecretHandle('resource_file_secret'), 'private-token', INSTALLATION_SCOPE));
     (await store.createResourceAttachment({ id: 'resource_file_secret', organizationId: project.organizationId!, projectId: project.id,
       name: 'File secret', driver: 'secret@1', target: { kind: 'path', path: '.env.local' },
       access: 'read', isolation: 'fork', source: {}, credentialHandles: [resourceSecretHandle('resource_file_secret')], publish: 'discard' }));

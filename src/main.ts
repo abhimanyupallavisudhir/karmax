@@ -20,7 +20,9 @@ import { openStore } from './store/db.js';
 import { defaultProvider } from './agent/adapters.js';
 import { KarmaxBus } from './contrib/bus.js';
 import { CredentialBroker } from './autonomy/broker.js';
-import { Vault, recordQuarantine } from './autonomy/vault.js';
+import { Vault, recordQuarantine, recordScopeMigration } from './autonomy/vault.js';
+import { resolveVaultScopes } from './autonomy/vault-scopes.js';
+import { INSTALLATION_SCOPE } from './autonomy/vault-keys.js';
 import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
 import { GitProfiles, inheritPersonalGithubProfile, userGitScope } from './autonomy/git-profiles.js';
 import { KarmaxApi } from './platform/api.js';
@@ -174,6 +176,12 @@ async function main() {
       : {}),
   }));
   const vault = new Vault(p.vault);
+  // Data epoch 4 (SS-1): every secret moves under its owner's data key; the database knows the owners.
+  const scoped = await recordScopeMigration(vault, (handles) => resolveVaultScopes(store, handles), (report) => store.appendAudit({
+    principalId: 'system:vault', action: 'vault.scopes.migrated', detail: { migrated: report.migrated, byScope: report.byScope,
+      unresolved: report.unresolved.length, unresolvedHandles: report.unresolved.slice(0, 500) } }));
+  if (scoped?.migrated) console.log(`  • Vault: ${scoped.migrated} secrets moved under per-owner data keys`
+    + (scoped.unresolved.length ? `; ${scoped.unresolved.length} with no owner found stay under the installation key (audit log: vault.scopes.migrated)` : ''));
   // Binds ciphertext written before AU-27 to its handle; what will not open is quarantined, loudly.
   // Reported until audited, so a crash between quarantine and audit still reaches the log.
   await recordQuarantine(vault, (entry) => store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
@@ -184,11 +192,11 @@ async function main() {
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');
   const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
   if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
-    (await broker.ensureHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n')));
+    (await broker.ensureHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'), INSTALLATION_SCOPE));
   if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
-    (await broker.ensureHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET));
+    (await broker.ensureHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET, INSTALLATION_SCOPE));
   if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
-    (await broker.ensureHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET));
+    (await broker.ensureHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET, INSTALLATION_SCOPE));
   // One deployment App owns repository installations and user OAuth. Environment
   // values remain an upgrade/enterprise bootstrap path; the normal path is the
   // browser manifest, whose converted client credentials persist in Store/Vault.

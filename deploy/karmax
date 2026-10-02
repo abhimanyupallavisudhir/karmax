@@ -29,6 +29,19 @@ sign_checksums() (
   dc "$@" npm run --silent backup -- --sign-checksums < "$destination/SHA256SUMS" > "$destination/SHA256SUMS.sig"
 )
 
+# Every deployment secret except the vault key (SS-2): the vault's data keys
+# are wrapped under it, so a backup that carried it would decrypt every secret
+# it holds. Keep deploy/.secrets/vault_key off-host instead; restore needs it.
+copy_deployment_secrets() (
+  destination=$1
+  mkdir "$destination" && chmod 700 "$destination" || exit 1
+  for secret in "$SECRETS_DIR"/*; do
+    case "$(basename "$secret")" in vault_key|vault_key.*) continue ;; esac
+    [ -f "$secret" ] || continue
+    cp -p "$secret" "$destination/" || exit 1
+  done
+)
+
 compact_backups() {
   # Optional space optimization must never invalidate a verified backup or
   # prevent an emergency deployment on a host without util-linux hardlink.
@@ -277,6 +290,9 @@ cmd_doctor() {
     [ -s "$SECRETS_DIR/$secret" ] || die "missing secret: $secret"
   done
   note 'Durable secrets are present.'
+  if [ -e "$SECRETS_DIR/vault_key.next" ] || [ -e "$SECRETS_DIR/vault_key.previous" ]; then
+    echo 'karmax: warning: a vault key rotation is unfinished; run ./deploy/karmax rotate-vault-key to finish it' >&2
+  fi
   dc ps
   report_app_role
   domain=$(env_value KARMAX_DOMAIN)
@@ -315,14 +331,14 @@ cmd_backup() {
   dc exec -T postgresql pg_dump -U temporal -Fc karmax > "$staging/karmax.dump"
   dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$staging/temporal.dump"
   dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$staging/temporal-visibility.dump"
-  cp -R "$SECRETS_DIR" "$staging/deployment-secrets"
+  copy_deployment_secrets "$staging/deployment-secrets"
   backup_checksums "$staging"
   sign_checksums "$staging" exec -T app
   chmod -R go-rwx "$staging"
   mv "$staging" "$destination"
   trap - EXIT
   note "Backup complete: $destination"
-  note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
+  backup_notice
   compact_backups
 }
 
@@ -365,12 +381,17 @@ cmd_backup_candidate() {
   if ! dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$destination/temporal-visibility.dump"; then
     rm -rf "$destination"; return 1
   fi
-  if ! cp -R "$SECRETS_DIR" "$destination/deployment-secrets"; then rm -rf "$destination"; return 1; fi
+  if ! copy_deployment_secrets "$destination/deployment-secrets"; then rm -rf "$destination"; return 1; fi
   if ! backup_checksums "$destination"; then rm -rf "$destination"; return 1; fi
   if ! sign_checksums "$destination" run --rm --no-deps -T app; then rm -rf "$destination"; return 1; fi
   if ! chmod -R go-rwx "$destination"; then rm -rf "$destination"; return 1; fi
   note "Backup complete: $destination"
-  note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
+  backup_notice
+}
+
+backup_notice() {
+  note 'It holds the encrypted vault but not its key: restoring it needs deploy/.secrets/vault_key, so keep a copy of that key off-host.'
+  note 'Still treat it as sensitive: it holds the auth secret, provider logins and the database dumps.'
 }
 
 cmd_restore() {
@@ -378,18 +399,24 @@ cmd_restore() {
   # Backups are signed (DB-10). --trust-key names the fingerprint of the key
   # that signed one taken on another host; --accept-unsigned-v1 restores one
   # from before signing, which nothing can authenticate, and is audited.
-  trust='' unsigned=''
+  # Backups do not carry the vault key (SS-2): --vault-key names a copy of the
+  # deploy/.secrets/vault_key the backup was taken under (kept off-host, or a
+  # vault_key.retired-* after a rotation); without it the live key is used.
+  trust='' unsigned='' vault_key=''
   while [ "$#" -gt 1 ]; do
     case "$1" in
       --trust-key)
         case "${2:-}" in SHA256:[A-Za-z0-9+/]*) ;; *) die '--trust-key needs a SHA256:… key fingerprint' ;; esac
         trust="$trust --trust-key $2"; shift 2 ;;
       --accept-unsigned-v1) unsigned=' --accept-unsigned-v1'; shift ;;
+      --vault-key)
+        [ -s "${2:-}" ] || die '--vault-key needs a copy of the vault_key file the backup was taken under'
+        vault_key=$2; shift 2 ;;
       *) break ;;
     esac
   done
   source=${1:-}
-  [ -n "$source" ] || die 'usage: ./deploy/karmax restore [--trust-key SHA256:…] [--accept-unsigned-v1] /path/to/backup'
+  [ -n "$source" ] || die 'usage: ./deploy/karmax restore [--trust-key SHA256:…] [--accept-unsigned-v1] [--vault-key FILE] /path/to/backup'
   case "$source" in /*) ;; *) source="$PWD/$source" ;; esac
   [ -d "$source" ] || die "backup not found: $source"
   [ -f "$ENV_FILE" ] || die 'configure the destination first with `./deploy/karmax up your-domain`'
@@ -415,16 +442,26 @@ cmd_restore() {
   else
     die 'backup has no checksums (it predates them); restore it only if it stayed in trusted storage, with --accept-unsigned-v1'
   fi
-  # Check both signatures, every checksum, the control-plane manifest and
-  # every payload file using the candidate app, while the live containers and
-  # all three databases are still untouched.
+  # The vault key the restored vault will open with: --vault-key, else the one
+  # a backup from before SS-2 carries, else this instance's own. The checks
+  # below refuse it unless the backup's vault is wrapped under it.
+  candidate_key="$stage/.restore-vault-key"
+  if [ -n "$vault_key" ]; then cp "$vault_key" "$candidate_key"
+  elif [ -f "$source/deployment-secrets/vault_key" ]; then cp "$source/deployment-secrets/vault_key" "$candidate_key"
+  else cp "$SECRETS_DIR/vault_key" "$candidate_key"
+  fi || die 'could not stage the vault key'
+  chmod 600 "$candidate_key"
+  # Check both signatures, every checksum, the control-plane manifest, every
+  # payload file and the vault key using the candidate app, while the live
+  # containers and all three databases are still untouched.
   dc build app
   # The backup is private to the operator who took it (0600) and the app image
   # runs as its own uid, so the one-offs that read it run as root. Their stdin
   # is closed so they cannot swallow the confirmation meant for the prompt.
   # shellcheck disable=SC2086 # fingerprints and flags are validated words
-  dc run --rm --no-deps -T --user root -v "$source:/backup:ro" app npm run restore -- --verify-deployment$trust$unsigned /backup \
-    < /dev/null || die 'backup verification failed'
+  dc run --rm --no-deps -T --user root -v "$source:/backup:ro" -e KARMAX_VAULT_KEY_FILE=/backup/.restore-vault-key \
+    app npm run restore -- --verify-deployment --check-vault-key$trust$unsigned /backup \
+    < /dev/null || die 'backup verification failed (a vault key it names is the wrong one: pass the right one with --vault-key FILE)'
   for dump in karmax temporal temporal-visibility; do
     [ -f "$source/$dump.dump" ] || { [ "$dump" = karmax ] && continue; die "backup is missing $dump.dump"; }
     dc run --rm --no-deps -T postgresql pg_restore -f /dev/null < "$source/$dump.dump" \
@@ -467,6 +504,12 @@ cmd_restore() {
   }
   abandon() { drop_staging; die "$1; nothing on this instance was changed"; }
   cp -R "$source/deployment-secrets" "$staged_secrets" || abandon 'could not copy the deployment secrets'
+  cp "$candidate_key" "$staged_secrets/vault_key" || abandon 'could not stage the vault key'
+  # Keys retired by rotate-vault-key open the backups taken before the
+  # rotation; a restore never discards them.
+  for retired in "$SECRETS_DIR"/vault_key.retired-*; do
+    [ ! -f "$retired" ] || cp -p "$retired" "$staged_secrets/" || abandon 'could not keep the retired vault keys'
+  done
   chmod 700 "$staged_secrets" && secret_mode "$staged_secrets"/* || abandon 'could not protect the deployment secrets'
   dc up -d postgresql || abandon 'PostgreSQL did not start'
   attempt=0
@@ -718,6 +761,57 @@ cmd_rotate_postgres_password() {
   note 'PostgreSQL password rotated.'
 }
 
+# The vault's key encryption key (SS-1, wiki features/vault-encryption). The
+# vault holds every data key wrapped under it, possibly under several keys, so
+# each step can be repeated after an interruption, and the previous key keeps
+# opening everything until the last one:
+#   1. wrap every data key under a new key (vault_key.next), the app serving;
+#   2. stop the app, wrap what it created meanwhile, switch the files
+#      (vault_key -> vault_key.previous, vault_key.next -> vault_key), start it;
+#   3. prune the previous key's wraps, and retire it.
+# Run it again to finish an interrupted rotation.
+cmd_rotate_vault_key() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  current="$SECRETS_DIR/vault_key" next="$SECRETS_DIR/vault_key.next" previous="$SECRETS_DIR/vault_key.previous"
+  [ -s "$current" ] || die 'missing secret: vault_key'
+  wrap_under_next() {
+    dc "$@" -v "$next:/run/secrets/vault_key_next:ro" app npm run --silent vault-key -- add /run/secrets/vault_key_next
+  }
+  # Interrupted between saving the previous key and moving the new one in.
+  if [ -s "$next" ] && [ -s "$previous" ]; then
+    cmp -s "$previous" "$current" || die "both $next and $previous exist and $current is neither: inspect them before rotating again"
+    mv "$next" "$current" || die 'could not move the new vault key into place'
+  fi
+  if [ ! -s "$previous" ]; then
+    if [ ! -s "$next" ]; then
+      ( umask 077 && random_hex 48 > "$next.tmp" && mv "$next.tmp" "$next" ) || die 'could not write the new vault key; nothing was changed'
+    fi
+    secret_mode "$next" || die "could not set the mode of $next"
+    note 'Wrapping every data key under the new vault key while the app serves…'
+    wrap_under_next run --rm --no-deps -T || die 'could not wrap the data keys under the new key; the vault still uses the current key, and running this again resumes'
+    note 'Stopping the app to switch keys…'
+    dc stop app || die 'could not stop the app; the vault still uses the current key'
+    if ! wrap_under_next run --rm --no-deps -T; then
+      dc up -d --no-build app || true
+      die 'could not wrap the data keys created meanwhile; the app was restarted on the current key, and running this again resumes'
+    fi
+    ( umask 077 && cp -p "$current" "$previous.tmp" && mv "$previous.tmp" "$previous" ) || die 'could not save the previous vault key; the app is stopped on the current key: start it with ./deploy/karmax up'
+    mv "$next" "$current" || die "could not move the new vault key into place; run this again (the app is stopped)"
+  fi
+  note 'Starting the app with the new vault key…'
+  if ! { dc up -d --no-build app && wait_ready; }; then
+    die "the app did not become ready on the new vault key. The previous key still opens the vault: mv $previous $current and start it (./deploy/karmax up), or fix the start and run this again"
+  fi
+  note 'Removing the previous key from the vault…'
+  dc exec -T app npm run --silent vault-key -- prune || die 'could not prune the previous key; the vault opens with the new key, and running this again finishes'
+  retired="$SECRETS_DIR/vault_key.retired-$(date -u +%Y%m%dT%H%M%SZ)"
+  mv "$previous" "$retired" || die "could not retire $previous"
+  note 'Vault key rotated.'
+  note "Backups taken before now still need the previous key: copy $retired off-host, keep it as long as those backups, then delete it here."
+  note "Keep a copy of the new $current off-host too: backups never carry it."
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./deploy/karmax COMMAND
@@ -726,13 +820,14 @@ Usage: ./deploy/karmax COMMAND
   doctor                       Validate configuration, containers, DNS, and HTTPS
   status                       Show service health
   logs [SERVICE]               Follow logs (app by default)
-  backup [DIRECTORY]           Snapshot Karmax, object data, Temporal, and keys
+  backup [DIRECTORY]           Snapshot Karmax, object data and Temporal (never the vault key)
   prune-backups                Drop automatic snapshots past their retention
-  restore [--trust-key FP] [--accept-unsigned-v1] DIRECTORY
-                               Verify signatures and restore a complete snapshot
+  restore [--trust-key FP] [--accept-unsigned-v1] [--vault-key FILE] DIRECTORY
+                               Verify signatures and the vault key, restore a complete snapshot
   update [--accept-vault-findings] [REVISION]
                                Backup, check the vault, deploy an exact master revision, and restart
   rotate-postgres-password      Replace PostgreSQL's superuser password
+  rotate-vault-key              Replace the vault's key encryption key (resumable)
   down                          Stop everything without deleting durable data
 EOF
 }
@@ -749,6 +844,7 @@ case "$command" in
   restore) cmd_restore "$@" ;;
   update) cmd_update "$@" ;;
   rotate-postgres-password) cmd_rotate_postgres_password "$@" ;;
+  rotate-vault-key) cmd_rotate_vault_key "$@" ;;
   down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;
   help|-h|--help) usage ;;
   *) usage >&2; die "unknown command: $command" ;;

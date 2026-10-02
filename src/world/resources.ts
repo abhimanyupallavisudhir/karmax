@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Client } from '@temporalio/client';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { organizationScope } from '../autonomy/vault-keys.js';
 import type { IgnoredResourceInventory, Project, ResourceAttachment, ResourceAccess, ResourceCandidate,
   ResourceChangeSummary, ResourcePublishPolicy, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -494,11 +495,11 @@ export class ProjectResourceService {
 
   /** Store generated per-world service endpoints behind opaque vault handles.
    * World metadata may be durable; connection strings and tokens may not be. */
-  async registerServiceEnvironment(handle: WorldHandle, values: Record<string, string>): Promise<WorldHandle> {
+  async registerServiceEnvironment(handle: WorldHandle, values: Record<string, string>, organizationId: string): Promise<WorldHandle> {
     const refs: Record<string, string> = {};
     for (const [name, value] of Object.entries(values)) {
       const ref = `world-service:${handle.id}:${handle.generation ?? 1}:${name}`;
-      (await this.broker.registerHandle(ref, value));
+      (await this.broker.registerHandle(ref, value, organizationScope(organizationId)));
       refs[name] = ref;
     }
     return { ...handle, meta: { ...handle.meta,
@@ -680,7 +681,7 @@ export class ProjectResourceService {
                   && attachment.target.name === value.name);
                 if (existing) { result.reused.push(value.name); continue; }
                 const id = newId('resource'), handle = `resource:${id}:credential`;
-                (await this.broker.registerHandle(handle, value.value));
+                (await this.broker.registerHandle(handle, value.value, organizationScope(project.organizationId!)));
                 try {
                   (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
                     projectId: project.id, name: value.name, driver: 'secret@1',
@@ -696,7 +697,7 @@ export class ProjectResourceService {
             if (existing) { result.reused.push(target); continue; }
             if (data && !data.includes(0)) {
               const id = newId('resource'), handle = `resource:${id}:credential`;
-              (await this.broker.registerHandle(handle, data.toString('utf8')));
+              (await this.broker.registerHandle(handle, data.toString('utf8'), organizationScope(project.organizationId!)));
               try {
                 (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
                   projectId: project.id, name: copyGlobSecretName(entry.name), driver: 'secret@1',

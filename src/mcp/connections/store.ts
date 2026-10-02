@@ -2,6 +2,7 @@ import * as __asyncCollections from '../../util/async-collections.js';
 import crypto from 'node:crypto';
 import type { Store } from '../../store/db.js';
 import type { CredentialBroker } from '../../autonomy/broker.js';
+import { organizationScope } from '../../autonomy/vault-keys.js';
 import { publicUrl } from './http.js';
 import { handleRef, recordSecretRefs } from '../../autonomy/task-secrets.js';
 
@@ -109,7 +110,7 @@ export class McpConnections {
       }
       if (changed || auth === 'none') { (await this.broker.deleteHandle(this.handle(connection.id))); connection.secretNames = []; }
       if (secrets) {
-        (await this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets)));
+        (await this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets), organizationScope(this.organizationId)));
         connection.secretNames = Object.keys(secrets);
       }
       const connections = (await this.all()).filter((c) => c.id !== connection.id);
@@ -142,7 +143,7 @@ export class McpConnections {
   async setSecret(c: McpConnection, value: unknown) {
     await this.store.transaction(async () => {
       if ((await this.get(c.id, c.projectId)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
-      (await this.broker.registerHandle(this.handle(c.id), JSON.stringify(value)));
+      (await this.broker.registerHandle(this.handle(c.id), JSON.stringify(value), organizationScope(this.organizationId)));
     });
   }
   async selected(ids: string[], projectId: string): Promise<McpConnection[]> {
