@@ -7,6 +7,7 @@ import type { ProviderSandboxRef } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import type { WorldCheckpointService } from './checkpoint.js';
 import type { ObjectStore } from '../store/objects.js';
+import { expireConversationExports } from '../store/conversation-exports.js';
 
 // Private/explicit pools retain physical resource totals. Hosted customer-owned
 // pools ignore these totals and derive active worlds from plan concurrency.
@@ -186,6 +187,7 @@ export class WorldLifecycleManager {
       (await this.store.deletePromotedArtifact(artifact.id));
       await this.objects?.delete(artifact.objectKey).catch(() => undefined);
     }
+    if (this.objects) await expireConversationExports(this.store, this.objects, now);
     for (const preview of (await this.store.expiredPreviewLeases(now))) {
       (await this.store.revokePreviewLease(preview.id));
       const handle = (await this.store.currentWorld(preview.worldId)) as any;

@@ -70,7 +70,7 @@ import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
-import { createCodexConversationExport, readCodexConversationExport } from '../store/conversation-exports.js';
+import { ConversationExportExpired, createCodexConversationExport, readCodexConversationExport } from '../store/conversation-exports.js';
 import type { AccessMode, AccessStatus, VaultFieldName } from '../autonomy/vault-items.js';
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { newId } from '../util/id.js';
@@ -5675,7 +5675,7 @@ export class Gateway {
           const boundId = url.searchParams.get('exportId');
           let data: Buffer, filename: string, source: string, warnings: PanagentWarning[] = [];
           if (boundId) {
-            const exported = await readCodexConversationExport(objects, taskId, requestedRole, boundId);
+            const exported = await readCodexConversationExport(objects, taskId, requestedRole, boundId, store);
             ({ data, filename, source, warnings } = exported);
           } else {
             const stored = (await storedConversationSession(store, taskId, task.intentId, requestedRole,
@@ -5688,7 +5688,7 @@ export class Gateway {
               provider, sessionId, title: `${task.title} · ${requestedRole}`, cwd: view?.worldPath });
             if (provider === 'codex') {
               const exported = await createCodexConversationExport(objects, taskId, requestedRole, sessionId,
-                stored.home && stored.id ? { home: stored.home } : { generated: await generate() });
+                stored.home && stored.id ? { home: stored.home } : { generated: await generate() }, store);
               ({ data, filename, source, warnings } = exported);
             } else {
               if (stored.source) data = await fs.promises.readFile(stored.source);
@@ -5710,6 +5710,7 @@ export class Gateway {
           });
           return void res.end(data);
         } catch (error) {
+          if (error instanceof ConversationExportExpired) return this.json(res, 410, { error: error.message });
           return this.json(res, 409, { error: `conversation export failed: ${error instanceof Error ? error.message : String(error)}` });
         }
       }
@@ -5888,7 +5889,7 @@ export class Gateway {
                 id, role, sessionId, stored.home && stored.id ? { home: stored.home } : {
                   generated: await exportConversationWithPanagent({ messages: transcript, provider: 'codex',
                     sessionId, title: `${t?.title} · ${role}`, cwd: view?.worldPath }),
-                });
+                }, store);
               exportId = exported.exportId;
               exportMetadata = { filename: exported.filename, requiredCodexVersion: exported.requiredCodexVersion,
                 downloadUrl: `/api/tasks/${encodeURIComponent(id)}/conversation.jsonl?role=${encodeURIComponent(role)}&exportId=${exportId}` };

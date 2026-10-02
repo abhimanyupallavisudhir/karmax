@@ -16,6 +16,7 @@ import { E2BWorldProvider } from '../world/e2b.js';
 import { DaytonaWorldProvider } from '../world/daytona.js';
 import { LocalObjectStore, S3ObjectStore } from '../store/objects.js';
 import { StorageLocationService } from '../store/storage-locations.js';
+import { backfillConversationExports } from '../store/conversation-exports.js';
 import { WorldCheckpointService } from '../world/checkpoint.js';
 import { RunnerPoolService } from '../world/runners.js';
 import { WorldAccessService } from '../world/access.js';
@@ -74,6 +75,10 @@ export async function createExecutionServices(input: {
   const storageLocations = new StorageLocationService(store, objectStore, broker, managedStorageQuotaBytes,
     !deployment.hosted);
   if (bootstrap) for (const organization of (await store.listOrganizations())) (await storageLocations.ensureManaged(organization.id));
+  // Conversation exports written before they were recorded are registered once
+  // so the lifecycle sweep can expire them (src/store/conversation-exports.ts).
+  if (bootstrap) await backfillConversationExports(store, objectStore, p.objects)
+    .catch((error) => console.warn(`[conversation-exports] backfill failed: ${error instanceof Error ? error.message : String(error)}`));
   const snapshotEngine = new ObjectSnapshotEngine(objectStore, broker, storageLocations);
   const resources = new ProjectResourceService(store, worlds, snapshotEngine, broker,
     { client, taskQueue: TASK_QUEUE }, storageLocations);

@@ -613,6 +613,11 @@ export class Store {
         bytes INTEGER NOT NULL, mediaType TEXT NOT NULL, name TEXT NOT NULL,
         createdAt INTEGER NOT NULL, expiresAt INTEGER
       );
+      CREATE TABLE IF NOT EXISTS conversation_exports (
+        objectKey TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
+        taskId TEXT NOT NULL, role TEXT NOT NULL, exportId TEXT NOT NULL,
+        bytes INTEGER NOT NULL, createdAt INTEGER NOT NULL, usedAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS executions (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -833,6 +838,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_usage_org_time ON usage_events(organizationId, startedAt);
       CREATE INDEX IF NOT EXISTS idx_usage_admissions_org ON usage_admissions(organizationId, kind, state, createdAt);
       CREATE INDEX IF NOT EXISTS idx_artifacts_task ON promoted_artifacts(taskId, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_conversation_exports_used ON conversation_exports(usedAt);
+      CREATE INDEX IF NOT EXISTS idx_conversation_exports_project ON conversation_exports(projectId);
       CREATE INDEX IF NOT EXISTS idx_executions_task ON executions(taskId, startedAt);
       CREATE INDEX IF NOT EXISTS idx_execution_frames ON execution_frames(executionId, seq);
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
@@ -1581,6 +1588,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM preview_leases WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id));
+      (await this.db.prepare('DELETE FROM conversation_exports WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM world_leases WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM usage_admissions WHERE projectId=?').run(id));
       (await this.db.prepare('UPDATE usage_events SET projectId=NULL, taskId=NULL, worldId=NULL, metadata=NULL WHERE projectId=?').run(id));
@@ -1992,6 +2000,7 @@ export class Store {
       usage_events: (await selectRows(this.db, 'usage_events', 'organizationId=?', [organizationId])),
       usage_admissions: (await selectRows(this.db, 'usage_admissions', 'organizationId=?', [organizationId])),
       promoted_artifacts: (await selectRows(this.db, 'promoted_artifacts', 'organizationId=?', [organizationId])),
+      conversation_exports: (await selectRows(this.db, 'conversation_exports', 'organizationId=?', [organizationId])),
       executions: (await selectRows(this.db, 'executions', 'organizationId=?', [organizationId])),
       execution_frames: (await rowsFor(this.db, 'execution_frames', 'executionId', executionIds)),
       preview_leases: (await selectRows(this.db, 'preview_leases', 'organizationId=?', [organizationId]))
@@ -2174,6 +2183,8 @@ export class Store {
     }
     for (const row of (await this.db.prepare('SELECT objectKey FROM promoted_artifacts WHERE projectId=?').all(projectId)) as any[])
       objectKeys.add(String(row.objectKey));
+    for (const row of (await this.db.prepare('SELECT objectKey FROM conversation_exports WHERE projectId=?').all(projectId)) as Array<{ objectKey: string }>)
+      objectKeys.add(String(row.objectKey));
     const attachmentIds = ((await this.db.prepare('SELECT attachmentId FROM attachment_scopes WHERE projectId=?').all(projectId)) as any[])
       .map((row) => String(row.attachmentId));
     const leases = ((await this.db.prepare(`SELECT l.id, COALESCE(p.provider, 'unknown') provider
@@ -2264,6 +2275,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM preview_leases WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM executions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM conversation_exports WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM usage_events WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM usage_admissions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM world_leases WHERE organizationId=?').run(organizationId));
@@ -7284,6 +7296,49 @@ export class Store {
   async expiredPromotedArtifacts(now = Date.now()): Promise<PromotedArtifact[]> {
     return ((await this.db.prepare('SELECT * FROM promoted_artifacts WHERE expiresAt IS NOT NULL AND expiresAt<=?').all(now)) as any[])
       .map((row) => ({ ...row, expiresAt: Number(row.expiresAt) }));
+  }
+
+  /** A frozen conversation export (`src/store/conversation-exports.ts`). Its
+   * identity is content-derived, so recording the same snapshot again only
+   * refreshes when it was last used. The organization and project come from
+   * the task; an export of an unknown task is not recorded. */
+  async recordConversationExport(input: { objectKey: string; taskId: string; role: string; exportId: string;
+    bytes: number; usedAt?: number; onlyIfAbsent?: boolean }): Promise<boolean> {
+    return this.db.transaction(async () => {
+      const task = (await this.db.prepare(`SELECT t.projectId, p.organizationId FROM tasks t JOIN projects p ON p.id=t.projectId
+        WHERE t.id=?`).get(input.taskId)) as { projectId: string; organizationId: string | null } | undefined;
+      if (!task) return false;
+      const usedAt = input.usedAt ?? Date.now();
+      const result = (await this.db.prepare(`INSERT INTO conversation_exports
+        (objectKey, organizationId, projectId, taskId, role, exportId, bytes, createdAt, usedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(objectKey) DO ${input.onlyIfAbsent ? 'NOTHING' : 'UPDATE SET bytes=excluded.bytes, usedAt=excluded.usedAt'}`)
+        .run(input.objectKey, task.organizationId ?? 'org_personal', task.projectId, input.taskId, input.role,
+          input.exportId, input.bytes, usedAt, usedAt)) as { changes?: number };
+      return Number(result?.changes ?? 1) > 0;
+    });
+  }
+
+  async touchConversationExport(objectKey: string, now = Date.now()): Promise<void> {
+    (await this.db.prepare('UPDATE conversation_exports SET usedAt=? WHERE objectKey=? AND usedAt<?').run(now, objectKey, now));
+  }
+
+  async conversationExport(objectKey: string): Promise<{ objectKey: string; organizationId: string; projectId: string;
+    taskId: string; role: string; exportId: string; bytes: number; createdAt: number; usedAt: number } | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM conversation_exports WHERE objectKey=?').get(objectKey)) as
+      { objectKey: string; organizationId: string; projectId: string; taskId: string; role: string; exportId: string;
+        bytes: number | string; createdAt: number | string; usedAt: number | string } | undefined;
+    return row ? { ...row, bytes: Number(row.bytes), createdAt: Number(row.createdAt), usedAt: Number(row.usedAt) } : undefined;
+  }
+
+  /** Exports unused since `usedBefore`, or whose task is gone, oldest first. */
+  async expiredConversationExports(usedBefore: number, limit: number): Promise<string[]> {
+    return ((await this.db.prepare(`SELECT e.objectKey FROM conversation_exports e LEFT JOIN tasks t ON t.id=e.taskId
+      WHERE e.usedAt<=? OR t.id IS NULL ORDER BY e.usedAt LIMIT ?`).all(usedBefore, limit)) as Array<{ objectKey: string }>)
+      .map((row) => String(row.objectKey));
+  }
+
+  async deleteConversationExport(objectKey: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM conversation_exports WHERE objectKey=?').run(objectKey));
   }
 
   async createExecution(input: Omit<ExecutionRecord, 'state' | 'startedAt' | 'heartbeatAt'>
