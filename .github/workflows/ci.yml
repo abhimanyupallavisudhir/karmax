@@ -232,7 +232,7 @@ jobs:
             --resolve karmax.localhost:80:127.0.0.1 http://karmax.localhost/api/health/ready)
           echo "edge: $redirect"
           [ "$redirect" = '308 https://karmax.localhost/api/health/ready' ]
-          docker compose exec -T caddy wget -qO- http://app:4505/api/health/ready
+          docker compose exec -T caddy wget -qO- http://127.0.0.1:4505/api/health/ready
 
       - name: Keep the app off the PostgreSQL superuser
         if: steps.scope.outputs.artifacts == 'true'
