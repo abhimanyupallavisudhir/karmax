@@ -2919,6 +2919,10 @@ html[data-theme="dark"] .github-signin-btn:active,
 .artifact-reader-content > pre { margin: 0; font-family: var(--font-mono); font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .authz-editor .authz-description { margin: 0; line-height: 1.45; }
+.authz-warning { display: flex; align-items: center; gap: 6px; margin: 6px 0 0; padding: 6px 10px; border-radius: 8px;
+  background: var(--danger-weak); color: var(--danger); font-size: 13px; font-weight: 600; line-height: 1.4; }
+.authz-warning[hidden] { display: none; }
+.authz-warning .info-dot { color: inherit; }
 .authorization-role { border-top: 1px solid var(--line); padding: 12px 0; }
 .authorization-role > summary { display: list-item; cursor: pointer; }
 .authorization-role > summary .chip { margin-left: 8px; }

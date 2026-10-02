@@ -61,6 +61,30 @@ export interface VaultItemPolicy {
  * default, so later global changes still flow through to the task. */
 export type VaultTaskPolicyOverrides = Record<string, Partial<VaultItemPolicy>>;
 
+const USE_RANK: Record<VaultItemPolicy['use'], number> = { auto: 0, ask: 1 };
+const REVEAL_RANK: Record<VaultItemPolicy['reveal'], number> = { auto: 0, ask: 1, never: 2 };
+
+/** Does `next` make `prior` easier to obtain than its policy allows? */
+export function loosensPolicy(prior: VaultItemPolicy, next: Partial<VaultItemPolicy> | undefined): boolean {
+  return (next?.use !== undefined && USE_RANK[next.use] < USE_RANK[prior.use])
+    || (next?.reveal !== undefined && REVEAL_RANK[next.reveal] < REVEAL_RANK[prior.reveal]);
+}
+
+/**
+ * An edit that would hand out an existing item's secret without revealing it
+ * outright, and therefore needs vault read access (`credential:reveal`):
+ * loosening its policy, or adding a site its password can be filled into
+ * (a page the editor controls reads the filled value back).
+ */
+export function weakensProtection(prior: VaultItem,
+  next: { policy?: Partial<VaultItemPolicy>; domains?: string[] }): string | undefined {
+  if (loosensPolicy(prior.policy, next.policy)) return `loosen the policy of "${prior.label}"`;
+  const known = new Set((prior.domains ?? []).map((domain) => domain.trim().toLowerCase()));
+  if (next.domains?.some((domain) => domain.trim() && !known.has(domain.trim().toLowerCase())))
+    return `add sites "${prior.label}" can be filled into`;
+  return undefined;
+}
+
 export interface VaultItem {
   id: string;
   type: VaultItemType;
@@ -638,6 +662,10 @@ export class VaultItems {
     const policyForTask = (await this.effectivePolicy(taskId, item));
     if (mode === 'reveal' && policyForTask.reveal === 'never') return { status: 'denied', reason: `"${item.label}" is never revealed in plaintext (${taskId ? 'task' : 'item'} policy)` };
     if (taskId && !opts.ambient && (await this.takePass(taskId, item.id, mode, opts.consume ?? false))) return { status: 'granted' };
+    // Vault read access (Super-administrator) needs no grant or approval for an
+    // explicit request. Ambient injection still follows grants and policy, so
+    // such a task does not carry the whole vault in its environment.
+    if (!opts.ambient && allows(caps, 'credential:reveal')) return { status: 'granted' };
     if (!(await this.covered(caps, taskId, item))) return { status: 'needs_approval', reason: 'this task was not granted this credential' };
     const policy = mode === 'reveal' ? policyForTask.reveal : policyForTask.use;
     if (policy !== 'auto') return { status: 'needs_approval', reason: `"${item.label}" requires per-${mode} approval (${taskId ? 'task' : 'item'} policy)` };

@@ -1620,7 +1620,10 @@ function authorizationLevels() {
     { id: 'viewer', description: 'Read projects, tasks, conversations, and settings in the selected scope.', name: 'Viewer', scope: 'selectable' },
     { id: 'developer', description: 'Read diagnostics, create tasks, and manage your own work and its descendants.', name: 'Developer', scope: 'selectable' },
     { id: 'maintainer', description: 'Manage all tasks, reviews, settings, and automation in the selected projects.', name: 'Project maintainer', scope: 'selectable' },
-    { id: 'administrator', description: 'Manage this organization, including projects, members, credentials, and payments.', name: 'Administrator', scope: 'organization' },
+    { id: 'administrator', description: 'Manage this organization: projects, members, settings, and credentials within their policies.', name: 'Administrator', scope: 'organization' },
+    { id: 'superadmin', description: 'Everything an Administrator can do, plus the vault, payments, and deleting the organization.', name: 'Super-administrator', scope: 'organization',
+      warning: 'Super-administrator authorization will give agents full read access to your vault.',
+      warningDetail: 'Agents can read every secret regardless of its policy, approve credential requests and spending, manage payment cards, and delete the organization.' },
     { id: 'god', description: 'Unrestricted access across every organization and the installation, including global settings and authorization.', name: 'God', scope: 'global' },
     ...(typeof S !== 'undefined' && S.authorizationCatalogOrganization === S.organizationId ? (S.authorizationCatalog?.profiles || []).filter((role) => role.scopeKey === `organization:${S.organizationId}`).map((role) => ({ ...role, scope: 'selectable' })) : []),
   ];
@@ -1660,6 +1663,7 @@ function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
     <select class="authz-level-select" aria-label="Authorization level" aria-describedby="${esc(id)}-description">${(authorizationLevels().some((candidate) => candidate.id === level.id) ? authorizationLevels() : [...authorizationLevels(), level]).map((candidate) =>
       `<option value="${esc(candidate.id)}" ${candidate.id === selected.level ? 'selected' : ''}>${esc(candidate.name)}</option>`).join('')}</select>
     <p class="authz-description task-sub" id="${esc(id)}-description" aria-live="polite">${esc(level.description || "Custom capabilities in the selected scope.")}</p>
+    ${authorizationWarningHtml(level)}
     <div class="authz-scope-combo" ${level.scope === 'selectable' ? '' : 'hidden'}>
       <div class="authz-scope-field">
         <span class="authz-scope-chips">${chips.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : names.get(scope) || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('')}</span>
@@ -1669,6 +1673,12 @@ function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
       <div class="authz-scope-menu" role="listbox" hidden></div>
     </div>
   </div>`;
+}
+
+/** The one-line warning a dangerous level carries wherever it is chosen; the
+ * detail is a tap/hover away. */
+function authorizationWarningHtml(level) {
+  return `<p class="authz-warning" role="note" ${level?.warning ? '' : 'hidden'}><span>${esc(level?.warning || '')}</span>${level?.warningDetail ? ` ${policyTip(level.warningDetail)}` : ''}</p>`;
 }
 
 function readAuthorizationEditor(root) {
@@ -1694,7 +1704,7 @@ function isAuthorizationGrantGap(error) {
  * grant the complete requested package; selectors are still re-checked when the
  * request is created and when it is approved. */
 async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 'agent') {
-  const targets = await api('/api/authorization/escalation-targets', {
+  const targets = await api(`/api/authorization/escalation-targets?projectId=${encodeURIComponent(projectId)}`, {
     method: 'POST', body: JSON.stringify({ projectId, authorization }),
   });
   return new Promise((resolve) => {
@@ -1787,6 +1797,8 @@ function wireAuthorizationEditor(root, projects, onChange) {
   const drawChips = () => {
     const description = root.querySelector('.authz-description');
     if (description) description.textContent = levelOf().description || 'Custom capabilities in the selected scope.';
+    const warning = root.querySelector('.authz-warning');
+    if (warning) warning.outerHTML = authorizationWarningHtml(levelOf());
     const selected = value.scope === 'organization' ? ['@organization'] : (value.projectIds || []);
     chips.innerHTML = selected.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : projectById.get(scope)?.name || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('');
     input.placeholder = authorizationScopePlaceholder(selected);
@@ -6754,7 +6766,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
             if (!draft) for (let i = 1; i < attemptCount; i++)
               await api(`/api/tasks/${targetId}/attempts`, { method: 'POST', body: '{}' });
           }
-          await api('/api/authorization-requests', { method: 'POST', body: JSON.stringify({
+          await api(`/api/authorization-requests?projectId=${encodeURIComponent(projectId)}`, { method: 'POST', body: JSON.stringify({
             projectId, target: { kind: 'task', taskId: targetId, queueAfterApproval: true },
             authorization: st.authorization, audience: decision.audience, reason: decision.reason,
           }) });
@@ -12821,7 +12833,7 @@ async function fillAvatarEditor(overlay, close, proj, avatar) {
               scope: avatar.authorization.scope, projectIds: avatar.authorization.projectIds,
             }, proj.id) })
             : await save({ ...payload, limitAuthorization: true, enabled: false });
-          await api('/api/authorization-requests', { method: 'POST', body: JSON.stringify({
+          await api(`/api/authorization-requests?projectId=${encodeURIComponent(proj.id)}`, { method: 'POST', body: JSON.stringify({
             projectId: proj.id,
             target: { kind: 'avatar', avatarId: saved.id, enableAfterApproval: !avatar },
             authorization: requestedAuthorization, audience: decision.audience, reason: decision.reason,
@@ -15478,7 +15490,7 @@ const VAULT_SECRET_LABELS = {
 // Short label + click-to-expand explanation for the two per-item policies.
 const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
 const SESSION_EXCLUSIVE_TIP = 'For sites that sign other copies out when one is used. Other tasks wait until the task using it is done.';
-const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). It then travels to the model provider and may end up in training data. “never” forbids that entirely; “ask” requires your approval each time.';
+const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). It then travels to the model provider and may end up in training data. “never” forbids that to everyone but Super-administrators, who can read the whole vault; “ask” requires your approval each time.';
 // `title` covers hover on desktop; the click handler is for touch, where there is
 // no hover. It used to call `alert()` — the only modal in a console that speaks in
 // toasts, and on desktop it fired *on top of* the native tooltip.
