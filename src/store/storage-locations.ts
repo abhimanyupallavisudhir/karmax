@@ -5,7 +5,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import { organizationScope } from '../autonomy/vault-keys.js';
 import type { StorageLocation, StorageLocationUsage } from '../domain/types.js';
 import type { Store } from './db.js';
-import { S3ObjectStore, type ObjectStore } from './objects.js';
+import { S3ObjectStore, type ObjectRequestOptions, type ObjectStore } from './objects.js';
 import { newId } from '../util/id.js';
 import { BRAND } from '../domain/brand.js';
 
@@ -14,7 +14,9 @@ export function managedStorageLocationId(organizationId: string): string {
 }
 
 /** Organization storage control plane. The operator store remains the bounded,
- * zero-configuration default; customer S3 credentials never enter SQLite. */
+ * zero-configuration default; customer S3 credentials never enter SQLite.
+ * `managedQuotaBytes` is a private operator's cap: a hosted organization's
+ * managed quota follows its plan (`Store.storageLocationQuotaBytes`). */
 export class StorageLocationService {
   private stores = new Map<string, ObjectStore>();
 
@@ -39,17 +41,19 @@ export class StorageLocationService {
 
   async list(organizationId: string): Promise<Array<Omit<StorageLocation, 'credentialHandle'> & { credentialConfigured: boolean; usage: StorageLocationUsage }>> {
     (await this.ensureManaged(organizationId));
-    return (await __asyncCollections.map((await this.store.listStorageLocations(organizationId)), async ({ credentialHandle, ...location }) => ({
-      ...location, credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)),
-      usage: (await this.store.storageLocationUsage(location.id)),
-    })));
+    return (await __asyncCollections.map((await this.store.listStorageLocations(organizationId)), async ({ credentialHandle, ...location }) => {
+      const usage = (await this.store.storageLocationUsage(location.id));
+      return { ...location, quotaBytes: usage.quotaBytes,
+        credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)), usage };
+    }));
   }
 
   async view(organizationId: string, id: string): Promise<Omit<StorageLocation, 'credentialHandle'>
     & { credentialConfigured: boolean; usage: StorageLocationUsage }> {
     const { credentialHandle, ...location } = (await this.ownedLocation(organizationId, id));
-    return { ...location, credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)),
-      usage: (await this.store.storageLocationUsage(id)) };
+    const usage = (await this.store.storageLocationUsage(id));
+    return { ...location, quotaBytes: usage.quotaBytes,
+      credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)), usage };
   }
 
   async defaultLocation(organizationId: string): Promise<StorageLocation> {
@@ -173,7 +177,7 @@ class PrefixedObjectStore implements ObjectStore {
   constructor(private inner: ObjectStore, private prefix: string) {}
   put(key: string, data: Buffer, contentType?: string): Promise<void> { return this.inner.put(this.key(key), data, contentType); }
   get(key: string): Promise<Buffer> { return this.inner.get(this.key(key)); }
-  delete(key: string): Promise<void> { return this.inner.delete(this.key(key)); }
+  delete(key: string, options?: ObjectRequestOptions): Promise<void> { return this.inner.delete(this.key(key), options); }
   private key(key: string): string { return this.prefix ? `${this.prefix}/${key}` : key; }
 }
 

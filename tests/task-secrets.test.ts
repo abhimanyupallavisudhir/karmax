@@ -180,7 +180,7 @@ describe('Codex conversation exports', () => {
     publishLocalCodexHistory(home, { file: `rollout-2026-10-02T00-00-00-${id}.jsonl`, content }, id);
     const scrubber = new SecretScrubber();
     scrubber.add('sk-codex-export-0123456789');
-    const exported = await createCodexConversationExport(objects, 'task_a', 'do', id, { home }, scrubber);
+    const exported = await createCodexConversationExport(objects, 'task_a', 'do', id, { home }, undefined, scrubber);
     const frozen = (await readCodexConversationExport(objects, 'task_a', 'do', exported.exportId)).data;
     for (const data of [exported.data, frozen]) {
       expect(data.toString()).not.toContain('sk-codex-export');

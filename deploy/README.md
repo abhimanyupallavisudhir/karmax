@@ -194,6 +194,42 @@ connection, testing, rotation, and removal also have permission-checked platform
 MCP tools, so an authorized agent can connect E2B or Daytona without shell
 access.
 
+### Object storage on S3 or Cloudflare R2
+
+Checkpoints, resource snapshots and saved review files go to the `karmax_data`
+volume unless `.turnkey.env` selects an S3-compatible bucket:
+
+```bash
+KARMAX_OBJECT_STORE=s3
+KARMAX_S3_ENDPOINT=https://<account-id>.eu.r2.cloudflarestorage.com   # R2, EU jurisdiction
+KARMAX_S3_BUCKET=karmax-objects
+KARMAX_S3_REGION=auto                                                # R2; an AWS region elsewhere
+```
+
+An R2 bucket in the EU jurisdiction answers only on the `.eu.` host; the
+default `https://<account-id>.r2.cloudflarestorage.com` returns 403 for it.
+
+Write the key pair to `deploy/.secrets/s3_access_key_id` and
+`deploy/.secrets/s3_secret_access_key` (they exist empty until then), then
+restart with `./deploy/karmax up`. `./deploy/karmax doctor` names the active
+store and, for S3, writes, reads back and deletes a probe object.
+
+Backups copy the local volume but not a bucket, and R2 has no object versioning.
+So with S3 a deleted object stays in the bucket for
+`KARMAX_OBJECT_DELETE_DELAY_DAYS` (default 30; `0` deletes at once) before the
+lifecycle sweep purges it: a restored backup younger than that still finds every
+object it references.
+
+`./deploy/karmax migrate-objects` copies the local store into the configured
+bucket while the app keeps running. It is resumable (objects already there are
+skipped), `--verify-only` checks without writing, `--concurrency N` bounds
+parallel transfers, and it never deletes anything. It ends with an inventory of
+local objects the database no longer references. To switch, run it once while
+serving, stop the app, run it again, then with `--verify-only`, set the
+variables above, and start. Keep the local copy until the delay has passed: to
+go back, stop the app, copy what was written since with `--from-s3`, unset
+`KARMAX_OBJECT_STORE`, and start.
+
 ## Local development with a hosted control plane
 
 A hosted installation does not clone repositories onto its own filesystem.
@@ -508,3 +544,20 @@ HTTPS origins are separated, stable keys exist, PostgreSQL and Temporal are
 durable, and the object-store profile is appropriate. Hosted projects cannot select worktree,
 memory, or Docker worlds, so repository code never executes in the control-plane
 container.
+
+The Linux deployment runs Caddy on the host network so IPv6 connections keep
+their real peer addresses (Docker's userland proxy would present every IPv6
+client as one bridge address). The app publishes port 4505 on host loopback
+only, and `KARMAX_TRUSTED_PROXY_IP=gateway` makes it believe Caddy's overwritten,
+single-address X-Forwarded-For only from its own bridge gateway, where host
+connections to that port arrive from. No subnet is pinned, so an update never
+rebuilds the Compose network. Host-local processes are trusted at this boundary.
+Never expose port 4505 publicly or trust an entire proxy subnet. Other installs
+ignore forwarded headers unless `KARMAX_TRUSTED_PROXY_IP` names an exact proxy
+address. The gateway groups IPv6 clients by /64 for login lockout and hosted
+request budgets; Caddy also enforces its per-address edge budgets. These budgets
+are per replica. Host-network Caddy binds ports 80 and 443 itself, so a host
+firewall must allow them, including UDP 443 for HTTP/3 (Docker's published ports
+used to bypass it). Its admin API is off, since on the host network it would let
+any local process rewrite the edge, so `caddy reload` is unavailable: a changed
+Caddyfile takes effect when the Caddy container restarts.

@@ -33,7 +33,8 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     const c = await this.source();
     if (!c.individualPriceId || !c.teamBasePriceId || !c.teamSeatPriceId) return undefined;
     return { individualPriceId: c.individualPriceId, teamBasePriceId: c.teamBasePriceId,
-      teamSeatPriceId: c.teamSeatPriceId, individualProductId: c.individualProductId, teamProductId: c.teamProductId };
+      teamSeatPriceId: c.teamSeatPriceId, individualProductId: c.individualProductId, teamProductId: c.teamProductId,
+      storagePackPriceId: c.storagePackPriceId || undefined, storagePackProductId: c.storagePackProductId || undefined };
   }
   async createCustomer(): Promise<{ id: string }> {
     throw new Error('Paddle collects customer details during checkout');
@@ -86,9 +87,12 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
       throw new BillingRequestRejected('Paddle has not provided a billing portal link');
     return { url };
   }
+  // Paddle's PATCH replaces the whole item list: every write below sends every
+  // item it keeps, including storage packs it is not changing.
   async changePlan(input: Parameters<SubscriptionProvider['changePlan']>[0]) {
-    const items = await this.items(input.plan, input.seats);
+    const plan = await this.items(input.plan, input.seats);
     const current = await this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, 'GET');
+    const items = [...plan, ...packItems(await this.catalog(), current.items)];
     if (sameItems(current.items, items)) return { id: input.subscriptionId };
     return this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, 'PATCH', {
       items, proration_billing_mode: 'prorated_next_billing_period',
@@ -104,9 +108,30 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     const catalog = await this.catalog();
     if (!catalog || !subscription.items?.some((item: any) => item.price?.id === catalog.teamBasePriceId))
       throw new BillingRequestRejected('cannot update seats on a non-Team Paddle subscription');
-    if (subscription.items.some((item: any) => ![catalog.teamBasePriceId, catalog.teamSeatPriceId].includes(item.price?.id)))
+    if (subscription.items.some((item: any) => ![catalog.teamBasePriceId, catalog.teamSeatPriceId, catalog.storagePackPriceId]
+      .includes(item.price?.id)))
       throw new BillingRequestRejected('Paddle subscription has unexpected items; reconcile before changing seats');
-    const items = await this.items('team', input.seats);
+    const items = [...await this.items('team', input.seats), ...packItems(catalog, subscription.items)];
+    if (sameItems(subscription.items, items)) return { id: input.subscriptionId };
+    return this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, 'PATCH', {
+      items, proration_billing_mode: 'prorated_next_billing_period',
+    });
+  }
+  async updateStoragePacks(input: Parameters<SubscriptionProvider['updateStoragePacks']>[0]) {
+    const catalog = await this.catalog();
+    if (!catalog) throw new BillingRequestRejected('Paddle prices are not configured');
+    const pack = catalog.storagePackPriceId;
+    if (!pack) throw new BillingRequestRejected('storage packs are not configured');
+    if (!Number.isSafeInteger(input.storagePacks) || input.storagePacks < 0) throw new BillingRequestRejected('invalid storage pack count');
+    const subscription = await this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, 'GET');
+    const plans = [catalog.individualPriceId, catalog.teamBasePriceId];
+    if (!Array.isArray(subscription.items) || !subscription.items.some((item: any) => plans.includes(item.price?.id)))
+      throw new BillingRequestRejected('cannot add storage packs to a Paddle subscription without a plan');
+    if (subscription.items.some((item: any) => ![...plans, catalog.teamSeatPriceId, pack].includes(item.price?.id)))
+      throw new BillingRequestRejected('Paddle subscription has unexpected items; reconcile before changing storage packs');
+    const items = [...subscription.items.filter((item: any) => item.price.id !== pack)
+      .map((item: any) => ({ price_id: item.price.id as string, quantity: Number(item.quantity) })),
+    ...(input.storagePacks ? [{ price_id: pack, quantity: input.storagePacks }] : [])];
     if (sameItems(subscription.items, items)) return { id: input.subscriptionId };
     return this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, 'PATCH', {
       items, proration_billing_mode: 'prorated_next_billing_period',
@@ -158,11 +183,19 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     }
     if (intent.kind !== 'checkout') {
       if (!intent.subscriptionId) return null;
+      const catalog = await this.catalog();
+      if (intent.kind === 'storage' && (intent.storagePacks === undefined || !catalog?.storagePackPriceId)) return null;
       const subscription = await this.request(`/subscriptions/${encodeURIComponent(intent.subscriptionId)}`, 'GET');
       if (intent.kind === 'cancel') return subscription.status === 'canceled' || subscription.scheduled_change?.action === 'cancel'
         ? { id: intent.subscriptionId } : absent;
+      if (!Array.isArray(subscription.items)) return null;
+      // Each write is settled by the part of the item list it changed.
+      const pack = catalog?.storagePackPriceId;
+      if (intent.kind === 'storage') return storagePacks(pack!, subscription.items) === intent.storagePacks
+        ? { id: intent.subscriptionId } : absent;
       if (!intent.plan || !intent.seats) return null;
-      return sameItems(subscription.items, await this.items(intent.plan, intent.seats)) ? { id: intent.subscriptionId } : absent;
+      const planItems = subscription.items.filter((item: any) => !pack || item.price?.id !== pack);
+      return sameItems(planItems, await this.items(intent.plan, intent.seats)) ? { id: intent.subscriptionId } : absent;
     }
     if (!intent.plan || !intent.seats || !intent.successUrl) return null;
     let found: any;
@@ -235,6 +268,17 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
       throw error;
     }
   }
+}
+
+function storagePacks(pack: string, items: any[]): number {
+  return items.filter((item) => item.price?.id === pack).reduce((sum, item) => sum + Number(item.quantity), 0);
+}
+
+/** The storage-pack line a rewrite keeps unchanged (Paddle has no zero quantity). */
+function packItems(catalog: SubscriptionCatalogConfig | undefined, current: any): Array<{ price_id: string; quantity: number }> {
+  const pack = catalog?.storagePackPriceId;
+  const quantity = pack && Array.isArray(current) ? storagePacks(pack, current) : 0;
+  return pack && quantity > 0 ? [{ price_id: pack, quantity }] : [];
 }
 
 function sameItems(actual: any, expected: Array<{ price_id: string; quantity: number }>): boolean {

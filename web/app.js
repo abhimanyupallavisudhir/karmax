@@ -8,6 +8,26 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// Organization storage page: the over-limit state of managed storage and what
+// uses it, with the clean-up an owner can do. `contents` is null without
+// organization:edit.
+function storageOverQuotaMarkup(contents) {
+  if (!contents?.overQuota) return '';
+  const date = new Date(contents.overQuota.deleteAt).toLocaleDateString();
+  return `<p class="task-sub storage-over">Over the limit: adding data is paused. ${policyTip(`Free space or upgrade by ${date}. After that, stored data is deleted, older versions first, until it fits.`)}</p>`;
+}
+function storageContentsMarkup(contents) {
+  const projects = (contents?.projects || []).filter((project) => project.bytes > 0);
+  if (!projects.length) return '';
+  const rows = projects.map((project) => {
+    const resources = project.resources.map((resource) => `<div class="member-row storage-item"><span>${esc(resource.name)}</span><span>${formatBytes(resource.currentBytes)}${resource.olderVersions ? ` · ${resource.olderVersions} older version${resource.olderVersions === 1 ? '' : 's'} ${formatBytes(resource.olderBytes)}` : ''}${resource.taskCopies ? ` · task copies ${formatBytes(resource.taskCopyBytes)}` : ''}</span>${resource.olderVersions ? `<button class="btn sm" data-older-versions="${esc(resource.id)}">Delete older versions</button>` : ''}</div>`).join('');
+    const workspaces = project.checkpoints.count ? `<div class="member-row storage-item"><span>Saved task workspaces ${policyTip(`Uncommitted files of parked tasks. A finished task's are deleted ${contents.policy.finishedTaskCheckpointDays} days after it ends.`)}</span><span>${formatBytes(project.checkpoints.bytes)}</span>${project.checkpoints.finishedCount ? `<button class="btn sm" data-finished-workspaces="${esc(project.projectId)}">Delete finished (${formatBytes(project.checkpoints.finishedBytes)})</button>` : ''}</div>` : '';
+    const artifacts = project.artifacts.count ? `<div class="member-row storage-item"><span>Review files ${policyTip('Files attached to reviews. They are deleted automatically when they expire.')}</span><span>${formatBytes(project.artifacts.bytes)}</span></div>` : '';
+    return `<div class="storage-project"><div class="member-row"><b>${esc(project.name)}</b><span>${formatBytes(project.bytes)}</span></div>${resources}${workspaces}${artifacts}</div>`;
+  }).join('');
+  return `<details class="settings-disclosure compact"><summary><b>What's using space</b> ${policyTip('Sizes before sharing: versions share unchanged files, so deleting one frees only what is unique to it.')}</summary>${rows}</details>`;
+}
+
 function formatBytes(value) {
   const bytes = Number(value);
   if (!Number.isFinite(bytes) || bytes < 0) return '—';
@@ -9908,13 +9928,14 @@ function localConversationHandoff(v, cwd, portable = false, preparedSessions = S
 
 // The Work-locally dialogs share one frame: a loading state while `load()` runs,
 // then `render(data)`'s body, with close, copy and conversation downloads wired.
+// The body scrolls under a fixed header so tall plans fit any screen.
 // Resolves to { host, data }, or null when the load failed or the dialog closed.
 async function localHandoffDialog({ loading, load, title = () => 'Work locally', render }) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
   const show = (heading, body) => {
     host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">${heading} <span class="q-spacer"></span><button class="icon-btn local-handoff-close" aria-label="Close">✕</button></div>
-    ${body}
+    <div class="local-handoff-body">${body}</div>
   </div></div>`;
     host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
     host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
@@ -15049,6 +15070,7 @@ async function wirePaidLaunchCard() {
         <label class="form-row">Individual $9 price<input class="paid-paddle-individual-price" value="${esc(paddle.individualPriceId || '')}" placeholder="pri_…" /></label>
         <label class="form-row">Team $19 base price<input class="paid-paddle-team-base-price" value="${esc(paddle.teamBasePriceId || '')}" placeholder="pri_…" /></label>
         <label class="form-row">Additional user $5 price<input class="paid-paddle-team-seat-price" value="${esc(paddle.teamSeatPriceId || '')}" placeholder="pri_…" /></label>
+        <label class="form-row">Storage pack $4 price<input class="paid-paddle-storage-pack-price" value="${esc(paddle.storagePackPriceId || '')}" placeholder="pri_…" /></label>
         <label class="form-row">Default payment link<input value="${esc(paddle.checkoutUrl || '')}" readonly /></label>
         <label class="form-row">Webhook destination<input value="${esc(paddle.webhookUrl || '')}" readonly /></label>
       </div></details>
@@ -15107,6 +15129,7 @@ async function wirePaidLaunchCard() {
           individualPriceId: box.querySelector('.paid-paddle-individual-price').value,
           teamBasePriceId: box.querySelector('.paid-paddle-team-base-price').value,
           teamSeatPriceId: box.querySelector('.paid-paddle-team-seat-price').value,
+          storagePackPriceId: box.querySelector('.paid-paddle-storage-pack-price').value,
         },
         paidLaunch: box.querySelector('.paid-launch-enabled').checked,
         founderReviewed: box.querySelector('.paid-founder-reviewed').checked,
@@ -16006,7 +16029,7 @@ function passwordsCard() {
         <input class="vi-label" placeholder="label (e.g. GitHub — alice)" style="flex:1;min-width:140px" />
         <input class="vi-domains" placeholder="domains (e.g. github.com)" style="flex:1;min-width:140px" />
         <input class="vi-username" placeholder="username" style="min-width:120px" />
-        <input class="vi-envvar" placeholder="env var (api/ssh keys)" style="min-width:140px;display:none" />
+        <input class="vi-envvar" placeholder="env var name" pattern="[A-Za-z_][A-Za-z0-9_]*" spellcheck="false" autocapitalize="characters" style="min-width:140px;display:none" />
       </div></div>
       <div class="vault-secret-rows"></div>
       <div class="form-row"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
@@ -16032,7 +16055,12 @@ async function wireVaultCards(organizationId) {
   const secretRows = () => {
     box.querySelectorAll('.totp-secret-control').forEach((control) => clearTotpQrPreview(control));
     const type = box.querySelector('.vi-type').value;
-    box.querySelector('.vi-envvar').style.display = type === 'api-key' || type === 'ssh-key' ? '' : 'none';
+    const envVar = box.querySelector('.vi-envvar');
+    envVar.style.display = type === 'api-key' || type === 'ssh-key' ? '' : 'none';
+    envVar.placeholder = type === 'ssh-key' ? 'key path var, e.g. DEPLOY_KEY' : 'env var, e.g. OPENAI_API_KEY';
+    envVar.title = type === 'ssh-key'
+      ? 'Optional. Agents get the path to this key file in this variable. Not the public key.'
+      : 'Optional. Agents get this key in this variable.';
     box.querySelector('.vault-secret-rows').innerHTML = VAULT_SECRET_LABELS[type].map(([field, label]) =>
       `<div class="form-row"><label>${esc(label)}</label>${field === 'env' || field === 'privateKey' || field === 'note'
         ? `<textarea class="vi-secret" data-field="${field}" rows="3" style="width:100%"></textarea>`
@@ -16097,6 +16125,7 @@ async function wireVaultCards(organizationId) {
         ? sortVaultItems(vaultItems).map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
           <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
             ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
+            ${i.envVar ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="Environment variable agents receive">$${esc(i.envVar)}</span>` : ''}
             <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
           <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
@@ -17008,6 +17037,9 @@ function inboxTabs() {
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
+  if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
+    ? 'Stored data deleted to fit the limit'
+    : `Over the storage limit — free space by ${new Date(item.subject.deleteAt).toLocaleDateString()}`;
   if (item.subject?.kind === 'credential') {
     if (item.subject.reason === 'signed-out') return 'Signed out — sign in again';
     const days = Math.max(0, Math.ceil((item.subject.expiresAt - Date.now()) / 86_400_000));
@@ -17018,6 +17050,7 @@ function inboxRowLabel(item) {
 // What a row is about, for rows that are not a task's (resource asks, logins).
 function inboxTitle(item, fallback = item.kind) {
   if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
+  if (item.subject?.kind === 'storage') return `Storage · ${formatBytes(item.subject.retainedBytes)} of ${formatBytes(item.subject.quotaBytes)}`;
   return item.task?.title || item.resource?.name || fallback;
 }
 // Every priority is explicit; color and bars make the urgent levels scannable.
@@ -17270,6 +17303,9 @@ async function openInboxItem(item) {
   }
   if (item.subject?.kind === 'credential') {
     return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-agents`);
+  }
+  if (item.subject?.kind === 'storage') {
+    return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-storage`);
   }
   if (item.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId); if (!project) return;
@@ -18085,8 +18121,8 @@ async function hydrateOrganizationSubscription(organizationId) {
       <b>Before checkout</b><p class="task-sub">${esc(disclosures.renewalDisclosure || 'Subscriptions renew monthly until canceled.')} ${esc(disclosures.cancellationDisclosure || 'Cancel online from Organization settings before renewal.')} ${esc(disclosures.refundDisclosure || 'Payments are non-refundable except where law requires.')}</p>
       ${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')}</div>
     <div class="settings-grid" style="margin-top:14px">
-      <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user · unlimited projects · ${esc(individual.maxActiveAgentRuns)} shared concurrent agent runs.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
-      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First active user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month. With ${esc(state.activeUsers)} active user${state.activeUsers === 1 ? '' : 's'}: ${esc(price(teamTotal))} / month and ${esc(teamConcurrency)} shared concurrent agent runs. Unlimited projects · ${esc(team.maxActiveAgentRuns)} base concurrency + ${esc(team.additionalActiveUserAgentRuns)} per additional active user.</p><button class="btn sm primary billing-checkout" data-plan="team" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Team</button></div>
+      <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user · unlimited projects · ${esc(individual.maxActiveAgentRuns)} shared concurrent agent runs · ${esc(formatBytes(individual.storageBytes))} storage.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
+      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First active user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month. With ${esc(state.activeUsers)} active user${state.activeUsers === 1 ? '' : 's'}: ${esc(price(teamTotal))} / month and ${esc(teamConcurrency)} shared concurrent agent runs. Unlimited projects · ${esc(team.maxActiveAgentRuns)} base concurrency + ${esc(team.additionalActiveUserAgentRuns)} per additional active user · ${esc(formatBytes(team.storageBytes))} storage + ${esc(formatBytes(team.additionalActiveUserStorageBytes))} per additional active user.</p><button class="btn sm primary billing-checkout" data-plan="team" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Team</button></div>
       <div class="card" style="padding:14px"><b>Enterprise</b><p class="task-sub">Custom deployment and support. Not available as a self-service launch plan.</p></div></div>` : '';
   const downgradeDisabled = ownerDisabled || (state.activeUsers > 1
     ? 'disabled title="Remove additional active users first"' : '');
@@ -18099,11 +18135,18 @@ async function hydrateOrganizationSubscription(organizationId) {
     <select id="billing-gift-plan" aria-label="Gift subscription">${Object.values(catalog).filter(plan => plan.id !== 'free').map(plan => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select>
     <button class="btn sm billing-gift" title="Complimentary access until removed. Existing paid billing continues.">${state.gift ? 'Update gift' : 'Gift'}</button>
     ${state.gift ? '<button class="btn sm billing-gift-remove">Remove gift</button>' : ''}</div>` : '';
+  const pack = state.storagePack || {};
+  const packs = Number(state.storagePacks || 0);
+  const packBusy = ownerDisabled || (state.pendingRequest ? 'disabled title="Wait for the pending billing request"' : '');
+  const storagePacks = hasSubscription && pack.available && ['active', 'trialing', 'past_due'].includes(state.status)
+    ? `<div class="member-row"><span>Storage packs ${policyTip(`Each pack adds ${formatBytes(pack.bytes)} of storage for ${price(pack.monthlyPriceCents)}/month, prorated on your next bill. Packs end with the subscription.`)}</span>
+      <span class="team-actions"><button class="btn sm billing-packs" data-packs="${packs - 1}" aria-label="Remove a storage pack" ${packs > 0 ? packBusy : 'disabled'}>−</button><b>${packs}</b><button class="btn sm billing-packs" data-packs="${packs + 1}" aria-label="Add a storage pack" ${state.status === 'past_due' ? 'disabled title="Update the payment method first"' : packBusy}>+</button>
+      <span class="task-sub">${packs ? `${esc(price(packs * pack.monthlyPriceCents))}/month` : `${esc(price(pack.monthlyPriceCents))}/month each`}</span></span></div>` : '';
   const giftNotice = state.gift && hasSubscription ? `<div class="member-row"><span><b>${esc(names[state.gift.plan])}</b> <span class="chip">Gifted · no expiry</span></span></div>` : '';
   const effective = hasSubscription && state.plan !== billedPlan ? ` · effective access: ${esc(names[state.plan] || state.plan)}` : '';
   box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[hasSubscription ? billedPlan : state.plan] || state.plan)} <span class="chip">${esc(state.gift && !hasSubscription ? 'Gifted · no expiry' : statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}${effective}</span></span>
     <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
-    ${giftNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
+    ${storagePacks}${giftNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
     ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel online at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
     ${state.pendingRequest ? `<p class="task-sub">A billing request is pending confirmation. Wait a minute, then check its result before retrying. <button class="btn sm billing-reconcile" ${ownerDisabled}>Check pending billing request</button></p>` : ''}
     ${state.pendingCheckout && !hasSubscription ? `<p class="task-sub">An unpaid checkout is open. <button class="btn sm billing-cancel-checkout" ${ownerDisabled}>Cancel pending checkout</button></p>` : ''}
@@ -18156,6 +18199,15 @@ async function hydrateOrganizationSubscription(organizationId) {
     }); toast('Plan change submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
     catch (error) { toast(error.message, true); }
   });
+  box.querySelectorAll('.billing-packs').forEach((button) => button.addEventListener('click', async () => {
+    const next = Number(button.dataset.packs);
+    if (!confirm(next > packs ? `Add a ${formatBytes(pack.bytes)} storage pack for ${price(pack.monthlyPriceCents)}/month?` : 'Remove a storage pack?')) return;
+    button.disabled = true;
+    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/storage-packs`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ packs: next }),
+    }); toast('Storage change submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    catch (error) { button.disabled = false; toast(error.message, true); }
+  }));
   box.querySelector('.billing-cancel')?.addEventListener('click', async () => {
     if (!confirm('Cancel this subscription at the end of its current billing period?')) return;
     try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {
@@ -18642,10 +18694,11 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await refresh('compute'); } catch (e) { toast(e.message, true); } }));
     },
     async storage() {
-      const storageLocations = await read('storage').catch(() => []);
+      const [storageLocations, contents] = await Promise.all([read('storage').catch(() => []), read('storage-contents').catch(() => null)]);
       if (!live('storage')) return;
       $('#org-storage').innerHTML = `
-        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress${pct >= 100 ? ' over' : ''}"><i style="width:${pct}%"></i></div>` : ''}${location.kind === 'managed' ? storageOverQuotaMarkup(contents) : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+        ${storageContentsMarkup(contents)}
         <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
           <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
           <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-tavya"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
@@ -18663,6 +18716,20 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
           toast('Customer storage connected'); await refresh('storage');
         } catch (error) { toast(error.message, true); }
       });
+      $('#org-storage')?.querySelectorAll('[data-older-versions]').forEach((button) => button.addEventListener('click', async () => {
+        if (!confirm('Delete the older versions of this data? The current version is kept.')) return;
+        try {
+          const result = await api(`/api/organizations/${organizationId}/storage-contents/resources/${encodeURIComponent(button.dataset.olderVersions)}/older-versions`, { method: 'DELETE' });
+          toast(`Deleted ${result.deleted} older version${result.deleted === 1 ? '' : 's'}`); reads.delete('storage'); reads.delete('storage-contents'); await refresh('storage');
+        } catch (error) { toast(error.message, true); }
+      }));
+      $('#org-storage')?.querySelectorAll('[data-finished-workspaces]').forEach((button) => button.addEventListener('click', async () => {
+        if (!confirm('Delete the saved workspaces of finished tasks in this project? Their committed work stays on their branches.')) return;
+        try {
+          await api(`/api/organizations/${organizationId}/storage-contents/projects/${encodeURIComponent(button.dataset.finishedWorkspaces)}/finished-workspaces`, { method: 'DELETE' });
+          toast('Deleted'); reads.delete('storage'); reads.delete('storage-contents'); await refresh('storage');
+        } catch (error) { toast(error.message, true); }
+      }));
       $('#org-storage')?.querySelectorAll('[data-storage]').forEach((row) => {
         const id = encodeURIComponent(row.dataset.storage);
         row.querySelector('.storage-test')?.addEventListener('click', async () => { try {
@@ -19643,7 +19710,8 @@ function renderPricing() {
     const priceLine = plan.id === 'free' ? price : `${price}<small> / month</small>`;
     return `<article class="price-card" data-plan="${esc(plan.id)}"><div class="price-name">${esc(plan.name)}</div>
       <div class="price-value">${priceLine}</div><p>${esc(users)}</p><ul><li>Unlimited projects</li>
-      <li>${esc(plan.maxActiveAgentRuns)} concurrent agent run${plan.maxActiveAgentRuns === 1 ? '' : 's'}${plan.id === 'team' ? ` shared across the organization + ${esc(plan.additionalActiveUserAgentRuns)} per additional active user` : ''}</li></ul>
+      <li>${esc(plan.maxActiveAgentRuns)} concurrent agent run${plan.maxActiveAgentRuns === 1 ? '' : 's'}${plan.id === 'team' ? ` shared across the organization + ${esc(plan.additionalActiveUserAgentRuns)} per additional active user` : ''}</li>
+      <li>${esc(formatBytes(plan.storageBytes))} storage${plan.id === 'team' ? ` + ${esc(formatBytes(plan.additionalActiveUserStorageBytes))} per additional active user` : ''}</li></ul>
       ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
   }).join('');
   $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/login">Sign in</a></header>

@@ -232,6 +232,14 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(detectConversationImport(data)).toBe('codex');
     expect(data.toString('utf8')).toContain('It is still portable.');
     expect(JSON.parse(data.toString('utf8').split('\n')[0]!).payload.id).toBe(sessions.do.exportId);
+    // The frozen export is recorded so the lifecycle sweep can expire it.
+    expect((await h.store.conversationExport(`conversation-exports/${task.id}/do/${sessions.do.exportId}.json`)))
+      .toMatchObject({ taskId: task.id, role: 'do', exportId: sessions.do.exportId });
+    // An expired (or unknown) export is gone, not a server failure.
+    const expired = await fetch(`${base}/api/tasks/${task.id}/conversation.jsonl?role=do&exportId=99999999-9999-4999-8999-999999999999`,
+      { headers: auth() });
+    expect(expired.status).toBe(410);
+    expect((await expired.json() as any).error).toContain('expired');
   });
 
   it('uploads ordinary prompt files with project scope and durable task references', async () => {

@@ -151,6 +151,70 @@ describe('agent project-secret delivery', () => {
  * are archived in the event log and task view. Values karmax itself delivered
  * to the turn are scrubbed wherever they would be archived.
  */
+describe('work-environment screening', () => {
+  it('runs the turn without entries a command cannot receive, and says which were left out', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-agent-env-screen-'));
+    const previous = { home: process.env.KARMAX_HOME, floor: process.env.KARMAX_AGENT_MIN_FREE_MB, load: process.env.KARMAX_AGENT_MAX_LOAD_FACTOR };
+    process.env.KARMAX_HOME = dir;
+    process.env.KARMAX_AGENT_MIN_FREE_MB = '0';
+    process.env.KARMAX_AGENT_MAX_LOAD_FACTOR = '0';
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Screen'));
+    const task = (await store.createTask({ projectId: project.id, title: 'Work', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } }));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const worlds = new WorldRegistry();
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    for (const [id, name, variable, value] of [['resource_good', 'Good token', 'GOOD_TOKEN', 'good-value'],
+      ['resource_binary', 'Binary secret', 'BINARY_TOKEN', 'bin\u0000ary-value']] as const) {
+      (await broker.registerHandle(resourceSecretHandle(id), value));
+      (await store.createResourceAttachment({ id, organizationId: project.organizationId!, projectId: project.id,
+        name, driver: 'secret@1', target: { kind: 'environment', name: variable },
+        access: 'read', isolation: 'fork', source: {}, credentialHandles: [resourceSecretHandle(id)], publish: 'discard' }));
+    }
+    let received: TurnInput | undefined;
+    let shell = '';
+    const adapter = { provider: 'mock' as const, async runTurn(input: TurnInput) {
+      received = input;
+      // Project variables reach every world command; one bad value must not break them.
+      shell = (await input.world.exec('sh', ['-c', 'printf %s "$GOOD_TOKEN"'])).stdout;
+      return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: 'done' };
+    } };
+    const core = makeCoreActivities({ store, worlds, resources, broker,
+      adapters: new Map([['mock', adapter]]), profiles: new ProfileResolver(store, 'mock') });
+    const handle = await core.createWorld({ taskId: task.id, projectId: project.id, kind: 'memory', base: 'main' });
+    const vault = vi.spyOn(VaultItems.prototype, 'envFor').mockImplementation(async (_task, _caps, _keys, skipped) => {
+      skipped?.push({ source: 'vault item "dataset"', reason: 'its env var name is not a valid variable name' });
+      // A source that forgets to screen is caught at assembly.
+      return { VAULT_KEY: 'vault-value', 'ssh-ed25519 AAAA pasted': 'leaked-name-value' };
+    });
+    try {
+      await core.runAgentTurn({ taskId: task.id, role: 'do', worldHandle: handle,
+        messages: [{ id: 'm1', role: 'user', text: 'work', ts: 0 }],
+        task: { projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'software-dev' } as any });
+      expect(received?.secretEnv).toEqual({ GOOD_TOKEN: 'good-value', VAULT_KEY: 'vault-value' });
+      expect(shell).toBe('good-value');
+      for (const source of ['vault item "dataset"', 'project secret "Binary secret"', 'a credential'])
+        expect(received?.systemPrompt).toContain(source);
+      const notice = (await store.eventsSince(task.id, 0)).find((event) =>
+        event.type === 'agent.activity' && (event.payload as any).id === 'work-environment');
+      expect(notice?.payload).toMatchObject({ kind: 'status', phase: 'failed', title: '3 credentials not given to the agent' });
+      const archived = JSON.stringify([received?.systemPrompt, (await store.eventsSince(task.id, 0)).map((event) => event.payload)]);
+      for (const value of ['bin', 'ary-value', 'leaked-name-value', 'AAAA']) expect(archived).not.toContain(value);
+    } finally {
+      vault.mockRestore();
+      await core.destroyWorld(handle);
+      await resources.deleteProject(project.id);
+      (await store.close());
+      fs.rmSync(dir, { recursive: true, force: true });
+      restoreEnv('KARMAX_HOME', previous.home);
+      restoreEnv('KARMAX_AGENT_MIN_FREE_MB', previous.floor);
+      restoreEnv('KARMAX_AGENT_MAX_LOAD_FACTOR', previous.load);
+    }
+  });
+});
+
 describe('agent output archiving', () => {
   it('scrubs the turn’s own secrets from output, activity and the final answer', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-agent-scrub-'));

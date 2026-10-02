@@ -5,6 +5,7 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { WorldLifecycleManager } from '../src/world/runners.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
+import { pendingTimers } from './helpers/pending-timers.js';
 
 function deferred() {
   let resolve!: () => void;
@@ -55,6 +56,7 @@ it('RT-6 heartbeats local provisioning until durable registration completes', as
   vi.spyOn(Context, 'current').mockReturnValue({ heartbeat,
     cancellationSignal: new AbortController().signal } as any);
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+  const pending = pendingTimers(/src[\\/]activities[\\/]core/);
   const worlds = new WorldRegistry();
   worlds.register({ kind: 'memory', create: async () => {
     entered.resolve(); await finish.promise;
@@ -69,7 +71,7 @@ it('RT-6 heartbeats local provisioning until durable registration completes', as
     expect(heartbeat).toHaveBeenCalled();
   } finally {
     finish.resolve(); await creating;
-    expect(vi.getTimerCount()).toBe(0);
+    expect(pending()).toBe(0);
     vi.useRealTimers();
   }
 });

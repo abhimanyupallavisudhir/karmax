@@ -8,8 +8,8 @@
 import { HOSTED_PLANS } from '../domain/entitlements.js';
 import { DEFAULT_SITE_NAME } from '../domain/brand.js';
 
-export const POLICY_VERSION = '2026-09-24.1';
-export const POLICY_EFFECTIVE_DATE = 'September 24, 2026';
+export const POLICY_VERSION = '2026-10-02.1';
+export const POLICY_EFFECTIVE_DATE = 'October 2, 2026';
 export const POLICY_DRAFT_NOTICE = 'Launch draft pending final operator approval — not legal advice or a statement of completed legal review.';
 
 export type PolicySlug = 'terms' | 'acceptable-use' | 'privacy' | 'billing' | 'subprocessors' | 'security' | 'data' | 'dpa';
@@ -134,7 +134,8 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'Stripe — legacy subscription billing where configured, and the separate agent-card integration when selected; receives the account and payment information required for those functions, not repository/workspace content for subscription billing.',
         'OpenAI and Anthropic — prompts, selected repository/workspace context, attachments, and outputs when their model or connected subscription is selected. BYOK uses the customer’s provider account; managed usage uses the operator’s account.',
         'E2B or Daytona — isolated compute, repository checkout, workspace files, environment variables made available to the world, command traffic, and resulting artifacts when that cloud world provider is selected.',
-        'one.com — VPS hosting and server backups where used by the operator. This can include application databases, encrypted vault material and local objects. A core-hosting location is not a location guarantee for model calls, sandboxes or integrations.',
+        'one.com — VPS hosting and server backups where used by the operator. This can include application databases and encrypted vault material, plus, until it is removed in November 2026, the copy of stored objects made before they moved to Cloudflare R2. A core-hosting location is not a location guarantee for model calls, sandboxes or integrations.',
+        'Cloudflare (R2) — managed object storage in R2’s EU jurisdiction, which keeps stored objects in EU data centres: world checkpoints and project resource data (encrypted by tavya before upload), review attachments and conversation exports. Deleted objects are kept up to 30 days so backups stay restorable. Data an organization places in a storage bucket it connects itself goes to that bucket instead.',
         'Resend — transactional account, verification, security and support-notification email where configured; receives recipient addresses and message contents, not unrestricted repository access.',
         'Composio — managed connection brokerage where configured; may handle connection credentials and tool requests/results. A broker engaged by the operator is distinct from the customer-selected destination service.',
         'Configured database, object-storage, hosting, email, monitoring, and support providers — account records, service metadata, stored objects, transactional messages, diagnostics, or support content as needed for their function.',
@@ -164,6 +165,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
       { heading: 'Retention', paragraphs: [
         'Active account, project, task, audit, workspace, and billing records are retained while needed to provide and secure the service. Execution worlds may be short-lived or hibernated by their provider; adopted project resources and repository history follow their configured storage and Git retention.',
         'Retention decisions depend on whether an account or project is active, whether records are needed to complete an authorized task or resolve a dispute, statutory accounting requirements, security investigations and legal holds. Information must not be retained merely because storage is available. The operator must document the applicable periods and review retained exceptions.',
+        'Managed storage has a limit set by the organization’s plan and any storage packs. While an organization is over its limit, for example after a subscription ends or lapses, it can view, download and delete stored data but cannot add more; saving the work in progress of its tasks continues. Its owners are notified when it goes over and 30 and 7 days before deletion. If it is still over the limit 12 months after going over, stored data is deleted, finished tasks’ saved workspaces and older versions first, until it fits. Saved workspaces of done or cancelled tasks are deleted 30 days after the task ends; their committed work remains on their branches.',
         'Account deletion is an operator-reviewed process, not an automatic purge triggered by subscription cancellation. Backup copies and data held by connected services require separate handling. An offboarding response must identify retained categories, their reason and applicable period or expiry criteria rather than promise immediate deletion everywhere. Retention exceptions must be reviewed and ended when their purpose no longer applies.',
         'Provider backup retention and local application-backup retention are separate. Deleting active data does not instantly erase historical backups. Retained copies must be restricted from ordinary use, expire under the applicable backup cycle, and have completed deletion requests reapplied before restored data is returned to service. Backups do not preserve all external services or live sandbox state.',
       ] },

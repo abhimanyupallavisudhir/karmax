@@ -1,3 +1,4 @@
+import { clientAddress, ClientRequestLimits } from './client-address.js';
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
 import type { PasskeyCredential } from '../autonomy/passkey.js';
 import { ExecutionOutput } from './execution-output.js';
@@ -70,7 +71,7 @@ import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
-import { createCodexConversationExport, readCodexConversationExport } from '../store/conversation-exports.js';
+import { ConversationExportExpired, createCodexConversationExport, readCodexConversationExport } from '../store/conversation-exports.js';
 import type { AccessMode, AccessStatus, VaultFieldName, VaultItem } from '../autonomy/vault-items.js';
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { newId } from '../util/id.js';
@@ -122,6 +123,7 @@ export interface GatewayDeps {
   agentInfo: { provider: Provider; reason: string };
   broker?: import('../autonomy/broker.js').CredentialBroker;
   email?: import('../autonomy/email.js').EmailService;
+  managedStorage?: import('../world/managed-storage.js').ManagedStorageService;
   payments?: import('../autonomy/payments.js').PaymentProvider;
   paymentRegistry?: import('../autonomy/payments.js').PaymentRegistry;
   login?: import('../autonomy/login.js').LoginManager;
@@ -200,7 +202,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/gift$/.test(p)) return 'subscription:gift';
-  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|reconcile)$/.test(p))
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|storage-packs|reconcile)$/.test(p))
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
@@ -219,6 +221,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // let a deliberately project-ceilinged agent read every sibling project. This
   // is an administrative operation, not a read.
   if (/^\/api\/organizations\/[^/]+\/export$/.test(p)) return 'organization:edit';
+  // The storage contents name every project's data across the organization,
+  // so even reading them is above the project-grant ceiling (like export).
+  if (/^\/api\/organizations\/[^/]+\/storage-contents(?:\/|$)/.test(p)) return 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/(?:accounts|git-profiles|credentials)(?:\/|$)/.test(p))
     return read ? 'credential:read' : 'credential:write';
   if (/^\/api\/organizations\/[^/]+\/workflows(?:\/|$)/.test(p))
@@ -609,6 +614,7 @@ export class Gateway {
   private requestGuards = new WeakMap<http.IncomingMessage, () => Promise<void>>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number }>();
+  private requestLimits = new ClientRequestLimits();
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
    *  directly, so without this a password could be guessed online. */
@@ -1024,9 +1030,7 @@ export class Gateway {
   }
 
   private clientAddress(req: http.IncomingMessage): string {
-    // Only a hosted cell sits behind a proxy whose forwarded header is trustworthy.
-    const forwarded = this.deps.hosted ? String(req.headers['x-forwarded-for'] ?? '').split(',')[0]!.trim() : '';
-    return forwarded || req.socket.remoteAddress || 'unknown';
+    return clientAddress(req);
   }
   private loginBlocked(keys: string[]): boolean {
     const now = Date.now();
@@ -1599,6 +1603,8 @@ export class Gateway {
         { 'cache-control': 'no-store', 'content-length': '0' });
       return void res.end();
     }
+    if (this.deps.hosted && !p.startsWith('/api/health/') && !this.requestLimits.allow(this.clientAddress(req), p))
+      return this.json(res, 429, { error: 'too many requests; try again later' });
     if (p.startsWith('/share/conversations/')) {
       const share = req.method === 'GET' ? (await publicShare(this.deps.store, p.slice('/share/conversations/'.length))) : undefined;
       const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));
@@ -2591,13 +2597,13 @@ export class Gateway {
           gift: await this.deps.subscriptions?.currentGift(organizationId) ?? null,
           activeUsers,
           currentMonthlyPriceCents: entitlements.plan
-            ? hostedMonthlyPriceCents(entitlements.plan, activeUsers)
+            ? hostedMonthlyPriceCents(entitlements.plan, activeUsers, entitlements.storagePacks)
             : null,
           activeAgentRuns,
           queuedAgentRuns,
         });
       }
-      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|reconcile|gift)$/);
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|storage-packs|reconcile|gift)$/);
       if (subscription) {
         const organizationId = subscription[1]!;
         const action = subscription[2]!;
@@ -2665,12 +2671,34 @@ export class Gateway {
               String(body.plan ?? ''), idempotencyKey));
           }
           if (action === 'cancel') return this.json(res, 202, await billing.cancel(organizationId, idempotencyKey));
+          if (action === 'storage-packs')
+            return this.json(res, 202, await billing.storagePacks(organizationId, (await this.body(req)).packs, idempotencyKey));
           if (action === 'reconcile') return this.json(res, 200, await billing.reconcilePending(organizationId));
           await billing.syncSeats(organizationId);
           return this.json(res, 202, { syncing: true });
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      // What managed storage holds and the over-quota state (GET), and the
+      // clean-up actions; all need organization:edit (routeCapability).
+      const storageContents = p.match(/^\/api\/organizations\/([^/]+)\/storage-contents(?:\/(resources|projects)\/([^/]+)\/(older-versions|finished-workspaces))?$/);
+      if (storageContents) {
+        const organizationId = storageContents[1]!;
+        const managed = this.deps.managedStorage;
+        if (!(await store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+        if (!managed) return this.json(res, 503, { error: 'managed storage is unavailable' });
+        try {
+          if (method === 'GET' && !storageContents[2]) return this.json(res, 200, (await managed.contents(organizationId)));
+          if (method === 'DELETE' && storageContents[2] === 'resources' && storageContents[4] === 'older-versions') {
+            const attachment = (await store.getResourceAttachment(storageContents[3]!));
+            if (!attachment || attachment.organizationId !== organizationId) return this.json(res, 404, { error: 'data resource not found' });
+            return this.json(res, 200, (await managed.deleteOlderVersions(attachment.id)));
+          }
+          if (method === 'DELETE' && storageContents[2] === 'projects' && storageContents[4] === 'finished-workspaces')
+            return this.json(res, 200, (await managed.deleteFinishedWorkspaces(organizationId, storageContents[3]!)));
+          return this.json(res, 405, { error: 'method not allowed' });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationStorage = p.match(/^\/api\/organizations\/([^/]+)\/storage(?:\/([^/]+))?(?:\/(test|default))?$/);
       if (organizationStorage) {
@@ -5703,7 +5731,7 @@ export class Gateway {
           const boundId = url.searchParams.get('exportId');
           let data: Buffer, filename: string, source: string, warnings: PanagentWarning[] = [];
           if (boundId) {
-            const exported = await readCodexConversationExport(objects, taskId, requestedRole, boundId);
+            const exported = await readCodexConversationExport(objects, taskId, requestedRole, boundId, store);
             ({ data, filename, source, warnings } = exported);
           } else {
             const stored = (await storedConversationSession(store, taskId, task.intentId, requestedRole,
@@ -5716,7 +5744,7 @@ export class Gateway {
               provider, sessionId, title: `${task.title} · ${requestedRole}`, cwd: view?.worldPath });
             if (provider === 'codex') {
               const exported = await createCodexConversationExport(objects, taskId, requestedRole, sessionId,
-                stored.home && stored.id ? { home: stored.home } : { generated: await generate() },
+                stored.home && stored.id ? { home: stored.home } : { generated: await generate() }, store,
                 (await (await this.taskSecrets(taskId)).refresh()));
               ({ data, filename, source, warnings } = exported);
             } else {
@@ -5742,6 +5770,7 @@ export class Gateway {
           });
           return void res.end(data);
         } catch (error) {
+          if (error instanceof ConversationExportExpired) return this.json(res, 410, { error: error.message });
           return this.json(res, 409, { error: `conversation export failed: ${error instanceof Error ? error.message : String(error)}` });
         }
       }
@@ -5920,7 +5949,7 @@ export class Gateway {
                 id, role, sessionId, stored.home && stored.id ? { home: stored.home } : {
                   generated: await exportConversationWithPanagent({ messages: transcript, provider: 'codex',
                     sessionId, title: `${t?.title} · ${role}`, cwd: view?.worldPath }),
-                }, (await (await this.taskSecrets(id)).refresh()));
+                }, store, (await (await this.taskSecrets(id)).refresh()));
               exportId = exported.exportId;
               exportMetadata = { filename: exported.filename, requiredCodexVersion: exported.requiredCodexVersion,
                 downloadUrl: `/api/tasks/${encodeURIComponent(id)}/conversation.jsonl?role=${encodeURIComponent(role)}&exportId=${exportId}` };

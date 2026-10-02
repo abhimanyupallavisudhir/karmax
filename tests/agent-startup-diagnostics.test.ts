@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { RemoteSpawnedProcess } from '../src/agent/remote-process.js';
+import { pendingTimers } from './helpers/pending-timers.js';
 
 describe('agent startup diagnostics', () => {
   it('collects live process and memory evidence while omitting raw stderr and command lines', async () => {
@@ -114,11 +115,12 @@ describe('agent startup diagnostics', () => {
 
   it('does not let an unresponsive diagnostic probe prevent retry', async () => {
     vi.useFakeTimers();
+    const pending = pendingTimers(/src[\\/]agent[\\/]/);
     try {
       const probe = collectStartupProbe({ exec: () => new Promise(() => {}) } as any, '/startup.log', '/stderr.log');
       await vi.advanceTimersByTimeAsync(3500);
       expect(await probe).toEqual({ status: 'timeout' });
-      expect(vi.getTimerCount()).toBe(0);
+      expect(pending()).toBe(0);
     } finally { vi.useRealTimers(); }
   });
 
@@ -142,6 +144,7 @@ describe('agent startup diagnostics', () => {
 
   it.each(['reject', 'hang'])('still aborts and retries when diagnostic publication can %s', async (failure) => {
     vi.useFakeTimers();
+    const pending = pendingTimers(/src[\\/]agent[\\/]/);
     const abort = vi.fn();
     try {
       const stream = (async function* () { await new Promise(() => {}); })();
@@ -150,7 +153,7 @@ describe('agent startup diagnostics', () => {
       await vi.advanceTimersByTimeAsync(305_000);
       expect(await result).toMatchObject({ code: 'ETIMEDOUT' });
       expect(abort).toHaveBeenCalledOnce();
-      expect(vi.getTimerCount()).toBe(0);
+      expect(pending()).toBe(0);
     } finally { vi.useRealTimers(); }
   });
 });

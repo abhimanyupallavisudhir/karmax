@@ -143,6 +143,12 @@ ensure_secrets() (
   for secret in auth_secret vault_key world_ref_key; do
     write_secret "$secret" || exit 1
   done
+  # The S3 object store's keys are the operator's to write (see
+  # KARMAX_OBJECT_STORE in .turnkey.env); empty means not configured.
+  for secret in s3_access_key_id s3_secret_access_key; do
+    { [ -e "$SECRETS_DIR/$secret" ] || (umask 022 && : > "$SECRETS_DIR/$secret"); } \
+      && secret_mode "$SECRETS_DIR/$secret" || exit 1
+  done
 )
 
 configure() {
@@ -232,6 +238,33 @@ wait_ready() {
   done
 }
 
+# Caddy is the only way in, so "ready" means a request crosses it: the host's
+# own HTTPS to this domain, answered by the app's readiness route. -k because
+# the question is whether the edge reaches the app, not whether the certificate
+# is publicly trusted; --resolve keeps DNS out of it.
+edge_answers() {
+  domain=$(env_value KARMAX_DOMAIN)
+  [ -n "$domain" ] && command -v curl >/dev/null 2>&1 || return 1
+  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$domain:443:127.0.0.1" \
+    "https://$domain/api/health/ready" 2>/dev/null) || code=000
+  [ "$code" = 200 ]
+}
+
+wait_edge() {
+  note 'Waiting for the public edge (Caddy) to reach the control plane…'
+  attempt=0
+  until edge_answers; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 30 ]; then
+      dc ps caddy || true
+      dc logs --tail=50 caddy >&2 || true
+      echo "karmax: https://$(env_value KARMAX_DOMAIN) no longer answers through Caddy; its logs are above" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 print_finish() {
   domain=$(env_value KARMAX_DOMAIN)
   preview=$(env_value KARMAX_PREVIEW_DOMAIN)
@@ -295,12 +328,25 @@ cmd_doctor() {
   fi
   dc ps
   report_app_role
+  # Names the store; an S3 one must accept a write, read-back and delete.
+  objects_ok=1
+  dc exec -T app npm run --silent object-store-check < /dev/null || objects_ok=''
   domain=$(env_value KARMAX_DOMAIN)
   if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 "https://$domain/api/health/ready" >/dev/null 2>&1; then
     note "Public HTTPS health check passed for $domain."
   else
     note "Public HTTPS is not reachable yet. Check DNS for $domain and ports 80/443."
   fi
+  [ -n "$objects_ok" ] || die 'object store check failed; see its output above'
+}
+
+# Copy the local object store to the S3 store configured in .turnkey.env, from
+# a one-off container of the installed release, while the app keeps serving.
+# Never deletes anything. Wiki ops/object-store has the cutover procedure.
+cmd_migrate_objects() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  dc run --rm --no-deps -T app npm run --silent migrate-objects -- "$@"
 }
 
 cmd_backup() {
@@ -707,13 +753,22 @@ cmd_update() {
     die "deployment $target could not boot on this vault (see the vault preflight above); production remains at $previous. Fix what it reported first"
   fi
 
+  # An update must not break an edge that worked before it (a release can move
+  # Caddy's ports or how it reaches the app). One that could not answer yet (no
+  # certificate or DNS) does not gate the release.
+  edge_before=0
+  if edge_answers; then edge_before=1; fi
+  app_ready=0
   if dc up -d --remove-orphans && wait_ready; then
-    cleanup_migration
-    migration_backup=''
-    report_app_role || true
-    reclaim_space
-    note "Update complete at $target."
-    return 0
+    app_ready=1
+    if [ "$edge_before" = 0 ] || wait_edge; then
+      cleanup_migration
+      migration_backup=''
+      report_app_role || true
+      reclaim_space
+      note "Update complete at $target."
+      return 0
+    fi
   fi
 
   # Candidate startup can change durable data and advance Temporal histories.
@@ -721,6 +776,9 @@ cmd_update() {
   # data. Preserve the candidate/data and stop serving instead; recovery must
   # repair forward or explicitly restore a coordinated pre-update backup.
   if [ "$previous_epoch" != "$target_epoch" ]; then
+    # A healthy app behind a broken edge keeps working its tasks; stopping it
+    # would only add to the outage.
+    [ "$app_ready" = 0 ] || die "deployment $target runs across data epochs $previous_epoch -> $target_epoch, but https://$(env_value KARMAX_DOMAIN) no longer answers through Caddy; code-only rollback refused, app left running. Repair the edge forward (./deploy/karmax logs caddy)"
     dc stop app || die "deployment $target failed across data epochs; could not stop the app; manual recovery required"
     die "deployment $target failed across data epochs $previous_epoch -> $target_epoch; app stopped, data retained, code-only rollback refused. Repair forward or restore the pre-update backup at $destination with its matching code and Temporal history"
   fi
@@ -730,7 +788,7 @@ cmd_update() {
   note "Deployment $target failed; rolling back to $previous…"
   git -C "$ROOT_DIR" checkout --detach "$previous"
   restore_migration
-  if dc build app && dc up -d --remove-orphans && wait_ready; then
+  if dc build app && dc up -d --remove-orphans && wait_ready && { [ "$edge_before" = 0 ] || wait_edge; }; then
     cleanup_migration
     migration_backup=''
     die "deployment $target failed; production was restored to $previous"
@@ -828,6 +886,8 @@ Usage: ./deploy/karmax COMMAND
                                Backup, check the vault, deploy an exact master revision, and restart
   rotate-postgres-password      Replace PostgreSQL's superuser password
   rotate-vault-key              Replace the vault's key encryption key (resumable)
+  migrate-objects [--verify-only] [--concurrency N]
+                               Copy local objects to the configured S3 store
   down                          Stop everything without deleting durable data
 EOF
 }
@@ -845,6 +905,7 @@ case "$command" in
   update) cmd_update "$@" ;;
   rotate-postgres-password) cmd_rotate_postgres_password "$@" ;;
   rotate-vault-key) cmd_rotate_vault_key "$@" ;;
+  migrate-objects) cmd_migrate_objects "$@" ;;
   down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;
   help|-h|--help) usage ;;
   *) usage >&2; die "unknown command: $command" ;;

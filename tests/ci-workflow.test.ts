@@ -69,7 +69,10 @@ describe('deploy artifacts', () => {
   it('installs the turnkey stack with the operator command and routes the edge to it', () => {
     expect(runs).toContain('./deploy/karmax up karmax.localhost preview.karmax.localhost');
     expect(runs).toContain("[ \"$redirect\" = '308 https://karmax.localhost/api/health/ready' ]");
-    expect(runs).toContain('docker compose exec -T caddy wget -qO- http://app:4505/api/health/ready');
+    // Caddy runs on the host network (CI-8): it reaches the app where its
+    // reverse_proxy does, on the host loopback port, not by Compose DNS.
+    expect(runs).toContain('docker compose exec -T caddy wget -qO- http://127.0.0.1:4505/api/health/ready');
+    expect(runs).not.toContain('app:4505');
   });
 
   it('proves the booted app uses its own database role and never sees the superuser password (CI-7)', () => {

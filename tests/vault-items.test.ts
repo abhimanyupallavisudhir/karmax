@@ -419,6 +419,65 @@ describe('spawn-time materialization (§5A)', () => {
     expect(Object.keys((await items.envFor('t2', [])))).toHaveLength(0);
   });
 
+  it('refuses an env var that is not a variable name, since every turn exports it', async () => {
+    const { items } = makeService();
+    const publicKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEM0BwPOhpo alice@example.com';
+    await expect(items.save({ type: 'ssh-key', label: 'dataset', envVar: publicKey, secrets: { privateKey: 'PRIVATE' } }))
+      .rejects.toThrow(/env var name/i);
+    await expect(items.save({ type: 'api-key', label: 'modal', envVar: 'MODAL-TOKEN', secrets: { secret: 's' } }))
+      .rejects.toThrow(/env var name/i);
+    expect(await items.list()).toHaveLength(0);
+    // Surrounding whitespace is still trimmed, and clearing it stays possible.
+    const saved = (await items.save({ type: 'api-key', label: 'modal', envVar: ' MODAL_TOKEN ', secrets: { secret: 's' } }));
+    expect(saved.envVar).toBe('MODAL_TOKEN');
+    expect((await items.save({ id: saved.id, type: 'api-key', envVar: '' })).envVar).toBeUndefined();
+  });
+
+  it('skips a stored item with an invalid env var name instead of failing every turn', async () => {
+    // radnyee#2: a public key pasted into an ssh-key's env var field was exported
+    // as a variable name, and every turn of every granted task died before the
+    // agent started ("Invalid project environment variable").
+    const { items, store } = makeService('org_legacy');
+    const good = (await items.save({ type: 'api-key', label: 'openai', envVar: 'OPENAI_API_KEY', secrets: { secret: 'sk-123' } }));
+    const bad = (await items.save({ type: 'ssh-key', label: 'dataset', envVar: 'DATASET_KEY', secrets: { privateKey: 'PRIVATE' } }));
+    const legacy = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEM0BwPOhpo alice@example.com';
+    const index = JSON.parse((await store.kvGet('vault:items:org_legacy'))!);
+    (await store.kvSet('vault:items:org_legacy', JSON.stringify(index.map((item: any) => item.id === bad.id ? { ...item, envVar: legacy } : item))));
+
+    const turn = turnKeyDirectory();
+    const skipped: Array<{ source: string; reason: string }> = [];
+    const env = (await items.envFor('t1', ['use-credential:*'], turn, skipped));
+    expect(env).toEqual({ OPENAI_API_KEY: 'sk-123' });
+    expect(fs.readdirSync(turn)).toHaveLength(0);
+    // Reported by label; the stored "name" may itself be pasted key material.
+    expect(skipped).toEqual([{ source: 'vault item "dataset"', reason: expect.stringMatching(/env var name/) }]);
+    expect(JSON.stringify(skipped)).not.toContain('AAAA');
+    expect(store.audit.find((entry) => entry.action === 'vault.inject.failed')?.detail).toMatchObject({ itemId: bad.id });
+    await removeTurnKeys(turn);
+    // A policy edit that re-sends the stored name does not lock the item.
+    expect((await items.save({ id: bad.id, type: 'ssh-key', envVar: legacy, policy: { use: 'ask' } })).policy.use).toBe('ask');
+    expect(good.envVar).toBe('OPENAI_API_KEY');
+  });
+
+  it('delivers each usable entry and reports every one a command could not receive', async () => {
+    const { items, store } = makeService();
+    const caps = ['use-credential:*'];
+    (await items.save({ type: 'api-key', label: 'binary paste', envVar: 'PASTED_KEY', secrets: { secret: 'sk\u0000tail' } }));
+    (await items.save({ type: 'env', label: 'modal', secrets: { env: '# Modal\n\nMODAL_TOKEN_ID=ak-1\nMODAL-TOKEN-SECRET=as-2\nBROKEN=a\u0000b\n' } }));
+    const skipped: Array<{ source: string; reason: string }> = [];
+    expect(await items.envFor('t1', caps, undefined, skipped)).toEqual({ MODAL_TOKEN_ID: 'ak-1' });
+    expect(skipped).toEqual([
+      { source: 'vault item "binary paste"', reason: 'its value contains a NUL byte' },
+      { source: 'vault item "modal"', reason: 'line 4 is not NAME=value' },
+      { source: 'vault item "modal"', reason: 'BROKEN\'s value contains a NUL byte' },
+    ]);
+    // Reasons never carry values.
+    expect(JSON.stringify(skipped)).not.toMatch(/as-2|tail/);
+    expect(store.audit.filter((entry) => entry.action === 'vault.inject.failed')).toHaveLength(3);
+    // Without a collector the same entries are still dropped.
+    expect(await items.envFor('t1', caps)).toEqual({ MODAL_TOKEN_ID: 'ak-1' });
+  });
+
   it('a one-shot "once" approval never becomes standing env injection', async () => {
     const { items } = makeService();
     const item = (await items.save({ type: 'api-key', label: 'stripe', envVar: 'STRIPE_KEY', policy: { use: 'ask' }, secrets: { secret: 'sk-live' } }));

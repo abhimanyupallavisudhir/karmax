@@ -12,7 +12,6 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { CHECKPOINT_KEY_HANDLE, WorldCheckpointService } from '../src/world/checkpoint.js';
-import { CheckpointRefusedError } from '../src/world/checkpoint-chunks.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import type { World } from '../src/world/types.js';
@@ -154,24 +153,29 @@ describe('chunked world checkpoints', () => {
     expect(fs.readFileSync(path.join(root, 'notes/b.md'), 'utf8')).toBe('unchanged');
   });
 
-  it('refuses a checkpoint over the storage quota, keeps nothing, and names the largest files', async () => {
+  it('keeps a checkpoint over the storage quota, counts it, and names the largest files', async () => {
+    // Work in progress is never refused for quota (wiki features/managed-storage):
+    // a world that cannot checkpoint cannot park.
     const f = await fixture({ quotaBytes: 2 * MiB });
     f.write('dataset.bin', crypto.randomBytes(3 * MiB));
     f.write('small.txt', 'small');
-    const error = await f.service.checkpoint(f.world.handle).catch(caught => caught);
-    expect(error).toBeInstanceOf(CheckpointRefusedError);
-    expect(error.message).toMatch(/organization storage is full/);
-    expect(await chunkRows(f.store)).toEqual([]);
-    expect(f.chunkObjects()).toEqual([]);
-    expect(await f.store.latestWorldCheckpoint(f.task.id)).toBeUndefined();
+    const checkpoint = await f.service.checkpoint(f.world.handle);
+    expect((await f.store.latestWorldCheckpoint(f.task.id))?.id).toBe(checkpoint.id);
+    expect((await chunkRows(f.store)).length).toBeGreaterThan(0);
     const notice = await f.service.takeNotice(f.task.id);
-    expect(notice).toMatch(/^Your uncommitted work could not be checkpointed: organization storage is full/);
+    expect(notice).toMatch(/^Your organization's storage is over its quota/);
+    expect(notice).toContain('This checkpoint was kept');
     expect(notice).toContain('- dataset.bin (3.0 MiB)');
     expect(notice).toContain('.gitignore');
-    // A later successful checkpoint clears the notice.
+    // While the large checkpoint is still kept (the two newest are), the
+    // organization stays over its quota and the notice stays.
     fs.rmSync(path.join(f.world.handle.root, 'dataset.bin'));
+    await f.service.checkpoint(f.world.handle);
+    expect(await f.service.takeNotice(f.task.id)).toMatch(/over its quota/);
+    // Once it is pruned and its chunks freed, the notice clears.
     await f.store.kvSet(`checkpoint-notice:${f.task.id}`, 'stale');
     await f.service.checkpoint(f.world.handle);
+    expect(await f.store.getWorldCheckpoint(checkpoint.id)).toBeUndefined();
     expect(await f.service.takeNotice(f.task.id)).toBeUndefined();
   });
 

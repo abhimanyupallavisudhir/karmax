@@ -9,6 +9,8 @@ import { organizationScope } from './vault-keys.js';
 import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
 import { newId } from '../util/id.js';
+import { isEnvName } from '../util/shell.js';
+import { envEntryProblem, type SkippedEnv } from '../util/work-env.js';
 import { parseSavedSession, sessionDomainError } from './browser-session.js';
 import { paths } from '../config/paths.js';
 import { handleRef, recordSecretRefs } from './task-secrets.js';
@@ -419,6 +421,11 @@ export class VaultItems {
       if (!domains.length) throw new Error('a saved session needs the site\'s domain');
       for (const domain of domains) { const error = sessionDomainError(domain); if (error) throw new Error(error); }
     }
+    // Every granted turn exports it, so a bad name would fail them all. A stored
+    // legacy name may be re-sent unchanged (envFor skips it) so other edits work.
+    const envVar = args.envVar !== undefined ? args.envVar.trim() : prior?.envVar;
+    if (envVar && envVar !== prior?.envVar && !isEnvName(envVar))
+      throw new Error('The env var name may contain only letters, digits and _, and cannot start with a digit (e.g. DEPLOY_KEY)');
     const id = prior?.id ?? newId('vi');
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
@@ -444,7 +451,6 @@ export class VaultItems {
     const domains = args.domains !== undefined ? list(args.domains) : prior?.domains;
     const username = args.username !== undefined ? args.username.trim() : prior?.username;
     const tags = args.tags !== undefined ? list(args.tags) : prior?.tags;
-    const envVar = args.envVar !== undefined ? args.envVar.trim() : prior?.envVar;
     const item: VaultItem = {
       id,
       type: args.type,
@@ -721,28 +727,41 @@ export class VaultItems {
    * `keys` — the receiving world, or a host directory — for one turn, and
    * `removeTurnKeys` deletes them when it ends (AU-33).
    */
-  async envFor(taskId: string, caps: Capability[], keys?: World | string): Promise<Record<string, string>> {
+  async envFor(taskId: string, caps: Capability[], keys?: World | string, skipped?: SkippedEnv[]): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
     for (const item of (await this.list())) {
       if (!['env', 'api-key', 'ssh-key'].includes(item.type)) continue;
       if (item.provenance.taskId && item.provenance.taskId !== taskId
         && !caps.includes(`use-credential:item:${item.id}`)) continue;
       if ((await this.access(caps, taskId, item, 'use', { ambient: true })).status !== 'granted') continue;
+      // One unusable entry must not block every turn granted to it: it is left
+      // out, audited, and reported by the item's label (never its name or value).
+      const skip = async (reason: string) => {
+        skipped?.push({ source: `vault item "${item.label}"`, reason });
+        (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'vault.inject.failed', detail: { itemId: item.id, error: reason } }));
+      };
       try {
+        if (item.type !== 'env' && item.envVar && !isEnvName(item.envVar)) { await skip('its env var name is not a valid variable name'); continue; }
         if (item.type === 'env' && item.fields.includes('env')) {
-          for (const line of (await this.resolveField(item, 'env', { taskId, mode: 'use' })).split('\n')) {
+          const lines = (await this.resolveField(item, 'env', { taskId, mode: 'use' })).split('\n');
+          for (const [index, line] of lines.entries()) {
+            if (!line.trim() || line.trim().startsWith('#')) continue;
             const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-            if (!m || line.trim().startsWith('#')) continue;
-            env[m[1]!] = m[2]!.replace(/^(["'])(.*)\1$/, '$2');
+            if (!m) { await skip(`line ${index + 1} is not NAME=value`); continue; }
+            const value = m[2]!.replace(/^(["'])(.*)\1$/, '$2');
+            if (value.includes('\0')) { await skip(`${m[1]}'s value contains a NUL byte`); continue; }
+            env[m[1]!] = value;
           }
         } else if (item.type === 'api-key' && item.envVar && item.fields.includes('secret')) {
-          env[item.envVar] = (await this.resolveField(item, 'secret', { taskId, mode: 'use' }));
+          const secret = (await this.resolveField(item, 'secret', { taskId, mode: 'use' }));
+          const problem = envEntryProblem(item.envVar, secret);
+          if (problem) await skip(problem);
+          else env[item.envVar] = secret;
         } else if (item.type === 'ssh-key' && item.envVar && item.fields.includes('privateKey')) {
           env[item.envVar] = (await this.materializeKey(item, { taskId }, keys));
         }
       } catch (e) {
-        // One corrupted/missing secret must not block every turn granted to it;
-        // the failure is audited instead of silently skipped.
+        skipped?.push({ source: `vault item "${item.label}"`, reason: 'it could not be read' });
         (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'vault.inject.failed', detail: { itemId: item.id, error: e instanceof Error ? e.message : String(e) } }));
       }
     }

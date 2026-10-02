@@ -182,8 +182,6 @@ export class WorldCheckpointService {
     catch (error) { await captured.rollback().catch(() => undefined); throw error; }
     (await this.store.attachWorldCheckpoint(handle, checkpoint.id));
     await clearCheckpointStale(this.store, handle.id);
-    if (omitted.length) await this.store.kvSet(noticeKey(handle.id), omittedNotice(omitted));
-    else await this.store.kvDelete(noticeKey(handle.id));
     await this.store.updateWorldMeta(handle, { cleanCheckpoint: cleanFingerprint
       ? { id: checkpoint.id, fingerprint: cleanFingerprint } : null });
     (await this.store.recordUsage({ organizationId: project.organizationId, projectId, taskId: handle.id, worldId: handle.id,
@@ -195,6 +193,13 @@ export class WorldCheckpointService {
     if (options.scrubSecrets !== false) await this.resources?.scrubSecrets(handle);
     await this.store.pruneWorldCheckpoints(handle.id);
     await this.collectGarbage(handle.id);
+    // Judged after pruning, so the notice reflects what is still stored.
+    const usage = delta.storageLocationId ? await this.store.storageLocationUsage(delta.storageLocationId) : undefined;
+    const overQuota = usage?.quotaBytes != null && usage.retainedBytes > usage.quotaBytes
+      ? { retainedBytes: usage.retainedBytes, quotaBytes: usage.quotaBytes, largest: captured.largest } : undefined;
+    const notices = [...overQuota ? [overQuotaNotice(overQuota)] : [], ...omitted.length ? [omittedNotice(omitted)] : []];
+    if (notices.length) await this.store.kvSet(noticeKey(handle.id), notices.join('\n\n'));
+    else await this.store.kvDelete(noticeKey(handle.id));
     return checkpoint;
     });
   }
@@ -516,6 +521,12 @@ function refusalNotice(error: CheckpointRefusedError): string {
   return [`Your uncommitted work could not be checkpointed: ${error.message}.`,
     ...(files.length ? ['', ...files, ''] : []),
     'Until it can be, this task\'s sandbox cannot hibernate and its uncommitted work exists only there. Commit what belongs in the repository, add generated or downloaded files to .gitignore, or move large data out of the task world (for example into a project resource).'].join('\n');
+}
+
+function overQuotaNotice(over: { retainedBytes: number; quotaBytes: number; largest: Array<{ path: string; bytes: number }> }): string {
+  return [`Your organization's storage is over its quota (${formatBytes(over.retainedBytes)} of ${formatBytes(over.quotaBytes)}). This checkpoint was kept, but new uploads are refused until data is deleted or the plan grows. Largest uncommitted files:`,
+    ...over.largest.map(file => `- ${file.path} (${formatBytes(file.bytes)})`),
+    'Commit what belongs in the repository, add generated or downloaded files to .gitignore, or delete what is no longer needed.'].join('\n');
 }
 
 function omittedNotice(omitted: Array<{ path: string; reason: string }>): string {

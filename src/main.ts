@@ -265,6 +265,14 @@ async function main() {
   const emailService = new EmailService(emailConfig,
     (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined));
   identity.mailer = emailService;
+  // Managed storage lifecycle: retention, the over-quota policy and the
+  // storage page (scheduled hourly below).
+  const { ManagedStorageService } = await import('./world/managed-storage.js');
+  const { storageNotifier } = await import('./world/storage-notices.js');
+  const managedStorage = new ManagedStorageService({ store, resources, checkpoints, objects: objectStore,
+    notify: storageNotifier({ store, email: emailService, publicUrl: process.env.KARMAX_PUBLIC_URL,
+      userEmail: async (userId) => (await identity.userById(userId))?.email ?? undefined,
+      siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))) }) });
   const handoffs = new WorldHandoffService(store, worlds, githubApp, runners, worldAccess, p.localCheckouts, resources);
   const worldLifecycle = new WorldLifecycleManager(store, worlds, checkpoints, 60_000, objectStore, runners, worldAccess);
   const delivery = new DeliveryDispatcher(store, {
@@ -353,6 +361,7 @@ async function main() {
     agentInfo: { provider, reason },
     broker,
     email: emailService,
+    managedStorage,
     payments,
     paymentRegistry,
     login,
@@ -449,6 +458,15 @@ async function main() {
   const retentionTimer = new AsyncInterval(sweepRetention, 3600_000);
   retentionTimer.unref();
   startupJobs.push(() => retentionTimer.run());
+  // Managed storage: expire finished tasks' saved workspaces, delete leaked
+  // park-time data captures, and apply the over-quota policy (hosted).
+  const managedStorageTimer = new AsyncInterval(async () => {
+    const result = (await managedStorage.run());
+    if (result.expiredCheckpoints || result.deletedRevisions)
+      console.log(`  • Storage retention: ${result.expiredCheckpoints} finished-task checkpoint(s), ${result.deletedRevisions} unreferenced data capture(s)`);
+  }, 3600_000);
+  managedStorageTimer.unref();
+  startupJobs.push(() => managedStorageTimer.run());
   // Reconcile missed notification close events without delaying the first API response.
   const inboxCleanup = new AsyncInterval(() => store.pruneStaleInbox().then(() => undefined), 3600_000);
   inboxCleanup.unref();

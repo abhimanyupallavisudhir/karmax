@@ -210,6 +210,13 @@ export const isReviewRequestEvent = (type: string): boolean =>
  * this store is the searchable index of projects/lists/tasks/profiles plus an
  * append-only event log that powers the live UI stream.
  */
+/** The deletion-queue entry `WorldCheckpointService.collectGarbage` consumes. A
+ * chunked (format 2) checkpoint carries what releasing its chunks needs. */
+function checkpointGcEntry(worldId: string, checkpoint: WorldCheckpoint): string {
+  return JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta!.objectKey,
+    ...(checkpoint.filesystemDelta!.format === 2 ? { projectId: checkpoint.projectId, filesystemDelta: checkpoint.filesystemDelta } : {}) });
+}
+
 export class Store {
   /** Compound service mutations must include their reads in this boundary. */
   transaction<T>(operation: () => Promise<T>): Promise<T> {
@@ -643,6 +650,15 @@ export class Store {
         bytes INTEGER NOT NULL, mediaType TEXT NOT NULL, name TEXT NOT NULL,
         createdAt INTEGER NOT NULL, expiresAt INTEGER
       );
+      CREATE TABLE IF NOT EXISTS conversation_exports (
+        objectKey TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
+        taskId TEXT NOT NULL, role TEXT NOT NULL, exportId TEXT NOT NULL,
+        bytes INTEGER NOT NULL, createdAt INTEGER NOT NULL, usedAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS object_tombstones (
+        objectKey TEXT PRIMARY KEY, deletedAt INTEGER NOT NULL, purgeAfter INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_object_tombstones_due ON object_tombstones(purgeAfter);
       CREATE TABLE IF NOT EXISTS executions (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -775,7 +791,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS subscription_billing_accounts (
         organizationId TEXT PRIMARY KEY, provider TEXT NOT NULL, customerId TEXT UNIQUE,
         subscriptionId TEXT UNIQUE, plan TEXT NOT NULL, status TEXT NOT NULL,
-        seats INTEGER NOT NULL, itemsJson TEXT NOT NULL, currentPeriodEnd INTEGER,
+        seats INTEGER NOT NULL, storagePacks INTEGER NOT NULL DEFAULT 0, itemsJson TEXT NOT NULL, currentPeriodEnd INTEGER,
         cancelAtPeriodEnd INTEGER NOT NULL, lastEventAt INTEGER NOT NULL,
         lastEventRank INTEGER NOT NULL DEFAULT 0,
         verifiedAt INTEGER, pastDueAt INTEGER, lastError TEXT,
@@ -863,6 +879,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_usage_org_time ON usage_events(organizationId, startedAt);
       CREATE INDEX IF NOT EXISTS idx_usage_admissions_org ON usage_admissions(organizationId, kind, state, createdAt);
       CREATE INDEX IF NOT EXISTS idx_artifacts_task ON promoted_artifacts(taskId, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_conversation_exports_used ON conversation_exports(usedAt);
+      CREATE INDEX IF NOT EXISTS idx_conversation_exports_project ON conversation_exports(projectId);
       CREATE INDEX IF NOT EXISTS idx_executions_task ON executions(taskId, startedAt);
       CREATE INDEX IF NOT EXISTS idx_execution_frames ON execution_frames(executionId, seq);
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
@@ -1066,6 +1084,8 @@ export class Store {
       (await this.db.exec("ALTER TABLE organizations ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'"));
     if (!organizationCols.some((c) => c.name === 'nameVisibility'))
       (await this.db.exec("ALTER TABLE organizations ADD COLUMN nameVisibility TEXT NOT NULL DEFAULT 'members'"));
+    if (!organizationCols.some((c) => c.name === 'storagePacks'))
+      (await this.db.exec('ALTER TABLE organizations ADD COLUMN storagePacks INTEGER NOT NULL DEFAULT 0'));
     const policyAcceptanceCols = (await this.db.prepare('PRAGMA table_info(policy_acceptances)').all()) as { name: string }[];
     if (!policyAcceptanceCols.some((c) => c.name === 'organizationId'))
       (await this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN organizationId TEXT'));
@@ -1081,6 +1101,8 @@ export class Store {
       (await this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN pastDueAt INTEGER'));
     if (!subscriptionBillingCols.some((c) => c.name === 'lastEventRank'))
       (await this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN lastEventRank INTEGER NOT NULL DEFAULT 0'));
+    if (!subscriptionBillingCols.some((c) => c.name === 'storagePacks'))
+      (await this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN storagePacks INTEGER NOT NULL DEFAULT 0'));
     (await this.db.exec(`UPDATE subscription_billing_accounts SET lastEventRank=CASE status
       WHEN 'canceled' THEN 690 WHEN 'incomplete_expired' THEN 680
       WHEN 'unpaid' THEN 670 WHEN 'paused' THEN 660 WHEN 'incomplete' THEN 650
@@ -1611,6 +1633,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM preview_leases WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id));
+      (await this.db.prepare('DELETE FROM conversation_exports WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM world_leases WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM usage_admissions WHERE projectId=?').run(id));
       (await this.db.prepare('UPDATE usage_events SET projectId=NULL, taskId=NULL, worldId=NULL, metadata=NULL WHERE projectId=?').run(id));
@@ -1808,7 +1831,28 @@ export class Store {
     const organization = (await this.getOrganization(organizationId));
     if (!organization) throw new Error(`no organization ${organizationId}`);
     return organizationEntitlements(organization.plan, this.hosted,
-      (await this.listOrganizationMemberships(organizationId)).length);
+      (await this.listOrganizationMemberships(organizationId)).length, organization.storagePacks ?? 0);
+  }
+
+  /** Billing's storage-pack mutation boundary, beside setOrganizationPlan: the
+   * count of packs a verified subscription carries (0 when it has none). */
+  async setOrganizationStoragePacks(organizationId: string, storagePacks: number): Promise<Organization> {
+    return this.db.transaction(async () => {
+      if (!Number.isSafeInteger(storagePacks) || storagePacks < 0) throw new Error('storage packs must be a non-negative integer');
+      if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
+      (await this.db.prepare('UPDATE organizations SET storagePacks=? WHERE id=?').run(storagePacks, organizationId));
+      this.notifyOrganizationEntitlementsChanged(organizationId);
+      return (await this.getOrganization(organizationId))!;
+    });
+  }
+
+  /** The quota a storage location enforces. A hosted organization's managed
+   * storage follows its plan, active users and packs; any other location keeps
+   * its own configured quota (a private operator's cap, or none). */
+  async storageLocationQuotaBytes(location: StorageLocation): Promise<number | undefined> {
+    if (location.kind === 'managed' && this.hosted)
+      return (await this.organizationEntitlements(location.organizationId)).storageQuotaBytes ?? undefined;
+    return location.quotaBytes;
   }
 
   /** Billing's sole plan mutation boundary. Pricing and limits remain in the
@@ -2001,6 +2045,7 @@ export class Store {
       usage_events: (await selectRows(this.db, 'usage_events', 'organizationId=?', [organizationId])),
       usage_admissions: (await selectRows(this.db, 'usage_admissions', 'organizationId=?', [organizationId])),
       promoted_artifacts: (await selectRows(this.db, 'promoted_artifacts', 'organizationId=?', [organizationId])),
+      conversation_exports: (await selectRows(this.db, 'conversation_exports', 'organizationId=?', [organizationId])),
       executions: (await selectRows(this.db, 'executions', 'organizationId=?', [organizationId])),
       execution_frames: (await rowsFor(this.db, 'execution_frames', 'executionId', executionIds)),
       preview_leases: (await selectRows(this.db, 'preview_leases', 'organizationId=?', [organizationId]))
@@ -2184,6 +2229,8 @@ export class Store {
     }
     for (const row of (await this.db.prepare('SELECT objectKey FROM promoted_artifacts WHERE projectId=?').all(projectId)) as any[])
       objectKeys.add(String(row.objectKey));
+    for (const row of (await this.db.prepare('SELECT objectKey FROM conversation_exports WHERE projectId=?').all(projectId)) as Array<{ objectKey: string }>)
+      objectKeys.add(String(row.objectKey));
     const attachmentIds = ((await this.db.prepare('SELECT attachmentId FROM attachment_scopes WHERE projectId=?').all(projectId)) as any[])
       .map((row) => String(row.attachmentId));
     const leases = ((await this.db.prepare(`SELECT l.id, COALESCE(p.provider, 'unknown') provider
@@ -2274,6 +2321,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM preview_leases WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM executions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM conversation_exports WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM usage_events WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM usage_admissions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM world_leases WHERE organizationId=?').run(organizationId));
@@ -4522,11 +4570,21 @@ export class Store {
     createdAt = Date.now()): Promise<void> {
     return this.db.transaction(async () => {
 
-    const ids = new Set<string>();
-    for (const notice of notices) for (const userId of new Set(userIds)) {
-      const id = `inbox_credential_${crypto.createHash('sha256')
-        .update(JSON.stringify([organizationId, userId, notice.credentialKey, notice.reason, notice.expiresAt])).digest('hex').slice(0, 24)}`;
-      ids.add(id);
+    const rows = new Map<string, { userId: string; notice: CredentialNotice }>();
+    for (const notice of notices) for (const userId of new Set(userIds))
+      rows.set(`inbox_credential_${crypto.createHash('sha256')
+        .update(JSON.stringify([organizationId, userId, notice.credentialKey, notice.reason, notice.expiresAt])).digest('hex').slice(0, 24)}`,
+        { userId, notice });
+    // Withdraw notices that no longer apply first: the inbox keeps one live row
+    // per (user, task id, kind), so an expiring login's notice would otherwise
+    // block its signed-out successor and then be swept, leaving none.
+    const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='credential'`)
+      .all(organizationId)) as any[]).map((row) => String(row.id)).filter((id) => !rows.has(id));
+    if (stale.length) {
+      (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+      (await deleteRows(this.db, 'inbox', 'id', stale));
+    }
+    for (const [id, { userId, notice }] of rows) {
       const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
         (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
         VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
@@ -4540,13 +4598,41 @@ export class Store {
         (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
         .run(newId('delivery'), id, channel, createdAt, createdAt));
     }
-    const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='credential'`)
-      .all(organizationId)) as any[]).map((row) => String(row.id)).filter((id) => !ids.has(id));
-    if (stale.length) {
-      (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
-      (await deleteRows(this.db, 'inbox', 'id', stale));
-    }
 
+    });
+  }
+
+  /** The organization owners' storage notice (one current stage at a time),
+   * or none once the organization is back within its quota. Email is sent by
+   * the notifier itself, so only browser and Slack delivery are queued here. */
+  async syncStorageInbox(organizationId: string, userIds: string[],
+    notice: { stage: string; retainedBytes: number; quotaBytes: number; deleteAt: number } | undefined, createdAt = Date.now()): Promise<void> {
+    return this.db.transaction(async () => {
+      const ids = new Map<string, string>();
+      if (notice) for (const userId of new Set(userIds)) ids.set(`inbox_storage_${crypto.createHash('sha256')
+        .update(JSON.stringify([organizationId, userId, notice.stage, notice.deleteAt])).digest('hex').slice(0, 24)}`, userId);
+      // Withdraw the previous stage first: one row per owner and task id.
+      const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='storage'`)
+        .all(organizationId)) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !ids.has(id));
+      if (stale.length) {
+        (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+        (await deleteRows(this.db, 'inbox', 'id', stale));
+      }
+      if (!notice) return;
+      const urgency = notice.stage === '7d' || notice.stage === 'deleted' ? 'critical' : 'high';
+      for (const [id, userId] of ids) {
+        const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+          (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
+          VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
+          id, organizationId, userId, createdAt * 1000, `storage:${organizationId}`, urgencyRank(urgency), createdAt,
+          JSON.stringify({ kind: 'storage', ...notice })));
+        if (!Number(inserted.changes)) continue;
+        const preferences = (await this.getDeliveryPreferences(userId, organizationId));
+        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
+          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+            .run(newId('delivery'), id, channel, createdAt, createdAt));
+      }
     });
   }
 
@@ -6255,17 +6341,23 @@ export class Store {
     if (location.kind === 'managed') {
       retainedBytes += Number(((await this.db.prepare('SELECT COALESCE(SUM(bytes), 0) bytes FROM promoted_artifacts WHERE organizationId=?')
         .get(location.organizationId)) as any)?.bytes ?? 0);
+      // A checkpoint queued for deletion no longer counts: its object goes with
+      // the next lifecycle sweep.
       retainedBytes += Number(((await this.db.prepare(`SELECT COALESCE(SUM(CAST(json_extract(manifest, '$.filesystemDelta.bytes') AS INTEGER)), 0) bytes
         FROM world_checkpoints WHERE projectId IN (SELECT id FROM projects WHERE organizationId=?)
-        AND json_extract(manifest, '$.filesystemDelta.storageLocationId') IS NULL`)
+        AND json_extract(manifest, '$.filesystemDelta.storageLocationId') IS NULL
+        AND id NOT IN (SELECT substr(k, 15) FROM kv WHERE k LIKE 'checkpoint-gc:%')`)
         .get(location.organizationId)) as any)?.bytes ?? 0);
     }
-    // A chunked checkpoint's chunks are counted above; its manifest is counted here.
+    // A chunked checkpoint's chunks are counted above; its manifest is counted
+    // here, unless it is queued for deletion.
     retainedBytes += Number(((await this.db.prepare(`SELECT COALESCE(SUM(CAST(json_extract(manifest, '$.filesystemDelta.bytes') AS INTEGER)), 0) bytes
-      FROM world_checkpoints WHERE json_extract(manifest, '$.filesystemDelta.storageLocationId')=?`)
+      FROM world_checkpoints WHERE json_extract(manifest, '$.filesystemDelta.storageLocationId')=?
+      AND id NOT IN (SELECT substr(k, 15) FROM kv WHERE k LIKE 'checkpoint-gc:%')`)
       .get(locationId)) as { bytes?: number } | undefined)?.bytes ?? 0);
-    return { locationId, retainedBytes, quotaBytes: location.quotaBytes,
-      ...(location.quotaBytes == null ? {} : { availableBytes: Math.max(0, location.quotaBytes - retainedBytes) }) };
+    const quotaBytes = (await this.storageLocationQuotaBytes(location));
+    return { locationId, retainedBytes, quotaBytes,
+      ...(quotaBytes == null ? {} : { availableBytes: Math.max(0, quotaBytes - retainedBytes) }) };
   }
 
   async backfillManagedStorageLocation(organizationId: string, locationId: string): Promise<void> {
@@ -6277,8 +6369,11 @@ export class Store {
     });
   }
 
+  /** Reserve bytes for an upload. `enforceQuota: false` still counts them but
+   * never refuses: work-in-progress checkpoints must save even over quota,
+   * because a world that cannot checkpoint cannot park (it keeps running). */
   async reserveStorageUpload(uploadId: string, organizationId: string, storageLocationId: string,
-    bytes: number, expiresAt: number): Promise<void> {
+    bytes: number, expiresAt: number, options: { enforceQuota?: boolean } = {}): Promise<void> {
     return this.db.transaction(async () => {
 
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('invalid storage upload reservation');
@@ -6286,12 +6381,12 @@ export class Store {
     if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      const retained = (await this.storageLocationUsage(storageLocationId)).retainedBytes;
+      const { retainedBytes: retained, quotaBytes } = (await this.storageLocationUsage(storageLocationId));
       const total = retained + Number(((await this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
         FROM storage_upload_reservations WHERE storageLocationId=? AND uploadId<>?`)
         .get(storageLocationId, uploadId)) as any)?.bytes ?? 0) + bytes;
-      if (location.quotaBytes != null && total > location.quotaBytes)
-        throw new Error(`managed upload quota exceeded (${total} retained or pending bytes, ${location.quotaBytes} byte limit)`);
+      if (options.enforceQuota !== false && quotaBytes != null && total > quotaBytes)
+        throw new Error(`managed upload quota exceeded (${total} retained or pending bytes, ${quotaBytes} byte limit)`);
       (await this.db.prepare(`INSERT INTO storage_upload_reservations (uploadId, organizationId, storageLocationId, bytes, expiresAt)
         VALUES (?, ?, ?, ?, ?) ON CONFLICT(uploadId) DO UPDATE SET bytes=excluded.bytes, expiresAt=excluded.expiresAt`)
         .run(uploadId, organizationId, storageLocationId, bytes, expiresAt));
@@ -6309,7 +6404,8 @@ export class Store {
     });
   }
 
-  async retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): Promise<void> {
+  async retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string,
+    options: { enforceQuota?: boolean } = {}): Promise<void> {
     return this.db.transaction(async () => {
 
     const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes)
@@ -6319,14 +6415,23 @@ export class Store {
       if (storageLocationId) {
         const location = (await this.getStorageLocation(storageLocationId));
         if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
+      }
+      if (storageLocationId && options.enforceQuota !== false) {
         const newBytes = (await __asyncCollections.reduce(chunks, async (sum, chunk) => sum + ((await this.db.prepare(
           'SELECT 1 FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?').get(organizationId, chunk.id)) ? 0 : chunk.bytes), 0));
-        const used = Number(((await this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes FROM resource_snapshot_chunks
-          WHERE organizationId=? AND storageLocationId=?`).get(organizationId, storageLocationId)) as any)?.bytes ?? 0);
-        if (location.quotaBytes != null && used + newBytes > location.quotaBytes)
-          throw new Error(`managed storage quota exceeded (${used + newBytes} bytes requested, ${location.quotaBytes} byte limit)`);
+        // The same total the quota is shown against: chunks, and for managed
+        // storage also artifacts and checkpoints.
+        const { retainedBytes: used, quotaBytes } = (await this.storageLocationUsage(storageLocationId));
+        if (quotaBytes != null && used + newBytes > quotaBytes)
+          throw new Error(`managed storage quota exceeded (${used + newBytes} bytes requested, ${quotaBytes} byte limit)`);
       }
-      for (const chunk of chunks) (await insert.run(organizationId, chunk.id, storageLocationId ?? null, chunk.bytes));
+      // A capture retains a reused baseline chunk without writing it again, so
+      // a delete of that chunk still pending since its release must not purge it.
+      const cancelPurge = this.db.prepare('DELETE FROM object_tombstones WHERE objectKey=?');
+      for (const chunk of chunks) {
+        (await insert.run(organizationId, chunk.id, storageLocationId ?? null, chunk.bytes));
+        (await cancelPurge.run(`resources/${organizationId}/chunks/${chunk.id}.bin`));
+      }
       (await this.db.exec('COMMIT'));
     }
     catch (error) { (await this.db.exec('ROLLBACK')); throw error; }
@@ -6496,11 +6601,145 @@ export class Store {
       }
       for (const checkpoint of checkpoints.slice(2)) {
         if (pinned.has(checkpoint.id)) continue;
-        if (checkpoint.filesystemDelta) await this.kvSet(`checkpoint-gc:${checkpoint.id}`,
-          JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta.objectKey,
-            ...(checkpoint.filesystemDelta.format === 2 ? { projectId: checkpoint.projectId, filesystemDelta: checkpoint.filesystemDelta } : {}) }));
+        if (checkpoint.filesystemDelta) await this.kvSet(`checkpoint-gc:${checkpoint.id}`, checkpointGcEntry(worldId, checkpoint));
       }
     });
+  }
+
+  /** Queue for deletion the checkpoints of done or cancelled tasks finished
+   * before `olderThan`, whose newest checkpoint is also older and whose world
+   * isn't live. Fork pins are kept. Committed work is on the task branch;
+   * these hold only the uncommitted leftovers. Failed tasks keep theirs:
+   * recovery restores them. Returns how many checkpoints were queued. */
+  async expireFinishedWorldCheckpoints(olderThan: number,
+    options: { limit?: number; organizationId?: string; projectId?: string } = {}): Promise<number> {
+    const { limit = 200, organizationId, projectId } = options;
+    const worlds = ((await this.db.prepare(`SELECT w.worldId AS worldId FROM world_checkpoints w
+      JOIN tasks t ON t.id=w.worldId
+      WHERE json_extract(t.lastView, '$.status') IN ('done', 'cancelled') AND COALESCE(t.completedAt, 0) < ?
+        ${organizationId ? 'AND w.projectId IN (SELECT id FROM projects WHERE organizationId=?)' : ''}
+        ${projectId ? 'AND w.projectId=?' : ''}
+        AND NOT EXISTS (SELECT 1 FROM world_instances wi WHERE wi.worldId=w.worldId AND wi.state IN ('ready', 'parked')
+          AND wi.generation=(SELECT MAX(x.generation) FROM world_instances x WHERE x.worldId=w.worldId))
+      GROUP BY w.worldId HAVING MAX(w.createdAt) < ? ORDER BY MAX(w.createdAt) LIMIT ?`)
+      .all(olderThan, ...(organizationId ? [organizationId] : []), ...(projectId ? [projectId] : []), olderThan, limit)) as Array<{ worldId: string }>)
+      .map((row) => String(row.worldId));
+    if (!worlds.length) return 0;
+    const pinned = new Set((await this.kvEntries('fork-checkpoint:')).map((row) => row.value));
+    let queued = 0;
+    for (const worldId of worlds) await this.db.transaction(async () => {
+      const rows = (await this.db.prepare('SELECT id, manifest FROM world_checkpoints WHERE worldId=?').all(worldId)) as Array<{ id: string; manifest: string }>;
+      for (const row of rows) {
+        if (pinned.has(String(row.id))) continue;
+        const checkpoint = JSON.parse(row.manifest) as WorldCheckpoint;
+        if (checkpoint.filesystemDelta) {
+          if (await this.kvGet(`checkpoint-gc:${checkpoint.id}`)) continue;
+          await this.kvSet(`checkpoint-gc:${checkpoint.id}`, checkpointGcEntry(worldId, checkpoint));
+        } else await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpoint.id);
+        queued++;
+      }
+    });
+    return queued;
+  }
+
+  /** Revision ids that something can still read: an attachment's current
+   * revision, an unreleased lease's base, a retained world checkpoint, or a
+   * park's incremental baseline. */
+  private async referencedResourceRevisionIds(): Promise<Set<string>> {
+    const ids = new Set<string>();
+    for (const row of (await this.db.prepare('SELECT currentRevisionId FROM resource_attachments WHERE currentRevisionId IS NOT NULL').all()) as Array<{ currentRevisionId: string }>)
+      ids.add(String(row.currentRevisionId));
+    for (const row of (await this.db.prepare("SELECT revisionId FROM resource_leases WHERE state<>'released' AND revisionId IS NOT NULL").all()) as Array<{ revisionId: string }>)
+      ids.add(String(row.revisionId));
+    for (const row of (await this.db.prepare(`SELECT manifest FROM world_checkpoints WHERE manifest LIKE '%"resources"%'`).all()) as Array<{ manifest: string }>)
+      for (const ref of (JSON.parse(row.manifest) as WorldCheckpoint).resources ?? []) ids.add(ref.revisionId);
+    for (const entry of (await this.kvEntries('resource-checkpoint:'))) {
+      try { const revisionId = JSON.parse(entry.value)?.revisionId; if (revisionId) ids.add(String(revisionId)); } catch {}
+    }
+    return ids;
+  }
+
+  /** Park-time captures of a task's private resource copy (`metadata.checkpoint`)
+   * created before `olderThan` that nothing references any more: the world
+   * checkpoint that pointed at them was pruned, or the task ended. */
+  async unreferencedCheckpointRevisions(olderThan: number, limit = 100): Promise<ResourceRevision[]> {
+    const referenced = (await this.referencedResourceRevisionIds());
+    return ((await this.db.prepare(`SELECT * FROM resource_revisions WHERE metadata LIKE '%"checkpoint":true%'
+      AND createdAt < ? ORDER BY createdAt`).all(olderThan)) as Parameters<typeof resourceRevisionRow>[0][])
+      .map(resourceRevisionRow).filter((revision) => !referenced.has(revision.id)).slice(0, limit);
+  }
+
+  /** Delete a revision row only if nothing references it now. The caller then
+   * deletes its objects; a failure there leaks bytes, never a dangling row.
+   * `allowCurrent` also clears it as its attachment's current revision. */
+  async deleteResourceRevisionIfUnreferenced(id: string, options: { allowCurrent?: boolean } = {}): Promise<ResourceRevision | undefined> {
+    return this.db.transaction(async () => {
+      const revision = (await this.getResourceRevision(id));
+      if (!revision) return undefined;
+      // Targeted checks, not referencedResourceRevisionIds(): this runs once
+      // per deletion while holding the Store's write lock.
+      const attachment = (await this.getResourceAttachment(revision.attachmentId));
+      const current = attachment?.currentRevisionId === id;
+      if ((current && !options.allowCurrent) || (await this.resourceRevisionReferencedBesidesCurrent(id))) return undefined;
+      if (current) (await this.db.prepare('UPDATE resource_attachments SET currentRevisionId=NULL, updatedAt=? WHERE id=?')
+        .run(Date.now(), revision.attachmentId));
+      (await this.db.prepare('DELETE FROM resource_revisions WHERE id=?').run(id));
+      return revision;
+    });
+  }
+
+  private async resourceRevisionReferencedBesidesCurrent(id: string): Promise<boolean> {
+    if ((await this.db.prepare("SELECT 1 FROM resource_leases WHERE state<>'released' AND revisionId=?").get(id))) return true;
+    if ((await this.db.prepare('SELECT 1 FROM world_checkpoints WHERE manifest LIKE ?').get(`%"revisionId":"${id}"%`))) return true;
+    return (await this.kvEntries('resource-checkpoint:')).some((entry) => entry.value.includes(`"revisionId":"${id}"`));
+  }
+
+  /** Everything an organization keeps in storage, for the storage page and the
+   * over-quota policy. Sizes are logical bytes: revisions share unchanged
+   * chunks, so deleting one frees only what is unique to it. */
+  async organizationStorageContents(organizationId: string): Promise<{
+    attachments: Array<Pick<ResourceAttachment, 'id' | 'projectId' | 'name' | 'storageLocationId' | 'currentRevisionId'>>;
+    revisions: Array<Pick<ResourceRevision, 'id' | 'attachmentId' | 'bytes' | 'createdAt' | 'storageLocationId' | 'createdByTaskId'> & { checkpoint: boolean }>;
+    checkpoints: Array<{ id: string; projectId: string; worldId: string; bytes: number; createdAt: number; taskStatus?: string }>;
+    artifacts: PromotedArtifact[];
+  }> {
+    const attachments = ((await this.db.prepare(`SELECT id, projectId, name, storageLocationId, currentRevisionId
+      FROM resource_attachments WHERE organizationId=? ORDER BY createdAt`).all(organizationId)) as Array<{ id: string; projectId: string;
+        name: string; storageLocationId: string | null; currentRevisionId: string | null }>)
+      .map((row) => ({ id: String(row.id), projectId: String(row.projectId), name: String(row.name),
+        storageLocationId: row.storageLocationId ?? undefined, currentRevisionId: row.currentRevisionId ?? undefined }));
+    const revisions = ((await this.db.prepare(`SELECT r.* FROM resource_revisions r JOIN resource_attachments a ON a.id=r.attachmentId
+      WHERE a.organizationId=? ORDER BY r.createdAt`).all(organizationId)) as Parameters<typeof resourceRevisionRow>[0][]).map(resourceRevisionRow)
+      .map((revision) => ({ id: revision.id, attachmentId: revision.attachmentId, bytes: revision.bytes, createdAt: revision.createdAt,
+        storageLocationId: revision.storageLocationId, createdByTaskId: revision.createdByTaskId,
+        checkpoint: revision.metadata?.checkpoint === true }));
+    const checkpoints = ((await this.db.prepare(`SELECT w.id, w.projectId, w.worldId, w.manifest, w.createdAt,
+      json_extract(t.lastView, '$.status') AS taskStatus
+      FROM world_checkpoints w JOIN projects p ON p.id=w.projectId LEFT JOIN tasks t ON t.id=w.worldId
+      WHERE p.organizationId=? ORDER BY w.createdAt`).all(organizationId)) as Array<{ id: string; projectId: string; worldId: string;
+        manifest: string; createdAt: number; taskStatus: string | null }>)
+      .map((row) => ({ id: String(row.id), projectId: String(row.projectId), worldId: String(row.worldId),
+        bytes: Number((JSON.parse(row.manifest) as WorldCheckpoint).filesystemDelta?.bytes ?? 0), createdAt: Number(row.createdAt),
+        ...(row.taskStatus ? { taskStatus: String(row.taskStatus) } : {}) }));
+    const queued = new Set((await this.kvEntries('checkpoint-gc:')).map((entry) => entry.key.slice('checkpoint-gc:'.length)));
+    const artifacts = ((await this.db.prepare('SELECT * FROM promoted_artifacts WHERE organizationId=? ORDER BY createdAt').all(organizationId)) as Array<
+      Omit<PromotedArtifact, 'expiresAt'> & { expiresAt: number | null }>)
+      .map((row) => ({ ...row, bytes: Number(row.bytes), createdAt: Number(row.createdAt), expiresAt: row.expiresAt == null ? undefined : Number(row.expiresAt) }));
+    return { attachments, revisions, checkpoints: checkpoints.filter((checkpoint) => !queued.has(checkpoint.id)), artifacts };
+  }
+
+  /** When an organization's managed storage first exceeded its quota, and which
+   * notices it has been sent; undefined while it is within its quota. */
+  async storageOverQuota(organizationId: string): Promise<{ since: number; notices: string[] } | undefined> {
+    const raw = (await this.kvGet(`storage-over-quota:${organizationId}`));
+    if (!raw) return undefined;
+    try { const value = JSON.parse(raw); return { since: Number(value.since), notices: Array.isArray(value.notices) ? value.notices.map(String) : [] }; }
+    catch { return undefined; }
+  }
+
+  async setStorageOverQuota(organizationId: string, value: { since: number; notices: string[] } | undefined): Promise<void> {
+    if (value) (await this.kvSet(`storage-over-quota:${organizationId}`, JSON.stringify(value)));
+    else (await this.kvDelete(`storage-over-quota:${organizationId}`));
   }
 
   async pinWorldCheckpointForFork(taskId: string, checkpointId: string): Promise<void> {
@@ -7178,6 +7417,74 @@ export class Store {
   async expiredPromotedArtifacts(now = Date.now()): Promise<PromotedArtifact[]> {
     return ((await this.db.prepare('SELECT * FROM promoted_artifacts WHERE expiresAt IS NOT NULL AND expiresAt<=?').all(now)) as any[])
       .map((row) => ({ ...row, expiresAt: Number(row.expiresAt) }));
+  }
+
+  /** A frozen conversation export (`src/store/conversation-exports.ts`). Its
+   * identity is content-derived, so recording the same snapshot again only
+   * refreshes when it was last used. The organization and project come from
+   * the task; an export of an unknown task is not recorded. */
+  async recordConversationExport(input: { objectKey: string; taskId: string; role: string; exportId: string;
+    bytes: number; usedAt?: number; onlyIfAbsent?: boolean }): Promise<boolean> {
+    return this.db.transaction(async () => {
+      const task = (await this.db.prepare(`SELECT t.projectId, p.organizationId FROM tasks t JOIN projects p ON p.id=t.projectId
+        WHERE t.id=?`).get(input.taskId)) as { projectId: string; organizationId: string | null } | undefined;
+      if (!task) return false;
+      const usedAt = input.usedAt ?? Date.now();
+      const result = (await this.db.prepare(`INSERT INTO conversation_exports
+        (objectKey, organizationId, projectId, taskId, role, exportId, bytes, createdAt, usedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(objectKey) DO ${input.onlyIfAbsent ? 'NOTHING' : 'UPDATE SET bytes=excluded.bytes, usedAt=excluded.usedAt'}`)
+        .run(input.objectKey, task.organizationId ?? 'org_personal', task.projectId, input.taskId, input.role,
+          input.exportId, input.bytes, usedAt, usedAt)) as { changes?: number };
+      return Number(result?.changes ?? 1) > 0;
+    });
+  }
+
+  async touchConversationExport(objectKey: string, now = Date.now()): Promise<void> {
+    (await this.db.prepare('UPDATE conversation_exports SET usedAt=? WHERE objectKey=? AND usedAt<?').run(now, objectKey, now));
+  }
+
+  async conversationExport(objectKey: string): Promise<{ objectKey: string; organizationId: string; projectId: string;
+    taskId: string; role: string; exportId: string; bytes: number; createdAt: number; usedAt: number } | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM conversation_exports WHERE objectKey=?').get(objectKey)) as
+      { objectKey: string; organizationId: string; projectId: string; taskId: string; role: string; exportId: string;
+        bytes: number | string; createdAt: number | string; usedAt: number | string } | undefined;
+    return row ? { ...row, bytes: Number(row.bytes), createdAt: Number(row.createdAt), usedAt: Number(row.usedAt) } : undefined;
+  }
+
+  /** Exports unused since `usedBefore`, or whose task is gone, oldest first. */
+  async expiredConversationExports(usedBefore: number, limit: number): Promise<string[]> {
+    return ((await this.db.prepare(`SELECT e.objectKey FROM conversation_exports e LEFT JOIN tasks t ON t.id=e.taskId
+      WHERE e.usedAt<=? OR t.id IS NULL ORDER BY e.usedAt LIMIT ?`).all(usedBefore, limit)) as Array<{ objectKey: string }>)
+      .map((row) => String(row.objectKey));
+  }
+
+  async deleteConversationExport(objectKey: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM conversation_exports WHERE objectKey=?').run(objectKey));
+  }
+
+  // Delayed deletion of managed objects (src/store/deferred-delete.ts).
+  async objectTombstone(key: string): Promise<{ key: string; deletedAt: number; purgeAfter: number } | undefined> {
+    const row = (await this.db.prepare('SELECT deletedAt, purgeAfter FROM object_tombstones WHERE objectKey=?').get(key)) as
+      { deletedAt: number | bigint; purgeAfter: number | bigint } | undefined;
+    return row ? { key, deletedAt: Number(row.deletedAt), purgeAfter: Number(row.purgeAfter) } : undefined;
+  }
+
+  async recordObjectTombstone(key: string, deletedAt: number, purgeAfter: number): Promise<void> {
+    (await this.db.prepare(`INSERT INTO object_tombstones (objectKey, deletedAt, purgeAfter) VALUES (?, ?, ?)
+      ON CONFLICT(objectKey) DO UPDATE SET deletedAt=excluded.deletedAt, purgeAfter=excluded.purgeAfter`).run(key, deletedAt, purgeAfter));
+  }
+
+  async deleteObjectTombstone(key: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM object_tombstones WHERE objectKey=?').run(key));
+  }
+
+  async hasResourceChunk(organizationId: string, chunkId: string): Promise<boolean> {
+    return !!(await this.db.prepare('SELECT 1 FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?').get(organizationId, chunkId));
+  }
+
+  async dueObjectTombstones(now: number, limit: number): Promise<string[]> {
+    return ((await this.db.prepare('SELECT objectKey FROM object_tombstones WHERE purgeAfter<=? ORDER BY purgeAfter, objectKey LIMIT ?')
+      .all(now, limit)) as Array<{ objectKey: string }>).map((row) => String(row.objectKey));
   }
 
   async createExecution(input: Omit<ExecutionRecord, 'state' | 'startedAt' | 'heartbeatAt'>
@@ -8490,7 +8797,7 @@ function requiredTargets(policy: ConfirmationPolicy): number {
 
 function rowToOrganization(r: any): Organization {
   return { id: r.id, name: r.name, slug: r.slug, kind: r.kind, nameVisibility: r.nameVisibility === 'public' ? 'public' : 'members',
-    plan: isHostedPlanId(r.plan) ? r.plan : 'free', createdAt: r.createdAt };
+    plan: isHostedPlanId(r.plan) ? r.plan : 'free', storagePacks: Number(r.storagePacks ?? 0) || 0, createdAt: r.createdAt };
 }
 
 function rowToTeam(r: any): Team {

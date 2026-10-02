@@ -252,6 +252,10 @@ const MAX_MERGE_ATTEMPTS = 3;
 /** Default re-prompt cadence for a parent holding an unanswered child raise (SPEC §5.3).
  *  Bounds the subtask-wait so an ignored raise re-enters Do instead of parking forever. */
 const DEFAULT_SUBTASK_NAG_MS = 60_000;
+/** How much of a child's last message its parent sees in the raise for a Do
+ *  turn that ended without a PR; the rest is in the child's conversation. */
+const PARENT_RAISE_OUTPUT_CHARS = 2_000;
+const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
  *  Task tool) are still running. We hold in Do and re-prompt so it waits for them,
  *  but bound the re-prompts so a wedged sub-agent can't park the task forever. */
@@ -1532,6 +1536,14 @@ async function softwareDevImpl(
     } else if (resp.action === 'confirm') {
       if (stage === 'escalated' && escalationAction) {
         if (escalationAction === 'confirm') manualEscalationRequested = true;
+        return;
+      }
+      // A Do turn that ended without open_pr asks its parent to approve what it
+      // has. Approving it there opens the PR, as Open PR would; setting only
+      // `confirmed` left the child parked in Do with its parent waiting on it.
+      if (explicitPrCycle && stage === 'do' && waitingFor?.kind === 'parent'
+        && patched('software-dev-parent-confirm-opens-pr-v1')) {
+        prRequested = true;
         return;
       }
       confirmed = true;
@@ -3422,8 +3434,11 @@ Inspect the complete current diff and specifically compare its delta from the re
             || 'The agent finished its turn. Send a follow-up, or open the PR if the work is truly complete.';
           if (input.parentTaskId) {
             waitingFor = { kind: 'parent', detail: 'Waiting for the managing agent to open the PR' };
-            await notifyParent(turn.raise?.type ?? 'needs_confirmation',
-              turn.raise?.detail ?? 'The Do turn ended. Open the PR only if the requested work is truly complete; otherwise send a comment.');
+            // The parent answers from this text alone, so it carries the child's
+            // own last words (its question, or what it says it finished).
+            await notifyParent(turn.raise?.type ?? 'needs_confirmation', turn.raise?.detail
+              ?? `Its Do turn ended without opening a PR. Confirm to open the PR if the work is truly complete; otherwise comment.${turn.output?.trim()
+                ? `\n\nIts last message:\n${clip(turn.output.trim(), PARENT_RAISE_OUTPUT_CHARS)}` : ''}`);
             await publish();
             await condition(() => prRequested || cancelled || msgs.length > seen);
           } else {

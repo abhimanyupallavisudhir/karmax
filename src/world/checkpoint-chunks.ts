@@ -15,8 +15,10 @@ const deflate = promisify(gzip);
 const inflate = promisify(gunzip);
 
 /** Policy, not memory: capture and restore stream one chunk at a time, so
- * these bound how long a park may take and what one task may store. The
- * organization's storage quota is enforced chunk by chunk as bytes are kept. */
+ * these bound how long a park may take and what one task may store. Chunks
+ * count toward the organization's plan storage quota but are never refused
+ * for it; an over-quota organization gets a notice after pruning
+ * (wiki features/managed-storage). */
 export const CHECKPOINT_LIMITS = {
   files: 100_000,
   fileBytes: 16 * 1024 ** 3,
@@ -61,6 +63,8 @@ export class ChunkedCheckpointStore {
   async capture(input: { world: World; organizationId: string; worldId: string; generation: number; objectKey: string;
     entries: CaptureEntry[]; baseline?: WorldCheckpoint; checkContinue?: () => Promise<void> }): Promise<{
     delta: FilesystemDelta; uploadedBytes: number; omitted: Array<{ path: string; reason: string }>; rollback: () => Promise<void>;
+    /** The largest files captured, for a notice if storage is over its quota. */
+    largest: Array<{ path: string; bytes: number }>;
   }> {
     const { world, organizationId, checkContinue } = input;
     const location = await this.location(organizationId);
@@ -77,11 +81,10 @@ export class ChunkedCheckpointStore {
     const retain = async (chunks: Array<{ id: string; bytes: number }>) => {
       const fresh = chunks.filter(chunk => !held.has(chunk.id));
       if (!fresh.length) return;
-      try { await this.store.retainResourceChunks(organizationId, fresh, location.id); }
-      catch (error) {
-        if (/quota exceeded/.test(String((error as Error)?.message))) throw this.quotaRefusal(error as Error, stats);
-        throw error;
-      }
+      // Counted against the quota but never refused (wiki features/managed-storage):
+      // a world that cannot checkpoint cannot park, and an over-quota organization
+      // is read-only for new data, not for saving work in progress.
+      await this.store.retainResourceChunks(organizationId, fresh, location.id, { enforceQuota: false });
       for (const chunk of fresh) held.set(chunk.id, chunk.bytes);
     };
     const put = async (id: string, sealed: () => Buffer | Promise<Buffer>, bytes: number) => {
@@ -201,7 +204,7 @@ export class ChunkedCheckpointStore {
       return {
         delta: { format: 2, objectKey: input.objectKey, sha256: sha256(sealed), bytes: sealed.length,
           ...(location.id ? { storageLocationId: location.id } : {}), files: manifest.files.length, contentBytes },
-        uploadedBytes, omitted,
+        uploadedBytes, omitted, largest: largest(stats.filter(stat => stat.kind === 'file')),
         rollback: async () => {
           await location.objects.delete(input.objectKey).catch(() => undefined);
           await rollback();
@@ -343,10 +346,6 @@ export class ChunkedCheckpointStore {
     if (total > CHECKPOINT_LIMITS.totalBytes)
       throw new CheckpointRefusedError(`${formatBytes(total)} of uncommitted files exceed the ${formatBytes(CHECKPOINT_LIMITS.totalBytes)} checkpoint limit`,
         largest(stats));
-  }
-
-  private quotaRefusal(error: Error, stats: CheckpointStat[]): CheckpointRefusedError {
-    return new CheckpointRefusedError(`organization storage is full: ${error.message}`, largest(stats.filter(stat => stat.kind === 'file')));
   }
 
   private async deleteChunks(location: Location, ids: string[]): Promise<void> {

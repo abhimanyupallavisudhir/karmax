@@ -291,6 +291,8 @@ describe('turnkey backup publication', () => {
 describe('turnkey deployment secrets', () => {
   const secretsDir = generateSecrets();
   const secrets = ['auth_secret', 'vault_key', 'world_ref_key'];
+  // Operator-supplied, empty until an S3 object store is configured.
+  const optional = ['s3_access_key_id', 's3_secret_access_key'];
 
   // An update runs the installed release's script, which cannot generate a
   // host secret a newer release adds; Compose would refuse to mount it. So
@@ -298,10 +300,37 @@ describe('turnkey deployment secrets', () => {
   it('generates every secret the compose profile mounts, and mounts no new one', () => {
     const compose = fs.readFileSync(path.join(deployDir, 'compose.turnkey.yml'), 'utf8');
     const mounted = Object.keys(parse(compose).secrets as Record<string, unknown>);
-    expect(mounted.sort()).toEqual([...secrets].sort());
-    for (const name of secrets) {
+    expect(mounted.sort()).toEqual([...secrets, ...optional].sort());
+    for (const name of [...secrets, ...optional]) {
       expect(fs.existsSync(path.join(secretsDir, name)), `${name} was not generated`).toBe(true);
     }
+  });
+
+  // Compose refuses to start without every mounted file, but an S3 key is the
+  // operator's to write: an empty file means "not configured", never a random key.
+  it('creates the S3 key files empty and keeps the operator\'s', () => {
+    for (const name of optional) expect(fs.readFileSync(path.join(secretsDir, name), 'utf8')).toBe('');
+    fs.writeFileSync(path.join(secretsDir, 's3_secret_access_key'), 'operator-key\n');
+    rerunUp(path.dirname(secretsDir));
+    expect(fs.readFileSync(path.join(secretsDir, 's3_secret_access_key'), 'utf8')).toBe('operator-key\n');
+    expect(fs.readFileSync(path.join(secretsDir, 's3_access_key_id'), 'utf8')).toBe('');
+    for (const name of optional) expect(fs.statSync(path.join(secretsDir, name)).mode & 0o004).toBe(0o004);
+  });
+
+  it('configures the object store from .turnkey.env, local unless told otherwise, with keys from secret files', () => {
+    const compose = parse(fs.readFileSync(path.join(deployDir, 'compose.turnkey.yml'), 'utf8'));
+    const app = compose.services.app;
+    expect(app.environment).toMatchObject({
+      KARMAX_OBJECT_STORE: '${KARMAX_OBJECT_STORE:-local}',
+      KARMAX_OBJECT_DELETE_DELAY_DAYS: '${KARMAX_OBJECT_DELETE_DELAY_DAYS:-}',
+      KARMAX_S3_ENDPOINT: '${KARMAX_S3_ENDPOINT:-}',
+      KARMAX_S3_BUCKET: '${KARMAX_S3_BUCKET:-}',
+      KARMAX_S3_REGION: '${KARMAX_S3_REGION:-}',
+      KARMAX_S3_ACCESS_KEY_ID_FILE: '/run/secrets/s3_access_key_id',
+      KARMAX_S3_SECRET_ACCESS_KEY_FILE: '/run/secrets/s3_secret_access_key',
+    });
+    expect(app.environment).not.toHaveProperty('KARMAX_S3_SECRET_ACCESS_KEY');
+    expect(app.secrets).toEqual(expect.arrayContaining(optional));
   });
 
   // The app container runs as its own uid and compose bind-mounts these files
