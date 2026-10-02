@@ -289,6 +289,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   request_credential: 'credential:read', store_credential: 'vault:store',
   check_agent_mail: 'credential:read', enroll_passkey: 'credential:read',
   use_passkey: 'credential:read', save_passkey: 'vault:store',
+  use_session: 'credential:read', save_session: 'vault:store',
   list_payments: 'payment:read', manage_payments: 'payment:write',
   list_users: 'user:read', manage_users: 'user:write',
   list_authorization: 'authorization:read', manage_authorization: 'authorization:write',

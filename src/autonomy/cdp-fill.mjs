@@ -20,7 +20,7 @@
  * On success prints {"origin":"https://..."} to stdout; on failure prints
  * {"error":"..."} and exits 1.
  *
- * `--bridge <nonce> <expectDomains> <cdpUrl>` instead relays the matching
+ * `--bridge <nonce> <expectDomains> <cdpUrl> [--any]` instead relays the matching
  * page's CDP session over this process's terminal (world-fill.ts
  * openWorldPage), so the gateway can hold a passkey authenticator in a remote
  * world's browser across the agent's click. Lines in are base64 CDP messages;
@@ -195,27 +195,27 @@ function wsClient(wsUrl) {
 const connect = wsClient;
 
 /** The page whose target-list url matches `domains`; its live origin is checked by the caller. */
-async function findPage(cdpUrl, domains) {
+async function findPage(cdpUrl, domains, anyPage = false) {
   const base = assertLoopback(cdpUrl);
   const list = await (await fetch(new URL('/json/list', base), { signal: AbortSignal.timeout(TIMEOUT) })).json();
   if (process.env.KARMAX_CDP_DEBUG)
     process.stderr.write(`[cdp-fill] /json/list: ${JSON.stringify(list.map((t) => ({ type: t.type, url: t.url, ws: !!t.webSocketDebuggerUrl })))}\n`);
   const pages = list.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-  const page = domains.length
+  const page = (domains.length
     ? pages.find((t) => { try { return domains.some((d) => domainMatches(new URL(t.url).hostname, d)); } catch { return false; } })
-    : pages[0];
+    : pages[0]) ?? (anyPage ? pages[0] : undefined);
   if (!page) throw new Error(domains.length
     ? `no open page matches ${domains.join(', ')} — navigate to the login page first`
     : 'no open page at the CDP endpoint');
   return page;
 }
 
-async function bridge(nonce, domainCsv, bridgeCdpUrl) {
+async function bridge(nonce, domainCsv, bridgeCdpUrl, anyPage = false) {
   const emit = (message) => process.stdout.write(`@@${nonce}@@ ${JSON.stringify(message)}\n`);
   try {
     const domains = domainCsv.split(',').map((s) => s.trim()).filter(Boolean);
     if (!/^[0-9a-f]{16,}$/.test(nonce) || !domains.length) throw new Error('bridge needs a nonce and target domains');
-    const session = await connect((await findPage(bridgeCdpUrl, domains)).webSocketDebuggerUrl);
+    const session = await connect((await findPage(bridgeCdpUrl, domains, anyPage)).webSocketDebuggerUrl);
     session.raw.listen((text) => emit({ cdp: text }));
     session.raw.ended.then(() => process.exit(0));
     let pending = '';
@@ -271,5 +271,5 @@ async function main() {
   }
 }
 
-if (process.argv[2] === '--bridge') void bridge(process.argv[3] ?? '', process.argv[4] ?? '', process.argv[5] ?? '');
+if (process.argv[2] === '--bridge') void bridge(process.argv[3] ?? '', process.argv[4] ?? '', process.argv[5] ?? '', process.argv[6] === '--any');
 else main().then(() => process.exit(0)).catch((e) => fail(e?.message ?? String(e)));

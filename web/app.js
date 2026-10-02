@@ -6711,6 +6711,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         if (draftMode) closeTask();
         else {
           S.attemptGroup = null; // its cached record still says draft
+          // The page under the form was rendered while it was a draft; never
+          // show it for a frame while the task list reloads.
+          renderTaskLoadingPage(taskRecord(draft.id) || draft);
           await refreshTasks();
           if (S.selected === draft.id) {
             history.replaceState({ kx: 1 }, '', taskUrl(draft.id));
@@ -15474,6 +15477,7 @@ const VAULT_SECRET_LABELS = {
 };
 // Short label + click-to-expand explanation for the two per-item policies.
 const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
+const SESSION_EXCLUSIVE_TIP = 'For sites that sign other copies out when one is used. Other tasks wait until the task using it is done.';
 const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). It then travels to the model provider and may end up in training data. “never” forbids that entirely; “ask” requires your approval each time.';
 // `title` covers hover on desktop; the click handler is for touch, where there is
 // no hover. It used to call `alert()` — the only modal in a console that speaks in
@@ -15593,9 +15597,10 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <button class="btn sm" data-vreq-act="task" ${unbound ? 'disabled' : ''}>This task</button>
           <button class="btn sm" data-vreq-act="always" ${unbound ? 'disabled' : ''}>Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
-          ${policyTip(`Once: ${items.find((item) => item.id === request.itemId)?.type === 'passkey'
-            ? 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.'
-            : 'Approves one credential operation, consumed when used, not at the next agent turn.'}
+          ${policyTip(`Once: ${({
+            passkey: 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.',
+            session: 'Signs the agent\'s browser into this site once. It stays signed in until the site ends the session.',
+          })[items.find((item) => item.id === request.itemId)?.type] || 'Approves one credential operation, consumed when used, not at the next agent turn.'}
 
 This task: Approves the operation and grants this task the credential across turns. Its policy stays unchanged, so “ask” can prompt again.
 
@@ -16083,8 +16088,9 @@ async function wireVaultCards(organizationId) {
             <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
           <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          ${i.type === 'session' ? `<label title="${esc(SESSION_EXCLUSIVE_TIP)}">one task at a time <input type="checkbox" class="vi-exclusive" ${i.exclusive ? 'checked' : ''}></label>` : ''}
           <button class="btn sm" data-vi-reveal="${esc(i.id)}" title="Temporarily inspect one stored field (audited)" ${(i.fields || []).length ? '' : 'disabled'}>View</button>
-          <button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>
+          ${i.type === 'session' ? '' : `<button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>`}
           <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button>
           <div class="vault-reveal-panel" hidden>
             <label>Stored field <select class="vi-reveal-field">${(i.fields || []).map((field) => `<option value="${esc(field)}">${esc(field)}</option>`).join('')}</select></label>
@@ -16117,6 +16123,18 @@ async function wireVaultCards(organizationId) {
         };
         row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
         row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
+        row.querySelector('.vi-exclusive')?.addEventListener('change', async (event) => {
+          const box = event.target;
+          box.disabled = true;
+          try {
+            const updated = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, exclusive: box.checked }) });
+            Object.assign(item, updated.item || updated, { exclusive: !!(updated.item || updated).exclusive });
+            toast(box.checked ? 'One task at a time' : 'Shared by tasks');
+          } catch (e) {
+            box.checked = !!item.exclusive;
+            toast(e.message, true);
+          } finally { box.disabled = false; }
+        });
       });
       list.querySelectorAll('[data-vi-reveal]').forEach((button) => button.addEventListener('click', () => {
         const row = button.closest('[data-vi]');

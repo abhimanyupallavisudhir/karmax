@@ -8,6 +8,7 @@ import { CredentialBroker } from './broker.js';
 import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
 import { newId } from '../util/id.js';
+import { parseSavedSession, sessionDomainError } from './browser-session.js';
 import { paths } from '../config/paths.js';
 
 /**
@@ -28,8 +29,8 @@ import { paths } from '../config/paths.js';
  * request for it (one-shot pass / task grant extension, §7).
  */
 
-export type VaultItemType = 'login' | 'api-key' | 'ssh-key' | 'env' | 'passkey' | 'note';
-export type VaultFieldName = 'password' | 'totp' | 'secret' | 'privateKey' | 'env' | 'passkey' | 'note';
+export type VaultItemType = 'login' | 'api-key' | 'ssh-key' | 'env' | 'passkey' | 'session' | 'note';
+export type VaultFieldName = 'password' | 'totp' | 'secret' | 'privateKey' | 'env' | 'passkey' | 'session' | 'note';
 
 /** The secret fields each item type may carry. Item CRUD never returns their
  * values; the gateway's separate human-administrator inspection route resolves
@@ -42,6 +43,9 @@ export const ITEM_FIELDS: Record<VaultItemType, VaultFieldName[]> = {
   // A passkey stores the CDP virtual-authenticator credential as one JSON blob
   // ({credentialId, privateKey, rpId, userHandle, signCount}); §8.
   passkey: ['passkey'],
+  // A signed-in browser session: the site's cookies and localStorage, as
+  // browser-session.ts captures them; one JSON blob.
+  session: ['session'],
   note: ['note'],
 };
 
@@ -68,6 +72,9 @@ export interface VaultItem {
   /** api-key: env var carrying the secret at spawn; ssh-key: env var carrying
    *  the materialized key file's path. Absent ⇒ not injected at spawn. */
   envVar?: string;
+  /** session: in at most one task's browser at a time, for sites that rotate
+   *  their tokens on use and would sign the other copies out (session-holds.ts). */
+  exclusive?: boolean;
   /** Which secret fields currently have stored values (never the values). */
   fields: VaultFieldName[];
   policy: VaultItemPolicy;
@@ -361,6 +368,7 @@ export class VaultItems {
     username?: string;
     tags?: string[];
     envVar?: string;
+    exclusive?: boolean;
     policy?: Partial<VaultItemPolicy>;
     secrets?: Partial<Record<VaultFieldName, string>>;
     /** Internal connector snapshot: remove fields absent from the source. */
@@ -378,6 +386,12 @@ export class VaultItems {
     if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 65_536) throw new Error('vault item exceeds size limit (64 KiB)');
     if (args.type === 'note' && !args.replaceSecrets && args.secrets?.note !== undefined && !args.secrets.note.trim())
       throw new Error('a standalone note cannot be empty');
+    if (args.type === 'session') {
+      if (args.secrets?.session?.trim()) parseSavedSession(args.secrets.session);
+      const domains = args.domains ?? prior?.domains ?? [];
+      if (!domains.length) throw new Error('a saved session needs the site\'s domain');
+      for (const domain of domains) { const error = sessionDomainError(domain); if (error) throw new Error(error); }
+    }
     const id = prior?.id ?? newId('vi');
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
@@ -412,6 +426,7 @@ export class VaultItems {
       ...(username ? { username } : {}),
       ...(tags?.length ? { tags } : {}),
       ...(envVar ? { envVar } : {}),
+      ...(args.type === 'session' && (args.exclusive ?? prior?.exclusive) ? { exclusive: true } : {}),
       fields: [...fields],
       policy: {
         use: args.policy?.use ?? prior?.policy.use ?? 'auto',

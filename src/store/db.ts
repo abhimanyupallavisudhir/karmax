@@ -5484,7 +5484,7 @@ export class Store {
       await this.kvDeletePrefix(sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`,
-        `retention:settled:${taskId}`, `retention:view:${taskId}`, `view-order:${taskId}`]) (await exact.run(key));
+        `retention:settled:${taskId}`, `retention:view:${taskId}`, `view-order:${taskId}`, `vault:session-holds:${taskId}`]) (await exact.run(key));
       // Turn ids are `<task>#n` (older runs) or `<task>:<run>#n`; both carry the
       // turn's session checkpoint and journal.
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,

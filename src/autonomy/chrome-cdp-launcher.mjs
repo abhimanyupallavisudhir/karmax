@@ -25,7 +25,7 @@
  *   KARMAX_CDP_CHROME       explicit Chrome executable (else auto-detected)
  *   KARMAX_CDP_USER_DATA_DIR  Chrome profile dir (default a temp dir)
  *   KARMAX_CDP_KEEP_ALIVE=1  keep Chrome until its isolated world is stopped
- *   KARMAX_CDP_HEADFUL=1     launch a visible browser (default headless=new)
+ *   KARMAX_CDP_HEADFUL=1     launch a visible browser, else headless (default headless=new)
  * Any extra argv is forwarded to chrome-devtools-mcp.
  */
 import { spawn, spawnSync } from 'node:child_process';
@@ -213,9 +213,8 @@ async function main() {
   const createdProfile = !profile || !fs.existsSync(userDataDir);
   fs.mkdirSync(userDataDir, { recursive: true, mode: 0o700 });
   if (!KEEP_ALIVE && createdProfile) process.on('exit', () => fs.rmSync(userDataDir, { recursive: true, force: true }));
-  const headless = process.env.KARMAX_CDP_HEADFUL === '1' ? [] : ['--headless=new'];
-  const chromeArgs = [
-    ...headless, `--remote-debugging-port=${PORT}`, '--remote-debugging-address=127.0.0.1',
+  const baseArgs = [
+    `--remote-debugging-port=${PORT}`, '--remote-debugging-address=127.0.0.1',
     `--user-data-dir=${userDataDir}`, '--no-first-run', '--no-default-browser-check',
     '--disable-features=Translate', 'about:blank',
   ];
@@ -223,31 +222,35 @@ async function main() {
   // or when the caller forces it (remote worlds pass KARMAX_CDP_NO_SANDBOX=1).
   let isRoot = false;
   try { isRoot = typeof process.getuid === 'function' && process.getuid() === 0; } catch { /* non-posix */ }
-  if (isRoot || process.env.KARMAX_CDP_NO_SANDBOX === '1') chromeArgs.unshift('--no-sandbox');
+  if (isRoot || process.env.KARMAX_CDP_NO_SANDBOX === '1') baseArgs.unshift('--no-sandbox');
 
+  // A visible browser that cannot open its display gives way to a headless
+  // one on the same port: the pipe fallback has no port for fills to reach.
+  const attempts = process.env.KARMAX_CDP_HEADFUL === '1' ? [[], ['--headless=new']] : [['--headless=new']];
   let browser;
-  try {
-    browser = spawn(chrome, chromeArgs, { stdio: 'ignore', detached: KEEP_ALIVE });
-    if (KEEP_ALIVE) browser.unref();
-  } catch (e) {
-    log(`failed to spawn Chrome (${e?.message ?? e}) — falling back to pipe mode`);
-    const mcp = runMcp(undefined);
-    mcp.on('exit', (code) => process.exit(code ?? 0));
-    return;
+  for (const mode of attempts) {
+    let candidate;
+    try {
+      candidate = spawn(chrome, [...mode, ...baseArgs], { stdio: 'ignore', detached: KEEP_ALIVE });
+      if (KEEP_ALIVE) candidate.unref();
+    } catch (e) {
+      log(`failed to spawn Chrome (${e?.message ?? e})`);
+      break;
+    }
+    let browserDead = false;
+    candidate.on('exit', () => { browserDead = true; });
+    candidate.on('error', (e) => { browserDead = true; log(`Chrome failed: ${e?.message ?? e}`); });
+    // Wait for the DevTools endpoint (up to ~12s).
+    for (let i = 0; i < 48 && !browserDead; i++) {
+      if (await cdpUp(PORT)) { browser = candidate; break; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (browser) break;
+    log(`Chrome${mode.length ? '' : ' (visible)'} did not expose its DevTools port in time`);
+    try { candidate.kill('SIGKILL'); } catch { /* ignore */ }
   }
-
-  let browserDead = false;
-  browser.on('exit', () => { browserDead = true; });
-
-  // Wait for the DevTools endpoint (up to ~12s).
-  let ready = false;
-  for (let i = 0; i < 48 && !browserDead; i++) {
-    if (await cdpUp(PORT)) { ready = true; break; }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  if (!ready) {
-    log('Chrome did not expose its DevTools port in time — falling back to pipe mode');
-    try { browser.kill('SIGKILL'); } catch { /* ignore */ }
+  if (!browser) {
+    log('falling back to pipe mode');
     const mcp = runMcp(undefined);
     mcp.on('exit', (code) => process.exit(code ?? 0));
     return;

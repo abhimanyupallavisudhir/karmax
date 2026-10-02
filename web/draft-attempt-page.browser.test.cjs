@@ -25,6 +25,7 @@ const draftOf = (n) => attempt(n, {
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
     let records = [attempt(1), draftOf(2), attempt(3)];
+    let slowListOnce = false;
     let group = () => ({ intentId: 'i1', principalAttemptId: 'a1', attempts: records });
     const created = [];
     const viewOf = (id) => {
@@ -49,11 +50,17 @@ const draftOf = (n) => attempt(n, {
         } else if (p.endsWith('/queue') && req.method() === 'POST') {
           const id = p.split('/')[3];
           records = records.map((r) => (r.id === id ? { ...r, params: { prompt: r.params.prompt } } : r));
+          // A slow task list after Run, as on a loaded CI runner: the page must
+          // not show the draft it was, under the form, while the list loads.
+          slowListOnce = true;
           data = {};
         } else if (p.endsWith('/attempts')) data = group();
         else if (p.endsWith('/sessions')) data = {};
         else if (p.includes('/defaults/')) data = { task: { inherited: {} } };
-        else if (p.endsWith('/tasks')) data = records.filter((r) => r.id === 'a1');
+        else if (p.endsWith('/tasks')) {
+          if (slowListOnce) { slowListOnce = false; await new Promise((resolve) => setTimeout(resolve, 400)); }
+          data = records.filter((r) => r.id === 'a1');
+        }
         else if (p.includes('explanation-settings')) data = { effective: { enabled: false } };
         else if (p.endsWith('/credentials')) data = { credentials: [], task: { own: {}, enabled: [] } };
         else if (p.endsWith('/accounts')) data = { logins: [] };

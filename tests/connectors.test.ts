@@ -888,6 +888,33 @@ describe('Connectors sync into the vault (§9)', () => {
     ]);
   });
 
+  // A saved browser session expires and rotates within days; copying it into
+  // the person's own password store would leave stale bearer cookies there.
+  it('never writes a saved browser session back to an external store', async () => {
+    const { items, store, broker } = makeVault();
+    const pushed: any[] = [];
+    const connector = new PassConnector(scriptedExec({}));
+    (connector as any).push = async (item: any) => { pushed.push(item); return { externalId: 'tavya/session' }; };
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+    (await connectors.setConfig('pass', { writeBack: true }));
+    const session = (await items.save({
+      type: 'session', label: 'notion.so (signed in)', domains: ['notion.so'],
+      secrets: { session: JSON.stringify({ version: 1, capturedAt: 1, cookies: [], storage: [] }) },
+      provenance: { source: 'task:t1', taskId: 't1' },
+    }));
+    expect(await connectors.writeBackCreated(session.id)).toEqual([]);
+    await expect(connectors.writeBack('pass', session.id)).rejects.toThrow(/session/);
+    expect(pushed).toEqual([]);
+  });
+
+  it('refuses a malformed or unscoped saved session', async () => {
+    const { items } = makeVault();
+    await expect(items.save({ type: 'session', label: 's', domains: ['notion.so'], secrets: { session: 'cookies' } })).rejects.toThrow(/JSON/);
+    await expect(items.save({ type: 'session', label: 's', secrets: { session: JSON.stringify({ version: 1, capturedAt: 1, cookies: [], storage: [] }) } })).rejects.toThrow(/domain/);
+    await expect(items.save({ type: 'session', label: 's', domains: ['co.uk'], secrets: { session: JSON.stringify({ version: 1, capturedAt: 1, cookies: [], storage: [] }) } })).rejects.toThrow(/public suffix/);
+  });
+
   it('keeps distinct write-back bindings when several connectors are enabled', async () => {
     const { items, store, broker } = makeVault();
     const updated: any[] = [];

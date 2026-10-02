@@ -691,6 +691,24 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/login', a))),
   );
   server.registerTool(
+    'save_session',
+    {
+      description:
+        `Save the signed-in session of the site open in your browser (its cookies and storage) as a vault item, so later tasks start signed in with use_session. Works however the site was signed into, including "Sign in with Google/GitHub": sign in first (with fill_credential, a passkey, or ask a human to sign in through this task's desktop), then call this on the signed-in page. Values never enter your context. The vault copy is then refreshed from your browser after each turn. Pass itemId to replace a session with a new sign-in.`,
+      inputSchema: { domain: z.string().optional(), itemId: z.string().optional(), label: z.string().optional(), username: z.string().optional(), exclusive: z.boolean().optional() },
+    },
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/session/save', a))),
+  );
+  server.registerTool(
+    'use_session',
+    {
+      description:
+        `Sign your browser into a site with a saved session (see save_session). Navigate to the site first; ${BRAND} restores its cookies and storage and reloads the page signed in, without the values entering your context. Returns granted; needs_approval (a request was raised; you are resumed when it is decided); busy (the session works in one task at a time and another task has it: pause, then retry); expired or not_in_vault. When it no longer works, the result names the site's saved password or passkey to sign in with; then call save_session with the itemId.`,
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), why: z.string().optional() },
+    },
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/session/use', a))),
+  );
+  server.registerTool(
     'describe_platform',
     { description: 'Describe the complete administrative API available through platform_request.', inputSchema: {} },
     async () => wrap(async () => PLATFORM_API_CATALOG),

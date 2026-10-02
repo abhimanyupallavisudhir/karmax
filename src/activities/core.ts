@@ -496,6 +496,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   );
 
   const gitProfilesForScope = (scope: string) => new GitProfiles(store, deps.broker, paths().state, scope);
+  /** Refresh the saved browser sessions a task's browser holds into the vault,
+   *  and with `release` let go of them (session-holds.ts). Only remote and
+   *  container worlds keep their browser between turns, so only they are read. */
+  const browserOutlivesTurns = (kind: WorldKind) => kind === 'container' || isRemote(kind);
+  const settleSessions = async (taskId: string, world: World | (() => Promise<World | undefined>) | undefined, release: boolean) => {
+    try {
+      const [{ settleTaskSessions }, { openWorldPage }, { WORLD_CDP_URL }] = await Promise.all([
+        import('../autonomy/session-holds.js'), import('../autonomy/world-fill.js'), import('../autonomy/task-browser.js')]);
+      await settleTaskSessions({ store, broker: deps.broker, taskId, world, release,
+        openPage: (w, domains) => openWorldPage(w, { expectDomains: domains, cdpUrl: WORLD_CDP_URL, anyPage: true }) });
+    } catch (error) {
+      console.warn(`[vault] saved sessions of ${taskId} not settled: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   const activeGithubAccountId = async (userId: string) => typeof deps.githubApp?.activeUserAccountId === 'function'
     ? (await deps.githubApp.activeUserAccountId(userId)) : undefined;
 
@@ -1194,6 +1208,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
         }
 
+        if (!(await valid())) return;
+        // A parked world's browser is not checkpointed: keep its sessions, then free them.
+        await settleSessions(taskId, async () => browserOutlivesTurns(waitingWorld.kind) ? openWorld(waitingWorld, taskId) : undefined, true);
         if (!(await valid())) return;
         await parkingTrace.measure('lifecycle.park', () => withTiming(parkingTrace, () => worlds.park(waitingWorld)));
       }
@@ -2982,6 +2999,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       // Adapters can also return review info directly without invoking the tool.
       if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, result.reviewInfo, true);
+      // The site may have rotated a saved session's cookies during the turn.
+      await settleSessions(args.taskId, browserOutlivesTurns(world.handle.kind) ? world : undefined, false);
       if (result.subTaskResponses?.length) {
         const { kept, refused } = await ownSubTaskResponses(store, args.taskId, result.subTaskResponses);
         result.subTaskResponses = kept;
@@ -3368,6 +3387,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (!(await owns())) return;
           const world = await worlds.open(current);
           if (!(await owns())) return;
+          await settleSessions(handle.id, browserOutlivesTurns(current.kind) ? world : undefined, true);
+          if (!(await owns())) return;
           // A remote sandbox takes its jobs with it; a host-side world must stop them.
           if (!isRemote(current.kind)) await stopJobs(world).catch(() => undefined);
           await world.destroy();
@@ -3424,7 +3445,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           };
           await idle();
           // Cancelling stops the task's durable jobs as well as its agent.
-          await stopJobs(remote ?? await worlds.open(current)).catch(() => undefined);
+          const live = remote ?? await worlds.open(current);
+          await stopJobs(live).catch(() => undefined);
+          // A parked world's browser is not checkpointed: keep its sessions, then free them.
+          await settleSessions(current.id, browserOutlivesTurns(current.kind) ? live : undefined, true);
           if (deps.checkpoints) {
             if (remote && worldRepos(current).length) {
               const projectId = String(current.meta?.projectId ?? '');
