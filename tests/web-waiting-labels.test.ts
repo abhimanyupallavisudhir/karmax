@@ -210,6 +210,21 @@ describe('waiting labels in task summaries', () => {
       .toBe(`Needs input until ${waitDeadline(until)}`);
   });
 
+  // legibench3#18 read "working" through 23 minutes of identical infrastructure
+  // failures; between attempts nothing runs, and the chip says when it will.
+  it('shows when a stage that failed on infrastructure runs again, in any stage', () => {
+    const until = Date.now() + 10 * 60_000;
+    const retry = { kind: 'retry', detail: 'Retry 5 of 5', until };
+    expect(waitingText(retry)).toBe(`Retrying at ${waitDeadline(until)}`);
+    expect(waitingText({ kind: 'retry' })).toBe('Retrying');
+    for (const stage of ['setup', 'do', 'review', 'merge'])
+      expect(stageLabel({ stage, status: 'waiting', state: {}, waitingFor: retry })).toBe(waitingText(retry));
+    context.S.tasks = [{ id: 'task-1', lastView: { stage: 'do', status: 'active' } }];
+    expect(patchTaskListFromEvent({ taskId: 'task-1', type: 'view.updated',
+      payload: { stage: 'do', status: 'waiting', agentTurn: null, waitingFor: 'retry', waitingUntil: until } })).toBe(true);
+    expect(stageLabel(context.S.tasks[0].lastView)).toBe(`Retrying at ${waitDeadline(until)}`);
+  });
+
   // Likewise a turn that ended to wait on other tasks: the chip names them.
   it('names the tasks a parked agent waits on', () => {
     for (const [kind, label] of [['subtask', 'Waiting for sub-tasks'], ['collaboration', 'Waiting for collaborator'], ['parent', 'Waiting for parent']]) {

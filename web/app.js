@@ -4993,6 +4993,8 @@ function stageLabel(v) {
   if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
   // So is a turn parked on its credential or quota: nothing is working.
   if (v.status === 'waiting' && v.waitingFor?.kind === 'account') return waitingText(v.waitingFor);
+  // Nor is a stage between attempts after an infrastructure failure.
+  if (v.status === 'waiting' && v.waitingFor?.kind === 'retry') return waitingText(v.waitingFor);
   // Nor is an agent that ended its turn to wait for a job, a time or other tasks
   // (task 433 read "working" for hours while paused until the next morning).
   if (v.stage === 'do' && v.status === 'waiting' && PARKED_WAITS.has(v.waitingFor?.kind)) return waitingText(v.waitingFor);
@@ -10155,6 +10157,7 @@ function waitingLabel(w) {
     case 'confirm': return 'review';
     case 'responder': return 'responder';
     case 'job': return 'job';
+    case 'retry': return 'retry';
     default: return 'progress';
   }
 }
@@ -10170,6 +10173,7 @@ function waitingText(w) {
   // A paused agent's ask carries the time it carries on without an answer.
   if (w?.kind === 'human') return Number.isFinite(w.until) ? `Needs input until ${waitDeadline(w.until)}` : 'Needs input';
   if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Waiting until ${waitDeadline(w.until)}` : 'Waiting';
+  if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
   // A job is shown by the name its agent gave it. The deadline is when the
   // agent resumes even if the job never finishes.
   if (w?.kind === 'job') {
@@ -15430,8 +15434,8 @@ const VAULT_SECRET_LABELS = {
   note: [['note', 'note']],
 };
 // Short label + click-to-expand explanation for the two per-item policies.
-const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment. “ask” requires approval before each use.';
-const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
+const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
+const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). It then travels to the model provider and may end up in training data. “never” forbids that entirely; “ask” requires your approval each time.';
 // `title` covers hover on desktop; the click handler is for touch, where there is
 // no hover. It used to call `alert()` — the only modal in a console that speaks in
 // toasts, and on desktop it fired *on top of* the native tooltip.
@@ -15539,7 +15543,9 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
           </div>
           <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
-          ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>` : ''}
+          ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
+            : request.mode === 'reveal' ? `<div class="approval-request-warn">The agent will see the plaintext: it travels to the model provider and may end up in training data.</div>`
+            : items.find((item) => item.id === request.itemId)?.type === 'passkey' ? '' : `<div class="approval-request-warn caution">Blind use is not foolproof: a misbehaving agent can still leak it, e.g. by entering it on a malicious site.</div>`}
         </div>
         <div class="approval-request-actions">
           ${request.itemId ? '' : `${addLink ? `<a class="vreq-add" data-spa href="${globalRoute('organization')}#settings-payments" title="Add it in Settings → Passwords &amp; payments">Add to vault</a>` : ''}
@@ -15912,6 +15918,15 @@ async function openConnectorEditor(query, changed, app, existing) {
 function passwordsCard() {
   return `<div class="card" id="vault-card">
     <div class="section-h">Passwords <span class="chip">organization resource</span></div>
+    <div class="vault-risk" role="note">
+      <span class="vault-risk-mark" aria-hidden="true">!</span>
+      <div><b>Connect your passwords and secrets at your own risk.</b>
+        <ul>
+          <li>Granting an agent <code>reveal</code> authorization (“agent sees”) to a password is dangerously insecure: it travels to the servers of the model provider (and who knows where else) and may find its way into model training data. We allow it because we know some of you happily paste secrets into agent chat, so we’ll just make that easier for you and accelerate natural selection.</li>
+          <li>Granting an agent <code>use</code> authorization (“blind use”) lets it pass your password into password forms without looking. This still does not guarantee safety: an agent gone bad (through misalignment, prompt injection or an accidental mistake) can still leak it, e.g. by entering it into a malicious server.</li>
+        </ul>
+        Always prefer to connect services via <a href="#settings-connections">MCP or Composio</a>, if available.</div>
+    </div>
     <button type="button" class="btn vault-manage-button" id="vault-manage-open" disabled>
       <span>Vault credentials</span>
       <span class="vault-manage-count">Loading…</span>

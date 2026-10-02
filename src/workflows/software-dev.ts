@@ -1694,8 +1694,19 @@ async function softwareDevImpl(
               const wait = INFRA_BACKOFF_MS[infraRetries++]!;
               attempt--; // an infra park is not a resolve attempt
               error = `infrastructure: ${describeError(err)} — retrying ${stageName} in ${Math.round(wait / 1000)}s (${infraRetries}/${INFRA_BACKOFF_MS.length})`;
+              // Say plainly that nothing runs until the retry: a stage that read
+              // "working" through 23 minutes of identical failures looked like it
+              // would retry forever (legibench3#18). A waiting publication may
+              // schedule world maintenance, so older histories keep `active`.
+              const resumeStatus = status;
+              const visibleWait = patched('software-dev-infra-retry-wait-v1');
+              if (visibleWait) {
+                status = 'waiting';
+                waitingFor = { kind: 'retry', detail: `Retry ${infraRetries} of ${INFRA_BACKOFF_MS.length}`, until: Date.now() + wait };
+              }
               await publish();
               await condition(() => cancelled || retryRequested, wait);
+              if (visibleWait) { waitingFor = undefined; status = resumeStatus; }
               if (cancelled) throw new Cancelled();
               retryRequested = false;
               error = undefined;

@@ -192,8 +192,9 @@ export function watchesJobs(view: Pick<TaskView, 'waitingFor'>): boolean {
   return view.waitingFor?.kind === 'job' || Boolean(view.waitingFor?.jobs?.length);
 }
 
-/** These waits still own live work or are about to enter a turn. */
+/** These waits still own live work or are about to enter a turn (a retry after
+ * an infrastructure failure is seconds to minutes away). */
 export function hasLiveWorldWork(view: Pick<TaskView, 'waitingFor'>): boolean {
   return view.waitingFor?.kind === 'agentSlot' || view.waitingFor?.kind === 'subagent'
-    || view.waitingFor?.kind === 'shell';
+    || view.waitingFor?.kind === 'shell' || view.waitingFor?.kind === 'retry';
 }

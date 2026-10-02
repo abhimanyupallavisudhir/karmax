@@ -36,6 +36,8 @@ import { platformToolHandlers } from './tools.js';
  *   @fail <message>                 throw (exercises Resolve)
  *   @failonce <message>             throw only the FIRST time per world (exercises the
  *                                   transient-infra retry path — no Resolve)
+ *   @failworld <message>            throw on this and every later turn in this world, the
+ *                                   retries' resume prompts included (a fault that persists)
  *   @decide <action> :: <reason>    resolve agent verdict (resume/retryStage/gotoStage/parkUntil/escalate)
  *   @confirm <action> [:: text]     confirm agent verdict (confirm/revise/reject)
  *   @openpr                         explicitly request the PR/Review cycle
@@ -46,6 +48,8 @@ import { platformToolHandlers } from './tools.js';
 // @failonce ledger: activity retries land in the same world, so keying by world+message
 // makes the second attempt succeed. Module-level: survives across turn invocations.
 const failedOnce = new Set<string>();
+// @failworld ledger: worlds whose every turn fails with the recorded message.
+const failingWorlds = new Map<string, string>();
 // `@subagents N` ledger: the sub-agent count drains by one each turn (keyed by world),
 // so a turn that "finished" is HELD in Do until the count reaches 0 — modelling
 // auto-backgrounded Claude Agent SDK sub-agents that settle over several turns.
@@ -272,6 +276,9 @@ export class MockAdapter implements AgentAdapter {
         // may park a login (AD-2/AD-7); anything else stays a plain Error.
         case 'fail':
           throw providerErrorFromMessage('mock', rest || 'mock failure');
+        case 'failworld':
+          failingWorlds.set(input.world.handle.id, rest || 'mock persistent failure');
+          throw providerErrorFromMessage('mock', failingWorlds.get(input.world.handle.id)!);
         case 'failonce': {
           const key = `${input.world.handle.id}:${rest}`;
           if (!failedOnce.has(key)) {
@@ -343,6 +350,8 @@ export class MockAdapter implements AgentAdapter {
     // (claude.ts / codex.ts both strip conversation system messages) — otherwise the
     // mock "sees" things a real agent never would, masking bugs like a child raise
     // injected as a system message that never reaches the parent agent.
+    const persistent = failingWorlds.get(input.world.handle.id);
+    if (persistent) throw providerErrorFromMessage('mock', persistent);
     const recent = input.messages.filter((m) => m.role === 'user');
     const initialText = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
     await processText(initialText);

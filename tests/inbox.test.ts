@@ -124,6 +124,44 @@ describe.each(storeBackends)('inbox ($name)', ({ name, open }) => {
     expect((await f.inbox()).map((item) => item.kind)).toEqual(['escalated']);
   });
 
+  // legibench3#18 (2026-10-01): a workflow's own escalation (Resolve and retries
+  // exhausted) publishes stage `escalated`, status `blocked` and no `waitingFor`.
+  // None of the seven tasks escalated that way on tavya.io had an inbox row, so
+  // nobody was ever told; the task looked like it simply kept failing.
+  it('asks a person about a task its workflow escalated, once, until it is retried', async () => {
+    const f = (await fixture(open));
+    const escalated = { stage: 'escalated', status: 'blocked', error: 'infrastructure: fetch failed (still failing after 5 waits)' };
+    (await f.view(escalated));
+    const first = (await f.inbox());
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({ kind: 'escalated', actionable: true, unread: true });
+    for (let i = 0; i < 3; i++) (await f.view(escalated));
+    expect((await f.inbox()).map((item) => item.id)).toEqual([first[0]!.id]);
+    const deliveries = (await f.store.db.prepare('SELECT COUNT(*) c FROM delivery_outbox WHERE inboxId=?').get(first[0]!.id)) as any;
+    expect(Number(deliveries.c)).toBeLessThanOrEqual(3); // one per channel, not one per tick
+    (await f.store.pruneStaleInbox());
+    expect((await f.inbox())).toHaveLength(1);
+    // A person's Retry resumes the failed stage: the ask is answered.
+    (await f.view({ stage: 'do', status: 'active' }));
+    expect((await f.inbox())).toEqual([]);
+  });
+
+  it('backfills an escalation whose notification an older build never raised, quietly', async () => {
+    const f = (await fixture(open));
+    const view = { taskId: f.task.id, title: f.task.title, workflow: f.task.workflow, stage: 'escalated', status: 'blocked',
+      messages: [], actions: [], state: {}, updatedAt: Date.now() } as any;
+    (await f.store.saveView(f.task.id, view, undefined, undefined, undefined, PUBLISHED));
+    expect((await f.inbox())).toEqual([]);
+    (await f.store.pruneStaleInbox());
+    const items = (await f.inbox());
+    expect(items.map((item) => item.kind)).toEqual(['escalated']);
+    // Boot reconciliation surfaces it in the inbox without emailing about the past.
+    const deliveries = (await f.store.db.prepare('SELECT COUNT(*) c FROM delivery_outbox WHERE inboxId=?').get(items[0]!.id)) as any;
+    expect(Number(deliveries.c)).toBe(0);
+    (await f.store.pruneStaleInbox());
+    expect((await f.inbox())).toHaveLength(1);
+  });
+
   it('removes an ask once the task stops waiting on a human', async () => {
     const f = (await fixture(open));
     (await f.view(humanWait('review')));

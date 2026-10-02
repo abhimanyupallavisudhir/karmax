@@ -89,7 +89,7 @@ import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js'
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
-import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { importWithPanagent, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
@@ -2101,7 +2101,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : profile.provider === 'opencode' ? path.join('.local', 'share', 'opencode')
           : '.claude';
         const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), ambientHome);
-        const applyPanagent = async (source: PanagentSource, mode: 'context' | 'transcript') => {
+        // An import runs only while this role has no session, so a retry may
+        // replace the copy an earlier attempt wrote: the same source keeps one id.
+        const applyPanagent = async (source: PanagentSource, mode: 'context' | 'transcript', origin: string) => {
           const imported = await importWithPanagent({
             source,
             provider: profile.provider,
@@ -2109,6 +2111,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             worldPath: worldWorkingDirectory(world.handle),
             mode,
             native: !apiRail && ['claude', 'codex'].includes(profile.provider),
+            sessionId: stableImportSessionId(args.taskId, args.role, profile.provider, origin),
           });
           if (imported.kind === 'native') session = imported.sessionId;
           else {
@@ -2140,10 +2143,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             throw new Error('uploaded conversation belongs to a different project');
           if (!deps.objects) throw new Error('conversation import storage is unavailable');
           const data = await deps.objects.get(conversationImportObjectKey(args.task.projectId, upload.id));
-          const kind = await applyPanagent({ data, name: upload.name }, 'transcript');
+          const kind = await applyPanagent({ data, name: upload.name }, 'transcript', `upload:${upload.id}`);
           (await record(args.taskId, 'session.imported', { source: 'upload', format: upload.format, provider: profile.provider, kind }));
         } else if (share) {
-          const kind = await applyPanagent({ url: share }, 'context');
+          const kind = await applyPanagent({ url: share }, 'context', `share:${share}`);
           (await record(args.taskId, 'session.imported', { source: 'share', provider: profile.provider, kind }));
         } else if (spec.resumeFrom.sessionId) {
           // A raw id is meaningful only on a host-local install, where the UI and
@@ -2164,7 +2167,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const sourceProvider = profile.provider === 'claude' ? 'codex' : 'claude';
             const sourceFile = findProviderSession({ provider: sourceProvider, session, searchInstallation: true });
             if (sourceFile) {
-              const kind = await applyPanagent({ path: sourceFile }, 'transcript');
+              const kind = await applyPanagent({ path: sourceFile }, 'transcript', `session:${sourceProvider}:${session}`);
               materialized = true;
               (await record(args.taskId, 'session.imported', { source: 'local-id', sourceProvider, provider: profile.provider, kind }));
             }
@@ -2248,7 +2251,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const sourceFile = findProviderSession({ provider: srcProvider, session: srcSession, srcHome });
             if (sourceFile) {
               try {
-                const kind = await applyPanagent({ path: sourceFile }, 'transcript');
+                const kind = await applyPanagent({ path: sourceFile }, 'transcript',
+                  `task:${spec.resumeFrom.taskId}:${srcRole}:${srcProvider}:${srcSession}`);
                 prepared = true;
                 (await record(args.taskId, 'session.forked', {
                   from: spec.resumeFrom, session: srcSession, native: kind === 'native', converted: true,

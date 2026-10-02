@@ -1622,8 +1622,10 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder' | 'job' | 'timer'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience;
-    /** `job` / `timer` / a paused agent's `human` or `parent` ask: when the agent is resumed at the latest (epoch ms). */
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder' | 'job' | 'timer' | 'retry'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience;
+    /** `job` / `timer` / a paused agent's `human` or `parent` ask: when the agent
+     * is resumed at the latest; `retry`: when a stage that failed on
+     * infrastructure runs again (epoch ms). */
     until?: number;
     /** `human`: how loudly the ask was raised; omitted means the inbox kind's default. */
     urgency?: Urgency;
