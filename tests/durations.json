@@ -283,7 +283,7 @@
   "tests/payments.test.ts": 1.1,
   "tests/permission-requests.test.ts": 0.2,
   "tests/phase-e.test.ts": 8.7,
-  "tests/pipeline-recovery.test.ts": 121.6,
+  "tests/pipeline-recovery.test.ts": 157,
   "tests/pipeline-subtasks.test.ts": 121.8,
   "tests/pipeline.test.ts": 150.5,
   "tests/platform-authz.test.ts": 0.7,
