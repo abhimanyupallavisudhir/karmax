@@ -492,6 +492,30 @@ describe('task stage transitions', () => {
     });
   });
 
+  /** #456: a sub-task escalated to a person ran on as a top-level task. Its
+   * replacement run's Review and input holds went to @creator, and its parent,
+   * waiting on it, was never told it needed anything. */
+  it('keeps a sub-task\'s parent and profiles across a lifecycle replacement', async () => {
+    const f = (await fixture());
+    const child = (await f.store.createTask({
+      projectId: f.project.id,
+      title: 'Child',
+      workflow: 'software-dev',
+      workflowVersion: '1.4.0',
+      parentTaskId: f.task.id,
+      createdBy: { kind: 'task-agent', taskId: f.task.id, role: 'do' },
+      params: { prompt: 'child work', base: 'main', target: 'main', profiles: { do: 'organization:org_personal::do-default' } },
+    }));
+    (await f.store.saveView(child.id, { ...f.view, taskId: child.id, title: 'Child' }));
+    (await f.api.escalateToHuman(f.token, { taskId: child.id, audience: ['@creator'], message: 'Approve the sandbox key' }));
+    expect(f.starts).toHaveLength(1);
+    expect(f.starts[0]!.options.workflowId).toBe(child.id);
+    expect(f.starts[0]!.options.args[0]).toMatchObject({
+      parentTaskId: f.task.id,
+      profiles: { do: 'organization:org_personal::do-default' },
+    });
+  });
+
   /** #21: an Avatar is dispatched with the escalating agent's words in its
    *  task prompt; they arrive fenced as data, not as the Avatar's instructions. */
   it('quotes the escalating agent’s message as data in the Avatar’s task prompt', async () => {

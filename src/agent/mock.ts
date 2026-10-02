@@ -13,7 +13,7 @@ import { platformToolHandlers } from './tools.js';
  * Directives (one per line, anywhere in the task prompt or follow-up messages):
  *   @write <path> :: <content>      write a file (\n decoded to newlines)
  *   @run <command...>               run a shell command in the world
- *   @subtask <title> :: <prompt>    spawn a child task
+ *   @subtask <title> :: <prompt>    spawn a child task (\n in <prompt> decoded to newlines)
  *   @subtaskwith <json> :: <title> :: <prompt>
  *                                   spawn a child task with create_sub_task `params`
  *   @branch <name> [:: <base>]      add another branch/PR to this task (multi-PR)
@@ -147,7 +147,7 @@ export class MockAdapter implements AgentAdapter {
           const [json, spec] = directive === 'subtaskwith' ? splitOn(rest, '::') : ['', rest];
           const [title, prompt = ''] = splitOn(spec, '::');
           try {
-            await ctx.createSubTask({ title: title.trim(), prompt: prompt.trim(), ...(json ? { params: JSON.parse(json) } : {}) });
+            await ctx.createSubTask({ title: title.trim(), prompt: prompt.trim().replace(/\\n/g, '\n'), ...(json ? { params: JSON.parse(json) } : {}) });
             outputs.push(`subtask: ${title.trim()}`);
           } catch (e: any) {
             // A refused create_sub_task is a tool error the agent reads, not a failed turn.

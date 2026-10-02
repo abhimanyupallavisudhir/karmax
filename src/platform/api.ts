@@ -1717,6 +1717,11 @@ export class KarmaxApi {
       projectId: task.projectId,
       title: task.title,
       project: (await this.deps.store.effectiveProjectConfig(project)),
+      // A sub-task's run is its parent's confirmer route and raise target. Every
+      // replacement (escalation, hold, stage move, recovery) starts here, and
+      // without this the new run took itself for a top-level task: its Review and
+      // input holds went to @creator and its parent was never told (task #456).
+      ...(task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}),
     });
     input.createdAt = task.createdAt;
     input.workflow = task.workflow;
