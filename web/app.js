@@ -3133,7 +3133,8 @@ function inboxEventChanges(ev) {
   return ev.type.includes('escalat')
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
-      'credential.approval-requested', 'credential.approval-resolved', 'connection.requested', 'connection.resolved',
+      'credential.approval-requested', 'credential.approval-resolved', 'credential.approval-dismissed',
+      'connection.requested', 'connection.resolved', 'connection.dismissed',
       'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
       'authorization.approval-requested', 'authorization.approval-resolved', 'authorization.approval-dismissed'].includes(ev.type);
 }
@@ -3431,7 +3432,7 @@ const LIST_RELOAD_EVENTS = new Set([
   'subtask.created',
   'task.responsibility-changed',
   'credential.approval-requested', 'connection.requested',
-  'credential.approval-resolved',
+  'credential.approval-resolved', 'credential.approval-dismissed', 'connection.dismissed',
   'permission.approval-requested',
   'permission.approval-resolved',
   'permission.approval-dismissed',
@@ -3506,7 +3507,7 @@ function patchSubTaskSummaryFromEvent(ev) {
 // An approval request carries no lifecycle fields to patch, and the child's
 // summary only learns its count from the server: refetch the open parent.
 function subTaskSummaryEventNeedsRefresh(ev) {
-  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved)$/.test(ev.type || '')) return false;
+  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved|dismissed)$/.test(ev.type || '')) return false;
   return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
 }
 
@@ -7170,8 +7171,8 @@ async function refreshTaskHistory(taskId) {
 const TASK_WALK_SETTLE_MS = 150;
 
 // Approval decisions load for the pages that show them: a task with pending
-// decisions (dismissed ones too: the conversation keeps them, because the agent
-// still waits), or its Approvals tab (UI-6). Vault item names only label
+// decisions (dismissed ones too: the agent still waits, so the tab can still
+// answer them), or its Approvals tab (UI-6). Vault item names only label
 // credential requests, so they load only when there are some.
 function showsTaskApprovals(view) {
   return !!(view.approvalRequests || view.pendingDecisions || S.taskTab === 'approvals');
@@ -8063,7 +8064,7 @@ function approvalRequestsTab(v) {
     return '<div class="task-approvals" id="task-approval-requests"><span class="global-search-loading">Loading…</span></div>';
   }
   const pending = [...S.approvalRequests, ...S.permissionRequests, ...(S.authorizationRequests || [])]
-    .filter((request) => request.status === 'pending' && !request.dismissed).length + (S.connections || []).filter(c => ['requested', 'connecting'].includes(c.status)).length;
+    .filter((request) => request.status === 'pending' && !request.dismissed).length + (S.connections || []).filter(c => ['requested', 'connecting'].includes(c.status) && !c.dismissed).length;
   return `<div class="task-approvals" id="task-approval-requests">
     <div class="approval-page-head">
       <div><div class="section-h">Approval Requests</div>
@@ -8083,11 +8084,12 @@ function approvalRequestsTab(v) {
 }
 
 // Keep decisions in the conversation only while they still need attention.
-// Dismissal silences a notification; it does not resolve the underlying request.
+// Dismissal ignores a request without resolving it: it leaves the conversation
+// and notifications, and stays answerable on the Approval Requests tab.
 function conversationApprovalRequests() {
-  const pending = (requests) => (requests || []).filter((request) => request.status === 'pending');
+  const pending = (requests) => (requests || []).filter((request) => request.status === 'pending' && !request.dismissed);
   const connections = (S.connections || []).filter((connection) =>
-    ['requested', 'connecting', 'expired'].includes(connection.status) || connection.disconnectPending);
+    ['requested', 'connecting', 'expired'].includes(connection.status) && !connection.dismissed || connection.disconnectPending);
   const rows = connectionRows(connections, true)
     + permissionRequestRows(pending(S.permissionRequests))
     + authorizationRequestRows(pending(S.authorizationRequests))
@@ -15600,12 +15602,13 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
     ? pending.map((request) => {
       const bound = request.itemId ? undefined : credentialRequestBindings.get(request.id);
       const unbound = !request.itemId && !bound;
-      return `<div class="approval-request" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
+      return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
         <div class="approval-request-main">
           <div class="approval-request-title">${request.itemId
             ? esc(itemLabel(request.itemId))
             : `${esc(request.domain || '?')} <span class="chip approval-needed">not in vault</span>`}
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
+            ${request.dismissed ? '<span class="chip">dismissed</span>' : ''}
           </div>
           <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
@@ -15629,6 +15632,7 @@ This task: Approves the operation and grants this task the credential across tur
 Always: Does the same as “This task” and sets this credential’s ${request.mode === 'reveal' ? '“agent sees”' : '“blind use”'} policy to “auto” until changed. The other policy stays unchanged. Future tasks still need a grant for this credential; it is not automatically included in every task. Task-specific policy overrides still apply.
 
 Deny: Rejects this request.`, '?')}
+          ${request.dismissed ? '' : '<button class="btn sm" data-vreq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>'}
         </div>
       </div>`;
     }).join('')
@@ -15768,6 +15772,11 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
         method: 'POST',
         body: JSON.stringify({ action: button.dataset.vreqAct, itemId }),
       });
+      if (button.dataset.vreqAct === 'dismiss') {
+        toast('Request dismissed');
+        await onResolved?.(result);
+        return;
+      }
       credentialRequestBindings.delete(row.dataset.vreq);
       const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
       toast(result.resume?.resumed ? `${decision} — task resumed automatically`
@@ -15808,8 +15817,9 @@ function connectionRows(connections, inTask = false) {
     const canConnect = !c.ownerId || own;
     const status = { requested: c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
     const projects = S.projects.filter(p => p.organizationId === c.organizationId);
-    return `<div class="approval-request" data-connection="${esc(c.id)}">
-      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span></div>
+    const open = !!c.taskId && ['requested', 'connecting', 'expired'].includes(c.status);
+    return `<div class="approval-request${open && c.dismissed ? ' approval-request-dismissed' : ''}" data-connection="${esc(c.id)}">
+      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ' <span class="chip">dismissed</span>' : ''}</div>
         ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
         <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
         ${own && !inTask ? `<details><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
@@ -15822,6 +15832,7 @@ function connectionRows(connections, inTask = false) {
         ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
         ${own && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
         ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+        ${canConnect && open && !c.dismissed ? '<button type="button" class="btn sm" data-connection-action="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
       </div></div>`;
   }).join('');
 }
@@ -15861,6 +15872,7 @@ function wireConnectionActions(root, organizationId, refresh) {
       } else {
         const body = action === 'access' ? { projectIds: [...row.querySelectorAll('input:checked')].map(input => input.value) } : {};
         await api(`/api/connections/${encodeURIComponent(id)}/${action}${oq}`, { method: action === 'access' ? 'PUT' : 'POST', body: JSON.stringify(body) });
+        if (action === 'dismiss') toast('Request dismissed');
         await refresh();
       }
     } catch (e) { popup?.close(); toast(e.message, true); }

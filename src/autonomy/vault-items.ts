@@ -128,6 +128,8 @@ export interface CredentialAccessRequest {
   why?: string;
   status: 'pending' | 'granted' | 'denied';
   resolution?: { action: 'once' | 'task' | 'always' | 'deny'; by: string; at: number };
+  /** Silenced by a human: off their notifications, still pending for the agent. */
+  dismissed?: { by: string; at: number };
   createdAt: number;
   /** Human-facing task metadata added by the gateway; never persisted in the
    * organization-scoped request record. */
@@ -839,6 +841,22 @@ export class VaultItems {
     req.resolution = { action: args.action, by: args.by, at: Date.now() };
     (await this.saveRequests(all));
     (await this.store.appendAudit({ principalId: args.by, action: 'vault.request.resolved', detail: { requestId, taskId: req.taskId, itemId: req.itemId, action: args.action } }));
+    return req;
+
+    });
+  }
+
+  /** Silence a parked request without answering it: the agent is not told and
+   * keeps waiting, and the request can still be granted or denied later. */
+  async dismiss(requestId: string, by: string): Promise<CredentialAccessRequest> {
+    return this.store.transaction(async () => {
+    const all = (await this.requests());
+    const req = all.find((r) => r.id === requestId);
+    if (!req) throw new Error(`no credential request ${requestId}`);
+    if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
+    req.dismissed ??= { by, at: Date.now() };
+    (await this.saveRequests(all));
+    (await this.store.appendAudit({ principalId: by, action: 'vault.request.dismissed', detail: { requestId, taskId: req.taskId } }));
     return req;
 
     });

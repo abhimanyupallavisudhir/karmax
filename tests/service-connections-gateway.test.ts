@@ -48,7 +48,7 @@ describe('connection gateway flow', () => {
       active: async () => live, session: async () => 'private-session',
       tools: async () => [{ slug: 'GMAIL_FETCH_EMAILS', name: 'Fetch mail', inputParameters: { type: 'object' } }], execute, disconnect: async () => {} };
     service = new ServiceConnections(store, broker, () => backend, openMcp); await service.configure('secret-api-key');
-    const client = { workflow: { getHandle: () => ({ signal, query: async () => ({ status: 'waiting', stage: 'do' }) }) } } as any;
+    const client = { workflow: { getHandle: () => ({ signal, query: async () => ({ status: 'waiting', stage: 'do', actions: [] }) }) } } as any;
     const worlds = new WorldRegistry();
     const api = new KarmaxApi({ store, tokens, client, worlds, taskQueue: 'test', contentDir: home });
     const gateway = (await Gateway.create({ store, tokens, api, client, worlds, broker, serviceConnections: service,
@@ -207,6 +207,44 @@ describe('connection gateway flow', () => {
     const response = await request(`/api/connections/${pending.id}/disconnect?organizationId=${org}`, { method: 'POST', body: {} });
     expect(response.status).toBe(200);
     expect((await service.pending(taskId))).toHaveLength(0);
+  });
+  it.each(['connection', 'credential'])('dismisses a %s request without notifying the agent, leaving it answerable', async (kind) => {
+    const task = (await store.createTask({ projectId: project, title: `Dismiss ${kind}`, workflow: 'just-do', workflowVersion: '1.0.0',
+      params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'alice' } }));
+    const token = (await tokens.mint({ taskId: task.id, profileId: 'developer', role: 'do', principal: 'user:alice', projectId: project,
+      organizationId: org, ceiling: ['task:read', 'credential:read', 'connection:use'], grantorCaps: ['task:read', 'credential:read', 'connection:use'] })).token;
+    let id: string; let resolve: (action: string) => Promise<Response>;
+    if (kind === 'connection') {
+      id = (await (await request('/api/connections/request', { token, method: 'POST', body: { toolkit: 'notion', why: 'Read notes' } })).json() as any).connection.id;
+      resolve = (action) => request(`/api/connections/${id}/${action}?organizationId=${org}`, { method: 'POST', body: {} });
+    } else {
+      const item: any = await (await request(`/api/vault/items?organizationId=${org}`, { method: 'POST', body: {
+        type: 'login', label: 'Dismissable', domains: 'dismiss.example.com', policy: { use: 'ask', reveal: 'ask' }, secrets: { password: 'pw' } } })).json();
+      const asked: any = await (await request('/api/vault/requests', { token, method: 'POST', body: { itemId: item.id, why: 'Sign in' } })).json();
+      expect(asked.status).toBe('needs_approval');
+      id = asked.requestId;
+      resolve = (action) => request(`/api/vault/requests/${id}/resolve?organizationId=${org}`, { method: 'POST', body: { action } });
+    }
+    const view = async () => (await (await request(`/api/tasks/${task.id}`)).json()) as any;
+    expect(await view()).toMatchObject({ approvalRequests: 1, pendingDecisions: 1 });
+    const signals = signal.mock.calls.length;
+    const dismissed = await resolve('dismiss');
+    expect(dismissed.status).toBe(200);
+    expect(await dismissed.json()).toMatchObject({ dismissed: { by: expect.stringContaining('alice') } });
+    expect(await view()).toMatchObject({ pendingDecisions: 1 });
+    expect(await view()).not.toHaveProperty('approvalRequests');
+    const events = (await store.eventsSince(task.id, 0)).map((event) => event.type);
+    expect(events).toContain(kind === 'connection' ? 'connection.dismissed' : 'credential.approval-dismissed');
+    expect(events).not.toContain('conversation.message');
+    expect(signal.mock.calls.length).toBe(signals);
+    // Dismissal only silences the ask: it can still be answered later.
+    expect((await resolve(kind === 'connection' ? 'disconnect' : 'deny')).status).toBe(200);
+    expect(await view()).not.toHaveProperty('pendingDecisions');
+  });
+  it('lets only the owner or a task editor dismiss a connection request', async () => {
+    const pending = (await service.request(org, 'linear', otherTask, 'do', 'Read issues'));
+    expect((await request(`/api/connections/${pending.id}/dismiss?organizationId=${org}`, { token: agent, method: 'POST', body: {} })).status).toBe(403);
+    expect((await request(`/api/connections/${pending.id}/dismiss?organizationId=${org}`, { user: 'eve', method: 'POST', body: {} })).status).toBe(403);
   });
   it('keeps provider configuration installation-scoped and write-only', async () => {
     expect(routeCapability('PUT', '/api/connections/config')).toBe('settings:write');

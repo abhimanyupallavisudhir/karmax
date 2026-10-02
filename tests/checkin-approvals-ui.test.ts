@@ -33,11 +33,17 @@ describe('check-in pending decisions', () => {
     c.S.connections[0].status = 'active';
     expect(c.conversationApprovalRequests()).toBe('');
   });
-  it('keeps dismissed requests actionable and reconnects visible', () => {
+  it('leaves dismissed requests out of the conversation and keeps reconnects visible', () => {
     const c = setup();
-    c.S.permissionRequests = [{ id: 'permission', status: 'pending', dismissed: { by: 'user' }, capabilities: [], audience: [] }];
-    expect(c.conversationApprovalRequests()).toContain('data-preq-act="approve"');
+    const dismissed = { by: 'user', at: 1 };
+    c.S.approvalRequests = [{ id: 'vault', itemId: 'item', status: 'pending', dismissed }];
+    c.S.permissionRequests = [{ id: 'permission', status: 'pending', dismissed, capabilities: [], audience: [] }];
+    c.S.authorizationRequests = [{ id: 'authorization', status: 'pending', dismissed, recipients: ['user'], target: { kind: 'task' }, audience: [] }];
+    c.S.connections = [{ id: 'connection', status: 'requested', dismissed }];
+    expect(c.conversationApprovalRequests()).toBe('');
+    c.S.approvalRequests = [];
     c.S.permissionRequests = [];
+    c.S.authorizationRequests = [];
     for (const status of ['requested', 'connecting', 'expired']) {
       c.S.connections = [{ id: 'connection', status }];
       expect(c.conversationApprovalRequests()).toContain('data-connection');
