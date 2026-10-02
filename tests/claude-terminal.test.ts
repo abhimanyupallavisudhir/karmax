@@ -43,6 +43,7 @@ import { ProviderFailure, isTransportError } from '../src/agent/limits.js';
 import { remoteAgentHomeRelative } from '../src/agent/remote-process.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
 import { controlClient } from './helpers/control-server.js';
+import { pendingTimers } from './helpers/pending-timers.js';
 
 const input: any = {
   profile: { id: 'p', name: 'claude', provider: 'claude', role: 'do', capabilities: [] },
@@ -91,6 +92,7 @@ describe('Claude Agent SDK terminal outcome contract', () => {
 
   it('retries a silent SDK startup without waiting for the 45-minute activity timeout', async () => {
     vi.useFakeTimers();
+    const pending = pendingTimers(/src[\\/]agent[\\/]/);
     // A lost startup can leave next() pending even after the SDK is aborted.
     sdkState.run = async function* () { await new Promise(() => {}); };
     let failure: any;
@@ -110,12 +112,13 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       expect(diagnostic).toMatchObject({ kind: 'error', phase: 'failed', title: 'Agent startup stalled' });
       expect(JSON.parse(diagnostic.detail)).toMatchObject({ version: 1, remote: false, process: 'not-observed' });
       await turn;
-      expect(vi.getTimerCount()).toBe(0);
+      expect(pending()).toBe(0);
     } finally { vi.useRealTimers(); }
   });
 
   it('removes the startup deadline after the first SDK event, including during quiet work', async () => {
     vi.useFakeTimers();
+    const pending = pendingTimers(/src[\\/]agent[\\/]/);
     let finish!: () => void;
     const working = new Promise<void>(resolve => { finish = resolve; });
     sdkState.run = async function* () {
@@ -131,7 +134,7 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       expect(sdkState.options.abortController.signal.aborted).toBe(false);
       finish();
       expect((await turn).termination.kind).toBe('success');
-      expect(vi.getTimerCount()).toBe(0);
+      expect(pending()).toBe(0);
     } finally { vi.useRealTimers(); }
   });
 

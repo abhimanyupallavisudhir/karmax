@@ -281,6 +281,7 @@
   "tests/passkey.test.ts": 0,
   "tests/payment-controls-ui.test.ts": 0,
   "tests/payments.test.ts": 1.1,
+  "tests/pending-timers.test.ts": 0.2,
   "tests/permission-requests.test.ts": 0.2,
   "tests/phase-e.test.ts": 8.7,
   "tests/pipeline-recovery.test.ts": 180,

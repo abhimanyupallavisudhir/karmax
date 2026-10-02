@@ -153,11 +153,17 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
     // the child raises for confirmation and the parent surfaces it, then parks
     await parentSawRaise(handle, 'needs_confirmation');
 
-    const agentTurns = async () => ((await view(handle)).messages as any[]).filter((m) => m.role === 'agent').length;
-    const before = await agentTurns();
     // Without ANY human input, the parent must take further Do turns (nagging itself)
     // rather than sitting frozen — proof it is not dead-parked on an unwakeable wait.
-    await expect.poll(agentTurns, { timeout: 20_000, interval: 500 }).toBeGreaterThan(before);
+    // Count from the raise, not from when this test samples: the reminders are
+    // bounded (three, then a human is asked), and a slow runner can sample after
+    // all of them (master CI #1416).
+    const turnsSinceRaise = async () => {
+      const msgs = (await view(handle)).messages as any[];
+      const raised = msgs.findLastIndex((m) => m.role === 'user' && m.text.includes('needs_confirmation'));
+      return msgs.slice(raised + 1).filter((m) => m.role === 'agent').length;
+    };
+    await expect.poll(turnsSinceRaise, { timeout: 20_000, interval: 500 }).toBeGreaterThan(1);
 
     // and it is still fully redirectable: the human (or a real agent) answers, and the
     // parent proceeds normally to its own Review and merges the stacked work.

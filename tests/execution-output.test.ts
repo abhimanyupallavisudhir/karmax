@@ -3,6 +3,7 @@ import { ExecutionOutput, EXECUTION_OUTPUT_BYTES } from '../src/gateway/executio
 import { utf8Tail } from '../src/util/utf8-tail.js';
 import { Store } from '../src/store/db.js';
 import { ReviewActionRunner } from '../src/gateway/review-actions.js';
+import { pendingTimers } from './helpers/pending-timers.js';
 
 function gate() {
   let release!: () => void;
@@ -37,6 +38,7 @@ it('coalesces a noisy stream behind one write and drains its bounded UTF-8 tail'
 
 it('retries a failed bounded tail without unhandled rejections, then drains on close', async () => {
   vi.useFakeTimers();
+  const pending = pendingTimers(/src[\\/]gateway[\\/]execution-output/);
   const error = new Error('storage unavailable');
   const persist = vi.fn().mockRejectedValueOnce(error).mockResolvedValue(undefined);
   const report = vi.fn();
@@ -49,18 +51,19 @@ it('retries a failed bounded tail without unhandled rejections, then drains on c
   await writer.close();
   expect(report).toHaveBeenCalledWith(error);
   expect(persist.mock.calls.map(call => call[0])).toEqual(['before', 'beforeafter']);
-  expect(vi.getTimerCount()).toBe(0);
+  expect(pending()).toBe(0);
 });
 
 it('reports a drain failure and cancels its retry timer on shutdown', async () => {
   vi.useFakeTimers();
+  const pending = pendingTimers(/src[\\/]gateway[\\/]execution-output/);
   const persist = vi.fn(async () => { throw new Error('offline'); });
   const writer = new ExecutionOutput(persist, () => {});
   writer.append('kept');
   await expect(writer.close()).rejects.toThrow('offline');
   await vi.advanceTimersByTimeAsync(5000);
   expect(persist).toHaveBeenCalledTimes(1);
-  expect(vi.getTimerCount()).toBe(0);
+  expect(pending()).toBe(0);
 });
 
 it('keeps oversized newest frames within the durable reconnect budget', async () => {
