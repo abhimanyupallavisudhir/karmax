@@ -225,6 +225,8 @@ describe('unreferenced object inventory', () => {
     await store.kvSet('checkpoint-gc:checkpoint_pruned', JSON.stringify({ worldId: 'task_a', objectKey: 'checkpoints/org_a/proj_a/task_a/checkpoint_pruned.bin' }));
     await run(`INSERT INTO promoted_artifacts (id, organizationId, projectId, taskId, objectKey, sha256, bytes, mediaType, name, createdAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 'art_live', 'org_a', 'proj_a', 'task_a', 'artifacts/org_a/proj_a/task_a/art_live', 'x', 1, 'text/plain', 'a', 1);
+    await run(`INSERT INTO conversation_exports (objectKey, organizationId, projectId, taskId, role, exportId, bytes, createdAt, usedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, 'conversation-exports/task_a/do/x.json', 'org_a', 'proj_a', 'task_a', 'do', 'x', 5, 1, 1);
     await store.kvSet('resource-upload:upload_live', JSON.stringify({ id: 'upload_live', files: { f: { parts: [{ objectKey: 'resource-uploads/org_a/upload_live/f/0.bin' }] } } }));
     await store.close();
     return file;
@@ -249,6 +251,7 @@ describe('unreferenced object inventory', () => {
       object('resource-uploads/org_a/upload_live/f/0.bin'),
       object('resource-uploads/org_a/upload_old/f/0.bin', 70),
       object('conversation-exports/task_a/do/x.json', 5),
+      object('conversation-exports/task_gone/do/y.json', 90),
       object('something-else/x', 80),
     ], references);
     const family = (name: string) => report.families.find((entry) => entry.family === name)!;
@@ -260,9 +263,10 @@ describe('unreferenced object inventory', () => {
     expect(family('checkpoint').reasons).toEqual({ 'pending checkpoint GC': { count: 1, bytes: 40 }, 'no checkpoint row': { count: 1, bytes: 50 } });
     expect(family('artifact')).toMatchObject({ referenced: { count: 1 }, unreferenced: { count: 1, bytes: 60 } });
     expect(family('resource upload part')).toMatchObject({ referenced: { count: 1 }, unreferenced: { count: 1, bytes: 70 } });
-    expect(family('conversation export')).toMatchObject({ untracked: { count: 1, bytes: 5 } });
+    expect(family('conversation export')).toMatchObject({ referenced: { count: 1, bytes: 5 }, unreferenced: { count: 1, bytes: 90 } });
+    expect(family('conversation export').reasons).toEqual({ 'no export row': { count: 1, bytes: 90 } });
     expect(family('unknown')).toMatchObject({ untracked: { count: 1, bytes: 80 } });
-    expect(report.unreferenced).toEqual({ count: 7, bytes: 100 + 50 + 90 + 60 + 70 });
+    expect(report.unreferenced).toEqual({ count: 8, bytes: 100 + 50 + 90 + 60 + 70 + 90 });
     // Chunks referenced from customer buckets live there, not in the managed store.
     expect(references.chunks.has('org_a/customer')).toBe(false);
     const text = formatInventory(report);
