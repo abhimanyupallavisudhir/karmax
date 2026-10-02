@@ -15,8 +15,10 @@ const deflate = promisify(gzip);
 const inflate = promisify(gunzip);
 
 /** Policy, not memory: capture and restore stream one chunk at a time, so
- * these bound how long a park may take and what one task may store. The
- * organization's storage quota is enforced chunk by chunk as bytes are kept. */
+ * these bound how long a park may take and what one task may store. Chunks
+ * count toward the organization's plan storage quota but are never refused
+ * for it; an over-quota organization gets a notice after pruning
+ * (wiki features/managed-storage). */
 export const CHECKPOINT_LIMITS = {
   files: 100_000,
   fileBytes: 16 * 1024 ** 3,
