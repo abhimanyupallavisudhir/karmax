@@ -6711,6 +6711,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         if (draftMode) closeTask();
         else {
           S.attemptGroup = null; // its cached record still says draft
+          // The page under the form was rendered while it was a draft; never
+          // show it for a frame while the task list reloads.
+          renderTaskLoadingPage(taskRecord(draft.id) || draft);
           await refreshTasks();
           if (S.selected === draft.id) {
             history.replaceState({ kx: 1 }, '', taskUrl(draft.id));
