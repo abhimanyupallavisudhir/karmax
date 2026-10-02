@@ -916,6 +916,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .subtask-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
 .subtask-title .task-num { flex: none; font-size: 11px; }
 .subtask-copy { color: var(--ink-3); font-size: 11px; }
+.subtask-copy .chip, .fork-state .chip { margin-left: 4px; padding: 0 6px; font-size: 10px; line-height: 16px; }
 .subtask-pipeline .pipeline .seg { width: 16px; height: 4px; }
 .subtask-pipeline .pipeline .ponr { width: 7px; height: 7px; }
 .subtask-arrow { color: var(--ink-3); font-size: 20px; line-height: 1; transition: transform .12s, color .12s; }

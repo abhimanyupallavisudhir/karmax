@@ -3483,6 +3483,13 @@ function patchSubTaskSummaryFromEvent(ev) {
   return !!summary && patchLifecycleView(summary, ev);
 }
 
+// An approval request carries no lifecycle fields to patch, and the child's
+// summary only learns its count from the server: refetch the open parent.
+function subTaskSummaryEventNeedsRefresh(ev) {
+  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved)$/.test(ev.type || '')) return false;
+  return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
+}
+
 function patchTaskListFromEvent(ev) {
   if (ev.type !== 'view.updated' || !ev.taskId) return false;
   const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
@@ -3565,6 +3572,7 @@ function connectWs() {
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
     if (S.selected && ev.taskId !== S.selected && patchSubTaskSummaryFromEvent(ev)) scheduleTaskPageRender();
+    if (S.selected && ev.taskId !== S.selected && subTaskSummaryEventNeedsRefresh(ev)) refreshTask('subtask.approval');
     if (S.selected && ev.taskId !== S.selected
       && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
       && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask('attempt.sibling'); // its card, not our details
@@ -8794,32 +8802,33 @@ function parentTaskContext(v) {
   </button>`;
 }
 
-// Turn workflow vocabulary into the one short state phrase a person needs while
-// scanning delegated work. The pipeline still carries exact stage progression;
-// this copy carries meaning.
+// A child reads exactly as it does in the task list and on its own page: the
+// same stage label, the same status colour, the same "approval needed" flag. A
+// second vocabulary here ("In progress", "Ready to return") drifted from the
+// child's real state — "Waiting · working", "Ready to return" for a child the
+// parent had already approved, "In progress" for one waiting on an approval.
 function subTaskState(rec) {
   const v = rec?.lastView || {};
-  const status = v.status || 'active';
-  const stage = v.stage || 'setup';
-  if (status === 'done' || stage === 'done') return { label: 'Complete', tone: 'done', complete: true };
-  if (status === 'failed') return { label: 'Failed', tone: 'failed', complete: false };
-  if (status === 'cancelled') return { label: 'Cancelled', tone: 'cancelled', complete: false };
-  if (stage === 'escalated' || status === 'blocked') return { label: 'Needs direction', tone: 'blocked', complete: false };
-  if (stage === 'review') return { label: 'Ready to return', tone: 'waiting', complete: false };
-  if (v.waitingFor?.kind === 'parent') return { label: 'Waiting on parent', tone: 'waiting', complete: false };
-  if (status === 'waiting') return { label: 'Waiting', tone: 'waiting', complete: false };
-  return { label: 'In progress', tone: 'active', complete: false };
+  const done = v.status === 'done' || v.stage === 'done';
+  const tone = v.state?.draft ? 'draft' : done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
+  return { label: stageLabel(v), tone, complete: done, approval: !!v.approvalRequests };
+}
+
+function subTaskStateHtml(state, className) {
+  return `<span class="${className}">${esc(state.label)}${state.approval ? ' <span class="chip approval-needed">approval needed</span>' : ''}</span>`;
 }
 
 function subTasksSection(v) {
   // Every child the store records, not only those the current run spawned (a
   // replaced run forgets children that had already settled). A finished child is
-  // archived out of the live list, so the parent's view carries its summary.
+  // archived out of the live list, so the parent's view carries its summary —
+  // fetched with the parent and patched from the child's events, so it wins over
+  // any other copy of the child the console happens to hold.
   const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
   const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])];
   if (!ids.length) return '';
   const children = ids.map((id) => {
-    const rec = taskRecord(id) || summaries.get(id);
+    const rec = summaries.get(id) || taskRecord(id);
     const state = subTaskState(rec);
     return { id, rec, state };
   });
@@ -8832,7 +8841,7 @@ function subTasksSection(v) {
       <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
       <span class="subtask-identity">
         <span class="subtask-title">${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}<strong>${esc(title)}</strong></span>
-        <span class="subtask-copy">${esc(state.label)} <span aria-hidden="true">·</span> ${esc(stageLabel(childView))}</span>
+        ${subTaskStateHtml(state, 'subtask-copy')}
       </span>
       <span class="subtask-pipeline" aria-hidden="true">${pipeline(childView)}</span>
       <span class="subtask-arrow" aria-hidden="true">›</span>
@@ -8895,7 +8904,7 @@ function agentForksSection(v) {
         <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
         <span class="fork-identity">
           <span class="fork-title">${task.num != null ? `<span class="task-num">#${task.num}</span>` : ''}<strong>${esc(task.title)}</strong></span>
-          <span class="fork-state">${esc(state.label)}</span>
+          ${subTaskStateHtml(state, 'fork-state')}
         </span>
         <span class="fork-arrow" aria-hidden="true">›</span>
       </a>
@@ -16209,7 +16218,7 @@ async function wireVaultCards(organizationId) {
     overlay.className = 'modal-overlay';
     let profileData = { profiles: [], defaultProfile: null };
     try { profileData = await api(`/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`); } catch {}
-    const storeFields = () => `      <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="git@github.com:you/password-store.git" autocomplete="off" /></div>
+    const storeFields = () => `      <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="https://github.com/you/password-store" autocomplete="off" /></div>
       <div class="form-row"><label>Password-store path in repository <span class="task-sub">(optional; auto-detected)</span></label><input class="git-pass-path" placeholder=".password-store" autocomplete="off" /></div>
       <div class="form-row"><label>Git profile <span class="task-sub">(used for private clone and push)</span></label><select class="git-pass-profile">
         <option value="">Organization default${profileData.defaultProfile ? ` — ${esc(profileData.defaultProfile)}` : ''}</option>

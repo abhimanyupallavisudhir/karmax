@@ -3412,8 +3412,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         let current = (await store.currentWorld(handle.id)) as WorldHandle;
         // Capacity admission cannot hold the transition lock: an existing
         // accessor may need that lock to release the capacity we are awaiting.
-        const prepared = deps.checkpoints && isRemote(current.kind) && worldRepos(current).length
-          ? await openWorld(current, current.id) : undefined;
+        // A remote world is opened even without repositories: a paused E2B
+        // sandbox keeps its processes, so its jobs must be stopped first.
+        const remote = isRemote(current.kind) ? await openWorld(current, current.id) : undefined;
         const suspend = async () => {
           if (!(await valid())) return;
           current = (await store.currentWorld(handle.id)) as WorldHandle;
@@ -3423,13 +3424,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           };
           await idle();
           // Cancelling stops the task's durable jobs as well as its agent.
-          const live = prepared ?? (isRemote(current.kind) ? undefined : await worlds.open(current));
-          if (live) await stopJobs(live).catch(() => undefined);
+          await stopJobs(remote ?? await worlds.open(current)).catch(() => undefined);
           if (deps.checkpoints) {
-            if (prepared) {
+            if (remote && worldRepos(current).length) {
               const projectId = String(current.meta?.projectId ?? '');
               if ((await store.listProjectRepositories(projectId)).length) {
-                const pushed = await publishTaskBranch(prepared, current.id);
+                const pushed = await publishTaskBranch(remote, current.id);
                 if (pushed.skipped.length)
                   throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
               }
