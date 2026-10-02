@@ -152,3 +152,29 @@ it('rejects arbitrary hosted Git transport hosts (AU-16)', async () => {
     'org', undefined, undefined, { hosted: true });
   await expect(connector.list()).rejects.toThrow(/hosted.*Git|public/);
 });
+
+it('fetches SSH-form GitHub, GitLab and Bitbucket stores over HTTPS when hosted', async () => {
+  const hosted = (repositoryUrl: string, repositoryCredential?: (url: string) => Promise<undefined>) =>
+    new GitPassConnector(() => JSON.stringify({ repositoryUrl, gpgPrivateKey: 'key' }), 'org', undefined,
+      fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-pass-state-')), { hosted: true, repositoryCredential });
+  for (const [repositoryUrl, https] of [
+    ['git@github.com:srajma/password-store.git', 'https://github.com/srajma/password-store.git'],
+    ['ssh://git@github.com/srajma/password-store', 'https://github.com/srajma/password-store'],
+    ['git@gitlab.com:group/sub/store.git', 'https://gitlab.com/group/sub/store.git'],
+    ['ssh://git@bitbucket.org:22/team/store.git', 'https://bitbucket.org/team/store.git'],
+  ]) {
+    expect((await hosted(repositoryUrl!).describe()).detail).toBe(`connected to ${https}`);
+    // The brokered GitHub App credential is looked up by, and git clones, the HTTPS URL.
+    const fetched: string[] = [];
+    await expect(hosted(repositoryUrl!, async (url) => { fetched.push(url); throw new Error('stop'); }).list()).rejects.toThrow();
+    expect(fetched).toEqual([https]);
+  }
+});
+
+it('names the accepted form instead of "Invalid URL" for a hosted store URL it cannot read', async () => {
+  for (const repositoryUrl of ['github.com/srajma/password-store', 'git@example.com:you/store.git', 'ssh://git@github.com:2222/you/store.git']) {
+    const info = await new GitPassConnector(() => JSON.stringify({ repositoryUrl, gpgPrivateKey: 'key' }),
+      'org', undefined, undefined, { hosted: true }).describe();
+    expect(info).toMatchObject({ available: false, detail: expect.stringMatching(/hosted.*https:\/\/github\.com\//i) });
+  }
+});

@@ -240,7 +240,7 @@ try {
   };
   const refused = await connectFromBrowser();
   assert.equal(refused.status(), 400);
-  assert.match(await refused.text(), /hosted Git password stores require public/);
+  assert.match(await refused.text(), /hosted Git password stores need a GitHub, GitLab or Bitbucket URL/);
   assert.equal(requests.length, 0, 'hosted rejection must happen before contacting the private Git server');
   // A private HTTPS remote is supported only on the self-hosted deployment.
   await hostedGateway.close();
