@@ -9916,13 +9916,14 @@ function localConversationHandoff(v, cwd, portable = false, preparedSessions = S
 
 // The Work-locally dialogs share one frame: a loading state while `load()` runs,
 // then `render(data)`'s body, with close, copy and conversation downloads wired.
+// The body scrolls under a fixed header so tall plans fit any screen.
 // Resolves to { host, data }, or null when the load failed or the dialog closed.
 async function localHandoffDialog({ loading, load, title = () => 'Work locally', render }) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
   const show = (heading, body) => {
     host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">${heading} <span class="q-spacer"></span><button class="icon-btn local-handoff-close" aria-label="Close">✕</button></div>
-    ${body}
+    <div class="local-handoff-body">${body}</div>
   </div></div>`;
     host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
     host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
