@@ -1064,10 +1064,17 @@ export function platformToolHandlers(
         const missing = before.filter((job) => job.state === 'missing').map((job) => job.id);
         if (missing.length) return `error: no such job: ${missing.join(', ')}`;
         const running = before.filter((job) => job.state === 'running').map((job) => job.id);
-        await stopJobs(world, running);
+        // An exited job may still have left processes running (`server &`).
+        const stops = new Map((await stopJobs(world, ids)).map((stop) => [stop.id, stop]));
         const after = new Map((await jobStatuses(world, running)).map((job) => [job.id, job.state]));
-        return ids.map((id) => !running.includes(id) ? `${id} had already stopped.`
-          : after.get(id) === 'running' ? `${id} is still running.` : `Stopped ${id}.`).join('\n');
+        return before.map(({ id, state }) => {
+          const { processes = 0, survivors = [] } = stops.get(id) ?? {};
+          if (survivors.length) return `${id}: ${survivors.length === 1 ? 'process' : 'processes'} ${survivors.join(', ')} survived SIGKILL.`;
+          if (running.includes(id)) return after.get(id) === 'running' ? `${id} is still running.` : `Stopped ${id}.`;
+          return processes
+            ? `${id} had already ${state === 'exited' ? 'exited' : 'stopped'}; ended the ${processes} ${processes === 1 ? 'process' : 'processes'} it left running.`
+            : `${id} had already stopped.`;
+        }).join('\n');
       } catch (e: any) {
         return `error: ${e?.message ?? e}`;
       }

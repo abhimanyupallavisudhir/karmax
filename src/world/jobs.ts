@@ -27,6 +27,11 @@ import { ensureWorldExcluded } from './secret-exclude.js';
  * So any later activity — after a worker restart, a sandbox pause, or a new
  * turn — can learn its state with one `exec`, for every world kind alike.
  * `.karmax-injection/` is excluded from git and from checkpoints.
+ *
+ * Every process of a job carries `KARMAX_JOB=<id>` in its environment. That,
+ * not the process tree, is what `stopJobs` follows: a process keeps it after
+ * `setsid`, a double fork, or the death of every ancestor, and nothing else in
+ * the world has it.
  */
 
 export const JOB_ROOT = '.karmax-injection/jobs';
@@ -75,7 +80,7 @@ cat > "$d/command"
 [ -z "$name" ] || printf '%s\n' "$name" > "$d/name"
 printf '%s\\n' "$cwd" > "$d/cwd"; date +%s > "$d/started"
 cd -- "$cwd"
-setsid bash -c 'd=$1; echo $$ > "$d/pid.tmp"; cut -d" " -f22 /proc/$$/stat > "$d/pidstart" 2>/dev/null || true
+KARMAX_JOB=$id setsid bash -c 'd=$1; echo $$ > "$d/pid.tmp"; cut -d" " -f22 /proc/$$/stat > "$d/pidstart" 2>/dev/null || true
   mv -f "$d/pid.tmp" "$d/pid"
   bash "$d/command" > "$d/log" 2>&1 < /dev/null; c=$?
   date +%s > "$d/ended"; echo "$c" > "$d/exit.tmp"; mv -f "$d/exit.tmp" "$d/exit"' karmax-job "$d" > /dev/null 2>&1 < /dev/null &
@@ -174,21 +179,69 @@ export async function listJobs(world: World): Promise<string[]> {
   return result.stdout.split('\n').map((line) => line.trim()).filter(isJobId);
 }
 
+// `members` prints "pid job" for every live process of the listed jobs: the
+// job's session while its leader runs, and anything carrying its cookie (which
+// also finds what an exited job left behind). Escalation follows every one of
+// them, not the session leader: a leader that dies on SIGTERM at once must not
+// spare a child that catches it (#466: a Vitest worker running Temporal, whose
+// Runtime traps SIGTERM, outlived two stop_job calls).
 const STOP = `${ALIVE}
-live=""
-for id in "$@"; do d=${JOB_ROOT}/$id; [ -f "$d/exit" ] && continue
-  if alive "$d"; then p=$(cat "$d/pid"); kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true; live="$live $id"; fi
+ids=" "; cookies=""; sessions=""
+for id in "$@"; do d=${JOB_ROOT}/$id; [ -d "$d" ] || continue
+  ids="$ids$id "; cookies="$cookies -e KARMAX_JOB=$id"
+  if [ ! -f "$d/exit" ] && alive "$d"; then sessions="$sessions $(cat "$d/pid"):$id"; fi
 done
-i=0; while [ -n "$live" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); next=""
-  for id in $live; do alive "${JOB_ROOT}/$id" && next="$next $id"; done; live=$next; done
-for id in $live; do p=$(cat "${JOB_ROOT}/$id/pid"); kill -KILL -- "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null || true; done`;
+[ -n "$cookies" ] || exit 0
+members() {
+  if [ -n "$sessions" ]; then for f in /proc/[0-9]*/stat; do
+    { read -r s < "$f"; } 2>/dev/null || continue
+    set -- \${s##*) }; [ "$1" = Z ] && continue
+    for e in $sessions; do [ "$4" = "\${e%%:*}" ] && { p=\${f#/proc/}; echo "\${p%/stat} \${e#*:}"; }; done
+  done; fi
+  # grep -l finds candidates portably (BusyBox has no -z); the exact entry decides.
+  for f in $(grep -lsF $cookies /proc/[0-9]*/environ); do p=\${f#/proc/}
+    { while IFS= read -r -d '' e; do case "$e" in KARMAX_JOB=*) v=\${e#KARMAX_JOB=}
+        case "$ids" in *" $v "*) echo "\${p%/environ} $v";; esac; break;; esac; done < "$f"; } 2>/dev/null
+  done
+}
+pids() { printf '%s\\n' "$1" | cut -d' ' -f1 | sort -u; }
+found=$(members | sort -u); [ -n "$found" ] || exit 0
+kill -TERM $(pids "$found") 2>/dev/null
+# Deadlines, not round counts: a scan of a busy host's /proc takes a while.
+end=$((SECONDS + 5)); while [ "$SECONDS" -lt "$end" ] && [ -n "$(members)" ]; do sleep 0.1; done
+end=$((SECONDS + 3)); while left=$(members | sort -u); [ -n "$left" ] && [ "$SECONDS" -lt "$end" ]; do
+  kill -KILL $(pids "$left") 2>/dev/null; sleep 0.1; done
+printf '%s\\n' "$found" | cut -d' ' -f2 | sort | uniq -c | while read -r n id; do echo "stopped $id $n"; done
+[ -z "$left" ] || printf '%s\\n' "$left" | while read -r p id; do echo "survivor $id $p"; done
+true`;
 
-/** Stop jobs (all of this world's by default): SIGTERM the job's process
- * group, then SIGKILL whatever is left after five seconds. */
-export async function stopJobs(world: World, ids?: string[]): Promise<void> {
+/** What stopping one job did. */
+export interface JobStop {
+  id: string;
+  /** Processes of the job that were running when the stop began. */
+  processes: number;
+  /** Pids still alive after SIGKILL (uninterruptible, or not ours to kill). */
+  survivors: number[];
+}
+
+/** Stop jobs (all of this world's by default) and every process they started:
+ * SIGTERM, then SIGKILL whatever is left after five seconds. Reports the jobs
+ * that had any process left to stop. */
+export async function stopJobs(world: World, ids?: string[]): Promise<JobStop[]> {
   const targets = (ids ?? (await listJobs(world))).filter(isJobId);
-  if (!targets.length) return;
-  await world.exec('bash', ['-c', STOP, 'karmax-job-stop', ...targets], { cwd: world.handle.root, timeoutMs: 30_000 });
+  if (!targets.length) return [];
+  const result = await world.exec('bash', ['-c', STOP, 'karmax-job-stop', ...targets], { cwd: world.handle.root, timeoutMs: 30_000 });
+  if (result.code !== 0) throw new Error(`could not stop jobs: ${(result.stderr || result.stdout).trim().slice(0, 300) || `exit ${result.code}`}`);
+  const stops = new Map<string, JobStop>();
+  for (const line of result.stdout.split('\n')) {
+    const [kind, id, value] = line.trim().split(' ');
+    if (!isJobId(id) || !value) continue;
+    const stop = stops.get(id) ?? { id, processes: 0, survivors: [] };
+    if (kind === 'stopped') stop.processes = Number(value);
+    else if (kind === 'survivor') stop.survivors.push(Number(value));
+    stops.set(id, stop);
+  }
+  return [...stops.values()];
 }
 
 /**
