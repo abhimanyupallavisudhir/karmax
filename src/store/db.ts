@@ -618,6 +618,10 @@ export class Store {
         taskId TEXT NOT NULL, role TEXT NOT NULL, exportId TEXT NOT NULL,
         bytes INTEGER NOT NULL, createdAt INTEGER NOT NULL, usedAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS object_tombstones (
+        objectKey TEXT PRIMARY KEY, deletedAt INTEGER NOT NULL, purgeAfter INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_object_tombstones_due ON object_tombstones(purgeAfter);
       CREATE TABLE IF NOT EXISTS executions (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -6317,7 +6321,13 @@ export class Store {
         if (quotaBytes != null && used + newBytes > quotaBytes)
           throw new Error(`managed storage quota exceeded (${used + newBytes} bytes requested, ${quotaBytes} byte limit)`);
       }
-      for (const chunk of chunks) (await insert.run(organizationId, chunk.id, storageLocationId ?? null, chunk.bytes));
+      // A capture retains a reused baseline chunk without writing it again, so
+      // a delete of that chunk still pending since its release must not purge it.
+      const cancelPurge = this.db.prepare('DELETE FROM object_tombstones WHERE objectKey=?');
+      for (const chunk of chunks) {
+        (await insert.run(organizationId, chunk.id, storageLocationId ?? null, chunk.bytes));
+        (await cancelPurge.run(`resources/${organizationId}/chunks/${chunk.id}.bin`));
+      }
       (await this.db.exec('COMMIT'));
     }
     catch (error) { (await this.db.exec('ROLLBACK')); throw error; }
@@ -7339,6 +7349,31 @@ export class Store {
 
   async deleteConversationExport(objectKey: string): Promise<void> {
     (await this.db.prepare('DELETE FROM conversation_exports WHERE objectKey=?').run(objectKey));
+  }
+
+  // Delayed deletion of managed objects (src/store/deferred-delete.ts).
+  async objectTombstone(key: string): Promise<{ key: string; deletedAt: number; purgeAfter: number } | undefined> {
+    const row = (await this.db.prepare('SELECT deletedAt, purgeAfter FROM object_tombstones WHERE objectKey=?').get(key)) as
+      { deletedAt: number | bigint; purgeAfter: number | bigint } | undefined;
+    return row ? { key, deletedAt: Number(row.deletedAt), purgeAfter: Number(row.purgeAfter) } : undefined;
+  }
+
+  async recordObjectTombstone(key: string, deletedAt: number, purgeAfter: number): Promise<void> {
+    (await this.db.prepare(`INSERT INTO object_tombstones (objectKey, deletedAt, purgeAfter) VALUES (?, ?, ?)
+      ON CONFLICT(objectKey) DO UPDATE SET deletedAt=excluded.deletedAt, purgeAfter=excluded.purgeAfter`).run(key, deletedAt, purgeAfter));
+  }
+
+  async deleteObjectTombstone(key: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM object_tombstones WHERE objectKey=?').run(key));
+  }
+
+  async hasResourceChunk(organizationId: string, chunkId: string): Promise<boolean> {
+    return !!(await this.db.prepare('SELECT 1 FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?').get(organizationId, chunkId));
+  }
+
+  async dueObjectTombstones(now: number, limit: number): Promise<string[]> {
+    return ((await this.db.prepare('SELECT objectKey FROM object_tombstones WHERE purgeAfter<=? ORDER BY purgeAfter, objectKey LIMIT ?')
+      .all(now, limit)) as Array<{ objectKey: string }>).map((row) => String(row.objectKey));
   }
 
   async createExecution(input: Omit<ExecutionRecord, 'state' | 'startedAt' | 'heartbeatAt'>

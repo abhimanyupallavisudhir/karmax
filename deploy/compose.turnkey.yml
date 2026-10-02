@@ -134,7 +134,16 @@ services:
       KARMAX_DATABASE_URL_FILE: /run/karmax-database/database_url
       KARMAX_TEMPORAL_ADDRESS: temporal:7233
       KARMAX_TEMPORAL_NAMESPACE: karmax
-      KARMAX_OBJECT_STORE: local
+      # local (the karmax_data volume) unless .turnkey.env sets s3; the keys
+      # are in .secrets/s3_access_key_id and s3_secret_access_key. Wiki
+      # ops/object-store. An empty delay means 30 days for s3, none for local.
+      KARMAX_OBJECT_STORE: ${KARMAX_OBJECT_STORE:-local}
+      KARMAX_OBJECT_DELETE_DELAY_DAYS: ${KARMAX_OBJECT_DELETE_DELAY_DAYS:-}
+      KARMAX_S3_ENDPOINT: ${KARMAX_S3_ENDPOINT:-}
+      KARMAX_S3_BUCKET: ${KARMAX_S3_BUCKET:-}
+      KARMAX_S3_REGION: ${KARMAX_S3_REGION:-}
+      KARMAX_S3_ACCESS_KEY_ID_FILE: /run/secrets/s3_access_key_id
+      KARMAX_S3_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_access_key
       KARMAX_CLOUD_WORLD_PROVIDER: ${KARMAX_CLOUD_WORLD_PROVIDER:-e2b}
       # Optional sign-in providers, empty unless set in .turnkey.env. This block
       # is a whitelist, so a variable missing from it never reaches the app —
@@ -155,6 +164,8 @@ services:
       - auth_secret
       - vault_key
       - world_ref_key
+      - s3_access_key_id
+      - s3_secret_access_key
     volumes:
       - karmax_data:/var/lib/karmax
       - karmax_database:/run/karmax-database:ro
@@ -189,6 +200,8 @@ secrets:
   auth_secret: { file: ./.secrets/auth_secret }
   vault_key: { file: ./.secrets/vault_key }
   world_ref_key: { file: ./.secrets/world_ref_key }
+  s3_access_key_id: { file: ./.secrets/s3_access_key_id }
+  s3_secret_access_key: { file: ./.secrets/s3_secret_access_key }
 
 volumes:
   karmax_data:

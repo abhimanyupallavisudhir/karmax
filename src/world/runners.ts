@@ -8,6 +8,7 @@ import type { WorldRegistry } from './registry.js';
 import type { WorldCheckpointService } from './checkpoint.js';
 import type { ObjectStore } from '../store/objects.js';
 import { expireConversationExports } from '../store/conversation-exports.js';
+import { DeferredDeleteObjectStore } from '../store/deferred-delete.js';
 
 // Private/explicit pools retain physical resource totals. Hosted customer-owned
 // pools ignore these totals and derive active worlds from plan concurrency.
@@ -182,6 +183,7 @@ export class WorldLifecycleManager {
   private async sweepOnce(now: number): Promise<number> {
     (await this.runners?.reconcileWorldLeases(now));
     await this.checkpoints.collectGarbage?.();
+    if (this.objects instanceof DeferredDeleteObjectStore) await this.objects.purgeDue(now).catch(() => undefined);
     await this.reconcileProviderUsage(now);
     for (const artifact of (await this.store.expiredPromotedArtifacts(now))) {
       (await this.store.deletePromotedArtifact(artifact.id));

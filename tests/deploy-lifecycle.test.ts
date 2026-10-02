@@ -35,6 +35,10 @@ if (args.includes('cp')) {
 if (args.includes('--sign-checksums')) { fs.readFileSync(0); process.stdout.write('signature-fixture'); }
 if (args.includes('pg_dump')) process.stdout.write('dump-' + args.at(-1));
 if (args.join(' ').includes('pg_stat_activity')) process.stdout.write(process.env.FAKE_SESSIONS ?? '');
+if (args.join(' ').includes('object-store-check')) {
+  process.stdout.write(process.env.FAKE_OBJECT_STORE ?? 'object store: local\\n');
+  if (process.env.FAKE_OBJECT_STORE_FAIL) process.exit(1);
+}
 if (args.includes('pg_restore')) {
   const input = fs.readFileSync(0);
   if (!args.includes('/dev/null') && process.env.FAKE_RESTORED) fs.appendFileSync(process.env.FAKE_RESTORED, args.at(-1) + '=' + input + '\\n');
@@ -333,6 +337,32 @@ it('doctor reports the role the app connects to PostgreSQL as, and warns on the 
   expect(superuser.stderr).toContain('KARMAX_DATABASE_URL');
   const idle = h.run(['doctor'], '', '', { FAKE_SESSIONS: '' });
   expect(idle.stdout).toContain('The app has no connection to the karmax database');
+});
+
+it('doctor reports the active object store and fails when an S3 store does not answer its probe', () => {
+  const h = deployment();
+  const local = h.run(['doctor'], '', '', { FAKE_SESSIONS: 'karmax|f\n' });
+  expect(local.status, local.stderr).toBe(0);
+  expect(local.stdout).toContain('object store: local');
+  expect(h.calls().some(args => args.join(' ').includes('exec -T app npm run --silent object-store-check'))).toBe(true);
+  const broken = h.run(['doctor'], '', '', { FAKE_SESSIONS: 'karmax|f\n',
+    FAKE_OBJECT_STORE: 'object store: s3 bucket tavya-objects\nprobe failed: object store PUT failed (403)\n', FAKE_OBJECT_STORE_FAIL: '1' });
+  expect(broken.status).not.toBe(0);
+  expect(broken.stdout).toContain('probe failed');
+  expect(broken.stderr).toContain('object store check failed');
+  // The rest of the report still runs.
+  expect(broken.stdout).toMatch(/Public HTTPS/);
+});
+
+it('migrates objects from a one-off app container, passing the options through', () => {
+  const h = deployment();
+  const result = h.run(['migrate-objects', '--verify-only', '--concurrency', '4']);
+  expect(result.status, result.stderr).toBe(0);
+  expect(h.calls()).toContainEqual(expect.arrayContaining(['run', '--rm', '--no-deps', '-T', 'app', 'npm', 'run', '--silent',
+    'migrate-objects', '--', '--verify-only', '--concurrency', '4']));
+  expect(h.calls().some(args => args.includes('exec'))).toBe(false);
+  const failed = h.run(['migrate-objects'], 'migrate-objects');
+  expect(failed.status).not.toBe(0);
 });
 
 /** A deployment whose source is a Git checkout at `previous`, with `target`

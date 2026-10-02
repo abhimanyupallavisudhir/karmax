@@ -130,6 +130,12 @@ ensure_secrets() (
   for secret in auth_secret vault_key world_ref_key; do
     write_secret "$secret" || exit 1
   done
+  # The S3 object store's keys are the operator's to write (see
+  # KARMAX_OBJECT_STORE in .turnkey.env); empty means not configured.
+  for secret in s3_access_key_id s3_secret_access_key; do
+    { [ -e "$SECRETS_DIR/$secret" ] || (umask 022 && : > "$SECRETS_DIR/$secret"); } \
+      && secret_mode "$SECRETS_DIR/$secret" || exit 1
+  done
 )
 
 configure() {
@@ -279,12 +285,25 @@ cmd_doctor() {
   note 'Durable secrets are present.'
   dc ps
   report_app_role
+  # Names the store; an S3 one must accept a write, read-back and delete.
+  objects_ok=1
+  dc exec -T app npm run --silent object-store-check < /dev/null || objects_ok=''
   domain=$(env_value KARMAX_DOMAIN)
   if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 "https://$domain/api/health/ready" >/dev/null 2>&1; then
     note "Public HTTPS health check passed for $domain."
   else
     note "Public HTTPS is not reachable yet. Check DNS for $domain and ports 80/443."
   fi
+  [ -n "$objects_ok" ] || die 'object store check failed; see its output above'
+}
+
+# Copy the local object store to the S3 store configured in .turnkey.env, from
+# a one-off container of the installed release, while the app keeps serving.
+# Never deletes anything. Wiki ops/object-store has the cutover procedure.
+cmd_migrate_objects() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  dc run --rm --no-deps -T app npm run --silent migrate-objects -- "$@"
 }
 
 cmd_backup() {
@@ -733,6 +752,8 @@ Usage: ./deploy/karmax COMMAND
   update [--accept-vault-findings] [REVISION]
                                Backup, check the vault, deploy an exact master revision, and restart
   rotate-postgres-password      Replace PostgreSQL's superuser password
+  migrate-objects [--verify-only] [--concurrency N]
+                               Copy local objects to the configured S3 store
   down                          Stop everything without deleting durable data
 EOF
 }
@@ -749,6 +770,7 @@ case "$command" in
   restore) cmd_restore "$@" ;;
   update) cmd_update "$@" ;;
   rotate-postgres-password) cmd_rotate_postgres_password "$@" ;;
+  migrate-objects) cmd_migrate_objects "$@" ;;
   down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;
   help|-h|--help) usage ;;
   *) usage >&2; die "unknown command: $command" ;;
