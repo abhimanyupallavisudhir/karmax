@@ -2832,8 +2832,9 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   /** Tell our parent (if any) we need a decision (SPEC §5.3). Best effort — if the
    *  parent is gone the child stays human-resolvable via its own retry/confirm. */
-  async function notifyParent(type: ChildRaise['type'], detail?: string) {
-    if (!input.parentTaskId) return;
+  /** Raise to the parent; false when there is none (or it is gone). */
+  async function notifyParent(type: ChildRaise['type'], detail?: string): Promise<boolean> {
+    if (!input.parentTaskId) return false;
     try {
       await getExternalWorkflowHandle(input.parentTaskId).signal(raiseFromChildSignal, {
         childTaskId: taskId,
@@ -2841,8 +2842,10 @@ Inspect the complete current diff and specifically compare its delta from the re
         type,
         detail: detail ?? '',
       });
+      return true;
     } catch {
       /* parent gone → fall back to the human gate */
+      return false;
     }
   }
 
@@ -3082,11 +3085,43 @@ Inspect the complete current diff and specifically compare its delta from the re
     // The agent asked to be resumed later (`pause`): park here and resume it with
     // the outcome. A message, a child's event, or a cancellation ends it early.
     if (turn.wait && patched('agent-wait-v1')) {
+      // `needs_input`: ask the task's ordinary input route unless the agent
+      // named people — a sub-task's parent, else a configured response agent,
+      // which answers at once as it does for a question ending an ordinary
+      // turn; people get a Needs input hold.
+      const needsInput = turn.wait.needsInput;
+      const question = needsInput?.message ?? (turn.output?.trim() || 'The agent paused for your input.');
+      const routed = !!needsInput && !needsInput.audience?.length;
+      const askedParent = routed && await notifyParent('needs_info', question);
+      const route = routed && !askedParent && routedInputResponder ? liveResponder : undefined;
+      if (needsInput && route?.kind === 'agent' && responderRounds < 3) {
+        responderRounds++;
+        status = 'waiting';
+        waitingFor = { kind: 'responder', detail: question };
+        await publish();
+        const answer = await responderTurn(route, question);
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        if (answer) {
+          msgs.push({ id: `responder-${msgs.length}`, role: 'user', text: `Responder: ${answer}`, ts: msgs.length });
+          continue;
+        }
+      }
       const note = await waitForAgent(turn.wait, {
         world,
         ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
+        ...(askedParent ? { ask: { kind: 'parent' as const, detail: question } }
+          : needsInput ? { ask: {
+            kind: 'human' as const,
+            audience: needsInput.audience?.length ? needsInput.audience
+              : route?.kind === 'human' && route.audience?.length ? route.audience : ['@creator'],
+            detail: question,
+            ...(needsInput.urgency ? { urgency: needsInput.urgency } : {}),
+          } } : {}),
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
-        interrupted: () => cancelled || msgs.length > seen || raises.length > 0 || settled.length > 0,
+        // A Needs input hold offers Open PR, like any input hold in Do (and a parent may send it).
+        interrupted: () => cancelled || msgs.length > seen || raises.length > 0 || settled.length > 0
+          || (!!needsInput && prRequested),
       });
       if (cancelled) return await abort();
       if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });

@@ -356,14 +356,16 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
     const handle = await h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
-      args: [input({ taskId, repo, title: 'Render', prompt: '@job sleep 3; echo "@write out.txt :: rendered"\n@pause 30 :: last' })],
+      args: [input({ taskId, repo, title: 'Render', prompt: '@namedjob render :: sleep 3; echo "@write out.txt :: rendered"\n@pause 30 :: last' })],
     });
 
-    // Parked on the job, with the latest resume time shown.
+    // Parked on the job, shown by its name, with the latest resume time.
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('job');
     const parked = await view(handle);
     expect(parked.stage).toBe('do');
     expect(parked.waitingFor.detail).toMatch(/^Waiting for job-[a-f0-9]{8}$/);
+    expect(parked.waitingFor.summary).toBe('render');
+    expect(parked.waitingFor.jobs).toEqual([parked.waitingFor.detail.slice('Waiting for '.length)]);
     expect(parked.waitingFor.until).toBeGreaterThan(Date.now() + 25 * 60_000);
 
     // The job finishes; the agent is resumed with its output and acts on it.
@@ -426,6 +428,79 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
     await early.signal('confirm');
     expect((await early.result()).stage).toBe('done');
     expect((await git(repo, ['show', 'main:early.txt'])).stdout).toContain('woke');
+  }, 90_000);
+
+  // An agent that needed an answer but paused (to carry on if none came) read
+  // "Paused" and notified nobody. needs_input parks the same pause as an ask.
+  it('a needs-input pause asks for an answer, and carries on without one when the time is up', async () => {
+    const repo = await h.makeRepo('app-pause-input');
+    const unansweredId = newId('task');
+    const unanswered = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: unansweredId,
+      args: [input({ taskId: unansweredId, repo, title: 'Ask', prompt: '@write out.txt :: asked\n@pause 2 :: input high -- Which region?', waitMinuteMs: 1500 })],
+    });
+    await expect.poll(async () => (await view(unanswered)).waitingFor?.kind, { timeout: 20_000 }).toBe('human');
+    const asking = await view(unanswered);
+    expect(asking).toMatchObject({ stage: 'do', status: 'waiting' });
+    expect(asking.waitingFor).toMatchObject({ detail: 'Which region?', audience: ['@creator'], urgency: 'high' });
+    expect(asking.waitingFor.until).toBeGreaterThan(Date.now());
+    // The published lifecycle tick is the ask the inbox notifies on.
+    const ticks = (await h.store.eventsOfType(unansweredId, 'view.updated')).map((e: any) => e.payload);
+    expect(ticks).toContainEqual(expect.objectContaining({ waitingFor: 'human', waitingDetail: 'Which region?', urgency: 'high' }));
+    // Nobody answers: the agent is told so and carries on.
+    await expect.poll(async () => (await view(unanswered)).stage, { timeout: 30_000 }).toBe('review');
+    expect((await view(unanswered)).messages.some((m: any) => m.role === 'user' && /nobody answered within your 2-minute limit/.test(m.text))).toBe(true);
+    await unanswered.signal('cancel');
+    await unanswered.result();
+
+    // An answer resumes it at once, with the answer.
+    const answeredId = newId('task');
+    const answered = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: answeredId,
+      args: [input({ taskId: answeredId, repo, title: 'Ask', prompt: '@pause 600 :: input' })],
+    });
+    await expect.poll(async () => (await view(answered)).waitingFor?.kind, { timeout: 20_000 }).toBe('human');
+    const waiting = (await view(answered)).waitingFor;
+    expect(waiting.detail).toBeTruthy();
+    expect(waiting.urgency).toBeUndefined();
+    expect(waiting.until).toBeGreaterThan(Date.now() + 9 * 60 * 60_000);
+    await answered.signal('followUp', { id: 'answer', role: 'user', text: '@write region.txt :: eu-west', ts: 0 });
+    await expect.poll(async () => (await view(answered)).stage, { timeout: 30_000 }).toBe('review');
+    await answered.signal('confirm');
+    expect((await answered.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:region.txt'])).stdout).toContain('eu-west');
+  }, 90_000);
+
+  // A sub-task's questions go to its parent, so a needs-input pause asks the
+  // parent agent (not a person) and carries on if it does not answer in time.
+  it('a sub-task\'s needs-input pause asks its parent, whose comment resumes it', async () => {
+    const repo = await h.makeRepo('app-sub-pause-input');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Parent', prompt: '@subtask Ask :: @pause 600 :: input high -- Which region?' })],
+    });
+    try {
+      await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 30_000 }).toBe(1);
+      const childId = (await view(handle)).subTasks![0];
+      const child = h.client.workflow.getHandle(childId);
+      await expect.poll(async () => ((await child.query('view')) as any).waitingFor?.kind, { timeout: 30_000 }).toBe('parent');
+      const asking = (await child.query('view')) as any;
+      expect(asking.waitingFor).toMatchObject({ detail: 'Which region?' });
+      expect(asking.waitingFor.until).toBeGreaterThan(Date.now() + 9 * 60 * 60_000);
+      await parentSawRaise(handle, 'Which region?');
+      expect((await h.store.eventsOfType(childId, 'view.updated')).map((e: any) => e.payload.waitingFor)).not.toContain('human');
+
+      await handle.signal('followUp', { id: 'region-answer', role: 'user', text: `@respond comment ${childId} :: @write region.txt :: eu-west`, ts: 0 });
+      await expect.poll(async () => fs.existsSync(path.join(((await child.query('view')) as any).world.root, 'region.txt')), { timeout: 30_000 }).toBe(true);
+      expect(((await child.query('view')) as any).waitingFor?.detail).not.toBe('Which region?');
+    } finally {
+      await handle.signal('cancel');
+      await handle.result();
+    }
   }, 90_000);
 
   it('cancelling a task stops its durable jobs', async () => {

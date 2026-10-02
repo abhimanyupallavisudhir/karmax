@@ -417,6 +417,32 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     expect((await git(repo, ['show', 'main:proposal.js'])).stdout).toContain('ready = true');
   }, 120_000);
 
+  it('a needs-input pause in Do still offers Open PR, which ends the pause', async () => {
+    const repo = await h.makeRepo('explicit-open-pr-pause');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({
+        taskId,
+        repo,
+        title: 'Explicit proposal',
+        prompt: 'Prepare it.\n@write proposal.js :: export const ready = true;\n'
+          + '@run git add -A && git commit -q -m "prepare proposal"\n@pause 600 :: input -- Ship as is?',
+      })],
+    });
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.status}/${current.waitingFor?.kind}/${current.waitingFor?.detail}`;
+    }, { timeout: 30_000 }).toBe('do/waiting/human/Ship as is?');
+    expect((await view(handle)).actions.map((action: any) => action.name)).toContain('openPr');
+    await handle.signal('openPr');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect((await git(repo, ['show', 'main:proposal.js'])).stdout).toContain('ready = true');
+  }, 120_000);
+
   it.each([{ authorized: true, failed: true }, { authorized: false, failed: true },
     { authorized: true, failed: false }, { authorized: false, failed: false }])('manual opening confirms only an authorized reviewer ($authorized, failed: $failed)', async ({ authorized, failed }) => {
     const repo = await h.makeRepo(`manual-confirm-${authorized}-${failed}`);

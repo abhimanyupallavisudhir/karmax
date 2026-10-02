@@ -91,14 +91,21 @@ describe('separate waiting-world maintenance', () => {
     expect((await f.store.worldState(f.task.id))).toBe('parked');
   });
 
-  it('keeps the world running while its agent waits on a job, but parks a timed pause', async () => {
+  it('keeps the world running while its agent waits on a job, even while asking for input, but parks a timed pause', async () => {
     const f = (await fixture());
     const onJob = { ...f.view, waitingFor: { kind: 'job' as const, detail: 'Waiting for job-0000000a', until: Date.now() + 60_000 } };
     const jobFence = await f.publish(onJob);
     await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(onJob), jobFence!);
     expect(f.park).not.toHaveBeenCalled();
 
-    const paused = { ...f.view, waitingFor: { kind: 'timer' as const, detail: 'Paused for 30 min', until: Date.now() + 60_000 } };
+    // An agent asking for input while its job runs is a human wait, but the job still needs the world.
+    const asking = { ...f.view, waitingFor: { kind: 'human' as const, detail: 'Which region?', audience: ['@creator'],
+      jobs: ['job-0000000a'], until: Date.now() + 60_000 } };
+    const askFence = await f.publish(asking);
+    await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(asking), askFence!);
+    expect(f.park).not.toHaveBeenCalled();
+
+    const paused = { ...f.view, waitingFor: { kind: 'timer' as const, detail: 'Waiting 30 min', until: Date.now() + 60_000 } };
     const pauseFence = await f.publish(paused);
     await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(paused), pauseFence!);
     expect(f.park).toHaveBeenCalledOnce();

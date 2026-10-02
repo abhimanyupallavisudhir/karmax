@@ -1,6 +1,6 @@
 import { proxyActivities, condition, CancellationScope, isCancellation } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
-import type { AgentWait, TaskView, WorldHandleLike } from './contract.js';
+import type { AgentWait, HumanAudience, TaskView, Urgency, WorldHandleLike } from './contract.js';
 
 /**
  * The Do-stage half of the agent's `pause` tool: park the task, then resume the agent when its jobs exit, when
@@ -36,6 +36,11 @@ export function unattendedJobsReminder(turn: {
 
 export interface AgentWaitHooks {
   world: WorldHandleLike | undefined;
+  /** For a `needsInput` pause: whom the workflow asked — people, or a
+   * sub-task's parent agent — resolved from the agent's request and the
+   * task's input route. */
+  ask?: { kind: 'human'; audience: HumanAudience; detail: string; urgency?: Urgency }
+    | { kind: 'parent'; detail: string };
   /** Length of one minute (ms); only tests shorten it. */
   minuteMs?: number;
   /** Record the wait in the task view (status `waiting`) and publish it. */
@@ -52,13 +57,23 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
   const untilMs = Date.now() + wait.minutes * (hooks.minuteMs ?? 60_000);
   const jobs = wait.jobs ?? [];
   const list = jobs.join(', ');
-  await hooks.park(jobs.length
-    ? { kind: 'job', detail: `Waiting for ${list}`, until: untilMs }
-    : { kind: 'timer', detail: `Paused for ${wait.minutes} min`, until: untilMs });
+  // A wait is shown by what it waits for: the jobs' names when every one has one.
+  const named = jobs.length && wait.jobNames?.length === jobs.length ? wait.jobNames.join(', ') : undefined;
+  // An ask is what the task is waiting on, whatever else the agent watches:
+  // it reads Needs input (or names the parent) and notifies, where a timer or
+  // job wait does neither.
+  await hooks.park(hooks.ask
+    ? { ...hooks.ask, ...(jobs.length ? { jobs } : {}), until: untilMs }
+    : jobs.length
+    ? { kind: 'job', detail: `Waiting for ${list}`, ...(named ? { summary: named } : {}), jobs, until: untilMs }
+    : { kind: 'timer', detail: `Waiting ${wait.minutes} min`, until: untilMs });
 
   if (!jobs.length) {
     const interrupted = await condition(hooks.interrupted, untilMs - Date.now());
-    return interrupted ? undefined : `(Resumed: your ${wait.minutes}-minute pause is over.)`;
+    if (interrupted) return undefined;
+    return hooks.ask
+      ? `(Resumed: nobody answered within your ${wait.minutes}-minute limit. Carry on without the answer, or pause again to keep waiting.)`
+      : `(Resumed: your ${wait.minutes}-minute pause is over.)`;
   }
   const world = hooks.world;
   if (!world) return '(Resumed: the task has no world to check the jobs in.)';
@@ -83,6 +98,6 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
   }
   const head = outcome.finished
     ? `(Resumed: ${jobs.length > 1 ? 'your jobs have' : 'your job has'} finished.)`
-    : `(Resumed: your ${wait.minutes}-minute limit passed before ${jobs.length > 1 ? 'every job finished' : 'the job finished'}. Call pause again to keep waiting.)`;
+    : `(Resumed: your ${wait.minutes}-minute limit passed before ${jobs.length > 1 ? 'every job finished' : 'the job finished'}${hooks.ask ? ' or anyone answered' : ''}. Call pause again to keep waiting.)`;
   return `${head}\n\n${outcome.summary}`;
 }
