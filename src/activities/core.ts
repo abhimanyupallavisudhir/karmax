@@ -5518,7 +5518,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         workflowVersion: parent?.workflowVersion ?? '1.0.0',
         // The child's own agent fields first: its prompt and the parent's branch always win.
         params: { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
-          [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true },
+          [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
+          // Stored so a replacement run of this child, which is rebuilt from
+          // its record, keeps the parent's profiles as this first run does.
+          ...(args.profiles ? { profiles: args.profiles } : {}) },
         parentTaskId: args.parentTaskId,
         createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
         assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
