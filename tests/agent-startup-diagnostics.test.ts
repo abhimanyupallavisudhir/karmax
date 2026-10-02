@@ -7,21 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { RemoteSpawnedProcess } from '../src/agent/remote-process.js';
-
-/** Timers the startup code under test leaves pending. Not vi.getTimerCount():
- *  that also counts timers other files' leftover background work creates while
- *  fakes are installed, and flaked in CI (ops/ci "Counting fake timers"). */
-function pendingStartupTimers(): () => number {
-  const pending = new Set<unknown>();
-  const set = globalThis.setTimeout, clear = globalThis.clearTimeout;
-  vi.spyOn(globalThis, 'setTimeout').mockImplementation(((...args: Parameters<typeof setTimeout>) => {
-    const handle = set(...args);
-    if (/src[\\/]agent[\\/]/.test(new Error().stack ?? '')) pending.add(handle);
-    return handle;
-  }) as typeof setTimeout);
-  vi.spyOn(globalThis, 'clearTimeout').mockImplementation((handle) => { pending.delete(handle); clear(handle); });
-  return () => pending.size;
-}
+import { pendingTimers } from './helpers/pending-timers.js';
 
 describe('agent startup diagnostics', () => {
   it('collects live process and memory evidence while omitting raw stderr and command lines', async () => {
@@ -129,13 +115,13 @@ describe('agent startup diagnostics', () => {
 
   it('does not let an unresponsive diagnostic probe prevent retry', async () => {
     vi.useFakeTimers();
-    const pending = pendingStartupTimers();
+    const pending = pendingTimers(/src[\\/]agent[\\/]/);
     try {
       const probe = collectStartupProbe({ exec: () => new Promise(() => {}) } as any, '/startup.log', '/stderr.log');
       await vi.advanceTimersByTimeAsync(3500);
       expect(await probe).toEqual({ status: 'timeout' });
       expect(pending()).toBe(0);
-    } finally { vi.restoreAllMocks(); vi.useRealTimers(); }
+    } finally { vi.useRealTimers(); }
   });
 
   it('takes the diagnostic snapshot before aborting the silent process', async () => {
@@ -158,7 +144,7 @@ describe('agent startup diagnostics', () => {
 
   it.each(['reject', 'hang'])('still aborts and retries when diagnostic publication can %s', async (failure) => {
     vi.useFakeTimers();
-    const pending = pendingStartupTimers();
+    const pending = pendingTimers(/src[\\/]agent[\\/]/);
     const abort = vi.fn();
     try {
       const stream = (async function* () { await new Promise(() => {}); })();
@@ -168,6 +154,6 @@ describe('agent startup diagnostics', () => {
       expect(await result).toMatchObject({ code: 'ETIMEDOUT' });
       expect(abort).toHaveBeenCalledOnce();
       expect(pending()).toBe(0);
-    } finally { vi.restoreAllMocks(); vi.useRealTimers(); }
+    } finally { vi.useRealTimers(); }
   });
 });
