@@ -2,6 +2,15 @@ import type { Store } from './db.js';
 import type { ObjectRequestOptions, ObjectStore } from './objects.js';
 
 const DAY_MS = 24 * 60 * 60_000;
+const RESOURCE_CHUNK = /^resources\/([^/]+)\/chunks\/([^/]+)\.bin$/;
+
+/** The store's own timeout aborts the request; this also bounds a store that
+ *  ignores it, since the caller holds a lock until it returns. */
+function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms); });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
 
 /**
  * How long a deleted managed object stays in the store: `KARMAX_OBJECT_DELETE_DELAY_DAYS`.
@@ -32,7 +41,8 @@ export interface DeferredDeleteOptions {
   delayMs: number;
   /** Tombstones purged per sweep; each holds a Store transaction around one delete. */
   batchSize?: number;
-  /** Bound on one purge delete, which runs inside that transaction. */
+  /** Bound on one purge delete, which runs inside that transaction and so
+   *  holds the installation-wide lock on PostgreSQL. */
   deleteTimeoutMs?: number;
   /** Scratch keys deleted at once: browser upload parts are copied into
    *  resource chunks and then deleted, so delaying them would keep every
@@ -53,6 +63,10 @@ export interface DeferredDeleteOptions {
  * PostgreSQL, the write lock on SQLite). A `put` that finds a tombstone clears
  * it in its own transaction, so it either runs before the purge (which then
  * finds nothing to purge) or after it (and writes the object again).
+ *
+ * A capture also reuses a baseline chunk without writing it, only retaining
+ * its row. So `retainResourceChunks` drops the chunk's tombstone in the same
+ * transaction, and the purge keeps any chunk the database still references.
  */
 export class DeferredDeleteObjectStore implements ObjectStore {
   private readonly batchSize: number;
@@ -62,7 +76,7 @@ export class DeferredDeleteObjectStore implements ObjectStore {
 
   constructor(private inner: ObjectStore, private store: Store, private options: DeferredDeleteOptions) {
     this.batchSize = options.batchSize ?? 50;
-    this.deleteTimeoutMs = options.deleteTimeoutMs ?? 15_000;
+    this.deleteTimeoutMs = options.deleteTimeoutMs ?? 5_000;
     this.immediatePrefixes = options.immediatePrefixes ?? ['resource-uploads/'];
     this.now = options.now ?? Date.now;
   }
@@ -84,25 +98,30 @@ export class DeferredDeleteObjectStore implements ObjectStore {
     await this.store.recordObjectTombstone(key, now, now + this.options.delayMs);
   }
 
-  /** Purge up to one batch of due tombstones, oldest first. A failed delete
-   * keeps its tombstone for the next sweep. */
+  /** Purge up to one batch of due tombstones, oldest first. A chunk the
+   * database references again (a capture retained it after its release) is
+   * kept and its tombstone dropped. The batch stops at the first failed or
+   * timed-out delete: while the store is degraded, each sweep holds the lock
+   * for one bounded attempt, and the rest wait for a later sweep. */
   async purgeDue(now = this.now()): Promise<{ purged: number; failed: number }> {
-    let purged = 0, failed = 0;
+    let purged = 0;
     for (const key of await this.store.dueObjectTombstones(now, this.batchSize)) {
       try {
         const done = await this.store.transaction(async () => {
           const tombstone = await this.store.objectTombstone(key);
           if (!tombstone || tombstone.purgeAfter > now) return false; // resurrected or deleted again since
-          await this.inner.delete(key, { timeoutMs: this.deleteTimeoutMs });
+          const chunk = RESOURCE_CHUNK.exec(key);
+          const referenced = !!chunk && await this.store.hasResourceChunk(chunk[1]!, chunk[2]!);
+          if (!referenced) await withTimeout(this.inner.delete(key, { timeoutMs: this.deleteTimeoutMs }), this.deleteTimeoutMs);
           await this.store.deleteObjectTombstone(key);
-          return true;
+          return !referenced;
         });
         if (done) purged++;
       } catch (error) {
-        failed++;
         console.error(`[objects] could not purge ${key}: ${error instanceof Error ? error.message : String(error)}`);
+        return { purged, failed: 1 };
       }
     }
-    return { purged, failed };
+    return { purged, failed: 0 };
   }
 }

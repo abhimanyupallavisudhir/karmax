@@ -12,6 +12,7 @@ const DAY = 24 * 60 * 60_000;
 class MemoryObjects implements ObjectStore {
   objects = new Map<string, Buffer>();
   deletes: string[] = [];
+  attempts: Array<{ key: string; timeoutMs?: number }> = [];
   holdDelete?: Promise<void>;
   onDelete?: () => void;
   async put(key: string, data: Buffer) { this.objects.set(key, data); }
@@ -20,7 +21,8 @@ class MemoryObjects implements ObjectStore {
     if (!data) throw new Error(`missing ${key}`);
     return data;
   }
-  async delete(key: string) {
+  async delete(key: string, options: { timeoutMs?: number } = {}) {
+    this.attempts.push({ key, timeoutMs: options.timeoutMs });
     this.onDelete?.();
     await this.holdDelete;
     this.deletes.push(key);
@@ -51,7 +53,7 @@ describe.each(targets)('delayed deletion of managed objects (%s)', (target) => {
     return store;
   }
 
-  async function setup(delayMs = 30 * DAY, options: { batchSize?: number } = {}) {
+  async function setup(delayMs = 30 * DAY, options: { batchSize?: number; deleteTimeoutMs?: number } = {}) {
     const store = await openStore();
     const inner = new MemoryObjects();
     let now = 1_000_000;
@@ -141,6 +143,85 @@ describe.each(targets)('delayed deletion of managed objects (%s)', (target) => {
     expect(await objects.purgeDue()).toEqual({ purged: 0, failed: 0 });
     expect(inner.deletes).toEqual([]);
     expect((await objects.get('a')).toString()).toBe('again');
+  });
+
+  // A capture reuses a baseline chunk without writing it: it only retains its
+  // row. If the baseline revision is deleted meanwhile, its release drops the
+  // row and deletes the object (a tombstone), and then the capture's retain
+  // re-inserts the row. The tombstone must not purge a chunk a revision holds.
+  it('cancels a chunk\'s pending delete when a capture retains it again', async () => {
+    const { store, inner, objects, advance } = await setup();
+    const key = 'resources/org/chunks/reused.bin';
+    await store.retainResourceChunks('org', [{ id: 'reused', bytes: 5 }]);
+    await objects.put(key, Buffer.from('chunk'));
+    expect(await store.releaseResourceChunks('org', ['reused'])).toEqual(['reused']);
+    await objects.delete(key);
+    await store.retainResourceChunks('org', [{ id: 'reused', bytes: 5 }]);
+    expect(await store.objectTombstone(key)).toBeUndefined();
+    advance(31 * DAY);
+    expect(await objects.purgeDue()).toEqual({ purged: 0, failed: 0 });
+    expect(inner.attempts).toEqual([]);
+    expect((await objects.get(key)).toString()).toBe('chunk');
+  });
+
+  // The release and the object delete are separate steps, so the retain can
+  // land between them and the tombstone is recorded after it.
+  it('never purges a chunk the database still references, and drops its stale tombstone', async () => {
+    const { store, inner, objects, advance } = await setup(30 * DAY, { batchSize: 1 });
+    const key = 'resources/org/chunks/live.bin';
+    await objects.put(key, Buffer.from('chunk'));
+    await store.retainResourceChunks('org', [{ id: 'live', bytes: 5 }]);
+    await objects.delete(key);
+    // An unreferenced chunk of the same organization still purges.
+    await objects.put('resources/org/chunks/dead.bin', Buffer.from('dead'));
+    advance(1);
+    await objects.delete('resources/org/chunks/dead.bin');
+    advance(31 * DAY);
+    expect(await objects.purgeDue()).toEqual({ purged: 0, failed: 0 });
+    expect(await store.objectTombstone(key)).toBeUndefined();
+    expect(await objects.purgeDue()).toEqual({ purged: 1, failed: 0 });
+    expect(inner.deletes).toEqual(['resources/org/chunks/dead.bin']);
+    expect((await objects.get(key)).toString()).toBe('chunk');
+  });
+
+  // Each purge holds the installation-wide lock across one store delete. While
+  // the store is down, one bounded attempt per sweep is all it may cost.
+  it('stops the batch at the first delete that hangs, bounded by its timeout', async () => {
+    const { store, inner, objects, advance } = await setup(30 * DAY, { deleteTimeoutMs: 20 });
+    for (const key of ['h1', 'h2', 'h3']) { await objects.put(key, Buffer.from(key)); await objects.delete(key); advance(1); }
+    advance(30 * DAY);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    inner.holdDelete = new Promise(() => {}); // never answers, and ignores the timeout
+    expect(await objects.purgeDue()).toEqual({ purged: 0, failed: 1 });
+    expect(inner.attempts.map((attempt) => attempt.key)).toEqual(['h1']);
+    expect(error).toHaveBeenCalledWith(expect.stringMatching(/h1.*timed out/));
+    expect(await objects.purgeDue()).toEqual({ purged: 0, failed: 1 });
+    expect(inner.attempts.map((attempt) => attempt.key)).toEqual(['h1', 'h1']);
+    expect(await store.dueObjectTombstones(Number.MAX_SAFE_INTEGER, 10)).toEqual(['h1', 'h2', 'h3']);
+    inner.holdDelete = undefined;
+    expect(await objects.purgeDue()).toEqual({ purged: 3, failed: 0 });
+    error.mockRestore();
+  });
+
+  it('stops the batch at the first delete that fails', async () => {
+    const { store, inner, objects, advance } = await setup();
+    for (const key of ['f1', 'f2']) { await objects.put(key, Buffer.from(key)); await objects.delete(key); advance(1); }
+    advance(30 * DAY);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    inner.onDelete = () => { throw new Error('503 Slow Down'); };
+    expect(await objects.purgeDue()).toEqual({ purged: 0, failed: 1 });
+    expect(inner.attempts.map((attempt) => attempt.key)).toEqual(['f1']);
+    expect(await store.dueObjectTombstones(Number.MAX_SAFE_INTEGER, 10)).toEqual(['f1', 'f2']);
+    error.mockRestore();
+  });
+
+  it('bounds each purge delete by 5 seconds by default', async () => {
+    const { inner, objects, advance } = await setup();
+    await objects.put('t', Buffer.from('t'));
+    await objects.delete('t');
+    advance(31 * DAY);
+    await objects.purgeDue();
+    expect(inner.attempts).toEqual([{ key: 't', timeoutMs: 5_000 }]);
   });
 
   it('purges in bounded batches, oldest first', async () => {

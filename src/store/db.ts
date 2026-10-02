@@ -6264,7 +6264,13 @@ export class Store {
         if (quotaBytes != null && used + newBytes > quotaBytes)
           throw new Error(`managed storage quota exceeded (${used + newBytes} bytes requested, ${quotaBytes} byte limit)`);
       }
-      for (const chunk of chunks) (await insert.run(organizationId, chunk.id, storageLocationId ?? null, chunk.bytes));
+      // A capture retains a reused baseline chunk without writing it again, so
+      // a delete of that chunk still pending since its release must not purge it.
+      const cancelPurge = this.db.prepare('DELETE FROM object_tombstones WHERE objectKey=?');
+      for (const chunk of chunks) {
+        (await insert.run(organizationId, chunk.id, storageLocationId ?? null, chunk.bytes));
+        (await cancelPurge.run(`resources/${organizationId}/chunks/${chunk.id}.bin`));
+      }
       (await this.db.exec('COMMIT'));
     }
     catch (error) { (await this.db.exec('ROLLBACK')); throw error; }
@@ -7123,6 +7129,10 @@ export class Store {
 
   async deleteObjectTombstone(key: string): Promise<void> {
     (await this.db.prepare('DELETE FROM object_tombstones WHERE objectKey=?').run(key));
+  }
+
+  async hasResourceChunk(organizationId: string, chunkId: string): Promise<boolean> {
+    return !!(await this.db.prepare('SELECT 1 FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?').get(organizationId, chunkId));
   }
 
   async dueObjectTombstones(now: number, limit: number): Promise<string[]> {
