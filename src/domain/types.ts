@@ -1538,6 +1538,12 @@ export interface ChildTaskSummary {
   lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed'> & { state?: { draft?: boolean } };
 }
 
+/** A task forked from another task's agent, as the source's Agent forks panel
+ *  shows it; `forkOf` names the task(s) in that tree it resumed from. */
+export interface ForkTaskSummary extends ChildTaskSummary {
+  forkOf: string[];
+}
+
 export interface TaskView {
   taskId: string;
   /**
@@ -1615,7 +1621,12 @@ export interface TaskView {
   /** Every child the store records, with its list fields: finished children are
    *  archived out of the live task list, and a replaced run forgets settled ones. */
   subTaskSummaries?: ChildTaskSummary[];
+  /** Every task forked from this one's agents, nested forks included: a finished
+   *  fork is archived out of the live task list. */
+  forkSummaries?: ForkTaskSummary[];
   parentTaskId?: string;
+  /** The parent's list identity, which outlives the parent in the live task list. */
+  parentTask?: { id: string; num?: number; title: string };
   error?: string;
   /**
    * What the task is currently parked on, if anything (SPEC §6.2). Surfaced so the

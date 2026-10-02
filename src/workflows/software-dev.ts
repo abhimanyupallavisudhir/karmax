@@ -59,7 +59,7 @@ import {
   TaskRecoveryCheckpoint,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
-  landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
+  landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
@@ -710,6 +710,9 @@ async function softwareDevImpl(
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
+  // A released sandbox is no longer addressable, but the branch and checkouts it
+  // carried stay part of the finished task's record.
+  let releasedWorld: WorldHandleLike | undefined;
   let session: string | undefined = recovery?.session;
   // The config home that minted `session`. Provider sessions are login-bound, so a
   // later turn leased a DIFFERENT home must NOT resume this session — we drop it and
@@ -1087,6 +1090,7 @@ async function softwareDevImpl(
     const visibleMergeDomains = participantLanding && githubAuthoritativeMerge
       ? retainedMergeDomains
       : world ? mergeQueueDomains(world, target, input.projectId) : [];
+    const recordWorld = world ?? releasedWorld;
     return {
       taskId,
       title: input.title,
@@ -1126,12 +1130,12 @@ async function softwareDevImpl(
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
         ...(interlocksLandingTransitions && lifecycleTransitionBlocked ? { lifecycleTransitionBlocked: true } : {}),
       },
-      ...(!repositoryless ? { branch: world?.branch, base, targetBranch: target } : {}),
+      ...(!repositoryless ? { branch: recordWorld?.branch, base, targetBranch: target } : {}),
       world,
       worldPath: world?.workdir ?? world?.root,
       pr,
       ...(prs.length ? { prs } : {}),
-      ...(multiPrEnabled && world ? { checkouts: reviewCheckouts(worldRepos(world as any), checkoutHeads, checkoutApprovals, prs) } : {}),
+      ...(multiPrEnabled && recordWorld ? { checkouts: reviewCheckouts(worldRepos(recordWorld as any), checkoutHeads, checkoutApprovals, prs) } : {}),
       mergeQueue: mergeQueuePos,
       ...(intentAuthorizedLanding ? { landing } : {}),
       subTasks: subTaskIds.length ? subTaskIds : undefined,
@@ -3660,6 +3664,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
     await core.destroyWorld(world as any);
     if (remoteWorld) {
+      releasedWorld = world;
       world = undefined;
       await publish();
     }
@@ -4482,7 +4487,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     // Attempts exhausted (or a non-conflict failure) → escalate. A child raises
     // `blocked` to its parent (which can retry/answer/cancel); a top-level task
     // escalates to a human. Either can retry.
-    reviewInfo = { ...reviewInfo, summary: error };
+    // The Error section carries the refusal; the work summary keeps describing the work.
     stage = 'escalated';
     status = 'blocked';
     retryRequested = false;
@@ -4523,11 +4528,14 @@ Inspect the complete current diff and specifically compare its delta from the re
   }
   stage = 'done';
   status = 'done';
-  reviewInfo = { ...reviewInfo, summary: `Merged into ${target} at ${world!.repo ?? '(scratch repo)'} as ${sha?.slice(0, 8)}.` };
+  // The landing adds to the work summary; it never replaces it.
+  const landed = landedNote(world, target, sha);
+  if (landed) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${landed}` : landed };
   await publish();
   const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
   await core.destroyWorld(world as any);
   if (remoteWorld) {
+    releasedWorld = world;
     world = undefined;
     await publish();
   }
@@ -4567,6 +4575,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         const remoteWorld = releaseWorldOnCompletion(world);
         await core.destroyWorld(world as any);
         if (remoteWorld) {
+          releasedWorld = world;
           world = undefined;
           await publish();
         }

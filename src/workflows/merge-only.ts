@@ -22,7 +22,7 @@ import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmConfig, ConfirmDecision, ConfirmLayer,
   TaskPullRequest, mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
-  samePosition, MERGE_POLL } from './contract.js';
+  samePosition, MERGE_POLL, landedNote } from './contract.js';
 import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -173,6 +173,8 @@ async function mergeOnlyImpl(
   let confirmed = false;
   let cancelled = false;
   let world: WorldHandleLike | undefined;
+  // A released sandbox is gone, but its branch stays part of the task's record.
+  let releasedWorld: WorldHandleLike | undefined;
   // Who confirms at the Review gate (SPEC §5.2): the ordered confirm layers, played
   // sequentially — every layer must approve; [] ⇒ auto-confirm. Legacy {mode} shapes
   // and the `autoConfirm` flag normalize to their layer equivalents. The route is
@@ -250,7 +252,7 @@ async function mergeOnlyImpl(
         // The serialization keys this task merges under, so the UI (and tests)
         // can see it locks the same domains software-dev would for these repos.
         ...(serializedMergeDomains && world ? { mergeDomains: mergeQueueDomains(world, target, input.projectId) } : {}) },
-      branch: world?.branch, base, targetBranch: target,
+      branch: (world ?? releasedWorld)?.branch, base, targetBranch: target,
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
       editableParams: editableParamsNow(), waitingFor, agentTurn, mergeQueue,
       pr, ...(prs.length ? { prs } : {}),
@@ -356,6 +358,7 @@ async function mergeOnlyImpl(
     const remoteWorld = releaseWorldOnCompletion(world);
     await core.destroyWorld(world as any);
     if (remoteWorld) {
+      releasedWorld = world;
       world = undefined;
       await publish();
     }
@@ -608,7 +611,9 @@ async function mergeOnlyImpl(
   }
   stage = 'done';
   status = 'done';
-  reviewInfo = { ...reviewInfo, summary: `Merged into ${target} as ${result.sha?.slice(0, 8)}.` };
+  // The landing adds to the summary (the checks result); it never replaces it.
+  const landed = landedNote(world, target, result.sha);
+  if (landed) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${landed}` : landed };
   await publish();
   await releaseWorld();
   return { stage, sha: result.sha };

@@ -38,6 +38,30 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
     expect(await store.childTaskSummaries(first.id)).toEqual([]);
   });
 
+  // The overview's Agent forks panel: a finished fork is archived out of the live
+  // task list, so the source task's view must still carry it, forks of forks too.
+  it('summarizes every agent fork of a task, archived and nested ones included', async () => {
+    const project = await store.createProject('Forks');
+    const other = await store.createProject('Elsewhere');
+    const make = (title: string, params: Record<string, unknown>, projectId = project.id) => store.createTask({ projectId, title,
+      workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: title, ...params } });
+    const source = await make('Source', {});
+    const first = await make('First', { 'agent:do': { resumeFrom: { taskId: source.id, role: 'do' } } });
+    const nested = await make('Nested', { 'agent:do': { resumeFrom: { taskId: first.id, role: 'do' } } });
+    const confirmer = await make('Confirmer', { confirm: { layers: [{ kind: 'agent', resumeFrom: { taskId: source.id, role: 'merge' } }] } });
+    await make('Raw session', { 'agent:do': { resumeFrom: { sessionId: source.id } } });
+    await make('Mention', { prompt: `see ${source.id}` });
+    await make('Other project', { 'agent:do': { resumeFrom: { taskId: source.id, role: 'do' } } }, other.id);
+    await store.saveView(first.id, { taskId: first.id, title: 'First', workflow: 'software-dev', stage: 'done', status: 'done',
+      messages: [], actions: [], updatedAt: 1 } as any);
+    expect((await store.getTask(first.id))?.params.archived).toBe(true);
+    const forks = await store.forkTaskSummaries(source.id);
+    expect(forks.map((fork) => [fork.id, fork.forkOf])).toEqual([
+      [first.id, [source.id]], [nested.id, [first.id]], [confirmer.id, [source.id]]]);
+    expect(forks[0]).toMatchObject({ num: first.num, title: 'First', lastView: { stage: 'done', status: 'done' } });
+    expect(await store.forkTaskSummaries(nested.id)).toEqual([]);
+  });
+
   // Ids only carry millisecond time plus random bytes, so children created in
   // the same millisecond must keep their insertion order rather than id order.
   it('lists children created in the same millisecond in creation order', async () => {
