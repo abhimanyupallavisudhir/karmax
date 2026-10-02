@@ -88,7 +88,7 @@ describe('self-hosted console journeys (real gateway, mock agent)', () => {
         { timeout: 30_000 }).toBe('done'));
       expect((await git(repo, ['show', 'main:journey.txt'])).stdout).toContain('shipped from the console');
       const landed = (await git(repo, ['rev-parse', '--short=8', 'main'])).stdout.trim();
-      await step('the console reports the merge', () => page.getByText(`Merged into main at ${repo} as ${landed}.`).waitFor());
+      await step('the console reports the merge', () => page.getByText(`Merged into main as ${landed}.`).waitFor());
       expect(errors).toEqual([]);
     } finally { await context.close(); }
   }, 90_000);

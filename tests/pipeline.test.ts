@@ -60,6 +60,43 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     expect(onMain.stdout).toContain('export const f');
   });
 
+  it('a landed task keeps its work summary and branch after its world is released', async () => {
+    // Remote sandboxes are released on completion; the overview of the finished
+    // task must still say what the work was and which branch carried it.
+    const worktree = h.worlds.get('worktree');
+    const create = worktree.create;
+    worktree.create = async (spec) => {
+      const world = await create.call(worktree, spec);
+      world.handle.meta = { ...world.handle.meta, releaseOnCompletion: true };
+      return world;
+    };
+    try {
+      const repo = await h.makeRepo('released');
+      const project = (await h.store.createProject('Released world', { repos: [repo] }));
+      const { id: taskId } = (await h.store.createTask({ projectId: project.id, title: 'Release', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'land it' } }));
+      const handle = await h.client.workflow.start('softwareDev', {
+        taskQueue: TASK_QUEUE,
+        workflowId: taskId,
+        args: [input({ taskId, projectId: project.id, repo, prompt: '@write released.txt :: landed' })],
+      });
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+      const review = await view(handle);
+      expect(review.reviewInfo?.summary).toBe('wrote released.txt');
+      await handle.signal('confirm');
+      const result = await handle.result();
+      expect(result.stage).toBe('done');
+
+      const done = await view(handle);
+      expect(done.world).toBeUndefined();
+      expect(done.branch).toBe(review.branch);
+      expect(done.reviewInfo?.summary).toBe(`wrote released.txt\n\nMerged into main as ${result.sha.slice(0, 8)}.`);
+      expect((await h.store.getTask(taskId))?.lastView).toMatchObject({ branch: review.branch, reviewInfo: { summary: done.reviewInfo.summary } });
+    } finally {
+      worktree.create = create;
+    }
+  });
+
   it.each(['keep', 'cancel'] as const)('%s other attempts at first Merge admission', async (choice) => {
     const repo = await h.makeRepo(`attempts-${choice}`);
     const project = (await h.store.createProject(`Attempts ${choice}`, { repos: [repo], defaultBase: 'main', defaultTarget: 'main' }));
@@ -699,6 +736,8 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     const v = await view(handle);
     expect(v.error).toMatch(/merge failed/);
     expect(v.error).toContain('index.js');
+    // The Error section reports the refusal; the work summary still describes the work.
+    expect(v.reviewInfo?.summary).toBe('wrote index.js');
     // the merge agent got the conflict context on its retry turns
     const mergeTranscript = v.transcripts.find((t: any) => t.role === 'merge');
     expect(mergeTranscript.messages.map((m: any) => m.text).join('\n')).toContain('rejected');
@@ -787,8 +826,10 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     const runs = await Promise.all(started.map(async (r) => ({ ...r, handle: await r.handle })));
 
     // Drive every task to Review and confirm — they now all contend at Merge.
+    const summaries = new Map<string, string>();
     for (const r of runs) {
       await expect.poll(async () => (await view(r.handle)).stage, { timeout: 20_000 }).toBe('review');
+      summaries.set(r.taskId, (await view(r.handle)).reviewInfo?.summary);
     }
     for (const r of runs) await r.handle.signal('confirm');
 
@@ -796,6 +837,9 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     // these never resolve — the result() await is the deadlock detector.
     const results = await Promise.all(runs.map((r) => r.handle.result()));
     for (const res of results) expect(res.stage).toBe('done');
+    // The landing adds to the work summary; its commit is the primary repo's, so it names that repo.
+    for (const [i, r] of runs.entries()) expect((await view(r.handle)).reviewInfo?.summary)
+      .toBe(`${summaries.get(r.taskId)}\n\nMerged into main as ${results[i]!.sha!.slice(0, 8)} (${nm(r.s.repos[0]!)}).`);
 
     // Every repo received the work from BOTH tasks that touched it, landed on main.
     for (const [repo, labels] of [

@@ -150,6 +150,8 @@ async function justDoImpl(
   let stagingResources = false;
   let activeStaging: CancellationScope | undefined;
   let world: WorldHandleLike | undefined;
+  // A released sandbox is gone, but its branch stays part of the task's record.
+  let releasedWorld: WorldHandleLike | undefined;
   let session: string | undefined;
   let reviewInfo: ReviewInfo | undefined;
   let waitingFor: TaskView['waitingFor'];
@@ -177,7 +179,7 @@ async function justDoImpl(
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'just-do', stage, status, messages: msgs, reviewInfo,
-      actions: actions(), state: { worldReady: !!world, ...(applyingResources ? { applyingResources: true } : {}), ...(stagingResources ? { stagingResources: true } : {}), ...(finalizing ? { finalizing: true } : {}) }, branch: world?.branch, base,
+      actions: actions(), state: { worldReady: !!world, ...(applyingResources ? { applyingResources: true } : {}), ...(stagingResources ? { stagingResources: true } : {}), ...(finalizing ? { finalizing: true } : {}) }, branch: (world ?? releasedWorld)?.branch, base,
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
@@ -493,6 +495,7 @@ async function justDoImpl(
       const remote = remoteWorldProvider(world.provider ?? world.kind);
       await core.destroyWorld(world as any);
       if (remote) {
+        releasedWorld = world;
         world = undefined;
         await publish();
       }
@@ -527,6 +530,7 @@ async function justDoImpl(
     const remote = remoteWorldProvider(world.provider ?? world.kind);
     await core.destroyWorld(world as any);
     if (remote) {
+      releasedWorld = world;
       world = undefined;
       await publish();
     }

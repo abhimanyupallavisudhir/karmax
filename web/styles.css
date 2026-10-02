@@ -1073,7 +1073,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 
 /* review panel */
 .review { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; background: var(--surface-2); }
-.review .summary { margin-bottom: 10px; }
+.review .summary { margin-bottom: 10px; white-space: pre-line; }
 .review .links { display: flex; flex-wrap: wrap; gap: 8px; }
 .review .review-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
 .review .review-actions .btn.review-action { font-family: var(--font-mono); }

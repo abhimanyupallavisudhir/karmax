@@ -27,7 +27,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { EvalResult } from '../domain/search.js';
-import type { KarmaxEvent, TaskView } from '../domain/types.js';
+import type { ChildTaskSummary, KarmaxEvent, TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -919,12 +919,14 @@ export class Gateway {
       counts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
     }
     const count = counts.get(taskId);
-    // A parent's Sub-tasks panel flags a child's approval exactly as its list row does.
-    const subTaskSummaries = view.subTaskSummaries?.map((summary) => {
+    // Sub-task and fork panels flag a task's approval exactly as its list row does.
+    const flag = <T extends ChildTaskSummary>(summary: T): T => {
       const approvalRequests = counts.get(summary.id)?.notify;
       return approvalRequests && summary.lastView ? { ...summary, lastView: { ...summary.lastView, approvalRequests } } : summary;
-    });
-    return { ...view, ...(subTaskSummaries ? { subTaskSummaries } : {}),
+    };
+    const subTaskSummaries = view.subTaskSummaries?.map(flag);
+    const forkSummaries = view.forkSummaries?.map(flag);
+    return { ...view, ...(subTaskSummaries ? { subTaskSummaries } : {}), ...(forkSummaries ? { forkSummaries } : {}),
       approvalRequests: count?.notify || undefined, pendingDecisions: count?.pending || undefined };
   }
 
