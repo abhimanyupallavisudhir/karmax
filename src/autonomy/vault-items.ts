@@ -8,6 +8,7 @@ import { CredentialBroker } from './broker.js';
 import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
 import { newId } from '../util/id.js';
+import { isEnvName } from '../util/shell.js';
 import { parseSavedSession, sessionDomainError } from './browser-session.js';
 import { paths } from '../config/paths.js';
 
@@ -392,6 +393,11 @@ export class VaultItems {
       if (!domains.length) throw new Error('a saved session needs the site\'s domain');
       for (const domain of domains) { const error = sessionDomainError(domain); if (error) throw new Error(error); }
     }
+    // Every granted turn exports it, so a bad name would fail them all. A stored
+    // legacy name may be re-sent unchanged (envFor skips it) so other edits work.
+    const envVar = args.envVar !== undefined ? args.envVar.trim() : prior?.envVar;
+    if (envVar && envVar !== prior?.envVar && !isEnvName(envVar))
+      throw new Error('The env var name may contain only letters, digits and _, and cannot start with a digit (e.g. DEPLOY_KEY)');
     const id = prior?.id ?? newId('vi');
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
@@ -417,7 +423,6 @@ export class VaultItems {
     const domains = args.domains !== undefined ? list(args.domains) : prior?.domains;
     const username = args.username !== undefined ? args.username.trim() : prior?.username;
     const tags = args.tags !== undefined ? list(args.tags) : prior?.tags;
-    const envVar = args.envVar !== undefined ? args.envVar.trim() : prior?.envVar;
     const item: VaultItem = {
       id,
       type: args.type,
@@ -699,6 +704,7 @@ export class VaultItems {
         && !caps.includes(`use-credential:item:${item.id}`)) continue;
       if ((await this.access(caps, taskId, item, 'use', { ambient: true })).status !== 'granted') continue;
       try {
+        if (item.type !== 'env' && item.envVar && !isEnvName(item.envVar)) throw new Error('invalid env var name');
         if (item.type === 'env' && item.fields.includes('env')) {
           for (const line of (await this.resolveField(item, 'env', { taskId, mode: 'use' })).split('\n')) {
             const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);

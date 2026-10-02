@@ -8,12 +8,13 @@ import { isRemoteAgentWorld, preparedRemoteWorkDirectory } from './remote-proces
 import { ensureWorldExcluded } from '../world/secret-exclude.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import { processStartTick } from '../util/processes.js';
+import { isEnvName } from '../util/shell.js';
 
 /** Application credentials belong to work commands, never to the model client.
  * Tavya-owned turn values still win collisions (notably its scoped MCP token). */
 export function workEnvironment(input: TurnInput): Record<string, string> {
   return Object.fromEntries(Object.entries(input.secretEnv ?? {}).map(([name, value]) => {
-    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name) || value.includes('\0'))
+    if (!isEnvName(name) || value.includes('\0'))
       throw new Error('Invalid project environment variable');
     return [name, input.extraEnv?.[name] ?? value];
   }));
