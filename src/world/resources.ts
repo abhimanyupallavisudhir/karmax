@@ -75,9 +75,10 @@ export interface SnapshotEngine {
    * `unchanged: true` means it equals the baseline, whose sealedRef is returned
    * instead of a new manifest. It also returns `observed`, an opaque sealed
    * record of the file stamps it saw; passing that back with the revision this
-   * capture resolved to lets the next one skip files whose stamps match. */
+   * capture resolved to lets the next one skip files whose stamps match.
+   * `enforceQuota: false` counts new chunks without refusing them (checkpoints). */
   capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>,
-    incremental?: { baseline?: ResourceRevision; observed?: string }): Promise<{
+    incremental?: { baseline?: ResourceRevision; observed?: string; enforceQuota?: boolean }): Promise<{
     sealedRef: string; rootDigest: string; bytes: number; files: number; storageLocationId?: string; unchanged?: boolean;
     observed?: string;
   }>;
@@ -103,7 +104,8 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   }
 
   async capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>,
-    incremental?: { baseline?: ResourceRevision; observed?: string }) {
+    incremental?: { baseline?: ResourceRevision; observed?: string; enforceQuota?: boolean }) {
+    const quota = { enforceQuota: incremental?.enforceQuota !== false };
     const key = await this.key(attachment.organizationId);
     const storageLocationId = this.storageLocations
       ? (await this.storageLocations.requireForOrganization(attachment.organizationId, attachment.storageLocationId)).id
@@ -154,7 +156,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
             if (!retained.has(chunkId)) reused.set(chunkId, plain.length);
           } else {
             if (!retained.has(chunkId)) {
-              await this.chunkAccounting?.retain(attachment.organizationId, [{ id: chunkId, bytes: plain.length }], storageLocationId);
+              await this.chunkAccounting?.retain(attachment.organizationId, [{ id: chunkId, bytes: plain.length }], storageLocationId, quota);
               retained.set(chunkId, plain.length);
             }
             await objects.put(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`, sealDeterministic(key, chunkId, plain));
@@ -175,7 +177,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
         return { sealedRef: baselineRevision!.sealedRef, rootDigest, bytes: total, files: manifestFiles.length, storageLocationId,
           unchanged: true, ...(sealedStamps ? { observed: sealedStamps } : {}) };
       if (reused.size) {
-        await this.chunkAccounting?.retain(attachment.organizationId, [...reused].map(([id, bytes]) => ({ id, bytes })), storageLocationId);
+        await this.chunkAccounting?.retain(attachment.organizationId, [...reused].map(([id, bytes]) => ({ id, bytes })), storageLocationId, quota);
         for (const [id, bytes] of reused) retained.set(id, bytes);
       }
       const manifest: SnapshotManifest = { version: 1, attachmentId: attachment.id, files: manifestFiles, rootDigest, bytes: total };
@@ -319,7 +321,8 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   private attachmentResolver?: (id: string) => ResourceAttachment | undefined | Promise<ResourceAttachment | undefined>;
   setAttachmentResolver(resolve: (id: string) => ResourceAttachment | undefined | Promise<ResourceAttachment | undefined>): void { this.attachmentResolver = resolve; }
   private chunkAccounting?: {
-    retain(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void | Promise<void>;
+    retain(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string,
+      options?: { enforceQuota?: boolean }): void | Promise<void>;
     release(organizationId: string, chunkIds: string[]): string[] | Promise<string[]>;
   };
   setChunkAccounting(value: NonNullable<ObjectSnapshotEngine['chunkAccounting']>): void { this.chunkAccounting = value; }
@@ -350,7 +353,7 @@ export class ProjectResourceService {
     private storageLocations?: StorageLocationService) {
     if (engine instanceof ObjectSnapshotEngine) engine.setAttachmentResolver(async (id) => (await store.getResourceAttachment(id)));
     if (engine instanceof ObjectSnapshotEngine) engine.setChunkAccounting({
-      retain: async (organizationId, chunks, storageLocationId) => (await store.retainResourceChunks(organizationId, chunks, storageLocationId)),
+      retain: async (organizationId, chunks, storageLocationId, options) => (await store.retainResourceChunks(organizationId, chunks, storageLocationId, options)),
       release: async (organizationId, chunks) => (await store.releaseResourceChunks(organizationId, chunks)),
     });
   }
@@ -730,6 +733,15 @@ export class ProjectResourceService {
 
   /** Remove control-plane records, credentials, and revision manifests. Shared
    * content chunks are left for the snapshot engine's mark-and-sweep policy. */
+  /** Delete a revision only if nothing references it, then its objects. A
+   * failure deleting objects leaks bytes rather than leaving a dangling row. */
+  async deleteRevision(revisionId: string, options: { allowCurrent?: boolean } = {}): Promise<ResourceRevision | undefined> {
+    const revision = (await this.store.deleteResourceRevisionIfUnreferenced(revisionId, options));
+    if (revision) await this.engine.delete?.(revision).catch((error) =>
+      console.warn(`resource revision ${revision.id}: objects not deleted: ${error instanceof Error ? error.message : String(error)}`));
+    return revision;
+  }
+
   async deleteAttachment(attachmentId: string): Promise<void> {
     const attachment = (await this.store.getResourceAttachment(attachmentId));
     if (!attachment) return;
@@ -1029,7 +1041,10 @@ export class ProjectResourceService {
       const baseline = baselineId ? (await this.store.getResourceRevision(baselineId)) : undefined;
       const { unchanged, observed, ...captured } = await this.engine.capture(attachment,
         filesFromWorld(world, resourceAbsolutePath(handle, attachment), attachment, checkContinue),
-        { baseline: baseline?.attachmentId === attachment.id ? baseline : undefined, observed: sameLease ? recorded.observed : undefined });
+        { baseline: baseline?.attachmentId === attachment.id ? baseline : undefined, observed: sameLease ? recorded.observed : undefined,
+          // A park's capture of the task's private copy is work in progress:
+          // counted, never refused (see WorldCheckpointService).
+          enforceQuota: false });
       const revisionId = unchanged && baseline ? baseline.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
         parentRevisionId: lease.revisionId, engine: this.engine.id, ...captured, metadata: { checkpoint: true },
         createdByTaskId: lease.taskId })).id;

@@ -3038,3 +3038,12 @@ html[data-theme="dark"] .github-signin-btn:active,
 
 .text-prompt { width:min(480px,92vw); padding:20px; border:1px solid var(--line); border-radius:12px; background:var(--surface); color:var(--ink); }
 .text-prompt::backdrop { background:rgba(0,0,0,.4); }
+
+/* Organization storage: usage bar, over-limit note and what uses the space. */
+.storage-location .progress { height: 4px; margin: 6px 0 2px; overflow: hidden; border-radius: 999px; background: var(--line); }
+.storage-location .progress > i { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.storage-location .progress.over > i { background: var(--danger); }
+.storage-over { color: var(--danger); }
+.storage-project { padding: 6px 0; border-top: 1px solid var(--line); }
+.storage-project .storage-item { padding-left: 14px; font-size: .92em; color: var(--ink-2); }
+.storage-project .storage-item > span:first-child { flex: 1; }

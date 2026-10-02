@@ -190,8 +190,11 @@ export class WorldCheckpointService {
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
     const managedStorage = (await this.store.listStorageLocations(project.organizationId))
       .find((location) => location.kind === 'managed');
+    // Counted against the quota but never refused: a world that cannot
+    // checkpoint cannot park, and an over-quota organization is read-only for
+    // new data, not for saving the work in progress.
     if (managedStorage) (await this.store.reserveStorageUpload(`checkpoint:${checkpointId}`, project.organizationId,
-      managedStorage.id, encrypted.length, Date.now() + 60 * 60_000));
+      managedStorage.id, encrypted.length, Date.now() + 60 * 60_000, { enforceQuota: false }));
     try { await this.objects.put(objectKey, encrypted); }
     catch (error) {
       if (managedStorage) (await this.store.releaseStorageUpload(`checkpoint:${checkpointId}`));
