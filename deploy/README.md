@@ -300,6 +300,57 @@ restores only that copy (the backup's size again in free disk space). Every
 restore, signed or not, is written to the audit log at the next boot
 (`backup.restored`, `backup.restored.unsigned`).
 
+### Recovering on a new server
+
+Restoring on the same host needs only `./deploy/karmax restore BACKUP_DIR`. When
+the server itself is lost, three things must exist off-host, because none of
+them can be recovered from the others:
+
+- **a backup directory.** `deploy/backups/` is on the server's own disk, so copy
+  backups off-host (encrypted storage) as you take them;
+- **the vault key** (`deploy/.secrets/vault_key`), which no backup contains: a
+  single line with no trailing newline;
+- **the backup-signing fingerprint** (`SHA256:…`) that `backup` prints.
+
+A provider's full-disk image (one.com Basic Backup) is the exception: it brings
+back `deploy/.secrets/` with everything else, so restoring it needs neither the
+key nor the fingerprint.
+
+On the new server:
+
+```bash
+# 1. Install Docker Engine with Compose, clone Karmax at the release the backup
+#    was taken with (or a newer one), and start a fresh stack.
+./deploy/karmax up karmax.example.com
+
+# 2. Copy the backup directory onto the server, e.g. scp -r BACKUP admin@host:~/
+
+# 3. Put the vault key in a private file, byte for byte, e.g. from pass:
+umask 077
+pass show PATH/TO/ENTRY | head -n 1 | tr -d '\n' > ~/vault_key
+
+# 4. Restore. It checks the signature, every checksum and that the key opens
+#    the backup's vault before it changes anything; type RESTORE to confirm.
+./deploy/karmax restore --trust-key SHA256:FINGERPRINT --vault-key ~/vault_key ~/BACKUP
+
+# 5. Check the stack, then delete the key copy: restore installed it as
+#    deploy/.secrets/vault_key.
+./deploy/karmax doctor
+shred -u ~/vault_key
+```
+
+The fresh stack's own keys are replaced by the backup's (the auth and
+world-reference keys come from the backup; the vault key from `--vault-key`).
+A backup taken before a `rotate-vault-key` needs the key it was taken under,
+the retired one. Point DNS at the new server as in the installation section.
+
+On tavya.io the vault key is escrowed as the vault item recorded in the project
+wiki's `ops/secrets-and-accounts`, whose pass-store copy is
+`tavya/vi_murj15zj778a901db5.api-key` (step 3:
+`pass show tavya/vi_murj15zj778a901db5.api-key | head -n 1 | tr -d '\n'`), and the
+signing fingerprint is recorded on the wiki's `ops/production-tavya`. Update the
+item after every `rotate-vault-key`.
+
 ### Replay check
 
 A running workflow replays its recorded history under whatever code the next
