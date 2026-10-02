@@ -35,15 +35,21 @@ describe('Paddle automated setup', () => {
     const result = await provisionPaddle(config, 'https://tavya.test', 'Tavya', save, fetcher);
     expect(result.webhookUrl).toBe('https://tavya.test/api/subscriptions/paddle/webhook');
     expect(JSON.stringify(result)).not.toContain('pdl_ntfset_private');
-    expect(records.products).toHaveLength(2);
+    expect(records.products).toHaveLength(3);
     expect(records.prices.map(p => p.unit_price)).toEqual([
       { amount: '900', currency_code: 'USD' }, { amount: '1900', currency_code: 'USD' }, { amount: '500', currency_code: 'USD' },
+      { amount: '400', currency_code: 'USD' },
     ]);
+    const pack = records.prices.at(-1);
+    expect(pack).toMatchObject({ product_id: config.storagePackProductId, quantity: { minimum: 1, maximum: 999999 },
+      billing_cycle: { interval: 'month', frequency: 1 }, custom_data: { karmax_billing_role: 'storagePackPriceId' } });
+    expect(config.storagePackPriceId).toBe(pack.id);
+    expect(records.products.at(-1)).toMatchObject({ tax_category: 'saas', custom_data: { karmax_billing_role: 'storage' } });
     expect(records['notification-settings'][0]).toMatchObject({ traffic_source: 'platform', subscribed_events: [...PADDLE_WEBHOOK_EVENTS] });
     expect(config.webhookSecret).toBe('pdl_ntfset_private');
     await provisionPaddle(config, 'https://tavya.test', 'Tavya', save, fetcher);
-    expect(records.products).toHaveLength(2);
-    expect(records.prices).toHaveLength(3);
+    expect(records.products).toHaveLength(3);
+    expect(records.prices).toHaveLength(4);
     expect(records['client-tokens']).toHaveLength(1);
     expect(records['notification-settings']).toHaveLength(1);
   });
@@ -54,7 +60,21 @@ describe('Paddle automated setup', () => {
     await provisionPaddle(config, 'https://tavya.test', 'Tavya', save, fetcher);
     records.prices[0].unit_price.amount = '90';
     await expect(provisionPaddle(config, 'https://tavya.test', 'Tavya', save, fetcher)).rejects.toThrow(/published/);
-    expect(records.prices).toHaveLength(3);
+    expect(records.prices).toHaveLength(4);
+  });
+  it('adds the storage pack to a catalog provisioned before packs existed', async () => {
+    const { records, fetcher } = fixture();
+    const config: PaddleRuntimeConfig = { environment: 'sandbox', apiKey: 'secret' };
+    const save = async (patch: Partial<PaddleRuntimeConfig>) => { Object.assign(config, patch); };
+    await provisionPaddle(config, 'https://tavya.test', 'Tavya', save, fetcher);
+    records.products.pop(); records.prices.pop();
+    delete config.storagePackProductId; delete config.storagePackPriceId;
+    await provisionPaddle(config, 'https://tavya.test', 'Tavya', save, fetcher);
+    expect(records.products).toHaveLength(3);
+    expect(records.prices).toHaveLength(4);
+    expect(fetcher.mock.calls.filter(([, init]: any) => init.method === 'POST').map(([url]: any) => new URL(url).pathname))
+      .toEqual(['/products', '/products', '/prices', '/prices', '/prices', '/products', '/prices', '/client-tokens',
+        '/notification-settings', '/products', '/prices']);
   });
   it('never sends an API key to an untrusted pagination URL', async () => {
     const fetcher = vi.fn(async () => Response.json({ data: [], meta: { pagination: { has_more: true, next: 'https://attacker.test/steal' } } }));

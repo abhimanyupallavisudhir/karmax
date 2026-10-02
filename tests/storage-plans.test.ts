@@ -7,7 +7,8 @@ import { LocalObjectStore } from '../src/store/objects.js';
 import { StorageLocationService } from '../src/store/storage-locations.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { HOSTED_PLANS, STORAGE_PACK, hostedStorageQuotaBytes, organizationEntitlements } from '../src/domain/entitlements.js';
+import { HOSTED_PLANS, STORAGE_PACK, hostedMonthlyPriceCents, hostedStorageQuotaBytes,
+  organizationEntitlements } from '../src/domain/entitlements.js';
 
 const GIB = 1024 ** 3;
 const dirs: string[] = [];
@@ -36,6 +37,13 @@ describe('plan storage entitlements', () => {
   it('ignores packs on Free, so a lapsed subscription falls back to the Free quota', () => {
     expect(hostedStorageQuotaBytes('free', 1, 5)).toBe(5 * GIB);
     expect(organizationEntitlements('free', true, 1, 5)).toMatchObject({ storageQuotaBytes: 5 * GIB, storagePacks: 0 });
+  });
+
+  it('bills each pack monthly on a paid plan and never on Free', () => {
+    expect(hostedMonthlyPriceCents('team', 3, 2)).toBe(1_900 + 2 * 500 + 2 * 400);
+    expect(hostedMonthlyPriceCents('individual', 1, 1)).toBe(900 + 400);
+    expect(hostedMonthlyPriceCents('individual', 1)).toBe(900);
+    expect(hostedMonthlyPriceCents('free', 1, 3)).toBe(0);
   });
 
   it('leaves private installations unmetered', () => {

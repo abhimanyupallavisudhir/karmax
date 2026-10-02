@@ -1,4 +1,4 @@
-import { HOSTED_PLANS } from '../domain/entitlements.js';
+import { HOSTED_PLANS, STORAGE_PACK } from '../domain/entitlements.js';
 import { PADDLE_WEBHOOK_EVENTS, type PaddleRuntimeConfig } from './paddle.js';
 
 /** Re-runnable provisioning: discover existing remote objects before creating
@@ -39,19 +39,22 @@ export async function provisionPaddle(config: PaddleRuntimeConfig, publicUrl: st
     return matches[0];
   };
   const products = await list('/products?status=active&per_page=200');
-  const product = async (role: 'individual' | 'team', configured?: string) => {
+  const product = async (role: 'individual' | 'team' | 'storage',
+    key: 'individualProductId' | 'teamProductId' | 'storagePackProductId', name: string) => {
+    const configured = config[key];
     let found = configured ? products.find((p) => p.id === configured)
       : one(products.filter((p) => p.custom_data?.karmax_billing_role === role && p.custom_data?.karmax_origin === origin), `${role} products`);
     if (configured && !found) throw new Error(`configured Paddle ${role} product is unavailable`);
-    if (!found) found = (await request('/products', 'POST', { name: `${siteName} ${HOSTED_PLANS[role].name}`,
+    if (!found) found = (await request('/products', 'POST', { name: `${siteName} ${name}`,
       tax_category: 'saas', custom_data: { karmax_billing_role: role, karmax_origin: origin } })).data;
     if (found.tax_category !== 'saas') throw new Error(`Paddle ${role} product must use the SaaS tax category`);
-    await save(role === 'individual' ? { individualProductId: found.id } : { teamProductId: found.id });
+    await save({ [key]: found.id });
     return found.id as string;
   };
-  const individualProductId = await product('individual', config.individualProductId);
-  const teamProductId = await product('team', config.teamProductId);
-  const price = async (role: 'individualPriceId' | 'teamBasePriceId' | 'teamSeatPriceId', productId: string, amount: number, name: string) => {
+  const individualProductId = await product('individual', 'individualProductId', HOSTED_PLANS.individual.name);
+  const teamProductId = await product('team', 'teamProductId', HOSTED_PLANS.team.name);
+  const price = async (role: 'individualPriceId' | 'teamBasePriceId' | 'teamSeatPriceId' | 'storagePackPriceId',
+    productId: string, amount: number, name: string) => {
     const prices = await list(`/prices?product_id=${encodeURIComponent(productId)}&status=active&per_page=200`);
     let found = config[role] ? prices.find((p) => p.id === config[role])
       : one(prices.filter((p) => p.custom_data?.karmax_billing_role === role && p.custom_data?.karmax_origin === origin), `${role} prices`);
@@ -59,7 +62,7 @@ export async function provisionPaddle(config: PaddleRuntimeConfig, publicUrl: st
     if (!found) found = (await request('/prices', 'POST', { product_id: productId, description: name, name,
       billing_cycle: { interval: 'month', frequency: 1 }, trial_period: null, tax_mode: 'external',
       unit_price: { amount: String(amount), currency_code: 'USD' },
-      quantity: { minimum: 1, maximum: role === 'teamSeatPriceId' ? 999999 : 1 },
+      quantity: { minimum: 1, maximum: role === 'teamSeatPriceId' || role === 'storagePackPriceId' ? 999999 : 1 },
       custom_data: { karmax_billing_role: role, karmax_origin: origin } })).data;
     if (found.product_id !== productId || found.unit_price?.amount !== String(amount) || found.unit_price?.currency_code !== 'USD'
       || found.billing_cycle?.interval !== 'month' || found.billing_cycle?.frequency !== 1 || found.trial_period
@@ -69,6 +72,9 @@ export async function provisionPaddle(config: PaddleRuntimeConfig, publicUrl: st
   await price('individualPriceId', individualProductId, HOSTED_PLANS.individual.monthlyBasePriceCents, 'Individual monthly');
   await price('teamBasePriceId', teamProductId, HOSTED_PLANS.team.monthlyBasePriceCents, 'Team monthly');
   await price('teamSeatPriceId', teamProductId, HOSTED_PLANS.team.monthlyAdditionalActiveUserPriceCents, 'Additional active user monthly');
+  const pack = `${STORAGE_PACK.bytes / 1024 ** 3} GB storage pack`;
+  await price('storagePackPriceId', await product('storage', 'storagePackProductId', 'storage pack'),
+    STORAGE_PACK.monthlyPriceCents, `${pack} monthly`);
   if (!config.clientToken) {
     const name = `${origin} subscription checkout`;
     let token = one((await list('/client-tokens')).filter((t) => t.name === name && t.status === 'active'), 'client tokens');

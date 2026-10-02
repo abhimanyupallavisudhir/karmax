@@ -85,7 +85,15 @@ describe('installation paid-launch settings', () => {
       environment: 'sandbox', apiKey: 'pdl_sdbx_apikey_secret', webhookSecret: 'pdl_ntfset_secret',
       clientToken: 'test_public', individualPriceId: id('a'), teamBasePriceId: id('b'), teamSeatPriceId: id('c'),
     } };
+    expect((await service.configure(input, 'https://tavya.test')).paddle).toMatchObject({ configured: false,
+      missing: ['Storage pack price ID'] });
+    Object.assign(input.paddle, { storagePackPriceId: id('d'), storagePackProductId: `pro_${'e'.repeat(26)}` });
     const result = await service.configure(input, 'https://tavya.test');
+    expect(result.paddle).toMatchObject({ storagePackPriceId: id('d'), storagePackProductId: `pro_${'e'.repeat(26)}` });
+    // Saving other settings keeps the pack catalog.
+    expect((await service.configure({ paddle: { environment: 'sandbox' } }, 'https://tavya.test')).paddle)
+      .toMatchObject({ configured: true, storagePackPriceId: id('d') });
+    await expect(service.configure({ paddle: { storagePackPriceId: 'price_wrong' } }, 'https://tavya.test')).rejects.toThrow(/storagePackPriceId/);
     expect(result).toMatchObject({ billingProvider: 'paddle', canEnable: false,
       paddle: { configured: true, webhookUrl: 'https://tavya.test/api/subscriptions/paddle/webhook' } });
     expect(JSON.stringify(result)).not.toContain('pdl_sdbx_apikey_secret');

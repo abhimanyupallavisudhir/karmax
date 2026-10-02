@@ -198,7 +198,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/gift$/.test(p)) return 'subscription:gift';
-  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|reconcile)$/.test(p))
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|storage-packs|reconcile)$/.test(p))
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
@@ -2551,13 +2551,13 @@ export class Gateway {
           gift: await this.deps.subscriptions?.currentGift(organizationId) ?? null,
           activeUsers,
           currentMonthlyPriceCents: entitlements.plan
-            ? hostedMonthlyPriceCents(entitlements.plan, activeUsers)
+            ? hostedMonthlyPriceCents(entitlements.plan, activeUsers, entitlements.storagePacks)
             : null,
           activeAgentRuns,
           queuedAgentRuns,
         });
       }
-      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|reconcile|gift)$/);
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|storage-packs|reconcile|gift)$/);
       if (subscription) {
         const organizationId = subscription[1]!;
         const action = subscription[2]!;
@@ -2625,6 +2625,8 @@ export class Gateway {
               String(body.plan ?? ''), idempotencyKey));
           }
           if (action === 'cancel') return this.json(res, 202, await billing.cancel(organizationId, idempotencyKey));
+          if (action === 'storage-packs')
+            return this.json(res, 202, await billing.storagePacks(organizationId, (await this.body(req)).packs, idempotencyKey));
           if (action === 'reconcile') return this.json(res, 200, await billing.reconcilePending(organizationId));
           await billing.syncSeats(organizationId);
           return this.json(res, 202, { syncing: true });
