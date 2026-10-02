@@ -1,6 +1,7 @@
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
 import type { PasskeyCredential } from '../autonomy/passkey.js';
 import { ExecutionOutput } from './execution-output.js';
+import { TaskSecrets, handleRef, paymentCardDetails, recordSecretRefs, secretScope } from '../autonomy/task-secrets.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { GatewayMetrics } from './metrics.js';
@@ -88,7 +89,7 @@ import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/
 import { worldRepos, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
-import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
+import { ITEM_FIELDS, VaultItems, itemHandle } from '../autonomy/vault-items.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { AuthorizationRequests } from '../platform/authorization-requests.js';
@@ -664,7 +665,8 @@ export class Gateway {
       deps.identity.connectAccountClosure?.(async id => Boolean(await deps.store.kvGet(`account-closed:${id}`)));
       deps.store.connectUserNames(async () => (await deps.identity!.listUsers()));
     }
-    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources);
+    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources,
+      (taskId) => this.taskSecrets(taskId));
     this.fanout = (await DurableEventFanout.create(deps.store, deps.bus));
     // Device OAuth finishes in the provider CLI after `/accounts/connect` has
     // returned. Refreshing only in that request races the eventual auth.json and
@@ -1356,6 +1358,13 @@ export class Gateway {
   }
 
   /** PTY check-in (SPEC §5.5): an ephemeral provider-owned terminal in the task world. */
+  /** Everything this task received, resolved by this process (SS-3): stored
+   * and served output about the task is scrubbed of it. */
+  private async taskSecrets(taskId: string): Promise<TaskSecrets> {
+    return new TaskSecrets({ store: this.deps.store, broker: this.deps.broker,
+      cardDetails: paymentCardDetails(this.deps.store, this.deps.paymentRegistry) }, (await secretScope(this.deps.store, taskId)));
+  }
+
   private async terminal(ws: import('ws').WebSocket, req: http.IncomingMessage) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const taskId = url.searchParams.get('taskId') ?? '';
@@ -1433,7 +1442,10 @@ export class Gateway {
       : () => {};
     let finalizing: Promise<void> | undefined;
     let clientClosed = false;
-    const output = new ExecutionOutput(data => this.deps.store.appendExecutionFrame(executionId, data));
+    // Stored for reconnect and exported with the organization: scrubbed. The
+    // live stream to the person at the shell is not.
+    const output = new ExecutionOutput(data => this.deps.store.appendExecutionFrame(executionId, data), undefined,
+      (await this.taskSecrets(taskId)));
     const heartbeat = new AsyncInterval(() => this.deps.store.heartbeatExecution(executionId), 30_000);
     heartbeat.unref();
     const finish = (code: number | null, cancelled = false): Promise<void> => {
@@ -5691,7 +5703,8 @@ export class Gateway {
               provider, sessionId, title: `${task.title} · ${requestedRole}`, cwd: view?.worldPath });
             if (provider === 'codex') {
               const exported = await createCodexConversationExport(objects, taskId, requestedRole, sessionId,
-                stored.home && stored.id ? { home: stored.home } : { generated: await generate() });
+                stored.home && stored.id ? { home: stored.home } : { generated: await generate() },
+                (await (await this.taskSecrets(taskId)).refresh()));
               ({ data, filename, source, warnings } = exported);
             } else {
               if (stored.source) data = await fs.promises.readFile(stored.source);
@@ -5700,6 +5713,9 @@ export class Gateway {
               source = stored.source ? 'native' : 'generated';
             }
           }
+          // The provider's own file stays intact for resume; the copy served is
+          // masked byte for byte of everything the task received (SS-3).
+          data = (await (await this.taskSecrets(taskId)).refresh()).mask(data);
           const warningsHeader = conversionWarningsHeader(warnings);
           res.writeHead(200, {
             'content-type': 'application/x-ndjson; charset=utf-8',
@@ -5891,7 +5907,7 @@ export class Gateway {
                 id, role, sessionId, stored.home && stored.id ? { home: stored.home } : {
                   generated: await exportConversationWithPanagent({ messages: transcript, provider: 'codex',
                     sessionId, title: `${t?.title} · ${role}`, cwd: view?.worldPath }),
-                });
+                }, (await (await this.taskSecrets(id)).refresh()));
               exportId = exported.exportId;
               exportMetadata = { filename: exported.filename, requiredCodexVersion: exported.requiredCodexVersion,
                 downloadUrl: `/api/tasks/${encodeURIComponent(id)}/conversation.jsonl?role=${encodeURIComponent(role)}&exportId=${exportId}` };
@@ -6584,7 +6600,7 @@ export class Gateway {
             return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
           if (!item.fields.includes(field))
             return this.json(res, 400, { error: `item "${item.label}" has no stored ${field}` });
-          const value = (await vault.resolveField(item, field, { principal, mode: 'reveal' }));
+          const value = (await vault.resolveField(item, field, { principal, mode: 'reveal', ...(callerTaskId ? { taskId: callerTaskId } : {}) }));
           res.setHeader('cache-control', 'private, no-store');
           return this.json(res, 200, { itemId: item.id, field, value });
         }
@@ -6674,6 +6690,9 @@ export class Gateway {
                 detail: { itemId: saved.id, ...result } }));
             }
           }
+          // The task knows what it stored; keep it out of what is kept of the task.
+          (await recordSecretRefs(store, callerTaskId, Object.keys(b.secrets ?? {})
+            .filter((field): field is VaultFieldName => saved.fields.includes(field as VaultFieldName)).map((field) => handleRef(itemHandle(saved.id, field)))));
           return this.json(res, 200, { id: saved.id, label: saved.label, type: saved.type, fields: saved.fields,
             ...(propagated ? { propagated } : {}), ...(writeBack?.length ? { writeBack } : {}) });
         }

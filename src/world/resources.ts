@@ -22,6 +22,7 @@ import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL
 import type { ResourcePublishView } from '../coordinators/resource-publish.js';
 import { credentialResource, resourceSecretHandle, snapshotResource } from '../domain/resource-drivers.js';
 import { VaultItems, itemHandle, type VaultFieldName } from '../autonomy/vault-items.js';
+import { handleRef, recordSecretRefs } from '../autonomy/task-secrets.js';
 import { ensureWorldExcluded } from './secret-exclude.js';
 import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
@@ -467,6 +468,7 @@ export class ProjectResourceService {
     if (serviceHandles && typeof serviceHandles === 'object') {
       for (const [name, secretHandle] of Object.entries(serviceHandles as Record<string, unknown>)) {
         if (typeof secretHandle !== 'string') continue;
+        (await recordSecretRefs(this.store, handle.id, [handleRef(secretHandle)]));
         env[name] = this.broker.resolve(secretHandle, {
           taskId: handle.id,
           caps: [`use-credential:${secretHandle}`],
@@ -1187,6 +1189,8 @@ export class ProjectResourceService {
 
   private async resolveSecret(attachment: ResourceAttachment, taskId: string): Promise<string> {
     const handle = await this.ownedCredentialHandle(attachment);
+    // The world receives this value; scrub it from what tavya keeps of the task (SS-3).
+    (await recordSecretRefs(this.store, taskId, [handleRef(handle)]));
     return this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] });
   }
 

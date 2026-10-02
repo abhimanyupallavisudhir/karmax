@@ -10,6 +10,7 @@ import { Capability, allows } from '../platform/capabilities.js';
 import { newId } from '../util/id.js';
 import { parseSavedSession, sessionDomainError } from './browser-session.js';
 import { paths } from '../config/paths.js';
+import { handleRef, recordSecretRefs } from './task-secrets.js';
 
 /**
  * Vault items (wiki plans/PLAN-passwords §4): the typed product layer over the raw
@@ -139,6 +140,7 @@ export interface VaultItemStore {
   vaultUsageHistory?(itemIds: string[], now: number): (Record<string, VaultUsage>) | Promise<Record<string, VaultUsage>>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
+  kvClaim?(k: string, v: string): boolean | Promise<boolean>;
   kvDelete?(k: string): (void) | Promise<void>;
   /** One range read of every key under a prefix; stores without it are read per key. */
   kvEntries?(prefix: string): Promise<Array<{ key: string; value: string }>>;
@@ -656,6 +658,9 @@ export class VaultItems {
     const usageKey = kvUsagePrefix(this.organizationId) + item.id;
     const stored = (await this.store.kvGet(usageKey));
     const current: ItemUsage | undefined = stored ? JSON.parse(stored) : (await this.list()).find((candidate) => candidate.id === item.id);
+    // Whatever the task does with the value from here on is scrubbed from what
+    // tavya archives and serves about it (SS-3).
+    (await recordSecretRefs(this.store, ctx.taskId, [handleRef(handle)]));
     (await this.store.appendAudit({
       principalId: ctx.principal ?? (ctx.taskId ? `task:${ctx.taskId}` : 'system'),
       action: ctx.mode === 'reveal' ? 'vault.revealed' : 'vault.used',

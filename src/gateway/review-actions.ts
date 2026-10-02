@@ -1,4 +1,5 @@
 import { ExecutionOutput } from './execution-output.js';
+import type { TaskSecrets } from '../autonomy/task-secrets.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import type { WorldHandle, WorldProcess } from '../world/types.js';
@@ -45,6 +46,8 @@ export interface RunningAction {
   provider: string;
   previewLeaseIds: string[];
   world: WorldHandle;
+  /** What the task received, scrubbed from stored and replayed output (SS-3). */
+  secrets?: TaskSecrets;
 }
 
 export interface ActionStatus {
@@ -69,7 +72,8 @@ export class ReviewActionRunner {
 
   constructor(private worlds: WorldRegistry, private store: Store, private runners?: RunnerPoolService,
     private access?: import('../world/access.js').WorldAccessService,
-    private resources?: import('../world/resources.js').ProjectResourceService) {
+    private resources?: import('../world/resources.js').ProjectResourceService,
+    private secretsFor?: (taskId: string) => Promise<TaskSecrets>) {
     this.commandPoll = new AsyncInterval(async () => {
       for (const rec of this.procs.values()) {
         if (!rec.running) continue;
@@ -89,6 +93,8 @@ export class ReviewActionRunner {
     openUrls?: string[];
   }): Promise<RunningAction> {
     const procId = newId('execution');
+    const secrets = await this.secretsFor?.(opts.taskId);
+    const scrub = async (text: string) => secrets ? (await secrets.refresh()).scrub(text) : text;
     const task = (await this.store.getTask(opts.taskId));
     const project = task ? (await this.store.getProject(task.projectId)) : undefined;
     if (!task || !project?.organizationId) throw new Error('review execution has no owning project');
@@ -126,11 +132,11 @@ export class ReviewActionRunner {
         const ports = (opts.openUrls ?? []).map(loopbackPort).filter((port): port is number => port !== undefined);
         for (const stopped of await reclaimPorts(world, ports).catch(() => []))
           notice += `Stopped an earlier process on port ${stopped.port}: ${stopped.command || `pid ${stopped.pid}`}\n`;
-        if (notice) (await this.store.appendExecutionFrame(procId, notice, 'system'));
+        if (notice) (await this.store.appendExecutionFrame(procId, (await scrub(notice)), 'system'));
       }
       process = await world.startProcess({ command: opts.command });
     } catch (error) {
-      (await this.store.appendExecutionFrame(procId, `${error instanceof Error ? error.message : String(error)}\n`, 'system'));
+      (await this.store.appendExecutionFrame(procId, (await scrub(`${error instanceof Error ? error.message : String(error)}\n`)), 'system'));
       (await this.store.finishExecution(procId, null, 'failed'));
       if (runnerLeaseId && this.access) await this.access.releaseLeaseAndParkIfIdle(opts.world, runnerLeaseId);
       else if (runnerLeaseId) (await this.runners?.release(runnerLeaseId, opts.world.kind));
@@ -155,8 +161,9 @@ export class ReviewActionRunner {
       provider: opts.world.kind,
       previewLeaseIds,
       world: opts.world,
+      ...(secrets ? { secrets } : {}),
     };
-    const output = new ExecutionOutput(data => this.store.appendExecutionFrame(procId, data));
+    const output = new ExecutionOutput(data => this.store.appendExecutionFrame(procId, data), undefined, secrets);
     this.output.set(procId, output);
     this.procs.set(procId, rec);
     process.onOutput(buf => {
@@ -177,7 +184,8 @@ export class ReviewActionRunner {
 
   async status(procId: string): Promise<ActionStatus | undefined> {
     const r = this.procs.get(procId);
-    if (r) return toStatus(r);
+    // The live ring is replayed to whoever attaches later: scrub it like the frames.
+    if (r) return { ...toStatus(r), ...(r.secrets ? { output: (await r.secrets.refresh()).scrub(r.output) } : {}) };
     const durable = (await this.store.execution(procId));
     if (!durable) return undefined;
     return {
@@ -344,6 +352,6 @@ function reviewPreviewTtlMs(): number {
 
 function toStatus(r: RunningAction): ActionStatus {
   const { process: _p, listeners: _l, runnerLeaseId: _r, leaseReleased: _x, provider: _provider, world: _world,
-    previewLeaseIds: _previewLeaseIds, ...rest } = r;
+    previewLeaseIds: _previewLeaseIds, secrets: _secrets, ...rest } = r;
   return rest;
 }

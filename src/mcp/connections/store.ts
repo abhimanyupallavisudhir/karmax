@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import type { Store } from '../../store/db.js';
 import type { CredentialBroker } from '../../autonomy/broker.js';
 import { publicUrl } from './http.js';
+import { handleRef, recordSecretRefs } from '../../autonomy/task-secrets.js';
 
 export type McpTransport = { type: 'http' | 'sse'; url: string }
   | { type: 'stdio'; command: string; args: string[]; env?: Record<string, string> };
@@ -128,6 +129,11 @@ export class McpConnections {
     });
   }
 
+  /** Record that these connections' credentials are written into a task's
+   * world, so what tavya keeps of the task is scrubbed of them (SS-3). */
+  async delivered(taskId: string, connections: McpConnection[]): Promise<void> {
+    (await recordSecretRefs(this.store, taskId, connections.map((c) => handleRef(this.handle(c.id)))));
+  }
   secret(c: McpConnection, taskId?: string): any {
     const handle = this.handle(c.id);
     if (!this.broker.hasHandle(handle)) return {};
