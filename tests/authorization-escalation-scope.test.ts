@@ -30,8 +30,8 @@ async function signedIn(userId: string) {
   const worlds = new WorldRegistry();
   const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
   const client = { workflow: { getHandle: () => ({}) } } as any;
-  const api = new KarmaxApi({ store, tokens, client, worlds, broker, taskQueue: 'test' } as any);
   const authorization = await AuthorizationService.create(store);
+  const api = new KarmaxApi({ store, tokens, client, worlds, broker, authorization, taskQueue: 'test' } as any);
   const identity = {
     connectOrganizationNames() {}, connectAccountClosure() {},
     listUsers: async () => [{ id: userId, name: 'Person', email: 'person@example.com' }],
@@ -58,9 +58,9 @@ describe('asking for more authorization than you have', () => {
     const god = { level: 'god', scope: 'global' };
 
     const targets = await post(`/api/authorization/escalation-targets?projectId=${project.id}`, { projectId: project.id, authorization: god });
-    expect(targets.status).toBe(200);
+    expect(targets.status, await targets.clone().text()).toBe(200);
     const body = await targets.json() as any;
-    expect(body.missingCapabilities).toContain('settings:write');
+    expect(body.missingCapabilities).toEqual(['*']);
     expect(body.users).toEqual([]);
 
     // Naming the project only in the body cannot scope the session, so the
