@@ -2,6 +2,9 @@ import type { Store } from '../store/db.js';
 import { LOGIN_PROVIDERS, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import { INSTALLATION_SCOPE, organizationScope, userScope, type VaultScope } from './vault-keys.js';
 
+/** A row from a raw SQL read; columns are checked where they are used. */
+type Row = Record<string, unknown>;
+
 /**
  * Who owns each vault handle, for the data epoch 4 migration (SS-1): the
  * secrets written before data keys record no scope, so the database says.
@@ -41,7 +44,7 @@ export async function resolveVaultScopes(store: Store, handles: string[]): Promi
   }
   const attachments = new Map<string, string>();
   const referenced = new Map<string, Set<string>>();
-  for (const row of (await db.prepare('SELECT id, organizationId, credentialHandles FROM resource_attachments').all()) as any[]) {
+  for (const row of (await db.prepare('SELECT id, organizationId, credentialHandles FROM resource_attachments').all()) as Row[]) {
     attachments.set(String(row.id), String(row.organizationId));
     try {
       for (const handle of JSON.parse(String(row.credentialHandles)))
@@ -50,11 +53,11 @@ export async function resolveVaultScopes(store: Store, handles: string[]): Promi
   }
   const credentialOwners = new Map<string, string>();
   for (const table of ['storage_locations', 'world_provider_connections'])
-    for (const row of (await db.prepare(`SELECT credentialHandle, organizationId FROM ${table} WHERE credentialHandle IS NOT NULL`).all()) as any[])
+    for (const row of (await db.prepare(`SELECT credentialHandle, organizationId FROM ${table} WHERE credentialHandle IS NOT NULL`).all()) as Row[])
       credentialOwners.set(String(row.credentialHandle), String(row.organizationId));
   const cards = new Map<string, string>();
   for (const row of (await db.prepare(`SELECT c.id, c.scope, c.scopeId, p.organizationId AS projectOrganization FROM cards c
-    LEFT JOIN projects p ON c.scope='project' AND c.scopeId=p.id`).all()) as any[]) {
+    LEFT JOIN projects p ON c.scope='project' AND c.scopeId=p.id`).all()) as Row[]) {
     const org = row.scope === 'organization' ? row.scopeId : row.scope === 'project' ? row.projectOrganization : 'org_personal';
     if (org) cards.set(String(row.id), String(org));
   }
@@ -66,7 +69,7 @@ export async function resolveVaultScopes(store: Store, handles: string[]): Promi
   const taskOrganizations = new Map<string, string | undefined>();
   const taskOrganization = async (taskId: string) => {
     if (!taskOrganizations.has(taskId)) taskOrganizations.set(taskId, ((await db.prepare(
-      'SELECT p.organizationId AS organizationId FROM tasks t JOIN projects p ON p.id = t.projectId WHERE t.id = ?').get(taskId)) as any)?.organizationId);
+      'SELECT p.organizationId AS organizationId FROM tasks t JOIN projects p ON p.id = t.projectId WHERE t.id = ?').get(taskId)) as Row | undefined)?.organizationId as string | undefined);
     return taskOrganizations.get(taskId);
   };
   const providers = new Set<string>([...LOGIN_PROVIDERS, ...MODEL_PROVIDERS, 'grok']);
