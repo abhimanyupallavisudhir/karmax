@@ -189,7 +189,10 @@ describe('durable jobs (real worktree world)', () => {
         platformRequest: async (method: string, requestPath: string) => { requests.push(`${method} ${requestPath}`); return targets; },
         emit: () => {},
       } as any);
-      const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'pause')!.parameters as any;
+      // pause waits on jobs and events; it is not how an agent asks for input it needs.
+      const pause = TOOL_SCHEMAS.find((tool) => tool.name === 'pause')!;
+      expect(pause.description).toContain('It is not for asking: if you need an answer to continue, call escalate_to_human or end your turn with the question.');
+      const schema = pause.parameters as any;
       expect(Object.keys(schema.properties)).toEqual(['minutes', 'jobs', 'needs_input', 'message', 'audience', 'urgency']);
       expect(schema.properties.urgency.enum).toEqual(['low', 'normal', 'high', 'critical']);
 

@@ -173,14 +173,14 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'pause',
     description:
-      'End your turn and be resumed later: when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. ' +
-      'If you are waiting for someone\'s answer, set needs_input: the task shows Needs input and notifies them, and `minutes` is how long to wait before carrying on without it. After calling it, end your turn.',
+      'End your turn to wait for durable jobs or a real-world event (CI, a deploy, a set time), and be resumed when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. ' +
+      'It is not for asking: if you need an answer to continue, call escalate_to_human or end your turn with the question. Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. After calling it, end your turn.',
     parameters: {
       type: 'object',
       properties: {
         minutes: { type: 'number', description: `Resume after this many minutes at the latest (1–${MAX_WAIT_MINUTES}). With jobs, set it comfortably above their expected run time.` },
         jobs: { type: 'array', items: { type: 'string' }, description: 'Job ids from start_job to wait for.' },
-        needs_input: { type: 'boolean', description: 'You need a person\'s answer: ask them and show Needs input instead of Waiting.' },
+        needs_input: { type: 'boolean', description: 'While you wait, someone may answer, and you carry on without it at the deadline: ask them and show Needs input instead of Waiting. For an answer you need, use escalate_to_human instead.' },
         message: { type: 'string', minLength: 1, maxLength: 4_000, description: 'With needs_input: the question (default: your final response).' },
         audience: {
           type: 'array',

@@ -136,6 +136,7 @@ describe('prompt assembly derives from the declared role (not a hardcoded map)',
     expect(out).toContain('- start_job(command, cwd?, name?):');
     expect(out).toContain('- pause(minutes, jobs?, needs_input?):');
     expect(out).toContain('the task shows Needs input and notifies them');
+    expect(out).toContain('pause is for waiting, not for asking');
     expect(out).toContain('- stop_job(jobs):');
     expect(out).toContain('Anything you run from your own shell stops when your turn ends.');
     // The default organization prompt carries the working practice.

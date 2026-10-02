@@ -44,7 +44,7 @@ const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration 
 - Prefer native MCP: use servers selected in the agent’s Tools, or request a remote MCP server by its MCP Registry name or official HTTPS URL. Use a Composio toolkit only as the fallback when no suitable remote MCP server exists.
 - list_connections(), request_connection({mcp | toolkit}, why), search_connection_tools(connectionId, search), execute_connection_tool(connectionId, tool, arguments): use connected apps through the gateway. Prefer managed sign-in to asking for passwords or API keys. The user allows an account they already connected or signs in from a Connect button in the task, which then resumes automatically.
 - start_job(command, cwd?, name?): run a long command (render, build, training run, large test suite) as a durable job that outlives this turn and any interruption; its output goes to a log file, and its name is what people see while you wait on it. Anything you run from your own shell stops when your turn ends.
-- pause(minutes, jobs?, needs_input?): end this turn and be resumed when the listed jobs finish, when a message arrives, or after \`minutes\` — whichever comes first. Without jobs it is a timed pause. If you are waiting for someone's answer, set needs_input (optionally with message, audience and urgency, as for escalate_to_human): the task shows Needs input and notifies them, and you carry on without the answer once \`minutes\` pass.
+- pause(minutes, jobs?, needs_input?): end this turn and be resumed when the listed jobs finish, when a message arrives, or after \`minutes\` — whichever comes first. Without jobs it is a timed pause. pause is for waiting, not for asking: when you need an answer to continue, use escalate_to_human or end your turn with the question. Only when you are waiting anyway and someone may answer meanwhile, set needs_input (optionally with message, audience and urgency, as for escalate_to_human): the task shows Needs input and notifies them, and you carry on without the answer once \`minutes\` pass.
 - stop_job(jobs): stop durable jobs you no longer need.
 - request_agent_action(taskId, "publish_branch", message?): ask a collaborator to publish in the background. It returns a durable request id immediately; continue other useful work and never poll. ${BRAND} injects completion or failure into this conversation and keeps the task in Do while a request remains outstanding.
 - cancel_agent_action(requestId): withdraw one of your pending collaboration requests when its target is blocked or its result is no longer needed. This releases your Do-stage wait without cancelling the target task.
@@ -128,18 +128,23 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
 }
 
-/** The project's install commands, run on demand, and where a missing step
- * belongs so later tasks get it. */
+/** The project's install commands, which the agent runs itself, and where a
+ * missing step belongs so later tasks get it. Agents used to read these as
+ * already run, and not as the setting itself, so a step they had skipped came
+ * back as a "missing" step to add to the very setting that listed it. */
 function describeEnvironment(world: WorldHandle): string {
   if (!world.meta?.projectId) return '';
   const installs = Array.isArray(world.meta.environmentInstall)
     ? world.meta.environmentInstall as Array<{ root: string; commands: string[] }> : [];
-  return [
-    ...(installs.length ? ['Before building or running tests, install this project\'s toolchain once per task: '
-      + installs.map((entry) => `in ${entry.root} run \`${entry.commands.join(' && ')}\``).join('; ') + '.'] : []),
-    'If this project is missing a toolchain step that every task needs (dependencies, browsers, CLIs), work around it, '
-      + 'then suggest the exact command for Project Settings → Environment in your final response so future tasks start ready.',
-  ].join(' ');
+  if (!installs.length) return 'This project has no install commands in Project Settings → Environment, so nothing beyond its '
+    + 'environment image is installed for you. If every task needs a step (dependencies, browsers, CLIs), work around it, then suggest '
+    + 'the exact command to add there in your final response.';
+  return 'These are this project\'s install commands from Project Settings → Environment. They are not run for you: '
+    + 'before building or running tests, run all of them yourself, once per task: '
+    + installs.map((entry) => `in ${entry.root} run \`${entry.commands.join(' && ')}\``).join('; ') + '. '
+    + 'When something is missing (a dependency, browser or CLI), first check whether a command above covers it and you skipped or '
+    + 'shortened it; if so, run it. Only a step that every task needs and these commands lack belongs in your final response, '
+    + 'as the exact command to add to Project Settings → Environment.';
 }
 
 /**
