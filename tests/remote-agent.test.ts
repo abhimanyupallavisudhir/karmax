@@ -567,6 +567,23 @@ describe('remote subscription agents', () => {
     expect(world.files.get('.karmax-injection/agent/chrome-cdp-launcher.mjs')?.toString()).toContain('--remote-debugging-port');
   });
 
+  // A person signs into a site for the agent through a desktop world's noVNC
+  // view (then save_session keeps it), so there the agent's browser must be
+  // the visible one; a headless world keeps it headless.
+  it('shows the agent\'s browser on a desktop world\'s display', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-desktop-browser-'));
+    fs.writeFileSync(path.join(localHome, '.claude.json'), JSON.stringify({ mcpServers: {
+      'chrome-devtools': { command: 'npx', args: ['-y', 'chrome-devtools-mcp'] },
+    } }));
+    const desktop = fakeWorld(false, true);
+    desktop.handle.meta = { environmentFlavor: 'desktop' };
+    expect((await seedRemoteAgentHome(desktop, 'claude', localHome)).browserMcp?.['chrome-devtools']?.env)
+      .toMatchObject({ KARMAX_CDP_HEADFUL: '1', DISPLAY: ':0' });
+    const headless = (await seedRemoteAgentHome(fakeWorld(false, true), 'claude', localHome)).browserMcp?.['chrome-devtools']?.env;
+    expect(headless).not.toHaveProperty('KARMAX_CDP_HEADFUL');
+    expect(headless).not.toHaveProperty('DISPLAY');
+  });
+
   it('copies only the requested native session between remote worlds', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-destination-'));
     const source = fakeWorld();

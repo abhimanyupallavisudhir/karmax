@@ -62,6 +62,8 @@ ok(!rows.includes('tell the agent'), 'request UI never asks the human to perform
 const passkeyRows = credentialRequestRows([request], [{ id: 'vi_1', label: 'GitHub passkey', type: 'passkey' }]);
 ok(/Once: .*passkey.*agent.*browser.*3 minutes/.test(passkeyRows), 'a passkey once-grant says it lasts a browser session');
 ok(!/Once: .*3 minutes/.test(rows), 'other once-grants keep the one-operation wording');
+const sessionRows = credentialRequestRows([request], [{ id: 'vi_1', label: 'notes.test (signed in)', type: 'session' }]);
+ok(/Once: Signs the agent's browser into this site once/.test(sessionRows.replace(/&#39;|'/g, "'")), 'a session once-grant says it signs the browser in once');
 
 const permission = {
   id: 'preq_1',

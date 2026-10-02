@@ -456,6 +456,33 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       },
     },
   },
+  {
+    name: 'save_session',
+    description:
+      `Save the signed-in session of the site open in your browser (its cookies and storage) as a vault item, so later tasks start signed in with use_session. Works however the site was signed into, including "Sign in with Google/GitHub": sign in first (with fill_credential, a passkey, or ask a human to sign in through this task's desktop), then call this on the signed-in page. Values never enter your context. Pass item_id to refresh a session you used, after your work, so it does not go stale.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        domain: { type: 'string', description: 'The site, e.g. "notion.so". Cookies of other sites (such as the identity provider\'s) are never saved.' },
+        item_id: { type: 'string', description: 'Refresh this saved session instead of creating one.' },
+        label: { type: 'string' },
+        username: { type: 'string', description: 'The account signed in, for people choosing between sessions.' },
+      },
+    },
+  },
+  {
+    name: 'use_session',
+    description:
+      `Sign your browser into a site with a saved session (see save_session). Navigate to the site first; ${BRAND} restores its cookies and storage and reloads the page signed in, without the values entering your context. Returns granted, needs_approval (a request was raised; you are resumed when it is decided) or not_in_vault. If the page is still signed out, the session expired: sign in again and call save_session with the item_id.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string' },
+        domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
+        why: { type: 'string', description: 'Shown to the person asked to approve.' },
+      },
+    },
+  },
   // ─── task list operations ────────────────────────────────────────────────
   // These mirror the platform MCP server one-for-one. They used to exist ONLY
   // there, so an agent in a remote/cloud world — which falls back to these
@@ -1191,6 +1218,14 @@ export function platformToolHandlers(
     },
     async use_passkey(args) {
       return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/login', { itemId: args?.item_id, domain: args?.domain }));
+    },
+    async save_session(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/session/save', {
+        domain: args?.domain, itemId: args?.item_id, label: args?.label, username: args?.username,
+      }));
+    },
+    async use_session(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/session/use', { itemId: args?.item_id, domain: args?.domain, why: args?.why }));
     },
     // ─── task list operations (mirroring the platform MCP server) ─────────
     async create_task(args) {

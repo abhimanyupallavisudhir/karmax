@@ -691,6 +691,24 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/login', a))),
   );
   server.registerTool(
+    'save_session',
+    {
+      description:
+        `Save the signed-in session of the site open in your browser (its cookies and storage) as a vault item, so later tasks start signed in with use_session. Works however the site was signed into, including "Sign in with Google/GitHub": sign in first (with fill_credential, a passkey, or ask a human to sign in through this task's desktop), then call this on the signed-in page. Values never enter your context. Pass itemId to refresh a session you used, after your work, so it does not go stale.`,
+      inputSchema: { domain: z.string().optional(), itemId: z.string().optional(), label: z.string().optional(), username: z.string().optional() },
+    },
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/session/save', a))),
+  );
+  server.registerTool(
+    'use_session',
+    {
+      description:
+        `Sign your browser into a site with a saved session (see save_session). Navigate to the site first; ${BRAND} restores its cookies and storage and reloads the page signed in, without the values entering your context. Returns granted, needs_approval (a request was raised; you are resumed when it is decided) or not_in_vault. If the page is still signed out, the session expired: sign in again and call save_session with the itemId.`,
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), why: z.string().optional() },
+    },
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/session/use', a))),
+  );
+  server.registerTool(
     'describe_platform',
     { description: 'Describe the complete administrative API available through platform_request.', inputSchema: {} },
     async () => wrap(async () => PLATFORM_API_CATALOG),

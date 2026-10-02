@@ -2132,6 +2132,7 @@ export class Connectors {
     if (!(await this.config(name)).writeBack) return undefined;
     const item = (await this.items.get(itemId));
     if (!item) throw new Error(`no vault item ${itemId}`);
+    if (item.type === 'session') throw new Error('a saved browser session stays in the vault: it expires and rotates, so it is not written to other stores');
     if (item.provenance.source.startsWith('import:')) {
       throw new Error('this item came from a one-way file import; write-back to the imported file is unavailable');
     }
@@ -2161,6 +2162,7 @@ export class Connectors {
    */
   async writeBackCreated(itemId: string): Promise<Array<{ connector: string; externalId?: string; error?: string }>> {
     const results: Array<{ connector: string; externalId?: string; error?: string }> = [];
+    if ((await this.items.get(itemId))?.type === 'session') return results;
     for (const name of this.names()) {
       if (!(await this.config(name)).writeBack) continue;
       try {

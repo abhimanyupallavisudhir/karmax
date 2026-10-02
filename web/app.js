@@ -15541,9 +15541,10 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <button class="btn sm" data-vreq-act="task" ${unbound ? 'disabled' : ''}>This task</button>
           <button class="btn sm" data-vreq-act="always" ${unbound ? 'disabled' : ''}>Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
-          ${policyTip(`Once: ${items.find((item) => item.id === request.itemId)?.type === 'passkey'
-            ? 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.'
-            : 'Approves one credential operation, consumed when used, not at the next agent turn.'}
+          ${policyTip(`Once: ${({
+            passkey: 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.',
+            session: 'Signs the agent\'s browser into this site once. It stays signed in until the site ends the session.',
+          })[items.find((item) => item.id === request.itemId)?.type] || 'Approves one credential operation, consumed when used, not at the next agent turn.'}
 
 This task: Approves the operation and grants this task the credential across turns. Its policy stays unchanged, so “ask” can prompt again.
 
@@ -16023,7 +16024,7 @@ async function wireVaultCards(organizationId) {
           <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <button class="btn sm" data-vi-reveal="${esc(i.id)}" title="Temporarily inspect one stored field (audited)" ${(i.fields || []).length ? '' : 'disabled'}>View</button>
-          <button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>
+          ${i.type === 'session' ? '' : `<button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>`}
           <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button>
           <div class="vault-reveal-panel" hidden>
             <label>Stored field <select class="vi-reveal-field">${(i.fields || []).map((field) => `<option value="${esc(field)}">${esc(field)}</option>`).join('')}</select></label>

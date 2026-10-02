@@ -167,3 +167,40 @@ it('still refuses a retained-world endpoint served from another profile (AU-20)'
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A desktop world asks for a visible browser (KARMAX_CDP_HEADFUL). If it
+// cannot open its display, a headless browser on the same port must take its
+// place: the pipe fallback has no port, so no fill or saved session could
+// reach the agent's browser.
+it('falls back to a headless browser on the port when the visible one cannot open', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-browser-headful-'));
+  const reservation = http.createServer();
+  await new Promise<void>(resolve => reservation.listen(0, '127.0.0.1', resolve));
+  const port = (reservation.address() as { port: number }).port;
+  await new Promise<void>(resolve => reservation.close(() => resolve()));
+  const chrome = path.join(dir, 'chrome');
+  const mcp = path.join(dir, 'mcp');
+  // Like Chrome without an X server: a headful launch exits at once.
+  fs.writeFileSync(chrome, `#!${process.execPath}
+const http = require('node:http');
+if (!process.argv.includes('--headless=new')) process.exit(1);
+const port = Number(/--remote-debugging-port=(\\d+)/.exec(process.argv.join(' '))[1]);
+http.createServer((req, res) => res.end(JSON.stringify({ pid: process.pid, args: process.argv.slice(2) }))).listen(port, '127.0.0.1');
+`, { mode: 0o700 });
+  fs.writeFileSync(mcp, `#!${process.execPath}
+fetch('http://127.0.0.1:' + process.env.KARMAX_CDP_PORT + '/json/version').then(r => r.json())
+  .then(s => console.log(JSON.stringify({ ...s, browserUrl: process.argv.includes('--browserUrl') })));
+`, { mode: 0o700 });
+  let pid: number | undefined;
+  try {
+    const env = { ...process.env, KARMAX_CDP_PORT: String(port), KARMAX_CDP_CHROME: chrome, KARMAX_CDP_MCP_BIN: mcp,
+      KARMAX_CDP_KEEP_ALIVE: '0', KARMAX_CDP_HEADFUL: '1', KARMAX_CDP_USER_DATA_DIR: path.join(dir, 'profile') };
+    const attached = JSON.parse((await exec(process.execPath, [launcher], { env, timeout: 30_000 })).stdout);
+    pid = attached.pid;
+    expect(attached.args).toContain('--headless=new');
+    expect(attached.browserUrl).toBe(true);
+  } finally {
+    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 40_000);

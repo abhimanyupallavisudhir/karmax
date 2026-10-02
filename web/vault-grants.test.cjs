@@ -59,6 +59,7 @@ ok(!passwords.includes('class="vault-items-list"'), 'settings no longer renders 
 ok(vaultCards.includes('class="modal-card vault-manager-modal"'), 'settings button opens a full vault manager');
 ok(vaultCards.includes('class="vault-search"'), 'settings manager offers credential search');
 ok(vaultCards.includes('data-vi-rotate'), 'settings manager retains secret rotation');
+ok(/i\.type === 'session' \? '' : `<button class="btn sm" data-vi-rotate=/.test(vaultCards), 'a saved session is refreshed by signing in again, not by typing a secret');
 ok(vaultCards.includes('data-vi-reveal'), 'settings manager lets a vault administrator inspect a credential');
 ok(vaultCards.includes('/reveal'), 'settings manager uses the audited administrative reveal endpoint');
 ok(vaultCards.includes('Every reveal is recorded in the audit log'), 'settings manager explains that plaintext inspection is audited');
