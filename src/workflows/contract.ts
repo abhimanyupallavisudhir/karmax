@@ -51,6 +51,17 @@ export { mergeQueueDomains, remotePolicyOf, landingAuthorityOf, samePosition, ME
 export { reviewCheckouts, allCheckoutsApproved, approveAll } from '../domain/checkouts.js';
 export type { CheckoutApprovals } from '../domain/checkouts.js';
 export { worldRepos } from '../world/types.js';
+import { worldRepos } from '../world/types.js';
+
+/** The line a landing adds to the work summary. The commit is the one that
+ * landed in the world's primary repo, so with several repos it names that repo;
+ * the project wiki companion never counts as one. */
+export function landedNote(world: import('../domain/types.js').WorldHandleRef | undefined, target: string, sha: string | undefined): string | undefined {
+  if (!sha) return undefined;
+  const repos = world ? worldRepos(world as import('../world/types.js').WorldHandle).filter((repo) => repo.role !== 'project-wiki') : [];
+  const primary = repos.find((repo) => repo.repo === world?.repo) ?? repos[0];
+  return `Merged into ${target} as ${sha.slice(0, 8)}${repos.length > 1 && primary ? ` (${primary.name})` : ''}.`;
+}
 
 /** Pure provider classification, safe in Temporal's deterministic sandbox. */
 export function remoteWorldProvider(provider: string | undefined): boolean {

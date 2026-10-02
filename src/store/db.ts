@@ -24,6 +24,7 @@ import {
   AgentProfile,
   TaskView,
   ChildTaskSummary,
+  ForkTaskSummary,
   ReviewInfo,
   KarmaxEvent,
   Tag,
@@ -83,6 +84,7 @@ import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
+import { taskForkSourceIds } from '../domain/forks.js';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -121,6 +123,26 @@ export interface ViewPublicationOrder {
   runId: string;
   seq: number;
   revision?: number;
+}
+
+type TaskSummaryRow = { id: string; num: number | null; title: string; workflow: string; lastView: string | null };
+
+/** A related task's list fields, without its conversation. */
+function taskSummary(row: TaskSummaryRow): ChildTaskSummary {
+  const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
+  return {
+    id: row.id,
+    ...(row.num != null ? { num: row.num } : {}),
+    title: row.title,
+    workflow: row.workflow,
+    ...(view ? { lastView: {
+      stage: view.stage,
+      status: view.status,
+      ...(view.waitingFor ? { waitingFor: view.waitingFor } : {}),
+      ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
+      ...(view.state?.draft ? { state: { draft: true } } : {}),
+    } } : {}),
+  };
 }
 
 /** Conversation references are `${runId}:${revision}` (conversationPublisher):
@@ -3685,26 +3707,30 @@ export class Store {
   /** Each child's list fields, archived children included, for its parent's
    * Sub-tasks panel (`TaskView.subTaskSummaries`). */
   async childTaskSummaries(parentTaskId: string): Promise<ChildTaskSummary[]> {
-    const rows = await this.readRows<{ id: string; num: number | null; title: string; workflow: string; lastView: string | null }>(
+    const rows = await this.readRows<TaskSummaryRow>(
       // Children spawned in one turn share a millisecond and ids end in random
       // bytes; `ord` is the list position allocated at insert on both databases.
       'SELECT id, num, title, workflow, lastView FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, ord, rowid', [parentTaskId]);
-    return rows.map((row) => {
-      const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
-      return {
-        id: row.id,
-        ...(row.num != null ? { num: row.num } : {}),
-        title: row.title,
-        workflow: row.workflow,
-        ...(view ? { lastView: {
-          stage: view.stage,
-          status: view.status,
-          ...(view.waitingFor ? { waitingFor: view.waitingFor } : {}),
-          ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
-          ...(view.state?.draft ? { state: { draft: true } } : {}),
-        } } : {}),
-      };
-    });
+    return rows.map(taskSummary);
+  }
+
+  /** Every task forked from this one's agents, forks of forks included, archived
+   * ones too, for its Agent forks panel (`TaskView.forkSummaries`). Forks are
+   * found within the source's project, like the panel's live task list. */
+  async forkTaskSummaries(sourceTaskId: string): Promise<ForkTaskSummary[]> {
+    const rows = await this.readRows<TaskSummaryRow & { params: string }>(`SELECT t.id, t.num, t.title, t.workflow, t.lastView,
+      t.params FROM tasks t JOIN tasks source ON source.projectId = t.projectId
+      WHERE source.id = ? AND t.id <> source.id AND t.params LIKE ? ORDER BY t.createdAt, t.ord, t.rowid`,
+    [sourceTaskId, '%"resumeFrom"%']);
+    const candidates = rows.map((row) => ({ row, forkOf: taskForkSourceIds(JSON.parse(row.params)) }));
+    const reached = new Set([sourceTaskId]);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const { row, forkOf } of candidates)
+        if (!reached.has(row.id) && forkOf.some((id) => reached.has(id))) { reached.add(row.id); grew = true; }
+    }
+    return candidates.filter(({ row }) => row.id !== sourceTaskId && reached.has(row.id))
+      .map(({ row, forkOf }) => ({ ...taskSummary(row), forkOf: forkOf.filter((id) => reached.has(id)) }));
   }
 
   /** Resolve a task by its per-project sequential number (SPEC §10.6). */

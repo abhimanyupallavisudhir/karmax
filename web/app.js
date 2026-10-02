@@ -8376,7 +8376,7 @@ function syncTermButton() {
     btn.disabled = false;
   } else {
     btn.classList.remove('danger');
-    btn.textContent = hasWorld ? 'Open terminal' : 'No workspace yet';
+    btn.textContent = hasWorld ? 'Open terminal' : btn.dataset.noWorld || 'No workspace yet';
     btn.disabled = !hasWorld;
   }
 }
@@ -8791,7 +8791,7 @@ function parentTaskContext(v) {
   const child = taskRecord(v.taskId);
   const parentId = v.parentTaskId || child?.parentTaskId;
   if (!parentId) return '';
-  const parent = taskRecord(parentId);
+  const parent = taskRecord(parentId) || (v.parentTask?.id === parentId ? v.parentTask : null);
   const label = parent
     ? `${parent.num != null ? `#${parent.num} ` : ''}${parent.title}`
     : numLabel(parentId);
@@ -8882,19 +8882,30 @@ function taskForkSourceIds(task) {
   return [...sources];
 }
 
-// Build from the complete project task pool (which includes archived tasks), so
-// a completed fork remains visible and forks of forks naturally form a tree.
-// The lineage guard makes malformed/cyclic stored parameters harmless.
-function agentForkTree(sourceTaskId, lineage = []) {
+// The live task list holds only active tasks, so the view carries every fork the
+// store records (`forkSummaries`, archived ones included); a live record, which
+// is fresher, takes its place, and a fork made since the view loaded joins it.
+function agentForkPool(v) {
+  const pool = new Map((v.forkSummaries || []).map((fork) => [fork.id, { task: fork, sources: fork.forkOf || [] }]));
+  for (const task of S.tasks || []) {
+    const sources = taskForkSourceIds(task);
+    if (sources.length) pool.set(task.id, { task, sources });
+  }
+  return [...pool.values()];
+}
+
+// Forks of forks form a tree. The lineage guard makes malformed/cyclic stored
+// parameters harmless.
+function agentForkTree(pool, sourceTaskId, lineage = []) {
   const ancestors = new Set(lineage);
   ancestors.add(sourceTaskId);
-  return (S.tasks || [])
-    .filter((task) => !ancestors.has(task.id) && taskForkSourceIds(task).includes(sourceTaskId))
-    .map((task) => ({ task, children: agentForkTree(task.id, [...ancestors]) }));
+  return pool
+    .filter(({ task, sources }) => !ancestors.has(task.id) && sources.includes(sourceTaskId))
+    .map(({ task }) => ({ task, children: agentForkTree(pool, task.id, [...ancestors]) }));
 }
 
 function agentForksSection(v) {
-  const tree = agentForkTree(v.taskId);
+  const tree = agentForkTree(agentForkPool(v), v.taskId);
   if (!tree.length) return '';
   const countNodes = (nodes) => nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0);
   const renderNodes = (nodes) => `<ul class="fork-tree">${nodes.map(({ task, children }) => {
@@ -9089,8 +9100,8 @@ function checkinTab(v) {
       ${items}
       <div class="ck-side-h">Shell</div>
       <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
-        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? "Open a terminal in this task's workspace" : 'No workspace yet'}">
-          <span class="ck-name">${hasWorld ? 'Open terminal' : 'No workspace yet'}</span>
+        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? "Open a terminal in this task's workspace" : noWorkspaceLabel(v)}">
+          <span class="ck-name">${hasWorld ? 'Open terminal' : noWorkspaceLabel(v)}</span>
           <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
         </button>
         ${localWorldPath(v) ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
@@ -9680,6 +9691,11 @@ function conversationPresence(v, t) {
   return { label: 'Idle', tone: 'idle' };
 }
 
+// A finished task's workspace was released, not never started.
+function noWorkspaceLabel(v) {
+  return ['done', 'cancelled', 'failed'].includes(v.status) ? 'Workspace closed' : 'No workspace yet';
+}
+
 // The ephemeral terminal: a real PTY in the task's world; type straight into it
 // (Ctrl-C and friends land in the shell). "Open terminal" flips to "Kill
 // terminal" while a session is live — that closes the socket, which kills the
@@ -9699,11 +9715,11 @@ function terminalPane(v) {
       ${(v.checkouts || []).length > 1 ? `<select class="sel sm" id="term-checkout" title="Which branch's checkout to open the shell in">
         ${v.checkouts.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('')}
       </select>` : ''}
-      <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No workspace yet'}</button>
+      <button class="btn sm" id="term-open" data-no-world="${esc(noWorkspaceLabel(v))}" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : esc(noWorkspaceLabel(v))}</button>
     </div>
     <div class="ck-term">
       <pre class="raw ${open ? '' : 'hidden'} term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell"></pre>
-      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? "“Open terminal” starts one in the task's world." : "This task hasn't started its workspace yet."}</div>`}
+      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? "“Open terminal” starts one in the task's world." : noWorkspaceLabel(v) === 'Workspace closed' ? "This task's workspace closed when it finished." : "This task hasn't started its workspace yet."}</div>`}
     </div>`;
 }
 
@@ -10014,14 +10030,28 @@ function paymentsLiveKey(v) {
 // Agent authorization + per-task vault grants — the same controls the task form
 // offers, editable in-flight (SPEC §5.5). The change re-points the task's live
 // grant, so it takes effect at the next agent turn. Hidden for drafts (they edit
-// in the full form) and once frozen (terminal, or past the point of no return).
+// in the full form); once frozen (terminal, or past the point of no return) it
+// stays as a read-only record of what the task's agents were allowed.
 function authorizationSection(v) {
   const rec = taskRecord(v.taskId);
   if (rec?.params?.draft) return '';
-  if (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) return '';
   const organizationId = S.projects.find((project) => project.id === rec?.projectId)?.organizationId;
   const projects = S.projects.filter((project) => project.organizationId === organizationId);
   const stored = rec?.params?._authorization || {};
+  if (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) {
+    if (!rec) return '';
+    const credentials = (stored.capabilities || []).filter((c) => c.startsWith('use-credential:item:')).length;
+    const frozenTitle = TERMINAL_STAGES.includes(v.stage) ? 'Frozen — this task has finished' : 'Frozen — this task is landing';
+    return `<div class="section-h">Authorization</div>
+    <div class="parameter-fields" id="tp-auth-frozen">
+      <div class="form-row" data-row="__authorization" style="position:relative">
+        <span style="position:absolute;right:0;top:0;color:var(--ink-3)" title="${frozenTitle}">🔒</span>
+        <div class="label-row"><label>Authorization</label></div>
+        <div class="task-sub">${esc(authorizationSummary({ level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
+          projectIds: stored.projectIds || [rec.projectId].filter(Boolean) }, projects))}${credentials ? ` · ${credentials} vault credential${credentials === 1 ? '' : 's'}` : ''}</div>
+      </div>
+    </div>`;
+  }
   const selected = S.authorizationEdits?.[v.taskId]?.values.authorization || {
     level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
     projectIds: stored.projectIds || [rec?.projectId].filter(Boolean) };

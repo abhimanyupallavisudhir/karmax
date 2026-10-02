@@ -31,6 +31,8 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   let status: TaskView['status'] = 'active';
   const msgs: Message[] = [{ id: 'm0', role: 'user', text: input.command ?? input.prompt, ts: 0 }];
   let world: WorldHandleLike | undefined;
+  // A released sandbox is gone, but its branch stays part of the task's record.
+  let releasedWorld: WorldHandleLike | undefined;
   let code: number | undefined;
   let acked = false;
   let cancelled = false;
@@ -43,7 +45,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'script-exec', stage, status, messages: msgs, actions: actions(),
-      state: { code }, branch: world?.branch, base, world, worldPath: world?.workdir ?? world?.root,
+      state: { code }, branch: (world ?? releasedWorld)?.branch, base, world, worldPath: world?.workdir ?? world?.root,
       parentTaskId: input.parentTaskId, updatedAt: workflowInfo().historyLength,
     };
   }
@@ -77,6 +79,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   await publish();
   if (world && releaseWorldOnCompletion(world)) {
     await core.destroyWorld(world as any);
+    releasedWorld = world;
     world = undefined;
     await publish();
   }

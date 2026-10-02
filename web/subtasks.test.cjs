@@ -48,6 +48,9 @@ const parentLink = parentTaskContext({ taskId: 'child-a', parentTaskId: 'parent'
 ok(parentLink.includes('Sub-task of') && parentLink.includes('#10 Ship the new workspace'), 'child names its parent in the masthead');
 ok(parentLink.includes('data-open="parent"') && parentLink.startsWith('<button'), 'parent context is one keyboard-operable navigation target');
 ok(parentTaskContext({ taskId: 'parent' }) === '', 'top-level tasks do not render empty parent chrome');
+// A finished parent is archived out of the live list; the view still names it.
+const archivedParent = parentTaskContext({ taskId: 'orphan', parentTaskId: 'gone', parentTask: { id: 'gone', num: 7, title: 'Finished parent' } });
+ok(archivedParent.includes('#7 Finished parent') && archivedParent.includes('data-open="gone"'), 'an archived parent keeps its number and title');
 
 ok(subTaskState(S.tasks[1]).label === 'working', 'active work reads as it does in the task list');
 ok(subTaskState(S.tasks[2]).complete === true, 'done work contributes to completion');

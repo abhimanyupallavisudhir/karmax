@@ -41,7 +41,7 @@ global.subTaskState = (rec) => ({
 });
 global.taskUrl = (id) => `/tasks/${id}`;
 
-for (const name of ['taskForkSourceIds', 'agentForkTree', 'subTaskStateHtml', 'agentForksSection']) eval(extractFn(name));
+for (const name of ['taskForkSourceIds', 'agentForkPool', 'agentForkTree', 'subTaskStateHtml', 'agentForksSection']) eval(extractFn(name));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {
@@ -52,7 +52,7 @@ const ok = (condition, message) => {
 ok(taskForkSourceIds(S.tasks[1]).includes('source'), 'task agent resumeFrom identifies its source task');
 ok(taskForkSourceIds(S.tasks[4]).length === 0, 'a raw provider session is not mistaken for a task fork');
 
-const tree = agentForkTree('source');
+const tree = agentForkTree(agentForkPool({ taskId: 'source' }), 'source');
 ok(tree.length === 2, 'only direct forks occupy the top level');
 ok(tree[0].task.id === 'fork-a' && tree[0].children[0].task.id === 'nested', 'a recursive fork is nested under its source fork');
 ok(tree[1].task.id === 'fork-b' && tree[1].children.length === 0, 'sibling forks stay at the same level');
@@ -63,6 +63,21 @@ ok(panel.includes('href="/tasks/fork-a"') && panel.includes('href="/tasks/fork-b
 ok(panel.indexOf('href="/tasks/nested"') > panel.indexOf('class="fork-tree"', panel.indexOf('href="/tasks/fork-a"')), 'recursive forks render inside a nested tree');
 ok(!panel.includes('Continue raw session') && !panel.includes('Independent task'), 'unrelated continuations and tasks stay out of the section');
 ok(agentForksSection({ taskId: 'unrelated' }) === '', 'tasks without forks do not show empty overview chrome');
+
+// A finished fork is archived out of the live list; the view's summaries keep it,
+// and its own forks stay nested beneath it.
+const archived = { taskId: 'source', forkSummaries: [
+  { id: 'fork-done', num: 26, title: 'Finished approach', lastView: { stage: 'done', status: 'done' }, forkOf: ['source'] },
+  { id: 'fork-done-child', num: 27, title: 'Follow-up on the finished approach', lastView: { stage: 'do', status: 'active' }, forkOf: ['fork-done'] },
+  { id: 'fork-a', num: 21, title: 'Stale summary title', lastView: { stage: 'setup', status: 'active' }, forkOf: ['source'] },
+] };
+const withArchived = agentForksSection(archived);
+ok(withArchived.includes('5 task forks'), 'archived forks count alongside live ones');
+ok(withArchived.includes('href="/tasks/fork-done"') && withArchived.includes('Complete'), 'a finished fork stays listed as complete');
+ok(withArchived.indexOf('href="/tasks/fork-done-child"') > withArchived.indexOf('href="/tasks/fork-done"'), 'a fork of an archived fork nests beneath it');
+ok(withArchived.includes('Try the first approach') && !withArchived.includes('Stale summary title'), 'a live record supersedes its summary');
+ok(agentForksSection({ taskId: 'archived-only', forkSummaries: [{ id: 'x', title: 'Only fork', lastView: { status: 'done' }, forkOf: ['archived-only'] }] }).includes('1 task fork'),
+  'a task whose only fork finished still shows it');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
