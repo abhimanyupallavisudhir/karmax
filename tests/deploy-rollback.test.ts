@@ -43,6 +43,15 @@ dc() {
 cmd_backup_candidate() { destination="$DEPLOY_DIR/backups/fixture"; mkdir -p "$destination"; [ "${failure}" != backup ]; }
 ready_calls=0
 wait_ready() { ready_calls=$((ready_calls + 1)); [ "${ready ? '1' : '0'}" = 1 ] || [ "$ready_calls" -gt 1 ]; }
+# The edge answers before the update unless told otherwise; 'edge-breaks'
+# stops answering once the candidate is up, 'edge-down' never answered.
+edge_calls=0
+edge_answers() {
+  edge_calls=$((edge_calls + 1))
+  printf 'edge probe %s\\n' "$edge_calls" >> "$ROOT_DIR/operations"
+  case "${failure}" in edge-down) return 1 ;; edge-breaks) [ "$edge_calls" -eq 1 ] || [ -f "$ROOT_DIR/edge-restored" ] ;; *) return 0 ;; esac
+}
+sleep() { :; }
 cmd_update "$@"
 `;
   const file = path.join(root, 'deploy/fixture-updater'); fs.writeFileSync(file, script);
@@ -179,4 +188,39 @@ it('proceeds past the vault preflight only when told to', () => {
   expect(result.status, result.stderr).toBe(0);
   expect(result.head).toBe(result.target);
   expect(result.operations).toContain('vault-preflight');
+});
+
+// CI-8: a release that moves Caddy (to the host network, the app to a loopback
+// port) is only deployed once a request crosses the edge again; otherwise the
+// previous release, and its edge, come back.
+it('rolls back a release after which the edge stops answering', () => {
+  const result = update('2\n', '2\n', true, 'edge-breaks');
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('no longer answers through Caddy');
+  expect(result.stderr).toContain('automatic rollback');
+  expect(result.operations.match(/up -d/g)).toHaveLength(2);
+  expect(result.operations).toContain('logs --tail=50 caddy');
+  expect(result.head).toBe(result.previous);
+});
+
+it('deploys when the edge keeps answering', () => {
+  const result = update('2\n', '2\n', true);
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.head).toBe(result.target);
+  expect(result.operations.match(/edge probe/g)!.length).toBeGreaterThanOrEqual(2);
+});
+
+it('does not gate a release on an edge that never answered (no certificate or DNS yet)', () => {
+  const result = update('2\n', '2\n', true, 'edge-down');
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.head).toBe(result.target);
+  expect(result.operations.match(/edge probe/g)).toHaveLength(1);
+});
+
+it('leaves a healthy app running when only the edge breaks across data epochs', () => {
+  const result = update('2\n', '3\n', true, 'edge-breaks');
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('app left running');
+  expect(result.operations).not.toContain('stop app');
+  expect(result.head).toBe(result.target);
 });

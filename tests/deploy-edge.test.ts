@@ -127,7 +127,7 @@ describe('public edge (Caddy) image', () => {
   it('keeps signed legacy webhooks reachable without redirecting their POSTs', () => {
     const legacy = read('Caddyfile').split('{$KARMAX_LEGACY_DOMAIN:http://127.0.0.1:65535} {')[1]?.split('\n}')[0] ?? '';
     expect(legacy).toContain('import karmax_ratelimit');
-    expect(legacy).toContain('handle /api/github/webhook {\n\t\treverse_proxy app:4505');
+    expect(legacy).toContain('handle /api/github/webhook {\n\t\treverse_proxy 127.0.0.1:4505');
     expect(legacy).toContain('handle {\n\t\tredir https://{$KARMAX_DOMAIN}{uri} permanent');
   });
 
@@ -270,4 +270,30 @@ it('gives app responses without a policy a locked-down default on the console or
   const security = caddyfile.slice(caddyfile.indexOf('(karmax_security) {'), caddyfile.indexOf('\n}\n', caddyfile.indexOf('(karmax_security) {')));
   expect(security).not.toMatch(/Content-Security-Policy/i);
   expect(site('https://')).not.toMatch(/Content-Security-Policy/i);
+});
+
+it('preserves public IPv6 peers and exposes the app only on host loopback (CI-8)', () => {
+  for (const name of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    const config = parse(read(name));
+    expect(config.services.caddy.network_mode).toBe('host');
+    expect(config.services.caddy.ports).toBeUndefined();
+    expect(config.services.app.ports).toEqual(['127.0.0.1:4505:4505']);
+    // The app trusts forwarded addresses only from its own bridge gateway, which
+    // is where host-network Caddy's connections to the loopback port arrive
+    // from. Nothing pins the Compose network, so updating an install never has
+    // to rebuild it.
+    expect(config.services.app.environment.KARMAX_TRUSTED_PROXY_IP).toBe('gateway');
+    expect(config.networks?.default?.ipam).toBeUndefined();
+  }
+  expect(read('Caddyfile')).not.toContain('app:4505');
+  expect(read('Caddyfile').match(/header_up X-Forwarded-For \{http.request.remote.host\}/g)).toHaveLength(3);
+});
+
+it('keeps Caddy\'s admin API off now that Caddy shares the host network (CI-8)', () => {
+  // On the host network Caddy's default admin endpoint (localhost:2019) would
+  // let any process on the host replace the edge's configuration unauthenticated.
+  // Nothing reloads Caddy through it.
+  const caddyfile = read('Caddyfile');
+  const global = caddyfile.slice(caddyfile.indexOf('{'), caddyfile.indexOf('\n}\n'));
+  expect(global).toMatch(/^\tadmin off$/m);
 });
