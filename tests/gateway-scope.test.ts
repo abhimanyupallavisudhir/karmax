@@ -390,7 +390,7 @@ describe('gateway request scope for bare-id routes', () => {
     });
     expect(requested.status).toBe(200);
 
-    const summaries = (await (await fetch(`${base}/api/tasks/${parent.id}`, { headers: auth() })).json()).subTaskSummaries;
+    const summaries = ((await (await fetch(`${base}/api/tasks/${parent.id}`, { headers: auth() })).json()) as any).subTaskSummaries;
     expect(summaries).toEqual([expect.objectContaining({ id: child.id,
       lastView: expect.objectContaining({ status: 'waiting', approvalRequests: 1 }) })]);
   });

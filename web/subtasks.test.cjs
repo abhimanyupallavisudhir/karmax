@@ -60,7 +60,7 @@ ok(subTaskState(S.tasks[3]).label === 'escalated' && subTaskState(S.tasks[3]).to
 const state = (lastView, extra = {}) => subTaskState({ lastView, ...extra });
 const cases = [
   [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'agentSlot', detail: 'Starting agent' } }, 'working', 'waiting'],
-  [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'timer', until: 1 } }, 'Paused until 4:00 PM', 'waiting'],
+  [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'timer', until: 1 } }, 'Waiting until 4:00 PM', 'waiting'],
   [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'human', detail: 'Approve the sandbox keys' } }, 'Needs input', 'waiting'],
   [{ stage: 'do', status: 'waiting', waitingFor: { kind: 'subtask' } }, 'Waiting for sub-tasks', 'waiting'],
   [{ stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' } }, 'review', 'waiting'],
@@ -126,7 +126,7 @@ const approval = subTasksSection({ taskId: 'parent', workflow: 'software-dev', s
   { id: 'needs-key', num: 16, title: 'Paddle storage packs', workflow: 'software-dev',
     lastView: { stage: 'do', status: 'waiting', waitingFor: { kind: 'timer', until: 1 }, approvalRequests: 2 } },
 ] });
-ok(approval.includes('Paused until 4:00 PM') && approval.includes('approval needed'), 'a child waiting on an approval shows it in the parent');
+ok(approval.includes('Waiting until 4:00 PM') && approval.includes('approval needed'), 'a child waiting on an approval shows it in the parent');
 
 S.view = summaries;
 ok(patchSubTaskSummaryFromEvent({ type: 'view.updated', taskId: 'child-a', payload: { stage: 'review', status: 'waiting', waitingFor: 'parent' } }) === true,
