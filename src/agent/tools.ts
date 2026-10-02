@@ -310,7 +310,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_credential',
     description:
-      `Ask for access to a credential in the user's vault (a site login, API key, SSH key, or .env bag) that list_credentials does not show, identified by item_id or the site's domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — ${BRAND} automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human's own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then ${BRAND} resumes the task.`,
+      `Ask for access to a credential in the user's vault (a site login, API key, SSH key, or .env bag) that list_credentials does not show, identified by item_id or the site's domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — ${BRAND} automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human's own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then ${BRAND} resumes the task. Prefer an app connection (request_connection) when the service offers one, and ask for reveal only when use cannot work: a revealed secret is sent to your model provider.`,
     parameters: {
       type: 'object',
       properties: {
