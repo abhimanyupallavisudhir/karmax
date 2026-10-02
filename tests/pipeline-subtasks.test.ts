@@ -445,9 +445,10 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
     expect(asking).toMatchObject({ stage: 'do', status: 'waiting' });
     expect(asking.waitingFor).toMatchObject({ detail: 'Which region?', audience: ['@creator'], urgency: 'high' });
     expect(asking.waitingFor.until).toBeGreaterThan(Date.now());
-    // The published lifecycle tick is the ask the inbox notifies on.
-    const ticks = (await h.store.eventsOfType(unansweredId, 'view.updated')).map((e: any) => e.payload);
-    expect(ticks).toContainEqual(expect.objectContaining({ waitingFor: 'human', waitingDetail: 'Which region?', urgency: 'high' }));
+    // The published lifecycle tick is the ask the inbox notifies on. The query
+    // sees the ask before the publishView activity records it, so poll.
+    await expect.poll(async () => (await h.store.eventsOfType(unansweredId, 'view.updated')).map((e: any) => e.payload), { timeout: 10_000 })
+      .toContainEqual(expect.objectContaining({ waitingFor: 'human', waitingDetail: 'Which region?', urgency: 'high' }));
     // Nobody answers: the agent is told so and carries on.
     await expect.poll(async () => (await view(unanswered)).stage, { timeout: 30_000 }).toBe('review');
     expect((await view(unanswered)).messages.some((m: any) => m.role === 'user' && /nobody answered within your 2-minute limit/.test(m.text))).toBe(true);
