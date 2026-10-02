@@ -1535,7 +1535,8 @@ export interface ChildTaskSummary {
   num?: number;
   title: string;
   workflow: string;
-  lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed'> & { state?: { draft?: boolean } };
+  /** `approvalRequests` is the gateway's projection, as on a task-list row. */
+  lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed' | 'approvalRequests'> & { state?: { draft?: boolean } };
 }
 
 /** A task forked from another task's agent, as the source's Agent forks panel

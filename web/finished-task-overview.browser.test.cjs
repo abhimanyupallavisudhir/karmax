@@ -82,7 +82,7 @@ const root = __dirname;
     assert.match(overview, /work summary[\s\S]*3 file\(s\) changed\.[\s\S]*Merged into main as 1a2b3c4d\./i, 'the work summary keeps what the work was');
     assert.match(overview, /Screenshot/, 'review outputs stay openable');
     assert.match(overview, /2 task forks/, 'finished and live forks are both listed');
-    assert.match(overview, /Try a toolbar icon[\s\S]*Complete/, 'the finished fork shows as complete');
+    assert.equal(await page.locator('a[href$="/tasks/fork-done"] .subtask-state.done').count(), 1, 'the finished fork shows as done');
     assert.match(overview, /PR #7\s*merged/i, 'the merged pull request stays linked');
 
     await open('checkin');
