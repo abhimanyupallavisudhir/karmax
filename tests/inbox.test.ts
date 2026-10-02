@@ -69,6 +69,22 @@ describe.each(storeBackends)('inbox ($name)', ({ name, open }) => {
     expect((await f.inbox())).toEqual([]);
   });
 
+  it.each([
+    ['credential.approval-requested', 'credential.approval-dismissed'],
+    ['connection.requested', 'connection.dismissed'],
+  ])('silences a dismissed %s across waiting lifecycle ticks', async (requested, dismissed) => {
+    const f = (await fixture(open));
+    try {
+      (await f.store.appendEvent({ taskId: f.task.id, type: requested, ts: Date.now(), payload: { requestId: 'request' } }));
+      expect((await f.inbox('owner'))).toHaveLength(1);
+      (await f.store.appendEvent({ taskId: f.task.id, type: dismissed, ts: Date.now(), payload: { requestId: 'request' } }));
+      expect((await f.inbox('owner'))).toEqual([]);
+      (await f.view({ status: 'waiting', waitingFor: { kind: 'human' } }));
+      (await f.store.pruneStaleInbox());
+      expect((await f.inbox('owner'))).toEqual([]);
+    } finally { (await f.store.close()); }
+  });
+
   it('keeps a connection ask visible while another approval is dismissed', async () => {
     const f = (await fixture(open));
     try {

@@ -907,13 +907,13 @@ export class Gateway {
       counts.set(taskId, count);
     };
     for (const request of (await new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
-      .requests({ status: 'pending' }))) add(request.taskId);
+      .requests({ status: 'pending' }))) add(request.taskId, !!request.dismissed);
     for (const request of (await new PermissionRequests(this.deps.store, organizationId).requests({ status: 'pending' })))
       add(request.taskId, !!request.dismissed);
     for (const request of (await new AuthorizationRequests(this.deps.store, organizationId).requests({ status: 'pending' })))
       if (request.target.kind === 'task') add(request.target.taskId, !!request.dismissed);
     for (const connection of (await this.connections()?.all()) ?? [])
-      if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId);
+      if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId, !!connection.dismissed);
     return counts;
   }
 
@@ -6455,7 +6455,7 @@ export class Gateway {
             if (result.connection.status === 'active') this.sweepConnections();
             return this.json(res, 200, result);
           }
-          const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|callback|tools|execute)$/);
+          const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|dismiss|callback|tools|execute)$/);
           if (match) {
             const id = match[1]!; const action = match[2]!;
             const c = (await service.get(org, id));
@@ -6474,7 +6474,7 @@ export class Gateway {
               }
             } else {
               const userId = requireOwner();
-              if (callerTaskId || (c.ownerId !== userId && !(action === 'disconnect' && !c.ownerId && c.taskId && (await this.deps.tokens.check(token, 'task:edit', { projectId: (await store.getTask(c.taskId))?.projectId, organizationId: org })).ok))) return this.json(res, 403, { error: 'Only the connection owner can manage this account' });
+              if (callerTaskId || (c.ownerId !== userId && !(['disconnect', 'dismiss'].includes(action) && !c.ownerId && c.taskId && (await this.deps.tokens.check(token, 'task:edit', { projectId: (await store.getTask(c.taskId))?.projectId, organizationId: org })).ok))) return this.json(res, 403, { error: 'Only the connection owner can manage this account' });
               if (action === 'callback' && method === 'POST') {
                 const result = await service.finishMcp(org, id, userId, b.state, b.code); this.sweepConnections();
                 return this.json(res, 200, result);
@@ -6489,6 +6489,12 @@ export class Gateway {
                 for (const projectId of b.projectIds) if (!(await this.deps.tokens.check(token, 'project:settings:write', { projectId, organizationId: org })).ok)
                   return this.json(res, 403, { error: 'Project settings access required to share an account' });
                 return this.json(res, 200, await service.share(org, id, userId, b.projectIds));
+              }
+              if (action === 'dismiss' && method === 'POST') {
+                const result = await service.dismiss(org, id, actorPrincipal(callerIdentity.actor));
+                (await this.emitTaskEvent({ taskId: c.taskId!, type: 'connection.dismissed', ts: Date.now(),
+                  payload: { requestId: c.id, connectionId: c.id } }));
+                return this.json(res, 200, result);
               }
               if (action === 'disconnect' && method === 'POST') {
                 const result = await service.disconnect(org, id, userId); this.sweepConnections();
@@ -6803,8 +6809,17 @@ export class Gateway {
         if (vres && method === 'POST') {
           const b = await this.body(req);
           const action = String(b.action ?? '');
-          if (!['once', 'task', 'always', 'deny'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny' });
+          if (!['once', 'task', 'always', 'deny', 'dismiss'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny | dismiss' });
           try {
+            if (action === 'dismiss') {
+              const dismissed = (await vault.dismiss(vres[1]!, principal));
+              const task = (await store.getTask(dismissed.taskId));
+              if (task && (await store.getProject(task.projectId))?.organizationId === organizationId)
+                (await this.emitTaskEvent({ taskId: dismissed.taskId, type: 'credential.approval-dismissed', ts: Date.now(),
+                  payload: { requestId: dismissed.id } }));
+              return this.json(res, 200, { ...(await this.credentialRequestView(dismissed, organizationId)),
+                resume: { resumed: false, reason: 'Dismissed without notifying the agent' } });
+            }
             const resolved = (await vault.resolve(vres[1]!, { action: action as any, by: principal, itemId: b.itemId ? String(b.itemId) : undefined }));
             const item = resolved.itemId ? (await vault.get(resolved.itemId)) : undefined;
             const label = item?.label ?? resolved.domain ?? 'credential';

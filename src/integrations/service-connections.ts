@@ -38,6 +38,8 @@ export interface ServiceConnection {
   /** Changes on every sign-in, so a stale OAuth exchange cannot overwrite it. */
   revision?: string;
   notifiedAt?: number;
+  /** A task request silenced by a human: off their notifications, still open. */
+  dismissed?: { by: string; at: number };
 }
 export interface McpServer extends RemoteMcpTransport { auth: 'oauth' | 'none'; registry?: { name: string; version: string } }
 type OpenMcp = typeof openRemoteMcp;
@@ -229,6 +231,8 @@ export class ServiceConnections {
       let c = input.id ? (await this.get(org, input.id)) : undefined;
       if (c?.ownerId && c.ownerId !== ownerId) throw new ConnectionError('This connection belongs to another person', 403);
       if (c?.status === 'active') return { connection: this.view(c) };
+      // Answering a dismissed request takes it back up.
+      if (c) c.dismissed = undefined;
       if (input.useConnectionId) {
         if (!c?.taskId) throw new ConnectionError('Only a task request can use an existing account');
         const account = (await this.get(org, input.useConnectionId));
@@ -346,6 +350,17 @@ export class ServiceConnections {
         (await this.save({ ...grant, status: 'disconnected', notifiedAt: undefined }));
       if (c.accountId) { await this.remote(() => this.backend().disconnect(c.accountId!)); c.accountId = undefined; (await this.save(c)); }
       (await this.audit(c, ownerId, 'disconnected'));
+      return this.view(c);
+    });
+  }
+  /** Silence an open task request without answering it: the task is not told. */
+  async dismiss(org: string, id: string, by: string) {
+    return this.locked(id, async () => {
+      const c = (await this.get(org, id));
+      if (!c.taskId || !['requested', 'connecting', 'expired'].includes(c.status))
+        throw new ConnectionError('Only an open task request can be dismissed');
+      c.dismissed ??= { by, at: Date.now() };
+      (await this.save(c)); (await this.audit(c, by, 'dismissed'));
       return this.view(c);
     });
   }

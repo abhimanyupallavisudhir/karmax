@@ -1,5 +1,6 @@
-// What the task page loads, and that nothing loaded is lost: a decision dismissed
-// from the inbox still blocks its agent, so the page loads and shows it; a
+// What the task page loads, and that nothing loaded is lost: a dismissed
+// decision still blocks its agent, so the page loads it and its Approval Requests
+// tab shows it (the conversation leaves it out); a
 // websocket refresh racing the approvals load keeps what that load found; a j/k
 // walk continues from the page actually open; and agent review HTML is fetched
 // once per content, not on every repaint (UI-6).
@@ -48,9 +49,15 @@ const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     page.on('pageerror', error => { errors.push(error.message); console.error('page:', error.message); });
     const send = (event) => sockets.at(-1).send(JSON.stringify({ projectId: 'p', ts: Date.now(), ...event }));
 
-    // A decision dismissed from the inbox is still pending; its conversation shows it.
+    // A dismissed decision is still pending: it is loaded, kept out of the
+    // conversation, and answerable on the Approval Requests tab.
     await page.goto('http://console.test/org/workspace/tasks/1/checkin');
-    await page.locator('#ck-thread [data-preq="dismissed"]').waitFor();
+    await page.locator('#ck-thread').waitFor();
+    for (let i = 0; i < 50 && !requests.some(r => r.startsWith('GET /api/permission-requests')); i++) await wait(100);
+    await wait(400); // the approvals load (300 ms) lands and repaints
+    assert.equal(await page.locator('#ck-thread [data-preq="dismissed"]').count(), 0, 'a dismissed decision leaves the conversation');
+    await page.locator('[data-tasktab="approvals"]').click();
+    await page.locator('.approval-request-dismissed[data-preq="dismissed"] [data-preq-act="approve"]').waitFor();
 
     // A refresh that started before the approvals load finished keeps what it found.
     slowRefresh = true;
