@@ -917,7 +917,13 @@ export class Gateway {
       counts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
     }
     const count = counts.get(taskId);
-    return { ...view, approvalRequests: count?.notify || undefined, pendingDecisions: count?.pending || undefined };
+    // A parent's Sub-tasks panel flags a child's approval exactly as its list row does.
+    const subTaskSummaries = view.subTaskSummaries?.map((summary) => {
+      const approvalRequests = counts.get(summary.id)?.notify;
+      return approvalRequests && summary.lastView ? { ...summary, lastView: { ...summary.lastView, approvalRequests } } : summary;
+    });
+    return { ...view, ...(subTaskSummaries ? { subTaskSummaries } : {}),
+      approvalRequests: count?.notify || undefined, pendingDecisions: count?.pending || undefined };
   }
 
   private async credentialRequestView(request: CredentialAccessRequest, organizationId: string): Promise<CredentialAccessRequest> {

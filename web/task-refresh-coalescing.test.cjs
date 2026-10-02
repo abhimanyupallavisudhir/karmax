@@ -40,7 +40,7 @@ test('LT-17: a sibling attempt\'s lifecycle refreshes the attempt cards, coalesc
   const ctx = vm.createContext({ S: { projectId: 'p', selected: 'a', tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {},
       attemptGroup: { principalAttemptId: 'a', attempts: [{ id: 'a' }, { id: 'b' }] } },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false, scheduleTaskListReload: () => {},
+    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, subTaskSummaryEventNeedsRefresh: () => false, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false, scheduleTaskListReload: () => {},
     taskRecord: () => ({}), projectById: () => ({}), pendingCancellationView: v => v, renderTaskPage: () => {},
     api: url => {
       reads.push(url);
