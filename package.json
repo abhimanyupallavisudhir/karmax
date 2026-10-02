@@ -63,7 +63,7 @@
   },
   "devDependencies": {
     "@temporalio/proto": "^1.24.0",
-    "@types/node": "^22.10.0",
+    "@types/node": "^26.6.3",
     "@types/pg": "^8.15.5",
     "@types/ws": "^8.5.13",
     "@vitest/coverage-v8": "^4.1.11",
