@@ -481,6 +481,45 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     expect(cancelled.waitingFor).toBeUndefined();
   }, 120_000);
 
+  // legibench3#18: a session converted from a 44 MB Codex history was larger than
+  // Claude's context, so every retry and follow-up resumed it into the same refusal.
+  it('restarts Do on a fresh session when its session outgrew the model\'s context', async () => {
+    const repo = await h.makeRepo('app-context-overflow');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Overflow', prompt: 'Start.\n@incomplete', resolveAgentEnabled: false })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await handle.signal('followUp', { id: 'f1', role: 'user', text: '@overflow\n@review carried on', ts: 0 });
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'agent' && m.text?.includes('fresh session')),
+      { timeout: 30_000 }).toBe(true);
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    expect((await view(handle)).error).toBeUndefined();
+    // Neither Resolve nor an infrastructure retry spent a turn on it.
+    expect((await h.store.eventsSince(taskId, 0)).some((e) => e.type === 'resolve.auto')).toBe(false);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 60_000);
+
+  it('asks a person when even a fresh session is larger than the model\'s context', async () => {
+    const repo = await h.makeRepo('app-context-overflow-fresh');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Overflow', prompt: 'Start.\n@incomplete', resolveAgentEnabled: false })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await handle.signal('followUp', { id: 'f1', role: 'user', text: '@overflow always', ts: 0 });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('escalated');
+    const v = await view(handle);
+    expect(v.status).toBe('blocked');
+    expect(v.error).toMatch(/prompt is too long.*larger than the model's context window even in a fresh session/);
+    expect((await h.store.eventsSince(taskId, 0)).some((e) => e.type === 'resolve.auto')).toBe(false);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 60_000);
+
   it('restores the failed stage as soon as an escalated task is retried', async () => {
     const repo = await h.makeRepo('app-escalation-retry-stage');
     const taskId = newId('task');
