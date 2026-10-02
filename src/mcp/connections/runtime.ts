@@ -16,7 +16,9 @@ async function runnerBundle() {
     .then((result) => result.outputFiles![0]!.text).catch((e) => { bundle = undefined; throw e; });
   return bundle;
 }
-export async function prepareConnections(service: McpConnections | undefined, world: World, ids: string[], projectId: string, taskId: string, onCleanup: (cleanup: () => Promise<void>) => void): Promise<AgentMcpServer[]> {
+export async function prepareConnections(service: McpConnections | undefined, world: World, ids: string[], projectId: string, taskId: string, onCleanup: (cleanup: () => Promise<void>) => void,
+  /** Told every credential value written into the world, before it is written. */
+  onSecrets?: (values: string[]) => void): Promise<AgentMcpServer[]> {
   validateMcpSelection(ids);
   const remote = isRemoteAgentWorld(world);
   if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !remote) throw new Error('Hosted MCP connections require a remote execution environment');
@@ -34,6 +36,7 @@ export async function prepareConnections(service: McpConnections | undefined, wo
     for (const [name, spec] of Object.entries(servers)) out.push({ name, ...spec });
   }
   if (!selected.length || !service) return out;
+  await service.delivered(taskId, selected);
   await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
   const relative = `.karmax-injection/mcp/${crypto.randomBytes(12).toString('hex')}`;
   const absolute = path.posix.join(root, relative);
@@ -54,6 +57,7 @@ export async function prepareConnections(service: McpConnections | undefined, wo
   await world.writeFile(`${relative}/runner.mjs`, await runnerBundle());
   for (const c of selected) {
     const secrets = await connectionHeaders(service, c, taskId);
+    onSecrets?.(headerSecrets(secrets));
     const config = `${relative}/${c.id}.json`;
     let transport = c.transport;
     if (c.registry && transport.type === 'stdio' && transport.command === 'uvx') {
@@ -81,8 +85,11 @@ export async function prepareConnections(service: McpConnections | undefined, wo
         let value: unknown = { revoked: true };
         try {
           const current = (await service.get(c.id, projectId));
-          if (current.enabled && current.revision === c.revision)
-            value = { transport, secrets: await connectionHeaders(service, current, taskId), leaseExpiresAt: Date.now() + 120_000 };
+          if (current.enabled && current.revision === c.revision) {
+            const secrets = await connectionHeaders(service, current, taskId);
+            onSecrets?.(headerSecrets(secrets));
+            value = { transport, secrets, leaseExpiresAt: Date.now() + 120_000 };
+          }
         } catch { /* removed/revoked credentials close the connection */ }
         const temporary = file + '.next';
         await world.writeFile(temporary, JSON.stringify(value));
@@ -97,6 +104,9 @@ export async function prepareConnections(service: McpConnections | undefined, wo
   }
   return out;
 }
+/** A header value and the credential inside it (`Bearer <token>`). */
+const headerSecrets = (headers: Record<string, string>) =>
+  Object.values(headers).flatMap((value) => [value, String(value).replace(/^(?:Bearer|Basic|token)\s+/i, '')]);
 /** Codex command overrides are arguments, never shell text. Names are generated
  * IDs or validated manifest names. Codex splits override keys on dots and
  * treats quote characters literally, unlike a TOML document parser. */

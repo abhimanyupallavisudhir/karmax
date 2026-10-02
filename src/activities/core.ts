@@ -41,7 +41,7 @@ import {
 } from '../agent/provider-registry.js';
 import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
-import { SecretScrubber } from '../agent/activity.js';
+import { TaskSecrets, cardRef, handleRef, paymentCardDetails, recordSecretRefs, secretScope, taskRef } from '../autonomy/task-secrets.js';
 import { gateFollowUps } from './follow-up-gate.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
@@ -2039,6 +2039,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // identity and let the adapter read that provider's process environment.
       if (args.accountApiKeyHandle && deps.broker) {
         const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: [`use-credential:${args.accountApiKeyHandle}`] });
+        (await recordSecretRefs(store, args.taskId, [handleRef(args.accountApiKeyHandle)]));
         resolvedAuth = { apiKey };
       }
       // A remote world cannot inherit the host CLI's ambient subscription by
@@ -2111,6 +2112,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               nonRetryable: true,
             });
           }
+          // The fork carries the source's conversation, so what the source
+          // received is scrubbed from everything kept about the fork (SS-3).
+          (await recordSecretRefs(store, args.taskId, [taskRef(spec.resumeFrom.taskId)]));
         }
         // The config home THIS turn runs under — where the source session must be
         // visible for the provider to resolve it. Shared by both resume paths below.
@@ -2509,6 +2513,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
+      // Whatever the agent prints is archived (RT-12): its events, final answer,
+      // journal and review info. Scrub every value this task was handed — the
+      // turn's own credentials below, and every secret recorded as delivered to
+      // the task, wherever it was revealed (SS-3). Refreshed before each write,
+      // so a value revealed mid-turn is scrubbed from the next thing archived.
+      const taskSecrets = new TaskSecrets({ store, broker: deps.broker,
+        cardDetails: paymentCardDetails(store, deps.paymentRegistry) }, (await secretScope(store, args.taskId)));
+      const secrets = taskSecrets.scrubber;
       const resultKey = timingTurnId ? `turnresult:${args.taskId}:${args.role}:${timingTurnId}` : undefined;
       const savedResult = resultKey ? await store.kvGet(resultKey) : undefined;
       const checkpoint: { result: TurnResult; admissionId?: string } | undefined = savedResult ? JSON.parse(savedResult) : undefined;
@@ -2652,13 +2664,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // restored cloud sandbox or a repeatedly-forked session can still read them.
         const turnMessages = await materializeFileAttachments(world, messages);
         const chosenMcp = profile.mcpConnections === undefined ? [] : await timed('tool.connection.prepare', () => prepareConnections(
-          deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections!, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; }));
+          deps.broker ? new McpConnections(store, deps.broker, organizationId) : undefined, world, profile.mcpConnections!, args.task.projectId, args.taskId, (cleanup) => { mcpCleanup = cleanup; },
+          (values) => secrets.add(...values)));
         (await store.appendAudit({ principalId: `task:${args.taskId}`, action: 'mcp.selected', scopeKey: `project:${args.task.projectId}`, detail: { connections: profile.mcpConnections ?? [], role: args.role } }));
         let pullSecretEnv: (() => Promise<Record<string, string>>) | undefined;
-        // Whatever the agent prints is archived (RT-12); scrub every value this
-        // turn was handed, including secrets that arrive mid-turn.
-        const secrets = new SecretScrubber();
         secrets.add(token, resolvedAuth?.apiKey, resolvedAuth?.oauthToken);
+        (await taskSecrets.refresh());
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2728,7 +2739,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(turnSessionKey ? { journal: {
             restored: restoredJournal,
             save: async (journal: import('../agent/runtime.js').TurnJournal) => {
-              (await store.kvSet(`${turnSessionKey}:journal`, JSON.stringify(journal)));
+              (await store.kvSet(`${turnSessionKey}:journal`, JSON.stringify((await taskSecrets.refresh()).scrubValue(journal))));
             },
           } } : {}),
           pullSecretEnv: () => pullSecretEnv?.() ?? Promise.resolve({}),
@@ -2738,6 +2749,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // (one row per chunk) without changing what the UI renders.
           onEmit: async (t, source) => {
             // Assistant text is still being generated and may end mid-secret.
+            (await taskSecrets.refresh());
             const text = source === 'assistant' ? secrets.scrubPartial(t) : secrets.scrub(t);
             if (text === lastEmit || !text && source === 'assistant') return;
             lastEmit = text;
@@ -2751,7 +2763,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           onReviewInfo: async (info, supplied) => {
             signal?.throwIfAborted();
             if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, supplied);
-            (await store.checkpointReviewInfo(args.taskId, info));
+            (await store.checkpointReviewInfo(args.taskId, (await taskSecrets.refresh()).scrubValue(info)));
             (await record(args.taskId, 'review.updated', {}));
           },
           onActivity: async (activity) => {
@@ -2760,9 +2772,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               finalActivity = { turnId, id: activity.id, attempt: activityAttempt };
             }
             (await record(args.taskId, 'agent.activity', {
-              ...activity,
-              title: secrets.scrub(activity.title),
-              ...(activity.detail !== undefined ? { detail: secrets.scrub(activity.detail) } : {}),
+              ...(await taskSecrets.refresh()).scrubValue(activity),
               role: args.role,
               attempt: activityAttempt, workflowRunId,
               ...(turnId ? { turnId } : {}),
@@ -2826,6 +2836,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                     || (!fill.selectors.expiry && !(fill.selectors.expMonth && fill.selectors.expYear)))
                     throw new Error('number, CVC, and either combined expiry or month/year selectors are required');
                   const details = await provider.retrieveCardDetails(card.id);
+                  // The page now holds the card; keep its number out of what is archived.
+                  secrets.add(details.number);
+                  (await recordSecretRefs(store, args.taskId, [cardRef(card.id)]));
                   const expected = [domain];
                   let origin: string;
                   if (isRemoteAgentWorld(world)) {
@@ -2869,8 +2882,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
         },
         );
-        // The final answer becomes a conversation message in the task view.
-        if (result.output) result = { ...result, output: secrets.scrub(result.output) };
+        // The result goes to workflow history: the final answer becomes a
+        // conversation message (and later turns' input), review info, raises,
+        // sub-task prompts and skills are stored. Read once more what the task
+        // received before anything leaves the activity.
+        result = (await taskSecrets.refresh()).scrubValue(result);
         if (result.output?.trim() && finalActivity) result.finalActivity = finalActivity;
         if (resultKey) {
           await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));
@@ -2911,6 +2927,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (err) {
         (await admissionEnd(signal?.aborted ? 'cancelled' : 'failed'));
         if (token) (await deps.tokens?.revoke(token));
+        // A provider error can quote the agent's output; it reaches workflow history.
+        if (err instanceof Error) err.message = secrets.scrub(err.message);
         // Providers often surface their own generic AbortError after the activity
         // cancellation signal fires. Throw Temporal's cancellation reason instead
         // so WAIT_CANCELLATION_COMPLETED records an acknowledged cancellation,

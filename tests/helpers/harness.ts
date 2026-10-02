@@ -69,7 +69,7 @@ export interface Harness {
     serviceConnections?: import('../../src/integrations/service-connections.js').ServiceConnections;
     loginCommand?: LoginCommand;
     githubApp?: import('../../src/integrations/github-app.js').GitHubAppService }): Promise<{
-      url: string; internalUrl: string; close: () => Promise<void> }>;
+      url: string; internalUrl: string; close: () => Promise<void>; gateway: Gateway }>;
 }
 
 /** Boots a full karmax backend (Temporal + worker + deps) for integration tests. */
@@ -226,7 +226,7 @@ export async function bootHarness(
       }));
       const started = await gw.listen(opts?.port);
       gateways.push(started.close);
-      return started;
+      return { ...started, gateway: gw };
     },
     async stop() {
       // Teardown is five blocking steps against real infrastructure. When one of

@@ -2,6 +2,7 @@ import type { ObjectStore } from './objects.js';
 import { CODEX_VERSION, CodexHistoryError, prepareCodexHistory } from '../agent/codex-history.js';
 import { readLocalCodexHistory } from '../agent/codex-history-files.js';
 import type { PanagentWarning } from '../agent/panagent.js';
+import type { SecretScrubber } from '../agent/activity.js';
 
 interface ConversationExport {
   exportId: string;
@@ -22,14 +23,17 @@ function key(task: string, role: string, id: string): string {
 /** Freeze logical history once. The command and download reference this exact
  * snapshot even if the task resumes, forks, or changes providers afterwards. */
 export async function createCodexConversationExport(objects: ObjectStore, task: string, role: string,
-  session: string, source: { home: string } | { generated: { data: Buffer; warnings: PanagentWarning[] } }): Promise<ConversationExport> {
+  session: string, source: { home: string } | { generated: { data: Buffer; warnings: PanagentWarning[] } },
+  /** The task's secrets, masked byte for byte in the frozen copy (SS-3). */
+  secrets?: Pick<SecretScrubber, 'mask'>): Promise<ConversationExport> {
   const snapshot = await prepareCodexHistory(session, async (id) => {
     if ('home' in source) return readLocalCodexHistory(source.home, id);
     if (id !== session) throw new CodexHistoryError(`generated history has an unresolved ancestor ${id}`);
     return { file: `${id}.jsonl`, content: source.generated.data };
   }, { snapshot: true });
   const result: ConversationExport = { exportId: snapshot!.session, filename: snapshot!.filename,
-    requiredCodexVersion: CODEX_VERSION, source: 'home' in source ? 'native' : 'generated', data: snapshot!.content,
+    requiredCodexVersion: CODEX_VERSION, source: 'home' in source ? 'native' : 'generated',
+    data: secrets ? secrets.mask(snapshot!.content) : snapshot!.content,
     warnings: 'generated' in source ? source.generated.warnings : [] };
   await objects.put(key(task, role, result.exportId), Buffer.from(JSON.stringify({ ...result,
     data: result.data.toString('base64'), sources: snapshot!.sources, repaired: snapshot!.repaired })), 'application/json');
