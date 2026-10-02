@@ -126,6 +126,15 @@ describe('paid-launch policies', () => {
     expect(providers).toContain('Publishing an updated list alone does not replace');
   });
 
+  it('names Cloudflare R2 as the managed object store and no longer places objects on the VPS', () => {
+    const bullets = policyDocument('subprocessors')!.sections.flatMap((section) => section.bullets ?? []);
+    const r2 = bullets.find((bullet) => bullet.startsWith('Cloudflare'));
+    expect(r2).toMatch(/R2/);
+    expect(r2).toMatch(/EU jurisdiction/);
+    expect(r2).toMatch(/checkpoints|workspace/i);
+    expect(bullets.find((bullet) => bullet.startsWith('one.com'))).not.toMatch(/local objects/);
+  });
+
   it('incorporates a scoped processing addendum without claiming execution or launch approval', () => {
     const dpa = policyDocument('dpa')!;
     expect(dpa.title).toBe('Data Processing Addendum');
