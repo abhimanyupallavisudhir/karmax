@@ -187,7 +187,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'With needs_input: who to ask — user:<id>, @team:<slug>, @creator, @owners, @project, or @all (see escalate_to_human). Default: whoever answers this task\'s questions.',
+          description: 'With needs_input: who to ask — user:<id>, @team:<slug>, @creator, @owners, @project, or @all (see escalate_to_human). Default: whoever answers this task\'s questions (for a sub-task, its parent).',
         },
         urgency: URGENCY_PARAMETER,
       },

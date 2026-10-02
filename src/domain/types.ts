@@ -1623,7 +1623,7 @@ export interface TaskView {
    * agent login to free up or refresh. Cleared once unparked.
    */
   waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder' | 'job' | 'timer'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience;
-    /** `job` / `timer` / a paused agent's `human` ask: when the agent is resumed at the latest (epoch ms). */
+    /** `job` / `timer` / a paused agent's `human` or `parent` ask: when the agent is resumed at the latest (epoch ms). */
     until?: number;
     /** `human`: how loudly the ask was raised; omitted means the inbox kind's default. */
     urgency?: Urgency;
@@ -1889,7 +1889,8 @@ export interface AgentWait {
   /** The names the agent gave those jobs (`start_job`'s `name`), for people. */
   jobNames?: string[];
   /** The agent is waiting on an answer, not just on time: the task parks as
-   * Needs input and asks `audience` (default: the task's ordinary input route),
+   * Needs input and asks `audience` (default: the task's ordinary input route —
+   * a sub-task's parent, a configured Responder, or its creator),
    * and `minutes` becomes the deadline after which the agent carries on without
    * it. `message` defaults to the turn's final response. */
   needsInput?: { message?: string; audience?: HumanAudience; urgency?: Urgency };

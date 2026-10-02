@@ -358,6 +358,7 @@ async function justDoImpl(
       const note = await waitForAgent(turn.wait, {
         world,
         ...(needsInput ? { ask: {
+          kind: 'human' as const,
           audience: needsInput.audience?.length ? needsInput.audience : ['@creator'],
           detail: needsInput.message ?? (turn.output?.trim() || 'The agent paused for your input.'),
           ...(needsInput.urgency ? { urgency: needsInput.urgency } : {}),

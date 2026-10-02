@@ -10178,6 +10178,8 @@ function waitingText(w) {
   }
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
+  // A sub-task asking its parent carries on without an answer at `until`.
+  if (w?.kind === 'parent' && Number.isFinite(w.until)) return `Waiting for parent until ${waitDeadline(w.until)}`;
   return `Waiting for ${label}`;
 }
 

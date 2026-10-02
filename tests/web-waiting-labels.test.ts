@@ -215,6 +215,10 @@ describe('waiting labels in task summaries', () => {
     for (const [kind, label] of [['subtask', 'Waiting for sub-tasks'], ['collaboration', 'Waiting for collaborator'], ['parent', 'Waiting for parent']]) {
       expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: { kind } })).toBe(label);
     }
+    // A sub-task asking its parent says when it carries on without an answer.
+    const until = new Date().setHours(12, 0, 0, 0);
+    expect(stageLabel({ stage: 'do', status: 'waiting', state: {}, waitingFor: { kind: 'parent', detail: 'Which region?', until } }))
+      .toBe(`Waiting for parent until ${waitDeadline(until)}`);
     // A child held at Review for its parent is still in review.
     expect(stageLabel({ stage: 'review', status: 'waiting', state: {}, waitingFor: { kind: 'parent' } })).toBe('review');
     // Work still running inside the turn, or about to start one, is working.

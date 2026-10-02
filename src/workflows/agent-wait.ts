@@ -36,9 +36,11 @@ export function unattendedJobsReminder(turn: {
 
 export interface AgentWaitHooks {
   world: WorldHandleLike | undefined;
-  /** For a `needsInput` pause: the human ask to park on, resolved by the
-   * workflow from the agent's request and the task's input route. */
-  ask?: { audience: HumanAudience; detail: string; urgency?: Urgency };
+  /** For a `needsInput` pause: whom the workflow asked — people, or a
+   * sub-task's parent agent — resolved from the agent's request and the
+   * task's input route. */
+  ask?: { kind: 'human'; audience: HumanAudience; detail: string; urgency?: Urgency }
+    | { kind: 'parent'; detail: string };
   /** Length of one minute (ms); only tests shorten it. */
   minuteMs?: number;
   /** Record the wait in the task view (status `waiting`) and publish it. */
@@ -58,9 +60,10 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
   // A wait is shown by what it waits for: the jobs' names when every one has one.
   const named = jobs.length && wait.jobNames?.length === jobs.length ? wait.jobNames.join(', ') : undefined;
   // An ask is what the task is waiting on, whatever else the agent watches:
-  // it reads Needs input and notifies, where a timer or job wait does neither.
+  // it reads Needs input (or names the parent) and notifies, where a timer or
+  // job wait does neither.
   await hooks.park(hooks.ask
-    ? { kind: 'human', ...hooks.ask, ...(jobs.length ? { jobs } : {}), until: untilMs }
+    ? { ...hooks.ask, ...(jobs.length ? { jobs } : {}), until: untilMs }
     : jobs.length
     ? { kind: 'job', detail: `Waiting for ${list}`, ...(named ? { summary: named } : {}), jobs, until: untilMs }
     : { kind: 'timer', detail: `Waiting ${wait.minutes} min`, until: untilMs });

@@ -473,6 +473,36 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
     expect((await git(repo, ['show', 'main:region.txt'])).stdout).toContain('eu-west');
   }, 90_000);
 
+  // A sub-task's questions go to its parent, so a needs-input pause asks the
+  // parent agent (not a person) and carries on if it does not answer in time.
+  it('a sub-task\'s needs-input pause asks its parent, whose comment resumes it', async () => {
+    const repo = await h.makeRepo('app-sub-pause-input');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Parent', prompt: '@subtask Ask :: @pause 600 :: input high -- Which region?' })],
+    });
+    try {
+      await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 30_000 }).toBe(1);
+      const childId = (await view(handle)).subTasks![0];
+      const child = h.client.workflow.getHandle(childId);
+      await expect.poll(async () => ((await child.query('view')) as any).waitingFor?.kind, { timeout: 30_000 }).toBe('parent');
+      const asking = (await child.query('view')) as any;
+      expect(asking.waitingFor).toMatchObject({ detail: 'Which region?' });
+      expect(asking.waitingFor.until).toBeGreaterThan(Date.now() + 9 * 60 * 60_000);
+      await parentSawRaise(handle, 'Which region?');
+      expect((await h.store.eventsOfType(childId, 'view.updated')).map((e: any) => e.payload.waitingFor)).not.toContain('human');
+
+      await handle.signal('followUp', { id: 'region-answer', role: 'user', text: `@respond comment ${childId} :: @write region.txt :: eu-west`, ts: 0 });
+      await expect.poll(async () => fs.existsSync(path.join(((await child.query('view')) as any).world.root, 'region.txt')), { timeout: 30_000 }).toBe(true);
+      expect(((await child.query('view')) as any).waitingFor?.detail).not.toBe('Which region?');
+    } finally {
+      await handle.signal('cancel');
+      await handle.result();
+    }
+  }, 90_000);
+
   it('cancelling a task stops its durable jobs', async () => {
     const repo = await h.makeRepo('app-job-cancel');
     const taskId = newId('task');
