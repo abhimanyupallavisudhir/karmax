@@ -206,6 +206,9 @@ KARMAX_S3_BUCKET=karmax-objects
 KARMAX_S3_REGION=auto                                                # R2; an AWS region elsewhere
 ```
 
+An R2 bucket in the EU jurisdiction answers only on the `.eu.` host; the
+default `https://<account-id>.r2.cloudflarestorage.com` returns 403 for it.
+
 Write the key pair to `deploy/.secrets/s3_access_key_id` and
 `deploy/.secrets/s3_secret_access_key` (they exist empty until then), then
 restart with `./deploy/karmax up`. `./deploy/karmax doctor` names the active
