@@ -288,3 +288,12 @@ it('preserves public IPv6 peers and exposes the app only on host loopback (CI-8)
   expect(read('Caddyfile')).not.toContain('app:4505');
   expect(read('Caddyfile').match(/header_up X-Forwarded-For \{http.request.remote.host\}/g)).toHaveLength(3);
 });
+
+it('keeps Caddy\'s admin API off now that Caddy shares the host network (CI-8)', () => {
+  // On the host network Caddy's default admin endpoint (localhost:2019) would
+  // let any process on the host replace the edge's configuration unauthenticated.
+  // Nothing reloads Caddy through it.
+  const caddyfile = read('Caddyfile');
+  const global = caddyfile.slice(caddyfile.indexOf('{'), caddyfile.indexOf('\n}\n'));
+  expect(global).toMatch(/^\tadmin off$/m);
+});

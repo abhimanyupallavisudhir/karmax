@@ -429,4 +429,7 @@ ignore forwarded headers unless `KARMAX_TRUSTED_PROXY_IP` names an exact proxy
 address. The gateway groups IPv6 clients by /64 for login lockout and hosted
 request budgets; Caddy also enforces its per-address edge budgets. These budgets
 are per replica. Host-network Caddy binds ports 80 and 443 itself, so a host
-firewall must allow them (Docker's published ports used to bypass it).
+firewall must allow them, including UDP 443 for HTTP/3 (Docker's published ports
+used to bypass it). Its admin API is off, since on the host network it would let
+any local process rewrite the edge, so `caddy reload` is unavailable: a changed
+Caddyfile takes effect when the Caddy container restarts.

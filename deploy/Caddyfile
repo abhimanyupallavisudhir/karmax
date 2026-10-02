@@ -1,4 +1,7 @@
 {
+	# Caddy runs on the host network, where its admin API would let any local
+	# process rewrite the edge. Restart the container to apply a change.
+	admin off
 	on_demand_tls {
 		ask http://127.0.0.1:4505/api/tls/preview-allow
 	}
