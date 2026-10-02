@@ -54,12 +54,25 @@ it('gifts, changes, and removes plans from the organization billing screen throu
     expect(await page.locator('#org-plan input').nth(2).inputValue()).toBe('25 active agent runs');
     expect(await page.locator('#org-subscription').textContent()).toContain('Gifted · no expiry');
     expect(await page.locator('.billing-checkout').count()).toBe(0);
-    if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#org-subscription').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
+    // Gifted storage packs: any plan, no billing provider, shown apart in the plan card.
+    await page.getByRole('spinbutton', { name: 'Gift storage packs' }).fill('2');
+    await page.getByRole('button', { name: 'Gift packs', exact: true }).click();
+    await page.locator('#org-plan .plan-storage-extra.gifted').filter({ hasText: '+ 200 GB gifted' }).waitFor();
+    expect(await page.locator('#org-plan .plan-storage-base').innerText()).toBe('110 GB');
+    expect((await store.organizationEntitlements(recipient.id)).storageQuotaBytes).toBe(310 * 1024 ** 3);
+    expect(await page.locator('#org-subscription').innerText()).toContain('2 gifted storage packs');
+    expect(provider.calls).toHaveLength(0);
+    if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#org-plan').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
+    await page.getByRole('button', { name: 'Remove gifted packs', exact: true }).click();
+    await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).giftedStoragePacks).toBe(0);
+    await expect.poll(() => page.locator('#org-plan .plan-storage-extra').count()).toBe(0);
     await page.setViewportSize({ width: 390, height: 844 });
     await page.getByRole('button', { name: 'Remove gift', exact: true }).click();
     await page.locator('#org-plan .section-h').filter({ hasText: 'Free' }).waitFor();
     expect((await billing.current(recipient.id)).gift).toBeNull();
     expect(await page.locator('#org-plan').innerText()).toContain('Agent runs are paused');
+    // Free: the plan offers say how to get more storage.
+    expect(await page.locator('#org-subscription').innerText()).toContain('100 GB storage packs');
 
     // Render using a real, attenuated API token: ordinary organization admins
     // may read the gift, but the server never advertises gift controls to them.

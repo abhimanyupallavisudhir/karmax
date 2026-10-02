@@ -16,6 +16,8 @@ import { findFreePortFrom } from '../src/util/ports.js';
 import { FakeSubscriptionProvider, SubscriptionBillingService } from '../src/billing/subscriptions.js';
 import { IdentityService } from '../src/auth/identity.js';
 
+declare const getComputedStyle: any;
+
 it('adds and removes storage packs from Subscription billing, showing only verified packs', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-packs-browser-'));
   const port = await findFreePortFrom(48860);
@@ -72,6 +74,11 @@ it('adds and removes storage packs from Subscription billing, showing only verif
     await verified(2);
     await page.reload();
     await page.locator('#org-subscription').getByText('$8/month', { exact: true }).waitFor();
+    // The plan card shows the plan's storage, and the bought packs apart from it.
+    await page.locator('#org-plan .plan-storage-extra').filter({ hasText: '+ 200 GB packs' }).waitFor();
+    expect(await page.locator('#org-plan .plan-storage-base').innerText()).toBe('100 GB');
+    expect(await page.locator('#org-plan .plan-storage-extra').evaluate(element => getComputedStyle(element).color))
+      .not.toBe(await page.locator('#org-plan .plan-storage-base').evaluate(element => getComputedStyle(element).color));
     if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#org-subscription').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
 
     await remove.click();

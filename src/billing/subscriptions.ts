@@ -350,8 +350,9 @@ export class SubscriptionBillingService {
     const pendingRequest = Boolean(await this.store.db.prepare('SELECT requestKey FROM subscription_billing_locks WHERE organizationId=?').get(organizationId));
     const pendingCheckout = Boolean(await this.store.db.prepare("SELECT checkoutId FROM subscription_billing_checkouts WHERE organizationId=? AND state='pending'").get(organizationId));
     const storagePack = { ...STORAGE_PACK, available: Boolean((await provider.catalog())?.storagePackPriceId) };
+    const storagePackGift = await this.store.storagePackGift(organizationId);
     return { managed: true, providerConfigured: (await provider.configured()), plan, billedPlan, status, seats, gift, pendingRequest, pendingCheckout,
-      storagePacks: account?.storagePacks ?? 0, storagePack,
+      storagePacks: account?.storagePacks ?? 0, storagePack, storagePackGift, giftedStoragePacks: storagePackGift?.packs ?? 0,
       activeUsers: members, seatDeficit: gift?.plan === 'team' ? 0 : plan === 'team' ? Math.max(0, members - seats)
         : Math.max(0, members - HOSTED_PLANS[plan].includedActiveUsers),
       access, cancelAtPeriodEnd: account?.cancelAtPeriodEnd ?? false,
@@ -378,6 +379,22 @@ export class SubscriptionBillingService {
         }
         const account = await this.account(organizationId);
         await this.reconcileOrganization(organizationId, account);
+        return this.current(organizationId);
+      });
+    });
+  }
+
+  /** Complimentary storage packs, like a gifted plan: independent of the
+   * provider ledger, counted on any plan, kept until removed (0 removes). */
+  async giftStoragePacks(organizationId: string, packs: unknown, grantedBy: string, key: string) {
+    if (!this.hosted) throw new Error('storage pack gifts are only available on hosted installations');
+    this.requireKey(key);
+    if (typeof packs !== 'number' || !Number.isSafeInteger(packs) || packs < 0 || packs > 1000)
+      throw new Error('gifted storage packs must be a whole number from 0 to 1000');
+    return this.store.transaction(async () => {
+      if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
+      return this.idempotent(organizationId, `gift-storage:${packs}`, key, async () => {
+        await this.store.setStoragePackGift(organizationId, packs, grantedBy);
         return this.current(organizationId);
       });
     });
@@ -523,8 +540,9 @@ export class SubscriptionBillingService {
     const organization = await this.store.getOrganization(organizationId);
     if (!location || !organization) return;
     const users = (await this.store.listOrganizationMemberships(organizationId)).length;
-    const quota = hostedStorageQuotaBytes(organization.plan, users, packs);
-    if (quota >= hostedStorageQuotaBytes(organization.plan, users, organization.storagePacks ?? 0)) return;
+    const gifted = (await this.store.storagePackGift(organizationId))?.packs ?? 0;
+    const quota = hostedStorageQuotaBytes(organization.plan, users, packs, gifted);
+    if (quota >= hostedStorageQuotaBytes(organization.plan, users, organization.storagePacks ?? 0, gifted)) return;
     const { retainedBytes } = await this.store.storageLocationUsage(location.id);
     if (retainedBytes > quota) throw new Error(`Free ${gigabytes(retainedBytes - quota, Math.ceil)} of stored data first: `
       + `${gigabytes(retainedBytes)} is stored and the quota would be ${gigabytes(quota)}.`);
