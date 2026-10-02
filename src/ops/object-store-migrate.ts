@@ -214,6 +214,7 @@ export interface ObjectReferences {
   pendingCheckpointGc: Set<string>;
   artifacts: Set<string>;
   uploadParts: Set<string>;
+  conversationExports: Set<string>;
 }
 
 export interface ReferenceDatabase { query(sql: string): Promise<Array<Record<string, unknown>>>; close(): Promise<void> }
@@ -238,7 +239,7 @@ export function openReferenceDatabase(target: string): ReferenceDatabase {
 export async function loadObjectReferences(db: Pick<ReferenceDatabase, 'query'>): Promise<ObjectReferences> {
   const json = (value: unknown): any => { try { return JSON.parse(String(value)); } catch { return undefined; } };
   const references: ObjectReferences = { chunks: new Set(), manifests: new Set(), attachments: new Set(), checkpoints: new Set(),
-    pendingCheckpointGc: new Set(), artifacts: new Set(), uploadParts: new Set() };
+    pendingCheckpointGc: new Set(), artifacts: new Set(), uploadParts: new Set(), conversationExports: new Set() };
   for (const row of await db.query('SELECT organizationId, chunkId, storageLocationId FROM resource_snapshot_chunks WHERE refs > 0')) {
     const location = row.storageLocationId == null ? '' : String(row.storageLocationId);
     if (!location || location.startsWith('storage-managed-')) references.chunks.add(`${row.organizationId}/${row.chunkId}`);
@@ -257,6 +258,7 @@ export async function loadObjectReferences(db: Pick<ReferenceDatabase, 'query'>)
     if (typeof key === 'string') references.pendingCheckpointGc.add(key);
   }
   for (const row of await db.query('SELECT objectKey FROM promoted_artifacts')) references.artifacts.add(String(row.objectKey));
+  for (const row of await db.query('SELECT objectKey FROM conversation_exports')) references.conversationExports.add(String(row.objectKey));
   for (const row of await db.query("SELECT v FROM kv WHERE k LIKE 'resource-upload:%'")) {
     for (const file of Object.values(json(row.v)?.files ?? {}) as Array<{ parts?: Array<{ objectKey?: unknown }> } | undefined>)
       for (const part of file?.parts ?? []) if (typeof part?.objectKey === 'string') references.uploadParts.add(part.objectKey);
@@ -268,7 +270,7 @@ export interface FamilyReport {
   family: string;
   referenced: Tally;
   unreferenced: Tally;
-  /** Families no table indexes (conversation exports and imports, unknown keys). */
+  /** Families no table indexes (conversation imports, unknown keys). */
   untracked: Tally;
   reasons: Record<string, Tally>;
   /** Unreferenced bytes per organization, for the families keyed by one. */
@@ -331,7 +333,8 @@ function classify(key: string, references: ObjectReferences): { family: string; 
     return { family: 'artifact', organization, state: references.artifacts.has(key) ? 'referenced' : 'no artifact row' };
   if (parts[0] === 'resource-uploads')
     return { family: 'resource upload part', organization, state: references.uploadParts.has(key) ? 'referenced' : 'no upload session' };
-  if (parts[0] === 'conversation-exports') return { family: 'conversation export', state: 'untracked' };
+  if (parts[0] === 'conversation-exports')
+    return { family: 'conversation export', state: references.conversationExports.has(key) ? 'referenced' : 'no export row' };
   if (parts[0] === 'conversation-imports') return { family: 'conversation import', state: 'untracked' };
   return { family: 'unknown', state: 'untracked' };
 }
