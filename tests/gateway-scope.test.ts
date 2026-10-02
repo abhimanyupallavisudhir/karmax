@@ -363,6 +363,38 @@ describe('gateway request scope for bare-id routes', () => {
       .toEqual(['settings:read']);
   });
 
+  // A child paused on an approval request read "Paused until …" in its parent's
+  // Sub-tasks panel while the task list flagged it "approval needed": the
+  // parent's summaries must carry the same pending-approval count.
+  it("flags a sub-task's pending approval in its parent's summaries", async () => {
+    const view = (taskId: string, title: string, extra: Record<string, unknown> = {}) => ({
+      taskId, title, workflow: 'software-dev', stage: 'do', status: 'active',
+      messages: [], actions: [], state: {}, updatedAt: Date.now(), ...extra,
+    }) as any;
+    const parent = (await store.createTask({ projectId: mine, title: 'Storage switch', workflow: 'software-dev',
+      workflowVersion: '1.9.0', params: { prompt: 'parent' }, createdBy: { kind: 'user', userId: 'a' } }));
+    const child = (await store.createTask({ projectId: mine, title: 'Storage packs', workflow: 'software-dev',
+      workflowVersion: '1.9.0', params: { prompt: 'child' }, parentTaskId: parent.id, createdBy: { kind: 'user', userId: 'a' } }));
+    (await store.saveView(parent.id, view(parent.id, parent.title, { subTasks: [child.id] })));
+    (await store.saveView(child.id, view(child.id, child.title,
+      { status: 'waiting', waitingFor: { kind: 'timer', detail: 'Paused for 240 min', until: Date.now() + 60_000 } })));
+    liveView = (await store.getTask(parent.id))!.lastView;
+    const agent = (await tokens.mint({
+      taskId: child.id, profileId: 'do-default', role: 'do', principal: 'user:a', projectId: mine,
+      organizationId: acmeId, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'],
+    })).token;
+    const requested = await fetch(`${base}/api/agent/permission-requests`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${agent}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ capabilities: ['settings:read'], audience: ['@creator'], reason: 'Read the billing settings.' }),
+    });
+    expect(requested.status).toBe(200);
+
+    const summaries = ((await (await fetch(`${base}/api/tasks/${parent.id}`, { headers: auth() })).json()) as any).subTaskSummaries;
+    expect(summaries).toEqual([expect.objectContaining({ id: child.id,
+      lastView: expect.objectContaining({ status: 'waiting', approvalRequests: 1 }) })]);
+  });
+
   it('refuses PATCH/DELETE/reorder /api/views/:id across a project and tenant boundary', async () => {
     const foreign = (await store.createView({ projectId: theirs, name: 'Theirs', query: {} as any }));
     const own = (await store.createView({ projectId: mine, name: 'Mine', query: {} as any }));
