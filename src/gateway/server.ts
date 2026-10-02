@@ -6542,6 +6542,7 @@ export class Gateway {
             username: b.username ? String(b.username) : undefined,
             tags: Array.isArray(b.tags) ? b.tags.map(String) : typeof b.tags === 'string' ? b.tags.split(/[,\s]+/).filter(Boolean) : undefined,
             envVar: b.envVar ? String(b.envVar) : undefined,
+            ...(typeof b.exclusive === 'boolean' ? { exclusive: b.exclusive } : {}),
             policy: b.policy,
             secrets: b.secrets,
             provenance: { source: 'manual' },
@@ -6848,20 +6849,26 @@ export class Gateway {
         // A site's sign-in, captured from one task's browser and restored into
         // another's (browser-session.ts). This is how a site reached through
         // "Sign in with Google" is shared without the identity provider's
-        // password, which would open every site federated through it.
+        // password, which would open every site federated through it. Holding
+        // tasks refresh it after every turn (session-holds.ts).
         if (p === '/api/vault/session/save' || p === '/api/vault/session/use') {
           if (method !== 'POST') return this.json(res, 405, { error: 'use POST' });
           if (!callerTaskId) return this.json(res, 400, { error: 'sessions are saved from and restored into a task\'s own browser; call this with a task-agent token' });
           const b = await this.body(req);
-          const { captureSession, restoreSession, parseSavedSession, sessionDomainError } = await import('../autonomy/browser-session.js');
+          const { captureSession, restoreSession, parseSavedSession, sessionDomainError, sessionState } = await import('../autonomy/browser-session.js');
+          const holds = await import('../autonomy/session-holds.js');
           const raise = (decision: { status: AccessStatus; reason?: string }, item: VaultItem) =>
             this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, mode: 'use', why: b.why });
+          const busy = (item: VaultItem, heldBy: { taskId: string; num?: number; title?: string }) => this.json(res, 200, {
+            status: 'busy', itemId: item.id, heldBy,
+            reason: `${heldBy.num !== undefined ? `task #${heldBy.num}` : 'another task'} is signed in with "${item.label}", which works in one task at a time. Pause, then call use_session again; it frees up when that task's world parks or the task ends.`,
+          });
           try {
             if (p === '/api/vault/session/save') {
               const prior = b.itemId ? (await vault.get(String(b.itemId))) : undefined;
               if (b.itemId && !prior) return this.json(res, 404, { error: `no vault item ${b.itemId}` });
               if (prior && prior.type !== 'session') return this.json(res, 400, { error: `vault item ${prior.id} is a ${prior.type}, not a saved session` });
-              // Refreshing another task's session takes the grant that using it does.
+              // Replacing another task's session takes the grant that using it does.
               if (prior && prior.provenance.taskId !== callerTaskId && !allows(caps, 'credential:write')) {
                 const decision = (await vault.access(caps, callerTaskId, prior, 'use'));
                 if (decision.status !== 'granted') return this.json(res, 200, await raise(decision, prior));
@@ -6871,6 +6878,10 @@ export class Gateway {
               for (const domain of domains) {
                 const error = sessionDomainError(domain);
                 if (error) return this.json(res, 400, { error });
+              }
+              if (prior) {
+                const lease = await holds.acquireLease(store, organizationId, prior, callerTaskId);
+                if (!lease.granted) return busy(prior, lease.heldBy);
               }
               const opener = await this.taskPageOpener(callerTaskId, 'saved sessions');
               if ('error' in opener) return this.json(res, 400, { error: opener.error });
@@ -6885,34 +6896,56 @@ export class Gateway {
                 label: String(b.label ?? '').trim() || prior?.label || `${domains[0]} (signed in)`,
                 domains,
                 username: b.username ? String(b.username) : undefined,
+                ...(typeof b.exclusive === 'boolean' ? { exclusive: b.exclusive } : {}),
                 // A session skips the site's 2FA, so its value is never shown to an agent.
                 ...(prior ? {} : { policy: { use: 'auto' as const, reveal: 'never' as const } }),
                 secrets: { session: JSON.stringify(captured.saved) },
                 provenance: { source: `task:${callerTaskId}`, taskId: callerTaskId },
               }));
+              if (!prior && saved.exclusive) await holds.acquireLease(store, organizationId, saved, callerTaskId);
+              await holds.recordHold(store, organizationId, callerTaskId, saved.id);
               (await store.appendAudit({ principalId: `task:${callerTaskId}`, action: 'vault.session.saved',
-                detail: { itemId: saved.id, label: saved.label, cookies: captured.saved.cookies.length, refreshed: !!prior } }));
+                detail: { itemId: saved.id, label: saved.label, cookies: captured.saved.cookies.length, replaced: !!prior } }));
+              const storage = captured.saved.storage[0];
               return this.json(res, 200, { itemId: saved.id, label: saved.label, domains, cookies: captured.saved.cookies.length,
-                localStorage: captured.saved.storage.length > 0, ...(captured.storageOmitted ? { storageOmitted: true } : {}) });
+                localStorage: !!storage?.localStorage.length, sessionStorage: !!storage?.sessionStorage?.length,
+                indexedDB: (storage?.indexedDB ?? []).map((db) => db.name),
+                ...(saved.exclusive ? { exclusive: true } : {}), ...(captured.omitted.length ? { omitted: captured.omitted } : {}) });
             }
             const item = b.itemId ? (await vault.get(String(b.itemId)))
               : b.domain ? (await vault.findByDomain(String(b.domain))).find((i) => i.type === 'session') : undefined;
             if (!item || item.type !== 'session')
               return this.json(res, 200, { status: 'not_in_vault', reason: `no saved session${b.domain ? ` for ${b.domain}` : ''}; sign in on the site, then call save_session` });
+            const domains = item.domains ?? [];
+            // The site's own sign-in, for when the session no longer works.
+            const fallback = (await vault.findByDomain(domains[0] ?? '')).filter((i) => i.type === 'login' || i.type === 'passkey')
+              .map((i) => ({ itemId: i.id, label: i.label, type: i.type, tool: i.type === 'login' ? 'fill_credential' : 'use_passkey' }));
+            const signInAgain = fallback.length
+              ? `sign in with ${fallback.map((f) => `${f.tool} (itemId ${f.itemId}, "${f.label}")`).join(' or ')}, then call save_session with itemId ${item.id}`
+              : `sign in again (or ask a person to, through this task's desktop), then call save_session with itemId ${item.id}`;
             const checked = (await vault.access(caps, callerTaskId, item, 'use'));
             if (checked.status !== 'granted') return this.json(res, 200, await raise(checked, item));
-            const domains = item.domains ?? [];
+            const stored = vault.readSecret(item, 'session');
+            if (!stored || !sessionState(parseSavedSession(stored), domains).usable)
+              return this.json(res, 200, { status: 'expired', itemId: item.id, ...(fallback.length ? { fallback } : {}), next: `the saved session has expired: ${signInAgain}` });
             const opener = await this.taskPageOpener(callerTaskId, 'saved sessions');
             if ('error' in opener) return this.json(res, 400, { error: opener.error });
             // Open the page before a one-shot grant is spent on a restore that cannot run.
             const page = await opener.open(domains);
             try {
+              const lease = await holds.acquireLease(store, organizationId, item, callerTaskId);
+              if (!lease.granted) return busy(item, lease.heldBy);
               const decision = (await vault.access(caps, callerTaskId, item, 'use', { consume: true }));
-              if (decision.status !== 'granted') return this.json(res, 200, await raise(decision, item));
+              if (decision.status !== 'granted') {
+                await holds.releaseLease(store, organizationId, item.id, callerTaskId);
+                return this.json(res, 200, await raise(decision, item));
+              }
               const saved = parseSavedSession((await vault.resolveField(item, 'session', { taskId: callerTaskId, principal, mode: 'use' })));
               const restored = await restoreSession(page.session, domains, saved);
+              await holds.recordHold(store, organizationId, callerTaskId, item.id);
               return this.json(res, 200, { status: 'granted', itemId: item.id, ...restored, capturedAt: saved.capturedAt,
-                next: `the page reloaded with the saved session. If it is not signed in, the session expired: sign in again, then call save_session with itemId ${item.id}` });
+                ...(fallback.length ? { fallback } : {}),
+                next: `the page reloaded with the saved session. If it is still signed out, ${signInAgain}` });
             } finally { await page.session.close(); }
           } catch (e) {
             return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });

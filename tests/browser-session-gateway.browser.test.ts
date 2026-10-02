@@ -113,7 +113,7 @@ it('saves a site\'s session from one task and signs another task in after approv
     expect((await call(userToken, 'save', { domain: 'notes.test' })).status).toBe(403);
     const saved = await call(saverToken, 'save', { domain: 'notes.test', username: 'alice' });
     expect(saved.status).toBe(200);
-    expect(saved.body).toMatchObject({ domains: ['notes.test'], cookies: 1, localStorage: false });
+    expect(saved.body).toMatchObject({ domains: ['notes.test'], cookies: 1, localStorage: false, sessionStorage: false, indexedDB: [] });
     expect(JSON.stringify(saved.body)).not.toContain('SECRET');
     const item = (await vault.get(saved.body.itemId))!;
     expect(item).toMatchObject({ type: 'session', label: 'notes.test (signed in)', username: 'alice', policy: { use: 'auto', reveal: 'never' } });
@@ -141,7 +141,10 @@ it('saves a site\'s session from one task and signs another task in after approv
 
     await vault.resolve(asked.body.requestId, { action: 'once', by: 'user:test' });
     const used = await call(userToken, 'use', { domain: 'notes.test' });
-    expect(used.body).toMatchObject({ status: 'granted', itemId: item.id, cookies: 1, expired: 0 });
+    expect(used.body).toMatchObject({ status: 'granted', itemId: item.id, cookies: 1, expired: 0,
+      fallback: [{ itemId: login.id, type: 'login', tool: 'fill_credential' }] });
+    // Both browsers now hold it, so it is refreshed from them after each turn.
+    for (const holder of [saver, user]) expect(await store.kvGet(`vault:session-holds:${holder.id}`)).toContain(item.id);
     expect(JSON.stringify(used.body)).not.toContain('SECRET');
     await other.waitForFunction("document.getElementById('who')?.textContent === 'alice'");
     expect((await other.context().cookies()).map((c) => c.name)).toEqual(['notes_sid']);
@@ -161,6 +164,28 @@ it('saves a site\'s session from one task and signs another task in after approv
     expect((await vault.access([], user.id, item, 'use')).status).toBe('granted');
     expect(await browser.contexts()[0]!.cookies()).toEqual([]);
     expect((await call(userToken, 'use', { domain: 'missing.test' })).body).toMatchObject({ status: 'not_in_vault' });
+
+    // An expired session says so, names the site's own sign-in, and spends no approval.
+    const working = vault.readSecret(item, 'session')!;
+    const expiredSession = JSON.parse(working);
+    for (const cookie of expiredSession.cookies) cookie.expires = Math.floor(Date.now() / 1000) - 60;
+    await vault.save({ id: item.id, type: 'session', secrets: { session: JSON.stringify(expiredSession) } });
+    await freshPage(`https://app.notes.test:${sitePort}/`);
+    expect((await call(userToken, 'use', { itemId: item.id })).body).toMatchObject({ status: 'expired',
+      fallback: [{ itemId: login.id, tool: 'fill_credential' }], next: expect.stringContaining(`fill_credential (itemId ${login.id}`) });
+    expect((await vault.access([], user.id, item, 'use')).status).toBe('granted');
+
+    // One task at a time: a second task waits until the holder lets go.
+    await vault.save({ id: item.id, type: 'session', exclusive: true, secrets: { session: working } });
+    expect((await call(userToken, 'use', { itemId: item.id })).body).toMatchObject({ status: 'granted' });
+    const third = await task('third');
+    const thirdToken = await mint(third.id, ['credential:read']);
+    await vault.resolve((await call(thirdToken, 'use', { itemId: item.id })).body.requestId, { action: 'once', by: 'user:test' });
+    const waiting = await call(thirdToken, 'use', { itemId: item.id });
+    expect(waiting.body).toMatchObject({ status: 'busy', heldBy: { taskId: user.id, title: 'user' } });
+    expect((await vault.access([], third.id, item, 'use')).status).toBe('granted');
+    await store.saveView(user.id, { taskId: user.id, title: 'user', workflow: 'just-do', stage: 'done', status: 'done' } as any);
+    expect((await call(thirdToken, 'use', { itemId: item.id })).body).toMatchObject({ status: 'granted' });
   } finally {
     await close?.();
     await store.close();

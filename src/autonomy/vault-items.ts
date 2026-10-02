@@ -72,6 +72,9 @@ export interface VaultItem {
   /** api-key: env var carrying the secret at spawn; ssh-key: env var carrying
    *  the materialized key file's path. Absent ⇒ not injected at spawn. */
   envVar?: string;
+  /** session: in at most one task's browser at a time, for sites that rotate
+   *  their tokens on use and would sign the other copies out (session-holds.ts). */
+  exclusive?: boolean;
   /** Which secret fields currently have stored values (never the values). */
   fields: VaultFieldName[];
   policy: VaultItemPolicy;
@@ -365,6 +368,7 @@ export class VaultItems {
     username?: string;
     tags?: string[];
     envVar?: string;
+    exclusive?: boolean;
     policy?: Partial<VaultItemPolicy>;
     secrets?: Partial<Record<VaultFieldName, string>>;
     /** Internal connector snapshot: remove fields absent from the source. */
@@ -422,6 +426,7 @@ export class VaultItems {
       ...(username ? { username } : {}),
       ...(tags?.length ? { tags } : {}),
       ...(envVar ? { envVar } : {}),
+      ...(args.type === 'session' && (args.exclusive ?? prior?.exclusive) ? { exclusive: true } : {}),
       fields: [...fields],
       policy: {
         use: args.policy?.use ?? prior?.policy.use ?? 'auto',

@@ -14,7 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { openPage } from '../src/autonomy/cdp.js';
 import { openWorldPage } from '../src/autonomy/world-fill.js';
 import {
-  captureSession, restoreSession, sessionDomainError, cookieBelongs, parseSavedSession, type SavedSession,
+  captureSession, restoreSession, refreshSession, sessionState, sessionDomainError, cookieBelongs, parseSavedSession, type SavedSession,
 } from '../src/autonomy/browser-session.js';
 import { openSpawnedPty } from '../src/world/local-execution.js';
 import { findFreePortFrom } from '../src/util/ports.js';
@@ -42,6 +42,31 @@ function serve(req: import('node:http').IncomingMessage, res: import('node:http'
     `<div id="who">${/(?:^|; )sid=S1(?:;|$)/.test(cookies) ? 'alice' : 'signed out'}</div>
      <script>document.title = localStorage.getItem('token') || 'none'</script>`);
   if (host === 'idp.test' && url.pathname === '/login') return html('idp', { 'set-cookie': 'gsid=G1; Secure; HttpOnly; Path=/; Max-Age=3600' });
+  // A Firebase-style app: its sign-in lives in IndexedDB, behind a connection
+  // the page keeps open, plus a per-tab marker in sessionStorage. A second
+  // database holds a non-extractable CryptoKey, which no copy can carry.
+  if (host === 'fire.example.test') return html(`<div id="who">loading</div><script>
+    const open = indexedDB.open('firebaseLocalStorageDb', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('firebaseLocalStorage', { keyPath: 'fbase_key' });
+    open.onsuccess = async () => {
+      const db = window.db = open.result;
+      const who = document.getElementById('who');
+      if (location.pathname === '/login') {
+        const tx = db.transaction('firebaseLocalStorage', 'readwrite');
+        tx.objectStore('firebaseLocalStorage').put({ fbase_key: 'firebase:authUser', value: { email: 'alice@example.test', at: new Date(1000), key: new Uint8Array([1, 2, 3]), $t: 'literal' } });
+        sessionStorage.setItem('tab', 'T');
+        const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 128 }, false, ['encrypt']);
+        const keys = indexedDB.open('device-keys', 1);
+        keys.onupgradeneeded = () => keys.result.createObjectStore('keys');
+        keys.onsuccess = () => { const t = keys.result.transaction('keys', 'readwrite'); t.objectStore('keys').put(key, 'k'); t.oncomplete = () => { tx.oncomplete = null; who.textContent = 'stored'; }; };
+        return;
+      }
+      const read = db.transaction('firebaseLocalStorage').objectStore('firebaseLocalStorage').get('firebase:authUser');
+      read.onsuccess = () => {
+        const user = read.result && read.result.value;
+        who.textContent = user ? [user.email, user.at instanceof Date && user.at.getTime(), user.key instanceof Uint8Array && user.key.join(','), user.$t, sessionStorage.getItem('tab')].join('|') : 'signed out';
+      };
+    };</script>`);
   return html('a page');
 }
 
@@ -118,7 +143,7 @@ describe.each(Object.keys(paths) as Array<keyof typeof paths>)('the %s browser p
     const restore = await pageOn(['example.test']);
     try {
       expect(await restoreSession(restore.session, ['example.test'], parseSavedSession(JSON.stringify(saved))))
-        .toEqual({ cookies: 2, expired: 0, localStorage: true });
+        .toEqual({ cookies: 2, expired: 0, localStorage: true, sessionStorage: false, indexedDB: [] });
     } finally { await restore.session.close(); }
     await page.waitForFunction("document.getElementById('who')?.textContent === 'alice'");
     expect(await page.title()).toBe('T1');
@@ -126,6 +151,68 @@ describe.each(Object.keys(paths) as Array<keyof typeof paths>)('the %s browser p
     const sid = (await page.context().cookies()).find((c) => c.name === 'sid');
     expect(sid?.domain).toBe('app.example.test');
     expect(sid?.httpOnly).toBe(true);
+  });
+});
+
+describe('apps that sign in through web storage', () => {
+  it('carries IndexedDB and sessionStorage across, even while the page holds the database open', async () => {
+    const page = await open(at('fire.example.test', '/login'));
+    await page.waitForFunction("document.getElementById('who')?.textContent === 'stored'");
+    await page.goto(at('fire.example.test'));
+    const signedIn = 'alice@example.test|1000|1,2,3|literal|T';
+    await page.waitForFunction(`document.getElementById('who')?.textContent === ${JSON.stringify(signedIn)}`);
+    const capture = await openPage(devtools, { expectDomains: ['example.test'] });
+    let captured: Awaited<ReturnType<typeof captureSession>>;
+    try { captured = await captureSession(capture.session, ['example.test']); } finally { await capture.session.close(); }
+    expect(captured.saved.storage[0]!.indexedDB?.map((db) => db.name)).toEqual(['firebaseLocalStorageDb']);
+    expect(captured.saved.storage[0]!.sessionStorage).toEqual([['tab', 'T']]);
+    expect(captured.omitted).toEqual(['IndexedDB "device-keys" (holds values that cannot be copied)']);
+
+    // Signed out: the app's database emptied and the tab marker gone.
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Storage.clearDataForOrigin', { origin: at('fire.example.test').replace(/\/$/, ''), storageTypes: 'indexeddb' });
+    await page.evaluate('sessionStorage.clear()');
+    await page.reload();
+    await page.waitForFunction("document.getElementById('who')?.textContent === 'signed out'");
+
+    const restore = await openPage(devtools, { expectDomains: ['example.test'] });
+    try {
+      expect(await restoreSession(restore.session, ['example.test'], parseSavedSession(JSON.stringify(captured.saved))))
+        .toMatchObject({ indexedDB: ['firebaseLocalStorageDb'], sessionStorage: true });
+    } finally { await restore.session.close(); }
+    await page.waitForFunction(`document.getElementById('who')?.textContent === ${JSON.stringify(signedIn)}`);
+  });
+});
+
+describe('refreshing', () => {
+  const stored = (cookies: SavedSession['cookies']): SavedSession => ({ version: 1, capturedAt: 1, cookies, storage: [] });
+  const cookie = (name: string, value: string) => ({ name, value, domain: 'app.example.test', path: '/', secure: true, httpOnly: true });
+
+  it('takes what the site rotated or added, and never what it dropped', async () => {
+    const page = await open(at('app.example.test'));
+    await page.context().addCookies([
+      { name: 'sid', value: 'S2', domain: 'app.example.test', path: '/', secure: true, httpOnly: true },
+      { name: 'csrf', value: 'C1', domain: 'app.example.test', path: '/', secure: true, httpOnly: false },
+      { name: 'gsid', value: 'G1', domain: 'idp.test', path: '/', secure: true, httpOnly: true },
+    ]);
+    const target = await openPage(devtools, {});
+    try {
+      const { saved, changed } = await refreshSession(target.session, ['example.test'],
+        stored([cookie('sid', 'S1'), cookie('remember', 'R1')]), 5_000);
+      expect(changed).toBe(true);
+      expect(saved.capturedAt).toBe(5_000);
+      expect(Object.fromEntries(saved.cookies.map((c) => [c.name, c.value]))).toEqual({ sid: 'S2', remember: 'R1', csrf: 'C1' });
+      // A browser that lost the session changes nothing.
+      await page.context().clearCookies();
+      const empty = await refreshSession(target.session, ['example.test'], saved);
+      expect(empty).toEqual({ saved, changed: false });
+    } finally { await target.session.close(); }
+  });
+
+  it('knows when nothing is left to sign in with', () => {
+    const past = Math.floor(Date.now() / 1000) - 60;
+    expect(sessionState(stored([{ ...cookie('sid', 'S1'), expires: past }]), ['example.test'])).toMatchObject({ usable: false, expired: 1 });
+    expect(sessionState(stored([cookie('sid', 'S1')]), ['example.test'])).toMatchObject({ usable: true, expired: 0 });
   });
 });
 
@@ -144,7 +231,7 @@ describe('restoring', () => {
         cookie('gsid', 'idp.test'),
         cookie('stale', '.example.test', { expires: Math.floor(Date.now() / 1000) - 60 }),
       ]));
-      expect(result).toEqual({ cookies: 1, expired: 1, localStorage: false });
+      expect(result).toMatchObject({ cookies: 1, expired: 1, localStorage: false });
     } finally { await target.session.close(); }
     await page.waitForFunction("document.getElementById('who')?.textContent === 'alice'");
     expect((await page.context().cookies()).map((c) => c.name)).toEqual(['sid']);

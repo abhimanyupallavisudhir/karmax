@@ -102,16 +102,18 @@ export async function connect(wsUrl: string, timeoutMs = 15_000): Promise<CdpSes
 
 /** Open a session on the page matching `expectDomains`, with the live origin
  *  verified over CDP (the target list's url can lag or lie). */
-export async function openPage(cdpUrl: string, opts: { expectDomains?: string[]; timeoutMs?: number } = {}): Promise<{ session: CdpSession; origin: string }> {
+export async function openPage(cdpUrl: string, opts: { expectDomains?: string[]; timeoutMs?: number; anyPage?: boolean } = {}): Promise<{ session: CdpSession; origin: string }> {
   const timeoutMs = opts.timeoutMs ?? 15_000;
   const pages = await listPages(cdpUrl, timeoutMs);
-  const page = pickPage(pages, opts.expectDomains);
+  // `anyPage`: prefer a page on the domains, else take any (the caller checks
+  // origins itself, as reading a session's cookies needs no page on the site).
+  const page = pickPage(pages, opts.expectDomains) ?? (opts.anyPage ? pages[0] : undefined);
   if (!page) {
     throw new Error(opts.expectDomains?.length
       ? `no open page matches ${opts.expectDomains.join(', ')} — navigate to the login page first`
       : 'no open page at the CDP endpoint');
   }
-  return verifiedPage((await connect(page.webSocketDebuggerUrl!, timeoutMs)), opts.expectDomains);
+  return verifiedPage((await connect(page.webSocketDebuggerUrl!, timeoutMs)), opts.anyPage ? undefined : opts.expectDomains);
 }
 
 /** Check a page session's live origin against `expectDomains`; closes it if it does not match. */
