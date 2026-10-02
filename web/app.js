@@ -15994,7 +15994,7 @@ function passwordsCard() {
         <input class="vi-label" placeholder="label (e.g. GitHub — alice)" style="flex:1;min-width:140px" />
         <input class="vi-domains" placeholder="domains (e.g. github.com)" style="flex:1;min-width:140px" />
         <input class="vi-username" placeholder="username" style="min-width:120px" />
-        <input class="vi-envvar" placeholder="env var (api/ssh keys)" style="min-width:140px;display:none" />
+        <input class="vi-envvar" placeholder="env var name" pattern="[A-Za-z_][A-Za-z0-9_]*" spellcheck="false" autocapitalize="characters" style="min-width:140px;display:none" />
       </div></div>
       <div class="vault-secret-rows"></div>
       <div class="form-row"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
@@ -16020,7 +16020,12 @@ async function wireVaultCards(organizationId) {
   const secretRows = () => {
     box.querySelectorAll('.totp-secret-control').forEach((control) => clearTotpQrPreview(control));
     const type = box.querySelector('.vi-type').value;
-    box.querySelector('.vi-envvar').style.display = type === 'api-key' || type === 'ssh-key' ? '' : 'none';
+    const envVar = box.querySelector('.vi-envvar');
+    envVar.style.display = type === 'api-key' || type === 'ssh-key' ? '' : 'none';
+    envVar.placeholder = type === 'ssh-key' ? 'key path var, e.g. DEPLOY_KEY' : 'env var, e.g. OPENAI_API_KEY';
+    envVar.title = type === 'ssh-key'
+      ? 'Optional. Agents get the path to this key file in this variable. Not the public key.'
+      : 'Optional. Agents get this key in this variable.';
     box.querySelector('.vault-secret-rows').innerHTML = VAULT_SECRET_LABELS[type].map(([field, label]) =>
       `<div class="form-row"><label>${esc(label)}</label>${field === 'env' || field === 'privateKey' || field === 'note'
         ? `<textarea class="vi-secret" data-field="${field}" rows="3" style="width:100%"></textarea>`
@@ -16085,6 +16090,7 @@ async function wireVaultCards(organizationId) {
         ? sortVaultItems(vaultItems).map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
           <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
             ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
+            ${i.envVar ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="Environment variable agents receive">$${esc(i.envVar)}</span>` : ''}
             <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
           <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
