@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { recoverClaudeToolInputs } from '../src/agent/claude-history.js';
-import { importWithPanagent } from '../src/agent/panagent.js';
+import { importWithPanagent, stableImportSessionId } from '../src/agent/panagent.js';
 import { claudeCwdSlug } from '../src/agent/fork.js';
 const codex = (input: unknown) => [
   { type: 'session_meta', payload: { id: '11111111-1111-4111-8111-111111111111', cwd: '/tmp/source' } },
@@ -25,6 +25,22 @@ describe('Claude imported tool history', () => {
       expect(call(rs)).toMatchObject({ id: 'call1', input: input && typeof input === 'object' && !Array.isArray(input) ? input : { input } });
       expect(JSON.stringify(rs)).toContain('BLUEBIRD');
       expect(JSON.stringify(rs)).toContain('"tool_use_id":"call1"');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+  // legibench3#18: every failed attempt converted the 44 MB Codex source again
+  // under a new random id, leaving fifteen 19 MB copies in a shared login home.
+  it('replaces its own copy when one task\'s import of a source is retried', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-import-retry-'));
+    try {
+      const sessionId = stableImportSessionId('task_a', 'do', 'claude', 'task:task_src:do:codex:source');
+      expect(sessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(stableImportSessionId('task_a', 'do', 'claude', 'task:task_src:do:codex:source')).toBe(sessionId);
+      expect(stableImportSessionId('task_b', 'do', 'claude', 'task:task_src:do:codex:source')).not.toBe(sessionId);
+      const options = { source: { data: Buffer.from(codex({ command: 'pwd' })) }, provider: 'claude' as const,
+        forkHome: home, worldPath: '/tmp/world', mode: 'transcript' as const, native: true, sessionId };
+      for (let attempt = 0; attempt < 3; attempt++)
+        expect(await importWithPanagent(options)).toMatchObject({ kind: 'native', sessionId });
+      expect(fs.readdirSync(path.join(home, 'projects', claudeCwdSlug('/tmp/world')))).toEqual([`${sessionId}.jsonl`]);
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
   it.each([false, true])('recovers malformed history without changing its source (remote=%s)', async remote => {

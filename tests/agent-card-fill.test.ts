@@ -8,6 +8,7 @@ import { BudgetService } from '../src/autonomy/payments.js';
 import * as credentialFill from '../src/autonomy/fill.js';
 import * as cardFill from '../src/autonomy/card-fill.js';
 import * as connectionRuntime from '../src/mcp/connections/runtime.js';
+import * as remoteProcess from '../src/agent/remote-process.js';
 import * as taskBrowser from '../src/autonomy/task-browser.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -23,6 +24,9 @@ it.each([
   ['local', { kind: 'memory' }, false],
 ] as const)('fills the browser where the %s task runs it (AU-11)', async (_name, shape, inWorld) => {
   vi.spyOn(connectionRuntime, 'prepareConnections').mockResolvedValue([]);
+  // This world runs on the host while shaped as a cloud sandbox; a sandbox's
+  // bootstrap would link its managed Node into the host's /usr/local/bin.
+  vi.spyOn(remoteProcess, 'prewarmRemoteAgentHome').mockImplementation(() => {});
   const fillViaCdp = vi.spyOn(credentialFill, 'fillViaCdp').mockResolvedValue({ origin: 'https://shop.example.com' });
   const fillCardInWorld = vi.spyOn(cardFill, 'fillCardInWorld').mockResolvedValue({ origin: 'https://shop.example.com' });
   const ownBrowser = vi.spyOn(taskBrowser, 'localTaskBrowserUrl').mockReturnValue('http://127.0.0.1:45999');

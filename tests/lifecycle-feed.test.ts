@@ -75,7 +75,7 @@ describe('the lifecycle feed covers every lifecycle write', () => {
     const recorded = (await f.store.eventsOfType(dep.id, 'view.updated'));
     expect(recorded.map((event) => [event.payload.stage, event.payload.status])).toEqual([['do', 'active'], ['done', 'done']]);
     expect(recorded[1]!.payload).toEqual({ stage: 'done', status: 'done', waitingFor: null, waitingDetail: null,
-      waitingSummary: null, waitingProvider: null, waitingResetAt: null, agentTurn: null, agentRole: null });
+      waitingSummary: null, waitingProvider: null, waitingResetAt: null, waitingUntil: null, agentTurn: null, agentRole: null });
     expect(heard.map((event) => event.seq)).toEqual(recorded.map((event) => event.seq));
   });
 

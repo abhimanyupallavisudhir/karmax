@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
-import zlib from 'node:zlib';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { provisionGitRepos } from '../src/world/provision-git.js';
@@ -13,6 +12,8 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { WorldCheckpointService } from '../src/world/checkpoint.js';
+import { CHECKPOINT_LIMITS } from '../src/world/checkpoint-chunks.js';
+import type { WorldCheckpoint } from '../src/domain/types.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { ProjectEnvironment } from '../src/store/project-environment.js';
 import { ProjectServices } from '../src/store/project-services.js';
@@ -159,9 +160,10 @@ describe('portable world checkpoints', () => {
     expect((await world.exec('git', ['mv', 'tracked.txt', 'renamed.txt'])).code).toBe(0);
 
     const checkpoint = await checkpoints.checkpoint(world.handle);
+    expect(checkpoint.filesystemDelta).toMatchObject({ format: 2 });
     const encrypted = await objects.get(checkpoint.filesystemDelta!.objectKey);
-    expect(encrypted.subarray(0, 4).toString()).toBe('KMX1');
-    expect(encrypted.toString()).not.toContain('after');
+    expect(encrypted.subarray(0, 4).toString()).toBe('KRS1');
+    for (const stored of storedObjects(path.join(dir, 'objects'))) expect(stored.toString('latin1')).not.toContain('after');
     expect(checkpoint.ignored?.entries).toContainEqual(expect.objectContaining({ path: 'ignored-data' }));
     expect(checkpoint.ignored!.entries[0]!.bytes).toBeGreaterThanOrEqual(321);
     await world.destroy();
@@ -563,7 +565,7 @@ esac
   });
 });
 
-it('rejects oversized checkpoint files before reading them (WD-4)', async () => {
+it('refuses files over the checkpoint file limit before reading them, and tells the agent (WD-4)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-limit-'));
   const store = await Store.create(':memory:');
   const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
@@ -572,15 +574,22 @@ it('rejects oversized checkpoint files before reading them (WD-4)', async () => 
     workflowVersion: '1.0.0', params: { prompt: 'test' } });
   const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
   world.handle = await store.registerWorld(world.handle, project.id) as any;
+  // Sparse: the size is real to every reader, but no disk is used.
   const file = path.join(world.handle.root, 'large.bin');
-  fs.writeFileSync(file, ''); fs.truncateSync(file, 33 * 1024 * 1024);
+  fs.writeFileSync(file, ''); fs.truncateSync(file, CHECKPOINT_LIMITS.fileBytes + 1);
   const read = vi.spyOn(world, 'readFileBuffer');
+  const exec = vi.spyOn(world, 'exec');
   vi.spyOn(worlds, 'open').mockResolvedValue(world);
   const service = new WorldCheckpointService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')),
     new CredentialBroker(new Vault(path.join(dir, 'vault'))));
   try {
     await expect(service.checkpoint(world.handle)).rejects.toThrow('checkpoint file limit');
     expect(read).not.toHaveBeenCalled();
+    expect(exec.mock.calls.filter(([command, args]) => command === 'node' && String(args[1]).includes('readSync'))).toHaveLength(0);
+    const notice = await service.takeNotice(task.id);
+    expect(notice).toContain('a file exceeds the 16 GiB checkpoint file limit');
+    expect(notice).toContain('- large.bin (16 GiB)');
+    expect(await service.takeNotice(task.id)).toBeUndefined();
   } finally { vi.restoreAllMocks(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -647,7 +656,7 @@ it('retires obsolete checkpoints while keeping current recovery and fork pins (W
   } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-it('captures small dirty files in one bounded sandbox read (WD-19, LT-11)', async () => {
+it('captures small dirty files with one bounded sandbox listing and one read (WD-19, LT-11)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-batch-'));
   const store = await Store.create(':memory:');
   const worlds = new WorldRegistry(); worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
@@ -665,15 +674,24 @@ it('captures small dirty files in one bounded sandbox read (WD-19, LT-11)', asyn
     const checkpoint = await service.checkpoint(world.handle);
     expect(checkpoint.filesystemDelta?.bytes).toBeGreaterThan(0);
     expect(reads).not.toHaveBeenCalled();
-    expect(exec.mock.calls.filter(([command]) => command === 'node')).toHaveLength(1);
+    expect(exec.mock.calls.filter(([command]) => command === 'node')).toHaveLength(2);
   } finally { vi.restoreAllMocks(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 describe('symbolic links (WD-33)', () => {
   const SECRET = 'outside-credential-5d1c0a9e';
-  const decryptedFiles = async (service: WorldCheckpointService, objects: LocalObjectStore, checkpoint: { filesystemDelta?: { objectKey: string } }) => {
-    const plain = await (service as any).decrypt(await objects.get(checkpoint.filesystemDelta!.objectKey));
-    return (JSON.parse(zlib.gunzipSync(plain).toString()) as { files: Array<{ path: string; data?: string; symlink?: boolean }> }).files;
+  const decryptedFiles = async (service: WorldCheckpointService, store: Store, checkpoint: WorldCheckpoint) => {
+    const organizationId = (await store.getProject(checkpoint.projectId))!.organizationId!;
+    const files: Array<{ path: string; data?: string; symlink?: boolean }> = [];
+    for await (const entry of (service as any).chunks.entries(checkpoint, organizationId)) {
+      if (entry.link !== undefined) files.push({ path: entry.path, data: entry.link, symlink: true });
+      else if (entry.content) {
+        const parts: Buffer[] = [];
+        for await (const part of entry.content()) parts.push(part);
+        files.push({ path: entry.path, data: Buffer.concat(parts).toString('base64') });
+      }
+    }
+    return files;
   };
   const expectNoSecret = (files: Array<{ data?: string }>) => {
     for (const file of files) expect(Buffer.from(file.data ?? '', 'base64').toString('latin1')).not.toContain(SECRET);
@@ -709,7 +727,7 @@ describe('symbolic links (WD-33)', () => {
     fs.unlinkSync(path.join(world.handle.root, 'gone-link'));
     try {
       const checkpoint = await service.checkpoint(world.handle);
-      const files = await decryptedFiles(service, objects, checkpoint);
+      const files = await decryptedFiles(service, store, checkpoint);
       expectNoSecret(files);
       expect(files.filter(file => file.symlink).map(file => file.path).sort()).toEqual(Object.keys(links).sort());
       await world.destroy();
@@ -782,7 +800,7 @@ describe('symbolic links (WD-33)', () => {
     for (const [link, target] of Object.entries(links)) fs.symlinkSync(target, path.join(world.handle.root, link));
     try {
       const checkpoint = await service.checkpoint(world.handle);
-      expectNoSecret(await decryptedFiles(service, objects, checkpoint));
+      expectNoSecret(await decryptedFiles(service, store, checkpoint));
       await world.destroy();
       const restored = await service.restore(checkpoint.id, 'worktree');
       for (const [link, target] of Object.entries(links))
@@ -792,3 +810,9 @@ describe('symbolic links (WD-33)', () => {
     } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+/** Every object the store holds, for "never stored in plaintext" checks. */
+function storedObjects(root: string): Buffer[] {
+  return (fs.readdirSync(root, { recursive: true }) as string[]).map(name => path.join(root, name))
+    .filter(file => fs.statSync(file).isFile()).map(file => fs.readFileSync(file));
+}

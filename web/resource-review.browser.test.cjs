@@ -44,6 +44,27 @@ const freshness = src.slice(src.indexOf('function beginAsyncElementRender('), sr
       assert.ok(box.x + box.width <= width, 'resource list must fit on mobile');
       await page.screenshot({ path: `/tmp/karmax-resource-review-${width}.png` });
     }
-    console.log('Resource review browser regression passed (concurrent saves, confirmation, desktop and mobile layout).');
+    // A candidate the platform could not snapshot is reported, with its reason on hover.
+    await page.evaluate(() => {
+      items.splice(0, items.length,
+        { resource: { id: 'raw', name: 'Raw source data', target: { kind: 'path', path: 'raw_data' } },
+          candidate: { id: 'c1', state: 'pending', sourcePath: 'raw_data', createdAt: 1 } },
+        { resource: { id: 'data', name: 'Resource candidate' },
+          candidate: { id: 'c2', state: 'discarded', sourcePath: 'data', createdAt: 2,
+            error: 'snapshotting SQLite database data/pramana.db consistently needs 6.0 GiB of free disk in the task world, but only 5.1 GiB is free' } });
+      resourceReviewCache.clear();
+      return wireResourceReview(view, true);
+    });
+    const failed = page.getByText('Not saved', { exact: true });
+    await failed.waitFor();
+    assert.match(await failed.getAttribute('title'), /needs 6\.0 GiB of free disk/);
+    assert.equal(await page.locator('.resource-review-row').count(), 2);
+    for (const width of [860, 375]) {
+      await page.setViewportSize({ width, height: 300 });
+      const box = await page.locator('.resource-review-list').boundingBox();
+      assert.ok(box.x + box.width <= width, 'the failure row must fit on mobile');
+      await page.screenshot({ path: `/tmp/karmax-resource-review-failed-${width}.png` });
+    }
+    console.log('Resource review browser regression passed (concurrent saves, confirmation, failed snapshot, desktop and mobile layout).');
   } finally { await browser.close(); }
 })().catch((error) => { console.error(error); process.exitCode = 1; });

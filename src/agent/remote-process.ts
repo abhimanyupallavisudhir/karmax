@@ -1555,6 +1555,10 @@ function browserServers(world: World, browser: BrowserKind, tools: BrowserTools,
       // The task-isolated world owns this process and its private profile.
       KARMAX_CDP_KEEP_ALIVE: '1',
       KARMAX_CDP_USER_DATA_DIR: path.posix.join(world.handle.root, REMOTE_ROOT, 'browser-profile'),
+      // On a desktop world the agent's browser is the one on screen, so a
+      // person can sign in for it through the desktop view (then save_session
+      // keeps the sign-in). E2B Desktop and Daytona Computer Use draw on :0.
+      ...(world.handle.meta?.environmentFlavor === 'desktop' ? { KARMAX_CDP_HEADFUL: '1', DISPLAY: ':0' } : {}),
     },
   } };
 }

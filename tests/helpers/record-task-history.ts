@@ -9,7 +9,8 @@
  * commit before the change (copy this file and stub-task-worker.ts there if
  * they are newer). Scenarios: landing-duplicate, merge-queue-wait, long,
  * subtask-barrier, merge-failed (mergeOnly), turn-failed (justDo); the last two
- * record the whole closed execution.
+ * record the whole closed execution. infra-retry: a Do turn fails on
+ * infrastructure, waits out the first backoff and runs again (~70 s).
  */
 import fs from 'node:fs';
 import { ApplicationFailure } from '@temporalio/common';
@@ -32,7 +33,7 @@ const common: StubActivities = {
   agentUsesHostCapacity: async () => false, pendingServiceConnections: async () => 0,
   buildReview: async () => ({ summary: 'fixture', changedFiles: [] }), checkProposal: async () => ({ ready: true }),
   suspendWorldForRecovery: async () => {}, closePrs: async () => prs, destroyWorld: async () => {},
-  settleResourceReview: async () => ({ settled: true }), openPr: async () => prs,
+  settleResourceReview: async () => ({ settled: true }), stageResourceCandidates: async () => ({ staged: 0, failed: 0 }), pendingResourceCandidates: async () => 0, openPr: async () => prs,
   withdrawGithubPrs: async () => ({ withdrawn: [], reconciled: prs }),
   // Landing takes the Karmax slot at once; the merge-queue wait never gets it.
   enqueueMerge: async (_domain: string, taskId: string) => {
@@ -49,6 +50,7 @@ const counted = Object.fromEntries(Object.entries({
   ...common,
   runAgentTurn: async () => {
     if (scenario === 'turn-failed') throw ApplicationFailure.nonRetryable('agent refused the task', 'agent-error');
+    if (scenario === 'infra-retry') throw ApplicationFailure.retryable('fetch failed', 'agent-infra');
     return { output: replies(turns++), providerCompleted: true,
       ...(scenario === 'subtask-barrier' ? { waitForSubtasks: true } : {}) };
   },
@@ -71,6 +73,8 @@ const inputs: Record<string, unknown> = {
     branch: 'task', project: { repos: ['/fixture'] }, confirm: { layers: [] } },
   'turn-failed': { taskId: workflowId, projectId: 'fixture', title: 'Failed turn fixture', prompt: 'Work',
     project: { repos: ['/fixture'], worldProvider: 'e2b' } },
+  'infra-retry': { taskId: workflowId, projectId: 'fixture', title: 'Infrastructure retry fixture', prompt: 'Work',
+    project: { repos: ['/fixture'] }, resolveAgentEnabled: false },
   long: { taskId: workflowId, projectId: 'fixture', title: 'Long task', prompt: `Start. ${'p'.repeat(500)}`,
     project: { repos: ['/fixture'], remote: 'pr' } },
 };
@@ -78,6 +82,8 @@ const until: Record<string, () => boolean> = {
   'landing-duplicate': () => count('mergeGithubPrs') >= 5,
   'merge-queue-wait': () => count('mergeQueuePosition') >= 2,
   'subtask-barrier': () => count('runAgentTurn') >= 1,
+  // Three activity attempts, the 30 s backoff, then the stage's next run.
+  'infra-retry': () => count('runAgentTurn') >= 4,
 };
 
 const env = await startStubTaskWorker(counted);

@@ -137,17 +137,27 @@ describe('credential selection ranking through HTTP', () => {
       // open pages (or spend grants) the cap then refuses.
       const { PasskeyManager } = await import('../src/autonomy/passkey.js');
       (gateway as any).passkeys = new PasskeyManager(180_000, { perOwner: 1, total: 64 });
+      // The winner's page stays open until the other four have answered: once
+      // it spends the one-shot grant, a request that only now reaches its grant
+      // check is rightly told to ask again, which a slow runner made happen.
       let pages = 0;
+      let answered = 0;
+      let releaseWinner!: () => void;
+      const othersAnswered = new Promise<void>((resolve) => { releaseWinner = resolve; });
       (gateway as any).openTaskWorldPage = async () => {
         pages++;
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await othersAnswered;
         return { origin: 'https://example.com', session: { close: async () => {},
           call: async (method: string) => method === 'WebAuthn.addVirtualAuthenticator' ? { authenticatorId: 'auth' } : {} } };
       };
       const logins = await Promise.all(Array.from({ length: 5 }, () => fetch(`${running.url}/api/vault/passkey/login`, {
         method: 'POST', headers: { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' },
         body: JSON.stringify({ itemId: passkey.id }),
-      }).then((response) => response.json() as Promise<any>)));
+      }).then(async (response) => {
+        const login = await response.json() as any;
+        if (++answered === 4) releaseWinner();
+        return login;
+      })));
       expect(pages).toBe(1);
       expect(logins.filter((login) => login.status === 'granted')).toHaveLength(1);
       expect(logins.filter((login) => /passkey sessions open/.test(login.error ?? ''))).toHaveLength(4);

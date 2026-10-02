@@ -150,6 +150,46 @@ describe('Krmax panagent bridge', () => {
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
+  // legibench3#18: a 44 MB Codex session became an 11.9M-token Claude prompt ("prompt is
+  // too long: 11922478 tokens > 1000000"): its screenshots arrived as base64 text, and the
+  // history Codex had compacted away arrived in full.
+  it('converts a compacted Codex session with screenshots into a prompt Claude can take', async () => {
+    const home = temporary('karmax-codex-compacted-import-');
+    const png = `data:image/png;base64,${Buffer.alloc(300_000, 7).toString('base64')}`;
+    const item = (payload: object) => ({ type: 'response_item', payload });
+    const turn = (n: number) => [
+      item({ type: 'message', role: 'user', content: [{ type: 'input_text', text: `ask ${n}` }] }),
+      item({ type: 'custom_tool_call', call_id: `c${n}`, name: 'exec', input: 'plot()' }),
+      item({ type: 'custom_tool_call_output', call_id: `c${n}`, output: [
+        { type: 'input_text', text: `plotted ${n}` }, { type: 'input_image', image_url: png }] }),
+      item({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `done ${n}` }] }),
+    ];
+    const records = [
+      { type: 'session_meta', payload: { id: SOURCE_SESSION, timestamp: '2026-09-28T18:42:14Z', cwd: '/tmp/source' } },
+      ...turn(1), ...turn(2),
+      { type: 'compacted', payload: { message: '', replacement_history: [{ type: 'compaction', encrypted_content: 'opaque' }] } },
+      ...turn(3),
+    ];
+    try {
+      const result = await importWithPanagent({ source: { data: Buffer.from(records.map((r) => JSON.stringify(r)).join('\n') + '\n') },
+        provider: 'claude', forkHome: home, worldPath: '/tmp/imported', mode: 'transcript', native: true });
+      expect(result.kind).toBe('native');
+      if (result.kind !== 'native') return;
+      const lines = fs.readFileSync(path.join(home, 'projects', '-tmp-imported', `${result.sessionId}.jsonl`), 'utf8').trim().split('\n');
+      const blocks = lines.map((line) => JSON.parse(line)).flatMap((r) => Array.isArray(r.message?.content) ? r.message.content : []);
+      // Only the turn after the compaction keeps its tool work, and its screenshot is an image.
+      expect(blocks.filter((b) => b.type === 'tool_use').map((b) => b.id)).toEqual(['c3']);
+      const output = blocks.find((b) => b.type === 'tool_result');
+      expect(output.content).toEqual([{ type: 'text', text: 'plotted 3' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png.slice('data:image/png;base64,'.length) } }]);
+      const texts = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n')
+        + lines.map((line) => JSON.parse(line)).filter((r) => typeof r.message?.content === 'string').map((r) => r.message.content).join('\n');
+      expect(texts).not.toContain('base64');
+      for (const kept of ['ask 1', 'done 1', 'ask 2', 'done 2', 'ask 3', 'done 3']) expect(texts).toContain(kept);
+      expect(result.warnings?.map((w) => w.code)).toContain('codex_compaction_digest');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
   it('preserves valid Claude native records before a truncated tail', async () => {
     const home = temporary('karmax-truncated-claude-import-');
     try {

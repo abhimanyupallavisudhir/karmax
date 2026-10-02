@@ -501,7 +501,14 @@ export function classifyGithubActionsFailure(
   // A real failed step needs repair even when another job was interrupted.
   // The run's cancellation/timeout alone must not convert assertion text into
   // account evidence, nor can a quoted runner error request an automatic rerun.
+  // A job that started only after an interrupted job finished (an
+  // `if: always()` gate over its `needs`) may have failed because of that
+  // interruption, so it is not evidence against the revision (task 459).
+  const interruptedAt = Math.min(...jobs
+    .filter(job => ['cancelled', 'timed_out'].includes(job.conclusion?.toLowerCase() ?? ''))
+    .map(job => Date.parse(job.completedAt ?? '')).filter(Number.isFinite));
   if (jobs.some(job => job.conclusion?.toLowerCase() === 'failure'
+    && !(Date.parse(job.startedAt ?? '') >= interruptedAt)
     && job.steps.some(step => step.conclusion?.toLowerCase() === 'failure'))) return {
     ...common, disposition: 'revision',
     reason: 'GitHub reports a failed execution step; repair the proposal using the attached diagnostics.',

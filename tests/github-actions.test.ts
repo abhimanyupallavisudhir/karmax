@@ -127,6 +127,32 @@ describe('GitHub Actions API', () => {
     expect(classifyGithubActionsFailure(value).disposition).toBe('revision');
   });
 
+  it('retries when the only failed step is a gate that ran after an interrupted job (task 459)', () => {
+    const value = inspection('results: success cancelled success', { conclusion: 'cancelled' });
+    value.failedJobs[0]!.startedAt = '2026-10-01T21:03:09Z';
+    value.jobs = [
+      { id: 103, name: 'tests 1/5', status: 'completed', conclusion: 'success', url: '', steps: [],
+        startedAt: '2026-10-01T20:37:40Z', completedAt: '2026-10-01T20:52:00Z' },
+      { id: 104, name: 'tests 3/5', status: 'completed', conclusion: 'cancelled', url: '',
+        steps: [{ number: 4, name: 'Install system libraries', status: 'completed', conclusion: 'cancelled' }],
+        startedAt: '2026-10-01T20:37:40Z', completedAt: '2026-10-01T21:03:02Z' },
+    ];
+    expect(classifyGithubActionsFailure(value).disposition).toBe('retry');
+  });
+
+  it('still repairs a failure that ran alongside the interrupted job, gate or not', () => {
+    const value = inspection('results: failure cancelled', { conclusion: 'cancelled' });
+    value.failedJobs[0]!.startedAt = '2026-10-01T21:03:09Z';
+    value.jobs = [
+      { id: 103, name: 'tests 1/5', status: 'completed', conclusion: 'failure', url: '',
+        steps: [{ number: 5, name: 'Run tests', status: 'completed', conclusion: 'failure' }],
+        startedAt: '2026-10-01T20:37:40Z', completedAt: '2026-10-01T20:52:00Z' },
+      { id: 104, name: 'tests 3/5', status: 'completed', conclusion: 'timed_out', url: '', steps: [],
+        startedAt: '2026-10-01T20:37:40Z', completedAt: '2026-10-01T21:03:02Z' },
+    ];
+    expect(classifyGithubActionsFailure(value).disposition).toBe('revision');
+  });
+
   it('does not invent a cause when all jobs are skipped or metadata is partial', () => {
     const value = inspection('');
     value.failedJobs = [];

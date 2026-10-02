@@ -59,7 +59,7 @@ import {
   TaskRecoveryCheckpoint,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
-  landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
+  landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
@@ -69,6 +69,15 @@ import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 const coreChild = proxyActivities<childActivities>({ startToCloseTimeout: '20 seconds' });
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
+});
+// Snapshots move at a few MB/s out of a remote sandbox, so a multi-GB output
+// takes most of an hour. A retry keeps every candidate already staged.
+const resourceStaging = proxyActivities<coreActivities>({
+  // Heartbeats carry a cancel to the activity; a short timeout delivers it soon.
+  startToCloseTimeout: '12 hours', heartbeatTimeout: '30 seconds',
+  retry: { maximumAttempts: 3, initialInterval: '30 seconds' },
+  // A cancel must not move on to suspend or destroy the world mid-upload.
+  cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -243,6 +252,10 @@ const MAX_MERGE_ATTEMPTS = 3;
 /** Default re-prompt cadence for a parent holding an unanswered child raise (SPEC §5.3).
  *  Bounds the subtask-wait so an ignored raise re-enters Do instead of parking forever. */
 const DEFAULT_SUBTASK_NAG_MS = 60_000;
+/** How much of a child's last message its parent sees in the raise for a Do
+ *  turn that ended without a PR; the rest is in the child's conversation. */
+const PARENT_RAISE_OUTPUT_CHARS = 2_000;
+const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
  *  Task tool) are still running. We hold in Do and re-prompt so it waits for them,
  *  but bound the re-prompts so a wedged sub-agent can't park the task forever. */
@@ -696,10 +709,14 @@ async function softwareDevImpl(
   let awaitingResourceDecision = false;
   let resourceReviewSequence = carriedCount?.resourceReviewSequence ?? 0;
   let applyingResources = false;
+  let stagingResources = false;
   let resourcesApplied = carried?.resourcesApplied ?? false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
+  // A released sandbox is no longer addressable, but the branch and checkouts it
+  // carried stay part of the finished task's record.
+  let releasedWorld: WorldHandleLike | undefined;
   let session: string | undefined = recovery?.session;
   // The config home that minted `session`. Provider sessions are login-bound, so a
   // later turn leased a DIFFERENT home must NOT resume this session — we drop it and
@@ -839,6 +856,7 @@ async function softwareDevImpl(
   // signal aborts the in-flight agent turn instead of waiting for it to finish.
   let activeTurn: CancellationScope | undefined;
   let activeSetup: CancellationScope | undefined;
+  let activeStaging: CancellationScope | undefined;
 
   const kind = input.project.worldProvider ?? 'worktree';
 
@@ -982,7 +1000,7 @@ async function softwareDevImpl(
 
   // ── view-model ──
   function allowed(): DeclaredAction[] {
-    if (applyingResources) return [];
+    if (applyingResources || stagingResources) return [];
     const pausedRole: AgentRole | undefined =
       stage === 'do' || stage === 'review'
         ? 'do'
@@ -1076,6 +1094,7 @@ async function softwareDevImpl(
     const visibleMergeDomains = participantLanding && githubAuthoritativeMerge
       ? retainedMergeDomains
       : world ? mergeQueueDomains(world, target, input.projectId) : [];
+    const recordWorld = world ?? releasedWorld;
     return {
       taskId,
       title: input.title,
@@ -1092,6 +1111,7 @@ async function softwareDevImpl(
       state: {
         confirmed,
         ...(applyingResources ? { applyingResources: true } : {}),
+        ...(stagingResources ? { stagingResources: true } : {}),
         cancelled,
         ...(lifecycleReplacement ? { lifecycleReplacement: true } : {}),
         turnsSeen: seen,
@@ -1114,12 +1134,12 @@ async function softwareDevImpl(
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
         ...(interlocksLandingTransitions && lifecycleTransitionBlocked ? { lifecycleTransitionBlocked: true } : {}),
       },
-      ...(!repositoryless ? { branch: world?.branch, base, targetBranch: target } : {}),
+      ...(!repositoryless ? { branch: recordWorld?.branch, base, targetBranch: target } : {}),
       world,
       worldPath: world?.workdir ?? world?.root,
       pr,
       ...(prs.length ? { prs } : {}),
-      ...(multiPrEnabled && world ? { checkouts: reviewCheckouts(worldRepos(world as any), checkoutHeads, checkoutApprovals, prs) } : {}),
+      ...(multiPrEnabled && recordWorld ? { checkouts: reviewCheckouts(worldRepos(recordWorld as any), checkoutHeads, checkoutApprovals, prs) } : {}),
       mergeQueue: mergeQueuePos,
       ...(intentAuthorizedLanding ? { landing } : {}),
       subTasks: subTaskIds.length ? subTaskIds : undefined,
@@ -1174,7 +1194,35 @@ async function softwareDevImpl(
     }
   }
 
-  async function applyReviewedResources(): Promise<void> {
+  /** Snapshot proposed outputs while their world is still live: at the start
+   * of Review (before the world parks), and again before applying them, which
+   * refreshes anything changed and covers a restored approval and candidates
+   * from older executions. A failure never fails the task; settlement discards
+   * what is unstaged. A cancel or replacement interrupts staging at once and
+   * leaves the candidates pending for a restore. True when staging is part of
+   * this execution. */
+  async function stageResources(): Promise<boolean> {
+    if (!resourceCandidateReview || !patched('resource-candidate-staging-v1')) return false;
+    if (cancelled) return true;
+    // Most tasks propose none. If even the count fails, staging reports for itself.
+    const pending = await core.pendingResourceCandidates(taskId)
+      .catch((err) => { if (isCancellation(err)) throw err; return 1; });
+    if (!pending) return true;
+    stagingResources = true;
+    const priorStatus = status;
+    status = 'active';
+    await publish();
+    const scope = new CancellationScope({ cancellable: true });
+    activeStaging = scope; // from here a cancel reaches the activity; before, it is seen below
+    try { if (!cancelled) await scope.run(() => resourceStaging.stageResourceCandidates(taskId)); }
+    catch (err) { if (isCancellation(err) && !cancelled) throw err; }
+    finally { activeStaging = undefined; stagingResources = false; status = priorStatus; }
+    return true;
+  }
+
+  /** False when a cancel stopped staging: nothing is adopted for a cancelled task. */
+  async function applyReviewedResources(): Promise<boolean> {
+    if (await stageResources() && cancelled) return false;
     applyingResources = true;
     status = 'active';
     await publish();
@@ -1182,6 +1230,7 @@ async function softwareDevImpl(
       await runLandingActivity(() => resourceActivities.settleResourceReview(taskId));
       resourcesApplied = true;
     } finally { applyingResources = false; }
+    return true;
   }
 
   /** Play the one canonical Review route. Restored proposals call this after
@@ -1199,6 +1248,7 @@ async function softwareDevImpl(
 
     const automaticResources = resourceCandidateReview && patched('automatic-resource-review-v1');
     if (automaticResources) await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
+    if (await stageResources() && cancelled) return 'cancelled';
     if (resourceCandidateReview && !automaticResources) {
       let resolutionAtWait = resourceResolutionEpoch;
       let pending = await core.pendingResourceCandidates(taskId);
@@ -1309,7 +1359,7 @@ async function softwareDevImpl(
       }
     }
 
-    if (automaticResources) await applyReviewedResources();
+    if (automaticResources && !(await applyReviewedResources())) return 'cancelled';
     confirmed = true;
     if (intentAuthorizedLanding) {
       landing = {
@@ -1440,6 +1490,7 @@ async function softwareDevImpl(
       cancelled = true;
       activeSetup?.cancel(); // abort provider allocation/provisioning during Setup
       activeTurn?.cancel(); // abort an in-flight agent turn immediately (SPEC §5.6)
+      activeStaging?.cancel();
       cancelChildren(); // and tear down any running sub-task agents
     }
   });
@@ -1449,6 +1500,7 @@ async function softwareDevImpl(
       cancelled = true;
       activeSetup?.cancel();
       activeTurn?.cancel();
+      activeStaging?.cancel();
       if (!patched('software-dev-preserve-replacement-children-v1')) cancelChildren();
     }
   });
@@ -1484,6 +1536,14 @@ async function softwareDevImpl(
     } else if (resp.action === 'confirm') {
       if (stage === 'escalated' && escalationAction) {
         if (escalationAction === 'confirm') manualEscalationRequested = true;
+        return;
+      }
+      // A Do turn that ended without open_pr asks its parent to approve what it
+      // has. Approving it there opens the PR, as Open PR would; setting only
+      // `confirmed` left the child parked in Do with its parent waiting on it.
+      if (explicitPrCycle && stage === 'do' && waitingFor?.kind === 'parent'
+        && patched('software-dev-parent-confirm-opens-pr-v1')) {
+        prRequested = true;
         return;
       }
       confirmed = true;
@@ -1607,6 +1667,7 @@ async function softwareDevImpl(
     for (;;) {
       let attempt = 0;
       let infraRetries = 0;
+      let freshContext = false;
       for (; attempt <= MAX_RESOLVE_ATTEMPTS; attempt++) {
         limitReportedToCoordinator = false;
         try {
@@ -1617,6 +1678,24 @@ async function softwareDevImpl(
           // decision is task-local: never rotate accounts or ask Resolve to retry.
           if (failureHasType(err, 'agent-policy')) {
             lastError = describeError(err);
+            error = lastError;
+            break;
+          }
+          // A Do session the provider rejects as larger than the model's context
+          // fails the same way on every retry and follow-up (legibench3#18). Run
+          // the stage once more on a fresh session, which rebuilds its context from
+          // the task's transcript and a fork's source, as after a login change. If
+          // that overflows too, only a person can narrow the work: no Resolve turn.
+          if (failureHasType(err, 'agent-context') && stageName === 'do'
+            && patched('software-dev-context-overflow-fresh-session-v1')) {
+            if (!freshContext && session) {
+              freshContext = true;
+              session = undefined;
+              sessionHome = undefined;
+              attempt--;
+              continue;
+            }
+            lastError = `${describeError(err)} — the conversation is larger than the model's context window even in a fresh session; send a narrower follow-up or start a new task`;
             error = lastError;
             break;
           }
@@ -1650,8 +1729,19 @@ async function softwareDevImpl(
               const wait = INFRA_BACKOFF_MS[infraRetries++]!;
               attempt--; // an infra park is not a resolve attempt
               error = `infrastructure: ${describeError(err)} — retrying ${stageName} in ${Math.round(wait / 1000)}s (${infraRetries}/${INFRA_BACKOFF_MS.length})`;
+              // Say plainly that nothing runs until the retry: a stage that read
+              // "working" through 23 minutes of identical failures looked like it
+              // would retry forever (legibench3#18). A waiting publication may
+              // schedule world maintenance, so older histories keep `active`.
+              const resumeStatus = status;
+              const visibleWait = patched('software-dev-infra-retry-wait-v1');
+              if (visibleWait) {
+                status = 'waiting';
+                waitingFor = { kind: 'retry', detail: `Retry ${infraRetries} of ${INFRA_BACKOFF_MS.length}`, until: Date.now() + wait };
+              }
               await publish();
               await condition(() => cancelled || retryRequested, wait);
+              if (visibleWait) { waitingFor = undefined; status = resumeStatus; }
               if (cancelled) throw new Cancelled();
               retryRequested = false;
               error = undefined;
@@ -2777,8 +2867,9 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   /** Tell our parent (if any) we need a decision (SPEC §5.3). Best effort — if the
    *  parent is gone the child stays human-resolvable via its own retry/confirm. */
-  async function notifyParent(type: ChildRaise['type'], detail?: string) {
-    if (!input.parentTaskId) return;
+  /** Raise to the parent; false when there is none (or it is gone). */
+  async function notifyParent(type: ChildRaise['type'], detail?: string): Promise<boolean> {
+    if (!input.parentTaskId) return false;
     try {
       await getExternalWorkflowHandle(input.parentTaskId).signal(raiseFromChildSignal, {
         childTaskId: taskId,
@@ -2786,8 +2877,10 @@ Inspect the complete current diff and specifically compare its delta from the re
         type,
         detail: detail ?? '',
       });
+      return true;
     } catch {
       /* parent gone → fall back to the human gate */
+      return false;
     }
   }
 
@@ -3027,11 +3120,43 @@ Inspect the complete current diff and specifically compare its delta from the re
     // The agent asked to be resumed later (`pause`): park here and resume it with
     // the outcome. A message, a child's event, or a cancellation ends it early.
     if (turn.wait && patched('agent-wait-v1')) {
+      // `needs_input`: ask the task's ordinary input route unless the agent
+      // named people — a sub-task's parent, else a configured response agent,
+      // which answers at once as it does for a question ending an ordinary
+      // turn; people get a Needs input hold.
+      const needsInput = turn.wait.needsInput;
+      const question = needsInput?.message ?? (turn.output?.trim() || 'The agent paused for your input.');
+      const routed = !!needsInput && !needsInput.audience?.length;
+      const askedParent = routed && await notifyParent('needs_info', question);
+      const route = routed && !askedParent && routedInputResponder ? liveResponder : undefined;
+      if (needsInput && route?.kind === 'agent' && responderRounds < 3) {
+        responderRounds++;
+        status = 'waiting';
+        waitingFor = { kind: 'responder', detail: question };
+        await publish();
+        const answer = await responderTurn(route, question);
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        if (answer) {
+          msgs.push({ id: `responder-${msgs.length}`, role: 'user', text: `Responder: ${answer}`, ts: msgs.length });
+          continue;
+        }
+      }
       const note = await waitForAgent(turn.wait, {
         world,
         ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
+        ...(askedParent ? { ask: { kind: 'parent' as const, detail: question } }
+          : needsInput ? { ask: {
+            kind: 'human' as const,
+            audience: needsInput.audience?.length ? needsInput.audience
+              : route?.kind === 'human' && route.audience?.length ? route.audience : ['@creator'],
+            detail: question,
+            ...(needsInput.urgency ? { urgency: needsInput.urgency } : {}),
+          } } : {}),
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
-        interrupted: () => cancelled || msgs.length > seen || raises.length > 0 || settled.length > 0,
+        // A Needs input hold offers Open PR, like any input hold in Do (and a parent may send it).
+        interrupted: () => cancelled || msgs.length > seen || raises.length > 0 || settled.length > 0
+          || (!!needsInput && prRequested),
       });
       if (cancelled) return await abort();
       if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
@@ -3309,8 +3434,11 @@ Inspect the complete current diff and specifically compare its delta from the re
             || 'The agent finished its turn. Send a follow-up, or open the PR if the work is truly complete.';
           if (input.parentTaskId) {
             waitingFor = { kind: 'parent', detail: 'Waiting for the managing agent to open the PR' };
-            await notifyParent(turn.raise?.type ?? 'needs_confirmation',
-              turn.raise?.detail ?? 'The Do turn ended. Open the PR only if the requested work is truly complete; otherwise send a comment.');
+            // The parent answers from this text alone, so it carries the child's
+            // own last words (its question, or what it says it finished).
+            await notifyParent(turn.raise?.type ?? 'needs_confirmation', turn.raise?.detail
+              ?? `Its Do turn ended without opening a PR. Confirm to open the PR if the work is truly complete; otherwise comment.${turn.output?.trim()
+                ? `\n\nIts last message:\n${clip(turn.output.trim(), PARENT_RAISE_OUTPUT_CHARS)}` : ''}`);
             await publish();
             await condition(() => prRequested || cancelled || msgs.length > seen);
           } else {
@@ -3555,7 +3683,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   // Recovery may carry an already-approved proposal across a replacement run
   // and bypass the review gate. Finish any interrupted resource publication too.
   if (restoredReviewApproved && resourceCandidateReview && !resourcesApplied
-    && patched('automatic-resource-review-restored-v1')) await applyReviewedResources();
+    && patched('automatic-resource-review-restored-v1') && !(await applyReviewedResources())) return await abort();
 
   if (repositoryless) {
     stage = 'done';
@@ -3570,6 +3698,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
     await core.destroyWorld(world as any);
     if (remoteWorld) {
+      releasedWorld = world;
       world = undefined;
       await publish();
     }
@@ -4392,7 +4521,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     // Attempts exhausted (or a non-conflict failure) → escalate. A child raises
     // `blocked` to its parent (which can retry/answer/cancel); a top-level task
     // escalates to a human. Either can retry.
-    reviewInfo = { ...reviewInfo, summary: error };
+    // The Error section carries the refusal; the work summary keeps describing the work.
     stage = 'escalated';
     status = 'blocked';
     retryRequested = false;
@@ -4433,11 +4562,14 @@ Inspect the complete current diff and specifically compare its delta from the re
   }
   stage = 'done';
   status = 'done';
-  reviewInfo = { ...reviewInfo, summary: `Merged into ${target} at ${world!.repo ?? '(scratch repo)'} as ${sha?.slice(0, 8)}.` };
+  // The landing adds to the work summary; it never replaces it.
+  const landed = landedNote(world, target, sha);
+  if (landed) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${landed}` : landed };
   await publish();
   const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
   await core.destroyWorld(world as any);
   if (remoteWorld) {
+    releasedWorld = world;
     world = undefined;
     await publish();
   }
@@ -4477,6 +4609,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         const remoteWorld = releaseWorldOnCompletion(world);
         await core.destroyWorld(world as any);
         if (remoteWorld) {
+          releasedWorld = world;
           world = undefined;
           await publish();
         }

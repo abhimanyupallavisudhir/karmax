@@ -133,8 +133,10 @@ describe('prompt assembly derives from the declared role (not a hardcoded map)',
 
   it('tells every Do agent its own shell dies with the turn, and how to wait on long work (videos #1)', () => {
     const out = assemblePrompt({ profile: profile({ role: 'do' }), role: 'do', task, world, globalInstructions: GLOBAL_INSTRUCTIONS });
-    expect(out).toContain('- start_job(command, cwd?):');
-    expect(out).toContain('- pause(minutes, jobs?):');
+    expect(out).toContain('- start_job(command, cwd?, name?):');
+    expect(out).toContain('- pause(minutes, jobs?, needs_input?):');
+    expect(out).toContain('the task shows Needs input and notifies them');
+    expect(out).toContain('pause is for waiting, not for asking');
     expect(out).toContain('- stop_job(jobs):');
     expect(out).toContain('Anything you run from your own shell stops when your turn ends.');
     // The default organization prompt carries the working practice.
@@ -286,6 +288,13 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(GLOBAL_INSTRUCTIONS).toContain('at most 280 characters');
     expect(GLOBAL_INSTRUCTIONS).toContain('Source code is not a human-readable output');
     expect(GLOBAL_INSTRUCTIONS).toMatch(/summaries of changes\/answers in your final response/i);
+  });
+
+  it('steers agents to MCP connections and the wiki in global instructions', () => {
+    expect(GLOBAL_INSTRUCTIONS).toContain('(but prefer using MCPs to credentials, if available)');
+    expect(GLOBAL_INSTRUCTIONS).toContain('(and ask for their credential or ask to connect via MCP)');
+    expect(GLOBAL_INSTRUCTIONS).toContain('You are much more capable than you think you are.');
+    expect(GLOBAL_INSTRUCTIONS).toContain('Always use the wiki rather than any local memory files.');
   });
 });
 

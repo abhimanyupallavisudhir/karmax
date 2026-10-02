@@ -50,6 +50,20 @@ const root = __dirname;
       await openTask('fixture', 'parameters');
     }, { record });
 
+    // The ⓘ sits on the heading line, and clicking the heading text does not open it.
+    for (const [selector, heading] of [['.confirmer-field .cf-human', 'Who confirms'], ['.responder-field .rf-human', 'Who responds']]) {
+      const row = page.locator(selector).first();
+      await row.waitFor({ state: 'visible' });
+      const head = row.locator('.form-row-head');
+      assert.equal((await head.textContent()).replace('ⓘ', '').trim(), heading);
+      const dot = await head.locator('.info-dot').boundingBox(), text = await head.boundingBox();
+      assert.ok(dot.y >= text.y && dot.y + dot.height <= text.y + text.height + 1, `${heading}: ⓘ is on the heading line`);
+      assert.equal(await row.locator('.cf-audience').getAttribute('aria-label'), heading);
+      assert.deepEqual(await head.evaluate(el => { const c = getComputedStyle(el); return [c.fontSize, c.fontWeight]; }), ['12px', '600'], `${heading}: styled like other form headings`);
+      await head.click({ position: { x: 2, y: text.height / 2 } });
+      assert.equal(await page.locator('.toast').count(), 0, `${heading}: clicking the heading does not open the tip`);
+    }
+
     const suggestions = (input) => input.evaluate(el => [...el.closest('.combo').querySelectorAll('.combo-menu:not([hidden]) .combo-opt')].map(o => o.dataset.v));
     for (const selector of ['.confirmer-field .cf-audience', '.responder-field .rf-audience']) {
       const input = page.locator(selector);

@@ -556,7 +556,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   }, async (a) => wrap(async () => (await ops.platformRequest('GET',
     `/api/projects/${encodeURIComponent(a.projectId)}/resources/${encodeURIComponent(a.resourceId)}/revisions/${encodeURIComponent(a.revisionId)}/verify?offset=${a.offset ?? 0}&limit=${a.limit ?? 100}`))));
   server.registerTool('propose_project_resource', {
-    description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. Confirmation adopts it as a project default unless a reviewer excludes it using PUT /api/tasks/:taskId/resources/:resourceId/selection {excluded:true} through platform_request. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored. Agents with project:settings:write may instead administer resources directly through platform_request, including storageLocationId and other authorized projects.',
+    description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. A path is checked now and snapshotted when the task reaches Review, however large (refreshed if it changes before Confirm); keep it in place (Review shows whether it was saved). Confirmation adopts it as a project default unless a reviewer excludes it using PUT /api/tasks/:taskId/resources/:resourceId/selection {excluded:true} through platform_request. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored. Agents with project:settings:write may instead administer resources directly through platform_request, including storageLocationId and other authorized projects.',
     inputSchema: {
       path: z.string().optional(), vaultItemId: z.string().optional(), field: z.string().optional(), name: z.string(),
       driver: z.enum(['volume@1', 'object-tree@1', 'secret@1', 'service@1', 'database@1']).optional(),
@@ -609,7 +609,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'request_credential',
     {
       description:
-        `Ask for access to a credential in the user's vault (site login, API key, SSH key, .env bag) that list_credentials does not show, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human and this turn may stop — ${BRAND} automatically resumes the task with the decision; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human's own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then ${BRAND} resumes the task.`,
+        `Ask for access to a credential in the user's vault (site login, API key, SSH key, .env bag) that list_credentials does not show, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human and this turn may stop — ${BRAND} automatically resumes the task with the decision; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human's own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then ${BRAND} resumes the task. Prefer an app connection (request_connection) when the service offers one, and ask for reveal only when use cannot work: a revealed secret is sent to your model provider.`,
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), kind: z.enum(['access', 'reset']).optional(), why: z.string(), urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/requests', a))),
@@ -689,6 +689,24 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/passkey/login', a))),
+  );
+  server.registerTool(
+    'save_session',
+    {
+      description:
+        `Save the signed-in session of the site open in your browser (its cookies and storage) as a vault item, so later tasks start signed in with use_session. Works however the site was signed into, including "Sign in with Google/GitHub": sign in first (with fill_credential, a passkey, or ask a human to sign in through this task's desktop), then call this on the signed-in page. Values never enter your context. The vault copy is then refreshed from your browser after each turn. Pass itemId to replace a session with a new sign-in.`,
+      inputSchema: { domain: z.string().optional(), itemId: z.string().optional(), label: z.string().optional(), username: z.string().optional(), exclusive: z.boolean().optional() },
+    },
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/session/save', a))),
+  );
+  server.registerTool(
+    'use_session',
+    {
+      description:
+        `Sign your browser into a site with a saved session (see save_session). Navigate to the site first; ${BRAND} restores its cookies and storage and reloads the page signed in, without the values entering your context. Returns granted; needs_approval (a request was raised; you are resumed when it is decided); busy (the session works in one task at a time and another task has it: pause, then retry); expired or not_in_vault. When it no longer works, the result names the site's saved password or passkey to sign in with; then call save_session with the itemId.`,
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), why: z.string().optional() },
+    },
+    async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/session/use', a))),
   );
   server.registerTool(
     'describe_platform',

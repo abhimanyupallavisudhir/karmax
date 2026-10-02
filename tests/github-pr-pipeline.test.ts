@@ -26,6 +26,9 @@ const comments: { number: number; body: string }[] = [];
 let afterPrOpened: (() => Promise<void>) | undefined;
 let githubReadiness: Record<string, unknown> = {};
 let readinessReads = 0;
+// GitHub answers UNKNOWN mergeability while it recomputes after a target moves.
+let githubRecomputingReads = 0;
+let beforeEnqueue: (() => Promise<void>) | undefined;
 const githubReadinessBySlug = new Map<string, Record<string, unknown>>();
 let mergeHttpStatus: number | undefined;
 let useMergeQueue = false;
@@ -70,6 +73,14 @@ async function refreshPrHead(pr: any): Promise<void> {
   if (!remote) return;
   const head = await git(remote, ['rev-parse', '--verify', `refs/heads/${pr.head.ref}^{commit}`]);
   if (head.code === 0) pr.head.sha = head.stdout.trim();
+}
+
+/** GitHub's live target tip; a PR's own `baseRefOid` stays where it was opened. */
+async function targetTip(pr: any): Promise<string | undefined> {
+  const remote = await remoteForBranch(pr.head.ref, pr.repo);
+  if (!remote) return undefined;
+  const tip = await git(remote, ['rev-parse', '--verify', `refs/heads/${pr.base.ref}^{commit}`]);
+  return tip.code === 0 ? tip.stdout.trim() : undefined;
 }
 
 async function landProviderTarget(pr: any, target: string): Promise<string> {
@@ -135,9 +146,10 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   if (list && method === 'POST') {
     const pr = { repo: list[1], number: prs.length + 1, html_url: `https://github.com/${list[1]}/pull/${prs.length + 1}`,
       node_id: `PR_${prs.length + 1}`, state: 'open', merged_at: null, title: body.title, body: body.body,
-      head: { ref: body.head, sha: '' }, base: { ref: body.base } };
+      head: { ref: body.head, sha: '' }, base: { ref: body.base, sha: undefined as string | undefined } };
     prs.push(pr);
     await refreshPrHead(pr);
+    pr.base.sha = await targetTip(pr);
     const hook = afterPrOpened;
     afterPrOpened = undefined;
     await hook?.();
@@ -149,10 +161,16 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     const pr = prs.find((candidate) => candidate.repo === querySlug
       && candidate.number === Number(body.variables?.number)) ?? prs[0];
     if (pr) await refreshPrHead(pr);
+    const liveTarget = pr ? await targetTip(pr) : undefined;
+    const recomputing = githubRecomputingReads > 0;
+    if (recomputing) githubRecomputingReads--;
     return json(200, { data: { repository: { pullRequest: {
       id: pr?.node_id ?? 'PR_1', url: pr?.html_url ?? `https://github.com/${SLUG}/pull/1`,
       state: pr?.state === 'closed' ? 'CLOSED' : 'OPEN', isDraft: false, merged: Boolean(pr?.merged_at),
-      headRefOid: pr?.head?.sha ?? 'reviewed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      headRefOid: pr?.head?.sha ?? 'reviewed-head',
+      ...(pr?.base?.sha ? { baseRefOid: pr.base.sha } : {}),
+      ...(liveTarget ? { baseRef: { target: { oid: liveTarget } } } : {}),
+      mergeable: recomputing ? 'UNKNOWN' : 'MERGEABLE', mergeStateStatus: recomputing ? 'UNKNOWN' : 'CLEAN',
       statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } },
       viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
       ...(pr?.queueAccepted ? { mergeQueueEntry: { id: `MQ_${pr?.number ?? 'pipeline'}` } } : {}),
@@ -161,6 +179,9 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     } } } });
   }
   if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('enqueuePullRequest')) {
+    const hook = beforeEnqueue;
+    beforeEnqueue = undefined;
+    await hook?.();
     const pr = prs.find((candidate) => candidate.node_id === body.variables?.input?.pullRequestId);
     if (!useMergeQueue && !nativeQueueSlugs.has(pr?.repo))
       return json(200, { errors: [{ message: 'This branch has no merge queue' }] });
@@ -340,6 +361,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     afterPrOpened = undefined;
     githubReadiness = {};
     githubReadinessBySlug.clear();
+    githubRecomputingReads = 0;
+    beforeEnqueue = undefined;
     mergeHttpStatus = undefined;
     useMergeQueue = false;
     mergeQueueAccepted = false;
@@ -855,6 +878,47 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     // No person was asked anything after the initial Review.
     expect((await h.store.eventsSince(task.id, 0)).filter((event) => event.type === 'view.updated'
       && event.payload?.waitingFor === 'human' && event.payload?.stage !== 'review')).toHaveLength(0);
+  }, 120_000);
+
+  // Task 450 (2026-10-01): another task's PR landed 3 s before this one's
+  // fallback merge, so GitHub answered UNKNOWN while it recomputed. The
+  // landing watcher compared preflights, and GitHub's PR `baseRefOid` never
+  // moved, so the settled answer matched the pre-move preflight exactly: the
+  // task held the front slot for hours and every task behind it waited.
+  it('lands when the target moves between the landing preflight and the merge', async () => {
+    const repo = await repoWithOrigin('github-target-moved');
+    const project = (await h.store.createProject('Target moved before landing', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'target-moved', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'target-moved-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Land after a neighbour', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write neighbour.md :: reviewed proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 10,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    // The preflight has passed when the provider is asked to take the PR.
+    beforeEnqueue = async () => {
+      const origin = remoteBySlug.get(SLUG)!;
+      const landed = (await gitOrThrow(origin, ['-c', 'user.name=Neighbour', '-c', 'user.email=neighbour@example.test',
+        'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'Another task landed'])).trim();
+      await gitOrThrow(origin, ['update-ref', 'refs/heads/main', landed]);
+      githubRecomputingReads = 1;
+    };
+    await handle.signal('confirm');
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('done');
+    expect(prs[0]).toMatchObject({ state: 'closed', merged_at: expect.any(String) });
+    expect((await h.store.eventsSince(task.id, 0)).some((event) => event.type === 'view.updated'
+      && /still computing landing readiness/.test(String(event.payload?.waitingDetail ?? '')))).toBe(true);
   }, 120_000);
 
   it('asks a person, briefly, only when CI fails again after that rerun', async () => {

@@ -27,6 +27,10 @@ export interface PanagentImportOptions {
   mode: 'context' | 'transcript';
   /** API rails and providers without a panagent native writer receive a guarded message. */
   native: boolean;
+  /** The native session id to write. Stable for one task, role and source, so a
+   * retried import replaces its own unused copy instead of adding another
+   * (legibench3#18 left fifteen 19 MB copies in a shared login's home). */
+  sessionId?: string;
 }
 
 export type PanagentImportResult =
@@ -126,6 +130,16 @@ export function looksLikeConversationUrl(value: string): boolean {
 }
 
 /** Acquire/normalize with panagent, then either install a native session or emit safe context. */
+/** A UUID-shaped id that is the same for every import of one source into one
+ * task's role, and different for any other. */
+export function stableImportSessionId(...parts: string[]): string {
+  const hash = crypto.createHash('sha256').update(parts.join('\0')).digest();
+  hash[6] = (hash[6]! & 0x0f) | 0x40;
+  hash[8] = (hash[8]! & 0x3f) | 0x80;
+  const hex = hash.subarray(0, 16).toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export async function importWithPanagent(opts: PanagentImportOptions): Promise<PanagentImportResult> {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-panagent-'));
   try {
@@ -149,7 +163,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
       const raw = fs.readFileSync(source);
       const content = 'data' in opts.source && raw.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? raw.subarray(3) : raw;
       if (opts.native && opts.provider === 'claude') {
-        const native = rewriteClaudeHistory(content, crypto.randomUUID());
+        const native = rewriteClaudeHistory(content, opts.sessionId ?? crypto.randomUUID());
         if (native) {
           const destination = path.join(opts.forkHome, 'projects', claudeCwdSlug(opts.worldPath), `${native.sessionId}.jsonl`);
           fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
@@ -167,7 +181,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
           if (home && home !== source) return readLocalCodexHistory(home, session);
           if (session !== id) throw new CodexHistoryError(`uploaded history requires missing ancestor ${session}; download a complete conversation snapshot`);
           return { file: source, content };
-        }, { snapshot: true, identity: crypto.randomUUID() }))!;
+        }, { snapshot: true, identity: opts.sessionId ?? crypto.randomUUID() }))!;
         if (opts.native && opts.provider === 'codex') {
           installLocalCodexSnapshot(opts.forkHome, id, snapshot);
           return { kind: 'native', sessionId: snapshot.session };
@@ -177,7 +191,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
       }
     }
     if (opts.native && (opts.provider === 'claude' || opts.provider === 'codex')) {
-      const sessionId = crypto.randomUUID();
+      const sessionId = opts.sessionId ?? crypto.randomUUID();
       const output = path.join(temporary, `${sessionId}.jsonl`);
       const warnings = await runPanagent([
         'convert', source, ...format, '--to', opts.provider === 'claude' ? 'claude-code' : 'codex',

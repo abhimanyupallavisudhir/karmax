@@ -177,10 +177,9 @@ export class CodexAdapter implements AgentAdapter {
         ctx.onSession?.(session);
       },
     };
-    // A remote projection cannot refresh itself and current Codex treats an
-    // expired ID token as logged out even while its access token remains valid.
-    // Revalidate centrally before launching so routine one-hour expiry never
-    // consumes a model turn or quarantines a healthy shared login.
+    // A remote projection cannot refresh itself. Renew its access token centrally
+    // a day before expiry so a turn never starts on a token about to lapse; an
+    // early refresh that fails (a provider sign-in outage) keeps the valid token.
     let preflightStarted = false;
     try {
       const refreshed = await ensureCodexLoginFresh({
@@ -227,7 +226,8 @@ export class CodexAdapter implements AgentAdapter {
           ...(activityDetail(refreshError instanceof Error ? refreshError.message : refreshError)
             ? { detail: activityDetail(refreshError instanceof Error ? refreshError.message : refreshError) } : {}),
         });
-        throw error;
+        // The host's own refresh outranks the sandbox's report of a sign-out.
+        throw refreshError instanceof ProviderFailure ? refreshError : error;
       }
       if (ctx.signal?.aborted) throw error;
       ctx.emitActivity({

@@ -308,7 +308,7 @@ function npmDirectory(): string {
 
 /** A ChatGPT login whose ID token stays fresh for an hour: no host refresh. */
 export function freshCodexHome(home: string): void {
-  const idToken = `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.signature`;
+  const jwt = (seconds: number) => `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + seconds })).toString('base64url')}.signature`;
   fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt',
-    tokens: { id_token: idToken, access_token: 'access', refresh_token: 'host-authority' } }));
+    tokens: { id_token: jwt(3600), access_token: jwt(10 * 24 * 3600), refresh_token: 'host-authority' } }));
 }

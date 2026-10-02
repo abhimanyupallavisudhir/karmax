@@ -5,13 +5,13 @@ import { parseTransition } from '../resolve/transitions.js';
 import { MAX_REVIEW_TEXT_LENGTH, ReviewInfoRejected, validateReviewInfoCall } from './review-info.js';
 import { World } from '../world/types.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
-import { startJob, jobStatuses, describeJobs, listJobs, stopJobs } from '../world/jobs.js';
+import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
   compactSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
-import { URGENCY_LEVELS } from '../domain/types.js';
+import { URGENCY_LEVELS, type AgentWait, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
 
 /** The longest a single wait may last: a week, after which a parked world may hibernate. */
@@ -126,7 +126,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'respond_to_sub_task',
     description:
-      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve a PR already at Review), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends.',
+      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve what it has: lands a PR at Review, or opens the PR of a child whose turn ended without one), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends.',
     parameters: {
       type: 'object',
       properties: {
@@ -165,6 +165,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       properties: {
         command: { type: 'string', description: 'Shell command, run with bash.' },
         cwd: { type: 'string', description: 'Directory to run in; relative paths are from your working directory (the default).' },
+        name: { type: 'string', maxLength: MAX_JOB_NAME, description: 'A short name people see while you wait on it, e.g. "render" or "test suite".' },
       },
       required: ['command'],
     },
@@ -172,12 +173,23 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'pause',
     description:
-      'End your turn and be resumed later: when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. After calling it, end your turn.',
+      'End your turn to wait for durable jobs or a real-world event (CI, a deploy, a set time), and be resumed when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. ' +
+      'It is not for asking: if you need an answer to continue, call escalate_to_human or end your turn with the question. Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. After calling it, end your turn.',
     parameters: {
       type: 'object',
       properties: {
         minutes: { type: 'number', description: `Resume after this many minutes at the latest (1–${MAX_WAIT_MINUTES}). With jobs, set it comfortably above their expected run time.` },
         jobs: { type: 'array', items: { type: 'string' }, description: 'Job ids from start_job to wait for.' },
+        needs_input: { type: 'boolean', description: 'While you wait, someone may answer, and you carry on without it at the deadline: ask them and show Needs input instead of Waiting. For an answer you need, use escalate_to_human instead.' },
+        message: { type: 'string', minLength: 1, maxLength: 4_000, description: 'With needs_input: the question (default: your final response).' },
+        audience: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          maxItems: 32,
+          description: 'With needs_input: who to ask — user:<id>, @team:<slug>, @creator, @owners, @project, or @all (see escalate_to_human). Default: whoever answers this task\'s questions (for a sub-task, its parent).',
+        },
+        urgency: URGENCY_PARAMETER,
       },
       required: ['minutes'],
     },
@@ -310,7 +322,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_credential',
     description:
-      `Ask for access to a credential in the user's vault (a site login, API key, SSH key, or .env bag) that list_credentials does not show, identified by item_id or the site's domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — ${BRAND} automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human's own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then ${BRAND} resumes the task.`,
+      `Ask for access to a credential in the user's vault (a site login, API key, SSH key, or .env bag) that list_credentials does not show, identified by item_id or the site's domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — ${BRAND} automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human's own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then ${BRAND} resumes the task. Prefer an app connection (request_connection) when the service offers one, and ask for reveal only when use cannot work: a revealed secret is sent to your model provider.`,
     parameters: {
       type: 'object',
       properties: {
@@ -386,7 +398,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'propose_project_resource',
     description:
-      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. The resource becomes a project default on confirmation; reviewers can exclude it with PUT /api/tasks/:taskId/resources/:resourceId/selection {excluded:true} through platform_request. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service). For direct administration, agents with project:settings:write can instead use platform_request on project resources, including storageLocationId and other authorized projects.',
+      'Stage newly-created non-Git task output as a durable candidate for Review. A path must contain no secrets; it is checked now and snapshotted into encrypted object storage when the task reaches Review (refreshed if it changes before Confirm), so keep it in place (Review shows whether it was saved); a vault_item_id references a credential this task just stored without revealing it. The resource becomes a project default on confirmation; reviewers can exclude it with PUT /api/tasks/:taskId/resources/:resourceId/selection {excluded:true} through platform_request. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service). For direct administration, agents with project:settings:write can instead use platform_request on project resources, including storageLocationId and other authorized projects.',
     parameters: {
       type: 'object',
       properties: {
@@ -453,6 +465,34 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       properties: {
         item_id: { type: 'string' },
         domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
+      },
+    },
+  },
+  {
+    name: 'save_session',
+    description:
+      `Save the signed-in session of the site open in your browser (its cookies and storage) as a vault item, so later tasks start signed in with use_session. Works however the site was signed into, including "Sign in with Google/GitHub": sign in first (with fill_credential, a passkey, or ask a human to sign in through this task's desktop), then call this on the signed-in page. Values never enter your context. The vault copy is then refreshed from your browser after each turn. Pass item_id to replace a session with a new sign-in.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        domain: { type: 'string', description: 'The site, e.g. "notion.so". Cookies of other sites (such as the identity provider\'s) are never saved.' },
+        item_id: { type: 'string', description: 'Refresh this saved session instead of creating one.' },
+        label: { type: 'string' },
+        username: { type: 'string', description: 'The account signed in, for people choosing between sessions.' },
+        exclusive: { type: 'boolean', description: 'Only one task at a time may use it: for sites that sign other copies out when one is used.' },
+      },
+    },
+  },
+  {
+    name: 'use_session',
+    description:
+      `Sign your browser into a site with a saved session (see save_session). Navigate to the site first; ${BRAND} restores its cookies and storage and reloads the page signed in, without the values entering your context. Returns granted; needs_approval (a request was raised; you are resumed when it is decided); busy (the session works in one task at a time and another task has it: pause, then retry); expired or not_in_vault. When it no longer works, the result names the site's saved password or passkey to sign in with; then call save_session with the item_id.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string' },
+        domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
+        why: { type: 'string', description: 'Shown to the person asked to approve.' },
       },
     },
   },
@@ -929,6 +969,38 @@ export function platformToolHandlers(
     if (!ctx.platformRequest) throw new Error(`${BRAND} gateway is unavailable to this agent`);
     return ctx.platformRequest(method, requestPath, body);
   };
+  /** `pause`'s needs-input fields: who to ask, what, and how loudly. Routes are
+   * checked against the ones escalate_to_human offers, so a typo cannot park the
+   * task on an ask nobody receives. Avatars answer through escalate_to_human. */
+  const pauseInput = async (args: any): Promise<AgentWait['needsInput']> => {
+    const asked = args?.message !== undefined || args?.audience !== undefined || args?.urgency !== undefined;
+    if (args?.needs_input !== true) {
+      if (asked) throw new Error('message, audience and urgency apply only with needs_input: true');
+      return undefined;
+    }
+    const message = args?.message === undefined ? undefined : String(args.message).trim();
+    if (message !== undefined && !message) throw new Error('message must not be empty');
+    if (message && [...message].length > 4_000) throw new Error('message must be at most 4000 characters');
+    let audience: string[] | undefined;
+    if (args?.audience !== undefined) {
+      audience = [...new Set((Array.isArray(args.audience) ? args.audience : [args.audience])
+        .map((selector: unknown) => String(selector).trim()).filter(Boolean))] as string[];
+      if (!audience.length) throw new Error('audience must name at least one person or team');
+      if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
+      const avatars = audience.filter((selector) => selector.startsWith('avatar:'));
+      if (avatars.length) throw new Error(`${avatars.join(', ')}: ask an Avatar with escalate_to_human`);
+      if (ctx.platformRequest) {
+        const targets = await platformRequest('GET', '/api/agent/escalation-targets') as {
+          users?: Array<{ selector: string }>; teams?: Array<{ selector: string }>; special?: Array<{ selector: string }>;
+        };
+        const known = new Set([...targets.users ?? [], ...targets.teams ?? [], ...targets.special ?? []].map((t) => t.selector));
+        const unknown = audience.filter((selector) => !known.has(selector));
+        if (unknown.length) throw new Error(`no such route: ${unknown.join(', ')}. Valid routes: ${[...known].join(', ') || 'none'}`);
+      }
+    }
+    const urgency = URGENCY_LEVELS.includes(args?.urgency) ? args.urgency as Urgency : undefined;
+    return { ...(message ? { message } : {}), ...(audience ? { audience } : {}), ...(urgency ? { urgency } : {}) };
+  };
   const handlers: Record<string, (args: any) => Promise<string>> = {
     async bash(args) {
       const cmd = String(args?.command ?? '');
@@ -1003,10 +1075,11 @@ export function platformToolHandlers(
       if (!command) return 'error: command is required';
       try {
         const env = workEnv?.();
-        const job = await startJob(world, { command, ...(args?.cwd ? { cwd: String(args.cwd) } : {}), ...(env ? { env } : {}) });
+        const job = await startJob(world, { command, ...(args?.cwd ? { cwd: String(args.cwd) } : {}),
+          ...(args?.name ? { name: String(args.name) } : {}), ...(env ? { env } : {}) });
         await ctx.jobStarted(job.id);
         ctx.emit(`$ ${command} (job ${job.id})`);
-        return `Started job ${job.id}. Log: ${job.log}\nIt keeps running after this turn. Call pause with jobs ["${job.id}"] to be resumed when it finishes.`;
+        return `Started job ${job.id}${job.name ? ` (${job.name})` : ''}. Log: ${job.log}\nIt keeps running after this turn. Call pause with jobs ["${job.id}"] to be resumed when it finishes.`;
       } catch (e: any) {
         return `error: ${e?.message ?? e}`;
       }
@@ -1019,10 +1092,17 @@ export function platformToolHandlers(
         const missing = before.filter((job) => job.state === 'missing').map((job) => job.id);
         if (missing.length) return `error: no such job: ${missing.join(', ')}`;
         const running = before.filter((job) => job.state === 'running').map((job) => job.id);
-        await stopJobs(world, running);
+        // An exited job may still have left processes running (`server &`).
+        const stops = new Map((await stopJobs(world, ids)).map((stop) => [stop.id, stop]));
         const after = new Map((await jobStatuses(world, running)).map((job) => [job.id, job.state]));
-        return ids.map((id) => !running.includes(id) ? `${id} had already stopped.`
-          : after.get(id) === 'running' ? `${id} is still running.` : `Stopped ${id}.`).join('\n');
+        return before.map(({ id, state }) => {
+          const { processes = 0, survivors = [] } = stops.get(id) ?? {};
+          if (survivors.length) return `${id}: ${survivors.length === 1 ? 'process' : 'processes'} ${survivors.join(', ')} survived SIGKILL.`;
+          if (running.includes(id)) return after.get(id) === 'running' ? `${id} is still running.` : `Stopped ${id}.`;
+          return processes
+            ? `${id} had already ${state === 'exited' ? 'exited' : 'stopped'}; ended the ${processes} ${processes === 1 ? 'process' : 'processes'} it left running.`
+            : `${id} had already stopped.`;
+        }).join('\n');
       } catch (e: any) {
         return `error: ${e?.message ?? e}`;
       }
@@ -1033,11 +1113,14 @@ export function platformToolHandlers(
         return `error: minutes must be between 1 and ${MAX_WAIT_MINUTES}`;
       const requested = Array.isArray(args?.jobs) ? [...new Set(args.jobs.map((id: unknown) => String(id)))] as string[] : [];
       let jobs: string[] = [];
+      let jobNames: string[] = [];
       if (requested.length) {
         const statuses = await jobStatuses(world, requested, { tailLines: 20 });
         const missing = statuses.filter((job) => job.state === 'missing').map((job) => job.id);
         if (missing.length) return `error: no such job: ${missing.join(', ')}`;
-        jobs = statuses.filter((job) => job.state === 'running').map((job) => job.id);
+        const running = statuses.filter((job) => job.state === 'running');
+        jobs = running.map((job) => job.id);
+        jobNames = running.flatMap((job) => job.name ? [job.name] : []);
         // Nothing left to wait for: hand the results back now, no turn needed.
         if (!jobs.length) return `Every job has already finished — nothing to wait for.\n\n${describeJobs(statuses)}`;
       }
@@ -1045,10 +1128,20 @@ export function platformToolHandlers(
         .filter((job) => job.state === 'running' && !jobs.includes(job.id)).map((job) => job.id);
       if (unlisted.length)
         return `error: ${unlisted.join(', ')} ${unlisted.length > 1 ? 'are' : 'is'} still running. Pass ${unlisted.length > 1 ? 'them' : 'it'} in jobs: a pause without ${unlisted.length > 1 ? 'them' : 'it'} lets the world be suspended, which freezes ${unlisted.length > 1 ? 'them' : 'it'}. You are still resumed after minutes at the latest.`;
-      try { await ctx.requestWait({ minutes: Math.round(minutes), ...(jobs.length ? { jobs } : {}) }); }
+      let needsInput: AgentWait['needsInput'];
+      try { needsInput = await pauseInput(args); }
       catch (e: any) { return `error: ${e?.message ?? e}`; }
+      try {
+        await ctx.requestWait({ minutes: Math.round(minutes), ...(jobs.length ? { jobs } : {}),
+          ...(jobNames.length ? { jobNames } : {}), ...(needsInput ? { needsInput } : {}) });
+      }
+      catch (e: any) { return `error: ${e?.message ?? e}`; }
+      if (needsInput) {
+        const who = needsInput.audience?.join(', ') ?? 'whoever answers this task\'s questions';
+        return `Asking ${who}. End your turn now${needsInput.message ? '' : ' with the question as your final response'}; you will be resumed with their answer, ${jobs.length ? `when ${jobs.join(', ')} ${jobs.length > 1 ? 'finish' : 'finishes'}, ` : ''}or after ${Math.round(minutes)} min to carry on without it.`;
+      }
       return jobs.length
-        ? `Waiting for ${jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up.`
+        ? `Waiting for ${jobNames.length === jobs.length ? jobNames.join(', ') : jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up.`
         : `Pausing for ${Math.round(minutes)} min. End your turn now; you will be resumed then, or sooner if a message arrives.`;
     },
     async create_branch(args) {
@@ -1191,6 +1284,14 @@ export function platformToolHandlers(
     },
     async use_passkey(args) {
       return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/login', { itemId: args?.item_id, domain: args?.domain }));
+    },
+    async save_session(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/session/save', {
+        domain: args?.domain, itemId: args?.item_id, label: args?.label, username: args?.username, exclusive: args?.exclusive,
+      }));
+    },
+    async use_session(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/session/use', { itemId: args?.item_id, domain: args?.domain, why: args?.why }));
     },
     // ─── task list operations (mirroring the platform MCP server) ─────────
     async create_task(args) {

@@ -492,6 +492,30 @@ describe('task stage transitions', () => {
     });
   });
 
+  /** #456: a sub-task escalated to a person ran on as a top-level task. Its
+   * replacement run's Review and input holds went to @creator, and its parent,
+   * waiting on it, was never told it needed anything. */
+  it('keeps a sub-task\'s parent and profiles across a lifecycle replacement', async () => {
+    const f = (await fixture());
+    const child = (await f.store.createTask({
+      projectId: f.project.id,
+      title: 'Child',
+      workflow: 'software-dev',
+      workflowVersion: '1.4.0',
+      parentTaskId: f.task.id,
+      createdBy: { kind: 'task-agent', taskId: f.task.id, role: 'do' },
+      params: { prompt: 'child work', base: 'main', target: 'main', profiles: { do: 'organization:org_personal::do-default' } },
+    }));
+    (await f.store.saveView(child.id, { ...f.view, taskId: child.id, title: 'Child' }));
+    (await f.api.escalateToHuman(f.token, { taskId: child.id, audience: ['@creator'], message: 'Approve the sandbox key' }));
+    expect(f.starts).toHaveLength(1);
+    expect(f.starts[0]!.options.workflowId).toBe(child.id);
+    expect(f.starts[0]!.options.args[0]).toMatchObject({
+      parentTaskId: f.task.id,
+      profiles: { do: 'organization:org_personal::do-default' },
+    });
+  });
+
   /** #21: an Avatar is dispatched with the escalating agent's words in its
    *  task prompt; they arrive fenced as data, not as the Avatar's instructions. */
   it('quotes the escalating agent’s message as data in the Avatar’s task prompt', async () => {
@@ -775,6 +799,24 @@ describe('task stage transitions', () => {
       expect.objectContaining({ id: live.id, title: 'Working', lastView: expect.objectContaining({ stage: 'do', status: 'active' }) }),
     ]);
     expect((await f.api.getTaskView(f.token, done.id))?.subTaskSummaries).toBeUndefined();
+  });
+
+  // A finished task is archived out of the console's live list, so the overview
+  // lost a finished parent's name and every finished agent fork.
+  it('names the parent and every agent fork after they finish', async () => {
+    const f = (await fixture());
+    const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
+      workflowVersion: f.task.workflowVersion, params: { prompt: 'part' }, parentTaskId: f.task.id }));
+    const fork = (await f.store.createTask({ projectId: f.project.id, title: 'Fork', workflow: 'software-dev',
+      workflowVersion: f.task.workflowVersion, params: { prompt: 'branch', 'agent:do': { resumeFrom: { taskId: f.task.id, role: 'do' } } } }));
+    (await f.store.saveView(f.task.id, { ...f.view, stage: 'done', status: 'done' }));
+    (await f.store.saveView(fork.id, { ...f.view, taskId: fork.id, title: 'Fork', stage: 'done', status: 'done' }));
+    (await f.store.saveView(child.id, { ...f.view, taskId: child.id, title: 'Child', stage: 'do', status: 'active', parentTaskId: f.task.id }));
+    const source = await f.api.getTaskView(f.token, f.task.id);
+    expect(source?.forkSummaries).toEqual([expect.objectContaining({ id: fork.id, title: 'Fork', forkOf: [f.task.id],
+      lastView: expect.objectContaining({ status: 'done' }) })]);
+    expect(source?.parentTask).toBeUndefined();
+    expect((await f.api.getTaskView(f.token, child.id))?.parentTask).toEqual({ id: f.task.id, num: f.task.num, title: f.task.title });
   });
 
   it('restores cancellation to its remembered stage and supports a cross-cutting human hold', async () => {

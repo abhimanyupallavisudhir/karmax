@@ -13,7 +13,7 @@ import { platformToolHandlers } from './tools.js';
  * Directives (one per line, anywhere in the task prompt or follow-up messages):
  *   @write <path> :: <content>      write a file (\n decoded to newlines)
  *   @run <command...>               run a shell command in the world
- *   @subtask <title> :: <prompt>    spawn a child task
+ *   @subtask <title> :: <prompt>    spawn a child task (\n in <prompt> decoded to newlines)
  *   @subtaskwith <json> :: <title> :: <prompt>
  *                                   spawn a child task with create_sub_task `params`
  *   @branch <name> [:: <base>]      add another branch/PR to this task (multi-PR)
@@ -21,8 +21,10 @@ import { platformToolHandlers } from './tools.js';
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
  *   @wait                           parent parks until its sub-tasks finish/raise
  *   @job <command>                  start a durable job (the start_job tool)
+ *   @namedjob <name> :: <command>   the same, with a name
  *   @pause <minutes> [:: last]      the pause tool: a timed pause, or (`last`) also wait
- *                                   for the job this turn started last
+ *                                   for the job this turn started last; `:: input [<urgency>]
+ *                                   [-- <question>]` sets needs_input (combinable with `last`)
  *   @subagents <n>                  report in-harness sub-agents (Task tool) still running:
  *                                   N this turn, then N-1, … draining by one each turn until
  *                                   0 — models sub-agents that settle over several turns
@@ -34,6 +36,11 @@ import { platformToolHandlers } from './tools.js';
  *   @fail <message>                 throw (exercises Resolve)
  *   @failonce <message>             throw only the FIRST time per world (exercises the
  *                                   transient-infra retry path — no Resolve)
+ *   @failworld <message>            throw on this and every later turn in this world, the
+ *                                   retries' resume prompts included (a fault that persists)
+ *   @overflow [always]              fail as a context overflow while resuming a session
+ *                                   (`always`: in a fresh one too); in a fresh session
+ *                                   report `fresh session` and go on
  *   @decide <action> :: <reason>    resolve agent verdict (resume/retryStage/gotoStage/parkUntil/escalate)
  *   @confirm <action> [:: text]     confirm agent verdict (confirm/revise/reject)
  *   @openpr                         explicitly request the PR/Review cycle
@@ -44,6 +51,8 @@ import { platformToolHandlers } from './tools.js';
 // @failonce ledger: activity retries land in the same world, so keying by world+message
 // makes the second attempt succeed. Module-level: survives across turn invocations.
 const failedOnce = new Set<string>();
+// @failworld ledger: worlds whose every turn fails with the recorded message.
+const failingWorlds = new Map<string, string>();
 // `@subagents N` ledger: the sub-agent count drains by one each turn (keyed by world),
 // so a turn that "finished" is HELD in Do until the count reaches 0 — modelling
 // auto-backgrounded Claude Agent SDK sub-agents that settle over several turns.
@@ -138,7 +147,7 @@ export class MockAdapter implements AgentAdapter {
           const [json, spec] = directive === 'subtaskwith' ? splitOn(rest, '::') : ['', rest];
           const [title, prompt = ''] = splitOn(spec, '::');
           try {
-            await ctx.createSubTask({ title: title.trim(), prompt: prompt.trim(), ...(json ? { params: JSON.parse(json) } : {}) });
+            await ctx.createSubTask({ title: title.trim(), prompt: prompt.trim().replace(/\\n/g, '\n'), ...(json ? { params: JSON.parse(json) } : {}) });
             outputs.push(`subtask: ${title.trim()}`);
           } catch (e: any) {
             // A refused create_sub_task is a tool error the agent reads, not a failed turn.
@@ -190,16 +199,25 @@ export class MockAdapter implements AgentAdapter {
           outputs.push('wait');
           break;
         }
-        case 'job': {
-          const result = await platformToolHandlers(input.world, ctx).start_job!({ command: rest });
+        case 'job':
+        case 'namedjob': {
+          // A command may itself contain `::`, so only the name is split off.
+          const [name, command] = directive === 'namedjob' ? splitOn(rest, '::') : ['', rest];
+          const result = await platformToolHandlers(input.world, ctx).start_job!({ command: command.trim(), ...(name.trim() ? { name: name.trim() } : {}) });
           lastJob = result.match(/job-[a-f0-9]{8}/)?.[0];
           outputs.push(result.split('\n')[0]!);
           break;
         }
         case 'pause': {
-          const [minutes, which = ''] = splitOn(rest, '::');
-          const jobs = which.trim() === 'last' && lastJob ? [lastJob] : undefined;
-          outputs.push(await platformToolHandlers(input.world, ctx).pause!({ minutes: Number(minutes.trim()), ...(jobs ? { jobs } : {}) }));
+          // @pause <minutes> [:: last] [input [<urgency>] [-- <question>]]
+          const [minutes, options = ''] = splitOn(rest, '::');
+          const [flags = '', question] = options.split(' -- ');
+          const words = flags.trim().split(/\s+/);
+          const jobs = words.includes('last') && lastJob ? [lastJob] : undefined;
+          const urgency = words.find((word) => ['low', 'normal', 'high', 'critical'].includes(word));
+          const asks = words.includes('input')
+            ? { needs_input: true, ...(urgency ? { urgency } : {}), ...(question?.trim() ? { message: question.trim() } : {}) } : {};
+          outputs.push(await platformToolHandlers(input.world, ctx).pause!({ minutes: Number(minutes.trim()), ...(jobs ? { jobs } : {}), ...asks }));
           complete = false;
           break;
         }
@@ -261,6 +279,13 @@ export class MockAdapter implements AgentAdapter {
         // may park a login (AD-2/AD-7); anything else stays a plain Error.
         case 'fail':
           throw providerErrorFromMessage('mock', rest || 'mock failure');
+        case 'overflow':
+          if (input.session || rest === 'always') throw providerErrorFromMessage('mock', 'prompt is too long: 1200000 tokens > 1000000 maximum');
+          outputs.push('fresh session');
+          break;
+        case 'failworld':
+          failingWorlds.set(input.world.handle.id, rest || 'mock persistent failure');
+          throw providerErrorFromMessage('mock', failingWorlds.get(input.world.handle.id)!);
         case 'failonce': {
           const key = `${input.world.handle.id}:${rest}`;
           if (!failedOnce.has(key)) {
@@ -332,6 +357,8 @@ export class MockAdapter implements AgentAdapter {
     // (claude.ts / codex.ts both strip conversation system messages) — otherwise the
     // mock "sees" things a real agent never would, masking bugs like a child raise
     // injected as a system message that never reaches the parent agent.
+    const persistent = failingWorlds.get(input.world.handle.id);
+    if (persistent) throw providerErrorFromMessage('mock', persistent);
     const recent = input.messages.filter((m) => m.role === 'user');
     const initialText = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
     await processText(initialText);

@@ -9,8 +9,15 @@ const css = fs.readFileSync(path.join(__dirname, 'styles.css'), 'utf8');
 function extractFn(name, async = false) {
   const start = src.indexOf(`${async ? 'async ' : ''}function ${name}(`);
   if (start < 0) throw new Error(`${name} not found`);
+  // Skip the parameter list: it may destructure options (`{ single = false }`).
+  let parens = 0;
+  let body = -1;
+  for (let i = src.indexOf('(', start); i < src.length; i++) {
+    if (src[i] === '(') parens++;
+    else if (src[i] === ')') parens--;
+    else if (src[i] === '{' && parens === 0) { body = i; break; }
+  }
   let depth = 0;
-  const body = src.indexOf('{', start);
   for (let i = body; i < src.length; i++) {
     if (src[i] === '{') depth++;
     else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1);
@@ -52,6 +59,9 @@ ok(!passwords.includes('class="vault-items-list"'), 'settings no longer renders 
 ok(vaultCards.includes('class="modal-card vault-manager-modal"'), 'settings button opens a full vault manager');
 ok(vaultCards.includes('class="vault-search"'), 'settings manager offers credential search');
 ok(vaultCards.includes('data-vi-rotate'), 'settings manager retains secret rotation');
+ok(/i\.type === 'session' \? `<label title="\$\{esc\(SESSION_EXCLUSIVE_TIP\)\}">one task at a time <input type="checkbox" class="vi-exclusive"/.test(vaultCards), 'a saved session can be limited to one task at a time');
+ok(vaultCards.includes("JSON.stringify({ id: item.id, type: item.type, label: item.label, exclusive: box.checked })"), 'the one-at-a-time toggle saves through the item API');
+ok(/i\.type === 'session' \? '' : `<button class="btn sm" data-vi-rotate=/.test(vaultCards), 'a saved session is refreshed by signing in again, not by typing a secret');
 ok(vaultCards.includes('data-vi-reveal'), 'settings manager lets a vault administrator inspect a credential');
 ok(vaultCards.includes('/reveal'), 'settings manager uses the audited administrative reveal endpoint');
 ok(vaultCards.includes('Every reveal is recorded in the audit log'), 'settings manager explains that plaintext inspection is audited');

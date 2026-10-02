@@ -241,6 +241,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/vault/connectors (hosted 1Password + Git-backed pass; host-local Bitwarden/1Password/pass where available)',
     'POST /api/vault/connectors/:name/connect|config|list|sync|write-back|retry-writes|discard-writes (selective mirror + opt-in write-back; connect returns {connector, newStore}; sync body {externalIds, policy?, writeBack?}; list items carry folder for grouping)',
     'POST /api/vault/passkey/enroll|save|login|release (agent-enrolled passkeys via CDP virtual authenticator)',
+    'POST /api/vault/session/save|use (signed-in browser sessions: save the site open in the task browser; restore it into another task\'s browser)',
   ],
   agentMail: [
     'GET /api/organizations/:organizationId/agent-mail?since=&match=&limit= (per-organization agent inbox: address + messages, verification code/link extracted)',

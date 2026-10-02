@@ -1717,6 +1717,11 @@ export class KarmaxApi {
       projectId: task.projectId,
       title: task.title,
       project: (await this.deps.store.effectiveProjectConfig(project)),
+      // A sub-task's run is its parent's confirmer route and raise target. Every
+      // replacement (escalation, hold, stage move, recovery) starts here, and
+      // without this the new run took itself for a top-level task: its Review and
+      // input holds went to @creator and its parent was never told (task #456).
+      ...(task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}),
     });
     input.createdAt = task.createdAt;
     input.workflow = task.workflow;
@@ -2398,9 +2403,17 @@ export class KarmaxApi {
       const task = await this.deps.store.taskMetadataAsync(taskId);
       const group = await this.deps.store.attemptCommitAsync(taskId);
       const subTaskSummaries = await this.deps.store.childTaskSummaries(taskId);
+      const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
+      const parentTaskId = view.parentTaskId ?? task?.parentTaskId;
+      let parent = parentTaskId ? await this.deps.store.taskMetadataAsync(parentTaskId) : undefined;
+      // A parent elsewhere is named only to a caller who may read it.
+      if (parent && parent.projectId !== task?.projectId)
+        parent = await this.require(token, 'get_task', { projectId: parent.projectId, taskId: parent.id }).then(() => parent, () => undefined);
       return {
         ...view,
         ...(subTaskSummaries.length ? { subTaskSummaries } : {}),
+        ...(forkSummaries.length ? { forkSummaries } : {}),
+        ...(parent ? { parentTask: { id: parent.id, ...(parent.num != null ? { num: parent.num } : {}), title: parent.title } } : {}),
         notes: task?.notes,
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),

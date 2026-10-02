@@ -24,6 +24,7 @@ import {
   AgentProfile,
   TaskView,
   ChildTaskSummary,
+  ForkTaskSummary,
   ReviewInfo,
   KarmaxEvent,
   Tag,
@@ -83,9 +84,18 @@ import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
+import { taskForkSourceIds } from '../domain/forks.js';
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
+function foreignRows(rows: any[]): { seqs: number[]; events: Array<KarmaxEvent & { seq: number }> } {
+  return {
+    seqs: rows.map(row => Number(row.seq)),
+    events: rows.filter(row => row.origin !== PROCESS_EVENT_ORIGIN).map(row => ({
+      seq: Number(row.seq), taskId: row.taskId, type: row.type, ts: Number(row.ts), payload: JSON.parse(row.payload),
+    })),
+  };
+}
 
 export type CollaborationRequestStatus = 'pending' | 'completed' | 'failed';
 
@@ -113,6 +123,26 @@ export interface ViewPublicationOrder {
   runId: string;
   seq: number;
   revision?: number;
+}
+
+type TaskSummaryRow = { id: string; num: number | null; title: string; workflow: string; lastView: string | null };
+
+/** A related task's list fields, without its conversation. */
+function taskSummary(row: TaskSummaryRow): ChildTaskSummary {
+  const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
+  return {
+    id: row.id,
+    ...(row.num != null ? { num: row.num } : {}),
+    title: row.title,
+    workflow: row.workflow,
+    ...(view ? { lastView: {
+      stage: view.stage,
+      status: view.status,
+      ...(view.waitingFor ? { waitingFor: view.waitingFor } : {}),
+      ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
+      ...(view.state?.draft ? { state: { draft: true } } : {}),
+    } } : {}),
+  };
 }
 
 /** Conversation references are `${runId}:${revision}` (conversationPublisher):
@@ -180,6 +210,13 @@ export const isReviewRequestEvent = (type: string): boolean =>
  * this store is the searchable index of projects/lists/tasks/profiles plus an
  * append-only event log that powers the live UI stream.
  */
+/** The deletion-queue entry `WorldCheckpointService.collectGarbage` consumes. A
+ * chunked (format 2) checkpoint carries what releasing its chunks needs. */
+function checkpointGcEntry(worldId: string, checkpoint: WorldCheckpoint): string {
+  return JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta!.objectKey,
+    ...(checkpoint.filesystemDelta!.format === 2 ? { projectId: checkpoint.projectId, filesystemDelta: checkpoint.filesystemDelta } : {}) });
+}
+
 export class Store {
   /** Compound service mutations must include their reads in this boundary. */
   transaction<T>(operation: () => Promise<T>): Promise<T> {
@@ -574,7 +611,7 @@ export class Store {
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, worldGeneration INTEGER NOT NULL,
         attachmentId TEXT NOT NULL UNIQUE, sourceKind TEXT NOT NULL, sourcePath TEXT,
         vaultItemId TEXT, vaultField TEXT, state TEXT NOT NULL, createdAt INTEGER NOT NULL,
-        resolvedAt INTEGER, resolvedBy TEXT
+        resolvedAt INTEGER, resolvedBy TEXT, error TEXT
       );
       CREATE TABLE IF NOT EXISTS runner_pools (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL,
@@ -915,6 +952,8 @@ export class Store {
     // installs pick it up without a re-create.
     const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
+    const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
+    if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
     const scopedTokenCols = await this.db.prepare('PRAGMA table_info(scoped_tokens)').all() as Array<{ name: string }>;
     if (!scopedTokenCols.some((column) => column.name === 'principal'))
@@ -2185,7 +2224,8 @@ export class Store {
     }
     const objectKeys = new Set<string>();
     for (const row of (await this.db.prepare('SELECT manifest FROM world_checkpoints WHERE projectId=?').all(projectId)) as any[]) {
-      try { const checkpoint = JSON.parse(row.manifest) as WorldCheckpoint; if (checkpoint.filesystemDelta?.objectKey) objectKeys.add(checkpoint.filesystemDelta.objectKey); } catch {}
+      // Chunked checkpoints are released through WorldCheckpointService.deleteProject.
+      try { const checkpoint = JSON.parse(row.manifest) as WorldCheckpoint; if (checkpoint.filesystemDelta?.objectKey && checkpoint.filesystemDelta.format !== 2) objectKeys.add(checkpoint.filesystemDelta.objectKey); } catch {}
     }
     for (const row of (await this.db.prepare('SELECT objectKey FROM promoted_artifacts WHERE projectId=?').all(projectId)) as any[])
       objectKeys.add(String(row.objectKey));
@@ -3715,26 +3755,30 @@ export class Store {
   /** Each child's list fields, archived children included, for its parent's
    * Sub-tasks panel (`TaskView.subTaskSummaries`). */
   async childTaskSummaries(parentTaskId: string): Promise<ChildTaskSummary[]> {
-    const rows = await this.readRows<{ id: string; num: number | null; title: string; workflow: string; lastView: string | null }>(
+    const rows = await this.readRows<TaskSummaryRow>(
       // Children spawned in one turn share a millisecond and ids end in random
       // bytes; `ord` is the list position allocated at insert on both databases.
       'SELECT id, num, title, workflow, lastView FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, ord, rowid', [parentTaskId]);
-    return rows.map((row) => {
-      const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
-      return {
-        id: row.id,
-        ...(row.num != null ? { num: row.num } : {}),
-        title: row.title,
-        workflow: row.workflow,
-        ...(view ? { lastView: {
-          stage: view.stage,
-          status: view.status,
-          ...(view.waitingFor ? { waitingFor: view.waitingFor } : {}),
-          ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
-          ...(view.state?.draft ? { state: { draft: true } } : {}),
-        } } : {}),
-      };
-    });
+    return rows.map(taskSummary);
+  }
+
+  /** Every task forked from this one's agents, forks of forks included, archived
+   * ones too, for its Agent forks panel (`TaskView.forkSummaries`). Forks are
+   * found within the source's project, like the panel's live task list. */
+  async forkTaskSummaries(sourceTaskId: string): Promise<ForkTaskSummary[]> {
+    const rows = await this.readRows<TaskSummaryRow & { params: string }>(`SELECT t.id, t.num, t.title, t.workflow, t.lastView,
+      t.params FROM tasks t JOIN tasks source ON source.projectId = t.projectId
+      WHERE source.id = ? AND t.id <> source.id AND t.params LIKE ? ORDER BY t.createdAt, t.ord, t.rowid`,
+    [sourceTaskId, '%"resumeFrom"%']);
+    const candidates = rows.map((row) => ({ row, forkOf: taskForkSourceIds(JSON.parse(row.params)) }));
+    const reached = new Set([sourceTaskId]);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const { row, forkOf } of candidates)
+        if (!reached.has(row.id) && forkOf.some((id) => reached.has(id))) { reached.add(row.id); grew = true; }
+    }
+    return candidates.filter(({ row }) => row.id !== sourceTaskId && reached.has(row.id))
+      .map(({ row, forkOf }) => ({ ...taskSummary(row), forkOf: forkOf.filter((id) => reached.has(id)) }));
   }
 
   /** Resolve a task by its per-project sequential number (SPEC §10.6). */
@@ -4654,6 +4698,15 @@ export class Store {
     return runAudienceAsync(reviewAudience(task), async (sql, params) => (await this.db.prepare(sql).all(...params)));
   }
 
+  /** Who answers a blocked task: its reviewers, else its assignee, else whoever
+   * created it — the person the workflow's own escalation names. Never nobody. */
+  private async escalationAudience(task: TaskRecord): Promise<string[]> {
+    const users = (await this.reviewAudience(task));
+    if (!users.length && task.assignee) users.push(...(await this.expandPrincipal(task.assignee, task.projectId)));
+    if (!users.length) users.push(...(await this.humanAudience(task.id, ['@creator'])));
+    return users;
+  }
+
   private audienceReader() {
     const cache = new Map<string, Promise<any[]>>();
     return (sql: string, params: unknown[]) => {
@@ -4713,6 +4766,10 @@ export class Store {
     if (!task || !project?.organizationId) return;
     const status = ev.type === 'view.updated' ? String(ev.payload.status ?? '') : '';
     const finished = ['done', 'failed', 'cancelled'].includes(status);
+    // A workflow that has run out of retries and Resolve escalates with stage
+    // `escalated` and no `waitingFor`: it is blocked on a person all the same
+    // (legibench3#18 escalated this way and told nobody).
+    const escalated = ev.type === 'view.updated' && ev.payload.stage === 'escalated' && !finished;
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
     if (ev.type === 'credential.approval-resolved' || ev.type === 'connection.resolved' || ev.type === 'permission.approval-resolved'
@@ -4728,7 +4785,7 @@ export class Store {
     else if (ev.type === 'view.updated') {
       // The task is live again, so its last outcome has stopped being news — and
       // any ask it had parked on is answered unless it is STILL on a human.
-      const stale = ev.payload.waitingFor === 'human'
+      const stale = ev.payload.waitingFor === 'human' || escalated
         ? ["'update'"] : ["'update'", "'review-requested'", "'escalated'"];
       (await this.deleteInbox(`taskId=? AND kind IN (${stale.join(', ')})`, [task.id]));
     }
@@ -4758,10 +4815,9 @@ export class Store {
       kind = 'review-requested'; actionable = true; users = (await this.reviewAudience(task));
     } else if (ev.type.includes('escalat')) {
       kind = 'escalated'; actionable = true;
-      users = (await this.reviewAudience(task));
-      if (!users.length && task.assignee) users = (await this.expandPrincipal(task.assignee, task.projectId));
-    } else if (ev.type === 'view.updated' && ev.payload.waitingFor === 'human') {
-      // The one lifecycle state that is an ask: the task is parked ON a human.
+      users = (await this.escalationAudience(task));
+    } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated)) {
+      // The lifecycle states that are an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
       // already routed to exactly the people who can answer it.
       // A dismissed approval is still the reason for this hold; a lifecycle tick
@@ -4769,8 +4825,7 @@ export class Store {
       if ((await this.hasPendingApprovals(task.id, true))) return;
       kind = ev.payload.stage === 'review' ? 'review-requested' : 'escalated';
       actionable = true;
-      users = (await this.reviewAudience(task));
-      if (!users.length && task.assignee) users = (await this.expandPrincipal(task.assignee, task.projectId));
+      users = (await this.escalationAudience(task));
     } else if (finished) {
       kind = 'update';
       for (const subscriber of (await this.subscribersFor(task.id))) users.push(...(await this.expandPrincipal(subscriber, task.projectId)));
@@ -4827,7 +4882,8 @@ export class Store {
     dropped += (await this.deleteInbox(`kind='update' AND taskId IN (SELECT id FROM tasks
       WHERE COALESCE(json_extract(lastView, '$.status'), 'setup') NOT IN ('done', 'failed', 'cancelled'))`, []));
     dropped += (await this.deleteInbox(`kind IN ('review-requested', 'escalated') AND taskId IN (SELECT id FROM tasks
-      WHERE COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'human')`, []));
+      WHERE COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'human'
+        AND COALESCE(json_extract(lastView, '$.stage'), '') <> 'escalated')`, []));
     if ((await this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get())) {
       dropped += (await this.deleteInbox(`subject IS NULL AND kind='approval-requested' AND taskId NOT IN (
         SELECT e.taskId FROM events e
@@ -4836,7 +4892,29 @@ export class Store {
             AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []));
     }
+    (await this.backfillEscalations());
     return dropped;
+  }
+
+  /** The opening counterpart of the discharge above: a task escalated by a build
+   * that raised no ask for it is listed now. Quietly — the inbox shows it, but
+   * nobody is emailed about an escalation that may be weeks old. */
+  private async backfillEscalations(): Promise<void> {
+    const rows = (await this.db.prepare(`SELECT id FROM tasks WHERE json_extract(lastView, '$.stage')='escalated'
+      AND COALESCE(json_extract(lastView, '$.status'), '') NOT IN ('done', 'failed', 'cancelled')
+      AND id NOT IN (SELECT taskId FROM inbox WHERE actionable=1)`).all()) as Array<{ id: string }>;
+    for (const row of rows) {
+      const task = (await this.getTaskShallow(String(row.id)));
+      const project = task && (await this.getProject(task.projectId));
+      if (!task || !project?.organizationId) continue;
+      const latest = (await this.db.prepare('SELECT MAX(seq) seq FROM events WHERE taskId=?').get(task.id)) as { seq?: number | string | null } | undefined;
+      const createdAt = Number(task.lastView?.updatedAt) || Date.now();
+      for (const userId of new Set(await this.escalationAudience(task)))
+        (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+          (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt)
+          VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?)`).run(newId('inbox'), project.organizationId, userId,
+            Number(latest?.seq ?? 0), task.id, urgencyRank(DEFAULT_URGENCY.escalated), createdAt));
+    }
   }
 
   async claimDelivery(now = Date.now()): Promise<{ id: string; inbox: InboxItem; channel: 'browser' | 'email' | 'slack'; attempts: number } | undefined> {
@@ -5492,7 +5570,7 @@ export class Store {
       await this.kvDeletePrefix(sharePrefix);
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`, `pending-review:${taskId}`, `review-artifacts:${taskId}`, `resource-review:${taskId}`,
-        `retention:settled:${taskId}`, `retention:view:${taskId}`, `view-order:${taskId}`]) (await exact.run(key));
+        `retention:settled:${taskId}`, `retention:view:${taskId}`, `view-order:${taskId}`, `vault:session-holds:${taskId}`]) (await exact.run(key));
       // Turn ids are `<task>#n` (older runs) or `<task>:<run>#n`; both carry the
       // turn's session checkpoint and journal.
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`, `turnsession:${taskId}:`, `turnresult:${taskId}:`, `task-create:${taskId}:`,
@@ -5833,17 +5911,19 @@ export class Store {
    * Local publishers already emit on this process's bus. Origin is transport
    * metadata and is deliberately absent from public event representations. */
   async nextForeignEventPage(seq: number, limit = 128): Promise<{
-    cursor: number; scanned: number; events: Array<KarmaxEvent & { seq: number }>;
+    cursor: number; scanned: number; seqs: number[]; events: Array<KarmaxEvent & { seq: number }>;
   }> {
     const rows = await this.readRows<any>('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?',
       [seq, Math.max(1, Math.min(500, Math.floor(limit)))]);
-    return {
-      cursor: rows.length ? Number(rows[rows.length - 1].seq) : seq,
-      scanned: rows.length,
-      events: rows.filter(row => row.origin !== PROCESS_EVENT_ORIGIN).map(row => ({
-        seq: Number(row.seq), taskId: row.taskId, type: row.type, ts: Number(row.ts), payload: JSON.parse(row.payload),
-      })),
-    };
+    return { cursor: rows.length ? Number(rows[rows.length - 1].seq) : seq, scanned: rows.length, ...foreignRows(rows) };
+  }
+
+  /** The rows among `seqs` that exist now, and the other processes' events
+   *  among them: how the relay finds rows that committed after it read past. */
+  async foreignEventsAt(seqs: readonly number[]): Promise<{ seqs: number[]; events: Array<KarmaxEvent & { seq: number }> }> {
+    if (!seqs.length) return { seqs: [], events: [] };
+    return foreignRows(await this.readRows<any>(
+      `SELECT * FROM events WHERE seq IN (${seqs.map(() => '?').join(',')}) ORDER BY seq`, [...seqs]));
   }
 
   /** Event routing needs ownership, never a conversation or reviewer expansion. */
@@ -6074,7 +6154,7 @@ export class Store {
     return (rows as any[]).map(resourceCandidateRow);
   }
 
-  async resolveResourceCandidate(id: string, state: 'adopted' | 'discarded', resolvedBy: string): Promise<ResourceCandidate> {
+  async resolveResourceCandidate(id: string, state: 'adopted' | 'discarded', resolvedBy: string, error?: string): Promise<ResourceCandidate> {
     return this.db.transaction(async () => {
 
     const current = (await this.getResourceCandidate(id));
@@ -6082,8 +6162,8 @@ export class Store {
     const expected = state === 'discarded' ? 'discarding' : 'pending';
     if (current.state !== expected) throw new Error(`resource candidate is already ${current.state}`);
     const now = Date.now();
-    (await this.db.prepare('UPDATE resource_candidates SET state=?, resolvedAt=?, resolvedBy=? WHERE id=? AND state=?')
-      .run(state, now, resolvedBy, id, expected));
+    (await this.db.prepare('UPDATE resource_candidates SET state=?, resolvedAt=?, resolvedBy=?, error=? WHERE id=? AND state=?')
+      .run(state, now, resolvedBy, error ?? null, id, expected));
     return (await this.getResourceCandidate(id))!;
   
     });
@@ -6130,6 +6210,17 @@ export class Store {
     }
     return { candidate: (await this.getResourceCandidate(id))!, attachment: (await this.getResourceAttachment(attachment.id))! };
   
+    });
+  }
+
+  /** Record a revision and make it current in one step: when the baseline moved
+   * (or the attachment is gone), nothing is recorded. */
+  async saveAndPromoteResourceRevision(input: Omit<ResourceRevision, 'id' | 'createdAt'>,
+    expectedRevisionId: string | undefined): Promise<ResourceRevision> {
+    return this.db.transaction(async () => {
+      const revision = (await this.saveResourceRevision(input));
+      (await this.promoteResourceRevision(input.attachmentId, revision.id, expectedRevisionId));
+      return revision;
     });
   }
 
@@ -6231,8 +6322,9 @@ export class Store {
     if (!value) return undefined;
     const refs = Number(((await this.db.prepare(`SELECT
       (SELECT COUNT(*) FROM resource_attachments WHERE storageLocationId=?) +
-      (SELECT COUNT(*) FROM resource_revisions WHERE storageLocationId=?) AS n`).get(id, id)) as any)?.n ?? 0);
-    if (refs) throw new Error('storage location is still used by project resources or revisions');
+      (SELECT COUNT(*) FROM resource_revisions WHERE storageLocationId=?) +
+      (SELECT COUNT(*) FROM world_checkpoints WHERE json_extract(manifest, '$.filesystemDelta.storageLocationId')=?) AS n`).get(id, id, id)) as any)?.n ?? 0);
+    if (refs) throw new Error('storage location is still used by project resources, revisions or task checkpoints');
     (await this.db.prepare('DELETE FROM storage_locations WHERE id=?').run(id));
     return value;
   
@@ -6252,9 +6344,16 @@ export class Store {
       // the next lifecycle sweep.
       retainedBytes += Number(((await this.db.prepare(`SELECT COALESCE(SUM(CAST(json_extract(manifest, '$.filesystemDelta.bytes') AS INTEGER)), 0) bytes
         FROM world_checkpoints WHERE projectId IN (SELECT id FROM projects WHERE organizationId=?)
-          AND id NOT IN (SELECT substr(k, 15) FROM kv WHERE k LIKE 'checkpoint-gc:%')`)
+        AND json_extract(manifest, '$.filesystemDelta.storageLocationId') IS NULL
+        AND id NOT IN (SELECT substr(k, 15) FROM kv WHERE k LIKE 'checkpoint-gc:%')`)
         .get(location.organizationId)) as any)?.bytes ?? 0);
     }
+    // A chunked checkpoint's chunks are counted above; its manifest is counted
+    // here, unless it is queued for deletion.
+    retainedBytes += Number(((await this.db.prepare(`SELECT COALESCE(SUM(CAST(json_extract(manifest, '$.filesystemDelta.bytes') AS INTEGER)), 0) bytes
+      FROM world_checkpoints WHERE json_extract(manifest, '$.filesystemDelta.storageLocationId')=?
+      AND id NOT IN (SELECT substr(k, 15) FROM kv WHERE k LIKE 'checkpoint-gc:%')`)
+      .get(locationId)) as { bytes?: number } | undefined)?.bytes ?? 0);
     const quotaBytes = (await this.storageLocationQuotaBytes(location));
     return { locationId, retainedBytes, quotaBytes,
       ...(quotaBytes == null ? {} : { availableBytes: Math.max(0, quotaBytes - retainedBytes) }) };
@@ -6312,9 +6411,11 @@ export class Store {
       VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=resource_snapshot_chunks.refs+1`);
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
-      if (storageLocationId && options.enforceQuota !== false) {
+      if (storageLocationId) {
         const location = (await this.getStorageLocation(storageLocationId));
         if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
+      }
+      if (storageLocationId && options.enforceQuota !== false) {
         const newBytes = (await __asyncCollections.reduce(chunks, async (sum, chunk) => sum + ((await this.db.prepare(
           'SELECT 1 FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?').get(organizationId, chunk.id)) ? 0 : chunk.bytes), 0));
         // The same total the quota is shown against: chunks, and for managed
@@ -6499,8 +6600,7 @@ export class Store {
       }
       for (const checkpoint of checkpoints.slice(2)) {
         if (pinned.has(checkpoint.id)) continue;
-        if (checkpoint.filesystemDelta) await this.kvSet(`checkpoint-gc:${checkpoint.id}`,
-          JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta.objectKey }));
+        if (checkpoint.filesystemDelta) await this.kvSet(`checkpoint-gc:${checkpoint.id}`, checkpointGcEntry(worldId, checkpoint));
       }
     });
   }
@@ -6533,7 +6633,7 @@ export class Store {
         const checkpoint = JSON.parse(row.manifest) as WorldCheckpoint;
         if (checkpoint.filesystemDelta) {
           if (await this.kvGet(`checkpoint-gc:${checkpoint.id}`)) continue;
-          await this.kvSet(`checkpoint-gc:${checkpoint.id}`, JSON.stringify({ worldId, objectKey: checkpoint.filesystemDelta.objectKey }));
+          await this.kvSet(`checkpoint-gc:${checkpoint.id}`, checkpointGcEntry(worldId, checkpoint));
         } else await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpoint.id);
         queued++;
       }
@@ -6648,11 +6748,19 @@ export class Store {
     });
   }
 
-  async completeCheckpointDeletion(checkpointId: string): Promise<void> {
-    await this.db.transaction(async () => {
-      await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpointId);
+  /** True for exactly one caller: the one whose call removed the record. */
+  async completeCheckpointDeletion(checkpointId: string): Promise<boolean> {
+    return this.db.transaction(async () => {
+      const removed = await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpointId);
       await this.kvDelete(`checkpoint-gc:${checkpointId}`);
+      return Number(removed.changes) === 1;
     });
+  }
+
+  /** Every checkpoint of a project, including those waiting for collection. */
+  async listProjectCheckpoints(projectId: string): Promise<WorldCheckpoint[]> {
+    return ((await this.db.prepare('SELECT manifest FROM world_checkpoints WHERE projectId=?').all(projectId)) as Array<{ manifest: string }>)
+      .map(row => JSON.parse(row.manifest) as WorldCheckpoint);
   }
 
   async getWorldCheckpoint(id: string): Promise<WorldCheckpoint | undefined> {
@@ -8503,7 +8611,8 @@ function resourceCandidateRow(row: any): ResourceCandidate {
     attachmentId: row.attachmentId, sourceKind: row.sourceKind,
     sourcePath: row.sourcePath ?? undefined, vaultItemId: row.vaultItemId ?? undefined,
     vaultField: row.vaultField ?? undefined, state: row.state, createdAt: Number(row.createdAt),
-    resolvedAt: row.resolvedAt == null ? undefined : Number(row.resolvedAt), resolvedBy: row.resolvedBy ?? undefined };
+    resolvedAt: row.resolvedAt == null ? undefined : Number(row.resolvedAt), resolvedBy: row.resolvedBy ?? undefined,
+    ...(row.error ? { error: row.error } : {}) };
 }
 
 async function selectRows(db: SqlDatabase, table: string, where: string, args: any[]): Promise<any[]> {

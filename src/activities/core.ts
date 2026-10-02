@@ -1,3 +1,4 @@
+import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { createHash } from 'node:crypto';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
@@ -14,12 +15,12 @@ import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
 import { expectedTaskRemoteHeads } from '../world/publication.js';
-import { applyConversationPatch, conversationPage, hasLiveWorldWork, lifecycleEventPayload, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
+import { applyConversationPatch, conversationPage, hasLiveWorldWork, watchesJobs, lifecycleEventPayload, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -88,7 +89,7 @@ import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js'
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
-import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { importWithPanagent, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
@@ -176,6 +177,9 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
       ...(metadata ? { details: [metadata] } : {}),
     });
   }
+  // Not the agent's mistake and not transient: the session no longer fits the
+  // model. The workflow restarts the stage on a fresh session (agent-context).
+  if (isContextOverflow(msg)) return ApplicationFailure.create({ message: msg, type: 'agent-context', nonRetryable: true, cause });
   // A remote sandbox's own metrics outrank any reading of the error text: a
   // frozen sandbox fails with whatever the next provider call happens to say
   // (tasks 348/349: an exit "-1", "Sandbox is probably not running anymore").
@@ -492,6 +496,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   );
 
   const gitProfilesForScope = (scope: string) => new GitProfiles(store, deps.broker, paths().state, scope);
+  /** Refresh the saved browser sessions a task's browser holds into the vault,
+   *  and with `release` let go of them (session-holds.ts). Only remote and
+   *  container worlds keep their browser between turns, so only they are read. */
+  const browserOutlivesTurns = (kind: WorldKind) => kind === 'container' || isRemote(kind);
+  const settleSessions = async (taskId: string, world: World | (() => Promise<World | undefined>) | undefined, release: boolean) => {
+    try {
+      const [{ settleTaskSessions }, { openWorldPage }, { WORLD_CDP_URL }] = await Promise.all([
+        import('../autonomy/session-holds.js'), import('../autonomy/world-fill.js'), import('../autonomy/task-browser.js')]);
+      await settleTaskSessions({ store, broker: deps.broker, taskId, world, release,
+        openPage: (w, domains) => openWorldPage(w, { expectDomains: domains, cdpUrl: WORLD_CDP_URL, anyPage: true }) });
+    } catch (error) {
+      console.warn(`[vault] saved sessions of ${taskId} not settled: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   const activeGithubAccountId = async (userId: string) => typeof deps.githubApp?.activeUserAccountId === 'function'
     ? (await deps.githubApp.activeUserAccountId(userId)) : undefined;
 
@@ -1117,7 +1135,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   async function maintainWaitingWorld(taskId: string, view: LifecyclePublication, fence: string, retryFailure = true): Promise<void> {
     const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
     // A job wait needs the world running: parking would freeze the job.
-    if ((view.status !== 'waiting' && view.status !== 'blocked') || hasLiveWorldWork(view) || view.waitingFor?.kind === 'job'
+    if ((view.status !== 'waiting' && view.status !== 'blocked') || hasLiveWorldWork(view) || watchesJobs(view)
       || !waitingWorld || !worlds.get(waitingWorld.kind).parkable) return;
     let ctx: ReturnType<typeof activityContext.current> | undefined;
     try { ctx = activityContext.current(); } catch { /* direct tests */ }
@@ -1183,12 +1201,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           } catch (error) {
             if (error === deferred) return;
             if (ctx?.cancellationSignal.aborted) throw error;
-            (await record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) }));
+            (await record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error),
+              ...(error instanceof CheckpointRefusedError && error.files.length ? { files: error.files } : {}) }));
             // The world still parks, but hibernation must not trust an older checkpoint.
             await markCheckpointStale(store, waitingWorld, error instanceof Error ? error.message : String(error));
           }
         }
 
+        if (!(await valid())) return;
+        // A parked world's browser is not checkpointed: keep its sessions, then free them.
+        await settleSessions(taskId, async () => browserOutlivesTurns(waitingWorld.kind) ? openWorld(waitingWorld, taskId) : undefined, true);
         if (!(await valid())) return;
         await parkingTrace.measure('lifecycle.park', () => withTiming(parkingTrace, () => worlds.park(waitingWorld)));
       }
@@ -2099,7 +2121,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : profile.provider === 'opencode' ? path.join('.local', 'share', 'opencode')
           : '.claude';
         const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), ambientHome);
-        const applyPanagent = async (source: PanagentSource, mode: 'context' | 'transcript') => {
+        // An import runs only while this role has no session, so a retry may
+        // replace the copy an earlier attempt wrote: the same source keeps one id.
+        const applyPanagent = async (source: PanagentSource, mode: 'context' | 'transcript', origin: string) => {
           const imported = await importWithPanagent({
             source,
             provider: profile.provider,
@@ -2107,6 +2131,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             worldPath: worldWorkingDirectory(world.handle),
             mode,
             native: !apiRail && ['claude', 'codex'].includes(profile.provider),
+            sessionId: stableImportSessionId(args.taskId, args.role, profile.provider, origin),
           });
           if (imported.kind === 'native') session = imported.sessionId;
           else {
@@ -2138,10 +2163,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             throw new Error('uploaded conversation belongs to a different project');
           if (!deps.objects) throw new Error('conversation import storage is unavailable');
           const data = await deps.objects.get(conversationImportObjectKey(args.task.projectId, upload.id));
-          const kind = await applyPanagent({ data, name: upload.name }, 'transcript');
+          const kind = await applyPanagent({ data, name: upload.name }, 'transcript', `upload:${upload.id}`);
           (await record(args.taskId, 'session.imported', { source: 'upload', format: upload.format, provider: profile.provider, kind }));
         } else if (share) {
-          const kind = await applyPanagent({ url: share }, 'context');
+          const kind = await applyPanagent({ url: share }, 'context', `share:${share}`);
           (await record(args.taskId, 'session.imported', { source: 'share', provider: profile.provider, kind }));
         } else if (spec.resumeFrom.sessionId) {
           // A raw id is meaningful only on a host-local install, where the UI and
@@ -2162,7 +2187,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const sourceProvider = profile.provider === 'claude' ? 'codex' : 'claude';
             const sourceFile = findProviderSession({ provider: sourceProvider, session, searchInstallation: true });
             if (sourceFile) {
-              const kind = await applyPanagent({ path: sourceFile }, 'transcript');
+              const kind = await applyPanagent({ path: sourceFile }, 'transcript', `session:${sourceProvider}:${session}`);
               materialized = true;
               (await record(args.taskId, 'session.imported', { source: 'local-id', sourceProvider, provider: profile.provider, kind }));
             }
@@ -2246,7 +2271,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const sourceFile = findProviderSession({ provider: srcProvider, session: srcSession, srcHome });
             if (sourceFile) {
               try {
-                const kind = await applyPanagent({ path: sourceFile }, 'transcript');
+                const kind = await applyPanagent({ path: sourceFile }, 'transcript',
+                  `task:${spec.resumeFrom.taskId}:${srcRole}:${srcProvider}:${srcSession}`);
                 prepared = true;
                 (await record(args.taskId, 'session.forked', {
                   from: spec.resumeFrom, session: srcSession, native: kind === 'native', converted: true,
@@ -2427,6 +2453,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           session = undefined;
           deliveredMessages = 0;
         }
+      }
+      // A checkpoint refused (or incomplete) since the agent last worked: name the
+      // files, so it can commit, ignore or move them. Rides on the newest message
+      // the agent has not read yet; the workflow's message indices are unchanged.
+      if (args.role === 'do' && !resumedActivityAttempt && messages.length > (deliveredMessages ?? 0)) {
+        const notice = await deps.checkpoints?.takeNotice(args.taskId).catch(() => undefined);
+        const last = messages.length - 1;
+        if (notice) messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n(${notice})` } : message);
       }
       /** Compatibility publisher for immutable v1 histories. Those workflows
        * clear their in-memory account wait after a grant but cannot schedule a
@@ -2965,6 +2999,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       // Adapters can also return review info directly without invoking the tool.
       if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, result.reviewInfo, true);
+      // The site may have rotated a saved session's cookies during the turn.
+      await settleSessions(args.taskId, browserOutlivesTurns(world.handle.kind) ? world : undefined, false);
       if (result.subTaskResponses?.length) {
         const { kept, refused } = await ownSubTaskResponses(store, args.taskId, result.subTaskResponses);
         result.subTaskResponses = kept;
@@ -3351,6 +3387,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (!(await owns())) return;
           const world = await worlds.open(current);
           if (!(await owns())) return;
+          await settleSessions(handle.id, browserOutlivesTurns(current.kind) ? world : undefined, true);
+          if (!(await owns())) return;
           // A remote sandbox takes its jobs with it; a host-side world must stop them.
           if (!isRemote(current.kind)) await stopJobs(world).catch(() => undefined);
           await world.destroy();
@@ -3395,8 +3433,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         let current = (await store.currentWorld(handle.id)) as WorldHandle;
         // Capacity admission cannot hold the transition lock: an existing
         // accessor may need that lock to release the capacity we are awaiting.
-        const prepared = deps.checkpoints && isRemote(current.kind) && worldRepos(current).length
-          ? await openWorld(current, current.id) : undefined;
+        // A remote world is opened even without repositories: a paused E2B
+        // sandbox keeps its processes, so its jobs must be stopped first.
+        const remote = isRemote(current.kind) ? await openWorld(current, current.id) : undefined;
         const suspend = async () => {
           if (!(await valid())) return;
           current = (await store.currentWorld(handle.id)) as WorldHandle;
@@ -3406,13 +3445,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           };
           await idle();
           // Cancelling stops the task's durable jobs as well as its agent.
-          const live = prepared ?? (isRemote(current.kind) ? undefined : await worlds.open(current));
-          if (live) await stopJobs(live).catch(() => undefined);
+          const live = remote ?? await worlds.open(current);
+          await stopJobs(live).catch(() => undefined);
+          // A parked world's browser is not checkpointed: keep its sessions, then free them.
+          await settleSessions(current.id, browserOutlivesTurns(current.kind) ? live : undefined, true);
           if (deps.checkpoints) {
-            if (prepared) {
+            if (remote && worldRepos(current).length) {
               const projectId = String(current.meta?.projectId ?? '');
               if ((await store.listProjectRepositories(projectId)).length) {
-                const pushed = await publishTaskBranch(prepared, current.id);
+                const pushed = await publishTaskBranch(remote, current.id);
                 if (pushed.skipped.length)
                   throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
               }
@@ -3497,6 +3538,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }, 5_000);
       try { await deps.resources?.settleReview(taskId); }
       finally { clearInterval(pulse); }
+    },
+
+    /** Snapshot staged path candidates while the producing world is still live.
+     * Only the final attempt gives up on a candidate (discarding it with its
+     * reason); earlier failures retry with what is already staged kept. */
+    async stageResourceCandidates(taskId: string): Promise<{ staged: number; failed: number }> {
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct tests */ }
+      const pulse = setInterval(() => {
+        try { context?.heartbeat({ taskId, operation: 'staging-resources' }); } catch { /* activity completion/cancellation */ }
+      }, 5_000);
+      try {
+        const info = context?.info;
+        const maximumAttempts = info?.retryPolicy?.maximumAttempts ?? 0;
+        const result = await deps.resources?.stageCandidates(taskId, {
+          final: !info || (maximumAttempts > 0 && info.attempt >= maximumAttempts),
+          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); },
+        });
+        return { staged: result?.staged.length ?? 0, failed: result?.failed.length ?? 0 };
+      } finally { clearInterval(pulse); }
     },
 
     async pendingResourceCandidates(taskId: string): Promise<number> {
@@ -4758,6 +4819,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               landingOwner: 'karmax',
             };
           }
+          // A failed read is not GitHub computing: a `waiting` here is watched
+          // through preflights, which can read the same as before the failure.
+          if (!readiness && readinessError) return errorDecision(readinessError, current);
           if (!readiness || readiness.mergeable === 'UNKNOWN' || readiness.mergeStateStatus === 'UNKNOWN') {
             return {
               status: 'waiting', prs: current, actorUserId,
@@ -5454,7 +5518,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         workflowVersion: parent?.workflowVersion ?? '1.0.0',
         // The child's own agent fields first: its prompt and the parent's branch always win.
         params: { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
-          [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true },
+          [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
+          // Stored so a replacement run of this child, which is rebuilt from
+          // its record, keeps the parent's profiles as this first run does.
+          ...(args.profiles ? { profiles: args.profiles } : {}) },
         parentTaskId: args.parentTaskId,
         createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
         assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },

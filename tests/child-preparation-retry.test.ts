@@ -47,3 +47,21 @@ it('prepares a child of a remote world whose project has no repository', async (
     expect(await store.getTask(child.taskId)).toMatchObject({ parentTaskId: parent.id });
   } finally { vi.restoreAllMocks(); await store.close(); }
 });
+
+// #456: a replacement run of a child is rebuilt from its stored record, so the
+// parent's profiles it was started with must be stored there too.
+it('stores the profiles a child inherits from its parent', async () => {
+  const store = await Store.create(':memory:');
+  const project = await store.createProject('Profiles');
+  const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1', params: { prompt: 'fixture' } });
+  vi.spyOn(Context, 'current').mockImplementation(() => ({ info: { activityId: 'prepare',
+    workflowExecution: { workflowId: parent.id, runId: 'run-1' } } }) as any);
+  const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+  try {
+    const profiles = { do: 'organization:org_personal::do-default' };
+    const child = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work',
+      base: 'main', target: 'main', parentBranch: 'parent', project: {}, profiles } as any);
+    expect(child.profiles).toEqual(profiles);
+    expect((await store.getTask(child.taskId))!.params.profiles).toEqual(profiles);
+  } finally { vi.restoreAllMocks(); await store.close(); }
+});

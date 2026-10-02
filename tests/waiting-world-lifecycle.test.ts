@@ -66,6 +66,28 @@ describe('cancelled-world recovery', () => {
     if (change === 'access') expect(await f.store.eventsOfType(f.task.id, 'world.suspend_failed')).toHaveLength(1);
   });
 
+  // A paused E2B sandbox keeps its processes: a job left running would resume
+  // with the world, cancelled or not.
+  it('stops a cancelled cloud world\'s jobs before parking it, even without repositories', async () => {
+    const f = await fixture('e2b');
+    await f.store.createRunnerPool({ id: 'test', organizationId: f.project.organizationId!, name: 'Test', provider: 'e2b',
+      mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const lease = await f.store.requestWorldLease({ runnerPoolId: 'test', organizationId: f.project.organizationId!,
+      projectId: f.project.id, taskId: f.task.id, worldId: f.handle.id });
+    await f.store.updateWorldMeta(f.handle, { worldLeaseId: lease.id });
+    const steps: string[] = [];
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      if (args[2] === 'karmax-job-stop') { steps.push(`stop ${args.slice(3).join(' ')}`); return { code: 0, stdout: 'stopped job-0000000a 2\n', stderr: '' }; }
+      return { code: 0, stdout: 'job-0000000a\n', stderr: '' };
+    });
+    f.open.mockImplementation(async () => ({ handle: f.handle, exec }) as any);
+    f.park.mockImplementation(async () => { steps.push('park'); f.setParked(); return f.handle; });
+    await f.store.saveView(f.task.id, { ...f.view, status: 'cancelled', stage: 'cancelled' });
+    await f.core.suspendWorldForRecovery(f.handle);
+    expect(steps).toEqual(['stop job-0000000a', 'park']);
+    expect(await f.store.worldState(f.handle.id)).toBe('parked');
+  });
+
   it('rechecks cancellation after slow checkpointing', async () => {
     const f = await fixture(), entered = deferred(), finish = deferred();
     await f.store.saveView(f.task.id, { ...f.view, status: 'cancelled', stage: 'cancelled' });
@@ -91,14 +113,21 @@ describe('separate waiting-world maintenance', () => {
     expect((await f.store.worldState(f.task.id))).toBe('parked');
   });
 
-  it('keeps the world running while its agent waits on a job, but parks a timed pause', async () => {
+  it('keeps the world running while its agent waits on a job, even while asking for input, but parks a timed pause', async () => {
     const f = (await fixture());
     const onJob = { ...f.view, waitingFor: { kind: 'job' as const, detail: 'Waiting for job-0000000a', until: Date.now() + 60_000 } };
     const jobFence = await f.publish(onJob);
     await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(onJob), jobFence!);
     expect(f.park).not.toHaveBeenCalled();
 
-    const paused = { ...f.view, waitingFor: { kind: 'timer' as const, detail: 'Paused for 30 min', until: Date.now() + 60_000 } };
+    // An agent asking for input while its job runs is a human wait, but the job still needs the world.
+    const asking = { ...f.view, waitingFor: { kind: 'human' as const, detail: 'Which region?', audience: ['@creator'],
+      jobs: ['job-0000000a'], until: Date.now() + 60_000 } };
+    const askFence = await f.publish(asking);
+    await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(asking), askFence!);
+    expect(f.park).not.toHaveBeenCalled();
+
+    const paused = { ...f.view, waitingFor: { kind: 'timer' as const, detail: 'Waiting 30 min', until: Date.now() + 60_000 } };
     const pauseFence = await f.publish(paused);
     await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(paused), pauseFence!);
     expect(f.park).toHaveBeenCalledOnce();

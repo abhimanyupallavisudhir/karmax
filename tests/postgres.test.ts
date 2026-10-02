@@ -171,6 +171,30 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('accounts chunked checkpoints by storage location and collects each exactly once', async () => {
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Checkpoints');
+      const organizationId = project.organizationId!;
+      const now = Date.now();
+      for (const id of ['storage-managed-x', 'storage-s3-x']) await store.saveStorageLocation({ id, organizationId, name: id,
+        kind: id.includes('s3') ? 's3' : 'managed', config: {}, isDefault: !id.includes('s3'), status: 'ready', createdAt: now, updatedAt: now });
+      const checkpoint = (id: string, filesystemDelta: Record<string, unknown>) => store.saveWorldCheckpoint({ id, worldId: 'world',
+        generation: 1, projectId: project.id, runnerPoolId: 'local', environmentDigest: 'local', repos: [], createdAt: now,
+        filesystemDelta: filesystemDelta as any });
+      await checkpoint('legacy', { objectKey: 'legacy', sha256: 'a', bytes: 1000 });
+      await checkpoint('chunked', { objectKey: 'chunked', sha256: 'b', bytes: 70, format: 2, storageLocationId: 'storage-s3-x' });
+      await store.retainResourceChunks(organizationId, [{ id: 'c'.repeat(64), bytes: 4096 }], 'storage-s3-x');
+      expect((await store.storageLocationUsage('storage-managed-x')).retainedBytes).toBe(1000);
+      expect((await store.storageLocationUsage('storage-s3-x')).retainedBytes).toBe(4096 + 70);
+      await expect(store.deleteStorageLocation('storage-s3-x')).rejects.toThrow(/task checkpoints/);
+      expect((await store.listProjectCheckpoints(project.id)).map(row => row.id).sort()).toEqual(['chunked', 'legacy']);
+      expect(await Promise.all([store.completeCheckpointDeletion('chunked'), store.completeCheckpointDeletion('chunked')]))
+        .toEqual(expect.arrayContaining([true, false]));
+      expect((await store.storageLocationUsage('storage-s3-x')).retainedBytes).toBe(4096);
+    } finally { await store.close(); }
+  });
+
   it('scans only literal kv key prefixes', async () => {
     const store = await Store.create(url!);
     try {
@@ -187,6 +211,24 @@ integration('PostgreSQL cutover', () => {
     try {
       const indexes = await store.db.prepare("SELECT indexname FROM pg_indexes WHERE tablename='events'").all() as Array<{ indexname: string }>;
       expect(indexes.map((row) => row.indexname)).toContain('idx_events_type');
+    } finally { await store.close(); }
+  });
+
+  it('adds the candidate failure reason to an existing database and round-trips it', async () => {
+    (await Store.create(url!).then((store) => store.close()));
+    await admin!.query('ALTER TABLE resource_candidates DROP COLUMN error'); // as deployed before the column
+    const store = await Store.create(url!);
+    try {
+      const project = await store.createProject('Candidates');
+      const task = await store.createTask({ projectId: project.id, title: 'Data', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'fixture' } });
+      const attachment = await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+        name: 'Data', driver: 'object-tree@1', target: { kind: 'path', path: 'data' }, access: 'read', isolation: 'fork',
+        source: { candidate: true }, credentialHandles: [], publish: 'discard', enabled: false });
+      const candidate = await store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
+        taskId: task.id, worldId: task.id, worldGeneration: 1, attachmentId: attachment.id, sourceKind: 'path', sourcePath: 'data' });
+      await store.beginDiscardResourceCandidate(candidate.id, task.id);
+      await store.resolveResourceCandidate(candidate.id, 'discarded', 'system:resource-stage-failed', 'disk is full');
+      expect(await store.getResourceCandidate(candidate.id)).toMatchObject({ state: 'discarded', error: 'disk is full' });
     } finally { await store.close(); }
   });
 

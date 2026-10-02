@@ -291,7 +291,12 @@ export interface WorldCheckpoint {
     targetPinned?: boolean;
     role?: 'project-wiki';
   }>;
-  filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
+  /** `format: 2` is a sealed manifest of chunks in `storageLocationId`
+   * (src/world/checkpoint-chunks.ts); without it, one legacy KMX1 document. */
+  filesystemDelta?: { objectKey: string; sha256: string; bytes: number;
+    format?: 2; storageLocationId?: string; files?: number; contentBytes?: number };
+  /** Changed paths with no portable bytes (a nested repository, a socket). */
+  omitted?: Array<{ path: string; reason: string }>;
   resources?: Array<{ attachmentId: string; revisionId: string }>;
   /** Metadata-only inventory of ignored paths omitted from the portable delta.
    * Contents are never read or uploaded by this safety net. */
@@ -692,6 +697,8 @@ export interface ResourceCandidate {
   createdAt: number;
   resolvedAt?: number;
   resolvedBy?: string;
+  /** Why the platform discarded it: its snapshot could not be taken. */
+  error?: string;
 }
 
 export interface IgnoredResourceInventory {
@@ -1530,7 +1537,14 @@ export interface ChildTaskSummary {
   num?: number;
   title: string;
   workflow: string;
-  lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed'> & { state?: { draft?: boolean } };
+  /** `approvalRequests` is the gateway's projection, as on a task-list row. */
+  lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed' | 'approvalRequests'> & { state?: { draft?: boolean } };
+}
+
+/** A task forked from another task's agent, as the source's Agent forks panel
+ *  shows it; `forkOf` names the task(s) in that tree it resumed from. */
+export interface ForkTaskSummary extends ChildTaskSummary {
+  forkOf: string[];
 }
 
 export interface TaskView {
@@ -1610,16 +1624,28 @@ export interface TaskView {
   /** Every child the store records, with its list fields: finished children are
    *  archived out of the live task list, and a replaced run forgets settled ones. */
   subTaskSummaries?: ChildTaskSummary[];
+  /** Every task forked from this one's agents, nested forks included: a finished
+   *  fork is archived out of the live task list. */
+  forkSummaries?: ForkTaskSummary[];
   parentTaskId?: string;
+  /** The parent's list identity, which outlives the parent in the live task list. */
+  parentTask?: { id: string; num?: number; title: string };
   error?: string;
   /**
    * What the task is currently parked on, if anything (SPEC §6.2). Surfaced so the
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder' | 'job' | 'timer'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience;
-    /** `job` / `timer`: when the agent is resumed at the latest (epoch ms). */
-    until?: number };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder' | 'job' | 'timer' | 'retry'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience;
+    /** `job` / `timer` / a paused agent's `human` or `parent` ask: when the agent
+     * is resumed at the latest; `retry`: when a stage that failed on
+     * infrastructure runs again (epoch ms). */
+    until?: number;
+    /** `human`: how loudly the ask was raised; omitted means the inbox kind's default. */
+    urgency?: Urgency;
+    /** Durable jobs this wait watches (a `job` wait, or an ask that also waits
+     * on jobs): their world must keep running, or parking it freezes them. */
+    jobs?: string[] };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
@@ -1870,15 +1896,23 @@ export interface SubTaskResponse {
   text?: string;
 }
 
-/** A child-agent's explicit request up to its parent (the `raise_to_parent` tool). */
 /** An agent's request to end its turn and be resumed later: when every listed
  * durable job has exited, when a message arrives, or after `minutes` —
  * whichever comes first. Without jobs it is a timed pause. */
 export interface AgentWait {
   minutes: number;
   jobs?: string[];
+  /** The names the agent gave those jobs (`start_job`'s `name`), for people. */
+  jobNames?: string[];
+  /** The agent is waiting on an answer, not just on time: the task parks as
+   * Needs input and asks `audience` (default: the task's ordinary input route —
+   * a sub-task's parent, a configured Responder, or its creator),
+   * and `minutes` becomes the deadline after which the agent carries on without
+   * it. `message` defaults to the turn's final response. */
+  needsInput?: { message?: string; audience?: HumanAudience; urgency?: Urgency };
 }
 
+/** A child-agent's explicit request up to its parent (the `raise_to_parent` tool). */
 export interface RaiseToParent {
   type: RaiseType;
   detail?: string;

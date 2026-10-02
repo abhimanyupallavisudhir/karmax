@@ -138,6 +138,23 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', `tavya/${taskId}:note.txt`])).stdout).toContain('from the job');
   }, 60_000);
 
+  it('just-do: a needs-input pause asks for an answer and resumes with it', async () => {
+    const repo = await h.makeRepo('jd-ask');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('justDo', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'ask', prompt: '@pause 600 :: input low -- Which note?' })],
+    });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 15_000 }).toBe('human');
+    expect((await view(handle)).waitingFor).toMatchObject({ detail: 'Which note?', audience: ['@creator'], urgency: 'low' });
+    await handle.signal('followUp', { id: 'answer', role: 'user', text: '@write note.txt :: this one', ts: 0 });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', `tavya/${taskId}:note.txt`])).stdout).toContain('this one');
+  }, 60_000);
+
   it('just-do: applies resources only after every confirmation layer', async () => {
     const repo = await h.makeRepo('jd-resources');
     const project = await h.store.createProject('Just-do resources', { repos: [repo] });

@@ -2,6 +2,7 @@ import { createTaskWorld } from './world-setup.js';
 import { publishTaskView } from './view-publication.js';
 import { conversationPublisher } from '../domain/view-publication.js';
 import {
+  CancellationScope,
   proxyActivities,
   defineSignal,
   defineQuery,
@@ -24,6 +25,13 @@ import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
+});
+// See software-dev: multi-GB snapshots; a retry keeps what is already staged.
+const resourceStaging = proxyActivities<coreActivities>({
+  // Heartbeats carry a cancel to the activity; a short timeout delivers it soon.
+  startToCloseTimeout: '12 hours', heartbeatTimeout: '30 seconds',
+  retry: { maximumAttempts: 3, initialInterval: '30 seconds' },
+  cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 // An agent turn has no wall-clock limit: long investigations and builds are
@@ -139,7 +147,11 @@ async function justDoImpl(
   let awaitingResourceDecision = false;
   let resourceReviewSequence = 0;
   let applyingResources = false;
+  let stagingResources = false;
+  let activeStaging: CancellationScope | undefined;
   let world: WorldHandleLike | undefined;
+  // A released sandbox is gone, but its branch stays part of the task's record.
+  let releasedWorld: WorldHandleLike | undefined;
   let session: string | undefined;
   let reviewInfo: ReviewInfo | undefined;
   let waitingFor: TaskView['waitingFor'];
@@ -156,7 +168,7 @@ async function justDoImpl(
   const confirmLayers = confirmLayersOf(input.confirm);
 
   function actions(): DeclaredAction[] {
-    if (finalizing || applyingResources) return [];
+    if (finalizing || applyingResources || stagingResources) return [];
     const followUp: DeclaredAction = { name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true, args: [{ name: 'text', type: 'text', required: true }] };
     const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true };
     const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: 'Done', enabled: true };
@@ -167,9 +179,28 @@ async function justDoImpl(
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'just-do', stage, status, messages: msgs, reviewInfo,
-      actions: actions(), state: { worldReady: !!world, ...(applyingResources ? { applyingResources: true } : {}), ...(finalizing ? { finalizing: true } : {}) }, branch: world?.branch, base,
+      actions: actions(), state: { worldReady: !!world, ...(applyingResources ? { applyingResources: true } : {}), ...(stagingResources ? { stagingResources: true } : {}), ...(finalizing ? { finalizing: true } : {}) }, branch: (world ?? releasedWorld)?.branch, base,
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
+  }
+  /** Snapshot proposed outputs while their world is live (see software-dev). */
+  async function stageResources(): Promise<boolean> {
+    if (!resourceCandidateReview || !patched('resource-candidate-staging-v1')) return false;
+    if (cancelled) return true;
+    // Most tasks propose none. If even the count fails, staging reports for itself.
+    const pending = await core.pendingResourceCandidates(taskId)
+      .catch((err) => { if (isCancellation(err)) throw err; return 1; });
+    if (!pending) return true;
+    stagingResources = true;
+    const priorStatus = status;
+    status = 'active';
+    await publish();
+    const scope = new CancellationScope({ cancellable: true });
+    activeStaging = scope; // from here a cancel reaches the activity; before, it is seen below
+    try { if (!cancelled) await scope.run(() => resourceStaging.stageResourceCandidates(taskId)); }
+    catch (err) { if (isCancellation(err) && !cancelled) throw err; }
+    finally { activeStaging = undefined; stagingResources = false; status = priorStatus; }
+    return true;
   }
   const publishConversation = conversationPublisher(workflowInfo().runId,
     (snapshot, reference) => publishTaskView(core, taskId, snapshot, reference));
@@ -258,6 +289,7 @@ async function justDoImpl(
   setHandler(cancelSignal, () => {
     cancelled = true;
     leaser?.cancelActive();
+    activeStaging?.cancel();
   });
 
   await publish();
@@ -324,8 +356,15 @@ async function justDoImpl(
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     // `pause`: resume the agent when it is over.
     if (turn.wait && patched('agent-wait-v1')) {
+      const needsInput = turn.wait.needsInput;
       const note = await waitForAgent(turn.wait, {
         world,
+        ...(needsInput ? { ask: {
+          kind: 'human' as const,
+          audience: needsInput.audience?.length ? needsInput.audience : ['@creator'],
+          detail: needsInput.message ?? (turn.output?.trim() || 'The agent paused for your input.'),
+          ...(needsInput.urgency ? { urgency: needsInput.urgency } : {}),
+        } } : {}),
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
         interrupted: () => cancelled || msgs.length > seen,
       });
@@ -381,6 +420,7 @@ async function justDoImpl(
     let backToDo = false;
     const automaticResources = resourceCandidateReview && patched('automatic-resource-review-v1');
     if (automaticResources) await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
+    await stageResources();
     if (resourceCandidateReview && !automaticResources) {
       let resolutionAtWait = resourceResolutionEpoch;
       let pending = await core.pendingResourceCandidates(taskId);
@@ -436,7 +476,8 @@ async function justDoImpl(
     if (cancelled) break;
     if (!backToDo) {
       approved = true;
-      if (automaticResources) {
+      // A cancel during staging stops here: nothing is adopted for a cancelled task.
+      if (automaticResources && !(await stageResources() && cancelled)) {
         applyingResources = true;
         status = 'active';
         await publish();
@@ -454,6 +495,7 @@ async function justDoImpl(
       const remote = remoteWorldProvider(world.provider ?? world.kind);
       await core.destroyWorld(world as any);
       if (remote) {
+        releasedWorld = world;
         world = undefined;
         await publish();
       }
@@ -488,6 +530,7 @@ async function justDoImpl(
     const remote = remoteWorldProvider(world.provider ?? world.kind);
     await core.destroyWorld(world as any);
     if (remote) {
+      releasedWorld = world;
       world = undefined;
       await publish();
     }

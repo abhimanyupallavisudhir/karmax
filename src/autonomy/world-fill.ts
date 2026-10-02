@@ -72,6 +72,8 @@ export async function openWorldPage(world: World, opts: {
   cdpUrl: string;
   timeoutMs?: number;
   onClose?: () => void | Promise<void>;
+  /** Prefer a page on `expectDomains`, else take any; the origin is then not checked. */
+  anyPage?: boolean;
 }): Promise<{ session: CdpSession; origin: string }> {
   if (!opts.expectDomains.length) throw new Error('a browser session requires target domains');
   // Some providers type the command into an interactive shell, where a newline
@@ -86,7 +88,7 @@ export async function openWorldPage(world: World, opts: {
   // Raw mode: no echo of the relayed messages and no line-length limit. Some
   // providers type the command into an interactive shell, so it is one line.
   const pty = await world.openPty({ cwd: world.handle.root,
-    command: `stty raw -echo 2>/dev/null; exec node ${[helper, '--bridge', nonce, opts.expectDomains.join(','), opts.cdpUrl].map(shellQuote).join(' ')}` });
+    command: `stty raw -echo 2>/dev/null; exec node ${[helper, '--bridge', nonce, opts.expectDomains.join(','), opts.cdpUrl, ...(opts.anyPage ? ['--any'] : [])].map(shellQuote).join(' ')}` });
   let nextId = 1;
   let closed = false;
   const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
@@ -145,5 +147,5 @@ export async function openWorldPage(world: World, opts: {
   } finally {
     clearTimeout(timer);
   }
-  return verifiedPage(session, opts.expectDomains);
+  return verifiedPage(session, opts.anyPage ? undefined : opts.expectDomains);
 }

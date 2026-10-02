@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import type { World } from '../src/world/types.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
@@ -14,6 +15,14 @@ const until = async (check: () => Promise<boolean>, ms = 10_000) => {
   while (Date.now() < end) { if (await check()) return; await new Promise((r) => setTimeout(r, 100)); }
   throw new Error('condition not met');
 };
+
+/** /proc/<pid>/stat after the command name: [state, ppid, pgrp, session, …]. */
+const procStat = (pid: string) => { const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return stat.slice(stat.lastIndexOf(') ') + 2).split(' '); };
+/** Live processes whose argv[0] is `name` (set with `exec -a`); zombies hold nothing. */
+const named = (name: string) => fs.readdirSync('/proc').filter((e) => /^\d+$/.test(e)).filter((e) => {
+  try { return procStat(e)[0] !== 'Z' && fs.readFileSync(`/proc/${e}/cmdline`, 'utf8').split('\0')[0] === name; } catch { return false; }
+});
+const marker = () => `karmax-test-${Math.random().toString(36).slice(2, 10)}`;
 
 describe('durable jobs (real worktree world)', () => {
   let home: string;
@@ -92,6 +101,57 @@ describe('durable jobs (real worktree world)', () => {
     expect(survivors).toEqual([]);
   });
 
+  // #466: a vitest fork worker outlived stop_job twice. The job's session
+  // leader died on SIGTERM at once, so the stop never followed up with SIGKILL.
+  it('kills a child that ignores SIGTERM', async () => {
+    const m = marker();
+    const job = await startJob(world, { command: `bash -c 'trap "" TERM; exec -a ${m} sleep 120' & wait` });
+    await until(async () => named(m).length === 1);
+    await stopJobs(world, [job.id]);
+    expect(named(m)).toEqual([]);
+  });
+
+  it('kills children that left its process group or its session', async () => {
+    const m = marker();
+    const job = await startJob(world, { command: [
+      `(set -m; bash -c 'exec -a ${m}-group sleep 120' & wait) &`,
+      `setsid bash -c 'exec -a ${m}-session sleep 120' &`,
+      `setsid bash -c 'setsid bash -c "trap \\"\\" TERM; exec -a ${m}-deep sleep 120" & wait' &`,
+      'wait',
+    ].join('\n') });
+    const kinds = ['group', 'session', 'deep'];
+    await until(async () => kinds.every((kind) => named(`${m}-${kind}`).length === 1));
+    const pid = fs.readFileSync(path.join(world.handle.root, '.karmax-injection/jobs', job.id, 'pid'), 'utf8').trim();
+    const [group, session, deep] = kinds.map((kind) => procStat(named(`${m}-${kind}`)[0]!));
+    // They really escaped: a group of its own, then sessions of their own.
+    expect(group![2]).not.toBe(pid);
+    expect(group![3]).toBe(pid);
+    expect(session![3]).not.toBe(pid);
+    expect(deep![3]).not.toBe(pid);
+    await stopJobs(world, [job.id]);
+    expect(kinds.flatMap((kind) => named(`${m}-${kind}`))).toEqual([]);
+  });
+
+  it('stops what an exited job left running, and nothing that is not its own', async () => {
+    const m = marker();
+    const job = await startJob(world, { command: `setsid bash -c 'exec -a ${m}-left sleep 120' & echo started` });
+    const other = await startJob(world, { command: `exec -a ${m}-other sleep 120` });
+    const stranger = spawn('bash', ['-c', `exec -a ${m}-stranger sleep 120`], { stdio: 'ignore' });
+    try {
+      await until(async () => (await jobStatuses(world, [job.id]))[0]!.state === 'exited'
+        && ['left', 'other', 'stranger'].every((kind) => named(`${m}-${kind}`).length === 1));
+      await stopJobs(world, [job.id]);
+      expect(named(`${m}-left`)).toEqual([]);
+      expect(named(`${m}-other`)).toHaveLength(1);
+      expect(named(`${m}-stranger`)).toHaveLength(1);
+      expect((await jobStatuses(world, [other.id]))[0]!.state).toBe('running');
+      // A world's teardown stops every job it ever ran.
+      await stopJobs(world);
+      expect(named(`${m}-other`)).toEqual([]);
+      expect(named(`${m}-stranger`)).toHaveLength(1);
+    } finally { stranger.kill('SIGKILL'); }
+  });
+
   it('a waiter process exits when the jobs finish, or at its deadline', async () => {
     const job = await startJob(world, { command: 'sleep 1' });
     const waiter = await startJobWaiter(world, [job.id], 60);
@@ -156,6 +216,69 @@ describe('durable jobs (real worktree world)', () => {
       expect(ctx.waits).toEqual([{ minutes: 10 }, { minutes: 90, jobs: [running.id] }]);
     });
 
+    // An agent that paused while waiting on someone's answer read "Paused", and
+    // nobody was told. needs_input makes the same pause an ask.
+    it('a job may be named, and the name follows it to every wait on it', async () => {
+      const ctx = { started: [] as string[], waits: [] as AgentWait[] };
+      const t = tools(ctx);
+      expect(await t.start_job!({ command: 'sleep 30', name: 'x'.repeat(61) })).toBe('error: name must be at most 60 characters');
+      const reply = await t.start_job!({ command: 'sleep 30', name: '  render\nfinal  ' });
+      const render = reply.match(/job-[a-f0-9]{8}/)![0];
+      expect(reply).toContain(`Started job ${render} (render final)`);
+      const unnamed = (await t.start_job!({ command: 'sleep 30' })).match(/job-[a-f0-9]{8}/)![0];
+      expect((await jobStatuses(world, [render, unnamed])).map((job) => job.name)).toEqual(['render final', undefined]);
+      expect(describeJobs(await jobStatuses(world, [render]))).toContain(`Job ${render} (render final) is still running`);
+
+      expect(await t.pause!({ minutes: 30, jobs: [render, unnamed] })).toContain('Waiting for');
+      expect(await t.pause!({ minutes: 30, jobs: [render] })).toBe('error: ' + unnamed + ' is still running. Pass it in jobs: a pause without it lets the world be suspended, which freezes it. You are still resumed after minutes at the latest.');
+      await stopJobs(world, [unnamed]);
+      expect(await t.pause!({ minutes: 30, jobs: [render] })).toContain('Waiting for render final');
+      expect(ctx.waits).toEqual([
+        { minutes: 30, jobs: [render, unnamed], jobNames: ['render final'] },
+        { minutes: 30, jobs: [render], jobNames: ['render final'] },
+      ]);
+      await stopJobs(world, [render]);
+    });
+
+    it('pause with needs_input asks for an answer, routed and as loud as the agent said', async () => {
+      const ctx = { started: [] as string[], waits: [] as AgentWait[] };
+      const targets = { users: [{ selector: 'user:ana' }], teams: [{ selector: '@team:ops' }], special: [{ selector: '@creator' }] };
+      const requests: string[] = [];
+      const t = platformToolHandlers(world, {
+        requestWait: (wait: AgentWait) => { ctx.waits.push(wait); },
+        platformRequest: async (method: string, requestPath: string) => { requests.push(`${method} ${requestPath}`); return targets; },
+        emit: () => {},
+      } as any);
+      // pause waits on jobs and events; it is not how an agent asks for input it needs.
+      const pause = TOOL_SCHEMAS.find((tool) => tool.name === 'pause')!;
+      expect(pause.description).toContain('It is not for asking: if you need an answer to continue, call escalate_to_human or end your turn with the question.');
+      const schema = pause.parameters as any;
+      expect(Object.keys(schema.properties)).toEqual(['minutes', 'jobs', 'needs_input', 'message', 'audience', 'urgency']);
+      expect(schema.properties.urgency.enum).toEqual(['low', 'normal', 'high', 'critical']);
+
+      // The ask's fields only mean something on an ask.
+      expect(await t.pause!({ minutes: 5, urgency: 'high' })).toBe('error: message, audience and urgency apply only with needs_input: true');
+      // A route nobody receives would park the task on an ask nobody sees.
+      expect(await t.pause!({ minutes: 5, needs_input: true, audience: ['user:nobody'] }))
+        .toBe('error: no such route: user:nobody. Valid routes: user:ana, @team:ops, @creator');
+      expect(await t.pause!({ minutes: 5, needs_input: true, audience: ['avatar:a1'] }))
+        .toBe('error: avatar:a1: ask an Avatar with escalate_to_human');
+      expect(await t.pause!({ minutes: 5, needs_input: true, message: '  ' })).toBe('error: message must not be empty');
+      expect(ctx.waits).toEqual([]);
+
+      const asked = await t.pause!({ minutes: 120, needs_input: true, audience: ['user:ana', '@team:ops'],
+        message: 'Which region should the bucket live in?', urgency: 'high' });
+      expect(asked).toContain('Asking user:ana, @team:ops');
+      expect(asked).toContain('after 120 min to carry on without it');
+      // With no question, the final response is the question.
+      expect(await t.pause!({ minutes: 30, needs_input: true })).toContain('with the question as your final response');
+      expect(ctx.waits).toEqual([
+        { minutes: 120, needsInput: { message: 'Which region should the bucket live in?', audience: ['user:ana', '@team:ops'], urgency: 'high' } },
+        { minutes: 30, needsInput: {} },
+      ]);
+      expect(requests).toEqual(['GET /api/agent/escalation-targets', 'GET /api/agent/escalation-targets']);
+    });
+
     it('stop_job stops running jobs and reports each one', async () => {
       const t = tools({ started: [], waits: [] });
       expect(await t.stop_job!({ jobs: [] })).toBe('error: jobs is required');
@@ -165,7 +288,25 @@ describe('durable jobs (real worktree world)', () => {
       expect(reply).toContain(`Stopped ${runaway.id}.`);
       expect((await jobStatuses(world, [runaway.id]))[0]!.state).not.toBe('running');
       expect(await t.stop_job!({ jobs: [runaway.id] })).toBe(`${runaway.id} had already stopped.`);
+
+      const m = marker();
+      const leaver = await startJob(world, { command: `bash -c 'exec -a ${m} sleep 120' &` });
+      await until(async () => (await jobStatuses(world, [leaver.id]))[0]!.state === 'exited' && named(m).length === 1);
+      expect(await t.stop_job!({ jobs: [leaver.id] })).toBe(`${leaver.id} had already exited; ended the 1 process it left running.`);
+      expect(named(m)).toEqual([]);
     });
+  });
+
+  it('stop_job names processes that survive SIGKILL', async () => {
+    const id = 'job-0000000b';
+    const fake = { handle: world.handle, exec: async (_cmd: string, args: string[]) => {
+      if (args[2] === 'karmax-job-stop') return { code: 0, stdout: `stopped ${id} 3\nsurvivor ${id} 41\nsurvivor ${id} 42\n`, stderr: '' };
+      const boundary = args[3];
+      return { code: 0, stdout: `${boundary} ${id} lost 1 \n\n\n${boundary} end\n`, stderr: '' };
+    } } as unknown as World;
+    expect(await stopJobs(fake, [id])).toEqual([{ id, processes: 3, survivors: [41, 42] }]);
+    const t = platformToolHandlers(fake, { emit: () => {} } as any);
+    expect(await t.stop_job!({ jobs: [id] })).toBe(`${id}: processes 41, 42 survived SIGKILL.`);
   });
 
   it('describes jobs for the resumed agent', () => {

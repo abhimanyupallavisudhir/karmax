@@ -999,13 +999,14 @@ class GitPassStoreConnector implements CredentialConnector {
       throw new Error('Git-backed pass connection is invalid');
     }
     const value = parsed as Partial<GitPassConnection>;
-    const repositoryUrl = String(value.repositoryUrl ?? '').trim();
+    let repositoryUrl = String(value.repositoryUrl ?? '').trim();
     if (!repositoryUrl) throw new Error('repository URL is required');
     if (this.options.hosted) {
-      const url = new URL(repositoryUrl);
-      if (url.protocol !== 'https:' || !['github.com', 'gitlab.com', 'bitbucket.org'].includes(url.hostname)
+      repositoryUrl = hostedHttpsRepositoryUrl(repositoryUrl);
+      const url = URL.parse(repositoryUrl);
+      if (url?.protocol !== 'https:' || !HOSTED_GIT_HOSTS.includes(url.hostname)
         || (url.port && url.port !== '443') || url.username || url.password)
-        throw new Error('hosted Git password stores require public GitHub, GitLab or Bitbucket HTTPS URLs');
+        throw new Error('hosted Git password stores need a GitHub, GitLab or Bitbucket URL such as https://github.com/you/password-store');
     }
     if (!this.options.allowLocalRepository && !isRemoteGitUrl(repositoryUrl)) {
       throw new Error('repository must use an HTTPS or SSH repository URL');
@@ -1395,6 +1396,16 @@ function isRemoteGitUrl(value: string): boolean {
   return /^https:\/\/[^\s]+$/i.test(value)
     || /^ssh:\/\/[^\s]+$/i.test(value)
     || /^(?:[^@\s]+@)?[^:\s/]+:(?!:)[^\s]+$/.test(value);
+}
+
+const HOSTED_GIT_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
+
+/** `git@github.com:you/store.git` and `ssh://git@github.com/you/store.git` name
+ * the same repository as its HTTPS URL, the only transport hosted Git uses. */
+function hostedHttpsRepositoryUrl(value: string): string {
+  const ssh = value.match(/^git@([^:/\s]+):(?!\/)(\S+)$/) ?? value.match(/^ssh:\/\/git@([^:/\s]+)(?::22)?\/(\S+)$/i);
+  const host = ssh?.[1]!.toLowerCase();
+  return host && HOSTED_GIT_HOSTS.includes(host) ? `https://${host}/${ssh![2]}` : value;
 }
 
 function githubRepositorySlug(value: string): string | undefined {
@@ -2132,6 +2143,7 @@ export class Connectors {
     if (!(await this.config(name)).writeBack) return undefined;
     const item = (await this.items.get(itemId));
     if (!item) throw new Error(`no vault item ${itemId}`);
+    if (item.type === 'session') throw new Error('a saved browser session stays in the vault: it expires and rotates, so it is not written to other stores');
     if (item.provenance.source.startsWith('import:')) {
       throw new Error('this item came from a one-way file import; write-back to the imported file is unavailable');
     }
@@ -2161,6 +2173,7 @@ export class Connectors {
    */
   async writeBackCreated(itemId: string): Promise<Array<{ connector: string; externalId?: string; error?: string }>> {
     const results: Array<{ connector: string; externalId?: string; error?: string }> = [];
+    if ((await this.items.get(itemId))?.type === 'session') return results;
     for (const name of this.names()) {
       if (!(await this.config(name)).writeBack) continue;
       try {

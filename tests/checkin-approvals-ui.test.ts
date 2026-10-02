@@ -71,4 +71,13 @@ describe('check-in pending decisions', () => {
     expect(c.resourceReviewNeedsAction({ ...item, summary: { added: 0, modified: 0, deleted: 0 } })).toBe(false);
     expect(c.resourceReviewNeedsAction({ ...item, resource: { publish: 'discard' } })).toBe(false);
   });
+  it('keeps a candidate whose snapshot failed until the same path is staged again', () => {
+    const c = setup();
+    const failed = { candidate: { id: 'c1', state: 'discarded', sourcePath: 'data', error: 'disk full', createdAt: 1 } };
+    expect(c.resourceReviewNeedsAction(failed, [failed])).toBe(true);
+    const reviewerDiscarded = { candidate: { id: 'c0', state: 'discarded', sourcePath: 'old', createdAt: 0 } };
+    expect(c.resourceReviewNeedsAction(reviewerDiscarded, [reviewerDiscarded])).toBe(false);
+    const retried = { candidate: { id: 'c2', state: 'pending', sourcePath: 'data', createdAt: 2 } };
+    expect(c.resourceReviewNeedsAction(failed, [failed, retried])).toBe(false);
+  });
 });

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { chromium, type Browser } from 'playwright';
+import { chromium, type Browser, type WebSocketRoute } from 'playwright';
 
 /**
  * The real console scripts in a real browser, with a scripted `/api`. For UI
@@ -35,7 +35,11 @@ export async function closeConsoleBrowser(): Promise<void> {
 }
 
 export async function consolePage(options: { api?: ApiHandler; viewport?: { width: number; height: number };
-  /** The page's location; the console routes by it. */ path?: string } = {}) {
+  /** The page's location; the console routes by it. */ path?: string;
+  /** Plays the gateway's `/ws` event socket. */
+  webSocket?: (socket: WebSocketRoute) => void;
+  /** Install Playwright's fake clock before the console loads (`page.clock`). */
+  clock?: boolean } = {}) {
   browser ??= chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--no-sandbox'] });
   const context = await (await browser).newContext({ serviceWorkers: 'block', viewport: options.viewport ?? { width: 1280, height: 900 } });
   const calls: ApiCall[] = [];
@@ -59,7 +63,9 @@ export async function consolePage(options: { api?: ApiHandler; viewport?: { widt
       return route.fulfill({ status: (reply as any).status, json: (reply as any).json ?? {} });
     return route.fulfill({ json: reply });
   });
+  if (options.webSocket) await context.routeWebSocket('**/ws*', options.webSocket);
   const page = await context.newPage();
+  if (options.clock) await page.clock.install();
   // Fail a missing element within a test's budget instead of Playwright's 30 s default.
   page.setDefaultTimeout(8_000);
   page.on('pageerror', (error) => errors.push(error.message));
