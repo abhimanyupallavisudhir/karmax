@@ -6560,7 +6560,10 @@ export class Gateway {
               policy: (await vault.effectivePolicy(callerTaskId, item)),
             }))));
         }
-        if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, (await vault.listForSelection()));
+        if (p === '/api/vault/items' && method === 'GET') {
+          const canReveal = (await this.deps.tokens.check(token, 'credential:reveal', { organizationId })).ok;
+          return this.json(res, 200, (await vault.listForSelection()).map((item) => ({ ...item, canReveal })));
+        }
         if (p === '/api/vault/items' && method === 'POST') {
           const b = await this.body(req);
           const domains = Array.isArray(b.domains) ? b.domains.map(String) : typeof b.domains === 'string' ? b.domains.split(/[,\s]+/).filter(Boolean) : undefined;

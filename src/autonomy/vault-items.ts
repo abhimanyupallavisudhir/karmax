@@ -662,10 +662,6 @@ export class VaultItems {
     const policyForTask = (await this.effectivePolicy(taskId, item));
     if (mode === 'reveal' && policyForTask.reveal === 'never') return { status: 'denied', reason: `"${item.label}" is never revealed in plaintext (${taskId ? 'task' : 'item'} policy)` };
     if (taskId && !opts.ambient && (await this.takePass(taskId, item.id, mode, opts.consume ?? false))) return { status: 'granted' };
-    // Vault read access (Super-administrator) needs no grant or approval for an
-    // explicit request. Ambient injection still follows grants and policy, so
-    // such a task does not carry the whole vault in its environment.
-    if (!opts.ambient && allows(caps, 'credential:reveal')) return { status: 'granted' };
     if (!(await this.covered(caps, taskId, item))) return { status: 'needs_approval', reason: 'this task was not granted this credential' };
     const policy = mode === 'reveal' ? policyForTask.reveal : policyForTask.use;
     if (policy !== 'auto') return { status: 'needs_approval', reason: `"${item.label}" requires per-${mode} approval (${taskId ? 'task' : 'item'} policy)` };

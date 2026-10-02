@@ -148,6 +148,9 @@ describe('vault read access needs Super-administrator', () => {
     const admin = await agent('administrator');
     const superadmin = await agent('superadmin');
 
+    // The console disables View for whoever cannot reveal.
+    expect((await (await admin.call('/api/vault/items')).json() as any[]).map((item) => item.canReveal)).toEqual([false]);
+    expect((await (await superadmin.call('/api/vault/items')).json() as any[]).map((item) => item.canReveal)).toEqual([true]);
     const reveal = await admin.call(`/api/vault/items/${login.id}/reveal`, { field: 'password' });
     expect(reveal.status).toBe(403);
     const refusal = (await reveal.json() as any).error as string;
@@ -186,18 +189,18 @@ describe('vault read access needs Super-administrator', () => {
     expect((await superadmin.call(`/api/vault/requests/${second.requestId}/resolve`, { action: 'once' })).status).toBe(200);
   });
 
-  it('gives a Super-administrator agent the vault without asking, and an Administrator only what policy allows', async () => {
+  it('keeps "ask" a request a person sees, while only a Super-administrator can read past it', async () => {
     const { vault, agent } = await vaultGateway();
     const key = await vault.save({ type: 'api-key', label: 'Stripe', policy: { use: 'ask', reveal: 'ask' }, secrets: { secret: 'sk_live_super_secret' } });
     const open = await vault.save({ type: 'api-key', label: 'Search', policy: { use: 'auto', reveal: 'auto' }, secrets: { secret: 'search-key-value' } });
     const admin = await agent('administrator');
     const superadmin = await agent('superadmin');
-    const asked = await admin.call('/api/vault/resolve', { itemId: key.id, field: 'secret' });
-    expect((await asked.json() as any).status).toBe('needs_approval');
-    const allowed = await admin.call('/api/vault/resolve', { itemId: open.id, field: 'secret' });
-    expect((await allowed.json() as any)).toMatchObject({ status: 'granted', value: 'search-key-value' });
-    const granted = await superadmin.call('/api/vault/resolve', { itemId: key.id, field: 'secret' });
-    expect((await granted.json() as any)).toMatchObject({ status: 'granted', value: 'sk_live_super_secret' });
+    for (const caller of [admin, superadmin])
+      expect((await (await caller.call('/api/vault/resolve', { itemId: key.id, field: 'secret' })).json() as any).status).toBe('needs_approval');
+    expect((await (await admin.call('/api/vault/resolve', { itemId: open.id, field: 'secret' })).json() as any))
+      .toMatchObject({ status: 'granted', value: 'search-key-value' });
+    expect((await admin.call(`/api/vault/items/${key.id}/reveal`, { field: 'secret' })).status).toBe(403);
+    expect((await (await superadmin.call(`/api/vault/items/${key.id}/reveal`, { field: 'secret' })).json() as any).value).toBe('sk_live_super_secret');
   });
 
   it('keeps an Administrator from pointing a password-store connector somewhere else', async () => {

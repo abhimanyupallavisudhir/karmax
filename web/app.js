@@ -16101,7 +16101,7 @@ async function wireVaultCards(organizationId) {
           <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           ${i.type === 'session' ? `<label title="${esc(SESSION_EXCLUSIVE_TIP)}">one task at a time <input type="checkbox" class="vi-exclusive" ${i.exclusive ? 'checked' : ''}></label>` : ''}
-          <button class="btn sm" data-vi-reveal="${esc(i.id)}" title="Temporarily inspect one stored field (audited)" ${(i.fields || []).length ? '' : 'disabled'}>View</button>
+          <button class="btn sm" data-vi-reveal="${esc(i.id)}" title="${i.canReveal === false ? 'Viewing secrets needs Super-administrator authorization' : 'Temporarily inspect one stored field (audited)'}" ${(i.fields || []).length && i.canReveal !== false ? '' : 'disabled'}>View</button>
           ${i.type === 'session' ? '' : `<button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>`}
           <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button>
           <div class="vault-reveal-panel" hidden>
