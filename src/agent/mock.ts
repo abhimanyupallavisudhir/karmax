@@ -21,8 +21,10 @@ import { platformToolHandlers } from './tools.js';
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
  *   @wait                           parent parks until its sub-tasks finish/raise
  *   @job <command>                  start a durable job (the start_job tool)
+ *   @namedjob <name> :: <command>   the same, with a name
  *   @pause <minutes> [:: last]      the pause tool: a timed pause, or (`last`) also wait
- *                                   for the job this turn started last
+ *                                   for the job this turn started last; `:: input [<urgency>]
+ *                                   [-- <question>]` sets needs_input (combinable with `last`)
  *   @subagents <n>                  report in-harness sub-agents (Task tool) still running:
  *                                   N this turn, then N-1, … draining by one each turn until
  *                                   0 — models sub-agents that settle over several turns
@@ -194,16 +196,25 @@ export class MockAdapter implements AgentAdapter {
           outputs.push('wait');
           break;
         }
-        case 'job': {
-          const result = await platformToolHandlers(input.world, ctx).start_job!({ command: rest });
+        case 'job':
+        case 'namedjob': {
+          // A command may itself contain `::`, so only the name is split off.
+          const [name, command] = directive === 'namedjob' ? splitOn(rest, '::') : ['', rest];
+          const result = await platformToolHandlers(input.world, ctx).start_job!({ command: command.trim(), ...(name.trim() ? { name: name.trim() } : {}) });
           lastJob = result.match(/job-[a-f0-9]{8}/)?.[0];
           outputs.push(result.split('\n')[0]!);
           break;
         }
         case 'pause': {
-          const [minutes, which = ''] = splitOn(rest, '::');
-          const jobs = which.trim() === 'last' && lastJob ? [lastJob] : undefined;
-          outputs.push(await platformToolHandlers(input.world, ctx).pause!({ minutes: Number(minutes.trim()), ...(jobs ? { jobs } : {}) }));
+          // @pause <minutes> [:: last] [input [<urgency>] [-- <question>]]
+          const [minutes, options = ''] = splitOn(rest, '::');
+          const [flags = '', question] = options.split(' -- ');
+          const words = flags.trim().split(/\s+/);
+          const jobs = words.includes('last') && lastJob ? [lastJob] : undefined;
+          const urgency = words.find((word) => ['low', 'normal', 'high', 'critical'].includes(word));
+          const asks = words.includes('input')
+            ? { needs_input: true, ...(urgency ? { urgency } : {}), ...(question?.trim() ? { message: question.trim() } : {}) } : {};
+          outputs.push(await platformToolHandlers(input.world, ctx).pause!({ minutes: Number(minutes.trim()), ...(jobs ? { jobs } : {}), ...asks }));
           complete = false;
           break;
         }

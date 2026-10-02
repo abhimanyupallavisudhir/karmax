@@ -354,8 +354,15 @@ async function justDoImpl(
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     // `pause`: resume the agent when it is over.
     if (turn.wait && patched('agent-wait-v1')) {
+      const needsInput = turn.wait.needsInput;
       const note = await waitForAgent(turn.wait, {
         world,
+        ...(needsInput ? { ask: {
+          kind: 'human' as const,
+          audience: needsInput.audience?.length ? needsInput.audience : ['@creator'],
+          detail: needsInput.message ?? (turn.output?.trim() || 'The agent paused for your input.'),
+          ...(needsInput.urgency ? { urgency: needsInput.urgency } : {}),
+        } } : {}),
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
         interrupted: () => cancelled || msgs.length > seen,
       });

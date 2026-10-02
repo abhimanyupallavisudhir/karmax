@@ -10170,13 +10170,20 @@ function waitingText(w) {
     const summary = w.summary.replace(/\s+/g, ' ').trim();
     if (summary) return summary.slice(0, 72);
   }
-  if (w?.kind === 'human') return 'Needs input';
-  if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Paused until ${waitDeadline(w.until)}` : 'Paused';
+  // A paused agent's ask carries the time it carries on without an answer.
+  if (w?.kind === 'human') return Number.isFinite(w.until) ? `Needs input until ${waitDeadline(w.until)}` : 'Needs input';
+  if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Waiting until ${waitDeadline(w.until)}` : 'Waiting';
   if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
-  // The deadline is when the agent resumes even if the job never finishes.
-  if (w?.kind === 'job' && Number.isFinite(w.until)) return `Waiting for job until ${waitDeadline(w.until)}`;
+  // A job is shown by the name its agent gave it. The deadline is when the
+  // agent resumes even if the job never finishes.
+  if (w?.kind === 'job') {
+    const job = typeof w.summary === 'string' && w.summary.trim() ? w.summary.trim().slice(0, 72) : 'job';
+    return `Waiting for ${job}${Number.isFinite(w.until) ? ` until ${waitDeadline(w.until)}` : ''}`;
+  }
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
+  // A sub-task asking its parent carries on without an answer at `until`.
+  if (w?.kind === 'parent' && Number.isFinite(w.until)) return `Waiting for parent until ${waitDeadline(w.until)}`;
   return `Waiting for ${label}`;
 }
 
