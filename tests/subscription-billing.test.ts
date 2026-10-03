@@ -528,7 +528,7 @@ describe('subscription administration HTTP authorization', () => {
     vi.unstubAllEnvs();
   });
 
-  const post = (action: 'gift' | 'checkout' | 'portal' | 'change' | 'cancel' | 'sync-seats' | 'storage-packs',
+  const post = (action: 'gift' | 'gift-storage' | 'checkout' | 'portal' | 'change' | 'cancel' | 'sync-seats' | 'storage-packs',
     organizationId: string, token: string, body: Record<string, unknown> = {}) => fetch(
     `${base}/api/organizations/${organizationId}/subscription/${action}`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json',
@@ -683,6 +683,27 @@ describe('subscription administration HTTP authorization', () => {
     expect((await post('gift', recipient.id, scoped.token)).status).toBe(403);
     expect((await post('gift', recipient.id, agent.token, { plan: null })).status).toBe(200);
     expect((await billing.current(recipient.id)).plan).toBe('free');
+  });
+
+  it('lets Gods gift storage packs across organizations and denies organization owners', async () => {
+    const recipient = await store.createOrganization({ name: 'Pack gift recipient', ownerUserId: 'someone-else' });
+    const before = provider.calls.length;
+    const result = await post('gift-storage', recipient.id, browserToken, { packs: 2 });
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({ giftedStoragePacks: 2, storagePackGift: { packs: 2, grantedBy: 'user:me' } });
+    expect(provider.calls.length).toBe(before);
+    const entitlements = await fetch(`${base}/api/organizations/${recipient.id}/entitlements`, {
+      headers: { authorization: `Bearer ${browserToken}` } });
+    expect(await entitlements.json()).toMatchObject({ plan: 'free', giftedStoragePacks: 2, storageQuotaBytes: 205 * 1024 ** 3 });
+    const owner = await tokens.mintPrincipal('user:someone-else', ['organization:*', 'payment:*'], undefined, undefined, recipient.id);
+    expect((await post('gift-storage', recipient.id, owner.token, { packs: 5 })).status).toBe(403);
+    const invalid = await post('gift-storage', recipient.id, browserToken, { packs: -1 });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: expect.stringMatching(/whole number/) });
+    expect(await store.db.prepare("SELECT principalId FROM audit_log WHERE action='subscription.gift-storage' AND scopeKey=?")
+      .all(`organization:${recipient.id}`)).toEqual([{ principalId: 'user:me' }]);
+    expect((await post('gift-storage', recipient.id, browserToken, { packs: 0 })).status).toBe(200);
+    expect((await store.organizationEntitlements(recipient.id)).giftedStoragePacks).toBe(0);
   });
 
   it('lets the interactive owner change storage packs on a verified subscription', async () => {

@@ -801,6 +801,10 @@ export class Store {
         organizationId TEXT PRIMARY KEY, plan TEXT NOT NULL,
         grantedBy TEXT NOT NULL, grantedAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS storage_pack_gifts (
+        organizationId TEXT PRIMARY KEY, packs INTEGER NOT NULL,
+        grantedBy TEXT NOT NULL, grantedAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS subscription_billing_checkouts (
         provider TEXT NOT NULL, checkoutId TEXT NOT NULL, organizationId TEXT NOT NULL,
         createdAt INTEGER NOT NULL, subscriptionId TEXT, state TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY (provider, checkoutId)
@@ -1831,7 +1835,29 @@ export class Store {
     const organization = (await this.getOrganization(organizationId));
     if (!organization) throw new Error(`no organization ${organizationId}`);
     return organizationEntitlements(organization.plan, this.hosted,
-      (await this.listOrganizationMemberships(organizationId)).length, organization.storagePacks ?? 0);
+      (await this.listOrganizationMemberships(organizationId)).length, organization.storagePacks ?? 0,
+      (await this.storagePackGift(organizationId))?.packs ?? 0);
+  }
+
+  /** Storage packs the operator gifted, independent of billing. */
+  async storagePackGift(organizationId: string): Promise<{ packs: number; grantedBy: string; grantedAt: number } | null> {
+    const row = (await this.db.prepare('SELECT packs, grantedBy, grantedAt FROM storage_pack_gifts WHERE organizationId=?')
+      .get(organizationId)) as { packs: number | string; grantedBy: string; grantedAt: number | string } | undefined;
+    return row ? { packs: Number(row.packs), grantedBy: row.grantedBy, grantedAt: Number(row.grantedAt) } : null;
+  }
+
+  /** Gift `packs` storage packs (0 removes the gift). Billing's
+   * SubscriptionBillingService.giftStoragePacks is the caller. */
+  async setStoragePackGift(organizationId: string, packs: number, grantedBy: string): Promise<void> {
+    await this.db.transaction(async () => {
+      if (!Number.isSafeInteger(packs) || packs < 0) throw new Error('gifted storage packs must be a non-negative integer');
+      if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
+      if (packs === 0) (await this.db.prepare('DELETE FROM storage_pack_gifts WHERE organizationId=?').run(organizationId));
+      else (await this.db.prepare(`INSERT INTO storage_pack_gifts (organizationId, packs, grantedBy, grantedAt) VALUES (?, ?, ?, ?)
+        ON CONFLICT(organizationId) DO UPDATE SET packs=excluded.packs, grantedBy=excluded.grantedBy, grantedAt=excluded.grantedAt`)
+        .run(organizationId, packs, grantedBy, Date.now()));
+      this.notifyOrganizationEntitlementsChanged(organizationId);
+    });
   }
 
   /** Billing's storage-pack mutation boundary, beside setOrganizationPlan: the
@@ -2060,6 +2086,7 @@ export class Store {
       payment_transactions: (await selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId])),
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
       subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
+      storage_pack_gifts: (await selectRows(this.db, 'storage_pack_gifts', 'organizationId=?', [organizationId])),
       subscription_billing_accounts: (await selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId])),
       subscription_billing_checkouts: (await selectRows(this.db, 'subscription_billing_checkouts', 'organizationId=?', [organizationId])),
       subscription_billing_locks: (await selectRows(this.db, 'subscription_billing_locks', 'organizationId=?', [organizationId])),
@@ -2307,6 +2334,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM payment_connections WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_requests WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_gifts WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM storage_pack_gifts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_accounts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_checkouts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=?').run(organizationId));
