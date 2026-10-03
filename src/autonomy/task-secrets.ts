@@ -39,7 +39,7 @@ type RefStore = {
  * one conversation (the Confirm agent's session is the intent's), so what one
  * received is scrubbed from all of them, and a turn finds them under the
  * intent it already knows, with no extra read. */
-async function intentOf(store: RefStore, taskId: string): Promise<string> {
+async function intentOf(store: Pick<RefStore, 'getTask'>, taskId: string): Promise<string> {
   return (store.getTask ? (await store.getTask(taskId))?.intentId : undefined) ?? taskId;
 }
 
