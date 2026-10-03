@@ -115,7 +115,7 @@ describe('historical snapshot byte verification', () => {
       };
       expect(await f.engine.verify(await replaceManifest(), 0, 100)).toMatchObject({ status: 'failed', manifestVerified: false });
       // With a valid tree digest, plaintext still has to match the individual file hash.
-      manifest.rootDigest = sha(Buffer.from(JSON.stringify(manifest.files)));
+      manifest.rootDigest = sha(Buffer.from(JSON.stringify(manifest.version === 2 ? { packs: manifest.packs, files: manifest.files } : manifest.files)));
       expect(await f.engine.verify(await replaceManifest(), 0, 100)).toMatchObject({
         status: 'failed', manifestVerified: true, verifiedFiles: 0,
       });

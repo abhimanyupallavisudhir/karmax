@@ -473,6 +473,10 @@ class WorktreeWorld implements World {
     return readRegularFilePrefix(this.filePath(relPath), maxBytes);
   }
 
+  async *readFileStream(relPath: string): AsyncGenerator<Buffer> {
+    for await (const chunk of fs.createReadStream(this.filePath(relPath))) yield chunk as Buffer;
+  }
+
   async writeFile(relPath: string, content: string): Promise<void> {
     const abs = this.filePath(relPath);
     await fs.promises.mkdir(path.dirname(abs), { recursive: true });

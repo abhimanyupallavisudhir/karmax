@@ -8,7 +8,8 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
-import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
+import { ObjectSnapshotEngine, ProjectResourceService, type SnapshotInputFile, type StagingProgress } from '../src/world/resources.js';
+import { chunkId, chunkObjectKey, openRandom, organizationKey, sealDeterministic, sealRandom, sha256 } from '../src/world/chunk-store.js';
 import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { createRequire } from 'node:module';
@@ -532,19 +533,21 @@ describe('project resources', () => {
       writer.exec('ROLLBACK'); writer.close();
       // Idle, it is read in place: no copy, and a write attempted meanwhile waits for the lock.
       let blocked = false;
-      calls.mockImplementation(async (command, args, options) => {
-        const answer = tight(command, args);
-        if (answer) return answer;
-        const result = await exec(command, args, options);
-        if (!blocked && command === 'bash' && String(args?.[1]).includes('records.db') && String(args?.[1]).includes('dd ')) {
-          const late = new DatabaseSync(file);
-          try { late.exec('INSERT INTO t VALUES (\'late\')'); } catch (error) { blocked = /locked/.test(String(error)); }
-          late.close();
+      calls.mockImplementation(async (command, args, options) => tight(command, args) ?? exec(command, args, options));
+      const stream = world.readFileStream!.bind(world);
+      const streamed = vi.spyOn(world, 'readFileStream').mockImplementation(async function* (name: string) {
+        for await (const piece of stream(name)) {
+          if (!blocked && name.endsWith('records.db')) {
+            const late = new DatabaseSync(file);
+            try { late.exec('INSERT INTO t VALUES (\'late\')'); } catch (error) { blocked = /locked/.test(String(error)); }
+            late.close();
+          }
+          yield piece;
         }
-        return result;
       });
       expect(await resources.stageCandidates(task.id, { final: true })).toMatchObject({ staged: [data.candidate.id], failed: [] });
       expect(blocked).toBe(true);
+      expect(streamed.mock.calls.map(([name]) => name)).toContain(worldWorkingRelativePath(world.handle, 'data/records.db'));
       expect(calls.mock.calls.some(([command]) => command === 'python3')).toBe(false);
       expect(fs.readdirSync(path.join(root, '.karmax-injection')).filter((name) => name.startsWith('sqlite-'))).toEqual([]);
       const revision = (await store.getResourceRevision((await store.getResourceAttachment(data.attachment.id))!.currentRevisionId!))!;
@@ -624,6 +627,237 @@ describe('project resources', () => {
       await resources.discardCandidate(task.id, data.candidate.id, 'user:reviewer');
       expect(allFiles(objects)).toHaveLength(0);
     } finally { await cleanup(); }
+  });
+
+  /** Many small files and one large one, as a scraped corpus is. */
+  function writeCorpus(root: string, count: number) {
+    const expected = new Map<string, Buffer>();
+    for (let i = 0; i < count; i++) {
+      const name = `pages/page-${String(i).padStart(4, '0')}.txt`;
+      const data = Buffer.from(`scanned page ${i}\n`.repeat(i % 7 + 1));
+      fs.mkdirSync(path.join(root, 'raw', path.dirname(name)), { recursive: true });
+      fs.writeFileSync(path.join(root, 'raw', name), data);
+      expected.set(name, data);
+    }
+    const large = crypto.randomBytes(5 * 1024 * 1024 + 3);
+    fs.writeFileSync(path.join(root, 'raw', 'large.bin'), large);
+    expected.set('large.bin', large);
+    expected.set('page.txt', Buffer.from('scanned page'));
+    return expected;
+  }
+  async function restoreAll(resources: ProjectResourceService, store: Store, attachmentId: string, into: string) {
+    const revision = (await store.getResourceRevision((await store.getResourceAttachment(attachmentId))!.currentRevisionId!))!;
+    await resources['engine'].restore(revision, async (name: string, bytes: Buffer, offset: number) => {
+      fs.mkdirSync(path.dirname(path.join(into, name)), { recursive: true });
+      fs.writeFileSync(path.join(into, name), bytes, { flag: offset ? 'a' : 'w' });
+    });
+    return revision;
+  }
+  const readsOf = (calls: Array<unknown[]>) => calls.filter(([command, args]) => command === 'node' && String((args as string[])?.[0]) === '-e'
+    && String((args as string[])?.[1]).includes('readSync'))
+    .flatMap(([, args]) => (JSON.parse(String((args as string[])[2])) as Array<[string]>).map(([file]) => path.basename(file)));
+  async function chunkRows(store: Store) {
+    return (await store.db.prepare('SELECT chunkId, refs FROM resource_snapshot_chunks').all()) as Array<{ chunkId: string; refs: number }>;
+  }
+
+  it('saves thousands of small files a batch per round trip, packed into a few objects', async () => {
+    const { store, task, resources, world, cleanup, objects } = await candidateFixture('stage-many');
+    try {
+      const root = world.handle.workdir ?? world.handle.root;
+      const expected = writeCorpus(root, 600);
+      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      const exec = world.exec.bind(world);
+      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
+      const calls = vi.spyOn(world, 'exec').mockImplementation(exec);
+      const progress: StagingProgress[] = [];
+      expect(await resources.stageCandidates(task.id, { final: true, onProgress: (next) => progress.push(next) }))
+        .toEqual({ staged: [raw.candidate.id], failed: [] });
+      // 601 small files: a handful of batched reads, never a command per file.
+      expect(readsOf(calls.mock.calls)).toHaveLength(601);
+      expect(calls.mock.calls.length).toBeLessThan(20);
+      expect(calls.mock.calls.some(([, args]) => String(args?.[1]).includes('dd '))).toBe(false);
+      // The small files share packs: a few objects, not one per file.
+      expect(allFiles(objects).length).toBeLessThan(8);
+      const totalBytes = [...expected.values()].reduce((sum, data) => sum + data.length, 0);
+      expect(progress.at(-1)).toEqual({ path: 'raw', index: 0, count: 1, files: 602, totalFiles: 602, bytes: totalBytes, totalBytes });
+      const restored = path.join(root, '..', 'restored-many');
+      const revision = await restoreAll(resources, store, raw.attachment.id, restored);
+      for (const [name, data] of expected) expect(fs.readFileSync(path.join(restored, name)).equals(data)).toBe(true);
+      expect(await resources['engine'].verify!(revision, 0, 1000)).toMatchObject({ status: 'complete', verifiedFiles: 602 });
+      // A refresh with nothing changed reads nothing.
+      await new Promise((resolve) => setTimeout(resolve, 2_200)); // past the racy-clean window
+      await resources.stageCandidates(task.id, { final: true });
+      calls.mockClear();
+      expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [], failed: [] });
+      expect(readsOf(calls.mock.calls)).toEqual([]);
+      // Discarding releases every object.
+      await resources.discardCandidate(task.id, raw.candidate.id, 'user:reviewer');
+      expect(allFiles(objects)).toEqual([]);
+      expect(await chunkRows(store)).toEqual([]);
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  }, 60_000);
+
+  it('resumes an interrupted save where it stopped, reading and uploading only what it had not saved', async () => {
+    const { store, task, resources, world, cleanup, objects } = await candidateFixture('stage-resume');
+    try {
+      const root = world.handle.workdir ?? world.handle.root;
+      const expected = writeCorpus(root, 600);
+      await new Promise((resolve) => setTimeout(resolve, 2_200)); // stable stamps, as a finished build's are
+      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      const exec = world.exec.bind(world);
+      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
+      // Each batched read takes "11 seconds", so progress is recorded after each;
+      // the third fails as a sandbox that went away would.
+      let now = Date.now();
+      vi.spyOn(Date, 'now').mockImplementation(() => now);
+      let reads = 0;
+      const calls = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) => {
+        if (command === 'node' && String(args?.[1]).includes('readSync')) {
+          now += 11_000;
+          if (++reads === 3) return { code: 1, stdout: '', stderr: 'sandbox unavailable' };
+        }
+        return exec(command, args, options);
+      });
+      const uploaded = vi.spyOn((resources['engine'] as ObjectSnapshotEngine)['objects'] as LocalObjectStore, 'put');
+      await expect(resources.stageCandidates(task.id)).rejects.toThrow('sandbox unavailable');
+      expect((await store.getResourceCandidate(raw.candidate.id))?.state).toBe('pending');
+      // Everything read before the failed batch was saved.
+      const readCalls = calls.mock.calls.filter(([command, args]) => command === 'node' && String(args?.[1]).includes('readSync'));
+      const saved = readsOf(readCalls.slice(0, -1));
+      const firstUploads = uploaded.mock.calls.map(([key]) => key);
+      expect(saved.length).toBeGreaterThanOrEqual(128);
+      expect(await store.kvGet(`resource-capture:${raw.attachment.id}`)).toBeTruthy();
+      // Each save adds a segment of what it completed, rather than rewriting them all.
+      expect((await store.kvEntries(`resource-capture:${raw.attachment.id}:`)).length).toBeGreaterThan(0);
+      calls.mockClear(); uploaded.mockClear();
+      const streamed = vi.spyOn(world, 'readFileStream');
+
+      expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [raw.candidate.id], failed: [] });
+      const secondReads = readsOf(calls.mock.calls);
+      // Nothing saved is read or uploaded again: not the large file, not a saved page.
+      expect(secondReads.filter((name) => saved.includes(name))).toEqual([]);
+      expect(secondReads).toHaveLength(601 - saved.length);
+      expect(streamed).not.toHaveBeenCalled();
+      expect(uploaded.mock.calls.map(([key]) => key).filter((key) => firstUploads.includes(key) && key.includes('/chunks/'))).toEqual([]);
+      expect(await store.kvEntries('resource-capture:')).toEqual([]);
+      const restored = path.join(root, '..', 'restored-resume');
+      await restoreAll(resources, store, raw.attachment.id, restored);
+      for (const [name, data] of expected) expect(fs.readFileSync(path.join(restored, name)).equals(data)).toBe(true);
+      // Each object is held once, by the revision, and nothing else is left behind.
+      const rows = await chunkRows(store);
+      expect(rows.every((row) => Number(row.refs) === 1)).toBe(true);
+      expect(allFiles(path.join(objects, 'resources')).filter((file) => file.includes('/chunks/'))).toHaveLength(rows.length);
+      await resources.discardCandidate(task.id, raw.candidate.id, 'user:reviewer');
+      expect(allFiles(objects)).toEqual([]);
+      expect(await chunkRows(store)).toEqual([]);
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  }, 60_000);
+
+  it('releases an interrupted save\'s progress when its candidate is discarded', async () => {
+    const { store, task, resources, world, cleanup, objects } = await candidateFixture('stage-abandon');
+    try {
+      writeCorpus(world.handle.workdir ?? world.handle.root, 300);
+      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      const exec = world.exec.bind(world);
+      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
+      let reads = 0;
+      vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
+        command === 'node' && String(args?.[1]).includes('readSync') && ++reads === 2
+          ? { code: 1, stdout: '', stderr: 'sandbox unavailable' } : exec(command, args, options));
+      await expect(resources.stageCandidates(task.id)).rejects.toThrow('sandbox unavailable');
+      expect((await chunkRows(store)).length).toBeGreaterThan(0);
+      await resources.discardCandidate(task.id, raw.candidate.id, 'user:reviewer');
+      expect(await store.kvEntries('resource-capture:')).toEqual([]);
+      expect(allFiles(objects)).toEqual([]);
+      expect(await chunkRows(store)).toEqual([]);
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  }, 30_000);
+
+  it('takes over a stopped save\'s progress, never a running one\'s, and the loser releases nothing', async () => {
+    const { store, task, resources, cleanup, objects } = await candidateFixture('stage-takeover');
+    try {
+      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      const attachment = (await store.getResourceAttachment(raw.attachment.id))!;
+      const engine = resources['engine'] as ObjectSnapshotEngine;
+      const key = await organizationKey(resources['broker'], attachment.organizationId);
+      const record = async () => {
+        const value = await store.kvGet(`resource-capture:${attachment.id}`);
+        return value ? JSON.parse(openRandom(key, Buffer.from(value, 'base64')).toString('utf8')) : undefined;
+      };
+      const contents = new Map<string, Buffer>([['a-large.bin', crypto.randomBytes(5 * 1024 * 1024 + 3)]]);
+      for (let i = 0; i < 300; i++) contents.set(`p-${String(i).padStart(4, '0')}.txt`, Buffer.from(`page ${i}\n`.repeat(i % 5 + 1)));
+      const reader = vi.fn(async function* (files: Array<{ source: string }>) { for (const file of files) yield contents.get(file.source); });
+      const inputs = () => [...contents].map(([name, data]): SnapshotInputFile => ({ path: name, bytes: data.length, observed: `stamp:${name}`, data,
+        ...(data.length < 1024 * 1024 ? { range: { reader, source: name, stamp: name } } : {}) }));
+      let now = Date.now();
+      vi.spyOn(Date, 'now').mockImplementation(() => now);
+      // The first save records its progress, then stops answering (a worker that died).
+      let hang!: (error: Error) => void;
+      const hung = new Promise<never>((_, reject) => { hang = reject; });
+      const first = engine.capture(attachment, (async function* () {
+        for (const [index, file] of inputs().entries()) {
+          if (index === 201) { now += 11_000; yield file; await hung; }
+          yield file;
+        }
+      })(), { resume: true });
+      first.catch(() => undefined);
+      await vi.waitFor(async () => expect((await record())?.segments.length).toBeGreaterThan(0));
+      // While its record is fresh, another attempt leaves it alone.
+      const parallel = await engine.capture(attachment, (async function* () { yield* inputs(); })(), { resume: true });
+      await engine.delete!({ id: 'parallel', attachmentId: attachment.id, engine: engine.id, ...parallel, createdAt: now }, attachment);
+      expect((await record())?.owner).toBeTruthy();
+      // Once it is stale, the next attempt takes it over and resumes from it.
+      now += 60_000;
+      reader.mockClear();
+      const second = await engine.capture(attachment, (async function* () { yield* inputs(); })(), { resume: true });
+      expect(reader.mock.calls.flatMap(([files]) => files).length).toBeLessThan(300 - 128);
+      expect(await record()).toBeUndefined();
+      // The stopped attempt wakes up, finds its record gone, and releases nothing.
+      hang(new Error('worker restarted'));
+      await expect(first).rejects.toThrow('worker restarted');
+      const revision = await store.saveResourceRevision({ attachmentId: attachment.id, engine: engine.id, ...second, createdByTaskId: task.id });
+      const restored = new Map<string, Buffer>();
+      await engine.restore(revision, async (name, bytes, offset) => {
+        restored.set(name, offset ? Buffer.concat([restored.get(name)!, bytes]) : bytes);
+      });
+      expect([...restored.keys()].sort()).toEqual([...contents.keys()].sort());
+      for (const [name, data] of contents) expect(restored.get(name)!.equals(data)).toBe(true);
+      await engine.delete!(revision, attachment);
+      // What the stopped attempt held after its last record leaks; nothing was released twice.
+      const rows = (await chunkRows(store)).map((row) => row.chunkId);
+      for (const file of allFiles(path.join(objects, 'resources')).filter((file) => file.includes('/chunks/')))
+        expect(rows).toContain(path.basename(file, '.bin'));
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  }, 60_000);
+
+  it('restores and refreshes from snapshots saved before packs (version 1)', async () => {
+    const { store, task, resources, world, cleanup } = await candidateFixture('stage-v1');
+    try {
+      const root = world.handle.workdir ?? world.handle.root;
+      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      const attachment = (await store.getResourceAttachment(raw.attachment.id))!;
+      const engine = resources['engine'] as ObjectSnapshotEngine;
+      const key = await organizationKey(resources['broker'], attachment.organizationId);
+      const data = Buffer.from('scanned page');
+      const id = chunkId(key, undefined, data);
+      const objects = engine['objects'] as LocalObjectStore;
+      await objects.put(chunkObjectKey(attachment.organizationId, id), sealDeterministic(key, id, data));
+      await store.retainResourceChunks(attachment.organizationId, [{ id, bytes: data.length }]);
+      const files = [{ path: 'page.txt', bytes: data.length, sha256: sha256(data), chunks: [id] }];
+      const rootDigest = sha256(Buffer.from(JSON.stringify(files)));
+      const sealed = sealRandom(key, Buffer.from(JSON.stringify({ version: 1, attachmentId: attachment.id, files, rootDigest, bytes: data.length })));
+      const objectKey = `resources/${attachment.organizationId}/manifests/${attachment.id}/legacy.bin`;
+      await objects.put(objectKey, sealed);
+      const legacy = await store.saveAndPromoteResourceRevision({ attachmentId: attachment.id, engine: engine.id,
+        sealedRef: JSON.stringify({ objectKey, sha256: sha256(sealed) }), rootDigest, bytes: data.length, files: 1, createdByTaskId: task.id }, undefined);
+      expect(await engine.verify!(legacy, 0, 10)).toMatchObject({ status: 'complete', verifiedFiles: 1 });
+      await world.writeFile('raw/new.txt', 'new page');
+      expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [raw.candidate.id], failed: [] });
+      const restored = path.join(root, '..', 'restored-v1');
+      await restoreAll(resources, store, raw.attachment.id, restored);
+      expect(fs.readFileSync(path.join(restored, 'page.txt'), 'utf8')).toBe('scanned page');
+      expect(fs.readFileSync(path.join(restored, 'new.txt'), 'utf8')).toBe('new page');
+    } finally { vi.restoreAllMocks(); await cleanup(); }
   });
 
   it('discards staged candidates, preserves vault items, and inventories undeclared ignored paths without content', async () => {

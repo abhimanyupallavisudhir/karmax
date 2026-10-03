@@ -26,18 +26,52 @@ import { ensureWorldExcluded } from './secret-exclude.js';
 import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
 import { screenEnvironment, type SkippedEnv } from '../util/work-env.js';
-import { CHUNK_BYTES, chunkId as contentChunkId, chunkObjectKey, fixedChunks, openDeterministic, openRandom,
-  organizationKey, organizationKeyHandle, sealDeterministic, sealRandom, sha256 } from './chunk-store.js';
+import { CHUNK_BYTES, chunkId as contentChunkId, chunkObjectKey, fixedChunks, openCompressed, openDeterministic, openRandom,
+  organizationKey, organizationKeyHandle, sealCompressed, sealDeterministic, sealRandom, sha256 } from './chunk-store.js';
+import { READ_BATCH_BYTES, readCheckpointRanges } from './checkpoint-read.js';
 
 const COPY_GLOB_SECRET_BYTES = 64 * 1024;
 
-interface SnapshotFile { path: string; bytes: number; sha256: string; chunks: string[] }
-interface SnapshotManifest { version: 1; attachmentId: string; files: SnapshotFile[]; rootDigest: string; bytes: number }
+/** A file is its own chunks, or (version 2, when small) a slice of a shared pack. */
+type SnapshotEntry = { path: string; bytes: number; sha256: string } & ({ chunks: string[] } | { pack: number; offset: number });
+type SnapshotFile = SnapshotEntry;
+interface SnapshotManifest { version: 1 | 2; attachmentId: string; files: SnapshotEntry[]; packs?: string[]; rootDigest: string; bytes: number }
 interface SnapshotRef { objectKey: string; sha256: string; storageLocationId?: string }
 /** `data` is consumed only when the file must be read: an input whose
  * `observed` stamp matches the one recorded with the baseline reuses the
- * baseline's chunks. */
-export interface SnapshotInputFile { path: string; data: Buffer | AsyncIterable<Buffer>; bytes?: number; observed?: string }
+ * baseline's chunks. A small file with a `range` is read together with others
+ * through its `reader` instead. */
+export interface SnapshotInputFile { path: string; data: Buffer | AsyncIterable<Buffer>; bytes?: number; observed?: string; range?: SnapshotRange }
+/** Reads many whole files in one round trip, yielding each one's bytes in order,
+ * or undefined for a file whose `stamp` no longer matches (it changed). */
+export interface SnapshotRange {
+  reader: (files: Array<{ source: string; stamp: string; bytes: number }>) => AsyncIterable<Buffer | undefined>;
+  source: string;
+  stamp: string;
+}
+export interface CaptureOptions {
+  baseline?: ResourceRevision;
+  observed?: string;
+  enforceQuota?: boolean;
+  /** Record progress so an interrupted capture's next attempt continues from it
+   * instead of reading and uploading everything again ({@link CaptureProgress}). */
+  resume?: boolean;
+  onProgress?: (done: { files: number; bytes: number }) => void;
+}
+
+/** Files smaller than this share compressed packs, as world checkpoints do: a
+ * tree of 70,000 small files is a few thousand objects, not 70,000. */
+const PACKED_FILE_BYTES = 1024 * 1024;
+const PACK_BYTES = CHUNK_BYTES;
+/** One batched read returns at most this much (as base64), or this many files. */
+const BATCH_READ_BYTES = READ_BATCH_BYTES;
+const BATCH_READ_FILES = 128;
+const UPLOAD_CONCURRENCY = 4;
+/** How often a resumable capture records what it has saved. A record not
+ * updated for PROGRESS_STALE_MS belongs to an attempt that died: a worker that
+ * stopped heartbeating is retried no sooner than a minute later. */
+const PROGRESS_INTERVAL_MS = 10_000;
+const PROGRESS_STALE_MS = 45_000;
 export interface SnapshotVerification {
   status: 'complete' | 'partial' | 'failed';
   manifestVerified: boolean;
@@ -70,6 +104,9 @@ export interface ProposedResourceCandidate {
 /** A candidate that no retry can stage: its world or path is gone. */
 class UnstageableCandidate extends Error {}
 
+/** How far staging is through one candidate (`index` of `count`). */
+export interface StagingProgress { path: string; index: number; count: number; files: number; totalFiles: number; bytes: number; totalBytes: number }
+
 export interface StagedResourceCandidates {
   staged: string[];
   failed: Array<{ candidateId: string; sourcePath?: string; error: string }>;
@@ -87,10 +124,12 @@ export interface SnapshotEngine {
    * capture resolved to lets the next one skip files whose stamps match.
    * `enforceQuota: false` counts new chunks without refusing them (checkpoints). */
   capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>,
-    incremental?: { baseline?: ResourceRevision; observed?: string; enforceQuota?: boolean }): Promise<{
+    incremental?: CaptureOptions): Promise<{
     sealedRef: string; rootDigest: string; bytes: number; files: number; storageLocationId?: string; unchanged?: boolean;
     observed?: string;
   }>;
+  /** Release what an interrupted resumable capture of this attachment saved. */
+  abandonProgress?(attachment: ResourceAttachment): Promise<void>;
   restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>,
     options?: { signal?: AbortSignal }): Promise<void>;
   manifest(revision: ResourceRevision): Promise<SnapshotManifest>;
@@ -114,7 +153,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   }
 
   async capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>,
-    incremental?: { baseline?: ResourceRevision; observed?: string; enforceQuota?: boolean }) {
+    incremental?: CaptureOptions) {
     const quota = { enforceQuota: incremental?.enforceQuota !== false };
     const key = await this.key(attachment.organizationId);
     const storageLocationId = this.storageLocations
@@ -133,59 +172,205 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
       ? await this.manifest(baselineRevision).catch(() => undefined) : undefined;
     const stamps = baseline && incremental?.observed ? openStamps(key, incremental.observed, attachment.id, baseline.rootDigest) : undefined;
     const previous = new Map(baseline?.files.map((file) => [file.path, file]));
-    const stored = new Set(baseline?.files.flatMap((file) => file.chunks));
-    const manifestFiles: SnapshotFile[] = [];
+    // Objects known to exist: the baseline's, and whatever this capture (or the
+    // interrupted attempt it resumes) has finished uploading.
+    const present = new Set(baseline ? manifestObjects(baseline) : []);
+    /** References this capture holds: one per distinct object of its manifest once it completes. */
+    const held = new Map<string, number>();
+    const progress = incremental?.resume && this.progressStore
+      ? await CaptureProgress.claim(this.progressStore, key, attachment, storageLocationId) : undefined;
+    const resumed = new Map(progress?.files.map((file) => [file.path, file]));
+    for (const [id, bytes] of progress?.held ?? []) { held.set(id, bytes); present.add(id); }
+
+    /** Every file captured so far, by object id; numbered into a manifest at the end. */
+    const captured: ProgressFile[] = [];
+    /** Those a later attempt can resume from (stable stamps). */
+    const completed: ProgressFile[] = [];
     const observed: Record<string, string> = {};
-    const retained = new Map<string, number>();
-    const reused = new Map<string, number>();
     let total = 0;
+    let wrote = false;
+    const report = () => incremental?.onProgress?.({ files: captured.length, bytes: total });
+    const add = (entry: ProgressFile) => {
+      captured.push(entry);
+      if (entry.stamp) completed.push(entry);
+      total += entry.bytes;
+    };
+
+    const retain = async (chunks: Array<{ id: string; bytes: number }>) => {
+      const fresh = [...new Map(chunks.filter((chunk) => !held.has(chunk.id)).map((chunk) => [chunk.id, chunk])).values()];
+      if (!fresh.length) return;
+      await this.chunkAccounting?.retain(attachment.organizationId, fresh, storageLocationId, quota);
+      for (const chunk of fresh) held.set(chunk.id, chunk.bytes);
+    };
+    // Reusing an unchanged file retains its objects in batches, not per file.
+    let reusedPending: Array<{ id: string; bytes: number }> = [];
+    const retainReused = async () => { const pending = reusedPending; reusedPending = []; await retain(pending); };
+    /** Keep a baseline file as it is: its objects are already stored. */
+    const reuse = async (prior: SnapshotEntry, stamp: string | undefined) => {
+      const pack = 'pack' in prior ? baseline!.packs![prior.pack]! : undefined;
+      if (pack) reusedPending.push({ id: pack, bytes: PACK_BYTES });
+      else ('chunks' in prior ? prior.chunks : []).forEach((id, index) =>
+        reusedPending.push({ id, bytes: Math.min(CHUNK_BYTES, prior.bytes - index * CHUNK_BYTES) }));
+      if (reusedPending.length >= 1024) await retainReused();
+      const { pack: _index, ...rest } = prior as SnapshotEntry & { pack?: number };
+      add({ ...rest, ...(pack ? { pack } : {}), ...(stamp ? { stamp } : {}) });
+    };
+    const uploads = new BoundedUploads(UPLOAD_CONCURRENCY);
+    const uploading = new Set<string>();
+    const put = async (id: string, bytes: number, seal: () => Buffer | Promise<Buffer>) => {
+      await retain([{ id, bytes }]);
+      if (present.has(id) || uploading.has(id)) return;
+      uploading.add(id);
+      await uploads.add(async () => {
+        await objects.put(chunkObjectKey(attachment.organizationId, id), await seal());
+        present.add(id);
+        wrote = true;
+      });
+    };
+
+    let pack: Buffer[] = [];
+    let packBytes = 0;
+    let packed: ProgressFile[] = [];
+    const flushPack = async () => {
+      if (!packed.length) return;
+      const plain = Buffer.concat(pack, packBytes);
+      const id = contentChunkId(key, chunkNamespace, plain, 'pack');
+      await put(id, plain.length, () => sealCompressed(key, id, plain));
+      for (const file of packed) add({ ...file, pack: id });
+      pack = []; packBytes = 0; packed = [];
+    };
+    const addSmall = async (input: { path: string; observed?: string }, data: Buffer) => {
+      const digest = sha256(data);
+      // Read, but unchanged: packs are not content-addressed per file the way
+      // chunks are, so the baseline's slice is kept rather than packed again.
+      const prior = previous.get(input.path);
+      if (prior && prior.bytes === data.length && prior.sha256 === digest) return reuse(prior, input.observed);
+      if (packBytes && packBytes + data.length > PACK_BYTES) await flushPack();
+      packed.push({ path: input.path, bytes: data.length, sha256: digest, offset: packBytes,
+        ...(input.observed ? { stamp: input.observed } : {}) });
+      pack.push(data); packBytes += data.length;
+    };
+
+    // Small files a source can read together go out in one round trip per batch.
+    let batch: Array<{ input: SnapshotInputFile & { range: SnapshotRange }; path: string }> = [];
+    let batchBytes = 0;
+    const readBatch = async () => {
+      if (!batch.length) return;
+      const pending = batch; batch = []; batchBytes = 0;
+      let index = 0;
+      for await (const data of pending[0]!.input.range.reader(pending.map(({ input }) => ({ ...input.range, bytes: input.bytes! })))) {
+        const item = pending[index++];
+        if (!item) throw new Error('resource batch read returned too many files');
+        if (!data || data.length !== item.input.bytes) throw new Error(`${item.path} changed while it was being saved; save it again once it is settled`);
+        await addSmall({ path: item.path, observed: item.input.observed }, data);
+      }
+      if (index !== pending.length) throw new Error('resource batch read ended early');
+      report();
+    };
+
+    let lastSaved = Date.now();
+    let recorded = 0;
+    const saveProgress = async (park = false) => {
+      if (!progress) return;
+      // A part-filled pack is still a pack: saving it makes the files read so far
+      // resumable. A stopping attempt reads nothing more, and keeps what it read
+      // unless uploading is what failed.
+      if (!park) { await readBatch(); await flushPack(); await uploads.drain(); }
+      else {
+        if (!uploads.failed) await flushPack().catch(() => undefined);
+        await uploads.settle();
+      }
+      await retainReused();
+      // Only what is uploaded and held can be resumed from; each save adds the
+      // files completed since the last one.
+      const added = completed.slice(recorded).filter((file) => entryObjects(file).every((id) => held.has(id) && present.has(id)));
+      await progress.save(added, [...held].filter(([id]) => present.has(id)), park);
+      recorded = completed.length;
+      lastSaved = Date.now();
+    };
+
     try {
       for await (const input of files) {
         const relative = safePath(input.path);
         if (incremental && input.observed) observed[relative] = input.observed;
-        const prior = previous.get(relative);
-        if (prior && input.observed && stamps?.[relative] === input.observed) {
-          prior.chunks.forEach((chunkId, index) => {
-            if (!retained.has(chunkId)) reused.set(chunkId, Math.min(CHUNK_BYTES, prior.bytes - index * CHUNK_BYTES));
-          });
-          total += prior.bytes;
-          manifestFiles.push(prior);
+        const earlier = input.observed ? resumed.get(relative) : undefined;
+        if (earlier && earlier.stamp === input.observed && entryObjects(earlier).every((id) => held.has(id))) {
+          add(earlier);
           continue;
         }
-        const chunks: string[] = [];
-        const digest = crypto.createHash('sha256');
-        let fileBytes = 0;
-        for await (const plain of fixedChunks(input.data)) {
-          const chunkId = contentChunkId(key, chunkNamespace, plain);
-          if (stored.has(chunkId)) {
-            if (!retained.has(chunkId)) reused.set(chunkId, plain.length);
-          } else {
-            if (!retained.has(chunkId)) {
-              await this.chunkAccounting?.retain(attachment.organizationId, [{ id: chunkId, bytes: plain.length }], storageLocationId, quota);
-              retained.set(chunkId, plain.length);
-            }
-            await objects.put(chunkObjectKey(attachment.organizationId, chunkId), sealDeterministic(key, chunkId, plain));
-          }
-          chunks.push(chunkId);
-          digest.update(plain);
-          fileBytes += plain.length;
+        const prior = previous.get(relative);
+        if (prior && input.observed && stamps?.[relative] === input.observed) {
+          await reuse(prior, input.observed);
+          continue;
         }
-        if (input.bytes !== undefined && fileBytes !== input.bytes)
-          throw new Error('resource capture size mismatch');
-        total += fileBytes;
-        manifestFiles.push({ path: relative, bytes: fileBytes, sha256: digest.digest('hex'), chunks });
+        if (input.range && input.bytes !== undefined && input.bytes < PACKED_FILE_BYTES) {
+          if (batch.length && (batch[0]!.input.range.reader !== input.range.reader || batch.length >= BATCH_READ_FILES
+            || batchBytes + input.bytes > BATCH_READ_BYTES)) await readBatch();
+          batch.push({ input: input as SnapshotInputFile & { range: SnapshotRange }, path: relative });
+          batchBytes += input.bytes;
+        } else {
+          await readBatch();
+          if (input.bytes !== undefined && input.bytes < PACKED_FILE_BYTES) {
+            const parts: Buffer[] = [];
+            for await (const data of fixedChunks(input.data)) parts.push(data);
+            const data = Buffer.concat(parts);
+            if (data.length !== input.bytes) throw new Error('resource capture size mismatch');
+            await addSmall({ path: relative, observed: input.observed }, data);
+          } else {
+            const chunks: string[] = [];
+            const digest = crypto.createHash('sha256');
+            let fileBytes = 0;
+            for await (const plain of fixedChunks(input.data)) {
+              const chunkId = contentChunkId(key, chunkNamespace, plain);
+              await put(chunkId, plain.length, () => sealDeterministic(key, chunkId, plain));
+              chunks.push(chunkId);
+              digest.update(plain);
+              fileBytes += plain.length;
+              incremental?.onProgress?.({ files: captured.length, bytes: total + fileBytes });
+              // A long file keeps its record fresh, and its uploaded chunks are
+              // kept for a retry, which re-reads the file but uploads only the rest.
+              if (progress && Date.now() - lastSaved >= PROGRESS_INTERVAL_MS) await saveProgress();
+            }
+            if (input.bytes !== undefined && fileBytes !== input.bytes)
+              throw new Error('resource capture size mismatch');
+            add({ path: relative, bytes: fileBytes, sha256: digest.digest('hex'), chunks,
+              ...(input.observed ? { stamp: input.observed } : {}) });
+            report();
+          }
+        }
+        if (progress && Date.now() - lastSaved >= PROGRESS_INTERVAL_MS) await saveProgress();
       }
-      manifestFiles.sort((a, b) => a.path.localeCompare(b.path));
-      const rootDigest = sha256(Buffer.from(JSON.stringify(manifestFiles)));
+      await readBatch();
+      await flushPack();
+      await retainReused();
+      await uploads.drain();
+      report();
+      // Packs are numbered in path order, so the same files in the same packs
+      // make the same manifest however the capture encountered them.
+      captured.sort((a, b) => a.path.localeCompare(b.path));
+      const packs = [...new Set(captured.flatMap((file) => file.pack ? [file.pack] : []))];
+      const packIndex = new Map(packs.map((id, index) => [id, index]));
+      const manifestFiles = captured.map(({ stamp: _stamp, pack, offset, chunks, ...file }): SnapshotEntry =>
+        pack ? { ...file, pack: packIndex.get(pack)!, offset: offset! } : { ...file, chunks: chunks! });
+      const rootDigest = manifestDigest(manifestFiles, packs);
       const sealedStamps = Object.keys(observed).length ? sealStamps(key, attachment.id, rootDigest, observed) : undefined;
-      if (baseline && rootDigest === baseline.rootDigest && !retained.size)
+      const referenced = new Set([...packs, ...manifestFiles.flatMap((file) => 'chunks' in file ? file.chunks : [])]);
+      // The progress record is gone before any reference it names is released,
+      // so no later attempt can adopt (and release again) what is released here.
+      await progress?.clear();
+      if (baseline && rootDigest === baseline.rootDigest && !wrote) {
+        await this.releaseHeld(attachment.organizationId, objects, [...held.keys()]);
+        held.clear();
         return { sealedRef: baselineRevision!.sealedRef, rootDigest, bytes: total, files: manifestFiles.length, storageLocationId,
           unchanged: true, ...(sealedStamps ? { observed: sealedStamps } : {}) };
-      if (reused.size) {
-        await this.chunkAccounting?.retain(attachment.organizationId, [...reused].map(([id, bytes]) => ({ id, bytes })), storageLocationId, quota);
-        for (const [id, bytes] of reused) retained.set(id, bytes);
       }
-      const manifest: SnapshotManifest = { version: 1, attachmentId: attachment.id, files: manifestFiles, rootDigest, bytes: total };
+      // A file that changed after an interrupted attempt saved it leaves objects nothing references.
+      const orphans = [...held.keys()].filter((id) => !referenced.has(id));
+      if (orphans.length) {
+        await this.releaseHeld(attachment.organizationId, objects, orphans);
+        for (const id of orphans) held.delete(id);
+      }
+      const manifest: SnapshotManifest = { version: 2, attachmentId: attachment.id, files: manifestFiles, packs, rootDigest, bytes: total };
       const encrypted = sealRandom(key, Buffer.from(JSON.stringify(manifest)));
       const objectKey = `resources/${attachment.organizationId}/manifests/${attachment.id}/${newId('snapshot')}.bin`;
       await objects.put(objectKey, encrypted);
@@ -193,10 +378,41 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
         rootDigest, bytes: total, files: manifestFiles.length, storageLocationId,
         ...(sealedStamps ? { observed: sealedStamps } : {}) };
     } catch (error) {
-      const zero = (await this.chunkAccounting?.release(attachment.organizationId, [...retained.keys()])) ?? [];
-      await Promise.allSettled(zero.map((chunkId) => objects.delete(chunkObjectKey(attachment.organizationId, chunkId))));
+      await uploads.settle();
+      // Superseded: the references now belong to whoever took the record over.
+      if (error instanceof CaptureSuperseded || progress?.lost) throw error;
+      if (progress) {
+        // Keep what is saved for the next attempt; release only what never made
+        // it, which no record names (a record lists only uploaded objects).
+        try {
+          const unsaved = [...held.keys()].filter((id) => !present.has(id));
+          await this.releaseHeld(attachment.organizationId, objects, unsaved);
+          for (const id of unsaved) held.delete(id);
+          await saveProgress(true);
+        } catch { /* unrecorded references leak rather than risk releasing ones a record still names */ }
+        throw error;
+      }
+      await this.releaseHeld(attachment.organizationId, objects, [...held.keys()]);
       throw error;
     }
+  }
+
+  /** Give up an interrupted capture's saved progress, releasing what it holds.
+   * A capture still running loses its record and stops without releasing. */
+  async abandonProgress(attachment: ResourceAttachment): Promise<void> {
+    if (!this.progressStore) return;
+    const held = await CaptureProgress.take(this.progressStore, await this.key(attachment.organizationId, false)
+      .catch(() => undefined), attachment.id);
+    if (!held?.ids.length) return;
+    const objects = held.storageLocationId && this.storageLocations
+      ? (await this.storageLocations.objectStore(held.storageLocationId)) : this.objects;
+    await this.releaseHeld(attachment.organizationId, objects, held.ids);
+  }
+
+  private async releaseHeld(organizationId: string, objects: ObjectStore, ids: string[]): Promise<void> {
+    if (!ids.length) return;
+    const zero = (await this.chunkAccounting?.release(organizationId, ids)) ?? [];
+    await Promise.allSettled(zero.map((chunkId) => objects.delete(chunkObjectKey(organizationId, chunkId))));
   }
 
   async restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>,
@@ -205,6 +421,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     const manifest = await this.manifest(revision);
     // Bound memory and request fan-out. Chunks of each file remain ordered;
     // independent files can transfer together. Settle all writes before cleanup.
+    const packs = await this.packReader(revision, manifest);
     await forEachConcurrent(manifest.files, async file => {
       options.signal?.throwIfAborted();
       let offset = 0;
@@ -216,7 +433,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
         options.signal?.throwIfAborted();
         offset += bytes; buffered = []; bytes = 0;
       };
-      for await (const data of this.readFile(revision, file)) {
+      for await (const data of this.readFile(revision, file, packs)) {
         options.signal?.throwIfAborted();
         buffered.push(data); bytes += data.length;
         if (bytes >= 2 * CHUNK_BYTES) await flush();
@@ -226,7 +443,13 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   }
 
   /** One shared streaming integrity check for restore and verification. */
-  private async *readFile(revision: ResourceRevision, file: SnapshotFile): AsyncIterable<Buffer> {
+  private async *readFile(revision: ResourceRevision, file: SnapshotEntry, packs: (index: number) => Promise<Buffer>): AsyncIterable<Buffer> {
+    if ('pack' in file) {
+      const data = (await packs(file.pack)).subarray(file.offset, file.offset + file.bytes);
+      if (data.length !== file.bytes || sha256(data) !== file.sha256) throw new Error('resource snapshot integrity mismatch');
+      yield data;
+      return;
+    }
     const attachment = (await this.attachmentFor(revision));
     const key = await this.key(attachment.organizationId, false);
     const objects = (await this.objectsForRevision(revision));
@@ -245,6 +468,28 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
       throw new Error('resource snapshot integrity mismatch');
   }
 
+  /** Opens a manifest's packs on demand. Files are in path order and packs were
+   * filled in path order, so a few recent packs serve every concurrent reader. */
+  private async packReader(revision: ResourceRevision, manifest: SnapshotManifest): Promise<(index: number) => Promise<Buffer>> {
+    if (!manifest.packs?.length) return async () => { throw new Error('resource manifest has no packs'); };
+    const attachment = (await this.attachmentFor(revision));
+    const key = await this.key(attachment.organizationId, false);
+    const objects = (await this.objectsForRevision(revision));
+    const cached = new Map<string, Promise<Buffer>>();
+    return async (index) => {
+      const id = manifest.packs![index]!;
+      let plain = cached.get(id);
+      if (!plain) {
+        plain = timed('resource.chunk-read', () => objects.get(chunkObjectKey(attachment.organizationId, id)))
+          .then((sealed) => openCompressed(key, id, sealed, PACK_BYTES));
+        cached.set(id, plain);
+        plain.catch(() => cached.delete(id));
+        while (cached.size > 8) cached.delete(cached.keys().next().value!);
+      }
+      return plain;
+    };
+  }
+
   async verify(revision: ResourceRevision, offset: number, limit: number): Promise<SnapshotVerification> {
     const result: SnapshotVerification = { status: 'failed', manifestVerified: false, offset,
       verifiedFiles: 0, verifiedBytes: 0, files: [] };
@@ -253,13 +498,14 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
       Object.assign(result, { manifestVerified: true, rootDigest: manifest.rootDigest,
         totalFiles: manifest.files.length, totalBytes: manifest.bytes });
       if (offset > manifest.files.length) return { ...result, issue: 'invalid-offset' };
+      const packs = await this.packReader(revision, manifest);
       for (const file of manifest.files.slice(offset, offset + limit)) {
         if (result.verifiedBytes + file.bytes > VERIFY_MAX_BYTES) {
           result.issue = 'byte-limit';
           break;
         }
         // Do not retain plaintext. Exhaustion also checks empty files and the final hash.
-        for await (const _data of this.readFile(revision, file)) { /* checked by engine */ }
+        for await (const _data of this.readFile(revision, file, packs)) { /* checked by engine */ }
         result.files.push({ path: file.path, bytes: file.bytes, sha256: file.sha256 });
         result.verifiedFiles++;
         result.verifiedBytes += file.bytes;
@@ -285,24 +531,30 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     const encrypted = await (await this.objectsForRevision(revision, ref, owner)).get(ref.objectKey);
     if (sha256(encrypted) !== ref.sha256) throw new Error('resource manifest integrity mismatch');
     const manifest = JSON.parse(openRandom(await this.key(attachment.organizationId, false), encrypted).toString('utf8')) as SnapshotManifest;
-    if (manifest.version !== 1 || manifest.attachmentId !== attachment.id || manifest.rootDigest !== revision.rootDigest)
+    if (![1, 2].includes(manifest.version) || manifest.attachmentId !== attachment.id || manifest.rootDigest !== revision.rootDigest)
       throw new Error('resource manifest does not match its revision');
     if (!Array.isArray(manifest.files) || manifest.files.length !== (revision.files ?? manifest.files.length)
       || manifest.bytes !== revision.bytes || !Number.isSafeInteger(manifest.bytes) || manifest.bytes < 0)
       throw new Error('invalid resource manifest totals');
+    const packs = manifest.version === 2 ? manifest.packs : [];
+    if (!Array.isArray(packs) || packs.some((id) => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id)))
+      throw new Error('invalid resource manifest packs');
     const paths = new Set<string>();
     let bytes = 0;
     for (const file of manifest.files) {
       if (typeof file.path !== 'string' || file.path.length > 4096 || safePath(file.path) !== file.path
         || paths.has(file.path) || !Number.isSafeInteger(file.bytes) || file.bytes < 0
-        || !/^[a-f0-9]{64}$/.test(file.sha256) || !Array.isArray(file.chunks)
-        || file.chunks.length !== Math.max(1, Math.ceil(file.bytes / CHUNK_BYTES))
-        || file.chunks.some((id) => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id)))
+        || !/^[a-f0-9]{64}$/.test(file.sha256))
+        throw new Error('invalid resource manifest file');
+      if ('pack' in file ? !Number.isSafeInteger(file.pack) || !packs[file.pack] || !Number.isSafeInteger(file.offset)
+          || file.offset < 0 || file.offset + file.bytes > PACK_BYTES
+        : !Array.isArray(file.chunks) || file.chunks.length !== Math.max(1, Math.ceil(file.bytes / CHUNK_BYTES))
+          || file.chunks.some((id) => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id)))
         throw new Error('invalid resource manifest file');
       paths.add(file.path);
       bytes += file.bytes;
     }
-    if (bytes !== manifest.bytes || sha256(Buffer.from(JSON.stringify(manifest.files))) !== manifest.rootDigest)
+    if (bytes !== manifest.bytes || manifestDigest(manifest.files, manifest.version === 2 ? packs : undefined) !== manifest.rootDigest)
       throw new Error('resource manifest tree integrity mismatch');
     return manifest;
   }
@@ -313,8 +565,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     const ref = JSON.parse(revision.sealedRef) as SnapshotRef;
     const objects = (await this.objectsForRevision(revision, ref, owner));
     await objects.delete(ref.objectKey);
-    const zero = (await this.chunkAccounting?.release(attachment.organizationId,
-      [...new Set(manifest.files.flatMap((file) => file.chunks))])) ?? [];
+    const zero = (await this.chunkAccounting?.release(attachment.organizationId, manifestObjects(manifest))) ?? [];
     for (const chunkId of zero) await objects.delete(chunkObjectKey(attachment.organizationId, chunkId));
   }
 
@@ -332,6 +583,8 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     release(organizationId: string, chunkIds: string[]): string[] | Promise<string[]>;
   };
   setChunkAccounting(value: NonNullable<ObjectSnapshotEngine['chunkAccounting']>): void { this.chunkAccounting = value; }
+  private progressStore?: ProgressStore;
+  setProgressStore(value: ProgressStore): void { this.progressStore = value; }
 
   private async objectsForRevision(revision: ResourceRevision, ref?: SnapshotRef, owner?: ResourceAttachment): Promise<ObjectStore> {
     const locationId = ref?.storageLocationId ?? revision.storageLocationId;
@@ -358,6 +611,13 @@ export class ProjectResourceService {
     if (engine instanceof ObjectSnapshotEngine) engine.setChunkAccounting({
       retain: async (organizationId, chunks, storageLocationId, options) => (await store.retainResourceChunks(organizationId, chunks, storageLocationId, options)),
       release: async (organizationId, chunks) => (await store.releaseResourceChunks(organizationId, chunks)),
+    });
+    if (engine instanceof ObjectSnapshotEngine) engine.setProgressStore({
+      get: (key) => store.kvGet(key),
+      set: (key, value) => store.kvSet(key, value),
+      compareAndSet: (key, expected, next) => store.kvCompareAndSet(key, expected, next),
+      keys: async (prefix) => (await store.kvEntries(prefix)).map((entry) => entry.key),
+      delete: (key) => store.kvDelete(key),
     });
   }
 
@@ -753,6 +1013,7 @@ export class ProjectResourceService {
   async deleteAttachment(attachmentId: string): Promise<void> {
     const attachment = (await this.store.getResourceAttachment(attachmentId));
     if (!attachment) return;
+    await this.engine.abandonProgress?.(attachment);
     for (const revision of (await this.store.listResourceRevisions(attachmentId))) await this.engine.delete?.(revision);
     // Only the resource's own secret is its to delete. A vault item it projects
     // may control a live external account or serve another project, and any
@@ -821,14 +1082,17 @@ export class ProjectResourceService {
    * other candidates still staged; a candidate with no snapshot whose world or
    * path is gone, or that still fails on the `final` attempt, is discarded with
    * its reason, which Review shows. An earlier snapshot is never thrown away. */
-  async stageCandidates(taskId: string, options: { final?: boolean; checkContinue?: () => Promise<void> } = {}): Promise<StagedResourceCandidates> {
+  async stageCandidates(taskId: string, options: { final?: boolean; checkContinue?: () => Promise<void>;
+    onProgress?: (progress: StagingProgress) => void } = {}): Promise<StagedResourceCandidates> {
     const result: StagedResourceCandidates = { staged: [], failed: [] };
     const transient: unknown[] = [];
-    for (const candidate of await this.store.listResourceCandidates(taskId, false)) {
-      if (candidate.sourceKind !== 'path') continue;
+    const candidates = (await this.store.listResourceCandidates(taskId, false)).filter((candidate) => candidate.sourceKind === 'path');
+    for (const [index, candidate] of candidates.entries()) {
       await options.checkContinue?.();
       try {
-        if (await this.stageCandidate(taskId, candidate, options.checkContinue)) result.staged.push(candidate.id);
+        const progress = options.onProgress && ((done: Omit<StagingProgress, 'path' | 'index' | 'count'>) =>
+          options.onProgress!({ path: candidate.sourcePath!, index, count: candidates.length, ...done }));
+        if (await this.stageCandidate(taskId, candidate, options.checkContinue, progress)) result.staged.push(candidate.id);
       } catch (error) {
         await options.checkContinue?.(); // cancellation is not a staging failure
         if ((await this.store.getResourceCandidate(candidate.id))?.state !== 'pending') continue;
@@ -845,8 +1109,8 @@ export class ProjectResourceService {
   }
 
   /** True when a new revision was promoted. */
-  private async stageCandidate(taskId: string, candidate: ResourceCandidate,
-    checkContinue?: () => Promise<void>): Promise<boolean> {
+  private async stageCandidate(taskId: string, candidate: ResourceCandidate, checkContinue?: () => Promise<void>,
+    onProgress?: (done: Omit<StagingProgress, 'path' | 'index' | 'count'>) => void): Promise<boolean> {
     const attachment = await this.store.getResourceAttachment(candidate.attachmentId);
     if (!attachment) throw new UnstageableCandidate('resource candidate attachment is unavailable');
     const baseline = attachment.currentRevisionId ? await this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
@@ -866,9 +1130,13 @@ export class ProjectResourceService {
       throw new UnstageableCandidate(`${sourcePath} no longer exists in the task world`);
     }
     const stampsKey = `resource-candidate-observed:${candidate.id}`;
+    let totals = { files: 0, bytes: 0 };
+    // Multi-GB output takes minutes and outlives deploys: an interrupted attempt
+    // leaves its progress for the next one instead of starting over.
     const { unchanged, observed, ...captured } = await this.engine.capture(attachment,
-      filesFromWorld(world, sourcePath, attachment, checkContinue),
-      { baseline, observed: baseline ? (await this.store.kvGet(stampsKey)) : undefined });
+      filesFromWorld(world, sourcePath, attachment, checkContinue, (listed) => { totals = listed; }),
+      { baseline, observed: baseline ? (await this.store.kvGet(stampsKey)) : undefined, resume: true,
+        onProgress: (done) => onProgress?.({ ...done, totalFiles: totals.files, totalBytes: totals.bytes }) });
     if (unchanged && baseline) {
       if (observed) (await this.store.kvSet(stampsKey, observed));
       return false;
@@ -935,6 +1203,8 @@ export class ProjectResourceService {
     }
     const adopted = (await this.store.adoptResourceCandidate(candidate.id, taskId, resolvedBy));
     (await this.store.kvDelete(`resource-candidate-observed:${candidate.id}`));
+    // An interrupted refresh's saved progress is not part of what was adopted.
+    await this.engine.abandonProgress?.(adopted.attachment);
     const revision = adopted.attachment.currentRevisionId
       ? (await this.store.getResourceRevision(adopted.attachment.currentRevisionId)) : undefined;
     (await this.store.appendAudit({ principalId: resolvedBy, action: 'resource:candidate-adopt',
@@ -1276,8 +1546,10 @@ class EnvironmentWorld implements World {
   readonly diagnose?: World['diagnose'];
   readonly addCheckout?: World['addCheckout'];
   readonly readFilePrefix?: World['readFilePrefix'];
+  readonly readFileStream?: World['readFileStream'];
   constructor(private inner: World, private env: Record<string, string>) {
     if (inner.readFilePrefix) this.readFilePrefix = (path, maxBytes) => inner.readFilePrefix!(path, maxBytes);
+    if (inner.readFileStream) this.readFileStream = (path) => inner.readFileStream!(path);
     if (inner.addCheckout) this.addCheckout = spec => inner.addCheckout!(spec);
     if (inner.diagnose) this.diagnose = (window) => inner.diagnose!(window);
   }
@@ -1340,24 +1612,37 @@ async function readSmallFile(file: string, maximumBytes: number): Promise<Buffer
 }
 
 /** Stream a resource's files out of a world. One command lists every file with
- * its size and stamp; a file's bytes are read only if the consumer iterates its
- * `data`, which an unchanged file in an incremental capture never does (LT-11). */
-async function* filesFromWorld(world: World, target: string, attachment?: ResourceAttachment, checkContinue?: () => Promise<void>): AsyncGenerator<SnapshotInputFile> {
+ * its size and stamp; a file's bytes are read only if the consumer reads them,
+ * which an unchanged file in an incremental capture never does (LT-11). Small
+ * files can be read many to a round trip through their `range`; larger ones
+ * stream one at a time. */
+async function* filesFromWorld(world: World, target: string, attachment?: ResourceAttachment, checkContinue?: () => Promise<void>,
+  onListed?: (totals: { files: number; bytes: number }) => void): AsyncGenerator<SnapshotInputFile> {
   await checkContinue?.();
   const single = Boolean(attachment && fileShaped(attachment));
   // -H follows a symlinked target the way `test -f` did, so a linked
   // single-file resource is captured rather than recorded as empty.
   const prefix = target === '.' ? '' : `${target}/`;
-  const listed = await world.exec('bash', ['-lc', `date +%s.%N && { test ! -e ${quote(target)} || find -H ${quote(target)} ${single ? '-maxdepth 0 ' : ''}-type f -not -path '*/.git/*' -not -path '*/.karmax-injection/*' -printf '%s %T@ %C@ %i %p\\0'; }`],
+  const listed = await world.exec('bash', ['-lc', `date +%s.%N && pwd && { test ! -e ${quote(target)} || find -H ${quote(target)} ${single ? '-maxdepth 0 ' : ''}-type f -not -path '*/.git/*' -not -path '*/.karmax-injection/*' -printf '%s %T@ %C@ %i %p\\0'; }`],
     { timeoutMs: 30 * 60_000 });
-  const newline = listed.stdout.indexOf('\n');
-  const listedAt = Number(listed.stdout.slice(0, newline));
-  if (listed.code !== 0 || newline < 0) throw new Error(listed.stderr || `could not inspect resource path ${target}`);
-  const entries = listed.stdout.slice(newline + 1).split('\0').filter(Boolean).map((record) => {
+  const [listedAtLine, cwd] = listed.stdout.split('\n', 2);
+  const listedAt = Number(listedAtLine);
+  const header = `${listedAtLine}\n${cwd}\n`;
+  if (listed.code !== 0 || cwd === undefined || !listed.stdout.startsWith(header)) throw new Error(listed.stderr || `could not inspect resource path ${target}`);
+  const entries = listed.stdout.slice(header.length).split('\0').filter(Boolean).map((record) => {
     const [size, mtime, ctime, inode, ...name] = record.split(' ');
-    return { file: name.join(' '), bytes: Number(size), stamp: `${size}:${mtime}:${ctime}:${inode}`, changedAt: Number(ctime) };
+    return { file: name.join(' '), bytes: Number(size), stamp: `${size}:${mtime}:${ctime}:${inode}`, changedAt: Number(ctime),
+      // The batched reader's form of the same stamp: nanoseconds, as Node's bigint stat reports them.
+      exact: `${size}:${nanoseconds(mtime!)}:${nanoseconds(ctime!)}:${inode}` };
   }).sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
   const names = new Set(entries.map((entry) => entry.file));
+  const reader: SnapshotRange['reader'] = async function* (files) {
+    for await (const { data } of readCheckpointRanges(world, files.map((file) => ({ path: file.source, stamp: file.stamp,
+      offset: 0, length: file.bytes })), checkContinue)) yield data;
+  };
+  // A single-file target may be a link, which the batched reader never follows.
+  const ranged = !single && cwd.startsWith('/');
+  onListed?.({ files: entries.length, bytes: entries.reduce((sum, entry) => sum + (Number.isSafeInteger(entry.bytes) ? entry.bytes : 0), 0) });
   for (const entry of entries) {
     await checkContinue?.();
     const relative = single ? path.posix.basename(target)
@@ -1374,8 +1659,15 @@ async function* filesFromWorld(world: World, target: string, attachment?: Resour
     const sidecar = single || names.has(`${entry.file}-wal`) || names.has(`${entry.file}-journal`);
     const stable = (!sqlite || !sidecar) && Number.isFinite(listedAt) && entry.changedAt < listedAt - 2;
     yield { path: safePath(relative), ...(sqlite ? {} : { bytes: entry.bytes }), ...(stable ? { observed: entry.stamp } : {}),
+      ...(ranged && !sqlite ? { range: { reader, source: path.posix.resolve(cwd, entry.file), stamp: entry.exact } } : {}),
       data: worldFileChunks(world, entry.file, sqlite ? undefined : entry.bytes, checkContinue) };
   }
+}
+
+/** `find -printf %T@` (seconds with a fraction) as integer nanoseconds. */
+function nanoseconds(value: string): string {
+  const [seconds = '0', fraction = ''] = value.split('.');
+  return (BigInt(seconds) * 1_000_000_000n + BigInt((fraction + '000000000').slice(0, 9))).toString();
 }
 
 async function* worldFileChunks(world: World, file: string, bytes: number | undefined, checkContinue?: () => Promise<void>): AsyncGenerator<Buffer> {
@@ -1386,12 +1678,35 @@ async function* worldFileChunks(world: World, file: string, bytes: number | unde
     size = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
   }
   try {
-    for await (const chunk of readResourceChunks(world, captured.path, Number.isFinite(size) ? size : undefined, checkContinue)) {
-      yield chunk;
-      await captured.renew?.();
+    // A provider that streams files sends one long response instead of a
+    // command per 16 MiB, about three times faster out of an E2B sandbox.
+    const streamed = world.readFileStream && Number.isFinite(size) ? worldStreamPath(world, captured.path) : undefined;
+    if (streamed) {
+      let read = 0;
+      for await (const piece of world.readFileStream!(streamed)) {
+        read += piece.length;
+        if (read > size!) throw new Error('resource file changed or was truncated during capture');
+        await checkContinue?.();
+        yield piece;
+        await captured.renew?.();
+      }
+      if (read !== size) throw new Error('resource file changed or was truncated during capture');
+    } else {
+      for await (const chunk of readResourceChunks(world, captured.path, Number.isFinite(size) ? size : undefined, checkContinue)) {
+        yield chunk;
+        await captured.renew?.();
+      }
     }
     await captured.verify?.();
   } finally { await captured.cleanup?.(); }
+}
+
+/** A command-relative (or absolute) path as the world-root-relative path file APIs take. */
+function worldStreamPath(world: World, file: string): string | undefined {
+  const handle = world.handle;
+  if (!path.posix.isAbsolute(file)) return worldWorkingRelativePath(handle, file);
+  const root = (handle.root ?? '').replace(/\/+$/, '');
+  return root && file.startsWith(`${root}/`) ? worldRelativePath(file.slice(root.length + 1)) : undefined;
 }
 
 async function manifestFromWorld(attachment: ResourceAttachment, world: World, target: string): Promise<SnapshotManifest> {
@@ -1593,4 +1908,150 @@ function openStamps(key: Buffer, sealed: string, attachmentId: string, rootDiges
     return value?.attachmentId === attachmentId && value.rootDigest === rootDigest && value.stamps && typeof value.stamps === 'object'
       ? value.stamps : undefined;
   } catch { return undefined; }
+}
+
+function manifestDigest(files: SnapshotEntry[], packs?: string[]): string {
+  return sha256(Buffer.from(JSON.stringify(packs ? { packs, files } : files)));
+}
+function entryObjects(file: SnapshotEntry | ProgressFile): string[] {
+  return 'chunks' in file && file.chunks ? file.chunks : typeof (file as ProgressFile).pack === 'string' ? [(file as ProgressFile).pack!] : [];
+}
+/** Every object a manifest references, once each. */
+function manifestObjects(manifest: SnapshotManifest): string[] {
+  return [...new Set([...manifest.packs ?? [], ...manifest.files.flatMap((file) => 'chunks' in file ? file.chunks : [])])];
+}
+
+/** Bounded concurrent uploads. `add` waits for a free slot; the first failure
+ * is raised by the next `add` or by `drain`. */
+class BoundedUploads {
+  private running = new Set<Promise<void>>();
+  private failure?: { error: unknown };
+  constructor(private limit: number) {}
+  async add(task: () => Promise<void>): Promise<void> {
+    this.raise();
+    while (this.running.size >= this.limit) await Promise.race(this.running);
+    this.raise();
+    const run: Promise<void> = task().catch((error) => { this.failure ??= { error }; })
+      .finally(() => { this.running.delete(run); });
+    this.running.add(run);
+  }
+  get failed(): boolean { return Boolean(this.failure); }
+  async drain(): Promise<void> { await this.settle(); this.raise(); }
+  async settle(): Promise<void> { while (this.running.size) await Promise.all(this.running); }
+  private raise(): void { if (this.failure) throw this.failure.error; }
+}
+
+/** A completed file in a progress record: its objects by id, and its stamp. */
+interface ProgressFile { path: string; bytes: number; sha256: string; chunks?: string[]; pack?: string; offset?: number; stamp?: string }
+interface ProgressStore {
+  get(key: string): Promise<string | undefined>;
+  set(key: string, value: string): Promise<void>;
+  compareAndSet(key: string, expected: string | undefined, next: string | undefined): Promise<boolean>;
+  /** Keys starting with a prefix. */
+  keys(prefix: string): Promise<string[]>;
+  delete(key: string): Promise<void>;
+}
+interface ProgressHead { attachmentId: string; storageLocationId?: string; owner?: string; at: number;
+  held: Array<[string, number]>; segments: string[] }
+/** Another attempt took this capture's progress record over (or it was abandoned). */
+class CaptureSuperseded extends Error {
+  constructor() { super('resource capture was superseded by another attempt'); }
+}
+
+/**
+ * What an interrupted resumable capture has saved, and the chunk references it
+ * holds, sealed in kv: a small head under `resource-capture:<attachment>` and
+ * the completed files in segments beside it, one per save, so a save writes only
+ * what it adds. Exactly one capture owns a record: it claims one only when none
+ * exists, when its owner stopped recording, or when its owner gave it up, and
+ * every later write of the head is a compare-and-set against its own last
+ * write, so an attempt that lost the record stops without releasing anything (a
+ * leak, never a double release). A record never names an object that is not
+ * uploaded, and it is gone before any reference it names is released.
+ */
+class CaptureProgress {
+  lost = false;
+  private constructor(private store: ProgressStore, private key: Buffer, private recordKey: string,
+    private head: ProgressHead, private value: string | undefined, private owner: string,
+    readonly files: ProgressFile[], readonly held: Array<[string, number]>) {}
+
+  static keyFor(attachmentId: string): string { return `resource-capture:${attachmentId}`; }
+
+  static async claim(store: ProgressStore, key: Buffer, attachment: ResourceAttachment,
+    storageLocationId: string | undefined): Promise<CaptureProgress | undefined> {
+    const recordKey = CaptureProgress.keyFor(attachment.id);
+    const owner = crypto.randomUUID();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const value = await store.get(recordKey);
+      const head = value === undefined ? undefined : openSealed<ProgressHead>(key, value);
+      // A record that cannot be read is replaced; what it held leaks.
+      const usable = head && head.attachmentId === attachment.id && Array.isArray(head.held) && Array.isArray(head.segments)
+        && Number.isFinite(head.at) && (head.storageLocationId ?? undefined) === (storageLocationId ?? undefined);
+      if (usable && head.owner && Date.now() - head.at < PROGRESS_STALE_MS) return undefined; // a live attempt
+      const files: ProgressFile[] = [];
+      // A missing segment only means its files are read again; their objects are still held.
+      if (usable) for (const segment of head.segments) files.push(...(openSealed<ProgressFile[]>(key, (await store.get(segment)) ?? '') ?? []));
+      const next: ProgressHead = { attachmentId: attachment.id, ...(storageLocationId ? { storageLocationId } : {}), owner, at: Date.now(),
+        held: usable ? head.held : [], segments: usable ? head.segments : [] };
+      const sealed = sealValue(key, next);
+      if (await store.compareAndSet(recordKey, value, sealed))
+        return new CaptureProgress(store, key, recordKey, next, sealed, owner, files, next.held);
+    }
+    return undefined;
+  }
+
+  /** Remove a record whatever its state, returning the references it held. */
+  static async take(store: ProgressStore, key: Buffer | undefined, attachmentId: string)
+    : Promise<{ ids: string[]; storageLocationId?: string } | undefined> {
+    const recordKey = CaptureProgress.keyFor(attachmentId);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const value = await store.get(recordKey);
+      if (value === undefined) { await CaptureProgress.dropSegments(store, recordKey); return undefined; }
+      if (!await store.compareAndSet(recordKey, value, undefined)) continue;
+      await CaptureProgress.dropSegments(store, recordKey);
+      const head = key ? openSealed<ProgressHead>(key, value) : undefined;
+      return head?.attachmentId === attachmentId && Array.isArray(head.held)
+        ? { ids: head.held.map(([id]) => id), storageLocationId: head.storageLocationId } : { ids: [] };
+    }
+    throw new Error('resource capture progress kept changing');
+  }
+
+  /** Record `files` completed since the last save. `park`: this attempt is
+   * stopping, so the next one may take the record over at once. */
+  async save(files: ProgressFile[], held: Array<[string, number]>, park: boolean): Promise<void> {
+    if (this.lost) throw new CaptureSuperseded();
+    const segments = [...this.head.segments];
+    if (files.length) {
+      const segment = `${this.recordKey}:${this.owner}:${segments.length}`;
+      await this.store.set(segment, sealValue(this.key, files));
+      segments.push(segment);
+    }
+    const { owner: _owner, ...rest } = this.head;
+    await this.write({ ...rest, ...(park ? {} : { owner: this.owner }), at: Date.now(), held, segments });
+  }
+
+  async clear(): Promise<void> {
+    await this.write(undefined);
+    await CaptureProgress.dropSegments(this.store, this.recordKey);
+  }
+
+  private async write(next: ProgressHead | undefined): Promise<void> {
+    if (this.lost) throw new CaptureSuperseded();
+    const sealed = next && sealValue(this.key, next);
+    if (!await this.store.compareAndSet(this.recordKey, this.value, sealed)) { this.lost = true; throw new CaptureSuperseded(); }
+    this.value = sealed;
+    if (next) this.head = next;
+  }
+
+  /** Segments are written before the head names them, so a lost write can leave one behind. */
+  private static async dropSegments(store: ProgressStore, recordKey: string): Promise<void> {
+    for (const segment of await store.keys(`${recordKey}:`)) await store.delete(segment);
+  }
+}
+
+function sealValue(key: Buffer, value: unknown): string {
+  return sealRandom(key, Buffer.from(JSON.stringify(value))).toString('base64');
+}
+function openSealed<T>(key: Buffer, value: string): T | undefined {
+  try { return JSON.parse(openRandom(key, Buffer.from(value, 'base64')).toString('utf8')) as T; } catch { return undefined; }
 }
