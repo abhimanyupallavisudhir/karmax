@@ -201,7 +201,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/insights$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
-  if (/^\/api\/organizations\/[^/]+\/subscription\/gift$/.test(p)) return 'subscription:gift';
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:gift|gift-storage)$/.test(p)) return 'subscription:gift';
   if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|storage-packs|reconcile)$/.test(p))
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
@@ -2603,7 +2603,7 @@ export class Gateway {
           queuedAgentRuns,
         });
       }
-      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|storage-packs|reconcile|gift)$/);
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|storage-packs|reconcile|gift|gift-storage)$/);
       if (subscription) {
         const organizationId = subscription[1]!;
         const action = subscription[2]!;
@@ -2620,6 +2620,19 @@ export class Gateway {
           return this.json(res, 200, { ...(await billing.current(organizationId)), canManage, canGift });
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        if (action === 'gift-storage') {
+          try {
+            const body = await this.body(req);
+            const key = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
+            const actor = actorPrincipal(callerIdentity.actor);
+            const result = await billing.giftStoragePacks(organizationId, body.packs, actor, key);
+            await this.deps.authorization?.audit(actor, 'subscription.gift-storage', `organization:${organizationId}`,
+              { packs: body.packs, requestKey: key, ...identityAuditDetail(callerIdentity) });
+            return this.json(res, 200, result);
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
         if (action === 'gift') {
           try {
             const body = await this.body(req);

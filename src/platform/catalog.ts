@@ -271,6 +271,7 @@ export const PLATFORM_API_CATALOG = {
   payments: [
     'GET /api/subscriptions/paddle/checkout-config (public browser checkout configuration: Paddle environment and client-side token only; never API keys or webhook secrets)',
     'POST /api/organizations/:organizationId/subscription/gift (subscription:gift, God authority; Idempotency-Key required; body {plan:individual|team|null}; null removes the gift; existing paid billing continues)',
+    'POST /api/organizations/:organizationId/subscription/gift-storage (subscription:gift, God authority; Idempotency-Key required; body {packs:0..1000}; gifted 100 GB storage packs count on any plan until set to 0; independent of paid packs)',
     'GET /api/organizations/:organizationId/subscription/status (hosted SaaS plan and verified seat/payment state; self-hosted reports unmetered)',
     'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|sync-seats|storage-packs (owner-only hosted SaaS billing; mutation calls require Idempotency-Key; checkout body also requires {plan,acceptedPolicies:true,policyVersions}; storage-packs body {packs}: the total 100 GB packs to bill)',
     'POST /api/organizations/:organizationId/subscription/reconcile (owner-only; checks an uncertain Paddle request using provider reads only; never retries a payment)',

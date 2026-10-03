@@ -18116,13 +18116,17 @@ async function hydrateOrganizationSubscription(organizationId) {
   const teamConcurrency = Number(team.maxActiveAgentRuns || 0)
     + Math.max(0, Number(state.activeUsers || 0) - Number(team.includedActiveUsers || 1))
       * Number(team.additionalActiveUserAgentRuns || 0);
+  const pack = state.storagePack || {};
+  const packs = Number(state.storagePacks || 0);
+  const giftedPacks = Number(state.giftedStoragePacks || 0);
+  const packOffer = pack.available ? ` Add ${esc(formatBytes(pack.bytes))} storage packs for ${esc(price(pack.monthlyPriceCents))}/month each.` : '';
   const disclosures = S.launch?.checkoutDisclosures || {};
   const planCards = !hasSubscription && !state.gift ? `<div class="billing-commercial-terms">
       <b>Before checkout</b><p class="task-sub">${esc(disclosures.renewalDisclosure || 'Subscriptions renew monthly until canceled.')} ${esc(disclosures.cancellationDisclosure || 'Cancel online from Organization settings before renewal.')} ${esc(disclosures.refundDisclosure || 'Payments are non-refundable except where law requires.')}</p>
       ${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')}</div>
     <div class="settings-grid" style="margin-top:14px">
-      <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user · unlimited projects · ${esc(individual.maxActiveAgentRuns)} shared concurrent agent runs · ${esc(formatBytes(individual.storageBytes))} storage.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
-      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First active user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month. With ${esc(state.activeUsers)} active user${state.activeUsers === 1 ? '' : 's'}: ${esc(price(teamTotal))} / month and ${esc(teamConcurrency)} shared concurrent agent runs. Unlimited projects · ${esc(team.maxActiveAgentRuns)} base concurrency + ${esc(team.additionalActiveUserAgentRuns)} per additional active user · ${esc(formatBytes(team.storageBytes))} storage + ${esc(formatBytes(team.additionalActiveUserStorageBytes))} per additional active user.</p><button class="btn sm primary billing-checkout" data-plan="team" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Team</button></div>
+      <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user · unlimited projects · ${esc(individual.maxActiveAgentRuns)} shared concurrent agent runs · ${esc(formatBytes(individual.storageBytes))} storage.${packOffer}</p><button class="btn sm primary billing-checkout" data-plan="individual" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
+      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First active user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month. With ${esc(state.activeUsers)} active user${state.activeUsers === 1 ? '' : 's'}: ${esc(price(teamTotal))} / month and ${esc(teamConcurrency)} shared concurrent agent runs. Unlimited projects · ${esc(team.maxActiveAgentRuns)} base concurrency + ${esc(team.additionalActiveUserAgentRuns)} per additional active user · ${esc(formatBytes(team.storageBytes))} storage + ${esc(formatBytes(team.additionalActiveUserStorageBytes))} per additional active user.${packOffer}</p><button class="btn sm primary billing-checkout" data-plan="team" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Team</button></div>
       <div class="card" style="padding:14px"><b>Enterprise</b><p class="task-sub">Custom deployment and support. Not available as a self-service launch plan.</p></div></div>` : '';
   const downgradeDisabled = ownerDisabled || (state.activeUsers > 1
     ? 'disabled title="Remove additional active users first"' : '');
@@ -18134,19 +18138,25 @@ async function hydrateOrganizationSubscription(organizationId) {
     <label for="billing-gift-plan">Gift subscription</label>
     <select id="billing-gift-plan" aria-label="Gift subscription">${Object.values(catalog).filter(plan => plan.id !== 'free').map(plan => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select>
     <button class="btn sm billing-gift" title="Complimentary access until removed. Existing paid billing continues.">${state.gift ? 'Update gift' : 'Gift'}</button>
-    ${state.gift ? '<button class="btn sm billing-gift-remove">Remove gift</button>' : ''}</div>` : '';
-  const pack = state.storagePack || {};
-  const packs = Number(state.storagePacks || 0);
+    ${state.gift ? '<button class="btn sm billing-gift-remove">Remove gift</button>' : ''}</div>
+    <div class="inline-form" style="margin-top:8px">
+    <label for="billing-gift-packs">Gift storage packs</label>
+    <input id="billing-gift-packs" type="number" min="0" max="1000" step="1" value="${esc(giftedPacks)}" style="flex:0 0 6em;width:6em">
+    <button class="btn sm billing-gift-packs" title="Each pack adds ${esc(formatBytes(pack.bytes || 0))} on any plan until removed. Nothing is billed.">Gift packs</button>
+    ${giftedPacks ? '<button class="btn sm billing-gift-packs-remove">Remove gifted packs</button>' : ''}</div>` : '';
   const packBusy = ownerDisabled || (state.pendingRequest ? 'disabled title="Wait for the pending billing request"' : '');
   const storagePacks = hasSubscription && pack.available && ['active', 'trialing', 'past_due'].includes(state.status)
     ? `<div class="member-row"><span>Storage packs ${policyTip(`Each pack adds ${formatBytes(pack.bytes)} of storage for ${price(pack.monthlyPriceCents)}/month, prorated on your next bill. Packs end with the subscription.`)}</span>
       <span class="team-actions"><button class="btn sm billing-packs" data-packs="${packs - 1}" aria-label="Remove a storage pack" ${packs > 0 ? packBusy : 'disabled'}>−</button><b>${packs}</b><button class="btn sm billing-packs" data-packs="${packs + 1}" aria-label="Add a storage pack" ${state.status === 'past_due' ? 'disabled title="Update the payment method first"' : packBusy}>+</button>
       <span class="task-sub">${packs ? `${esc(price(packs * pack.monthlyPriceCents))}/month` : `${esc(price(pack.monthlyPriceCents))}/month each`}</span></span></div>` : '';
   const giftNotice = state.gift && hasSubscription ? `<div class="member-row"><span><b>${esc(names[state.gift.plan])}</b> <span class="chip">Gifted · no expiry</span></span></div>` : '';
+  const packsOnPaidPlan = !hasSubscription && state.gift && pack.available
+    ? `<div class="member-row"><span>Storage packs ${policyTip(`Packs of ${formatBytes(pack.bytes)} for ${price(pack.monthlyPriceCents)}/month are added to a paid subscription.`)}</span><span class="task-sub">With a paid plan</span></div>` : '';
+  const giftedPacksNotice = giftedPacks ? `<div class="member-row"><span><b>${esc(giftedPacks)} gifted storage pack${giftedPacks === 1 ? '' : 's'}</b> <span class="chip">Gifted · no expiry</span></span><span class="task-sub">+${esc(formatBytes(giftedPacks * Number(pack.bytes || 0)))}</span></div>` : '';
   const effective = hasSubscription && state.plan !== billedPlan ? ` · effective access: ${esc(names[state.plan] || state.plan)}` : '';
   box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[hasSubscription ? billedPlan : state.plan] || state.plan)} <span class="chip">${esc(state.gift && !hasSubscription ? 'Gifted · no expiry' : statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}${effective}</span></span>
     <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
-    ${storagePacks}${giftNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
+    ${storagePacks}${packsOnPaidPlan}${giftNotice}${giftedPacksNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
     ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel online at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
     ${state.pendingRequest ? `<p class="task-sub">A billing request is pending confirmation. Wait a minute, then check its result before retrying. <button class="btn sm billing-reconcile" ${ownerDisabled}>Check pending billing request</button></p>` : ''}
     ${state.pendingCheckout && !hasSubscription ? `<p class="task-sub">An unpaid checkout is open. <button class="btn sm billing-cancel-checkout" ${ownerDisabled}>Cancel pending checkout</button></p>` : ''}
@@ -18164,6 +18174,28 @@ async function hydrateOrganizationSubscription(organizationId) {
       if (S.organizationId === organizationId && $('#org-plan')) $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
     } catch (error) { button.disabled = false; toast(error.message, true); }
   };
+  const saveGiftPacks = async (packs, button) => {
+    button.disabled = true;
+    try {
+      await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/gift-storage`, {
+        method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ packs }),
+      });
+      toast(packs ? 'Storage packs gifted' : 'Gifted packs removed');
+      if (S.organizationId !== organizationId) return;
+      await hydrateOrganizationSubscription(organizationId);
+      const entitlements = await api(`/api/organizations/${encodeURIComponent(organizationId)}/entitlements`);
+      if (S.organizationId === organizationId && $('#org-plan')) $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
+    } catch (error) { button.disabled = false; toast(error.message, true); }
+  };
+  box.querySelector('.billing-gift-packs')?.addEventListener('click', event => {
+    const packs = Number(box.querySelector('#billing-gift-packs').value);
+    if (!Number.isInteger(packs) || packs < 0 || packs > 1000) { toast('Enter a whole number of packs from 0 to 1000', true); return; }
+    void saveGiftPacks(packs, event.currentTarget);
+  });
+  box.querySelector('.billing-gift-packs-remove')?.addEventListener('click', event => {
+    if (!confirm('Remove the gifted storage packs? Data above the remaining quota becomes read-only.')) return;
+    void saveGiftPacks(0, event.currentTarget);
+  });
   box.querySelector('.billing-gift')?.addEventListener('click', event => {
     const plan = box.querySelector('#billing-gift-plan').value;
     if (hasSubscription && !confirm(`Gift ${names[plan]} access? Existing paid billing will continue until canceled separately.`)) return;
@@ -18337,12 +18369,20 @@ function organizationPlanMarkup(entitlements) {
   const monthly = Number(entitlements.currentMonthlyPriceCents || 0) / 100;
   const price = entitlements.gift ? 'Gifted' : monthly ? `$${Number.isInteger(monthly) ? monthly : monthly.toFixed(2)}/month` : '$0/month';
   const usage = `${entitlements.activeAgentRuns || 0} active · ${entitlements.queuedAgentRuns || 0} queued`;
+  const packBytes = Number(entitlements.storagePackBytes || 0);
+  const paidPacks = Number(entitlements.storagePacks || 0);
+  const giftedPacks = Number(entitlements.giftedStoragePacks || 0);
+  const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  const storage = entitlements.includedStorageBytes == null ? '' : `<div class="form-row">Storage<div class="plan-storage">
+    <span class="plan-storage-base" title="Included with ${esc(entitlements.planName)}">${esc(formatBytes(entitlements.includedStorageBytes))}</span>
+    ${paidPacks ? `<span class="plan-storage-extra" title="${esc(plural(paidPacks, 'storage pack'))}">+ ${esc(formatBytes(paidPacks * packBytes))} packs</span>` : ''}
+    ${giftedPacks ? `<span class="plan-storage-extra gifted" title="${esc(plural(giftedPacks, 'gifted storage pack'))}">+ ${esc(formatBytes(giftedPacks * packBytes))} gifted</span>` : ''}</div></div>`;
   const memberWarning = entitlements.overMemberLimit
     ? `<div class="card" style="padding:10px;border-color:var(--warn);margin:10px 0"><b>Agent runs are paused</b><div class="task-sub">${esc(entitlements.planName)} allows ${esc(entitlements.maxMembers)} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${esc(memberCount)}. Remove ${esc(memberCount - entitlements.maxMembers)} extra member${memberCount - entitlements.maxMembers === 1 ? '' : 's'} in <a href="#settings-people">People &amp; authorization</a>, or restore Team. Running agents may finish; no new agent run will start until this is resolved.</div></div>`
     : '';
   return `<div class="section-h">${esc(entitlements.planName)} <span class="chip">${esc(price)}</span></div>
     ${memberWarning}
-    <div class="settings-grid"><label class="form-row">People<input value="${esc(users)}" readonly></label><label class="form-row">Projects<input value="${esc(projects)}" readonly></label><label class="form-row">Agent concurrency<input value="${esc(runs)}" readonly></label><label class="form-row">Current agent usage<input value="${esc(usage)}" readonly></label></div>
+    <div class="settings-grid"><label class="form-row">People<input value="${esc(users)}" readonly></label><label class="form-row">Projects<input value="${esc(projects)}" readonly></label>${storage}<label class="form-row">Agent concurrency<input value="${esc(runs)}" readonly></label><label class="form-row">Current agent usage<input value="${esc(usage)}" readonly></label></div>
     <p class="task-sub">Concurrency is a shared maximum for this organization. Work above the limit waits in queue; it is not reserved capacity.</p>`;
 }
 

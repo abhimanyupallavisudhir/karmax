@@ -62,7 +62,14 @@ export interface OrganizationEntitlements {
   /** Managed-storage quota: the plan's storage plus packs. Null means unmetered
    * (private installations, whose operator may still cap managed storage). */
   storageQuotaBytes: number | null;
+  /** The plan's own storage for its active users, before any packs. */
+  includedStorageBytes: number | null;
+  /** Paid packs in effect (billing-verified; none on Free). */
   storagePacks: number;
+  /** Operator-gifted packs, which apply on any plan until removed. */
+  giftedStoragePacks: number;
+  /** Bytes one storage pack adds. */
+  storagePackBytes: number;
   unlimitedProjects: true;
 }
 
@@ -93,28 +100,37 @@ export function hostedActiveAgentRuns(plan: HostedPlanId, activeUsers: number): 
   return definition.maxActiveAgentRuns + additional * definition.additionalActiveUserAgentRuns;
 }
 
-/** Managed storage for the plan, its active users and its storage packs. Packs
- * count only on a paid plan, so a lapsed subscription falls back to Free's. */
-export function hostedStorageQuotaBytes(plan: HostedPlanId, activeUsers: number, storagePacks = 0): number {
+/** The plan's own managed storage for its active users, before packs. */
+export function hostedIncludedStorageBytes(plan: HostedPlanId, activeUsers: number): number {
   const definition = hostedPlan(plan);
   const users = Math.max(0, Math.floor(Number(activeUsers) || 0));
   const additional = Math.max(0, users - definition.includedActiveUsers);
+  return definition.storageBytes + additional * definition.additionalActiveUserStorageBytes;
+}
+
+/** Managed storage for the plan, its active users and its storage packs. Paid
+ * packs count only on a paid plan, so a lapsed subscription falls back to
+ * Free's; packs the operator gifted count on any plan. */
+export function hostedStorageQuotaBytes(plan: HostedPlanId, activeUsers: number, storagePacks = 0, giftedStoragePacks = 0): number {
   const packs = plan === 'free' ? 0 : Math.max(0, Math.floor(Number(storagePacks) || 0));
-  return definition.storageBytes + additional * definition.additionalActiveUserStorageBytes + packs * STORAGE_PACK.bytes;
+  const gifted = Math.max(0, Math.floor(Number(giftedStoragePacks) || 0));
+  return hostedIncludedStorageBytes(plan, activeUsers) + (packs + gifted) * STORAGE_PACK.bytes;
 }
 
 /** Private installations deliberately have no monetization limits. */
 export function organizationEntitlements(plan: HostedPlanId, hosted: boolean,
-  currentMemberCount = 0, storagePacks = 0): OrganizationEntitlements {
+  currentMemberCount = 0, storagePacks = 0, giftedStoragePacks = 0): OrganizationEntitlements {
   const members = Math.max(0, Math.floor(Number(currentMemberCount) || 0));
   const packs = Math.max(0, Math.floor(Number(storagePacks) || 0));
+  const gifted = Math.max(0, Math.floor(Number(giftedStoragePacks) || 0));
   if (!hosted) return {
     deployment: 'private', plan: null, planName: 'Private installation',
     monthlyBasePriceCents: null, includedActiveUsers: null,
     monthlyAdditionalActiveUserPriceCents: null, maxMembers: null,
     currentMemberCount: members, overMemberLimit: false,
     memberAdmissionAllowed: true, agentRunAdmissionAllowed: true,
-    maxActiveAgentRuns: null, storageQuotaBytes: null, storagePacks: packs, unlimitedProjects: true,
+    maxActiveAgentRuns: null, storageQuotaBytes: null, includedStorageBytes: null, storagePacks: packs,
+    giftedStoragePacks: gifted, storagePackBytes: STORAGE_PACK.bytes, unlimitedProjects: true,
   };
   const definition = hostedPlan(plan);
   const overMemberLimit = definition.maxMembers != null && members > definition.maxMembers;
@@ -129,8 +145,11 @@ export function organizationEntitlements(plan: HostedPlanId, hosted: boolean,
     memberAdmissionAllowed: definition.maxMembers == null || members < definition.maxMembers,
     agentRunAdmissionAllowed: !overMemberLimit,
     maxActiveAgentRuns: hostedActiveAgentRuns(plan, members),
-    storageQuotaBytes: hostedStorageQuotaBytes(plan, members, packs),
+    storageQuotaBytes: hostedStorageQuotaBytes(plan, members, packs, gifted),
+    includedStorageBytes: hostedIncludedStorageBytes(plan, members),
     storagePacks: plan === 'free' ? 0 : packs,
+    giftedStoragePacks: gifted,
+    storagePackBytes: STORAGE_PACK.bytes,
     unlimitedProjects: true,
   };
 }
