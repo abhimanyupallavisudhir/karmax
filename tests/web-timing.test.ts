@@ -54,7 +54,8 @@ it('does not restore timing rows from HTTP responses that finish after disabling
  const context = vm.createContext({ S: {meta:{timingEnabled:true},projectId:'p'},api:()=>pending,renderMain:()=>{} });
  const history = source.slice(source.indexOf('function mergeTaskHistory('),source.indexOf('async function refreshTaskHistory('));
  const activity = source.slice(source.indexOf('async function seedActivity('),source.indexOf('function activityView('));
- vm.runInContext(history+activity,context);
+ const liveOnly = source.slice(source.indexOf('function liveOnlyEvent('),source.indexOf('\n',source.indexOf('function liveOnlyEvent(')));
+ vm.runInContext(history+activity+liveOnly,context);
  const load = vm.runInContext('seedActivity()',context);
  vm.runInContext('S.meta.timingEnabled=false',context);
  resolve([{type:'timing',seq:1},{type:'fixture',seq:2}]); await load;
