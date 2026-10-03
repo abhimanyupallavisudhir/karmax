@@ -192,6 +192,75 @@ describe('changing storage packs', () => {
   });
 });
 
+describe('gifted storage packs', () => {
+  async function freeOrganization() {
+    const store = await Store.create(':memory:', { hosted: true });
+    const organization = await store.createOrganization({ name: `Gift packs ${crypto.randomUUID().slice(0, 8)}`, ownerUserId: 'owner' });
+    const provider = new FakeSubscriptionProvider();
+    const billing = new SubscriptionBillingService(store, provider, true);
+    return { store, organization, provider, billing };
+  }
+
+  it('adds gifted packs to any plan, including Free, without touching the billing provider', async () => {
+    const f = await freeOrganization();
+    const state = await f.billing.giftStoragePacks(f.organization.id, 2, 'user:operator', 'gift-packs-free');
+    expect(state).toMatchObject({ giftedStoragePacks: 2, storagePackGift: { packs: 2, grantedBy: 'user:operator' } });
+    expect(await f.store.organizationEntitlements(f.organization.id)).toMatchObject({ plan: 'free',
+      includedStorageBytes: 5 * GIB, storagePacks: 0, giftedStoragePacks: 2, storageQuotaBytes: 205 * GIB });
+    await storeBytes(f.store, f.organization.id, 1);
+    expect((await f.store.storageLocationUsage(managedStorageLocationId(f.organization.id))).quotaBytes).toBe(205 * GIB);
+    expect(f.provider.calls).toHaveLength(0);
+
+    await f.billing.giftStoragePacks(f.organization.id, 0, 'user:operator', 'gift-packs-remove');
+    expect(await f.store.organizationEntitlements(f.organization.id)).toMatchObject({ giftedStoragePacks: 0, storageQuotaBytes: 5 * GIB });
+    expect((await f.billing.current(f.organization.id)).storagePackGift).toBeNull();
+    await f.store.close();
+  });
+
+  it('stacks on paid packs and outlives the subscription that carried them', async () => {
+    const f = await subscribed('team', 2);
+    await f.billing.giftStoragePacks(f.organization.id, 1, 'user:operator', 'gift-on-paid');
+    expect(await f.store.organizationEntitlements(f.organization.id)).toMatchObject({ plan: 'team',
+      includedStorageBytes: 100 * GIB, storagePacks: 2, giftedStoragePacks: 1, storageQuotaBytes: 400 * GIB });
+    await f.deliver('customer.subscription.deleted', f.snapshot('canceled'));
+    expect(await f.store.organizationEntitlements(f.organization.id)).toMatchObject({ plan: 'free',
+      storagePacks: 0, giftedStoragePacks: 1, storageQuotaBytes: 105 * GIB });
+    await f.store.close();
+  });
+
+  it('counts gifted packs when an owner removes paid ones', async () => {
+    const f = await subscribed('team', 2);
+    await storeBytes(f.store, f.organization.id, 250 * GIB);
+    await f.billing.giftStoragePacks(f.organization.id, 1, 'user:operator', 'gift-covers-removal');
+    await f.billing.storagePacks(f.organization.id, 1, 'remove-covered-by-gift');
+    expect(f.provider.calls.at(-1)).toMatchObject({ method: 'updateStoragePacks', input: { storagePacks: 1 } });
+    await f.store.close();
+  });
+
+  it('accepts only a whole pack count up to 1000 with a key, on hosted installations', async () => {
+    const f = await freeOrganization();
+    for (const packs of [-1, 1.5, '2', 1001])
+      await expect(f.billing.giftStoragePacks(f.organization.id, packs, 'user:operator', `invalid-gift-${String(packs)}`)).rejects.toThrow(/whole number/);
+    await expect(f.billing.giftStoragePacks(f.organization.id, 1, 'user:operator', '')).rejects.toThrow(/Idempotency-Key/i);
+    await expect(f.billing.giftStoragePacks('org_missing', 1, 'user:operator', 'gift-missing-org')).rejects.toThrow(/not found/);
+    const local = await Store.create(':memory:');
+    const organization = await local.createOrganization({ name: 'Private', ownerUserId: 'owner' });
+    await expect(new SubscriptionBillingService(local, new FakeSubscriptionProvider(), false)
+      .giftStoragePacks(organization.id, 1, 'user:operator', 'gift-private-1')).rejects.toThrow(/hosted/);
+    await local.close();
+    await f.store.close();
+  });
+
+  it('keeps gifted packs in the organization export and removes them with the organization', async () => {
+    const f = await freeOrganization();
+    await f.billing.giftStoragePacks(f.organization.id, 3, 'user:operator', 'gift-export');
+    expect(JSON.stringify(await f.store.exportOrganization(f.organization.id))).toContain('"storage_pack_gifts"');
+    await f.store.deleteOrganization(f.organization.id);
+    expect(await f.store.db.prepare('SELECT COUNT(*) n FROM storage_pack_gifts').get()).toMatchObject({ n: 0 });
+    await f.store.close();
+  });
+});
+
 const config: PaddleRuntimeConfig = { environment: 'sandbox', apiKey: 'pdl_sdbx_apikey_test',
   webhookSecret: 'pdl_ntfset_test', clientToken: 'test_token', individualPriceId: 'pri_individual',
   teamBasePriceId: 'pri_team', teamSeatPriceId: 'pri_seat', storagePackPriceId: 'pri_pack', storagePackProductId: 'pro_pack' };
