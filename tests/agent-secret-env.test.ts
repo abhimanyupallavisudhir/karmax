@@ -14,7 +14,7 @@ import { LocalObjectStore } from '../src/store/objects.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
-import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
+import { INSTALLATION_SCOPE, organizationScope } from '../src/autonomy/vault-keys.js';
 
 describe('agent project-secret delivery', () => {
   it('resolves attachment and service handles JIT into the dedicated turn channel', async () => {
@@ -168,7 +168,7 @@ describe('work-environment screening', () => {
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     for (const [id, name, variable, value] of [['resource_good', 'Good token', 'GOOD_TOKEN', 'good-value'],
       ['resource_binary', 'Binary secret', 'BINARY_TOKEN', 'bin\u0000ary-value']] as const) {
-      (await broker.registerHandle(resourceSecretHandle(id), value));
+      (await broker.registerHandle(resourceSecretHandle(id), value, organizationScope(project.organizationId!)));
       (await store.createResourceAttachment({ id, organizationId: project.organizationId!, projectId: project.id,
         name, driver: 'secret@1', target: { kind: 'environment', name: variable },
         access: 'read', isolation: 'fork', source: {}, credentialHandles: [resourceSecretHandle(id)], publish: 'discard' }));
