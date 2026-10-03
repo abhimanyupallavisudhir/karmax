@@ -259,7 +259,9 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
       // several in-harness sub-agents (Claude Agent SDK Task tool) are still running.
       // Completion is "done AND not waiting on any sub-agents", so it must NOT advance
       // to Review — it is held in Do (waitingFor 'subagent') until the count drains.
-      args: [input({ taskId, repo, title: 'Subagents', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@subagents 3', subagentWaitMs: 1500 })],
+      // Each hold must outlast a slow runner's view poll, or the poll can miss
+      // every hold and see only Review (CI #1442 missed three 1.5 s holds).
+      args: [input({ taskId, repo, title: 'Subagents', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@subagents 3', subagentWaitMs: 4000 })],
     });
 
     // It surfaces as held-in-Do, waiting on its sub-agents — NOT advanced to Review.
@@ -270,12 +272,12 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
     expect((await git(repo, ['show', 'main:out.txt'])).code).not.toBe(0);
 
     // Once the sub-agents drain (count → 0), it advances to Review on its own.
-    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 40_000 }).toBe('review');
     await handle.signal('confirm');
     expect((await handle.result()).stage).toBe('done');
     // the work landed only after the sub-agents were done
     expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
-  }, 60_000);
+  }, 90_000);
 
   it('gives up on a wedged sub-agent after the nudge budget, and surfaces a Review note', async () => {
     const repo = await h.makeRepo('app-subagents-wedged');
