@@ -12,6 +12,7 @@ import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resou
 import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
 import { ensureIdentity, gitOrThrow } from '../src/world/git.js';
 import type { World } from '../src/world/types.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 describe('existing world secret refresh', () => {
   let dir: string, store: Store, broker: CredentialBroker, resources: ProjectResourceService, world: World;
@@ -37,7 +38,7 @@ describe('existing world secret refresh', () => {
   });
   async function add(name = 'REFRESH_TEST_TOKEN', projectId = project.id) {
     const id = `resource_${name.toLowerCase()}`, credential = resourceSecretHandle(id);
-    (await broker.registerHandle(credential, 'fixture-value'));
+    (await broker.registerHandle(credential, 'fixture-value', INSTALLATION_SCOPE));
     return (await store.createResourceAttachment({ id, organizationId: project.organizationId!, projectId, name,
       driver: 'secret@1', target: { kind: 'environment', name }, access: 'read', isolation: 'fork',
       source: {}, credentialHandles: [credential], publish: 'discard' }));
@@ -107,7 +108,7 @@ describe('existing world secret refresh', () => {
     await resources.scrubSecrets(world.handle, world);
     await resources.prepare(world);
     expect(write).toHaveBeenCalledTimes(2);
-    await broker.registerHandle(secret.credentialHandles[0]!, 'rotated');
+    await broker.registerHandle(secret.credentialHandles[0]!, 'rotated', INSTALLATION_SCOPE);
     await resources.prepare(world);
     expect(write).toHaveBeenCalledTimes(3);
     expect(fs.readFileSync(fileAt(), 'utf8')).toBe('rotated');
@@ -140,8 +141,8 @@ describe('existing world secret refresh', () => {
     await resources.refresh(opened);
     expect(fs.readFileSync(fileAt(), 'utf8')).toBe('agent edit');
     // ...but a rotation in project settings reaches the running agent.
-    (await broker.registerHandle(file.credentialHandles[0]!, 'rotated-file'));
-    (await broker.registerHandle(token.credentialHandles[0]!, 'rotated-env'));
+    (await broker.registerHandle(file.credentialHandles[0]!, 'rotated-file', INSTALLATION_SCOPE));
+    (await broker.registerHandle(token.credentialHandles[0]!, 'rotated-env', INSTALLATION_SCOPE));
     expect(await resources.refresh(opened)).toEqual({ REFRESH_TEST_TOKEN: 'rotated-env' });
     expect(fs.readFileSync(fileAt(), 'utf8')).toBe('rotated-file');
     (await store.updateResourceAttachment(token.id, { enabled: false }));
@@ -154,7 +155,7 @@ describe('existing world secret refresh', () => {
     const secret = (await add()); (await broker.deleteHandle(secret.credentialHandles[0]!));
     await expect(resources.prepare(world)).rejects.toThrow();
     expect((await store.listResourceLeases(world.handle.id))).toEqual([]);
-    (await broker.registerHandle(secret.credentialHandles[0]!, 'fixture-value'));
+    (await broker.registerHandle(secret.credentialHandles[0]!, 'fixture-value', INSTALLATION_SCOPE));
     expect(await present(await resources.prepare(world))).toBe('true');
     expect(JSON.stringify((await store.auditSince()))).not.toContain('fixture-value');
     expect(JSON.stringify((await store.listResourceLeases(world.handle.id)))).not.toContain('fixture-value');

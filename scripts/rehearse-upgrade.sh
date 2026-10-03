@@ -455,6 +455,11 @@ restore() {
     [ -n "$fingerprint" ] || { echo 'rehearse: the backup is signed but its log names no fingerprint'; return 1; }
     accept+=(--trust-key "$fingerprint")
   fi
+  # Backups taken by a release with per-owner data keys (data epoch 4) leave
+  # the vault key out: the operator supplies the one kept off-host.
+  if [ ! -f "$BACKUP/deployment-secrets/vault_key" ] && grep -q -- '--vault-key' ./deploy/karmax; then
+    accept+=(--vault-key "$WORK/install/deploy/.secrets/vault_key")
+  fi
   printf '%s\n' "$confirm" | ./deploy/karmax restore "${accept[@]}" "$BACKUP"
 }
 seed_edge_certificate

@@ -101,7 +101,8 @@ export async function activateProjectRuntime(args: {
     const launched = await launchWorldServices(world, args.taskId, perWorld, resources);
     warnings.push(...launched.warnings);
     if (Object.keys(launched.env).length) {
-      if (args.resources) world.handle = await args.resources.registerServiceEnvironment(world.handle, launched.env);
+      if (args.resources) world.handle = await args.resources.registerServiceEnvironment(world.handle, launched.env,
+        (await args.store.getProject(args.projectId))?.organizationId ?? 'org_personal');
       else warnings.push('per-world service endpoints could not be injected because project resources are unavailable');
     }
     if (launched.containers.length)

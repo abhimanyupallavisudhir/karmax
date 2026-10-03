@@ -15,6 +15,7 @@ import { openSqlDatabase } from '../src/store/sql.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE } from '../src/integrations/github-app.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 describe('shared GitHub installations', () => {
   it('migrates existing connections without changing IDs or repository links, including on restart', async () => {
@@ -55,8 +56,8 @@ describe('shared GitHub installations', () => {
       const broker = new CredentialBroker(new Vault(dir));
       const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
         privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-      broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
-      broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'hook-secret');
+      broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE);
+      broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'hook-secret', INSTALLATION_SCOPE);
       const organizations = await Promise.all(['First', 'Second'].map(name =>
         store.createOrganization({ name, ownerUserId: 'owner' })));
       let repositories = [{ id: 7, name: 'app', private: true, ssh_url: 'git@github.com:acme/app.git',

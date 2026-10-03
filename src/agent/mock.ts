@@ -32,6 +32,8 @@ import { platformToolHandlers } from './tools.js';
  *                                   running: N this turn, then N-1, … draining by one each turn
  *                                   until 0 — models a `npm test &` the turn ended while awaiting
  *   @review <summary>               attach review info
+ *   @reveal <itemId> [:: field]     get_credential: reveal a vault item through the platform
+ *                                   API; every later line may print it as {{secret}}
  *   @skill <name> :: <content>      save a skill
  *   @fail <message>                 throw (exercises Resolve)
  *   @failonce <message>             throw only the FIRST time per world (exercises the
@@ -83,6 +85,7 @@ export class MockAdapter implements AgentAdapter {
     let complete = true;
     let pendingSubagents = 0;
     let lastJob: string | undefined;
+    let revealed: string | undefined;
     const outputs: string[] = [];
     // How many `msgs` this turn has consumed — the schedule snapshot to start, then
     // one more per in-flight follow-up injected below (SPEC §5.6). Reported so the
@@ -115,7 +118,7 @@ export class MockAdapter implements AgentAdapter {
     // delivered batch and each injected follow-up).
     const processText = async (text: string): Promise<void> => {
     for (const raw of text.split('\n')) {
-      const line = raw.trim();
+      const line = revealed === undefined ? raw.trim() : raw.trim().replaceAll('{{secret}}', revealed);
       if (!line.startsWith('@')) continue;
       const [, directive, rest = ''] = line.match(/^@(\w+)\s*(.*)$/) ?? [];
       switch (directive) {
@@ -219,6 +222,22 @@ export class MockAdapter implements AgentAdapter {
             ? { needs_input: true, ...(urgency ? { urgency } : {}), ...(question?.trim() ? { message: question.trim() } : {}) } : {};
           outputs.push(await platformToolHandlers(input.world, ctx).pause!({ minutes: Number(minutes.trim()), ...(jobs ? { jobs } : {}), ...asks }));
           complete = false;
+          break;
+        }
+        case 'reveal': {
+          const [itemId, field = ''] = splitOn(rest, '::');
+          if (!ctx.platformRequest) throw new Error('the platform API is unavailable to this turn');
+          const result: any = await ctx.platformRequest('POST', '/api/vault/resolve',
+            { itemId: itemId.trim(), ...(field.trim() ? { field: field.trim() } : {}) });
+          ctx.emitActivity({ id: `reveal-${itemId.trim()}`, kind: 'tool', phase: 'completed',
+            title: 'karmax · get_credential', detail: JSON.stringify(result) });
+          if (result?.status !== 'granted') {
+            outputs.push(`reveal ${itemId.trim()}: ${result?.status ?? 'failed'}`);
+            break;
+          }
+          revealed = String(result.value);
+          ctx.emit(`revealed ${revealed}`);
+          outputs.push(`revealed ${revealed}`);
           break;
         }
         case 'review': {

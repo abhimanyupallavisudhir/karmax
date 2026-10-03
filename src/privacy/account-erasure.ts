@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { Store } from '../store/db.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { userScope } from '../autonomy/vault-keys.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 
 export const closedAccountKey = (id: string) => `account-closed:${id}`;
@@ -179,6 +180,8 @@ export class AccountErasureService {
             await this.broker.deleteHandle(handle);
         for (const row of await this.store.kvEntries(`github-app:user:${userId}:`))
           if (row.key.startsWith(`github-app:user:${userId}:`)) await this.store.kvDelete(row.key);
+        // Crypto-shred everything else the user owns in the vault (SS-1).
+        await this.broker.destroyScope(userScope(userId));
       });
       await step('access-and-preferences', () => this.clearAccess(userId));
       await step('identity', () => this.identity.removeUser(userId));

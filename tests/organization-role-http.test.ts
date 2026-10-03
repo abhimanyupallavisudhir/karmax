@@ -58,7 +58,7 @@ describe('organization role HTTP API', () => {
     const response = await request(url);
     expect(response.status).toBe(200);
     const catalog = await response.json() as any;
-    expect(catalog.profiles).toHaveLength(5);
+    expect(catalog.profiles).toHaveLength(6);
     expect(catalog.canCreate).toBe(true);
     expect(catalog.creatableCapabilities).toContain('task:read');
     expect(catalog.creatableCapabilities).not.toContain('settings:write');

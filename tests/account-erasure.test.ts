@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +17,7 @@ import { Overlays } from '../src/store/overlays.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { GitHubAppService, GITHUB_APP_CLIENT_SECRET_HANDLE } from '../src/integrations/github-app.js';
+import { INSTALLATION_SCOPE, userScope } from '../src/autonomy/vault-keys.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -85,7 +87,7 @@ it('cleans only personal access/settings and preserves shared work, history and 
   const before = await store.getTask(task.id);
   for (const id of ['u_1', 'uX1']) {
     await new GitProfiles(store, broker, dir, userGitScope(id)).save({ name: 'main', userName: id, userEmail: `${id}@example.test`, sshKey: 'fixture' });
-    await broker.registerHandle(`github-app:user:${id}:account:9:authorization`, 'fixture-token');
+    await broker.registerHandle(`github-app:user:${id}:account:9:authorization`, 'fixture-token', userScope(id));
     await store.kvSet(`github-app:user:${id}:accounts`, '[{"id":"9"}]');
     await store.kvSet(`hosted:onboarding:${id}:${org.id}`, '{"display":"hidden"}');
     await store.setDeliveryPreferences({ userId: id, organizationId: org.id, browser: true, email: true, slack: false, routine: true });
@@ -97,6 +99,7 @@ it('cleans only personal access/settings and preserves shared work, history and 
   const delegation = await tokens.delegateHuman(human.token, { taskId: task.id, projectId: project.id });
   const agent = await tokens.mint({ taskId: task.id, profileId: 'test', principal: 'user:u_1', ceiling: ['*'], grantorCaps: ['*'], delegationId: delegation!.id, projectId: project.id });
   await store.kvSet('account-deletion:u_1', JSON.stringify({ userId: 'u_1', email: 'person@example.test' }));
+  await broker.registerHandle('user-owned:unlisted', 'no cleanup step names this handle', userScope('u_1'));
   const record = await close();
   expect(record.state).toBe('closed');
   expect(record.items.every(item => !item.decision)).toBe(true);
@@ -111,6 +114,10 @@ it('cleans only personal access/settings and preserves shared work, history and 
   expect(await store.listPrincipalGrants('user:uX1')).toHaveLength(1);
   expect(broker.listHandles().some(h => h.includes(':u_1:'))).toBe(false);
   expect(broker.hasHandle('github-app:user:uX1:account:9:authorization')).toBe(true);
+  // SS-1: the user's data key is destroyed too, and with it anything left under it.
+  expect(broker.hasHandle('user-owned:unlisted')).toBe(false);
+  expect(fs.existsSync(path.join(dir, 'vault', 'keys', `${crypto.createHash('sha256').update('user:u_1').digest('hex')}.json`))).toBe(false);
+  expect(fs.existsSync(path.join(dir, 'vault', 'keys', `${crypto.createHash('sha256').update('user:uX1').digest('hex')}.json`))).toBe(true);
   expect(await store.kvGet('github-app:user:u_1:accounts')).toBeUndefined();
   expect(await store.kvGet('github-app:user:uX1:accounts')).toBeDefined();
   expect(await store.kvGet(`hosted:onboarding:u_1:${org.id}`)).toBeUndefined();
@@ -130,7 +137,7 @@ it('keeps access fenced during failure and resumes idempotently with persisted p
   const { store, identity, broker, dir, tokens, service, close } = await fixture();
   const human = await tokens.mintPrincipal('user:u_1', ['*']);
   const failure = vi.spyOn(broker, 'deleteHandle').mockImplementationOnce(() => { throw new Error('fixture-vault-outage'); });
-  await broker.registerHandle('github-app:user:u_1:authorization', 'fixture');
+  await broker.registerHandle('github-app:user:u_1:authorization', 'fixture', userScope('u_1'));
   await expect(close()).rejects.toThrow('cleanup is incomplete');
   expect(await tokens.verify(human.token)).toBeUndefined();
   expect(identity.removeUser).not.toHaveBeenCalled();
@@ -147,7 +154,7 @@ it('removes the departing owner atomically with the fence, even when credential 
   const { store, broker, close } = await fixture();
   const org = await store.createOrganization({ name: 'Two owners', ownerUserId: 'u_1' });
   await store.setOrganizationMembership(org.id, 'admin', 'owner');
-  await broker.registerHandle('github-app:user:u_1:authorization', 'fixture');
+  await broker.registerHandle('github-app:user:u_1:authorization', 'fixture', userScope('u_1'));
   vi.spyOn(broker, 'deleteHandle').mockImplementationOnce(() => { throw new Error('outage'); });
   await expect(close()).rejects.toThrow('cleanup is incomplete');
   expect(await store.kvGet(closedAccountKey('u_1'))).toBeDefined();
@@ -157,7 +164,7 @@ it('removes the departing owner atomically with the fence, even when credential 
 
 it('rejects delayed GitHub grants and refreshes after closure without affecting the installation key', async () => {
   const { store, broker, close } = await fixture();
-  await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'fixture-installation-secret');
+  await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'fixture-installation-secret', INSTALLATION_SCOPE);
   let release!: () => void;
   let entered!: () => void;
   const started = new Promise<void>(resolve => { entered = resolve; });
@@ -348,7 +355,7 @@ it('validates every review decision and reopens a completed review when one chan
 it('does not let a slow concurrent retry undo a later review', async () => {
   const { store, identity, broker, dir, close } = await fixture();
   vi.spyOn(broker, 'deleteHandle').mockImplementationOnce(() => { throw new Error('outage'); });
-  await broker.registerHandle('github-app:user:u_1:authorization', 'fixture');
+  await broker.registerHandle('github-app:user:u_1:authorization', 'fixture', userScope('u_1'));
   await expect(close()).rejects.toThrow('cleanup is incomplete');
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });

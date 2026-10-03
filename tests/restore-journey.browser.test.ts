@@ -59,11 +59,14 @@ it('restores a backup over lost state, and the console carries the restored task
   await app.stop();
 
   await createBackup({ home, destination: path.join(root, 'backup') });
+  // Backups never carry the vault key (SS-2): the operator keeps a copy off-host.
+  const keptKey = path.join(root, 'vault.key');
+  fs.copyFileSync(path.join(home, 'vault', 'vault.key'), keptKey);
   // The disk holding karmax's metadata and vault is lost; task worlds and the
   // persistent Temporal server survive, as they would on another volume.
   fs.rmSync(path.join(home, 'state'), { recursive: true });
   fs.rmSync(path.join(home, 'vault'), { recursive: true });
-  const manifest = await restoreBackup(path.join(root, 'backup'), { home });
+  const manifest = await restoreBackup(path.join(root, 'backup'), { home, vaultKeyFile: keptKey });
   expect(manifest.temporal).toBe('embedded');
 
   app = await launchApp(home);

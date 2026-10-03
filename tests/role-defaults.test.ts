@@ -52,15 +52,17 @@ describe('autonomous role defaults', () => {
     } finally { await store.close(); }
   });
 
-  it('reserves only installation-wide capabilities from Administrators', async () => {
+  it('reserves only installation-wide capabilities from Super-administrators, and the vault, payments and deletion from Administrators', async () => {
     const store = await Store.create(':memory:');
     try {
       const auth = await AuthorizationService.create(store);
-      const caps = (await auth.profile('administrator'))!.capabilities;
-      expect(CAPABILITIES.filter(cap => !allows(caps, cap))).toEqual([
-        'workflow:install', 'process:kill', 'settings:read', 'settings:write',
-        'subscription:gift', 'authorization:read', 'authorization:write', 'user:read', 'user:write',
-      ]);
+      const installation = ['workflow:install', 'process:kill', 'settings:read', 'settings:write',
+        'subscription:gift', 'authorization:read', 'authorization:write', 'user:read', 'user:write'];
+      const superadmin = (await auth.profile('superadmin'))!.capabilities;
+      expect(CAPABILITIES.filter(cap => !allows(superadmin, cap))).toEqual(installation);
+      const admin = (await auth.profile('administrator'))!.capabilities;
+      expect(CAPABILITIES.filter(cap => !allows(admin, cap)).sort())
+        .toEqual([...installation, 'credential:reveal', 'payment:write', 'organization:delete'].sort());
     } finally { await store.close(); }
   });
 

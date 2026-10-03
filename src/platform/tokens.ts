@@ -363,14 +363,31 @@ export class TokenAuthority {
     return undefined;
   }
 
+  /** Where a refused capability was looked for, in words a person and an
+   * agent can both act on: the project and organization, by name and id. */
+  private async describeScope(record: ScopedToken, scope?: { projectId?: string; taskId?: string; organizationId?: string }): Promise<string> {
+    const projectId = scope?.projectId ?? (scope?.taskId ? await this.store?.taskProjectIdAsync(scope.taskId) : undefined)
+      ?? (scope?.organizationId ? undefined : record.projectId);
+    const project = projectId ? await this.store?.getProject(projectId) : undefined;
+    const organizationId = scope?.organizationId ?? project?.organizationId ?? record.organizationId;
+    const organization = organizationId ? await this.store?.getOrganization(organizationId) : undefined;
+    const named = (kind: string, id: string, name?: string) => name ? `${kind} ${JSON.stringify(name)} (${id})` : `${kind} ${id}`;
+    if (projectId && organizationId)
+      return `in ${named('project', projectId, project?.name)} of ${named('organization', organizationId, organization?.name)}`;
+    if (projectId) return `in ${named('project', projectId, project?.name)}`;
+    if (organizationId) return `in ${named('organization', organizationId, organization?.name)}`;
+    return 'across the installation (the request names no project or organization)';
+  }
+
   /** Verify the token and check it allows the requested capability. */
   async check(token: string, capability: Capability, scope?: { projectId?: string; taskId?: string; organizationId?: string;
-    audience?: ScopedToken['audience']; executionId?: string; worldGeneration?: number }): Promise<{ ok: boolean; record?: ScopedToken; reason?: string }> {
+    audience?: ScopedToken['audience']; executionId?: string; worldGeneration?: number }): Promise<{ ok: boolean; record?: ScopedToken; reason?: string; missing?: Capability }> {
     const record = (await this.verify(token));
     if (!record) return { ok: false, reason: 'invalid or expired token' };
     if (!allows(record.caps, capability) && !(OWN_TASK_CAPABILITIES.has(capability)
       && allows(record.caps, 'task:manage-own') && scope?.taskId
-      && await this.ownsTask(record, scope.taskId))) return { ok: false, record, reason: `missing capability ${capability}` };
+      && await this.ownsTask(record, scope.taskId)))
+      return { ok: false, record, missing: capability, reason: `missing capability ${capability} ${(await this.describeScope(record, scope))}` };
     // Resolve the tenant from durable ownership, including callers that pass
     // only a project/task ID. A transfer must immediately fence old org tokens.
     // A task decides its own project: a scope that pairs it with another one

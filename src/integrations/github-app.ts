@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import net from 'node:net';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { INSTALLATION_SCOPE, userScope } from '../autonomy/vault-keys.js';
 import type { Store } from '../store/db.js';
 import type { GitConnection, Repository } from '../domain/types.js';
 import { githubPrWebhookObservationKey, pullRequestWebhookEvent, reconcilePullRequestView,
@@ -432,9 +433,9 @@ export class GitHubAppService {
     (await this.store.kvSet(GITHUB_APP_ID_KEY, appId));
     (await this.store.kvSet(GITHUB_APP_SLUG_KEY, appSlug));
     if (this.options.clientId) (await this.store.kvSet(GITHUB_APP_CLIENT_ID_KEY, this.options.clientId));
-    (await this.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, input.privateKey));
-    if (input.webhookSecret) (await this.broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, input.webhookSecret));
-    if (input.clientSecret) (await this.broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, input.clientSecret));
+    (await this.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, input.privateKey, INSTALLATION_SCOPE));
+    if (input.webhookSecret) (await this.broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, input.webhookSecret, INSTALLATION_SCOPE));
+    if (input.clientSecret) (await this.broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, input.clientSecret, INSTALLATION_SCOPE));
     this.tokenCache.clear();
     this.permissionSnapshots.clear();
     return (await this.status());
@@ -546,7 +547,7 @@ export class GitHubAppService {
         ...(authorization.accessTokenExpiresAt ? { expiresAt: authorization.accessTokenExpiresAt.getTime() } : {}),
         ...(authorization.refreshToken ? { refreshToken: authorization.refreshToken } : {}),
         ...(authorization.refreshTokenExpiresAt ? { refreshExpiresAt: authorization.refreshTokenExpiresAt.getTime() } : {}),
-      })));
+      }), userScope(userId)));
       (await this.clearUserAuthorizationFailure(userId, identity.id));
       (await this.clearUserAuthorizationFailure(userId));
       (await this.saveUserIdentity(userId, identity, false));
@@ -1547,17 +1548,17 @@ export class GitHubAppService {
   }
 
   private async saveUserToken(userId: string, accountId: string, value: any): Promise<void> {
-    await this.saveTokenHandle(githubUserTokenHandle(userId, accountId), value);
+    await this.saveTokenHandle(githubUserTokenHandle(userId, accountId), value, userId);
   }
 
-  private async saveTokenHandle(handle: string, value: any): Promise<void> {
+  private async saveTokenHandle(handle: string, value: any, userId: string): Promise<void> {
     const now = Date.now();
     (await this.broker.registerHandle(handle, JSON.stringify({
       accessToken: String(value.access_token),
       expiresAt: value.expires_in ? now + Number(value.expires_in) * 1000 : undefined,
       refreshToken: value.refresh_token ? String(value.refresh_token) : undefined,
       refreshExpiresAt: value.refresh_token_expires_in ? now + Number(value.refresh_token_expires_in) * 1000 : undefined,
-    })));
+    }), userScope(userId)));
   }
 
   private resolvedUserToken(handle: string): { raw: string; value: {
@@ -1674,7 +1675,7 @@ export class GitHubAppService {
     }
     await this.store.transaction(async () => {
       await this.assertUserOpen(userId);
-      await this.saveTokenHandle(handle, value);
+      await this.saveTokenHandle(handle, value, userId);
     });
     (await this.clearUserAuthorizationFailure(userId, accountId));
     (await this.store.appendAudit({
@@ -1731,7 +1732,7 @@ export class GitHubAppService {
     if (!this.broker.hasHandle(legacy)) return;
     const identity = await this.userIdentity(userId);
     const stored = this.broker.resolve(legacy, { caps: [`use-credential:${legacy}`] });
-    (await this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), stored));
+    (await this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), stored, userScope(userId)));
     const accounts = (await this.userAccounts(userId));
     (await this.saveUserAccounts(userId, [...accounts.filter((account) => account.id !== identity.id), identity]));
     if (!(await this.store.kvGet(githubUserActiveAccountKey(userId)))) (await this.store.kvSet(githubUserActiveAccountKey(userId), identity.id));

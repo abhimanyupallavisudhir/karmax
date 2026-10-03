@@ -12,6 +12,7 @@ import { accountCoordinatorId } from '../src/coordinators/names.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { retryCredentials } from '../src/agent/credential-health.js';
 import { credPolicyKey } from '../src/platform/credential-sources.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 // Full HTTP -> API -> real Temporal workflow/coordinator -> credential lease ->
 // real git world -> agent result -> Review. Only model inference is simulated.
@@ -320,7 +321,7 @@ describe('credential Retry end to end', () => {
     const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
     const rows = await Promise.all(providers.map(async provider => {
       const handle = `${provider}:retry-test`;
-      (await h.broker.registerHandle(handle, 'test-key'));
+      (await h.broker.registerHandle(handle, 'test-key', INSTALLATION_SCOPE));
       return { id: `key:handle:${handle}`, provider, kind: 'key' as const, configHome: '', apiKeyHandle: handle };
     }));
     await coordinator.registerAccounts(rows);

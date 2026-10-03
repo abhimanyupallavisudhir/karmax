@@ -16,6 +16,7 @@ import { detectConversationImport } from '../src/store/conversation-imports.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -682,7 +683,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     };
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    (await h.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
+    (await h.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE));
     const githubApp = (await GitHubAppService.create(h.store, h.broker,
       { appId: '1', fetch: fakeFetch as typeof fetch }));
     await githubApp.adoptUserAuthorization('delegator', '42', { accessToken: 'pinned-token' });
@@ -1689,7 +1690,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     };
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    (await h.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey));
+    (await h.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE));
     const githubApp = (await GitHubAppService.create(h.store, h.broker, { appId: '1', fetch: fakeFetch as typeof fetch }));
     const connection = (await h.store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '321', accountLogin: 'acme', accountType: 'Organization' }));
@@ -1951,10 +1952,20 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect((await h.store.auditSince()).some((entry: any) => entry.action === 'vault.revealed'
       && entry.detail.itemId === created.id && entry.detail.field === 'password')).toBe(true);
 
-    // Explicit administrative authority permits inspection for agents too.
+    // Vault read access permits inspection for agents too; managing
+    // credentials alone does not.
+    const manager = (await h.tokens.mint({
+      taskId: 'task_admin_manage', profileId: 'do', principal: 'user:test', organizationId: 'org_personal',
+      ceiling: ['credential:write'], grantorCaps: ['credential:write'],
+    }));
+    expect((await fetch(`${base}/api/vault/items/${created.id}/reveal`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${manager.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ field: 'password' }),
+    })).status).toBe(403);
     const taskAgent = (await h.tokens.mint({
       taskId: 'task_admin_reveal', profileId: 'do', principal: 'user:test', organizationId: 'org_personal',
-      ceiling: ['credential:write'], grantorCaps: ['credential:write'],
+      ceiling: ['credential:write', 'credential:reveal'], grantorCaps: ['credential:write', 'credential:reveal'],
     }));
     const agentInspection = await fetch(`${base}/api/vault/items/${created.id}/reveal`, {
       method: 'POST',

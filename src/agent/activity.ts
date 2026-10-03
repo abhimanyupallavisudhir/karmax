@@ -56,26 +56,24 @@ function redactString(text: string): string {
 }
 
 /**
- * The exact values karmax delivered to one turn — its platform token, model
- * credential, project and vault secrets. Key-based redaction above cannot see
- * `echo $DATABASE_URL` or a `.env` printed in full, so wherever the turn's
- * text is archived (live output, activity items, the final answer) these
- * values are replaced outright. Short values are skipped: scrubbing "1" or
- * "true" would mangle ordinary text and protect nothing.
+ * The exact values karmax delivered to one task — its platform token, model
+ * credential, project and vault secrets, and every value revealed to it while
+ * it runs (`src/autonomy/task-secrets.ts`). Key-based redaction above cannot
+ * see `echo $DATABASE_URL` or a `.env` printed in full, so wherever the task's
+ * text is archived or served these values are replaced outright, in each form
+ * `secretForms` lists. Short values are skipped: scrubbing "1" or "true" would
+ * mangle ordinary text and protect nothing.
  */
 export class SecretScrubber {
   private values: string[] = [];
 
+  /** How many distinct forms are being scrubbed. */
+  get size(): number { return this.values.length; }
+
   add(...values: Array<string | undefined>): void {
     const next = new Set(this.values);
-    for (const value of values) {
-      if (!value || value.length < 8) continue;
-      next.add(value);
-      // The same value inside JSON (a tool result, an activity payload).
-      const escaped = JSON.stringify(value).slice(1, -1);
-      if (escaped !== value) next.add(escaped);
-    }
-    this.values = [...next].sort((a, b) => b.length - a.length);
+    for (const value of values) if (value && value.length >= MIN_SECRET_CHARS) for (const form of secretForms(value)) next.add(form);
+    if (next.size !== this.values.length) this.values = [...next].sort((a, b) => b.length - a.length);
   }
 
   scrub(text: string): string;
@@ -86,11 +84,37 @@ export class SecretScrubber {
     return text;
   }
 
-  /** `scrub` for the text so far of a block still being generated. A cut can
-   * fall inside a value, which then cannot match whole, so a tail that begins
-   * one (at least PARTIAL_SECRET_CHARS of it) is held back until more text
-   * arrives and the whole value can be replaced. */
-  scrubPartial(text: string): string {
+  /** `scrub` every string inside plain JSON data (a journal, review info, a
+   * turn result), leaving its shape intact. */
+  scrubValue<T>(value: T): T {
+    if (!this.values.length) return value;
+    if (typeof value === 'string') return this.scrub(value) as T;
+    if (Array.isArray(value)) return value.map((item) => this.scrubValue(item)) as T;
+    if (value && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype)
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, this.scrubValue(item)])) as T;
+    return value;
+  }
+
+  /** Mask every value in a file without moving a single byte: each matched
+   * byte becomes `*`. Native transcripts stay valid JSONL, and Codex history
+   * that refers to byte offsets in an ancestor rollout still lines up. */
+  mask(data: Buffer): Buffer {
+    if (!this.values.length) return data;
+    let text = data.toString('latin1');
+    let changed = false;
+    for (const value of this.values) {
+      const bytes = Buffer.from(value).toString('latin1');
+      if (!text.includes(bytes)) continue;
+      text = text.split(bytes).join('*'.repeat(bytes.length));
+      changed = true;
+    }
+    return changed ? Buffer.from(text, 'latin1') : data;
+  }
+
+  /** The length of the longest start of `text` that cannot end inside a
+   * value: a tail that begins one (at least PARTIAL_SECRET_CHARS of it) may
+   * still become that value when more text arrives. */
+  safeEnd(text: string): number {
     let end = text.length;
     for (let held = true; held;) {
       held = false;
@@ -103,8 +127,45 @@ export class SecretScrubber {
         }
       }
     }
-    return this.scrub(text.slice(0, end));
+    return end;
   }
+
+  /** `scrub` for the text so far of a block still being generated. A cut can
+   * fall inside a value, which then cannot match whole, so the tail that could
+   * still become one is held back until more text arrives. */
+  scrubPartial(text: string): string {
+    return this.scrub(text.slice(0, this.safeEnd(text)));
+  }
+}
+
+/** The shortest value worth scrubbing. */
+export const MIN_SECRET_CHARS = 8;
+
+/**
+ * Every form of `value` the scrubber can cheaply recognize: as is; JSON-escaped
+ * once (a tool result) and twice (that result inside a JSON transcript line);
+ * URL-encoded (a query string, a form body); and base64/base64url at each of
+ * the three byte alignments a value can have inside a longer encoded payload
+ * (`Authorization: Basic …`, a data URL). For an alignment, only the characters
+ * determined by the value's own bits are kept, so the form matches whatever
+ * surrounds it. Forms shorter than MIN_SECRET_CHARS are dropped.
+ */
+export function secretForms(value: string): string[] {
+  const forms = new Set<string>([value]);
+  const escaped = JSON.stringify(value).slice(1, -1);
+  forms.add(escaped);
+  forms.add(JSON.stringify(escaped).slice(1, -1));
+  const encoded = encodeURIComponent(value);
+  forms.add(encoded);
+  forms.add(encoded.replace(/%20/g, '+'));
+  const bytes = Buffer.from(value);
+  for (let offset = 0; offset < 3; offset++) {
+    const base64 = Buffer.concat([Buffer.alloc(offset), bytes]).toString('base64');
+    const core = base64.slice(Math.ceil((offset * 8) / 6), Math.floor(((offset + bytes.length) * 8) / 6));
+    forms.add(core);
+    forms.add(core.replace(/\+/g, '-').replace(/\//g, '_'));
+  }
+  return [...forms].filter((form) => form.length >= MIN_SECRET_CHARS);
 }
 
 /** The shortest start of a secret a live publication may not end with. */

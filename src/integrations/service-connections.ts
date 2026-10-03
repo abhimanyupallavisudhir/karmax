@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import Composio from '@composio/client';
 import type { Store } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { newId } from '../util/id.js';
 import { beginOAuth, finishOAuth, connectionHeaders, type OAuthVault, type OAuthTarget } from '../mcp/connections/oauth.js';
 import { openRemoteMcp, remoteMcpAuth, type RemoteMcpTransport } from '../mcp/connections/remote.js';
@@ -109,7 +110,7 @@ export class ServiceConnections {
     },
     setSecret: async (c, value) => {
       if ((await this.get(c.organizationId, c.id)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
-      (await this.broker.registerHandle(MCP_CREDENTIALS + c.id, JSON.stringify(value)));
+      (await this.broker.registerHandle(MCP_CREDENTIALS + c.id, JSON.stringify(value), organizationScope(c.organizationId)));
     },
   };
   private target(c: ServiceConnection): OAuthTarget {
@@ -127,7 +128,7 @@ export class ServiceConnections {
     // Changing projects would orphan their grants and sessions.
     for (const c of (await this.all()).filter(c => c.accountId))
       await this.remote(() => candidate.active(c.accountId!, c.toolkit));
-    (await this.broker.registerHandle(KEY, key.trim()));
+    (await this.broker.registerHandle(KEY, key.trim(), INSTALLATION_SCOPE));
     this.client = candidate;
   }
   private backend() {
@@ -271,7 +272,7 @@ export class ServiceConnections {
       // A returned account id is trusted only because it came from our own
       // server-side authorize call; a browser callback never supplies it.
       c.accountId = auth.id; c.sessionId = undefined; c.notifiedAt = undefined; c.status = 'connecting';
-      (await this.broker.registerHandle(PREFIX + c.id, auth.url));
+      (await this.broker.registerHandle(PREFIX + c.id, auth.url, organizationScope(c.organizationId)));
       (await this.save(c));
       return { connection: this.view(c), url: auth.url };
     });

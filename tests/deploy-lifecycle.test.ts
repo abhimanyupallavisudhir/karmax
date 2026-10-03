@@ -255,7 +255,8 @@ it('verifies backup signatures first, and restores an unsigned backup only when 
   expect(h.run(['restore', '--trust-key', fingerprint, destination], '', 'RESTORE\n').status).toBe(0);
   const calls = h.calls().map(args => args.join(' '));
   const stopped = calls.findIndex(call => call.endsWith(' down'));
-  const checked = calls.findIndex(call => call.includes(`npm run restore -- --verify-deployment --trust-key ${fingerprint} /backup`));
+  const checked = calls.findIndex(call => call.includes(`npm run restore -- --verify-deployment --check-vault-key --trust-key ${fingerprint} /backup`)
+    && call.includes('KARMAX_VAULT_KEY_FILE=/backup/.restore-vault-key'));
   expect(checked).toBeGreaterThan(-1);
   expect(checked).toBeLessThan(stopped);
   expect(calls.slice(stopped).some(call => call.includes(`npm run restore -- --trust-key ${fingerprint} /restore`))).toBe(true);
@@ -271,7 +272,7 @@ it('verifies backup signatures first, and restores an unsigned backup only when 
   expect(unsigned.status, unsigned.stderr).toBe(0);
   expect(unsigned.stdout).toContain('This backup is unsigned');
   const accepted = h.calls().map(args => args.join(' '));
-  expect(accepted.some(call => call.includes('--verify-deployment --accept-unsigned-v1 /backup'))).toBe(true);
+  expect(accepted.some(call => call.includes('--verify-deployment --check-vault-key --accept-unsigned-v1 /backup'))).toBe(true);
   expect(accepted.some(call => call.includes('npm run restore -- --accept-unsigned-v1 /restore'))).toBe(true);
 });
 
@@ -480,4 +481,27 @@ it('returns the checkout to the running revision when the target secrets cannot 
   expect(result.stderr).toContain(`production remains at ${h.previous}`);
   expect(h.git('rev-parse', 'HEAD')).toBe(h.previous);
   expect(h.calls().some(args => args.includes('build') || args.includes('up'))).toBe(false);
+});
+
+// SS-2: backups leave the vault key out; restore keeps this instance's key, or
+// installs the one the operator kept off-host, and keeps retired keys.
+it('restores a backup without its vault key using the live key, or the one supplied', () => {
+  const h = deployment();
+  const destination = path.join(h.root, 'snapshot');
+  expect(h.run(['backup', destination]).status).toBe(0);
+  expect(fs.existsSync(path.join(destination, 'deployment-secrets', 'vault_key'))).toBe(false);
+  fs.writeFileSync(path.join(h.deploy, '.secrets', 'vault_key.retired-20261001T000000Z'), 'retired-key');
+  h.clear();
+  expect(h.run(['restore', destination], '', 'RESTORE\n').status).toBe(0);
+  expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
+  expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key.retired-20261001T000000Z'), 'utf8')).toBe('retired-key');
+  const kept = path.join(h.root, 'kept-vault_key');
+  fs.writeFileSync(kept, 'off-host-vault_key');
+  h.clear();
+  const supplied = h.run(['restore', '--vault-key', kept, destination], '', 'RESTORE\n');
+  expect(supplied.status, supplied.stderr).toBe(0);
+  expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('off-host-vault_key');
+  // The supplied key is what the verification checked, before anything stopped.
+  const calls = h.calls().map(args => args.join(' '));
+  expect(calls.findIndex(call => call.includes('--check-vault-key'))).toBeLessThan(calls.findIndex(call => call.endsWith(' down')));
 });
