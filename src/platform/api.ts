@@ -69,7 +69,7 @@ import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import type { WorldAccessService } from '../world/access.js';
 import type { RunnerPoolService } from '../world/runners.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
-import { itemHandle } from '../autonomy/vault-items.js';
+import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 import { assertAgentSpec, selectableAvatar } from './agent-params.js';
@@ -1943,8 +1943,8 @@ export class KarmaxApi {
     const vault = new VaultItems(this.deps.store, undefined, undefined, organizationId);
     const out: VaultTaskPolicyOverrides = {};
     const canAdminister = allows(callerCaps, 'credential:write');
-    const useRank: Record<VaultItemPolicy['use'], number> = { auto: 0, ask: 1 };
-    const revealRank: Record<VaultItemPolicy['reveal'], number> = { auto: 0, ask: 1, never: 2 };
+    // Loosening a policy for a task hands it the secret: vault read access.
+    const canLoosen = allows(callerCaps, 'credential:reveal');
     for (const [itemId, raw] of Object.entries(requested ?? {})) {
       const item = (await vault.get(itemId));
       if (!item || (!canAdminister && !allows(callerCaps, `use-credential:item:${itemId}`))) {
@@ -1953,11 +1953,11 @@ export class KarmaxApi {
       }
       const policy: Partial<VaultItemPolicy> = {};
       if (raw?.use === 'auto' || raw?.use === 'ask') {
-        if (canAdminister || useRank[raw.use] >= useRank[item.policy.use]) policy.use = raw.use;
+        if (canLoosen || !loosensPolicy(item.policy, { use: raw.use })) policy.use = raw.use;
         else authorization.attenuated = true;
       }
       if (raw?.reveal === 'auto' || raw?.reveal === 'ask' || raw?.reveal === 'never') {
-        if (canAdminister || revealRank[raw.reveal] >= revealRank[item.policy.reveal]) policy.reveal = raw.reveal;
+        if (canLoosen || !loosensPolicy(item.policy, { reveal: raw.reveal })) policy.reveal = raw.reveal;
         else authorization.attenuated = true;
       }
       if (Object.keys(policy).length) out[itemId] = policy;
@@ -5281,7 +5281,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   private async requireOrganizationWikiWrite(token: string, organizationId: string) {
     const checked = (await this.deps.tokens.check(token, 'organization:wiki:write', { organizationId }));
-    if (!checked.ok) throw new CapabilityError(checked.reason === 'missing capability organization:wiki:write'
+    if (!checked.ok) throw new CapabilityError(checked.missing === 'organization:wiki:write'
       ? ORGANIZATION_WIKI_WRITE_DENIED : checked.reason ?? 'denied: organization:wiki:write');
     return checked.record!;
   }

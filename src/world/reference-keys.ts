@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
 
 /** New references use an installation key independent of provider credentials.
  * Keep the key id in the envelope so future rotation can retain old keys. */
@@ -16,7 +17,7 @@ export class WorldReferenceKeys {
     return this.cached;
   }
   static async create(broker: CredentialBroker, initialize = true): Promise<WorldReferenceKeys> {
-    if (initialize) await broker.ensureHandle('world-reference:key:v2', crypto.randomBytes(32).toString('base64'));
+    if (initialize) await broker.ensureHandle('world-reference:key:v2', crypto.randomBytes(32).toString('base64'), INSTALLATION_SCOPE);
     const keys = new WorldReferenceKeys(broker);
     if (initialize || broker.hasHandle('world-reference:key:v2')) keys.material();
     return keys;

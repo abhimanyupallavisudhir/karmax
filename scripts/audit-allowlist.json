@@ -1,0 +1,8 @@
+[
+  {
+    "id": "GHSA-vfj7-8cjw-p6xm",
+    "package": "braces",
+    "reason": "Stack-exhaustion DoS from deeply nested brace patterns; affects every braces version, no fix as of 2026-10-03. Reached only through @daytona/sdk -> fast-glob -> micromatch, and the SDK calls fast-glob only in Image.fromDockerfile to expand a local Dockerfile's COPY sources. tavya never builds Daytona images (src/world/daytona.ts uses only fs.uploadFile/downloadFile and process.executeCommand/createPty), so no pattern reaches braces. Wiki: incidents/lessons, 2026-10-03.",
+    "expires": "2026-11-15"
+  }
+]

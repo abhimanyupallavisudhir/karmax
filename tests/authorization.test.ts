@@ -31,10 +31,13 @@ describe('durable authorization policy', () => {
     try {
       const authz = (await AuthorizationService.create(store));
       for (const id of ['maintainer', 'administrator']) {
-        const profile = (await authz.profile(id))!;
-        // Those releases predate organization:wiki:write.
-        (await store.setAuthorizationProfile('global', { ...profile,
-          capabilities: [...profile.capabilities.filter((cap) => cap !== 'organization:wiki:write'), 'workflow:install'] }));
+        // Those releases predate organization:wiki:write, and Administrator was
+        // then "Full access inside one organization".
+        const profile = id === 'administrator'
+          ? [...SHIPPED_BUILTIN_PROFILES].find((version) => version.id === id && version.capabilities.includes('credential:*'))!
+          : (await authz.profile(id))!;
+        (await store.setAuthorizationProfile('global', { ...profile, builtin: true,
+          capabilities: [...profile.capabilities.filter((cap) => cap !== 'organization:wiki:write'), 'workflow:install'] } as any));
       }
       const upgraded = (await AuthorizationService.create(store));
       for (const id of ['maintainer', 'administrator']) {
@@ -43,10 +46,10 @@ describe('durable authorization policy', () => {
     } finally { (await store.close()); }
   });
 
-  it('seeds the five canonical authorization levels and resolves project defaults', async () => {
+  it('seeds the six canonical authorization levels and resolves project defaults', async () => {
     const store = (await Store.create(':memory:'));
     const authz = (await AuthorizationService.create(store));
-    expect((await authz.profiles()).map((p) => p.id)).toEqual(['administrator', 'developer', 'god', 'maintainer', 'viewer']);
+    expect((await authz.profiles()).map((p) => p.id)).toEqual(['administrator', 'developer', 'god', 'maintainer', 'superadmin', 'viewer']);
     expect((await authz.profile('viewer'))!.capabilities).toContain('task:read');
     expect((await authz.profile('viewer'))!.capabilities).not.toContain('task:create');
     expect((await authz.profile('god'))!.capabilities).toEqual(['*']);
@@ -274,19 +277,22 @@ describe('durable authorization policy', () => {
     ]);
   });
 
-  it('lets an organization Administrator manage tenant payments without host authority', async () => {
+  it('lets an organization Super-administrator, not an Administrator, manage tenant payments without host authority', async () => {
     const store = (await Store.create(':memory:'));
     const authz = (await AuthorizationService.create(store));
     const organization = (await store.createOrganization({ name: 'Acme' }));
     const project = (await store.createProject('App', {}, organization.id));
-    (await authz.grant('root', {
-      principalId: 'user:administrator',
+    for (const profileId of ['administrator', 'superadmin']) (await authz.grant('root', {
+      principalId: `user:${profileId}`,
       scopeKey: `organization:${organization.id}`,
-      profileId: 'administrator',
+      profileId,
     }));
-    const capabilities = (await authz.capabilities('user:administrator', project.id, organization.id));
-    expect(capabilities).toContain('payment:*');
+    const capabilities = (await authz.capabilities('user:superadmin', project.id, organization.id));
+    expect(allows(capabilities, 'payment:write')).toBe(true);
     expect(capabilities).not.toContain('process:*');
+    const administrator = (await authz.capabilities('user:administrator', project.id, organization.id));
+    expect(allows(administrator, 'payment:read')).toBe(true);
+    expect(allows(administrator, 'payment:write')).toBe(false);
   });
 
   it('applies team and @all project profiles dynamically', async () => {

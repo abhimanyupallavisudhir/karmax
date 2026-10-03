@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Client } from '@temporalio/client';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { organizationScope } from '../autonomy/vault-keys.js';
 import type { IgnoredResourceInventory, Project, ResourceAttachment, ResourceAccess, ResourceCandidate,
   ResourceChangeSummary, ResourcePublishPolicy, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -22,6 +23,7 @@ import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL
 import type { ResourcePublishView } from '../coordinators/resource-publish.js';
 import { credentialResource, resourceSecretHandle, snapshotResource } from '../domain/resource-drivers.js';
 import { VaultItems, itemHandle, type VaultFieldName } from '../autonomy/vault-items.js';
+import { handleRef, recordSecretRefs } from '../autonomy/task-secrets.js';
 import { ensureWorldExcluded } from './secret-exclude.js';
 import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
@@ -732,6 +734,7 @@ export class ProjectResourceService {
       const services: Record<string, string> = {};
       for (const [name, secretHandle] of Object.entries(serviceHandles as Record<string, unknown>)) {
         if (typeof secretHandle !== 'string') continue;
+        (await recordSecretRefs(this.store, handle.id, [handleRef(secretHandle)]));
         services[name] = this.broker.resolve(secretHandle, {
           taskId: handle.id,
           caps: [`use-credential:${secretHandle}`],
@@ -761,11 +764,11 @@ export class ProjectResourceService {
 
   /** Store generated per-world service endpoints behind opaque vault handles.
    * World metadata may be durable; connection strings and tokens may not be. */
-  async registerServiceEnvironment(handle: WorldHandle, values: Record<string, string>): Promise<WorldHandle> {
+  async registerServiceEnvironment(handle: WorldHandle, values: Record<string, string>, organizationId: string): Promise<WorldHandle> {
     const refs: Record<string, string> = {};
     for (const [name, value] of Object.entries(values)) {
       const ref = `world-service:${handle.id}:${handle.generation ?? 1}:${name}`;
-      (await this.broker.registerHandle(ref, value));
+      (await this.broker.registerHandle(ref, value, organizationScope(organizationId)));
       refs[name] = ref;
     }
     return { ...handle, meta: { ...handle.meta,
@@ -947,7 +950,7 @@ export class ProjectResourceService {
                   && attachment.target.name === value.name);
                 if (existing) { result.reused.push(value.name); continue; }
                 const id = newId('resource'), handle = `resource:${id}:credential`;
-                (await this.broker.registerHandle(handle, value.value));
+                (await this.broker.registerHandle(handle, value.value, organizationScope(project.organizationId!)));
                 try {
                   (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
                     projectId: project.id, name: value.name, driver: 'secret@1',
@@ -963,7 +966,7 @@ export class ProjectResourceService {
             if (existing) { result.reused.push(target); continue; }
             if (data && !data.includes(0)) {
               const id = newId('resource'), handle = `resource:${id}:credential`;
-              (await this.broker.registerHandle(handle, data.toString('utf8')));
+              (await this.broker.registerHandle(handle, data.toString('utf8'), organizationScope(project.organizationId!)));
               try {
                 (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
                   projectId: project.id, name: copyGlobSecretName(entry.name), driver: 'secret@1',
@@ -1478,6 +1481,8 @@ export class ProjectResourceService {
 
   private async resolveSecret(attachment: ResourceAttachment, taskId: string): Promise<string> {
     const handle = await this.ownedCredentialHandle(attachment);
+    // The world receives this value; scrub it from what tavya keeps of the task (SS-3).
+    (await recordSecretRefs(this.store, taskId, [handleRef(handle)]));
     return this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] });
   }
 

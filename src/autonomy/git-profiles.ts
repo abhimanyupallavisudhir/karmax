@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { GitProfile, ProjectConfig } from '../domain/types.js';
 import { CredentialBroker } from './broker.js';
+import { organizationScope, userScope, type VaultScope } from './vault-keys.js';
 import { git, isolatedGitEnvironment } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
 import { shellQuote } from '../util/shell.js';
@@ -41,6 +42,13 @@ export function userGitScope(userId: string): string {
 
 function userIdOfScope(scope: string): string | undefined {
   return scope.startsWith('user:') ? scope.slice('user:'.length) : undefined;
+}
+
+/** The vault scope owning a Git profile scope's secrets: the user's for a
+ * user profile, else the organization's (SS-1). */
+export function gitProfileVaultScope(scope: string): VaultScope {
+  const userId = userIdOfScope(scope);
+  return userId ? userScope(userId) : organizationScope(scope);
 }
 
 /** The vault handle for one of a profile's secrets. */
@@ -184,7 +192,7 @@ export class GitProfiles {
       if (kind === 'signing' && args.clearSigningKey) {
         (await this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId)));
       } else if (value?.trim()) {
-        (await this.requireBroker().registerHandle(gitHandle(name, kind, this.organizationId), value.trim()));
+        (await this.requireBroker().registerHandle(gitHandle(name, kind, this.organizationId), value.trim(), gitProfileVaultScope(this.organizationId)));
         (rec as any)[flag] = true;
       } else if (prior?.[flag] && !prior.source) {
         (rec as any)[flag] = true; // keep the existing secret

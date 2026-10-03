@@ -4,7 +4,7 @@ import { Capability, CAPABILITIES, DEVELOPER_WORKSPACE_CAPABILITIES, allows, att
 import { SHIPPED_BUILTIN_PROFILES } from './builtin-profile-history.js';
 import type { AuthorizationSelection, ProjectMembership } from '../domain/types.js';
 
-export type AuthorizationProfileId = 'viewer' | 'developer' | 'maintainer' | 'administrator' | 'god' | string;
+export type AuthorizationProfileId = 'viewer' | 'developer' | 'maintainer' | 'administrator' | 'superadmin' | 'god' | string;
 export type AuthorizationScope = 'global' | `organization:${string}` | `project:${string}`;
 
 export interface EffectiveAuthorization extends AuthorizationSelection {
@@ -85,13 +85,33 @@ export const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'project:resource:shared-write',
   // Loading code into the shared worker is installation authority, never tenant authority.
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
-  'credential:*', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
+  'credential:*', 'credential:reveal', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'github:actions:*', 'diagnostic:read', 'process:read', 'review:approve',
 ];
 
-/** The five canonical levels are deliberately job-shaped, not permission checklists. */
-const CANONICAL_AUTHORIZATION_LEVELS = ['viewer', 'developer', 'maintainer', 'administrator', 'god'] as const;
+/** What only a Super-administrator (or God) may do inside an organization:
+ * read the vault regardless of item policy, move money, and delete the
+ * organization. Everything else in the organization is an Administrator's. */
+export const SUPER_ADMINISTRATOR_CAPABILITIES: Capability[] = ['credential:reveal', 'payment:write', 'organization:delete'];
+
+const administrator: Capability[] = [
+  'project:transfer-out', 'project:transfer-in',
+  'organization:read', 'organization:create', 'organization:edit', 'organization:wiki:write',
+  'organization:member:read', 'organization:member:write', 'team:*', 'repository:*', 'inbox:*',
+  'project:read', 'project:create', 'project:edit', 'project:delete', 'project:settings:*',
+  'project:resource:shared-write',
+  'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
+  'credential:read', 'credential:write', 'vault:store', 'connection:use', 'use-credential:*', 'skill:write',
+  'payment:read', 'use-card:*',
+  'resolve-decision', 'confirm-decision', 'merge-into:*',
+  'github:actions:*', 'diagnostic:read', 'process:read', 'review:approve',
+];
+
+/** The six canonical levels are deliberately job-shaped, not permission checklists. */
+const CANONICAL_AUTHORIZATION_LEVELS = ['viewer', 'developer', 'maintainer', 'administrator', 'superadmin', 'god'] as const;
+/** Levels that only make sense for a whole organization. */
+const ORGANIZATION_LEVELS: Record<string, string> = { administrator: 'Administrator', superadmin: 'Super-administrator' };
 
 export const DEFAULT_AUTHORIZATION_PROFILES: AuthorizationProfile[] = [
   {
@@ -111,8 +131,13 @@ export const DEFAULT_AUTHORIZATION_PROFILES: AuthorizationProfile[] = [
   },
   {
     id: 'administrator', name: 'Administrator', builtin: true,
-    description: 'Full access inside one organization.',
-    capabilities: ORGANIZATION_GRANT_CEILING,
+    description: 'Manage one organization: its projects, members, settings, and credentials, within their policies.',
+    capabilities: administrator,
+  },
+  {
+    id: 'superadmin', name: 'Super-administrator', builtin: true,
+    description: 'Everything an Administrator can do, plus full read access to the vault, payments, and deleting the organization.',
+    capabilities: [...administrator, ...SUPER_ADMINISTRATOR_CAPABILITIES],
   },
   {
     id: 'god', name: 'God', builtin: true,
@@ -129,7 +154,12 @@ export const DEFAULT_AUTHORIZATION_PROFILES: AuthorizationProfile[] = [
 const PREVIOUS_BUILTIN_DESCRIPTIONS: Record<string, string> = {
   developer: 'Work with tasks, conversations, review actions, queues, and skills inside assigned projects.',
   maintainer: 'Developer access plus project settings, agent profiles, queues, and reviewed workflow changes.',
+  administrator: 'Full access inside one organization.',
 };
+
+/** The organization ceiling before vault read access was its own capability:
+ * Administrator was this whole set, which historical profiles still match. */
+const PREVIOUS_ORGANIZATION_GRANT_CEILING: Capability[] = ORGANIZATION_GRANT_CEILING.filter((capability) => capability !== 'credential:reveal');
 
 const PREVIOUS_BUILTIN_CAPABILITIES = {
   developer: [
@@ -179,7 +209,7 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
     'workflow:install', 'workflow:edit',
   ]],
-  administrator: [PREVIOUS_BUILTIN_CAPABILITIES.administrator!, [...ORGANIZATION_GRANT_CEILING, 'workflow:install'],
+  administrator: [PREVIOUS_BUILTIN_CAPABILITIES.administrator!, PREVIOUS_ORGANIZATION_GRANT_CEILING, [...PREVIOUS_ORGANIZATION_GRANT_CEILING, 'workflow:install'],
     PREVIOUS_BUILTIN_CAPABILITIES.administrator!.filter(cap => !cap.startsWith('project:transfer-')),
     [...PREVIOUS_BUILTIN_CAPABILITIES.administrator!.filter(cap => !cap.startsWith('project:transfer-')), 'workflow:install'],
     [...PREVIOUS_BUILTIN_CAPABILITIES.administrator!, 'workflow:install'],
@@ -245,6 +275,7 @@ export class AuthorizationService {
       }
     }
     (await this.migrateLegacyGrants());
+    (await this.promoteOwnersToSuperAdministrator());
     if (!(await this.store.kvGet('authz:default:global'))) (await this.store.kvSet('authz:default:global', 'developer'));
     (await this.migrateLegacyDefaults());
   }
@@ -258,12 +289,35 @@ export class AuthorizationService {
     }
   }
 
+  /** Administrator used to include the vault, payments and deleting the
+   * organization. Owners keep them as Super-administrators; other
+   * Administrators lose them. Runs once, so an owner later set to
+   * Administrator on purpose stays there. */
+  private async promoteOwnersToSuperAdministrator(): Promise<void> {
+    const marker = 'authz:migration:owners-superadmin';
+    if (await this.store.kvGet(marker)) return;
+    for (const organization of (await this.store.listOrganizations())) {
+      const scopeKey = organizationScope(organization.id);
+      for (const membership of (await this.store.listOrganizationMemberships(organization.id))) {
+        if (membership.role !== 'owner') continue;
+        const principalId = `user:${membership.userId}`;
+        const grant = (await this.store.listPrincipalGrants(principalId) as PrincipalGrant[])
+          .find((candidate) => candidate.scopeKey === scopeKey);
+        if (grant?.profileId !== 'administrator') continue;
+        (await this.store.setPrincipalGrant(principalId, scopeKey, { ...grant, profileId: 'superadmin' }));
+        (await this.audit('system:migration', 'authorization.grant.migrated', scopeKey,
+          { principalId, from: 'administrator', to: 'superadmin' }));
+      }
+    }
+    (await this.store.kvSet(marker, String(Date.now())));
+  }
+
   private async migrateLegacyGrants(): Promise<void> {
     for (const grant of (await this.store.listPrincipalGrants()) as PrincipalGrant[]) {
       let profileId = grant.profileId;
       if (grant.scopeKey === 'global' && (profileId === 'operator' || profileId === 'administrator')) profileId = 'god';
       else if (grant.scopeKey.startsWith('organization:') && profileId === 'operator') profileId = 'administrator';
-      else if (grant.scopeKey.startsWith('project:') && (profileId === 'operator' || profileId === 'administrator')) profileId = 'maintainer';
+      else if (grant.scopeKey.startsWith('project:') && (profileId === 'operator' || ORGANIZATION_LEVELS[profileId])) profileId = 'maintainer';
 
       if (grant.scopeKey === 'global' && (profileId === 'developer' || profileId === 'maintainer' || profileId === 'viewer')) {
         for (const organization of (await this.store.listOrganizations())) {
@@ -547,10 +601,10 @@ export class AuthorizationService {
     const level = String(input.level || '').trim();
     if (!CANONICAL_AUTHORIZATION_LEVELS.includes(level as any) && !(await this.store.getAuthorizationProfile(organizationScope(organizationId), level)))
       throw new Error(`unknown authorization level ${level}`);
-    if (level === 'administrator' && input.scope !== 'organization' && !allowLegacyAdministratorProject)
-      throw new Error('Administrator requires organization scope');
+    if (ORGANIZATION_LEVELS[level] && input.scope !== 'organization' && !(level === 'administrator' && allowLegacyAdministratorProject))
+      throw new Error(`${ORGANIZATION_LEVELS[level]} requires organization scope`);
     if (level === 'god' && input.scope !== 'global') throw new Error('God requires global scope');
-    if (!['administrator', 'god'].includes(level) && !['projects', 'organization'].includes(input.scope))
+    if (!ORGANIZATION_LEVELS[level] && level !== 'god' && !['projects', 'organization'].includes(input.scope))
       throw new Error(`${level} requires project or organization scope`);
     if (input.scope === 'projects') {
       const projectIds = [...new Set((input.projectIds ?? []).map(String).filter(Boolean))];
@@ -573,6 +627,7 @@ export class AuthorizationService {
   ): Promise<AuthorizationSelection> {
     const normalized = (await this.normalizeSelection(selection, organizationId));
     (await this.assertCanGrantSelection(actor, organizationId, normalized, grantorCaps));
+    (await this.assertCanChangePrincipal(actor, principalId, organizationId, grantorCaps));
 
     for (const grant of (await this.grants(principalId))) {
       const projectId = grant.scopeKey.startsWith('project:') ? grant.scopeKey.slice(8) : undefined;
@@ -586,6 +641,20 @@ export class AuthorizationService {
         : normalized.projectIds!.map(projectScope);
     for (const scopeKey of scopes) (await this.grant(actor, { principalId, scopeKey, profileId: normalized.level }));
     return normalized;
+  }
+
+  /** Changing or removing someone's authorization takes away what they hold,
+   * so it needs the same authority as granting it. */
+  async assertCanChangePrincipal(actor: string, principalId: string, organizationId: string, grantorCaps?: Capability[]): Promise<void> {
+    const current = (await this.selectionForPrincipal(principalId, organizationId));
+    if (!current) return;
+    try {
+      (await this.assertCanGrantSelection(actor, organizationId, current, grantorCaps));
+    } catch (error) {
+      if (error instanceof AuthorizationGrantError)
+        throw new AuthorizationGrantError('you cannot change the authorization of someone who holds more than you');
+      throw error;
+    }
   }
 
   async assertCanGrantSelection(
@@ -632,7 +701,7 @@ export class AuthorizationService {
       return { level: organization.profileId, scope: 'organization' };
     const projects = (await __asyncCollections.filter(grants, async (grant) => grant.scopeKey.startsWith('project:')
       && (await this.store.getProject(grant.scopeKey.slice(8)))?.organizationId === organizationId
-      && !['administrator', 'god'].includes(grant.profileId)
+      && !ORGANIZATION_LEVELS[grant.profileId] && grant.profileId !== 'god'
       && (await this.profile(grant.profileId, grant.scopeKey.slice(8), organizationId))));
     if (!projects.length) return undefined;
     const level = projects[0]!.profileId;
@@ -648,7 +717,7 @@ export class AuthorizationService {
   }
 
   async bootstrapOrganizationOwner(actor: string, userId: string, organizationId: string): Promise<void> {
-    (await this.grant(actor, { principalId: `user:${userId}`, scopeKey: organizationScope(organizationId), profileId: 'administrator' }));
+    (await this.grant(actor, { principalId: `user:${userId}`, scopeKey: organizationScope(organizationId), profileId: 'superadmin' }));
   }
 
   async audit(principalId: string, action: string, scopeKey: AuthorizationScope | string = 'global', detail: Record<string, unknown> = {}): Promise<number> {

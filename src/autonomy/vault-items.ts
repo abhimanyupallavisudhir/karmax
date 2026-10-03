@@ -5,6 +5,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CredentialBroker } from './broker.js';
+import { organizationScope } from './vault-keys.js';
 import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
 import { newId } from '../util/id.js';
@@ -12,6 +13,7 @@ import { isEnvName } from '../util/shell.js';
 import { envEntryProblem, type SkippedEnv } from '../util/work-env.js';
 import { parseSavedSession, sessionDomainError } from './browser-session.js';
 import { paths } from '../config/paths.js';
+import { handleRef, recordSecretRefs } from './task-secrets.js';
 
 /**
  * Vault items (wiki plans/PLAN-passwords §4): the typed product layer over the raw
@@ -62,6 +64,30 @@ export interface VaultItemPolicy {
  * explicitly granted. Missing dimensions inherit the item's organization-wide
  * default, so later global changes still flow through to the task. */
 export type VaultTaskPolicyOverrides = Record<string, Partial<VaultItemPolicy>>;
+
+const USE_RANK: Record<VaultItemPolicy['use'], number> = { auto: 0, ask: 1 };
+const REVEAL_RANK: Record<VaultItemPolicy['reveal'], number> = { auto: 0, ask: 1, never: 2 };
+
+/** Does `next` make `prior` easier to obtain than its policy allows? */
+export function loosensPolicy(prior: VaultItemPolicy, next: Partial<VaultItemPolicy> | undefined): boolean {
+  return (next?.use !== undefined && USE_RANK[next.use] < USE_RANK[prior.use])
+    || (next?.reveal !== undefined && REVEAL_RANK[next.reveal] < REVEAL_RANK[prior.reveal]);
+}
+
+/**
+ * An edit that would hand out an existing item's secret without revealing it
+ * outright, and therefore needs vault read access (`credential:reveal`):
+ * loosening its policy, or adding a site its password can be filled into
+ * (a page the editor controls reads the filled value back).
+ */
+export function weakensProtection(prior: VaultItem,
+  next: { policy?: Partial<VaultItemPolicy>; domains?: string[] }): string | undefined {
+  if (loosensPolicy(prior.policy, next.policy)) return `loosen the policy of "${prior.label}"`;
+  const known = new Set((prior.domains ?? []).map((domain) => domain.trim().toLowerCase()));
+  if (next.domains?.some((domain) => domain.trim() && !known.has(domain.trim().toLowerCase())))
+    return `add sites "${prior.label}" can be filled into`;
+  return undefined;
+}
 
 export interface VaultItem {
   id: string;
@@ -141,6 +167,7 @@ export interface VaultItemStore {
   vaultUsageHistory?(itemIds: string[], now: number): (Record<string, VaultUsage>) | Promise<Record<string, VaultUsage>>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
+  kvClaim?(k: string, v: string): boolean | Promise<boolean>;
   kvDelete?(k: string): (void) | Promise<void>;
   /** One range read of every key under a prefix; stores without it are read per key. */
   kvEntries?(prefix: string): Promise<Array<{ key: string; value: string }>>;
@@ -411,12 +438,12 @@ export class VaultItems {
       const value = args.secrets?.[field];
       // Pass notes are a complete snapshot, including an empty replacement.
       if (field === 'note' && value !== undefined) {
-        (await this.requireBroker().registerHandle(itemHandle(id, field), value));
+        (await this.requireBroker().registerHandle(itemHandle(id, field), value, organizationScope(this.organizationId)));
         fields.add(field);
         continue;
       }
       if (value?.trim()) {
-        (await this.requireBroker().registerHandle(itemHandle(id, field), value));
+        (await this.requireBroker().registerHandle(itemHandle(id, field), value, organizationScope(this.organizationId)));
         fields.add(field);
       }
     }
@@ -662,6 +689,9 @@ export class VaultItems {
     const usageKey = kvUsagePrefix(this.organizationId) + item.id;
     const stored = (await this.store.kvGet(usageKey));
     const current: ItemUsage | undefined = stored ? JSON.parse(stored) : (await this.list()).find((candidate) => candidate.id === item.id);
+    // Whatever the task does with the value from here on is scrubbed from what
+    // tavya archives and serves about it (SS-3).
+    (await recordSecretRefs(this.store, ctx.taskId, [handleRef(handle)]));
     (await this.store.appendAudit({
       principalId: ctx.principal ?? (ctx.taskId ? `task:${ctx.taskId}` : 'system'),
       action: ctx.mode === 'reveal' ? 'vault.revealed' : 'vault.used',

@@ -19,6 +19,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
 import { VaultItems } from '../src/autonomy/vault-items.js';
 import { FakeSubscriptionProvider, SubscriptionBillingService } from '../src/billing/subscriptions.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 const closers: Array<() => Promise<void>> = [];
 const tempDirs: string[] = [];
@@ -84,7 +85,7 @@ describe('hosted onboarding status API', () => {
     await providers.save({ organizationId: 'org_personal', provider: 'daytona', apiKey: 'daytona-test' });
     await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
       installationId: 'daytona-onboarding', accountLogin: 'alice', accountType: 'User' });
-    await broker.registerHandle('openai:first', 'sk-test');
+    await broker.registerHandle('openai:first', 'sk-test', INSTALLATION_SCOPE);
     await store.createProject('Daytona project', {}, 'org_personal');
     const complete = await (await request()).json() as any;
     expect(complete).toMatchObject({ complete: true, completedRequired: 4, totalRequired: 4 });
@@ -109,7 +110,7 @@ describe('hosted onboarding status API', () => {
 
     (await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
       installationId: 'installation-1', accountLogin: 'alice', accountType: 'User' }));
-    (await broker.registerHandle('openai:first', 'sk-test'));
+    (await broker.registerHandle('openai:first', 'sk-test', INSTALLATION_SCOPE));
     (await providers.save({ organizationId: 'org_personal', provider: 'e2b', apiKey: 'e2b-test' }));
     (await store.createProject('First project', {}, 'org_personal'));
 
@@ -203,7 +204,7 @@ describe('hosted onboarding status API', () => {
     const userId = (await identity.listUsers())[0]!.id;
     (await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
       installationId: 'keep-installation', accountLogin: 'alice', accountType: 'User' }));
-    (await broker.registerHandle('openai:first', 'sk-test'));
+    (await broker.registerHandle('openai:first', 'sk-test', INSTALLATION_SCOPE));
     (await providers.save({ organizationId: 'org_personal', provider: 'e2b', apiKey: 'e2b-test' }));
     const project = (await store.createProject('Keep my work', {}, 'org_personal'));
     expect(await (await request()).json()).toMatchObject({ complete: true, visible: false });

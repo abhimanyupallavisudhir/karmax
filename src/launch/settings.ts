@@ -1,5 +1,6 @@
 import { rememberSubscriptionCatalog } from '../billing/catalog.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
 import { STRIPE_BILLING_API_VERSION, STRIPE_BILLING_WEBHOOK_EVENTS } from '../billing/stripe-contract.js';
 import type { Store } from '../store/db.js';
 import { PADDLE_WEBHOOK_EVENTS, type PaddleRuntimeConfig } from '../billing/paddle.js';
@@ -130,7 +131,7 @@ export class PaidLaunchSettingsService {
         const current = await this.stored();
         if ((await this.paddleConfig()).environment !== c.environment) throw new Error('Paddle environment changed during setup');
         const { webhookSecret, apiKey: _key, ...publicPatch } = patch;
-        if (webhookSecret) await this.broker.registerHandle(`platform:paddle-subscriptions:${c.environment}:webhook-secret`, webhookSecret);
+        if (webhookSecret) await this.broker.registerHandle(`platform:paddle-subscriptions:${c.environment}:webhook-secret`, webhookSecret, INSTALLATION_SCOPE);
         await this.store.kvSet(PAID_LAUNCH_SETTINGS_KEY, JSON.stringify({ ...current,
           paddle: { ...current.paddle, environment: c.environment, ...publicPatch } }));
       }, fetcher);
@@ -295,7 +296,7 @@ export class PaidLaunchSettingsService {
         : current.completedTasks ?? [],
     };
     // Validate the complete form before rotating any live billing credential.
-    for (const [handle, value] of secrets) await this.broker.registerHandle(handle, value);
+    for (const [handle, value] of secrets) await this.broker.registerHandle(handle, value, INSTALLATION_SCOPE);
     (await this.store.kvSet(PAID_LAUNCH_SETTINGS_KEY, JSON.stringify(next)));
     const status = (await this.status(publicUrl));
     if (next.paidLaunch && !status.canEnable) {

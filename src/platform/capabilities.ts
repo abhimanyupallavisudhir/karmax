@@ -25,7 +25,7 @@ export const CAPABILITIES = [
   'project:settings:read', 'project:settings:write',
   'project:transfer-out', 'project:transfer-in',
   'project:resource:shared-write',
-  'organization:read', 'organization:create', 'organization:edit', 'organization:wiki:write',
+  'organization:read', 'organization:create', 'organization:edit', 'organization:delete', 'organization:wiki:write',
   'organization:member:read', 'organization:member:write',
   'team:read', 'team:write', 'repository:read', 'repository:write',
   'github:actions:read', 'github:actions:write',
@@ -33,7 +33,7 @@ export const CAPABILITIES = [
   'queue:read', 'queue:write', 'workflow:read', 'workflow:install', 'workflow:edit',
   'profile:read', 'profile:write', 'skill:write',
   'diagnostic:read', 'process:read', 'process:kill',
-  'credential:read', 'credential:write', 'connection:use', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
+  'credential:read', 'credential:write', 'credential:reveal', 'connection:use', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
   'settings:read', 'settings:write', 'subscription:gift',
   'authorization:read', 'authorization:write', 'user:read', 'user:write',
   // Workflow decisions are discoverable capabilities too. Authorization selects
@@ -121,7 +121,8 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
     capabilities: [
       ['organization:read', 'View organizations', 'Discover organizations in which the principal is a member.'],
       ['organization:create', 'Create organizations', 'Create a new tenant boundary.'],
-      ['organization:edit', 'Edit organizations', 'Change organization settings and lifecycle.'],
+      ['organization:edit', 'Edit organizations', 'Change organization settings.'],
+      ['organization:delete', 'Delete organizations', 'Permanently delete an organization and everything in it. Takes effect only through an organization-wide grant.'],
       ['organization:wiki:write', 'Edit organization wiki', 'Create, change, and delete organization wiki pages, which every task in the organization sees. Takes effect only through an organization-wide grant.'],
       ['organization:member:read', 'View members', 'View organization membership, invitations, and teams.'],
       ['organization:member:write', 'Manage members', 'Invite, remove, and change organization members.'],
@@ -182,10 +183,11 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['process:kill', 'Stop processes', `Terminate processes managed by ${BRAND}.`],
       ['credential:read', 'View credential metadata', 'Discover credential handles, vault items, and non-secret policy.'],
       ['connection:use', 'Use connected apps', 'Execute app tools using accounts explicitly shared with the task or project.'],
-      ['credential:write', 'Manage credentials', 'Create, replace, delete, configure, and inspect plaintext credentials and vault items; resolve credential access requests.'],
+      ['credential:write', 'Manage credentials', 'Create, rename, replace, and delete credentials and vault items, tighten their policies, and deny credential requests.'],
+      ['credential:reveal', 'Read the vault', 'Read any secret regardless of its policy: reveal it, loosen policies, change where it can be filled, approve credential requests, and connect password stores it is copied to. Takes effect only through an organization-wide grant.'],
       ['vault:store', 'Store new credentials', 'Write newly created credentials (accounts an agent registered) back into the vault as items.'],
       ['payment:read', 'View payments', 'Inspect payment methods, limits, and transactions.'],
-      ['payment:write', 'Manage payments', 'Create payment resources and authorize spending within policy.'],
+      ['payment:write', 'Manage payments', 'Add payment cards, set budgets and limits, manage billing, and approve spending.'],
       ['use-card:*', 'Use payment cards', 'Allow tasks to request spending. Narrow this wildcard to use-card:<card-id> in advanced target-scoped capabilities.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },
@@ -226,6 +228,10 @@ export function capMatches(pattern: Capability, cap: Capability): boolean {
   cap = normalizeCapability(cap);
   if (pattern === '*') return true;
   if (pattern === cap) return true;
+  // Vault read access is newer than `credential:*`, which Administrators,
+  // their tasks and customized profiles have long held. Only an explicit grant
+  // (or `*`) confers it, so no stored authorization gains it silently.
+  if (cap === 'credential:reveal') return false;
   if (pattern.endsWith(':*')) {
     const prefix = pattern.slice(0, -1); // keep trailing ':'
     return cap.startsWith(prefix);

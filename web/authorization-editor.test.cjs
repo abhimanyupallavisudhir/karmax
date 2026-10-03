@@ -30,7 +30,9 @@ const ok = (condition, message) => {
 };
 
 ok(authorizationLevels().map((level) => level.name).join('|') ===
-  'Viewer|Developer|Project maintainer|Administrator|God', 'shows exactly the five canonical levels');
+  'Viewer|Developer|Project maintainer|Administrator|Super-administrator|God', 'shows exactly the six canonical levels');
+ok(authorizationLevels().find((level) => level.id === 'superadmin')?.scope === 'organization',
+  'Super-administrator, like Administrator, is chosen for a whole organization');
 ok(!source.includes('Automation operator</option>'), 'removes Automation operator from authorization selectors');
 
 const suggestions = authorizationScopeSuggestions([
@@ -54,6 +56,8 @@ ok(css.includes('.authz-editor'), 'shared editor has dedicated visual styling');
 // hint next to the already-chosen scopes.
 const authorizationEditorHtmlFn = Function(`
   const esc = (value) => String(value);
+  ${extractFunction('policyTip')}
+  ${extractFunction('authorizationWarningHtml')}
   ${extractFunction('authorizationLevels')}
   ${extractFunction('normalizedAuthorization')}
   ${extractFunction('authorizationScopePlaceholder')}
@@ -80,8 +84,13 @@ ok(source.includes('input.placeholder = authorizationScopePlaceholder('),
 ok(source.includes('function chooseAuthorizationGrant('), 'task and Avatar flows share one authorization-gap prompt');
 ok(source.includes('Ask someone who can grant it') && source.includes('Limit it to my capabilities'),
   'the prompt presents both secure outcomes in plain language');
-ok(source.includes("api('/api/authorization/escalation-targets'"),
-  'recipient choices come from the server-filtered eligibility endpoint');
+ok(source.includes('api(`/api/authorization/escalation-targets?projectId=${encodeURIComponent(projectId)}`'),
+  'recipient choices come from the server-filtered eligibility endpoint, scoped to the project in the URL');
+// The gateway scopes a session to the project in the URL, never the body: a
+// body-only project made it check the owner's global grants and refuse them.
+ok(!/api\('\/api\/authorization-requests', \{ method: 'POST'/.test(source)
+  && (source.match(/api\(`\/api\/authorization-requests\?projectId=/g) || []).length === 2,
+  'authorization requests name their project in the URL');
 ok(source.includes("target: { kind: 'task'") && source.includes("target: { kind: 'avatar'"),
   'both task and Avatar creation can route approval to the target resource');
 ok(source.includes('Awaiting a routed approver') && source.includes('request.recipients.includes(signedInUserId)'),
@@ -109,7 +118,19 @@ for (const level of authorizationLevels()) {
   const html = authorizationEditorHtmlFn('description', { level: level.id, scope: 'projects', projectIds: ['p1'] }, projects);
   ok(html.includes(level.description) && html.includes('aria-describedby="description-description"'),
     `${level.name} has an associated plain-language description`);
+  const warning = html.match(/<p class="authz-warning"[^>]*>/)?.[0] || '';
+  ok(warning && (level.id === 'superadmin') === !warning.includes(' hidden'),
+    `${level.name} ${level.id === 'superadmin' ? 'shows' : 'hides'} the vault warning`);
 }
+const superadmin = authorizationEditorHtmlFn('s', { level: 'superadmin', scope: 'organization' }, projects);
+ok(superadmin.includes('Super-administrator authorization will give agents full read access to your vault.'),
+  'choosing Super-administrator warns, in one line, that agents get the whole vault');
+ok(/class="info-dot" title="[^"]*payment[^"]*delete the organization/.test(superadmin),
+  'the rest of what it allows is one tap or hover away');
+ok(wired.includes("warning.outerHTML = authorizationWarningHtml(levelOf())"),
+  'the warning follows the level as it is changed');
+ok(/\.authz-warning\s*\{[^}]*var\(--danger/.test(css) && css.includes('.authz-warning[hidden]'),
+  'the warning reads as a danger note and disappears for other levels');
 const normalized = Function(`${extractFunction('authorizationLevels')}; ${extractFunction('normalizedAuthorization')}; return normalizedAuthorization;`)();
 ok(normalized({ level: 'role_unavailable', scope: 'organization' }).level === 'role_unavailable',
   'catalog failure never silently widens a custom role to Developer');

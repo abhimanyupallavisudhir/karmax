@@ -7,6 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Vault, inspectVault, recordQuarantine } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { separateStoredCardCvcs } from '../src/autonomy/payments.js';
+import { INSTALLATION_SCOPE, organizationScope } from '../src/autonomy/vault-keys.js';
+
+const S = INSTALLATION_SCOPE;
 
 /**
  * AU-27: vault ciphertext is bound to its handle (AES-GCM additional data), and
@@ -56,18 +59,18 @@ describe('handle-bound vault ciphertext', () => {
   it('refuses a ciphertext moved onto another handle', async () => {
     const dir = directory();
     const vault = new Vault(dir);
-    await vault.put('attacker', 'attacker-secret');
-    await vault.put('victim', 'victim-secret');
-    const moved = JSON.parse(fs.readFileSync(entryFile(dir, 'attacker'), 'utf8')).blob;
-    fs.writeFileSync(entryFile(dir, 'victim'), JSON.stringify({ handle: 'victim', blob: moved }));
+    await vault.put('attacker', 'attacker-secret', S);
+    await vault.put('victim', 'victim-secret', S);
+    const moved = JSON.parse(fs.readFileSync(entryFile(dir, 'attacker'), 'utf8'));
+    fs.writeFileSync(entryFile(dir, 'victim'), JSON.stringify({ ...moved, handle: 'victim' }));
     expect(() => vault.reveal('victim')).toThrow(/victim.*failed authentication/);
   });
 
   it('keeps the history readable when a handle is renamed', async () => {
     const vault = new Vault(directory());
-    await vault.put('old', 'first');
-    await vault.put('old', 'second');
-    await vault.move('old', 'new');
+    await vault.put('old', 'first', S);
+    await vault.put('old', 'second', S);
+    await vault.move('old', 'new', S);
     expect(vault.reveal('new')).toBe('second');
     expect(vault.reveal('new', 1)).toBe('first');
   });
@@ -92,7 +95,7 @@ describe('handle-bound vault ciphertext', () => {
     fs.writeFileSync(path.join(dir, 'vault.key'), key, { mode: 0o600 });
     fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify({ mapped: legacyBlob(key, 'from-the-map') }));
     const vault = new Vault(dir);
-    await vault.put('fresh', 'value');
+    await vault.put('fresh', 'value', S);
     expect(vault.reveal('mapped')).toBe('from-the-map');
     expect(JSON.parse(fs.readFileSync(entryFile(dir, 'mapped'), 'utf8')).blob).toMatch(/^v2\./);
   });
@@ -102,7 +105,7 @@ describe('vault key canary', () => {
   it('refuses to open a vault with a different key before writing anything', async () => {
     const dir = directory();
     vi.stubEnv('KARMAX_VAULT_KEY', 'the-original-deployment-key-material-000');
-    await new Vault(dir).put('kept', 'secret');
+    await new Vault(dir).put('kept', 'secret', S);
     const before = fs.readdirSync(path.join(dir, 'entries')).sort();
     vi.stubEnv('KARMAX_VAULT_KEY', 'a-different-deployment-key-material-111');
     expect(() => new Vault(dir)).toThrow(/vault key does not open this vault/);
@@ -140,7 +143,7 @@ describe('a one-way migration that keeps its way back', () => {
     expect(vault.list().sort()).toEqual(['rotated', 'second']);
     expect(vault.reveal('second')).toBe('two');
     // Later writes are not held hostage by the damaged entries.
-    await vault.put('after', 'value');
+    await vault.put('after', 'value', S);
     await vault.delete('rotated');
     expect(vault.reveal('after')).toBe('value');
   });
@@ -148,7 +151,7 @@ describe('a one-way migration that keeps its way back', () => {
   it('lists around an unreadable entry instead of refusing', async () => {
     const dir = directory();
     const vault = new Vault(dir);
-    await vault.put('kept', 'secret');
+    await vault.put('kept', 'secret', S);
     fs.writeFileSync(path.join(dir, 'entries', `${'0'.repeat(64)}.json`), '');
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(vault.list()).toEqual(['kept']);
@@ -172,7 +175,7 @@ describe('a one-way migration that keeps its way back', () => {
     const vault = new Vault(directory());
     const fsync = vi.spyOn(fs, 'fsyncSync');
     const rename = vi.spyOn(fs, 'renameSync');
-    await vault.put('durable', 'value');
+    await vault.put('durable', 'value', S);
     const renamed = rename.mock.invocationCallOrder[0]!;
     expect(fsync.mock.invocationCallOrder.some(call => call < renamed)).toBe(true);
     expect(fsync.mock.invocationCallOrder.some(call => call > renamed)).toBe(true);
@@ -182,8 +185,10 @@ describe('a one-way migration that keeps its way back', () => {
 describe('the canary decides only when it can', () => {
   it('re-checks an empty or truncated canary against the entries and rewrites it', async () => {
     const dir = directory();
-    await new Vault(dir).put('kept', 'secret');
-    const canary = path.join(dir, 'vault.canary');
+    const vault = new Vault(dir);
+    await vault.put('kept', 'secret', S);
+    // Under data keys (data epoch 4) the canary is per key encryption key.
+    const canary = path.join(dir, 'keys', `${vault.kekId}.canary`);
     const good = fs.readFileSync(canary, 'utf8');
     for (const damaged of ['', good.slice(0, good.length - 10)]) {
       fs.writeFileSync(canary, damaged);
@@ -227,9 +232,9 @@ describe('the canary decides only when it can', () => {
     expect(() => new Vault(dir)).toThrow(/vault\.canary is missing or damaged, and the key opens none of the 1 entries/);
     const dir2 = directory();
     vi.stubEnv('KARMAX_VAULT_KEY', 'the-original-deployment-key-material-000');
-    return new Vault(dir2).put('kept', 'secret').then(() => {
+    return new Vault(dir2).put('kept', 'secret', S).then(() => {
       vi.stubEnv('KARMAX_VAULT_KEY', 'a-different-deployment-key-material-111');
-      expect(() => new Vault(dir2)).toThrow(/vault\.canary fails to authenticate/);
+      expect(() => new Vault(dir2)).toThrow(/vault key does not open this vault: it is vk-.*wrapped under vk-/);
     });
   });
 
@@ -246,7 +251,7 @@ describe('the canary decides only when it can', () => {
 
   it('opens a vault it cannot write, as the read-only restore drill does', async () => {
     const dir = directory();
-    await new Vault(dir).put('kept', 'secret');
+    await new Vault(dir).put('kept', 'secret', S);
     fs.rmSync(path.join(dir, 'vault.canary'));
     fs.chmodSync(dir, 0o500);
     try { expect(new Vault(dir).reveal('kept')).toBe('secret'); }
@@ -257,8 +262,8 @@ describe('the canary decides only when it can', () => {
 describe('replacing a secret without its history', () => {
   it('drops the earlier revisions', async () => {
     const vault = new Vault(directory());
-    await vault.put('card', 'with-cvc');
-    await vault.put('card', 'without-cvc', { history: false });
+    await vault.put('card', 'with-cvc', S);
+    await vault.put('card', 'without-cvc', S, { history: false });
     expect(vault.reveal('card')).toBe('without-cvc');
     expect(vault.reveal('card', 1)).toBeUndefined();
   });
@@ -484,12 +489,13 @@ describe('the first boot, round 4', () => {
     const { dir } = masterVault({ 'payment:card:big': card });
     expect(inspectVault(dir)).toMatchObject({ quarantine: [], unreadable: [], oversized: ['payment:card:big'] });
     const broker = new CredentialBroker(new Vault(dir));
-    await (broker as any).vault.migrate();
+    await (broker as any).vault.migrateToScopes(async () => new Map([['payment:card:big', organizationScope('org_a')]]));
     expect(await separateStoredCardCvcs(broker)).toBe(1);
+    expect(broker.scopeOf('payment:card:big:cvc')).toBe(organizationScope('org_a'));
     expect(JSON.parse(broker.resolve('payment:card:big', { caps: ['use-credential:*'] }))).not.toHaveProperty('cvc');
     // A new secret over the limit is still refused.
-    await expect(broker.registerHandle('fresh', 'y'.repeat(70_000))).rejects.toThrow(/size limit/);
-    await expect(broker.registerHandle('payment:card:big', 'z'.repeat(80_000))).rejects.toThrow(/size limit/);
+    await expect(broker.registerHandle('fresh', 'y'.repeat(70_000), S)).rejects.toThrow(/size limit/);
+    await expect(broker.registerHandle('payment:card:big', 'z'.repeat(80_000), organizationScope('org_a'))).rejects.toThrow(/size limit/);
   });
 
   // Items 2 and 8: once moved, secrets.json is a sentinel master refuses.
@@ -500,7 +506,7 @@ describe('the first boot, round 4', () => {
     expect(masterCanRead(dir)).toBe(false);
     expect(fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8')).toMatch(/pre-update backup/);
     const fresh = directory();
-    await new Vault(fresh).put('a', 'b');
+    await new Vault(fresh).put('a', 'b', S);
     expect(masterCanRead(fresh)).toBe(false);
   });
 
@@ -535,7 +541,7 @@ describe('the first boot, round 4', () => {
   // Item 4.
   it('offers the override for a failed canary only to a key that opens something', async () => {
     const { dir } = masterVault({ a: '1' });
-    await new Vault(dir).migrate();
+    new Vault(dir); // records the epoch 3 canary; a migrated vault has per-key canaries instead
     vi.stubEnv('KARMAX_VAULT_KEY', 'not-the-key-this-vault-was-created-with');
     const refusal = (() => { try { new Vault(dir); } catch (error) { return String(error); } })()!;
     expect(refusal).toMatch(/vault\.canary fails to authenticate/);
@@ -696,8 +702,8 @@ describe('the first boot, round 5', () => {
     const { dir } = masterVault({ big });
     const vault = new Vault(dir);
     await vault.migrate();
-    await expect(vault.put('big', 'y'.repeat(70_000))).rejects.toThrow(/size limit/);
-    await vault.put('big', 'z'.repeat(69_999));
+    await expect(vault.put('big', 'y'.repeat(70_000), S)).rejects.toThrow(/size limit/);
+    await vault.put('big', 'z'.repeat(69_999), S);
     expect(vault.reveal('big')).toBe('z'.repeat(69_999));
   });
 });

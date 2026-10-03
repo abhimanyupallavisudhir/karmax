@@ -16,6 +16,7 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_CLIENT_SECRET_HANDLE, GITHUB_APP_PERMISSIONS } from '../src/integrations/github-app.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 it('connects an already-installed GitHub account from settings and survives reload without a setup callback', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'github-existing-browser-'));
@@ -23,8 +24,8 @@ it('connects an already-installed GitHub account from settings and survives relo
   const broker = new CredentialBroker(new Vault(dir));
   const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
     privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-  await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
-  await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'test-secret');
+  await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE);
+  await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'test-secret', INSTALLATION_SCOPE);
   let visible = true;
   let listingFails = false;
   const fakeFetch = async (input: string | URL | Request) => {

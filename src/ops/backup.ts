@@ -7,6 +7,7 @@ import { paths } from '../config/paths.js';
 import { scanInstances } from '../util/instance.js';
 import { signBackupBytes, verifyBackupBytes } from './backup-signing.js';
 import { BRAND } from '../domain/brand.js';
+import { LocalKek, environmentKekId, keyIdOf } from '../autonomy/vault-keys.js';
 
 const sqlite = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
@@ -49,6 +50,16 @@ export interface BackupManifest {
    * backups actually contain. Never test this by falsiness.
    */
   secretsIncluded: boolean;
+  /**
+   * Does the payload carry `vault/vault.key` (SS-2)? Not unless the operator
+   * asked (`includeVaultKey`): the vault's data keys are wrapped under that
+   * key, so a backup that carries it is plaintext-equivalent. Absent on
+   * manifests from before it existed, which follow `secretsIncluded`.
+   */
+  vaultKeyIncluded?: boolean;
+  /** The vault key ids (`vk-…`) whose wraps the vault holds: restore refuses
+   * any other key before it changes anything. Empty when the source had none. */
+  vaultKeyIds?: string[];
   files: Array<{ path: string; bytes: number; sha256: string }>;
 }
 
@@ -97,6 +108,9 @@ export async function createBackup(options: {
    * preserves the existing self-contained behaviour.
    */
   excludeSecrets?: boolean;
+  /** Carry `vault/vault.key` in the payload, which a backup otherwise never
+   * does (SS-2): keep the vault key off-host and supply it on restore. */
+  includeVaultKey?: boolean;
 } = {}): Promise<{ directory: string; manifest: BackupManifest; signedBy: string }> {
   const home = path.resolve(options.home ?? paths().home);
   const p = paths(home);
@@ -136,7 +150,8 @@ export async function createBackup(options: {
         // A crash during atomic key publication may leave a private temporary
         // key. Never export it, including when excludeSecrets is requested.
         copyTree(path.join(home, component), path.join(payload, component),
-          file => !/^vault\.key\..*\.tmp$/.test(path.basename(file)));
+          file => !/^vault\.key\..*\.tmp$/.test(path.basename(file))
+            && (options.includeVaultKey === true || file !== path.join(home, component, 'vault.key')));
       else copyTree(path.join(home, component), path.join(payload, component));
     }
 
@@ -175,6 +190,8 @@ export async function createBackup(options: {
       // this flag to decide whether to overwrite the restored key material with the
       // target host's own. See `BackupManifest.secretsIncluded`.
       secretsIncluded: !options.excludeSecrets,
+      vaultKeyIncluded: options.includeVaultKey === true && !options.excludeSecrets,
+      vaultKeyIds: vaultKeyIds(path.join(home, 'vault')),
       files: listFiles(payload).map((file) => ({ path: slash(path.relative(payload, file)), bytes: fs.statSync(file).size, sha256: hashFile(file) })),
     };
     const manifestBytes = `${JSON.stringify(manifest, null, 2)}\n`;
@@ -188,11 +205,63 @@ export async function createBackup(options: {
   }
 }
 
-/** Check a backup in place, without restoring it. */
-export function verifyBackup(source: string, options: BackupTrust & { home?: string } = {}): BackupManifest {
+/** The key ids the vault in `vaultDir` is wrapped under: its key canaries,
+ * or, before data keys, the key the app would use. */
+function vaultKeyIds(vaultDir: string): string[] {
+  let canaries: string[] = [];
+  try { canaries = fs.readdirSync(path.join(vaultDir, 'keys')).filter((name) => name.endsWith('.canary')).map((name) => name.slice(0, -'.canary'.length)); }
+  catch { /* no data keys yet */ }
+  if (canaries.length) return canaries.sort();
+  const id = environmentKekId(vaultDir);
+  return id ? [id] : [];
+}
+
+/** Where restore takes the vault key from, checked against the manifest. */
+export interface VaultKeyChoice {
+  /** A copy of `vault/vault.key` kept off-host (32 raw bytes). */
+  vaultKeyFile?: string;
+}
+
+/**
+ * The vault key a restored vault will be opened with must be one it is
+ * wrapped under (SS-2), checked before anything is replaced: the app's
+ * `KARMAX_VAULT_KEY`, else the supplied `vault.key` copy, else the one the
+ * backup carries, else this home's own `vault/vault.key`. Returns what to do
+ * with this home's key file across the swap.
+ */
+function checkVaultKey(manifest: BackupManifest, payload: string, home: string, choice: VaultKeyChoice): { preserveLive: boolean; install?: Buffer } {
+  const ids = manifest.vaultKeyIds ?? [];
+  if (!ids.length || !fs.existsSync(path.join(payload, 'vault'))) return { preserveLive: false };
+  const readKey = (file: string) => {
+    const key = fs.readFileSync(file);
+    if (key.length !== 32) throw new Error(`${file} is not a vault key file (a copy of vault/vault.key holds 32 bytes)`);
+    return key;
+  };
+  let id: string, where: string, install: Buffer | undefined, preserveLive = false;
+  if (process.env.KARMAX_VAULT_KEY) { id = LocalKek.fromText(process.env.KARMAX_VAULT_KEY).id; where = ' (KARMAX_VAULT_KEY)'; }
+  else if (choice.vaultKeyFile) { install = readKey(choice.vaultKeyFile); id = keyIdOf(install); where = ` (${choice.vaultKeyFile})`; }
+  else if (manifest.vaultKeyIncluded && fs.existsSync(path.join(payload, 'vault', 'vault.key'))) {
+    id = keyIdOf(readKey(path.join(payload, 'vault', 'vault.key'))); where = ' (the backup\'s own vault.key)';
+  } else if (fs.existsSync(path.join(home, 'vault', 'vault.key'))) {
+    id = keyIdOf(readKey(path.join(home, 'vault', 'vault.key'))); where = ` (${path.join(home, 'vault', 'vault.key')})`; preserveLive = true;
+  } else {
+    throw new Error(`this backup's vault is encrypted under ${ids.join(' or ')}, and the backup does not carry that key (backups never do unless asked). `
+      + 'Supply the key it was taken with: KARMAX_VAULT_KEY or KARMAX_VAULT_KEY_FILE, or --vault-key-file with a copy of vault/vault.key '
+      + '(deploy/karmax restore --vault-key-file FILE). Nothing was changed');
+  }
+  if (!ids.includes(id))
+    throw new Error(`this backup's vault is encrypted under ${ids.join(' or ')}, but the vault key here is ${id}${where}. `
+      + 'Restore with the key the backup was taken under (after a key rotation, the retired key: --vault-key-file); nothing was changed');
+  return { preserveLive, ...(install ? { install } : {}) };
+}
+
+/** Check a backup in place, without restoring it; `checkVaultKey` also checks
+ * that the vault key available here opens its vault. */
+export function verifyBackup(source: string, options: BackupTrust & VaultKeyChoice & { home?: string; checkVaultKey?: boolean } = {}): BackupManifest {
   const directory = path.resolve(source);
   const { manifest } = readManifest(directory, options);
   verifyPayload(path.join(directory, 'payload'), manifest);
+  if (options.checkVaultKey) checkVaultKey(manifest, path.join(directory, 'payload'), path.resolve(options.home ?? paths().home), options);
   return manifest;
 }
 
@@ -252,7 +321,7 @@ export function signChecksums(bytes: Buffer, home = paths().home): string {
  * Unsigned checksums are accepted only beside an unsigned manifest, and only
  * with `acceptUnsignedV1`.
  */
-export function verifyDeploymentBackup(source: string, options: BackupTrust & { home?: string } = {}): { manifest: BackupManifest; signedBy?: string } {
+export function verifyDeploymentBackup(source: string, options: BackupTrust & VaultKeyChoice & { home?: string; checkVaultKey?: boolean } = {}): { manifest: BackupManifest; signedBy?: string } {
   const directory = path.resolve(source);
   const home = path.resolve(options.home ?? paths().home);
   let sums: Buffer;
@@ -295,7 +364,7 @@ export function verifyDeploymentBackup(source: string, options: BackupTrust & { 
 /** Restore a backup: copy its payload into a private stage, verify the copy,
  * and swap in only what was verified, component by component via
  * same-filesystem rename. A failed verification leaves the installation intact. */
-export async function restoreBackup(source: string, options: BackupTrust & { home?: string; allowRunning?: boolean } = {}): Promise<BackupManifest> {
+export async function restoreBackup(source: string, options: BackupTrust & VaultKeyChoice & { home?: string; allowRunning?: boolean } = {}): Promise<BackupManifest> {
   const directory = path.resolve(source);
   const home = path.resolve(options.home ?? paths().home);
   const { manifest, manifestSha256, signedBy } = readManifest(directory, { ...options, home });
@@ -319,10 +388,12 @@ export async function restoreBackup(source: string, options: BackupTrust & { hom
   // after it was checked (a swapped file, a symlink) would otherwise be
   // restored unverified.
   let present: Component[];
+  let vaultKey: ReturnType<typeof checkVaultKey>;
   try {
     present = COMPONENTS.filter((component) => fs.existsSync(path.join(payload, component)));
     for (const component of present) copyTree(path.join(payload, component), path.join(stageRoot, component));
     verifyPayload(stageRoot, manifest);
+    vaultKey = checkVaultKey(manifest, stageRoot, home, options);
   } catch (error) {
     fs.rmSync(stageRoot, { recursive: true, force: true });
     throw error;
@@ -357,6 +428,11 @@ export async function restoreBackup(source: string, options: BackupTrust & { hom
   // the restoring host's `vault.key`/`auth.db.secret` on top of the restored ones. On
   // the documented restore-onto-a-new-host path that leaves the backup's ciphertext
   // paired with a foreign key — permanently undecryptable, every session invalidated.
+  //
+  // A backup that leaves out only the vault key (every backup since SS-2,
+  // unless asked) keeps this home's key across the swap when, and only when,
+  // `checkVaultKey` proved it is the key the vault is wrapped under; a key
+  // supplied with `vaultKeyFile` is installed instead.
   const preserved = new Map<string, Buffer>();
   if (manifest.secretsIncluded === false) {
     for (const relative of SECRET_FILES) {
@@ -366,6 +442,9 @@ export async function restoreBackup(source: string, options: BackupTrust & { hom
       if (fs.existsSync(live)) preserved.set(relative, fs.readFileSync(live));
     }
   }
+  if (vaultKey.preserveLive && !preserved.has('vault/vault.key'))
+    preserved.set('vault/vault.key', fs.readFileSync(path.join(home, 'vault', 'vault.key')));
+  if (vaultKey.install) preserved.set('vault/vault.key', vaultKey.install);
 
   try {
     for (const component of present) {

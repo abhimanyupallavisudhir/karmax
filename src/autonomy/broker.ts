@@ -1,4 +1,5 @@
 import { Vault } from './vault.js';
+import type { VaultScope } from './vault-keys.js';
 import { Capability, allows } from '../platform/capabilities.js';
 
 export interface AuditEntry {
@@ -30,18 +31,25 @@ export class CredentialBroker {
 
   constructor(private vault: Vault) {}
 
-  /** Write back a (possibly newly created) secret under a handle. */
-  registerHandle(handle: string, secret: string, options?: { history?: boolean }) {
-    return this.vault.put(handle, secret, options);
+  /** Write back a (possibly newly created) secret under a handle, encrypted
+   * under the data key of the `scope` that owns it (SS-1). A handle stays in
+   * its scope: writing it as another owner's is refused. */
+  registerHandle(handle: string, secret: string, scope: VaultScope, options?: { history?: boolean }) {
+    return this.vault.put(handle, secret, scope, options);
   }
 
   /** Initialize a shared encryption key without rotating a concurrent creator's key. */
-  ensureHandle(handle: string, secret: string) {
-    return this.vault.putIfAbsent(handle, secret);
+  ensureHandle(handle: string, secret: string, scope: VaultScope) {
+    return this.vault.putIfAbsent(handle, secret, scope);
   }
 
   hasHandle(handle: string): boolean {
     return this.vault.has(handle);
+  }
+
+  /** The scope recorded on a handle's entry. */
+  scopeOf(handle: string): VaultScope | undefined {
+    return this.vault.scopeOf(handle);
   }
 
   deleteHandle(handle: string) {
@@ -54,8 +62,13 @@ export class CredentialBroker {
 
   /** Rename and/or rotate a handle without revealing its current secret to the
    * gateway. Supplying no replacement keeps the existing secret. */
-  updateHandle(handle: string, nextHandle: string, replacement?: string) {
-    return this.vault.move(handle, nextHandle, replacement);
+  updateHandle(handle: string, nextHandle: string, scope: VaultScope, replacement?: string) {
+    return this.vault.move(handle, nextHandle, scope, replacement);
+  }
+
+  /** Crypto-shred everything an organization or user owned (SS-1). */
+  destroyScope(scope: VaultScope) {
+    return this.vault.destroyScope(scope);
   }
 
   listHandles(): string[] {

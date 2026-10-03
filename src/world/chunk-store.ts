@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { gunzip, gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { organizationScope } from '../autonomy/vault-keys.js';
 
 /** Encrypted content-addressed chunks shared by project-resource snapshots and
  * world checkpoints. One organization key, one chunk namespace and one
@@ -18,7 +19,7 @@ export async function organizationKey(broker: CredentialBroker, organizationId: 
   const handle = organizationKeyHandle(organizationId);
   if (!broker.hasHandle(handle)) {
     if (!create) throw new Error('resource key unavailable');
-    await broker.ensureHandle(handle, crypto.randomBytes(32).toString('base64'));
+    await broker.ensureHandle(handle, crypto.randomBytes(32).toString('base64'), organizationScope(organizationId));
   }
   return Buffer.from(broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
 }
