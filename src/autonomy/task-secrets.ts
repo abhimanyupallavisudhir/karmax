@@ -17,25 +17,44 @@ import type { PaymentRegistry } from './payments.js';
  *    connection, per-world service value or model key the task received;
  *  - `card:<cardId>` — a payment card filled for the task (resolved through its
  *    payment rail, since an issuer's card is not in the vault);
- *  - `task:<taskId>` — everything another task received, for a fork that
+ *  - `task:<intentId>` — everything another task received, for a fork that
  *    carries that task's conversation.
+ *
+ * The `<taskId>` in the key is the task's intent (`intentOf`).
  */
 const prefix = (taskId: string) => `secretref:${taskId}:`;
 export const handleRef = (handle: string) => `handle:${handle}`;
 export const cardRef = (cardId: string) => `card:${cardId}`;
 export const taskRef = (taskId: string) => `task:${taskId}`;
 
-/** Stores without `kvClaim` (test doubles) record with an upsert. */
-type RefStore = { kvClaim?(k: string, v: string): boolean | Promise<boolean>; kvSet(k: string, v: string): void | Promise<void> };
+/** Stores without `kvClaim` (test doubles) record with an upsert; without
+ * `getTask`, a task is its own intent. */
+type RefStore = {
+  kvClaim?(k: string, v: string): boolean | Promise<boolean>;
+  kvSet(k: string, v: string): void | Promise<void>;
+  getTask?(id: string): Promise<{ intentId?: string } | undefined> | { intentId?: string } | undefined;
+};
+
+/** References are kept per intent, not per attempt: a task's attempts share
+ * one conversation (the Confirm agent's session is the intent's), so what one
+ * received is scrubbed from all of them, and a turn finds them under the
+ * intent it already knows, with no extra read. */
+async function intentOf(store: RefStore, taskId: string): Promise<string> {
+  return (store.getTask ? (await store.getTask(taskId))?.intentId : undefined) ?? taskId;
+}
 
 /** Remember that `taskId` received these secrets. */
 export async function recordSecretRefs(store: RefStore, taskId: string | undefined,
   refs: Array<string | undefined>): Promise<void> {
   if (!taskId || taskId === '*') return;
-  for (const ref of new Set(refs)) {
-    if (!ref) continue;
-    if (store.kvClaim) (await store.kvClaim(`${prefix(taskId)}${ref}`, '1'));
-    else (await store.kvSet(`${prefix(taskId)}${ref}`, '1'));
+  const owner = (await intentOf(store, taskId));
+  for (const raw of new Set(refs)) {
+    if (!raw) continue;
+    // A fork carries its source's conversation: name the source's intent.
+    const ref = raw.startsWith('task:') ? taskRef((await intentOf(store, raw.slice(5)))) : raw;
+    if (ref === taskRef(owner)) continue;
+    if (store.kvClaim) (await store.kvClaim(`${prefix(owner)}${ref}`, '1'));
+    else (await store.kvSet(`${prefix(owner)}${ref}`, '1'));
   }
 }
 
@@ -79,13 +98,11 @@ export function paymentCardDetails(store: Pick<Store, 'getCard'>, registry?: Pay
   };
 }
 
-/** A task and its sibling attempts: they share an intent's conversation (the
- * Confirm agent's session is the intent's), so what one received is scrubbed
- * from all of them. */
-export async function secretScope(store: Pick<Store, 'getTask' | 'attemptsOf'>, taskId: string): Promise<string[]> {
-  const task = (await store.getTask(taskId));
-  if (!task?.intentId) return [taskId];
-  return [...new Set([taskId, ...(await store.attemptsOf(task.intentId)).map((attempt) => attempt.id)])];
+/** Where a task's references are kept: its intent, shared by every attempt.
+ * Pass the task when the caller has already read it. */
+export async function secretScope(store: Pick<Store, 'getTask'>, taskId: string,
+  task?: { intentId?: string } | null): Promise<string[]> {
+  return [task !== undefined ? (task?.intentId ?? taskId) : (await intentOf(store, taskId))];
 }
 
 const RETRY_MS = 30_000;

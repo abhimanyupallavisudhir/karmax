@@ -2520,7 +2520,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // the task, wherever it was revealed (SS-3). Refreshed before each write,
       // so a value revealed mid-turn is scrubbed from the next thing archived.
       const taskSecrets = new TaskSecrets({ store, broker: deps.broker,
-        cardDetails: paymentCardDetails(store, deps.paymentRegistry) }, (await secretScope(store, args.taskId)));
+        cardDetails: paymentCardDetails(store, deps.paymentRegistry) }, (await secretScope(store, args.taskId, preparationTask ?? null)));
       const secrets = taskSecrets.scrubber;
       const resultKey = timingTurnId ? `turnresult:${args.taskId}:${args.role}:${timingTurnId}` : undefined;
       const savedResult = resultKey ? await store.kvGet(resultKey) : undefined;

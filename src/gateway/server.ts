@@ -9403,8 +9403,14 @@ export class Gateway {
    * a person knows whom to ask and an agent which authorization to request. */
   private async capabilityHint(capability: string, record: ScopedToken | undefined,
     scope: { projectId?: string; organizationId?: string; taskId?: string }): Promise<string> {
+    // Best effort: a refusal must stay a refusal even if its hint cannot be worked out.
+    try { return await this.capabilityHintUnsafe(capability, record, scope); } catch { return ''; }
+  }
+
+  private async capabilityHintUnsafe(capability: string, record: ScopedToken | undefined,
+    scope: { projectId?: string; organizationId?: string; taskId?: string }): Promise<string> {
     const authorization = this.deps.authorization;
-    if (!authorization) return '';
+    if (typeof authorization?.profile !== 'function' || typeof authorization.selectionForPrincipal !== 'function') return '';
     const organizationId = scope.organizationId ?? (scope.projectId ? await this.deps.store.projectOrganizationAsync(scope.projectId) : undefined)
       ?? record?.organizationId;
     const levels = ['viewer', 'developer', 'maintainer', 'administrator', 'superadmin', 'god'];

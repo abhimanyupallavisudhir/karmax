@@ -6,7 +6,8 @@ import { SecretScrubber, secretForms } from '../src/agent/activity.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { VaultItems } from '../src/autonomy/vault-items.js';
-import { TaskSecrets, cardRef, recordSecretRefs, secretValues, taskRef } from '../src/autonomy/task-secrets.js';
+import { organizationScope } from '../src/autonomy/vault-keys.js';
+import { TaskSecrets, cardRef, handleRef, recordSecretRefs, secretScope, secretValues, taskRef } from '../src/autonomy/task-secrets.js';
 import { McpConnections } from '../src/mcp/connections/store.js';
 import { Store } from '../src/store/db.js';
 import { ExecutionOutput } from '../src/gateway/execution-output.js';
@@ -126,6 +127,25 @@ describe('what a task received, across processes', () => {
       (await workerStore.close());
       (await gatewayStore.close());
     }
+  });
+
+  it('scrubs what one attempt received from its sibling attempts, found under their shared intent', async () => {
+    const dir = temp();
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    try {
+      const project = (await store.createProject('Attempts'));
+      const first = (await store.createTask({ projectId: project.id, title: 'Attempt 1', workflow: 'software-dev', workflowVersion: '1', params: { prompt: '' } }));
+      const second = (await store.createTask({ projectId: project.id, title: 'Attempt 2', workflow: 'software-dev', workflowVersion: '1',
+        params: { prompt: '' }, intentId: first.intentId ?? first.id }));
+      (await broker.registerHandle('item:vi_x:secret', 'sibling-secret-0123456789', organizationScope(project.organizationId ?? 'org_personal')));
+      (await recordSecretRefs(store, second.id, [handleRef('item:vi_x:secret')]));
+      const firstTask = (await store.getTask(first.id));
+      const scope = (await secretScope(store, first.id, firstTask));
+      expect(scope).toEqual([first.intentId ?? first.id]);
+      const secrets = new TaskSecrets({ store, broker }, scope);
+      expect((await secrets.refresh()).scrub('echo sibling-secret-0123456789')).toBe('echo [redacted]');
+    } finally { (await store.close()); }
   });
 
   it('includes MCP tokens, filled cards and what a forked-from task received', async () => {
