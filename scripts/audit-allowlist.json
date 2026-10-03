@@ -1,9 +1,0 @@
-[
-  {
-    "id": "GHSA-vfj7-8cjw-p6xm",
-    "package": "braces",
-    "roots": ["@daytona/sdk"],
-    "expires": "2026-11-03",
-    "reason": "No patched braces exists. @daytona/sdk loads fast-glob (and so braces) only in Image.extractCopySources, for Image.fromDockerfile and Image.dockerfileCommands; karmax builds Daytona images with Image.base().runCommands() only, which tests/audit-allowlist.test.ts enforces. Remove this entry once braces or @daytona/sdk ships a fix."
-  }
-]
