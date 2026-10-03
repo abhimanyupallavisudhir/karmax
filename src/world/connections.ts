@@ -1,4 +1,5 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { organizationScope } from '../autonomy/vault-keys.js';
 import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 
@@ -44,7 +45,7 @@ export class WorldProviderConnectionService {
     // endpoint must leave the previous working credential/config untouched.
     const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) }, this.store.hosted);
     const key = input.apiKey?.trim();
-    if (key) (await this.broker.registerHandle(handle, key));
+    if (key) (await this.broker.registerHandle(handle, key, organizationScope(input.organizationId)));
     if (!key && !this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
     const value = (await this.store.upsertWorldProviderConnection({
       organizationId: input.organizationId,

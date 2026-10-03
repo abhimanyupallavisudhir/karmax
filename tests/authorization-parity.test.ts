@@ -63,7 +63,7 @@ describe('human and agent authorization-level parity', () => {
     const human = (await tokens.verify(humanToken))!;
     human.caps = [...profile.capabilities];
     human.organizationId = profile.id === 'god' ? undefined : project.organizationId;
-    human.projectId = ['administrator', 'god'].includes(profile.id) ? undefined : project.id;
+    human.projectId = ['administrator', 'superadmin', 'god'].includes(profile.id) ? undefined : project.id;
     const delegation = (await tokens.delegateHuman(humanToken, { taskId: 'parity-agent',
       projectId: human.projectId, organizationId: human.organizationId }))!;
     const agent = (await tokens.mint({ taskId: 'parity-agent', principal: 'task:parity-agent', profileId: profile.id,
@@ -78,8 +78,8 @@ describe('human and agent authorization-level parity', () => {
           .toBe(allows(human.caps, capability));
       }
     }
-    const projectWrite = ['maintainer', 'administrator', 'god'].includes(profile.id);
-    const orgAdmin = ['administrator', 'god'].includes(profile.id);
+    const projectWrite = ['maintainer', 'administrator', 'superadmin', 'god'].includes(profile.id);
+    const orgAdmin = ['administrator', 'superadmin', 'god'].includes(profile.id);
     const statuses: number[][] = [];
     for (const [kind, token] of [['human', session.token], ['agent', agent.token]] as const) {
       const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
@@ -124,7 +124,7 @@ describe('human and agent authorization-level parity', () => {
         expect(processes.canKill).toBe(false);
         const unfiltered: any = await (await call('GET', '/api/processes')).json();
         expect(unfiltered.groups.map((group: any) => group.taskId)).toEqual(
-          profile.id === 'god' ? taskIds : profile.id === 'administrator' ? taskIds.slice(0, 2) : taskIds.slice(0, 1));
+          profile.id === 'god' ? taskIds : ['administrator', 'superadmin'].includes(profile.id) ? taskIds.slice(0, 2) : taskIds.slice(0, 1));
         expect(unfiltered.canKill).toBe(profile.id === 'god');
       }
       for (const [response, expected] of checks) {

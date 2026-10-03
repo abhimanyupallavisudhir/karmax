@@ -228,6 +228,9 @@ exit 0`,
     fs.mkdirSync(path.join(backup, 'deployment-secrets'));
     fs.writeFileSync(path.join(backup, 'control-plane', 'manifest.json'), '{}');
     fs.writeFileSync(path.join(backup, 'deployment-secrets', 'auth_secret'), 'x');
+    // A configured instance has its vault key, which backups do not carry (SS-2).
+    fs.mkdirSync(path.join(box.sandbox, '.secrets'), { mode: 0o700 });
+    fs.writeFileSync(path.join(box.sandbox, '.secrets', 'vault_key'), 'x');
     for (const dump of ['karmax', 'temporal', 'temporal-visibility']) {
       fs.writeFileSync(path.join(backup, `${dump}.dump`), crypto.randomBytes(dumpKiB * 1024 / 4));
     }
@@ -379,5 +382,84 @@ describe('hosted credential connector runtime', () => {
     const runtime = dockerfile.split('FROM node:22-bookworm-slim').at(-1) ?? '';
     expect(runtime).toMatch(/apt-get install[^\n]*\bgnupg\b/);
     expect(runtime).toMatch(/apt-get install[^\n]*\bage\b/);
+  });
+});
+
+// SS-1/SS-2: backups never carry the vault key, and its rotation resumes after
+// any interruption with the previous key opening the vault until the switch.
+describe('the vault key in the operator script', () => {
+  const homes: string[] = [];
+  afterAll(() => { for (const home of homes) fs.rmSync(home, { recursive: true, force: true }); });
+  /** A configured instance whose docker stub logs every call and fails the
+   * first call matching `FAIL_ON` (a file in the sandbox home). */
+  function instance() {
+    const box = operatorSandbox({
+      docker: `printf '%s\\n' "$*" >> "$(dirname "$0")/../docker.log"
+fail="$(dirname "$0")/../fail-on"
+if [ -s "$fail" ] && printf '%s' "$*" | grep -q -- "$(cat "$fail")"; then rm -f "$fail"; exit 1; fi
+case "$*" in *" cp app:"*) for last; do :; done; mkdir -p "$last" && echo '{}' > "$last/manifest.json" ;; esac
+exit 0`,
+    });
+    homes.push(box.home);
+    const secrets = path.join(box.sandbox, '.secrets');
+    fs.mkdirSync(secrets, { mode: 0o700 });
+    for (const name of ['auth_secret', 'vault_key', 'world_ref_key']) fs.writeFileSync(path.join(secrets, name), `${name}-${'ab'.repeat(24)}`, { mode: 0o644 });
+    const read = (name: string) => fs.readFileSync(path.join(secrets, name), 'utf8');
+    const failOn = (pattern: string) => fs.writeFileSync(path.join(box.home, 'fail-on'), pattern);
+    return { ...box, secrets, read, failOn };
+  }
+
+  it('backs up every deployment secret except the vault key', () => {
+    const box = instance();
+    const destination = path.join(box.home, 'manual-backup');
+    const result = box.run(['backup', destination]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(fs.readdirSync(path.join(destination, 'deployment-secrets')).sort()).toEqual(['auth_secret', 'world_ref_key']);
+    expect(fs.readFileSync(path.join(destination, 'SHA256SUMS'), 'utf8')).not.toContain('vault_key');
+    expect(result.stdout).toMatch(/not its key.*vault_key.*off-host/);
+  });
+
+  it('rotates the vault key in three resumable steps', () => {
+    const box = instance();
+    const original = box.read('vault_key');
+    // Interrupted at step 1: nothing switched; the rerun reuses the same new key.
+    box.failOn('vault-key -- add');
+    expect(box.run(['rotate-vault-key']).status).not.toBe(0);
+    expect(box.read('vault_key')).toBe(original);
+    const next = box.read('vault_key.next');
+    // Interrupted at step 3: switched, the previous key kept beside it.
+    box.failOn('vault-key -- prune');
+    const interrupted = box.run(['rotate-vault-key']);
+    expect(interrupted.status).not.toBe(0);
+    expect(interrupted.stderr).toMatch(/running this again finishes/);
+    expect(box.read('vault_key')).toBe(next);
+    expect(box.read('vault_key.previous')).toBe(original);
+    const finished = box.run(['rotate-vault-key']);
+    expect(finished.status, finished.stderr).toBe(0);
+    expect(box.read('vault_key')).toBe(next);
+    const names = fs.readdirSync(box.secrets);
+    expect(names.filter((name) => name.startsWith('vault_key.'))).toEqual([expect.stringMatching(/^vault_key\.retired-\d{8}T\d{6}Z$/)]);
+    expect(box.read(names.find((name) => name.startsWith('vault_key.retired-'))!)).toBe(original);
+    // Wrapped twice (the app serving, then stopped), switched, then pruned.
+    const calls = box.log().split('\n');
+    const at = (pattern: RegExp, from = 0) => calls.findIndex((line, i) => i >= from && pattern.test(line));
+    const firstAdd = at(/run .*vault_key_next.*vault-key -- add/);
+    const stop = at(/ stop app/, firstAdd);
+    const secondAdd = at(/run .*vault-key -- add/, stop);
+    const start = at(/ up -d --no-build app/, secondAdd);
+    expect([firstAdd, stop, secondAdd, start].every((i) => i >= 0)).toBe(true);
+    expect(at(/exec -T app npm run --silent vault-key -- prune/, start)).toBeGreaterThan(start);
+    expect(finished.stdout).toMatch(/copy .*vault_key\.retired-.* off-host/);
+  });
+
+  it('finishes a switch cut short between saving the previous key and moving the new one in', () => {
+    const box = instance();
+    const original = box.read('vault_key');
+    fs.writeFileSync(path.join(box.secrets, 'vault_key.next'), 'the-new-key-material-0123456789abcdef');
+    fs.writeFileSync(path.join(box.secrets, 'vault_key.previous'), original);
+    const result = box.run(['rotate-vault-key']);
+    expect(result.status, result.stderr).toBe(0);
+    expect(box.read('vault_key')).toBe('the-new-key-material-0123456789abcdef');
+    expect(box.log()).not.toMatch(/vault-key -- add/);
   });
 });

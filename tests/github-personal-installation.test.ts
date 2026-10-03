@@ -15,6 +15,7 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_CLIENT_SECRET_HANDLE, GITHUB_APP_PERMISSIONS } from '../src/integrations/github-app.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 type Installation = { id: number; account: { login: string; type: string }; suspended_at?: string };
 const cleanups: Array<() => Promise<void>> = [];
@@ -26,8 +27,8 @@ async function fixture(installations: Installation[]) {
   const broker = new CredentialBroker(new Vault(dir));
   const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
     privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-  await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
-  await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'test-secret');
+  await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE);
+  await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'test-secret', INSTALLATION_SCOPE);
   const github = { installations, listingFails: false, repositoriesFail: false };
   const fakeFetch = async (input: string | URL | Request) => {
     const url = new URL(String(input));

@@ -15,6 +15,7 @@ import { CHECKPOINT_KEY_HANDLE, WorldCheckpointService } from '../src/world/chec
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import type { World } from '../src/world/types.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 const MiB = 1024 * 1024;
 const dirs: string[] = [];
@@ -242,7 +243,7 @@ describe('chunked world checkpoints', () => {
       { repo: '', path: 'legacy.txt', data: Buffer.from('from the old format').toString('base64') },
       { repo: '', path: 'link', symlink: true, data: Buffer.from('legacy.txt').toString('base64') },
     ] };
-    if (!f.broker.hasHandle(CHECKPOINT_KEY_HANDLE)) await f.broker.ensureHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
+    if (!f.broker.hasHandle(CHECKPOINT_KEY_HANDLE)) await f.broker.ensureHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'), INSTALLATION_SCOPE);
     const key = Buffer.from(f.broker.resolve(CHECKPOINT_KEY_HANDLE, { caps: [`use-credential:${CHECKPOINT_KEY_HANDLE}`] }), 'base64');
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);

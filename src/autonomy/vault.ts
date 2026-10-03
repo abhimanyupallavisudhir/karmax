@@ -2,28 +2,44 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { acquireFileLock } from '../util/file-lock.js';
+import { INSTALLATION_SCOPE, LocalKek, isVaultScope, kekFromEnvironment, type KekSource, type KeyEncryptionKey, type VaultScope } from './vault-keys.js';
 
 /**
  * A local, file-backed secret vault (SPEC §1, §8.4): the credential broker's
- * storage on every deployment, hosted included. Secrets are encrypted at rest
- * with AES-256-GCM under `KARMAX_VAULT_KEY` when set (hosted requires it),
- * otherwise under a key kept in the vault dir (chmod 600). External password
- * stores are connectors that integrate with it, not replacement backends.
+ * storage on every deployment, hosted included. External password stores are
+ * connectors that integrate with it, not replacement backends. Stored values
+ * are SECRETS resolved only by the broker; everything else in the system holds
+ * opaque handles (pointers), never raw keys.
  *
- * Stored values are SECRETS resolved only by the broker; everything else in the
- * system holds opaque handles (pointers), never raw keys.
+ * Envelope encryption (SS-1, data epoch 4; wiki features/vault-encryption).
+ * Every secret belongs to a scope (an organization, a user, the installation)
+ * and is encrypted with AES-256-GCM under a random data key (DEK) of that scope:
+ * `v3.<kid>.iv.tag.ct`, its additional data binding the format, the scope and
+ * the handle. Each scope's DEKs live in a keyring, `keys/<sha256(scope)>.json`,
+ * wrapped under one or more key encryption keys (KEKs, `vault-keys.ts`), with
+ * additional data binding the format, the scope and the kid. Several wraps
+ * make KEK rotation crash-safe; deleting a keyring crypto-shreds its scope.
  *
- * Layout: one file per handle under `entries/`, each `v2.` ciphertext bound to
- * its handle (AU-27), with up to five earlier revisions. Releases before data
- * epoch 3 kept every secret, unbound, in one `secrets.json` map; the first
- * boot of this one moves and binds them (`migrate`). That is one-way, and the
- * way back is the pre-update backup (deploy/README.md, "Rollback compatibility").
+ * Layout: one file per handle under `entries/`, recording its scope, with up to
+ * five earlier revisions. Earlier formats are read only until they are
+ * migrated: unbound ciphertext (before data epoch 3) until `bind`, and `v2.`
+ * ciphertext under the KEK itself (data epoch 3) until `migrateToScopes`, which
+ * needs the database to find each secret's owner. Both migrations are one-way;
+ * the way back is the pre-update backup (deploy/README.md, "Rollback
+ * compatibility").
  */
 const CANARY = 'karmax-vault-canary';
 /** Not a storable handle, so the canary's ciphertext cannot stand in for an entry. */
 const CANARY_HANDLE = '\0canary';
 const boundTo = (handle: string) => Buffer.from(`karmax-vault:v2\0${handle}`, 'utf8');
+const scopedTo = (scope: string, handle: string) => Buffer.from(JSON.stringify(['karmax-vault:v3', scope, handle]), 'utf8');
+const KEYRING = 'karmax-vault-keyring:1';
+const wrappedFor = (scope: string, kid: string) => Buffer.from(JSON.stringify([KEYRING, scope, kid]), 'utf8');
+const KEK_CANARY = 'karmax-vault-kek-canary:1';
+const kekCanaryFor = (kekId: string) => Buffer.from(JSON.stringify([KEK_CANARY, kekId]), 'utf8');
 const ENTRY_FILE = /^[a-f0-9]{64}\.json$/;
+const KEYRING_FILE = /^[a-f0-9]{64}\.json$/;
+const KEK_ID = /^[A-Za-z0-9._-]{1,128}$/;
 /** How long quarantined entries are kept for someone to recover them. */
 const QUARANTINE_RETENTION_MS = 30 * 86_400_000;
 /** Secrets a write may not exceed, unless it shrinks one already stored. */
@@ -34,6 +50,10 @@ const SECRET_LIMIT = 65_536;
 const MOVED = ['karmax-vault-moved-to-entries',
   'The secrets moved to vault/entries/ (data epoch 3). To run an earlier release, restore the pre-update backup with its code.'];
 const isMoved = (parsed: unknown) => Array.isArray(parsed) && parsed[0] === MOVED[0];
+/** What `vault.canary` holds once every secret is under a data key: the
+ * epoch-3 release finds no canary and no entry its key opens, and refuses. */
+const SCOPED = { format: 'karmax-vault-moved-to-data-keys',
+  note: 'Secrets are encrypted under per-scope data keys (data epoch 4). To run an earlier release, restore the pre-update backup with its code.' };
 
 /** The vault key is not the vault's (as opposed to a vault that cannot be read). */
 export class VaultKeyRefused extends Error {}
@@ -51,6 +71,8 @@ export interface VaultInspection {
   bound: boolean;
   /** Secrets binding would re-encrypt (from `secrets.json` or `entries/`). */
   rebind: number;
+  /** Entries the epoch 4 migration would re-encrypt under their scope's data key. */
+  toScopes: number;
   /** Entries binding would move (or, for a damaged older revision, copy) to quarantine. */
   quarantine: QuarantinedEntry[];
   /** Files that cannot be read (permissions, I/O): binding stops on them. */
@@ -58,6 +80,27 @@ export interface VaultInspection {
   /** Secrets over the 64 KiB write limit (a previous release set none): kept,
    * and only ever rewritten smaller, as the CVC split does. */
   oversized?: string[];
+}
+
+/** What `migrateToScopes` did, for the audit log. */
+export interface ScopeMigration {
+  migrated: number;
+  /** Handles no owner was found for: kept under the installation's data key
+   * until a write names their owner. */
+  unresolved: string[];
+  byScope: Record<string, number>;
+}
+
+/** The vault's key state, for operators (`npm run vault-key -- status`). */
+export interface VaultKeyStatus {
+  kek: string;
+  /** Every secret is under a data key (the epoch 4 migration has finished). */
+  scoped: boolean;
+  keyrings: number;
+  scopes: VaultScope[];
+  /** Data keys wrapped under each KEK id. */
+  wraps: Record<string, number>;
+  canaries: string[];
 }
 
 /** One secret as binding sees it: from the pre-epoch-3 map, or an entry file. */
@@ -68,17 +111,34 @@ type PlannedEntry =
   /** A bound entry an interrupted move wrote for a secret no longer in the map. */
   | { kind: 'stale'; file: string };
 
-/** Open the vault in `dir` read-only and report what `migrate` would do. */
-export function inspectVault(dir: string): VaultInspection {
+/** An entry file. `scope` is absent only on ciphertext from before data epoch 4;
+ * `unresolved` marks an owner the migration could not find. */
+interface EntryRecord { handle: string; blob: string; previous: string[]; scope?: VaultScope; unresolved?: boolean }
+interface Keyring { format: string; scope: VaultScope; current: string; keys: Record<string, { created: number; wraps: Record<string, string> }> }
+
+/** Open the vault in `dir` read-only and report what the first boot would do. */
+export function inspectVault(dir: string, options: { kek?: KekSource } = {}): VaultInspection {
+  const empty = { bound: false, rebind: 0, toScopes: 0, quarantine: [], unreadable: [] };
   let vault: Vault;
-  try { vault = new Vault(dir, { readOnly: true }); }
+  try { vault = new Vault(dir, { readOnly: true, ...options }); }
   catch (error) {
     const message = (error as Error).message;
-    return { ...(error instanceof VaultKeyRefused ? { key: 'refused', refusal: message } : { key: 'unchecked', fatal: message }),
-      bound: false, rebind: 0, quarantine: [], unreadable: [] };
+    return { ...(error instanceof VaultKeyRefused ? { key: 'refused', refusal: message } : { key: 'unchecked', fatal: message }), ...empty };
   }
   try { return vault.inspect(); }
-  catch (error) { return { key: 'accepted', fatal: (error as Error).message, bound: false, rebind: 0, quarantine: [], unreadable: [] }; }
+  catch (error) { return { key: 'accepted', fatal: (error as Error).message, ...empty }; }
+}
+
+/** Run the data epoch 4 migration (SS-1) and append its report to the audit
+ * log, acknowledged only once written: a crash in between reports it again. */
+export async function recordScopeMigration(vault: Vault, resolve: (handles: string[]) => Promise<Map<string, VaultScope>>,
+  append: (report: ScopeMigration) => Promise<unknown>): Promise<ScopeMigration | undefined> {
+  await vault.migrateToScopes(resolve);
+  const report = vault.unauditedScopeMigration();
+  if (!report) return undefined;
+  await append(report);
+  vault.acknowledgeScopeMigration();
+  return report;
 }
 
 /** Append each quarantined entry to the audit log, and acknowledge it right
@@ -108,41 +168,66 @@ function syncFile(file: string): void {
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 const cannotWrite = (error: unknown) => ['EACCES', 'EPERM', 'EROFS'].includes((error as NodeJS.ErrnoException)?.code ?? '');
+const isScoped = (blob: unknown) => typeof blob === 'string' && blob.startsWith('v3.');
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 export class Vault {
-  private keyPath: string;
   private dbPath: string;
-  private key: Buffer;
+  private kek: KekSource;
+  /** The KEK's raw material, for ciphertext from before data keys. */
+  private key?: Buffer;
   private entriesPath: string;
+  private keysPath: string;
   private canaryPath: string;
   /** Recorded in the authenticated canary: unbound ciphertext is refused. */
   private bound = false;
+  /** Keyrings exist: secrets are written under data keys. */
+  private scoped = false;
+  /** `v2.` ciphertext under the KEK is still accepted (until `migrateToScopes` finishes). */
+  private legacy = true;
+  /** Some data keys lack a wrap under the current KEK; another known KEK opens them. */
+  private unwrapped = false;
+  /** Unwrapped data keys, by scope, valid while the keyring file is unchanged. */
+  private rings = new Map<string, { raw: string; keys: Map<string, Buffer> }>();
   private reported = new Set<string>();
   private readOnly: boolean;
   /** A well-formed canary failed to authenticate (for the wording of a refusal). */
   private canaryFailed = false;
 
   /** `readOnly` opens without creating or recording anything (a preflight, a
-   * restore drill); anything that would write throws. */
-  constructor(dir: string, options: { readOnly?: boolean } = {}) {
+   * restore drill); anything that would write throws. `kek` replaces the key
+   * from the environment (key rotation). */
+  constructor(dir: string, options: { readOnly?: boolean; kek?: KekSource } = {}) {
     this.readOnly = options.readOnly === true;
-    // The vault holds encrypted secrets and its key; keep the directory private
-    // (0700) so the 0600 files inside aren't reachable via a traversable dir.
+    // The vault holds encrypted secrets and possibly its key; keep the directory
+    // private (0700) so the 0600 files inside aren't reachable via a traversable dir.
     if (!this.readOnly) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    this.keyPath = path.join(dir, 'vault.key');
     this.dbPath = path.join(dir, 'secrets.json');
-    this.key = this.loadOrCreateKey();
+    this.kek = options.kek ?? kekFromEnvironment(dir, { readOnly: this.readOnly });
+    if (!KEK_ID.test(this.kek.current.id)) throw new Error(`invalid vault key id ${this.kek.current.id}`);
+    if (this.kek.current instanceof LocalKek) this.key = this.kek.current.material;
     this.entriesPath = path.join(dir, 'entries');
+    this.keysPath = path.join(dir, 'keys');
     if (!this.readOnly) fs.mkdirSync(this.entriesPath, { recursive: true, mode: 0o700 });
     this.canaryPath = path.join(dir, 'vault.canary');
-    this.checkCanary();
+    if (this.hasKeyrings()) this.checkKek();
+    else {
+      if (!this.key) throw new Error('a vault from before data keys needs its local vault key to migrate');
+      this.checkCanary();
+    }
     this.checkLegacyMap();
   }
 
-  /** Names this key without revealing it, for `KARMAX_VAULT_ACCEPT_KEY`. */
-  private keyId(): string {
-    return `vk-${crypto.createHash('sha256').update('karmax-vault-key-id\0').update(this.key).digest('hex').slice(0, 16)}`;
+  /** This vault's current key encryption key id. */
+  get kekId(): string { return this.kek.current.id; }
+
+  /** The KEK's raw material (only for ciphertext from before data keys). */
+  private legacyKey(): Buffer {
+    if (!this.key) throw new Error('ciphertext from before data keys needs the local vault key');
+    return this.key;
   }
+
+  private keyId(): string { return this.kek.current.id; }
   /** The operator's explicit word that this key is the vault's. It never
    * accepts a key that opens none of the vault's secrets. */
   private overridden(): boolean {
@@ -153,6 +238,172 @@ export class Vault {
       + (overridable ? `. If you are certain this key is the vault's, start once with KARMAX_VAULT_ACCEPT_KEY=${this.keyId()}; `
         + 'secrets it cannot open are then quarantined (deploy/README.md, "Rollback compatibility")' : ''));
   }
+
+  // ── Key encryption keys: canaries and keyrings ──
+
+  private canaryIds(): string[] {
+    try { return fs.readdirSync(this.keysPath).filter((name) => name.endsWith('.canary')).map((name) => name.slice(0, -'.canary'.length)).sort(); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  }
+  private keyringFiles(): string[] {
+    try { return fs.readdirSync(this.keysPath).filter((name) => KEYRING_FILE.test(name)).sort(); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  }
+  private hasKeyrings(): boolean { return this.canaryIds().length > 0 || this.keyringFiles().length > 0; }
+  private keyringPath(scope: string): string {
+    return path.join(this.keysPath, `${crypto.createHash('sha256').update(scope).digest('hex')}.json`);
+  }
+  private known(): KeyEncryptionKey[] { return [this.kek.current, ...this.kek.others]; }
+
+  /** A KEK's canary state, or undefined when it has none; a canary that fails
+   * to authenticate refuses the key. */
+  private readKekCanary(kek: KeyEncryptionKey): { legacy: boolean } | undefined {
+    let record: { kek?: unknown; blob?: unknown };
+    try { record = JSON.parse(fs.readFileSync(path.join(this.keysPath, `${kek.id}.canary`), 'utf8')); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      return undefined; // damaged: re-derived from the keyrings
+    }
+    let state: { canary?: unknown; legacy?: unknown } | undefined;
+    try { state = JSON.parse(kek.unwrap(String(record.blob), kekCanaryFor(kek.id)).toString('utf8')); } catch { state = undefined; }
+    if (record.kek !== kek.id || state?.canary !== CANARY) throw this.refuse(`vault/keys/${kek.id}.canary fails to authenticate`, false);
+    return { legacy: state.legacy === true };
+  }
+  private writeKekCanary(kek: KeyEncryptionKey, legacy: boolean): void {
+    if (this.readOnly) return;
+    fs.mkdirSync(this.keysPath, { recursive: true, mode: 0o700 });
+    const blob = kek.wrap(Buffer.from(JSON.stringify({ canary: CANARY, legacy })), kekCanaryFor(kek.id));
+    writeDurably(path.join(this.keysPath, `${kek.id}.canary`), `${JSON.stringify({ format: KEK_CANARY, kek: kek.id, blob })}\n`);
+  }
+
+  /** Every keyring, parsed; damaged ones are skipped here and fail their reads. */
+  private keyrings(): Array<{ file: string; ring: Keyring }> {
+    return this.keyringFiles().flatMap((file) => {
+      try {
+        const ring = JSON.parse(fs.readFileSync(path.join(this.keysPath, file), 'utf8')) as Keyring;
+        return ring?.format === KEYRING && isVaultScope(ring.scope) && ring.keys && typeof ring.keys === 'object' ? [{ file, ring }] : [];
+      } catch { return []; }
+    });
+  }
+
+  /**
+   * The KEK must be the vault's: its canary authenticates (or, lost, the
+   * keyrings carry its wraps), and every data key opens with a key this
+   * process knows. A wrong key is refused before anything is written with it;
+   * a key whose canary is missing while another known key's opens is a
+   * rotation in progress, completed on the first write.
+   */
+  private checkKek(): void {
+    this.scoped = true;
+    this.bound = true;
+    const canaries = this.canaryIds();
+    const current = this.kek.current;
+    let state = this.readKekCanary(current);
+    if (!state) {
+      const opener = this.kek.others.find((kek) => canaries.includes(kek.id) && this.readKekCanary(kek));
+      if (opener) state = this.readKekCanary(opener);
+      else if (this.keyrings().some(({ ring }) => Object.values(ring.keys).some((key) => key?.wraps?.[current.id]))) {
+        // A lost or damaged canary: the keyrings vouch for the key.
+        state = { legacy: !this.retiredCanary() };
+        try { this.writeKekCanary(current, state.legacy); } catch (error) { if (!cannotWrite(error)) throw error; }
+      } else {
+        throw this.refuse(canaries.length
+          ? `it is ${current.id}, but the vault's data keys are wrapped under ${canaries.join(', ')}`
+          : `none of its data keys is wrapped under ${current.id}`, false);
+      }
+      this.unwrapped = true;
+    }
+    this.legacy = state!.legacy;
+    const knownIds = new Set(this.known().map((kek) => kek.id));
+    const stranded: string[] = [];
+    let lacking = 0;
+    for (const { ring } of this.keyrings())
+      for (const [kid, key] of Object.entries(ring.keys)) {
+        const wraps = Object.keys(key?.wraps ?? {});
+        if (wraps.includes(current.id)) continue;
+        lacking++;
+        if (!wraps.some((id) => knownIds.has(id))) stranded.push(`${ring.scope} (${kid}, wrapped under ${wraps.join(', ') || 'nothing'})`);
+      }
+    if (stranded.length)
+      throw this.refuse(`${plural(stranded.length, 'data key')} ${stranded.length === 1 ? 'is' : 'are'} not wrapped under ${current.id}: `
+        + `${stranded.slice(0, 5).join('; ')}${stranded.length > 5 ? '; …' : ''}. Finish the vault key rotation `
+        + '(deploy/karmax rotate-vault-key, or npm run vault-key -- add with the vault running on the previous key), or start with that key', false);
+    if (lacking) this.unwrapped = true;
+  }
+
+  /** Has `vault.canary` been replaced by the data-key sentinel (migration finished)? */
+  private retiredCanary(): boolean {
+    try { return JSON.parse(fs.readFileSync(this.canaryPath, 'utf8'))?.format === SCOPED.format; } catch { return false; }
+  }
+
+  private parseRing(scope: string, raw: string): Keyring {
+    let ring: Keyring;
+    try { ring = JSON.parse(raw); } catch { throw new Error(`the vault keyring for ${scope} is unreadable; restore it from a backup`); }
+    if (ring?.format !== KEYRING || !ring.keys || typeof ring.keys !== 'object') throw new Error(`the vault keyring for ${scope} is corrupt`);
+    if (ring.scope !== scope) throw new Error(`the vault keyring for ${scope} belongs to ${String(ring.scope)}; it was moved or altered`);
+    return ring;
+  }
+  private readRingRaw(scope: string): string | undefined {
+    try { return fs.readFileSync(this.keyringPath(scope), 'utf8'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  }
+  private unwrapKey(ring: Keyring, kid: string): Buffer {
+    const wraps = ring.keys[kid]?.wraps ?? {};
+    for (const kek of this.known()) {
+      if (!wraps[kek.id]) continue;
+      let key: Buffer;
+      try { key = kek.unwrap(wraps[kek.id]!, wrappedFor(ring.scope, kid)); }
+      catch { throw new Error(`the data key ${kid} of ${ring.scope} failed authentication under ${kek.id} (altered, or moved from another keyring)`); }
+      if (key.length !== 32) throw new Error(`the data key ${kid} of ${ring.scope} is malformed`);
+      return key;
+    }
+    throw new Error(`the data key ${kid} of ${ring.scope} is not wrapped under ${this.kek.current.id}`);
+  }
+  /** A scope's data key by kid, for reading. */
+  private dataKey(scope: VaultScope, kid: string): Buffer {
+    const raw = this.readRingRaw(scope);
+    if (raw === undefined) { this.rings.delete(scope); throw new Error(`the data key ${kid} of ${scope} is destroyed or missing (its keyring is gone)`); }
+    let cached = this.rings.get(scope);
+    if (cached?.raw !== raw) this.rings.set(scope, cached = { raw, keys: cached?.keys ?? new Map() });
+    const known = cached.keys.get(kid);
+    if (known) return known;
+    const ring = this.parseRing(scope, raw);
+    if (!ring.keys[kid]) throw new Error(`the data key ${kid} of ${scope} is destroyed or missing (retired or shredded)`);
+    const key = this.unwrapKey(ring, kid);
+    cached.keys.set(kid, key);
+    return key;
+  }
+  /** Wrap a new data key under the current KEK, and under every other known
+   * KEK that already wraps this keyring (so a rotation in progress keeps working). */
+  private newDataKey(ring: Pick<Keyring, 'scope' | 'keys'>): { kid: string; key: Buffer } {
+    const kid = `dk-${crypto.randomBytes(8).toString('hex')}`;
+    const key = crypto.randomBytes(32);
+    const ids = new Set(Object.values(ring.keys).flatMap((entry) => Object.keys(entry.wraps ?? {})));
+    const wraps: Record<string, string> = {};
+    for (const kek of this.known()) if (kek === this.kek.current || ids.has(kek.id)) wraps[kek.id] = kek.wrap(key, wrappedFor(ring.scope, kid));
+    ring.keys[kid] = { created: Date.now(), wraps };
+    return { kid, key };
+  }
+  private writeRing(ring: Keyring, syncDir = true): void {
+    fs.mkdirSync(this.keysPath, { recursive: true, mode: 0o700 });
+    writeDurably(this.keyringPath(ring.scope), `${JSON.stringify(ring)}\n`, syncDir);
+  }
+  /** The scope's current data key, creating its keyring on first use. Under the lock. */
+  private writableKey(scope: VaultScope): { kid: string; key: Buffer } {
+    const raw = this.readRingRaw(scope);
+    if (raw === undefined) {
+      const ring: Keyring = { format: KEYRING, scope, current: '', keys: {} };
+      const created = this.newDataKey(ring);
+      ring.current = created.kid;
+      this.writeRing(ring);
+      return created;
+    }
+    const ring = this.parseRing(scope, raw);
+    if (!ring.keys[ring.current]) throw new Error(`the vault keyring for ${scope} has no current data key; restore it from a backup`);
+    return { kid: ring.current, key: this.dataKey(scope, ring.current) };
+  }
+
+  // ── Before data keys: the epoch 3 canary and binding ──
 
   /**
    * A known ciphertext under the vault key (AU-27). A wrong `KARMAX_VAULT_KEY`
@@ -175,7 +426,7 @@ export class Vault {
     const others = this.otherKnownKeys();
     let opened = 0, elsewhere = 0;
     for (const { handle, blob } of secrets) {
-      if (this.opens(blob, handle, this.key)) opened++;
+      if (this.opens(blob, handle, this.legacyKey())) opened++;
       else if (others.some((key) => this.opens(blob, handle, key))) elsewhere++;
     }
     if (secrets.length && !opened)
@@ -217,13 +468,13 @@ export class Vault {
       + '(deploy/README.md, "Rollback compatibility"), or move secrets.json aside to start without those secrets');
   }
 
-  /** Every secret's current blob, reading `secrets.json` once. */
+  /** Every secret's current blob from before data keys, reading `secrets.json` once. */
   private snapshot(): Array<{ handle: string; blob: string }> {
     const secrets = new Map<string, string>();
     for (const file of this.entryFiles()) {
       try {
         const entry = JSON.parse(fs.readFileSync(path.join(this.entriesPath, file), 'utf8'));
-        if (typeof entry?.handle === 'string' && typeof entry.blob === 'string') secrets.set(entry.handle, entry.blob);
+        if (typeof entry?.handle === 'string' && typeof entry.blob === 'string' && !isScoped(entry.blob)) secrets.set(entry.handle, entry.blob);
       } catch { /* unreadable: counted by neither side */ }
     }
     if (!this.migrated())
@@ -233,15 +484,11 @@ export class Vault {
 
   /** `vault.key` when `KARMAX_VAULT_KEY` supplies another key. */
   private otherKnownKeys(): Buffer[] {
-    if (!process.env.KARMAX_VAULT_KEY) return [];
-    try {
-      const file = fs.readFileSync(this.keyPath);
-      return file.equals(this.key) ? [] : [file];
-    } catch { return []; }
+    return this.kek.others.flatMap((kek) => kek instanceof LocalKek ? [kek.material] : []);
   }
 
   private opens(blob: string, handle: string, key: Buffer): boolean {
-    try { this.decrypt(blob, handle, key, true); return true; } catch { return false; }
+    try { this.legacyDecrypt(blob, handle, key, true); return true; } catch { return false; }
   }
 
   /** The recorded bound state, or undefined when there is no usable canary. */
@@ -252,12 +499,12 @@ export class Vault {
     if (parts.length !== 4 || parts[0] !== 'v2' || Buffer.from(parts[1]!, 'base64').length !== 12
       || Buffer.from(parts[2]!, 'base64').length !== 16) return undefined;
     let state: { canary?: string; bound?: unknown } | undefined;
-    try { state = JSON.parse(this.decrypt(blob as string, CANARY_HANDLE)); } catch { state = undefined; }
+    try { state = JSON.parse(this.legacyDecrypt(blob as string, CANARY_HANDLE)); } catch { state = undefined; }
     if (state?.canary !== CANARY) {
       this.canaryFailed = true;
       // Overridden, the secrets decide as for a missing canary: the key must still open some.
       if (this.overridden()) { console.error('[vault] KARMAX_VAULT_ACCEPT_KEY: replacing a canary this key does not open'); return undefined; }
-      const opensAny = this.snapshot().some(({ handle, blob }) => this.opens(blob, handle, this.key));
+      const opensAny = this.snapshot().some(({ handle, blob }) => this.opens(blob, handle, this.legacyKey()));
       throw this.refuse('vault/vault.canary fails to authenticate under KARMAX_VAULT_KEY (or vault.key)', opensAny);
     }
     return state.bound === true;
@@ -266,47 +513,9 @@ export class Vault {
   /** Best effort: a vault it cannot write (a restore drill) is checked, not recorded. */
   private writeCanary(): void {
     if (this.readOnly) return;
-    const blob = this.encrypt(JSON.stringify({ canary: CANARY, bound: this.bound }), CANARY_HANDLE);
+    const blob = this.legacyEncrypt(JSON.stringify({ canary: CANARY, bound: this.bound }), CANARY_HANDLE);
     try { writeDurably(this.canaryPath, `${JSON.stringify({ format: CANARY, blob })}\n`); }
     catch (error) { if (!cannotWrite(error)) throw error; }
-  }
-
-  /**
-   * `KARMAX_VAULT_KEY` overrides the on-disk key so a redeployed instance can
-   * reopen an existing vault (a container with no persistent vault dir, a
-   * restore onto a new host).
-   *
-   * INTENDED: the value is hashed, NOT stretched. It is key *material*, not a
-   * password — it must be high-entropy random (`openssl rand -base64 32`). A
-   * KDF here would only buy resistance to guessing a human-chosen phrase, and
-   * would silently change the derived key, making every existing vault
-   * undecryptable — so the hash stays. A short value is warned about rather than
-   * refused: hosted deployments already fail preflight on it
-   * (`config/deployment.ts`), and hard-failing here would lock an existing
-   * self-hosted user out of a vault that opens fine.
-   */
-  private loadOrCreateKey(): Buffer {
-    const supplied = process.env.KARMAX_VAULT_KEY;
-    if (supplied) {
-      if (supplied.length < 32) {
-        console.warn(
-          '[vault] KARMAX_VAULT_KEY is shorter than 32 characters. It is raw key material, '
-          + 'not a password, and is not stretched — generate one with `openssl rand -base64 32`.',
-        );
-      }
-      return crypto.createHash('sha256').update(supplied).digest();
-    }
-    if (fs.existsSync(this.keyPath)) return fs.readFileSync(this.keyPath);
-    if (this.readOnly) throw new Error('the vault has no key: set KARMAX_VAULT_KEY (or KARMAX_VAULT_KEY_FILE) or restore vault/vault.key');
-    const key = crypto.randomBytes(32);
-    // Publish only a complete key, without replacing a concurrently created one.
-    const temporary = `${this.keyPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(temporary, key, { mode: 0o600, flag: 'wx' });
-    try {
-      try { fs.linkSync(temporary, this.keyPath); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-      return fs.readFileSync(this.keyPath);
-    } finally { fs.unlinkSync(temporary); }
   }
 
   private readDb(): Record<string, string> {
@@ -321,26 +530,20 @@ export class Vault {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`vault ${this.dbPath} is not a secret map; restore it from a backup`);
     return parsed as Record<string, string>;
   }
-  /** Write-to-temp + fsync + rename so a crash mid-write can never leave a
-   *  truncated vault behind. */
-  private writeDb(db: Record<string, string>) {
-    writeDurably(this.dbPath, JSON.stringify(db));
-  }
 
-  /** `v2.` ciphertext authenticates its handle as additional data (AU-27), so
-   * a blob copied onto another handle's entry fails to open instead of
-   * handing that handle's reader a different secret. */
-  private encrypt(plain: string, handle: string): string {
+  /** `v2.` ciphertext authenticates its handle as additional data (AU-27). It
+   * is written only while binding, never after data keys exist. */
+  private legacyEncrypt(plain: string, handle: string): string {
     const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', this.legacyKey(), iv);
     cipher.setAAD(boundTo(handle));
     const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
     return `v2.${iv.toString('base64')}.${tag.toString('base64')}.${enc.toString('base64')}`;
   }
-  /** Unbound (pre-v2) ciphertext opens only until `migrate` has bound the vault
+  /** Unbound (pre-v2) ciphertext opens only until `bind` has bound the vault
    * (or, `anyFormat`, to recognise which key wrote it). */
-  private decrypt(blob: string, handle: string, key = this.key, anyFormat = false): string {
+  private legacyDecrypt(blob: string, handle: string, key = this.legacyKey(), anyFormat = false): string {
     const parts = typeof blob === 'string' ? blob.split('.') : [];
     const bound = parts[0] === 'v2';
     if (bound) parts.shift();
@@ -359,10 +562,46 @@ export class Vault {
     }
   }
 
+  // ── Ciphertext under data keys ──
+
+  private encrypt(plain: string, handle: string, scope: VaultScope, data?: { kid: string; key: Buffer }): string {
+    const { kid, key } = data ?? this.writableKey(scope);
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    cipher.setAAD(scopedTo(scope, handle));
+    const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+    return `v3.${kid}.${iv.toString('base64')}.${cipher.getAuthTag().toString('base64')}.${enc.toString('base64')}`;
+  }
+  /** Any stored blob: `v3.` under its scope's data key, and older formats only
+   * until their migrations have run. */
+  private decrypt(blob: string, handle: string, scope: VaultScope | undefined): string {
+    if (!isScoped(blob)) {
+      if (this.scoped && !this.legacy)
+        throw new Error(`vault entry for ${handle} is not under a data key (older ciphertext after the data epoch 4 migration); restore it from a backup`);
+      return this.legacyDecrypt(blob, handle);
+    }
+    const parts = blob.split('.');
+    if (!scope) throw new Error(`vault entry for ${handle} records no scope; restore it from a backup`);
+    const iv = parts.length === 5 ? Buffer.from(parts[2]!, 'base64') : Buffer.alloc(0);
+    const tag = parts.length === 5 ? Buffer.from(parts[3]!, 'base64') : Buffer.alloc(0);
+    if (iv.length !== 12 || tag.length !== 16) throw new Error('vault entry is corrupt (malformed ciphertext)');
+    let key: Buffer;
+    try { key = this.dataKey(scope, parts[1]!); }
+    catch (error) { throw new Error(`vault entry for ${handle}: ${(error as Error).message}`); }
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    decipher.setAAD(scopedTo(scope, handle));
+    try {
+      return Buffer.concat([decipher.update(Buffer.from(parts[4]!, 'base64')), decipher.final()]).toString('utf8');
+    } catch {
+      throw new Error(`vault entry for ${handle} failed authentication (altered, or moved from another handle or scope)`);
+    }
+  }
+
   private entryPath(handle: string): string {
     return path.join(this.entriesPath, crypto.createHash('sha256').update(handle).digest('hex') + '.json');
   }
-  /** Entry files; none before the first boot of this release created `entries/`. */
+  /** Entry files; none before the first boot of the epoch 3 release created `entries/`. */
   private entryFiles(): string[] {
     try { return fs.readdirSync(this.entriesPath).filter(file => ENTRY_FILE.test(file)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
@@ -376,34 +615,52 @@ export class Vault {
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
   }
 
-  private readEntry(handle: string): string | undefined {
-    const raw = this.readEntryFile(handle);
-    if (raw !== undefined) {
-      let entry: { handle?: unknown; blob?: unknown };
-      try { entry = JSON.parse(raw); }
-      catch { throw new Error(`vault entry for ${handle} is unreadable; restore it from a backup`); }
-      if (entry?.handle !== handle || typeof entry.blob !== 'string') throw new Error('vault entry is corrupt');
-      return entry.blob as string;
-    }
-    if (this.migrated()) return undefined;
-    return this.readDb()[handle];
-  }
-
-  private history(handle: string): string[] {
-    const raw = this.readEntryFile(handle);
-    if (raw === undefined) return [];
-    const previous = JSON.parse(raw).previous ?? [];
+  private parseEntry(raw: string, handle?: string): EntryRecord {
+    let entry: { handle?: unknown; blob?: unknown; previous?: unknown; scope?: unknown; unresolved?: unknown };
+    try { entry = JSON.parse(raw); }
+    catch { throw new Error(`vault entry for ${handle ?? 'a handle'} is unreadable; restore it from a backup`); }
+    if ((handle !== undefined && entry?.handle !== handle) || typeof entry?.handle !== 'string' || typeof entry.blob !== 'string')
+      throw new Error('vault entry is corrupt');
+    const previous = entry.previous ?? [];
     if (!Array.isArray(previous) || previous.length > 5 || previous.some(blob => typeof blob !== 'string'))
       throw new Error('vault history is corrupt');
-    return previous;
+    if (entry.scope !== undefined && !isVaultScope(entry.scope)) throw new Error(`vault entry for ${entry.handle} records an invalid scope`);
+    return { handle: entry.handle, blob: entry.blob, previous: previous as string[],
+      ...(entry.scope ? { scope: entry.scope as VaultScope } : {}), ...(entry.unresolved === true ? { unresolved: true } : {}) };
   }
 
-  private writeEntry(handle: string, blob: string, previous: string[] = [], syncDir = true): void {
-    writeDurably(this.entryPath(handle), JSON.stringify({ handle, blob, ...(previous.length ? { previous } : {}) }), syncDir);
+  private readEntry(handle: string): EntryRecord | undefined {
+    const raw = this.readEntryFile(handle);
+    if (raw !== undefined) return this.parseEntry(raw, handle);
+    if (this.migrated()) return undefined;
+    const blob = this.readDb()[handle];
+    return blob === undefined ? undefined : { handle, blob, previous: [] };
+  }
+
+  private writeEntry(entry: EntryRecord, syncDir = true): void {
+    writeDurably(this.entryPath(entry.handle), JSON.stringify({ handle: entry.handle, ...(entry.scope ? { scope: entry.scope } : {}),
+      blob: entry.blob, ...(entry.previous.length ? { previous: entry.previous } : {}), ...(entry.unresolved ? { unresolved: true } : {}) }), syncDir);
   }
 
   private validateSecret(secret: string): void {
     if (Buffer.byteLength(secret, 'utf8') > SECRET_LIMIT) throw new Error('vault secret exceeds size limit (64 KiB)');
+  }
+  private validateScope(scope: VaultScope): void {
+    if (!isVaultScope(scope)) throw new Error(`invalid vault scope ${JSON.stringify(scope)}: expected installation, organization:<id> or user:<id>`);
+  }
+
+  /**
+   * The entry, ready to be written as `scope`. A secret belongs to the scope
+   * recorded on it: a write naming another is refused, so a confused caller
+   * can never move one tenant's secret under another tenant's key. Only an
+   * owner the migration could not find yields, to the first write that names one.
+   */
+  private claim(entry: EntryRecord | undefined, scope: VaultScope): EntryRecord | undefined {
+    if (!entry?.scope || entry.scope === scope) return entry;
+    if (!entry.unresolved)
+      throw new Error(`vault entry for ${entry.handle} belongs to ${entry.scope}; refusing to write it as ${scope}`);
+    const reencrypt = (blob: string) => this.encrypt(this.decrypt(blob, entry.handle, entry.scope), entry.handle, scope);
+    return { handle: entry.handle, scope, blob: reencrypt(entry.blob), previous: entry.previous.map(reencrypt) };
   }
 
   private async mutate<T>(operation: () => T): Promise<T> {
@@ -411,7 +668,13 @@ export class Vault {
     const release = process.platform === 'linux'
       ? await acquireFileLock(`${this.dbPath}.lock`) : undefined;
     try {
-      if (!this.bound || !this.moved()) this.bind();
+      // Another process may have moved the vault to data keys meanwhile.
+      if (!this.scoped && this.hasKeyrings()) this.checkKek();
+      if (!this.scoped) {
+        if (!this.bound || !this.moved()) this.bind();
+        this.startScopes();
+      }
+      if (this.unwrapped) this.wrapAll();
       return operation();
     } finally { release?.(); }
   }
@@ -440,8 +703,8 @@ export class Vault {
         fromMap.add(file);
         try {
           if (typeof blob !== 'string') throw new Error('not a ciphertext');
-          const plain = this.decrypt(blob, handle);
-          planned.push({ kind: 'entry', file, handle, current: blob.startsWith('v2.') ? blob : this.encrypt(plain, handle),
+          const plain = this.legacyDecrypt(blob, handle);
+          planned.push({ kind: 'entry', file, handle, current: blob.startsWith('v2.') ? blob : this.legacyEncrypt(plain, handle),
             kept: [], dropped: 0, fromMap: true, changed: true, bytes: Buffer.byteLength(plain, 'utf8') });
         } catch (error) {
           planned.push({ kind: 'damaged', file, raw: JSON.stringify({ handle, blob }), handle, reason: (error as Error).message, fromMap: true });
@@ -457,6 +720,8 @@ export class Vault {
       let entry: { handle?: unknown; blob?: unknown; previous?: unknown };
       try { entry = JSON.parse(raw); }
       catch { planned.push({ kind: 'damaged', file, raw, reason: 'unreadable entry file', fromMap: false }); continue; }
+      // Already under a data key: nothing to bind.
+      if (isScoped(entry?.blob)) continue;
       // While secrets.json is still the source of truth, a bound entry for a
       // secret it no longer holds was written by an interrupted move, and the
       // previous release has since deleted that secret.
@@ -468,12 +733,12 @@ export class Vault {
       const handle = entry.handle;
       const rebind = (blob: unknown) => {
         if (typeof blob !== 'string') throw new Error('not a ciphertext');
-        const plain = this.decrypt(blob, handle);
-        return blob.startsWith('v2.') ? blob : this.encrypt(plain, handle);
+        const plain = this.legacyDecrypt(blob, handle);
+        return blob.startsWith('v2.') ? blob : this.legacyEncrypt(plain, handle);
       };
       let current: string;
       let bytes = 0;
-      try { current = rebind(entry.blob); bytes = Buffer.byteLength(this.decrypt(current, handle), 'utf8'); }
+      try { current = rebind(entry.blob); bytes = Buffer.byteLength(this.legacyDecrypt(current, handle), 'utf8'); }
       catch (error) { planned.push({ kind: 'damaged', file, raw, handle, reason: (error as Error).message, fromMap: false }); continue; }
       const history = Array.isArray(entry.previous) ? entry.previous : [];
       const kept = history.flatMap(blob => { try { return [rebind(blob)]; } catch { return []; } });
@@ -483,11 +748,23 @@ export class Vault {
     return planned;
   }
 
-  /** What `migrate` would do, without writing (see `inspectVault`). */
+  /** Entries holding ciphertext from before data keys (current or a revision). */
+  private unscopedFiles(): string[] {
+    return this.entryFiles().filter((file) => {
+      try {
+        const entry = JSON.parse(fs.readFileSync(path.join(this.entriesPath, file), 'utf8'));
+        return typeof entry?.blob === 'string' && (!isScoped(entry.blob)
+          || (Array.isArray(entry.previous) && entry.previous.some((blob: unknown) => !isScoped(blob))));
+      } catch { return false; }
+    });
+  }
+
+  /** What `migrate` and `migrateToScopes` would do, without writing (see `inspectVault`). */
   inspect(): VaultInspection {
     const migrated = this.moved();
-    const planned = this.bound && migrated ? [] : this.plan();
-    const report: VaultInspection = { key: 'accepted', bound: this.bound && migrated, rebind: 0, quarantine: [], unreadable: [] };
+    const bound = this.scoped || (this.bound && migrated);
+    const planned = bound ? [] : this.plan();
+    const report: VaultInspection = { key: 'accepted', bound, rebind: 0, toScopes: 0, quarantine: [], unreadable: [] };
     // A bound vault is not rewritten, but an unreadable entry still fails its reads.
     if (report.bound) for (const file of this.entryFiles()) {
       try { fs.accessSync(path.join(this.entriesPath, file), fs.constants.R_OK); }
@@ -502,6 +779,8 @@ export class Vault {
         if (entry.dropped) report.quarantine.push({ file: entry.file, handle: entry.handle, reason: `${entry.dropped} earlier revision(s) would not open` });
       }
     }
+    if (!this.scoped || this.legacy)
+      report.toScopes = bound ? this.unscopedFiles().length : planned.filter((entry) => entry.kind === 'entry').length;
     return report;
   }
 
@@ -531,7 +810,7 @@ export class Vault {
       else if (entry.kind === 'entry') {
         if (entry.dropped) this.quarantine({ kind: 'damaged', file: entry.file, handle: entry.handle,
           reason: `${entry.dropped} earlier revision(s) would not open`, fromMap: false }, true);
-        if (entry.changed) this.writeEntry(entry.handle, entry.current, entry.kept, false);
+        if (entry.changed) this.writeEntry({ handle: entry.handle, blob: entry.current, previous: entry.kept }, false);
       }
     }
     syncDirectory(this.entriesPath);
@@ -541,6 +820,77 @@ export class Vault {
     if (!fs.existsSync(path.join(this.entriesPath, '.migrated'))) writeDurably(path.join(this.entriesPath, '.migrated'), '');
     this.bound = true;
     this.writeCanary();
+  }
+
+  /** Begin writing under data keys: the current KEK's canary records whether
+   * older ciphertext remains to migrate. With none (a new vault), the epoch 3
+   * canary is retired at once. */
+  private startScopes(): void {
+    const legacy = this.unscopedFiles().length > 0;
+    this.writeKekCanary(this.kek.current, legacy);
+    this.scoped = true;
+    this.legacy = legacy;
+    if (!legacy) this.retireCanary();
+  }
+  private retireCanary(): void {
+    if (!this.retiredCanary()) writeDurably(this.canaryPath, `${JSON.stringify(SCOPED)}\n`);
+  }
+
+  /**
+   * Move a pre-epoch-4 vault under data keys (SS-1): re-encrypt every `v2.`
+   * secret and revision under the data key of the scope `resolve` names (the
+   * database knows who owns each handle), recording that scope on the entry.
+   * Handles without a known owner go under the installation's key, marked
+   * `unresolved`, until a write names their owner. Each entry is rewritten
+   * atomically and the canary flips only when none remains, so a crash midway
+   * finishes on the next boot; with nothing left to do this is a no-op.
+   */
+  async migrateToScopes(resolve: (handles: string[]) => Promise<Map<string, VaultScope>>): Promise<ScopeMigration> {
+    await this.mutate(() => undefined);
+    const report: ScopeMigration = { migrated: 0, unresolved: [], byScope: {} };
+    if (!this.legacy) return report;
+    const pending = this.unscopedFiles().flatMap((file) => {
+      try { return [String(JSON.parse(fs.readFileSync(path.join(this.entriesPath, file), 'utf8')).handle)]; } catch { return []; }
+    });
+    const owners = await resolve(pending);
+    return this.mutate(() => {
+      for (const file of this.unscopedFiles()) {
+        let entry: EntryRecord;
+        try { entry = this.parseEntry(fs.readFileSync(path.join(this.entriesPath, file), 'utf8')); }
+        catch (error) { this.quarantine({ kind: 'damaged', file, reason: (error as Error).message, fromMap: false }); continue; }
+        const owner = entry.scope ?? owners.get(entry.handle);
+        const scope = owner ?? INSTALLATION_SCOPE;
+        const convert = (blob: string) => isScoped(blob) ? blob : this.encrypt(this.legacyDecrypt(blob, entry.handle), entry.handle, scope);
+        let blob: string;
+        try { blob = convert(entry.blob); }
+        catch (error) { this.quarantine({ kind: 'damaged', file, handle: entry.handle, reason: (error as Error).message, fromMap: false }); continue; }
+        const previous = entry.previous.flatMap((older) => { try { return [convert(older)]; } catch { return []; } });
+        if (previous.length < entry.previous.length)
+          this.quarantine({ kind: 'damaged', file, handle: entry.handle,
+            reason: `${entry.previous.length - previous.length} earlier revision(s) would not open`, fromMap: false }, true);
+        this.writeEntry({ handle: entry.handle, scope, blob, previous, ...(owner ? {} : { unresolved: true }) }, false);
+        report.migrated++;
+        report.byScope[scope.split(':')[0]!] = (report.byScope[scope.split(':')[0]!] ?? 0) + 1;
+        if (!owner) report.unresolved.push(entry.handle);
+      }
+      syncDirectory(this.entriesPath);
+      // Kept until the audit log has it (`recordScopeMigration`), even across a crash.
+      writeDurably(this.scopeReportPath(), JSON.stringify(report));
+      this.writeKekCanary(this.kek.current, false);
+      this.legacy = false;
+      this.retireCanary();
+      return report;
+    });
+  }
+
+  private scopeReportPath(): string { return path.join(path.dirname(this.entriesPath), 'scope-migration.json'); }
+
+  /** The epoch 4 migration's report, until `acknowledgeScopeMigration`. */
+  unauditedScopeMigration(): ScopeMigration | undefined {
+    try { return JSON.parse(fs.readFileSync(this.scopeReportPath(), 'utf8')); } catch { return undefined; }
+  }
+  acknowledgeScopeMigration(): void {
+    if (!this.readOnly) fs.rmSync(this.scopeReportPath(), { force: true });
   }
 
   /**
@@ -607,13 +957,14 @@ export class Vault {
       };
       sweep(this.entriesPath, 0);
       sweep(quarantine, 0);
+      sweep(this.keysPath, 0);
       sweep(vaultDir, 60_000);
       let held: string[] = [];
       try { held = fs.readdirSync(quarantine); } catch { /* none */ }
       for (const file of held.filter((name) => !name.endsWith('.why')))
         if (Date.now() - fs.statSync(path.join(quarantine, file)).mtimeMs > QUARANTINE_RETENTION_MS)
           for (const stale of [file, `${file}.why`]) fs.rmSync(path.join(quarantine, stale), { force: true });
-      // Rollback copies an earlier build of this release kept.
+      // Rollback copies an earlier build of the epoch 3 release kept.
       for (const name of fs.readdirSync(vaultDir))
         if (name.startsWith('entries.pre-v2')) fs.rmSync(path.join(vaultDir, name), { recursive: true, force: true });
     });
@@ -622,49 +973,69 @@ export class Vault {
 
   /** `history: false` replaces the secret and forgets its earlier revisions,
    * for a value that must not survive in them (a card's CVC, AU-31). */
-  async put(handle: string, secret: string, options: { history?: boolean } = {}): Promise<void> {
+  async put(handle: string, secret: string, scope: VaultScope, options: { history?: boolean } = {}): Promise<void> {
+    this.validateScope(scope);
     await this.mutate(() => {
-      const prior = this.readEntry(handle);
-      // A rewrite that strictly shrinks a stored secret is always allowed: the previous
-      // release stored card billing fields with no limit, and their CVC must
-      // still come out (AU-31). Anything else keeps the limit.
+      const stored = this.readEntry(handle);
+      const prior = this.claim(stored, scope);
+      const priorSecret = prior === undefined ? undefined : this.decrypt(prior.blob, handle, prior.scope);
+      // A rewrite that strictly shrinks a stored secret is always allowed: an
+      // earlier release stored card billing fields with no limit, and their
+      // CVC must still come out (AU-31). Anything else keeps the limit.
       const bytes = Buffer.byteLength(secret, 'utf8');
-      if (bytes > SECRET_LIMIT && !(prior !== undefined && bytes < Buffer.byteLength(this.decrypt(prior, handle), 'utf8')))
+      if (bytes > SECRET_LIMIT && !(priorSecret !== undefined && bytes < Buffer.byteLength(priorSecret, 'utf8')))
         this.validateSecret(secret);
-      if (options.history === false) return this.writeEntry(handle, this.encrypt(secret, handle));
-      if (prior !== undefined && this.decrypt(prior, handle) === secret) return;
-      const previous = prior === undefined ? [] : [prior, ...this.history(handle)].slice(0, 5);
-      this.writeEntry(handle, this.encrypt(secret, handle), previous);
+      if (options.history === false) return this.writeEntry({ handle, scope, blob: this.encrypt(secret, handle, scope), previous: [] });
+      if (priorSecret === secret) {
+        if (prior !== stored) this.writeEntry(prior!);
+        return;
+      }
+      const previous = prior === undefined ? [] : [prior.blob, ...prior.previous].slice(0, 5);
+      this.writeEntry({ handle, scope, blob: this.encrypt(secret, handle, scope), previous });
     });
   }
 
-  async putIfAbsent(handle: string, secret: string): Promise<void> {
+  async putIfAbsent(handle: string, secret: string, scope: VaultScope): Promise<void> {
     this.validateSecret(secret);
-    await this.mutate(() => { if (!this.has(handle)) this.writeEntry(handle, this.encrypt(secret, handle)); });
+    this.validateScope(scope);
+    await this.mutate(() => {
+      const existing = this.readEntry(handle);
+      if (!existing) return this.writeEntry({ handle, scope, blob: this.encrypt(secret, handle, scope), previous: [] });
+      // Never rotate a concurrent creator's value; only correct a guessed owner.
+      if (existing.unresolved && existing.scope !== scope) this.writeEntry(this.claim(existing, scope)!);
+    });
   }
 
-  async move(handle: string, nextHandle: string, replacement?: string): Promise<void> {
+  async move(handle: string, nextHandle: string, scope: VaultScope, replacement?: string): Promise<void> {
+    this.validateScope(scope);
     if (replacement !== undefined) this.validateSecret(replacement);
     await this.mutate(() => {
-      const secret = replacement ?? this.reveal(handle);
+      const prior = this.claim(this.readEntry(handle), scope);
+      if (nextHandle !== handle) this.claim(this.readEntry(nextHandle), scope);
+      const secret = replacement ?? (prior === undefined ? undefined : this.decrypt(prior.blob, handle, prior.scope));
       if (secret === undefined) throw new Error(`credential broker: no secret for handle ${handle}`);
-      const prior = this.readEntry(handle);
-      const previous = prior !== undefined && this.decrypt(prior, handle) !== secret
-        ? [prior, ...this.history(handle)].slice(0, 5) : this.history(handle);
+      const history = prior?.previous ?? [];
+      const previous = prior !== undefined && this.decrypt(prior.blob, handle, prior.scope) !== secret
+        ? [prior.blob, ...history].slice(0, 5) : history;
       // History is bound to the old handle; carry it across re-encrypted.
-      this.writeEntry(nextHandle, this.encrypt(secret, nextHandle),
-        previous.map(blob => nextHandle === handle ? blob : this.encrypt(this.decrypt(blob, handle), nextHandle)));
+      this.writeEntry({ handle: nextHandle, scope, blob: this.encrypt(secret, nextHandle, scope),
+        previous: previous.map(blob => nextHandle === handle ? blob : this.encrypt(this.decrypt(blob, handle, prior?.scope), nextHandle, scope)) });
       if (nextHandle !== handle) fs.rmSync(this.entryPath(handle), { force: true });
     });
   }
   has(handle: string): boolean {
     return this.readEntry(handle) !== undefined;
   }
+  /** The scope a secret belongs to; undefined for none, or one not yet migrated. */
+  scopeOf(handle: string): VaultScope | undefined {
+    return this.readEntry(handle)?.scope;
+  }
   /** Internal: only the broker should call this. */
   reveal(handle: string, revision = 0): string | undefined {
     if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('invalid vault revision');
-    const blob = revision === 0 ? this.readEntry(handle) : this.history(handle)[revision - 1];
-    return blob === undefined ? undefined : this.decrypt(blob, handle);
+    const entry = this.readEntry(handle);
+    const blob = revision === 0 ? entry?.blob : entry?.previous[revision - 1];
+    return blob === undefined ? undefined : this.decrypt(blob, handle, entry!.scope);
   }
   list(): string[] {
     const handles: string[] = [];
@@ -692,5 +1063,148 @@ export class Vault {
       fs.rmSync(this.entryPath(handle), { force: true });
       return true;
     });
+  }
+
+  // ── Rotation and shredding ──
+
+  /** Entries of one scope, parsed (the unreadable are skipped). */
+  private scopeEntries(scope: VaultScope): EntryRecord[] {
+    return this.entryFiles().flatMap((file) => {
+      try {
+        const entry = this.parseEntry(fs.readFileSync(path.join(this.entriesPath, file), 'utf8'));
+        return entry.scope === scope ? [entry] : [];
+      } catch { return []; }
+    });
+  }
+
+  /**
+   * Replace a scope's data key: mint a new one (or, after an interruption,
+   * keep the one already minted), re-encrypt every entry of the scope and
+   * its revisions under it, then retire the old keys from the keyring.
+   * Quarantined copies stay under the retired key and stop opening.
+   */
+  async rotateDataKey(scope: VaultScope): Promise<{ reencrypted: number; retired: string[] }> {
+    this.validateScope(scope);
+    return this.mutate(() => {
+      const raw = this.readRingRaw(scope);
+      if (raw === undefined) return { reencrypted: 0, retired: [] };
+      const ring = this.parseRing(scope, raw);
+      if (Object.keys(ring.keys).length === 1) {
+        ring.current = this.newDataKey(ring).kid;
+        this.writeRing(ring);
+      }
+      const data = { kid: ring.current, key: this.dataKey(scope, ring.current) };
+      let reencrypted = 0;
+      for (const entry of this.scopeEntries(scope)) {
+        const blobs = [entry.blob, ...entry.previous];
+        if (blobs.every((blob) => blob.split('.')[1] === data.kid)) continue;
+        const reencrypt = (blob: string) => blob.split('.')[1] === data.kid ? blob
+          : this.encrypt(this.decrypt(blob, entry.handle, scope), entry.handle, scope, data);
+        this.writeEntry({ ...entry, blob: reencrypt(entry.blob), previous: entry.previous.map(reencrypt) }, false);
+        reencrypted++;
+      }
+      syncDirectory(this.entriesPath);
+      const retired = Object.keys(ring.keys).filter((kid) => kid !== data.kid);
+      ring.keys = { [data.kid]: ring.keys[data.kid]! };
+      this.writeRing(ring);
+      return { reencrypted, retired };
+    });
+  }
+
+  /**
+   * Crypto-shred a scope (organization deletion, account erasure): delete its
+   * entries and quarantined copies, then its keyring. Whatever ciphertext of
+   * the scope survives anywhere else (an old snapshot of a file) no longer
+   * opens; backups taken before still hold the wrapped key until they expire
+   * (wiki features/vault-encryption). Safe to repeat.
+   */
+  async destroyScope(scope: VaultScope): Promise<{ entries: number; quarantined: number }> {
+    this.validateScope(scope);
+    if (scope === INSTALLATION_SCOPE) throw new Error('the installation scope cannot be destroyed');
+    return this.mutate(() => {
+      let entries = 0, quarantined = 0;
+      for (const entry of this.scopeEntries(scope)) { fs.rmSync(this.entryPath(entry.handle), { force: true }); entries++; }
+      const dir = path.join(this.entriesPath, 'quarantine');
+      let names: string[] = [];
+      try { names = fs.readdirSync(dir); } catch { /* none */ }
+      for (const name of names.filter((file) => !file.endsWith('.why') && !file.endsWith('.tmp'))) {
+        let held: { scope?: unknown } | undefined;
+        try { held = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')); } catch { continue; }
+        if (held?.scope !== scope) continue;
+        for (const file of [name, `${name}.why`]) fs.rmSync(path.join(dir, file), { force: true });
+        quarantined++;
+      }
+      if (quarantined) syncDirectory(dir);
+      syncDirectory(this.entriesPath);
+      fs.rmSync(this.keyringPath(scope), { force: true });
+      this.rings.delete(scope);
+      if (fs.existsSync(this.keysPath)) syncDirectory(this.keysPath);
+      return { entries, quarantined };
+    });
+  }
+
+  /** Give every data key a wrap under the current KEK (opening it with
+   * another known KEK), then the current KEK's canary, last. */
+  private wrapAll(): number {
+    let wrapped = 0;
+    const current = this.kek.current;
+    for (const { ring } of this.keyrings()) {
+      let changed = false;
+      for (const [kid, entry] of Object.entries(ring.keys)) {
+        if (!entry.wraps[current.id]) {
+          entry.wraps[current.id] = current.wrap(this.unwrapKey(ring, kid), wrappedFor(ring.scope, kid));
+          changed = true;
+        }
+        wrapped++;
+      }
+      if (changed) this.writeRing(ring, false);
+    }
+    if (fs.existsSync(this.keysPath)) syncDirectory(this.keysPath);
+    this.writeKekCanary(current, this.legacy);
+    this.unwrapped = false;
+    return wrapped;
+  }
+
+  private requireScoped(): void {
+    if (!this.scoped || this.legacy)
+      throw new Error('the vault still holds secrets from before data keys: let the first boot of this release finish the data epoch 4 migration before rotating its key');
+  }
+
+  /** KEK rotation, step 1 (open with the new KEK as current and the old one
+   * among `others`): wrap every data key under the new KEK. The old KEK keeps
+   * opening everything until `pruneKeks`. Repeatable. */
+  async wrapUnderCurrentKek(): Promise<{ wrapped: number }> {
+    this.requireScoped();
+    return this.mutate(() => ({ wrapped: this.wrapAll() }));
+  }
+
+  /** KEK rotation, step 3 (after the switch to the new KEK): remove every
+   * other KEK's canary, then its wraps. From the first step on, the old KEK
+   * is refused. Repeatable. */
+  async pruneKeks(): Promise<{ pruned: string[] }> {
+    this.requireScoped();
+    return this.mutate(() => {
+      const current = this.kek.current.id;
+      const pruned = new Set(this.canaryIds().filter((id) => id !== current));
+      for (const id of pruned) fs.rmSync(path.join(this.keysPath, `${id}.canary`), { force: true });
+      if (pruned.size) syncDirectory(this.keysPath);
+      for (const { ring } of this.keyrings()) {
+        let changed = false;
+        for (const entry of Object.values(ring.keys))
+          for (const id of Object.keys(entry.wraps)) if (id !== current) { delete entry.wraps[id]; pruned.add(id); changed = true; }
+        if (changed) this.writeRing(ring, false);
+      }
+      if (fs.existsSync(this.keysPath)) syncDirectory(this.keysPath);
+      return { pruned: [...pruned].sort() };
+    });
+  }
+
+  keyStatus(): VaultKeyStatus {
+    const wraps: Record<string, number> = {};
+    const rings = this.keyrings();
+    for (const { ring } of rings)
+      for (const entry of Object.values(ring.keys)) for (const id of Object.keys(entry.wraps ?? {})) wraps[id] = (wraps[id] ?? 0) + 1;
+    return { kek: this.kek.current.id, scoped: this.scoped && !this.legacy, keyrings: rings.length,
+      scopes: rings.map(({ ring }) => ring.scope).sort(), wraps, canaries: this.canaryIds() };
   }
 }

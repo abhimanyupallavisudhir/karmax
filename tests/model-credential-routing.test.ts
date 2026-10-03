@@ -11,6 +11,7 @@ import { credPolicyKey } from '../src/platform/credential-sources.js';
 import { Store } from '../src/store/db.js';
 import { MemoryWorldProvider } from '../src/world/memory.js';
 import { WorldRegistry } from '../src/world/registry.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 describe('model-agnostic harness credential routing', () => {
   let dir: string;
@@ -31,7 +32,7 @@ describe('model-agnostic harness credential routing', () => {
     const project = await store.createProject('Work', {}, organization.id);
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const handle = `${provider}:${organization.id}:key`;
-    await broker.registerHandle(handle, 'fixture-api-key');
+    await broker.registerHandle(handle, 'fixture-api-key', INSTALLATION_SCOPE);
     const configHomes = new ConfigHomeManager(path.join(dir, 'homes'));
     const home = configHomes.ensure(provider, 'subscription', organization.id);
     fs.writeFileSync(path.join(home, provider === 'claude' ? '.credentials.json' : 'auth.json'),
@@ -53,8 +54,8 @@ describe('model-agnostic harness credential routing', () => {
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const googleHandle = `google:${organization.id}:primary`;
     const kimiHandle = `kimi:${organization.id}:design`;
-    (await broker.registerHandle(googleHandle, 'google-secret'));
-    (await broker.registerHandle(kimiHandle, 'kimi-secret'));
+    (await broker.registerHandle(googleHandle, 'google-secret', INSTALLATION_SCOPE));
+    (await broker.registerHandle(kimiHandle, 'kimi-secret', INSTALLATION_SCOPE));
     const configHomes = new ConfigHomeManager(path.join(dir, 'homes'));
     const grokHome = configHomes.ensure('opencode', 'grok-subscription', organization.id);
     configHomes.setModelProvider(grokHome, 'xai');
@@ -110,7 +111,7 @@ describe('model-agnostic harness credential routing', () => {
     const runtimeTask = (await store.createTask({ projectId: project.id, title: 'Design', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'design it' } as any }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault-runtime')));
-    (await broker.registerHandle('xai:legacy', 'must-not-be-resolved'));
+    (await broker.registerHandle('xai:legacy', 'must-not-be-resolved', INSTALLATION_SCOPE));
     (await store.upsertProfile({
       id: 'do-default',
       name: 'Do',
@@ -169,7 +170,7 @@ describe('model-agnostic harness credential routing', () => {
     const project = (await store.createProject('Disabled credentials', {}, organization.id));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault-disabled')));
     const handle = `google:${organization.id}:disabled`;
-    (await broker.registerHandle(handle, 'disabled-secret'));
+    (await broker.registerHandle(handle, 'disabled-secret', INSTALLATION_SCOPE));
     (await store.kvSet(credPolicyKey.organization(organization.id), JSON.stringify({
       off: [`key:handle:${handle}`],
     })));
@@ -240,8 +241,8 @@ describe('credential leases stay inside the task’s organization', () => {
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const theirKey = `claude:${theirs.id}:key`;
     const myKey = `claude:${mine.id}:key`;
-    (await broker.registerHandle(theirKey, 'their-api-key'));
-    (await broker.registerHandle(myKey, 'my-api-key'));
+    (await broker.registerHandle(theirKey, 'their-api-key', INSTALLATION_SCOPE));
+    (await broker.registerHandle(myKey, 'my-api-key', INSTALLATION_SCOPE));
     const configHomes = new ConfigHomeManager(path.join(dir, 'homes'));
     const login = (organizationId: string) => {
       const home = configHomes.ensure('claude', 'subscription', organizationId);

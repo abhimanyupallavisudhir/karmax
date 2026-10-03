@@ -2,6 +2,7 @@ import { clientAddress, ClientRequestLimits } from './client-address.js';
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
 import type { PasskeyCredential } from '../autonomy/passkey.js';
 import { ExecutionOutput } from './execution-output.js';
+import { TaskSecrets, handleRef, paymentCardDetails, recordSecretRefs, secretScope } from '../autonomy/task-secrets.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { GatewayMetrics } from './metrics.js';
@@ -35,7 +36,7 @@ import { ProjectTransfers, ProjectTransferError } from '../platform/project-tran
 import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { ConversationImportError, MAX_CONVERSATION_IMPORT_BYTES, putConversationImport } from '../store/conversation-imports.js';
 import { KarmaxBus } from '../contrib/bus.js';
-import { TokenAuthority } from '../platform/tokens.js';
+import { TokenAuthority, type ScopedToken } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
@@ -89,7 +90,8 @@ import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/
 import { worldRepos, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
-import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
+import { ITEM_FIELDS, VaultItems, itemHandle, weakensProtection } from '../autonomy/vault-items.js';
+import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { AuthorizationRequests } from '../platform/authorization-requests.js';
@@ -237,6 +239,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/projects\/[^/]+\/avatar-settings$/.test(p)) return read ? 'project:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/avatars(?:\/[^/]+)?$/.test(p)) return read ? 'project:read' : 'task:create';
+  if (/^\/api\/organizations\/[^/]+$/.test(p) && method === 'DELETE') return 'organization:delete';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
   // Requesting an explanation spends the organization's model credit and
@@ -670,7 +673,8 @@ export class Gateway {
       deps.identity.connectAccountClosure?.(async id => Boolean(await deps.store.kvGet(`account-closed:${id}`)));
       deps.store.connectUserNames(async () => (await deps.identity!.listUsers()));
     }
-    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources);
+    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources,
+      (taskId) => this.taskSecrets(taskId));
     this.fanout = (await DurableEventFanout.create(deps.store, deps.bus));
     // Device OAuth finishes in the provider CLI after `/accounts/connect` has
     // returned. Refreshing only in that request races the eventual auth.json and
@@ -1360,6 +1364,13 @@ export class Gateway {
   }
 
   /** PTY check-in (SPEC §5.5): an ephemeral provider-owned terminal in the task world. */
+  /** Everything this task received, resolved by this process (SS-3): stored
+   * and served output about the task is scrubbed of it. */
+  private async taskSecrets(taskId: string): Promise<TaskSecrets> {
+    return new TaskSecrets({ store: this.deps.store, broker: this.deps.broker,
+      cardDetails: paymentCardDetails(this.deps.store, this.deps.paymentRegistry) }, (await secretScope(this.deps.store, taskId)));
+  }
+
   private async terminal(ws: import('ws').WebSocket, req: http.IncomingMessage) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const taskId = url.searchParams.get('taskId') ?? '';
@@ -1437,7 +1448,10 @@ export class Gateway {
       : () => {};
     let finalizing: Promise<void> | undefined;
     let clientClosed = false;
-    const output = new ExecutionOutput(data => this.deps.store.appendExecutionFrame(executionId, data));
+    // Stored for reconnect and exported with the organization: scrubbed. The
+    // live stream to the person at the shell is not.
+    const output = new ExecutionOutput(data => this.deps.store.appendExecutionFrame(executionId, data), undefined,
+      (await this.taskSecrets(taskId)));
     const heartbeat = new AsyncInterval(() => this.deps.store.heartbeatExecution(executionId), 30_000);
     heartbeat.unref();
     const finish = (code: number | null, cancelled = false): Promise<void> => {
@@ -2187,8 +2201,8 @@ export class Gateway {
         const error = ['settings:read', 'settings:write'].includes(required)
           && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length)
           ? 'This endpoint configures the shared installation and requires global authority (God). Use /api/organizations/:id/settings/:workflow or /api/settings/project/:id/:workflow for your authorized scope.'
-          : required === 'organization:wiki:write' && checked.reason === `missing capability ${required}` ? ORGANIZATION_WIKI_WRITE_DENIED
-          : checked.reason ?? `missing capability ${required}`;
+          : required === 'organization:wiki:write' && checked.missing === required ? ORGANIZATION_WIKI_WRITE_DENIED
+          : `${checked.reason ?? `missing capability ${required}`}${checked.missing ? (await this.capabilityHint(checked.missing, checked.record ?? authRecord, scope)) : ''}`;
         return this.json(res, 403, { error });
       }
       if (checked.ok && checked.record) {
@@ -2852,7 +2866,7 @@ export class Gateway {
           return this.json(res, 200, (await __asyncCollections.map((await store.listOrganizationMemberships(organizationId)), async (membership) => {
             const user = users.get(membership.userId);
             const authorization = (await this.deps.authorization?.selectionForPrincipal(`user:${membership.userId}`, organizationId))
-              ?? (membership.role === 'owner' ? { level: 'administrator', scope: 'organization' } : undefined);
+              ?? (membership.role === 'owner' ? { level: 'superadmin', scope: 'organization' } : undefined);
             return { ...membership, authorization, profileId: authorization?.level ?? 'viewer',
               protectedOwner: membership.role === 'owner', ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
           })));
@@ -2874,6 +2888,8 @@ export class Gateway {
       }
       const organizationMember = p.match(/^\/api\/organizations\/([^/]+)\/members\/([^/]+)$/);
       if (organizationMember && method === 'DELETE') {
+        (await this.deps.authorization?.assertCanChangePrincipal(actorPrincipal(callerIdentity.actor),
+          `user:${organizationMember[2]!}`, organizationMember[1]!, authRecord?.kind === 'human' ? undefined : authRecord?.caps));
         (await store.deprovisionOrganizationUser(organizationMember[1]!, organizationMember[2]!));
         (await this.deps.authorization?.revoke(actorPrincipal(callerIdentity.actor), `user:${organizationMember[2]!}`, `organization:${organizationMember[1]!}`));
         void this.deps.subscriptions?.syncSeats(organizationMember[1]!).catch((error) =>
@@ -4049,7 +4065,7 @@ export class Gateway {
                 // handle may name someone else's (AU-40).
                 const handle = entry.value ? resourceSecretHandle(existing.id)
                   : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
-                if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value));
+                if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.updateResourceAttachment(existing.id, {
                   target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
                   credentialHandles: [handle], enabled: true,
@@ -4058,7 +4074,7 @@ export class Gateway {
               } else {
                 if (!entry.value) continue;
                 const id = newId('resource'), handle = `resource:${id}:credential`;
-                (await this.deps.broker.registerHandle(handle, entry.value));
+                (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.createResourceAttachment({ id, organizationId: project.organizationId,
                   projectId: project.id, name: entry.name, driver: 'secret@1',
                   target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
@@ -4238,7 +4254,7 @@ export class Gateway {
             if (!secret) return this.json(res, 400, { error: 'secret value is required for this resource driver' });
             if (!this.deps.broker) return this.json(res, 503, { error: 'credential broker is unavailable' });
             const handle = resourceSecretHandle(id);
-            (await this.deps.broker.registerHandle(handle, secret));
+            (await this.deps.broker.registerHandle(handle, secret, organizationScope(project.organizationId)));
             credentialHandles.push(handle);
           }
           try {
@@ -4361,7 +4377,7 @@ export class Gateway {
                 : {}),
               ...(b.credentialHandles ? { credentialHandles: b.credentialHandles } : {}),
             }));
-            if (secretUpdate) (await this.deps.broker!.registerHandle(secretUpdate.handle, secretUpdate.value));
+            if (secretUpdate) (await this.deps.broker!.registerHandle(secretUpdate.handle, secretUpdate.value, organizationScope(resource.organizationId)));
             return this.json(res, 200, redactResource(next));
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
@@ -5327,13 +5343,20 @@ export class Gateway {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
       }
+      // The project these act in decides the caller's authority, so it must be
+      // in the URL (`?projectId=`), where the gateway scopes the session to it.
+      const bodyScopedProject = (b: any) => requestedScope.projectId
+        && (b.projectId === undefined || String(b.projectId) === requestedScope.projectId) ? requestedScope.projectId : undefined;
+      const unscopedProject = 'pass the project as ?projectId= (it must match any projectId in the body)';
       if (p === '/api/authorization/escalation-targets' && method === 'POST') {
         const b = await this.body(req);
         const authorization = authorizationSelectionFromBody(b.authorization);
         if (!authorization) return this.json(res, 400, { error: 'authorization is required' });
+        const projectId = bodyScopedProject(b);
+        if (!projectId) return this.json(res, 400, { error: unscopedProject });
         try {
           const result = (await api.authorizationEscalationTargets(token, {
-            projectId: String(b.projectId ?? ''), authorization,
+            projectId, authorization,
           }));
           const names = new Map(((await this.deps.identity?.listUsers()) ?? []).map((user) =>
             [user.id, { name: user.name, email: user.email }]));
@@ -5351,9 +5374,11 @@ export class Gateway {
           const authorization = authorizationSelectionFromBody(b.authorization);
           if (!authorization || !b.target || typeof b.target !== 'object')
             return this.json(res, 400, { error: 'target and authorization are required' });
+          const projectId = bodyScopedProject(b);
+          if (!projectId) return this.json(res, 400, { error: unscopedProject });
           try {
             return this.json(res, 200, await api.requestAuthorization(token, {
-              projectId: String(b.projectId ?? ''), target: b.target as any, authorization,
+              projectId, target: b.target as any, authorization,
               audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
               reason: b.reason == null ? undefined : String(b.reason),
             }));
@@ -5732,7 +5757,8 @@ export class Gateway {
               provider, sessionId, title: `${task.title} · ${requestedRole}`, cwd: view?.worldPath });
             if (provider === 'codex') {
               const exported = await createCodexConversationExport(objects, taskId, requestedRole, sessionId,
-                stored.home && stored.id ? { home: stored.home } : { generated: await generate() }, store);
+                stored.home && stored.id ? { home: stored.home } : { generated: await generate() }, store,
+                (await (await this.taskSecrets(taskId)).refresh()));
               ({ data, filename, source, warnings } = exported);
             } else {
               if (stored.source) data = await fs.promises.readFile(stored.source);
@@ -5741,6 +5767,9 @@ export class Gateway {
               source = stored.source ? 'native' : 'generated';
             }
           }
+          // The provider's own file stays intact for resume; the copy served is
+          // masked byte for byte of everything the task received (SS-3).
+          data = (await (await this.taskSecrets(taskId)).refresh()).mask(data);
           const warningsHeader = conversionWarningsHeader(warnings);
           res.writeHead(200, {
             'content-type': 'application/x-ndjson; charset=utf-8',
@@ -5933,7 +5962,7 @@ export class Gateway {
                 id, role, sessionId, stored.home && stored.id ? { home: stored.home } : {
                   generated: await exportConversationWithPanagent({ messages: transcript, provider: 'codex',
                     sessionId, title: `${t?.title} · ${role}`, cwd: view?.worldPath }),
-                }, store);
+                }, store, (await (await this.taskSecrets(id)).refresh()));
               exportId = exported.exportId;
               exportMetadata = { filename: exported.filename, requiredCodexVersion: exported.requiredCodexVersion,
                 downloadUrl: `/api/tasks/${encodeURIComponent(id)}/conversation.jsonl?role=${encodeURIComponent(role)}&exportId=${exportId}` };
@@ -6533,6 +6562,15 @@ export class Gateway {
         // A saved browser session is never what a lookup by site means: it has no
         // field to fill or reveal, and must not shadow the site's login.
         const findItem = async (b: any) => (b.itemId ? (await vault.get(String(b.itemId))) : b.domain ? (await vault.findByDomain(String(b.domain))).find((i) => i.type !== 'session') : undefined);
+        // Reading the vault regardless of item policy is Super-administrator authority.
+        const vaultReadRefusal = async (doing: string) => {
+          const refused = (await this.refusal(token, 'credential:reveal', { organizationId }));
+          return refused ? `You cannot ${doing}: ${refused}` : undefined;
+        };
+        const editRefusal = async (prior: VaultItem | undefined, next: { policy?: any; domains?: string[] }) => {
+          const weakens = prior ? weakensProtection(prior, next) : undefined;
+          return weakens ? (await vaultReadRefusal(weakens)) : undefined;
+        };
 
         if (p === '/api/vault/import/bitwarden' && method === 'POST') {
           try {
@@ -6581,14 +6619,20 @@ export class Gateway {
               policy: (await vault.effectivePolicy(callerTaskId, item)),
             }))));
         }
-        if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, (await vault.listForSelection()));
+        if (p === '/api/vault/items' && method === 'GET') {
+          const canReveal = (await this.deps.tokens.check(token, 'credential:reveal', { organizationId })).ok;
+          return this.json(res, 200, (await vault.listForSelection()).map((item) => ({ ...item, canReveal })));
+        }
         if (p === '/api/vault/items' && method === 'POST') {
           const b = await this.body(req);
+          const domains = Array.isArray(b.domains) ? b.domains.map(String) : typeof b.domains === 'string' ? b.domains.split(/[,\s]+/).filter(Boolean) : undefined;
+          const refused = (await editRefusal(b.id ? (await vault.get(String(b.id))) : undefined, { policy: b.policy, domains }));
+          if (refused) return this.json(res, 403, { error: refused });
           const saved = (await vault.save({
             id: b.id ? String(b.id) : undefined,
             type: b.type,
             label: String(b.label ?? ''),
-            domains: Array.isArray(b.domains) ? b.domains.map(String) : typeof b.domains === 'string' ? b.domains.split(/[,\s]+/).filter(Boolean) : undefined,
+            domains,
             username: b.username ? String(b.username) : undefined,
             tags: Array.isArray(b.tags) ? b.tags.map(String) : typeof b.tags === 'string' ? b.tags.split(/[,\s]+/).filter(Boolean) : undefined,
             envVar: b.envVar ? String(b.envVar) : undefined,
@@ -6620,13 +6664,15 @@ export class Gateway {
         if (viReveal && method === 'POST') {
           const item = (await vault.get(viReveal[1]!));
           if (!item) return this.json(res, 404, { error: `no vault item ${viReveal[1]}` });
+          const refused = (await vaultReadRefusal(`reveal "${item.label}"`));
+          if (refused) return this.json(res, 403, { error: refused });
           const b = await this.body(req);
           const field = String(b.field ?? defaultField(item.type)) as any;
           if (!ITEM_FIELDS[item.type].includes(field))
             return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
           if (!item.fields.includes(field))
             return this.json(res, 400, { error: `item "${item.label}" has no stored ${field}` });
-          const value = (await vault.resolveField(item, field, { principal, mode: 'reveal' }));
+          const value = (await vault.resolveField(item, field, { principal, mode: 'reveal', ...(callerTaskId ? { taskId: callerTaskId } : {}) }));
           res.setHeader('cache-control', 'private, no-store');
           return this.json(res, 200, { itemId: item.id, field, value });
         }
@@ -6652,6 +6698,11 @@ export class Gateway {
           const ownItem = !prior || !callerTaskId || prior.provenance.taskId === callerTaskId || allows(caps, 'credential:write');
           let saved;
           if (ownItem) {
+            // An item this task created holds a secret it already knows.
+            if (prior && !(callerTaskId && prior.provenance.taskId === callerTaskId)) {
+              const refused = (await editRefusal(prior, { policy: b.policy, domains: Array.isArray(b.domains) ? b.domains.map(String) : undefined }));
+              if (refused) return this.json(res, 403, { error: refused });
+            }
             saved = (await vault.save({
               id: prior?.id,
               type: b.type,
@@ -6716,6 +6767,9 @@ export class Gateway {
                 detail: { itemId: saved.id, ...result } }));
             }
           }
+          // The task knows what it stored; keep it out of what is kept of the task.
+          (await recordSecretRefs(store, callerTaskId, Object.keys(b.secrets ?? {})
+            .filter((field): field is VaultFieldName => saved.fields.includes(field as VaultFieldName)).map((field) => handleRef(itemHandle(saved.id, field)))));
           return this.json(res, 200, { id: saved.id, label: saved.label, type: saved.type, fields: saved.fields,
             ...(propagated ? { propagated } : {}), ...(writeBack?.length ? { writeBack } : {}) });
         }
@@ -6817,6 +6871,11 @@ export class Gateway {
           const b = await this.body(req);
           const action = String(b.action ?? '');
           if (!['once', 'task', 'always', 'deny'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny' });
+          // Approving hands the requester the secret; anyone who manages credentials may refuse.
+          if (action !== 'deny') {
+            const refused = (await vaultReadRefusal('approve credential requests'));
+            if (refused) return this.json(res, 403, { error: refused });
+          }
           try {
             const resolved = (await vault.resolve(vres[1]!, { action: action as any, by: principal, itemId: b.itemId ? String(b.itemId) : undefined }));
             const item = resolved.itemId ? (await vault.get(resolved.itemId)) : undefined;
@@ -6852,6 +6911,14 @@ export class Gateway {
           if (connName && method === 'POST') {
             const b = await this.body(req);
             const action = connName[2];
+            // A connector the vault writes back to receives its secrets: choosing
+            // or redirecting one is vault read access. Importing is not.
+            const exports = ['connect', 'write-back', 'retry-write-back', 'retry-writes'].includes(action ?? '')
+              || (action === 'config' && b.writeBack === true) || (action === 'sync' && b.writeBack === true);
+            if (exports) {
+              const refused = (await vaultReadRefusal(`connect a password store the vault is copied to`));
+              if (refused) return this.json(res, 403, { error: refused });
+            }
             try {
               if (action === 'connect') {
                 return this.json(res, 200, { connected: true, ...(await connectors.connect(connName[1]!, String(b.secret ?? ''))) });
@@ -7157,7 +7224,7 @@ export class Gateway {
             // The provider secret (AgentMail key / IMAP password) → the vault under
             // an org-scoped handle the poller resolves; never echoed or stored raw.
             const apiKeyHandle = this.mailboxSecretHandle(organizationId, String(b.provider));
-            if (b.apiKey && this.deps.broker) (await this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey)));
+            if (b.apiKey && this.deps.broker) (await this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey), organizationScope(organizationId)));
             // REPLACE (not merge) so switching providers can't leave a stale field.
             const config = { ...result.config, ...(b.apiKey ? { apiKeyHandle } : {}) };
             (await this.setMailboxConfig(organizationId, config));
@@ -7196,7 +7263,7 @@ export class Gateway {
         });
         if (result.status === 'connected' && result.config) {
           const handle = 'email:outbound:auth';
-          if (b.secret && this.deps.broker) (await this.deps.broker.registerHandle(handle, String(b.secret)));
+          if (b.secret && this.deps.broker) (await this.deps.broker.registerHandle(handle, String(b.secret), INSTALLATION_SCOPE));
           // REPLACE, not merge, so switching providers can't leave a stale field.
           (await this.setOutboundEmailConfig({ ...result.config, secretHandle: handle }));
         }
@@ -7347,7 +7414,7 @@ export class Gateway {
         const handle = resourceOrganizationId === 'org_personal'
           ? `${provider}:${account}`
           : `${provider}:${resourceOrganizationId}:${account}`;
-        (await this.deps.broker.registerHandle(handle, String(b.apiKey)));
+        (await this.deps.broker.registerHandle(handle, String(b.apiKey), organizationScope(resourceOrganizationId)));
         await this.refreshLoginPool();
         return this.json(res, 200, { handle }); // never echoes the secret
       }
@@ -7380,7 +7447,7 @@ export class Gateway {
         if (nextHandle !== handle && this.deps.broker.hasHandle(nextHandle))
           return this.json(res, 409, { error: `API key ${provider}:${nextAccount} already exists` });
         const replacement = b.apiKey === undefined || b.apiKey === '' ? undefined : String(b.apiKey);
-        (await this.deps.broker.updateHandle(handle, nextHandle, replacement));
+        (await this.deps.broker.updateHandle(handle, nextHandle, organizationScope(resourceOrganizationId), replacement));
         if (nextHandle !== handle)
           (await this.remapCredentialPolicies(resourceOrganizationId, credentialKey, `key:handle:${nextHandle}`));
         await this.refreshLoginPool();
@@ -9330,6 +9397,49 @@ export class Gateway {
       'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow',
       'content-security-policy': SERVER_PAGE_CSP });
     res.end(PREVIEW_STOPPED_HTML);
+  }
+
+  /** Who has a refused capability, and what the caller has there instead, so
+   * a person knows whom to ask and an agent which authorization to request. */
+  private async capabilityHint(capability: string, record: ScopedToken | undefined,
+    scope: { projectId?: string; organizationId?: string; taskId?: string }): Promise<string> {
+    // Best effort: a refusal must stay a refusal even if its hint cannot be worked out.
+    try { return await this.capabilityHintUnsafe(capability, record, scope); } catch { return ''; }
+  }
+
+  private async capabilityHintUnsafe(capability: string, record: ScopedToken | undefined,
+    scope: { projectId?: string; organizationId?: string; taskId?: string }): Promise<string> {
+    const authorization = this.deps.authorization;
+    if (typeof authorization?.profile !== 'function' || typeof authorization.selectionForPrincipal !== 'function') return '';
+    const organizationId = scope.organizationId ?? (scope.projectId ? await this.deps.store.projectOrganizationAsync(scope.projectId) : undefined)
+      ?? record?.organizationId;
+    const levels = ['viewer', 'developer', 'maintainer', 'administrator', 'superadmin', 'god'];
+    const name = async (level: string) => (await authorization.profile(level, undefined, organizationId))?.name ?? level;
+    let lowest: string | undefined;
+    for (const level of levels) {
+      const profile = await authorization.profile(level, undefined, organizationId);
+      if (profile && allows(profile.capabilities, capability)) { lowest = level; break; }
+    }
+    const holders = !lowest ? '' : lowest === 'god' ? 'only God has it' : `${await name(lowest)} and above have it`;
+    let current = '';
+    if (record?.kind === 'human' && record.principal.startsWith('user:') && organizationId) {
+      const selection = await authorization.selectionForPrincipal(record.principal, organizationId);
+      current = selection ? `your authorization there is ${await name(selection.level)}` : 'you have no authorization there';
+    } else if (record && record.taskId !== '*') {
+      const stored = (await this.deps.store.getTask(record.taskId))?.params?._authorization as { level?: string; profileId?: string } | undefined;
+      const level = [stored?.level, stored?.profileId, record.profileId].find((candidate) => candidate && levels.includes(candidate));
+      if (level) current = `this task is authorized as ${await name(level)}`;
+    }
+    const parts = [current, holders].filter(Boolean);
+    return parts.length ? `. ${parts.join('; ').replace(/^./, (first) => first.toUpperCase())}.` : '';
+  }
+
+  /** The 403 message when the caller lacks `capability`, or undefined when it holds it. */
+  private async refusal(token: string, capability: string,
+    scope: { projectId?: string; organizationId?: string; taskId?: string }): Promise<string | undefined> {
+    const checked = await this.deps.tokens.check(token, capability, scope);
+    if (checked.ok) return undefined;
+    return `${checked.reason ?? `missing capability ${capability}`}${checked.missing ? (await this.capabilityHint(checked.missing, checked.record, scope)) : ''}`;
   }
 
   private json(res: http.ServerResponse, status: number, obj: unknown) {

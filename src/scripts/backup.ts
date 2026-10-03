@@ -1,5 +1,9 @@
 import fs from 'node:fs';
 import { createBackup, signChecksums } from '../ops/backup.js';
+import { hydrateSecretFiles } from '../config/deployment.js';
+
+// The manifest records the vault key's id (SS-2), read as the app reads it.
+hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'), ['KARMAX_VAULT_KEY']);
 
 // Flags before the positional destination, so `npm run backup -- --allow-running`
 // works and `npm run backup -- /path/to/dir` still does. The live-install guard
@@ -14,6 +18,7 @@ const flag = (name: string) => {
 };
 const allowRunning = flag('--allow-running');
 const excludeSecrets = flag('--exclude-secrets');
+const includeVaultKey = flag('--include-vault-key');
 // deploy/karmax: sign a deployment backup's SHA256SUMS (stdin) with this
 // installation's backup key, printing the signature (DB-10).
 if (flag('--sign-checksums')) {
@@ -22,13 +27,14 @@ if (flag('--sign-checksums')) {
 }
 if (argv.some((a) => a.startsWith('--'))) {
   throw new Error(`unknown option ${argv.find((a) => a.startsWith('--'))}\n`
-    + 'usage: npm run backup -- [--allow-running] [--exclude-secrets] [destination] | --sign-checksums < SHA256SUMS');
+    + 'usage: npm run backup -- [--allow-running] [--exclude-secrets] [--include-vault-key] [destination] | --sign-checksums < SHA256SUMS');
 }
 
 const result = await createBackup({
   destination: argv[0],
   allowRunning,
   excludeSecrets,
+  includeVaultKey,
   externalTemporal: Boolean(process.env.KARMAX_TEMPORAL_ADDRESS),
   externalObjectStore: process.env.KARMAX_OBJECT_STORE === 's3',
 });
@@ -39,6 +45,11 @@ if (allowRunning) {
   console.log('taken while karmax was running: components are snapshotted at different instants, '
     + 'so this backup is not point-in-time consistent');
 }
+if (result.manifest.vaultKeyIncluded) {
+  console.log('includes vault/vault.key (--include-vault-key): this backup alone decrypts every secret in it');
+} else if (result.manifest.vaultKeyIds?.length) {
+  console.log(`the vault key is not in this backup: restoring it needs ${result.manifest.vaultKeyIds.join(' or ')}; keep that key off-host`);
+}
 if (!result.manifest.secretsIncluded) {
-  console.log('secrets excluded: restoring this onto a different host will need its vault key supplied separately');
+  console.log('secrets excluded: the auth secret and plaintext provider logins are not in this backup either');
 }

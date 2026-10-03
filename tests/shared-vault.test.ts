@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +9,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { lockContended } from './helpers/lock-waiters.js';
 import { acquireFileLock } from '../src/util/file-lock.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 const linux = process.platform === 'linux' ? it : it.skip;
 const directories: string[] = [];
@@ -32,8 +34,8 @@ linux('initializes one complete key and retains independent writes from two proc
         try {
           const vault = new Vault(${JSON.stringify(dir)});
           for (let i = 0; i < 12; i++) {
-            await vault.put(${JSON.stringify(name)} + i, 'fixture-' + i);
-            await vault.putIfAbsent('shared-encryption-key', ${JSON.stringify(name)});
+            await vault.put(${JSON.stringify(name)} + i, 'fixture-' + i, 'installation');
+            await vault.putIfAbsent('shared-encryption-key', ${JSON.stringify(name)}, 'installation');
           }
           process.disconnect();
         } catch { process.exit(1); }
@@ -75,7 +77,7 @@ linux('waits asynchronously for another writer before reading the secret map', a
   const vault = new Vault(dir);
   const release = (await acquireFileLock(path.join(dir, 'secrets.json.lock')))!;
   let written = false;
-  const writing = vault.put('later', 'fixture').then(() => { written = true; });
+  const writing = vault.put('later', 'fixture', INSTALLATION_SCOPE).then(() => { written = true; });
   try {
     await lockContended(path.join(dir, 'secrets.json.lock'));
     expect(written).toBe(false);
@@ -86,11 +88,11 @@ linux('waits asynchronously for another writer before reading the secret map', a
 it('preserves a replacement credential when cleanup carries an older value', async () => {
   const vault = new Vault(directory());
   const broker = new CredentialBroker(vault);
-  await broker.registerHandle('token', 'old');
-  await broker.registerHandle('token', 'replacement');
+  await broker.registerHandle('token', 'old', INSTALLATION_SCOPE);
+  await broker.registerHandle('token', 'replacement', INSTALLATION_SCOPE);
   expect(await broker.deleteHandleIfUnchanged('token', 'old')).toBe(false);
   expect(vault.reveal('token')).toBe('replacement');
-  await broker.updateHandle('token', 'renamed');
+  await broker.updateHandle('token', 'renamed', INSTALLATION_SCOPE);
   expect(vault.has('token')).toBe(false);
   expect(vault.reveal('renamed')).toBe('replacement');
   expect(await broker.deleteHandleIfUnchanged('renamed', 'replacement')).toBe(true);
@@ -101,8 +103,8 @@ it('returns the same initialized encryption key to concurrent creators', async (
   const first = new Vault(dir);
   const second = new Vault(dir);
   const observed = await Promise.all([
-    first.putIfAbsent('key', 'first').then(() => first.reveal('key')),
-    second.putIfAbsent('key', 'second').then(() => second.reveal('key')),
+    first.putIfAbsent('key', 'first', INSTALLATION_SCOPE).then(() => first.reveal('key')),
+    second.putIfAbsent('key', 'second', INSTALLATION_SCOPE).then(() => second.reveal('key')),
   ]);
   expect(new Set(observed).size).toBe(1);
   expect(['first', 'second']).toContain(observed[0]);
@@ -111,21 +113,21 @@ it('returns the same initialized encryption key to concurrent creators', async (
 it('keeps the existing ciphertext intact when a mutation fails and releases admission', async () => {
   const dir = directory();
   const vault = new Vault(dir);
-  await vault.put('retained', 'fixture');
+  await vault.put('retained', 'fixture', INSTALLATION_SCOPE);
   const stored = () => fs.readdirSync(path.join(dir, 'entries')).sort().map((file) => [file, fs.readFileSync(path.join(dir, 'entries', file), 'utf8')]);
   const before = stored();
-  await expect(vault.move('missing', 'new')).rejects.toThrow('no secret');
+  await expect(vault.move('missing', 'new', INSTALLATION_SCOPE)).rejects.toThrow('no secret');
   expect(stored()).toEqual(before);
-  await vault.put('next', 'fixture-2');
+  await vault.put('next', 'fixture-2', INSTALLATION_SCOPE);
   expect(vault.reveal('retained')).toBe('fixture');
 });
 
 it('bounds secret writes and reads only the requested entry (AU-5)', async () => {
   const dir = directory();
   const vault = new Vault(dir);
-  await expect(vault.put('oversized', 'x'.repeat(65_537))).rejects.toThrow(/size/);
-  await vault.put('one', 'first');
-  await vault.put('two', 'second');
+  await expect(vault.put('oversized', 'x'.repeat(65_537), INSTALLATION_SCOPE)).rejects.toThrow(/size/);
+  await vault.put('one', 'first', INSTALLATION_SCOPE);
+  await vault.put('two', 'second', INSTALLATION_SCOPE);
   const read = vi.spyOn(fs, 'readFileSync');
   try {
     expect(vault.reveal('one')).toBe('first');
@@ -135,15 +137,17 @@ it('bounds secret writes and reads only the requested entry (AU-5)', async () =>
 
 it('migrates legacy ciphertext without losing readable secrets (AU-5)', async () => {
   const dir = directory();
-  const vault = new Vault(dir);
-  await vault.put('legacy', 'retained');
-  const entries = path.join(dir, 'entries');
-  const entry = JSON.parse(fs.readFileSync(path.join(entries, fs.readdirSync(entries).find(file => file.endsWith('.json'))!), 'utf8'));
-  fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify({ [entry.handle]: entry.blob }));
-  fs.rmSync(entries, { recursive: true });
+  // A vault as releases before data epoch 3 kept it: one secrets.json map of unbound ciphertext.
+  const key = crypto.randomBytes(32);
+  fs.writeFileSync(path.join(dir, 'vault.key'), key, { mode: 0o600 });
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const body = Buffer.concat([cipher.update('retained', 'utf8'), cipher.final()]);
+  fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify({
+    legacy: `${iv.toString('base64')}.${cipher.getAuthTag().toString('base64')}.${body.toString('base64')}` }));
   const reopened = new Vault(dir);
   expect(reopened.reveal('legacy')).toBe('retained');
-  await reopened.put('next', 'new');
+  await reopened.put('next', 'new', INSTALLATION_SCOPE);
   expect(new Vault(dir).reveal('legacy')).toBe('retained');
   expect(reopened.list().sort()).toEqual(['legacy', 'next']);
 });
@@ -152,7 +156,7 @@ it('migrates legacy ciphertext without losing readable secrets (AU-5)', async ()
 it('retains five encrypted prior values on rotation and deletes them with the handle (AU-22)', async () => {
   const dir = directory();
   const vault = new Vault(dir);
-  for (let i = 0; i < 8; i++) await vault.put('rotated', `rotation-secret-${i}`);
+  for (let i = 0; i < 8; i++) await vault.put('rotated', `rotation-secret-${i}`, INSTALLATION_SCOPE);
   const reopened = new Vault(dir);
   expect(reopened.reveal('rotated')).toBe('rotation-secret-7');
   expect(reopened.reveal('rotated', 1)).toBe('rotation-secret-6');

@@ -2,7 +2,9 @@ import * as __asyncCollections from '../../util/async-collections.js';
 import crypto from 'node:crypto';
 import type { Store } from '../../store/db.js';
 import type { CredentialBroker } from '../../autonomy/broker.js';
+import { organizationScope } from '../../autonomy/vault-keys.js';
 import { publicUrl } from './http.js';
+import { handleRef, recordSecretRefs } from '../../autonomy/task-secrets.js';
 
 export type McpTransport = { type: 'http' | 'sse'; url: string }
   | { type: 'stdio'; command: string; args: string[]; env?: Record<string, string> };
@@ -108,7 +110,7 @@ export class McpConnections {
       }
       if (changed || auth === 'none') { (await this.broker.deleteHandle(this.handle(connection.id))); connection.secretNames = []; }
       if (secrets) {
-        (await this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets)));
+        (await this.broker.registerHandle(this.handle(connection.id), JSON.stringify(secrets), organizationScope(this.organizationId)));
         connection.secretNames = Object.keys(secrets);
       }
       const connections = (await this.all()).filter((c) => c.id !== connection.id);
@@ -128,6 +130,11 @@ export class McpConnections {
     });
   }
 
+  /** Record that these connections' credentials are written into a task's
+   * world, so what tavya keeps of the task is scrubbed of them (SS-3). */
+  async delivered(taskId: string, connections: McpConnection[]): Promise<void> {
+    (await recordSecretRefs(this.store, taskId, connections.map((c) => handleRef(this.handle(c.id)))));
+  }
   secret(c: McpConnection, taskId?: string): any {
     const handle = this.handle(c.id);
     if (!this.broker.hasHandle(handle)) return {};
@@ -136,7 +143,7 @@ export class McpConnections {
   async setSecret(c: McpConnection, value: unknown) {
     await this.store.transaction(async () => {
       if ((await this.get(c.id, c.projectId)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
-      (await this.broker.registerHandle(this.handle(c.id), JSON.stringify(value)));
+      (await this.broker.registerHandle(this.handle(c.id), JSON.stringify(value), organizationScope(this.organizationId)));
     });
   }
   async selected(ids: string[], projectId: string): Promise<McpConnection[]> {

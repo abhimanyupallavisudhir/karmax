@@ -7,6 +7,7 @@ import { assertLoopback, connect, listPages } from '../src/autonomy/cdp.js';
 import { connectorOutboxKey, deleteItemConnectorWrites, readConnectorWrites } from '../src/autonomy/connector-writes.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
+import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 
 // AU-37: security guards in autonomy that no test pinned down.
 
@@ -41,9 +42,9 @@ describe('deleting a vault item', () => {
       const kv = new Map<string, string>();
       const store = { kvGet: (key: string) => kv.get(key), kvSet: (key: string, value: string) => void kv.set(key, value) };
       const broker = new CredentialBroker(new Vault(path.join(home, 'vault')));
-      await broker.registerHandle('outbox:gone', 'pending secret');
-      await broker.registerHandle('outbox:shared', 'shared secret');
-      await broker.registerHandle('outbox:kept', 'other secret');
+      await broker.registerHandle('outbox:gone', 'pending secret', INSTALLATION_SCOPE);
+      await broker.registerHandle('outbox:shared', 'shared secret', INSTALLATION_SCOPE);
+      await broker.registerHandle('outbox:kept', 'other secret', INSTALLATION_SCOPE);
       const write = (id: string, itemId: string, snapshotHandle: string) => ({ id, connector: 'pass-git', itemId, externalId: id, target: 't', snapshotHandle, attempts: 0, nextAttemptAt: 0 });
       store.kvSet(connectorOutboxKey('org'), JSON.stringify([write('a', 'gone', 'outbox:gone'), write('b', 'gone', 'outbox:shared'),
         write('c', 'other', 'outbox:shared'), write('d', 'other', 'outbox:kept')]));
