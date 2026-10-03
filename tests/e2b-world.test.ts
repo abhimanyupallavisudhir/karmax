@@ -454,10 +454,13 @@ describe('E2B cloud world provider', () => {
         expect(await world.readFile('b.txt')).toBe('second');
         expect((await world.readFileBuffer('a.bin')).toString()).toBe('first');
         expect((await world.readFilePrefix!('a.bin', 3)).toString()).toBe('fir');
+        const streamed: Buffer[] = [];
+        for await (const piece of world.readFileStream!('a.bin')) streamed.push(piece);
+        expect(Buffer.concat(streamed).toString()).toBe('first');
         // Only the first transfer was tried on the dropped session.
         expect(sdk).toEqual(['write /home/user/karmax/a.bin']);
         expect(requests).toEqual(['POST /home/user/karmax/a.bin', 'POST /home/user/karmax/b.txt',
-          'GET /home/user/karmax/b.txt', 'GET /home/user/karmax/a.bin', 'GET /home/user/karmax/a.bin']);
+          'GET /home/user/karmax/b.txt', 'GET /home/user/karmax/a.bin', 'GET /home/user/karmax/a.bin', 'GET /home/user/karmax/a.bin']);
       } finally { fetcher.mockRestore(); }
     });
 

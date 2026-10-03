@@ -134,6 +134,22 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
     expect(prepare.mock.calls.some(([sql]) => /FROM kv WHERE k(?: COLLATE "C")? >= \? AND k(?: COLLATE "C")? < \?/.test(sql))).toBe(true);
   });
 
+  it('compares and sets a kv value atomically', async () => {
+    expect(await store.kvCompareAndSet('cas:k', undefined, 'one')).toBe(true);
+    expect(await store.kvCompareAndSet('cas:k', undefined, 'other')).toBe(false);
+    expect(await store.kvCompareAndSet('cas:k', 'stale', 'two')).toBe(false);
+    expect(await store.kvGet('cas:k')).toBe('one');
+    expect(await store.kvCompareAndSet('cas:k', 'one', 'two')).toBe(true);
+    expect(await store.kvCompareAndSet('cas:k', 'one', undefined)).toBe(false);
+    expect(await store.kvCompareAndSet('cas:k', 'two', undefined)).toBe(true);
+    expect(await store.kvGet('cas:k')).toBeUndefined();
+    expect(await store.kvCompareAndSet('cas:k', undefined, undefined)).toBe(true);
+    // Only one of two racing writers that read the same value wins.
+    await store.kvSet('cas:race', 'base');
+    expect((await Promise.all([store.kvCompareAndSet('cas:race', 'base', 'a'), store.kvCompareAndSet('cas:race', 'base', 'b')]))
+      .filter(Boolean)).toHaveLength(1);
+  });
+
   it.skipIf(name !== 'SQLite')('indexes event type with task id for inbox and approval scans', async () => {
     const indexes = await store.db.prepare('PRAGMA index_list(events)').all() as Array<{ name: string }>;
     expect(indexes.map((row) => row.name)).toContain('idx_events_type');

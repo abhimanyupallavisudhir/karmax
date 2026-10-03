@@ -70,12 +70,13 @@ const coreChild = proxyActivities<childActivities>({ startToCloseTimeout: '20 se
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
 });
-// Snapshots move at a few MB/s out of a remote sandbox, so a multi-GB output
-// takes most of an hour. A retry keeps every candidate already staged.
+// A multi-GB output takes many minutes to snapshot out of a remote sandbox, and
+// a deploy restarts the worker under it. A retry resumes from what the previous
+// attempt saved, so retries are cheap; only the last one gives a candidate up.
 const resourceStaging = proxyActivities<coreActivities>({
   // Heartbeats carry a cancel to the activity; a short timeout delivers it soon.
   startToCloseTimeout: '12 hours', heartbeatTimeout: '30 seconds',
-  retry: { maximumAttempts: 3, initialInterval: '30 seconds' },
+  retry: { maximumAttempts: 5, initialInterval: '30 seconds' },
   // A cancel must not move on to suspend or destroy the world mid-upload.
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });

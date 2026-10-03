@@ -344,6 +344,8 @@ export interface World {
   readFileBuffer(relPath: string): Promise<Buffer>;
   /** At most `maxBytes` from the start of a regular file (world/file-prefix.ts). */
   readFilePrefix?(relPath: string, maxBytes: number): Promise<Buffer>;
+  /** A file's bytes as one stream, for files too large to buffer or to read a command at a time. */
+  readFileStream?(relPath: string): AsyncIterable<Buffer>;
   writeFile(relPath: string, content: string): Promise<void>;
   writeFileBuffer?(relPath: string, content: Buffer): Promise<void>;
   listFiles(): Promise<string[]>;

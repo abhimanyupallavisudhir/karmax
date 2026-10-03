@@ -60,7 +60,8 @@ jobs:
           grep -F 'unexpected key "queue"' "$RUNNER_TEMP/actionlint-negative.log"
 
       - uses: ./.github/actions/install
-      - run: npm audit --audit-level=high
+      # High and critical advisories fail, except reviewed ones in scripts/audit-allowlist.json.
+      - run: node scripts/audit.mjs
       - run: npm run typecheck
       # No lint errors, and no more warnings or `as any` casts than scripts/lint-budget.json allows.
       - run: npm run lint

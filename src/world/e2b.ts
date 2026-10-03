@@ -511,6 +511,26 @@ class E2BWorld implements World {
     });
   }
 
+  async *readFileStream(relPath: string): AsyncGenerator<Buffer> {
+    const file = this.filePath(relPath);
+    const abort = new AbortController();
+    const stream = await this.transfer(async () => await this.sandbox.files.read(file,
+      { format: 'stream', signal: abort.signal }) as unknown as ReadableStream<Uint8Array>,
+    async () => (await this.directTransfer('read', file, undefined, abort.signal)).body ?? new Blob([]).stream());
+    const reader = stream.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        yield Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+      }
+    } finally {
+      // A consumer that stops early must not leave the download running.
+      abort.abort();
+      await reader.cancel().catch(() => undefined);
+    }
+  }
+
   async writeFile(relPath: string, content: string): Promise<void> {
     await this.writeFileBuffer(relPath, Buffer.from(content));
   }

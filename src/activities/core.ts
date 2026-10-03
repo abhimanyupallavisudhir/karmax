@@ -10,6 +10,7 @@ import { turnPlatformRequest } from '../agent/platform-request.js';
 import { acquireConfirmLock } from './confirm-lock.js';
 import { scriptOutput, reviewFiles } from './result-bounds.js';
 import { mapBatches } from '../util/async-batch.js';
+import type { StagingProgress } from '../world/resources.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
@@ -130,6 +131,9 @@ import {
 import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 import { BRAND } from '../domain/brand.js';
 import { screenEnvironment, skippedEnvNotice, type SkippedEnv } from '../util/work-env.js';
+
+/** How often staging records its progress as a task event. */
+const STAGING_PROGRESS_EVERY_MS = 5_000;
 
 /** A retried turn's processes did not survive it; agents otherwise assume they did. */
 const INTERRUPTED_COMMANDS = 'Commands that were running in it, including run_in_background shells, were stopped: '
@@ -3562,8 +3566,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async stageResourceCandidates(taskId: string): Promise<{ staged: number; failed: number }> {
       let context: ReturnType<typeof activityContext.current> | undefined;
       try { context = activityContext.current(); } catch { /* direct tests */ }
+      let progress: StagingProgress | undefined;
+      let reported = 0;
       const pulse = setInterval(() => {
-        try { context?.heartbeat({ taskId, operation: 'staging-resources' }); } catch { /* activity completion/cancellation */ }
+        try { context?.heartbeat({ taskId, operation: 'staging-resources', ...(progress ? { progress } : {}) }); }
+        catch { /* activity completion/cancellation */ }
       }, 5_000);
       try {
         const info = context?.info;
@@ -3571,6 +3578,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const result = await deps.resources?.stageCandidates(taskId, {
           final: !info || (maximumAttempts > 0 && info.attempt >= maximumAttempts),
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); },
+          // Review shows how far a multi-GB save has got, so it never looks stuck.
+          onProgress: (next) => {
+            progress = next;
+            if (Date.now() - reported < STAGING_PROGRESS_EVERY_MS) return;
+            reported = Date.now();
+            void record(taskId, 'staging.progress', { ...next }).catch(() => undefined);
+          },
         });
         return { staged: result?.staged.length ?? 0, failed: result?.failed.length ?? 0 };
       } finally { clearInterval(pulse); }
