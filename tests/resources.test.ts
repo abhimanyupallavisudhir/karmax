@@ -493,6 +493,33 @@ describe('project resources', () => {
     } finally { vi.restoreAllMocks(); await cleanup(); }
   });
 
+  it('keeps output whose save keeps failing pending, with its reason, until it saves or is excluded', async () => {
+    const { store, task, resources, world, cleanup } = await candidateFixture('stage-unsaved');
+    try {
+      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      const exec = world.exec.bind(world);
+      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
+      const paused = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
+        command === 'bash' && String(args?.[1]).includes("find -H 'raw'") ? { code: 1, stdout: '', stderr: 'the sandbox paused' }
+          : exec(command, args, options));
+      // Even the last attempt does not give it up: it is still in the world.
+      expect(await resources.stageCandidates(task.id, { final: true })).toMatchObject({ staged: [],
+        failed: [{ candidateId: raw.candidate.id, error: 'the sandbox paused' }] });
+      expect(await store.getResourceCandidate(raw.candidate.id)).toMatchObject({ state: 'pending', error: 'the sandbox paused' });
+      expect(await resources.unsavedCandidates(task.id)).toEqual([{ path: 'raw', error: 'the sandbox paused' }]);
+      // Excluding it is the explicit way to go on without it.
+      await resources.beginReview(task.id);
+      await resources.setReviewExcluded(task.id, raw.attachment.id, true);
+      expect(await resources.unsavedCandidates(task.id)).toEqual([]);
+      await resources.setReviewExcluded(task.id, raw.attachment.id, false);
+      // A later save that works clears the reason.
+      paused.mockRestore();
+      expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [raw.candidate.id], failed: [] });
+      expect((await store.getResourceCandidate(raw.candidate.id))?.error ?? undefined).toBeUndefined();
+      expect(await resources.unsavedCandidates(task.id)).toEqual([]);
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  });
+
   it('settles a candidate whose snapshot never completed by discarding it, not by failing the confirmation', async () => {
     const { store, task, resources, cleanup } = await candidateFixture('settle-unstaged');
     try {

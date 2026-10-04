@@ -1252,14 +1252,25 @@ export class ProjectResourceService {
         const progress = options.onProgress && ((done: Omit<StagingProgress, 'path' | 'index' | 'count'>) =>
           options.onProgress!({ path: candidate.sourcePath!, index, count: candidates.length, ...done }));
         if (await this.stageCandidate(taskId, candidate, options.checkContinue, progress)) result.staged.push(candidate.id);
+        if (candidate.error) await this.store.recordResourceCandidateError(candidate.id, null);
       } catch (error) {
         await options.checkContinue?.(); // cancellation is not a staging failure
         if ((await this.store.getResourceCandidate(candidate.id))?.state !== 'pending') continue;
+        const reason = error instanceof Error ? error.message : String(error);
+        const staged = Boolean((await this.store.getResourceAttachment(candidate.attachmentId))?.currentRevisionId);
+        if (!staged && !(error instanceof UnstageableCandidate)) await this.store.recordResourceCandidateError(candidate.id, reason);
         if (!options.final && !(error instanceof UnstageableCandidate)) { transient.push(error); continue; }
         // A refresh that still fails keeps the snapshot already taken.
-        if ((await this.store.getResourceAttachment(candidate.attachmentId))?.currentRevisionId) continue;
-        const reason = error instanceof Error ? error.message : String(error);
-        await this.discardCandidate(taskId, candidate.id, 'system:resource-stage-failed', reason);
+        if (staged) continue;
+        if (error instanceof UnstageableCandidate) {
+          // Its world or path is gone: nothing could ever save it.
+          await this.discardCandidate(taskId, candidate.id, 'system:resource-stage-failed', reason);
+          result.failed.push({ candidateId: candidate.id, sourcePath: candidate.sourcePath, error: reason });
+          continue;
+        }
+        // Anything else may yet save: the output stays in its world, pending, with
+        // the reason shown at Review, and Confirm tries again. Only an explicit
+        // Exclude gives it up (pramana#1 lost raw_data to an automatic discard).
         result.failed.push({ candidateId: candidate.id, sourcePath: candidate.sourcePath, error: reason });
       }
     }
@@ -1478,6 +1489,20 @@ export class ProjectResourceService {
 
   /** Runs once all confirmation layers approve, inside a retriable workflow activity.
    * Freeze all choices together; individual publication CAS fences remain authoritative. */
+  /** Output the task proposed that has no snapshot yet and was not excluded:
+   * completing now would lose it with the task's world. Its path, and why the
+   * last save failed. */
+  async unsavedCandidates(taskId: string): Promise<Array<{ path: string; error?: string }>> {
+    const excluded = new Set((await this.store.resourceReview(taskId)).excluded);
+    const unsaved: Array<{ path: string; error?: string }> = [];
+    for (const candidate of await this.store.listResourceCandidates(taskId, false)) {
+      if (candidate.state !== 'pending' || candidate.sourceKind !== 'path' || excluded.has(candidate.attachmentId)) continue;
+      if (!(await this.store.getResourceAttachment(candidate.attachmentId))?.currentRevisionId)
+        unsaved.push({ path: candidate.sourcePath ?? candidate.attachmentId, ...(candidate.error ? { error: candidate.error } : {}) });
+    }
+    return unsaved;
+  }
+
   async settleReview(taskId: string): Promise<void> {
     const selection = await this.store.resourceReview(taskId, { freeze: true });
     const excluded = new Set(selection.excluded);
@@ -1540,38 +1565,41 @@ export class ProjectResourceService {
   async checkpoint(handle: WorldHandle, checkContinue?: () => Promise<void>): Promise<Array<{ attachmentId: string; revisionId: string }>> {
     const world = await this.worlds.open(handle);
     const refs: Array<{ attachmentId: string; revisionId: string }> = [];
-    for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
-      await checkContinue?.();
-      if (lease.state !== 'active') continue;
-      const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
-      if (!attachment || !isSnapshotDriver(attachment.driver) || attachment.target.kind !== 'path') continue;
-      if (attachment.access === 'read' && lease.revisionId) {
-        refs.push({ attachmentId: attachment.id, revisionId: lease.revisionId });
-        continue;
+    const transfer = this.directTransfer(handle) ? new DirectTransfer(world) : undefined;
+    try {
+      for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
+        await checkContinue?.();
+        if (lease.state !== 'active') continue;
+        const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
+        if (!attachment || !isSnapshotDriver(attachment.driver) || attachment.target.kind !== 'path') continue;
+        if (attachment.access === 'read' && lease.revisionId) {
+          refs.push({ attachmentId: attachment.id, revisionId: lease.revisionId });
+          continue;
+        }
+        // The previous park of this lease is the incremental baseline, else the
+        // revision the world started from: unchanged files are neither read nor
+        // uploaded, and an unchanged resource keeps its existing revision (LT-11).
+        // The stamps each park saw are kept with that pointer even when nothing
+        // changed, so only the first park after a restore reads every file.
+        const baselineKey = `resource-checkpoint:${handle.id}:${attachment.id}`;
+        let recorded: { leaseId?: string; revisionId?: string; observed?: string } = {};
+        try { recorded = JSON.parse((await this.store.kvGet(baselineKey)) ?? '{}'); } catch {}
+        const sameLease = recorded.leaseId === lease.id;
+        const baselineId = sameLease ? recorded.revisionId : lease.revisionId;
+        const baseline = baselineId ? (await this.store.getResourceRevision(baselineId)) : undefined;
+        const { unchanged, observed, ...captured } = await this.engine.capture(attachment,
+          filesFromWorld(world, resourceAbsolutePath(handle, attachment), attachment, checkContinue),
+          { baseline: baseline?.attachmentId === attachment.id ? baseline : undefined, observed: sameLease ? recorded.observed : undefined,
+            // A park's capture of the task's private copy is work in progress:
+            // counted, never refused (see WorldCheckpointService).
+            enforceQuota: false, ...(transfer ? { direct: { transfer, taskId: lease.taskId } } : {}) });
+        const revisionId = unchanged && baseline ? baseline.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
+          parentRevisionId: lease.revisionId, engine: this.engine.id, ...captured, metadata: { checkpoint: true },
+          createdByTaskId: lease.taskId })).id;
+        (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId, ...(observed ? { observed } : {}) })));
+        refs.push({ attachmentId: attachment.id, revisionId });
       }
-      // The previous park of this lease is the incremental baseline, else the
-      // revision the world started from: unchanged files are neither read nor
-      // uploaded, and an unchanged resource keeps its existing revision (LT-11).
-      // The stamps each park saw are kept with that pointer even when nothing
-      // changed, so only the first park after a restore reads every file.
-      const baselineKey = `resource-checkpoint:${handle.id}:${attachment.id}`;
-      let recorded: { leaseId?: string; revisionId?: string; observed?: string } = {};
-      try { recorded = JSON.parse((await this.store.kvGet(baselineKey)) ?? '{}'); } catch {}
-      const sameLease = recorded.leaseId === lease.id;
-      const baselineId = sameLease ? recorded.revisionId : lease.revisionId;
-      const baseline = baselineId ? (await this.store.getResourceRevision(baselineId)) : undefined;
-      const { unchanged, observed, ...captured } = await this.engine.capture(attachment,
-        filesFromWorld(world, resourceAbsolutePath(handle, attachment), attachment, checkContinue),
-        { baseline: baseline?.attachmentId === attachment.id ? baseline : undefined, observed: sameLease ? recorded.observed : undefined,
-          // A park's capture of the task's private copy is work in progress:
-          // counted, never refused (see WorldCheckpointService).
-          enforceQuota: false });
-      const revisionId = unchanged && baseline ? baseline.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
-        parentRevisionId: lease.revisionId, engine: this.engine.id, ...captured, metadata: { checkpoint: true },
-        createdByTaskId: lease.taskId })).id;
-      (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId, ...(observed ? { observed } : {}) })));
-      refs.push({ attachmentId: attachment.id, revisionId });
-    }
+    } finally { await transfer?.cleanup(); }
     return refs;
   }
 
@@ -1587,7 +1615,19 @@ export class ProjectResourceService {
     // Upload the immutable candidate before entering the singleton. The only
     // serialized operation is the tiny baseline pointer CAS, so a multi-GB model
     // upload cannot block another publication merely while bytes are moving.
-    const captured = await this.engine.capture(attachment, filesFromWorld(world, target, attachment));
+    // The revision the world started from: unchanged files keep its objects.
+    const started = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
+    const transfer = this.directTransfer(world.handle) ? new DirectTransfer(world) : undefined;
+    let capture: Awaited<ReturnType<SnapshotEngine['capture']>>;
+    try {
+      capture = await this.engine.capture(attachment, filesFromWorld(world, target, attachment), {
+        ...(started?.attachmentId === attachment.id ? { baseline: started } : {}), resume: true,
+        ...(transfer ? { direct: { transfer, taskId } } : {}) });
+    } finally { await transfer?.cleanup(); }
+    const { unchanged, observed: _observed, ...captured } = capture;
+    // Identical to what the world started from: there is nothing to publish (and
+    // its manifest belongs to that revision, so it must not become another's).
+    if (unchanged && started) return { attachment, revision: started, summary };
     const baseline = await this.publicationBaseline(taskId, attachment.currentRevisionId, lease.revisionId);
     const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: baseline,
       engine: this.engine.id, ...captured, metadata: { summary }, createdByTaskId: taskId }));

@@ -117,9 +117,12 @@ const ops = {
     try {
       const chunks = [];
       let offset = input.offset;
+      // Read from the start to the end in this one run: its hash comes for free.
+      const whole = input.offset === 0 ? crypto.createHash('sha256') : undefined;
       for (let i = 0; i < input.count && (offset < size || (size === 0 && offset === 0 && i === 0)); i++) {
         const plain = Buffer.alloc(Math.min(input.chunkBytes, size - offset));
         if (!readFully(fd, plain, offset)) fail(input.path + ' changed while it was being saved');
+        whole?.update(plain);
         const id = objectId(plain);
         const iv = hmac('iv:' + id).digest().subarray(0, 12);
         const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -130,7 +133,8 @@ const ops = {
         if (!plain.length) break;
       }
       checkUnchanged(fd, input.stamp);
-      return { chunks, next: offset, size, eof: offset >= size };
+      const eof = offset >= size;
+      return { chunks, next: offset, size, eof, ...(eof && whole ? { sha256: whole.digest('hex') } : {}) };
     } finally { fs.closeSync(fd); }
   },
 

@@ -353,6 +353,59 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     expect(await handle.result()).toMatchObject({ stage: 'done' });
   }, 120_000);
 
+  it.each(['saves', 'is excluded'] as const)('output that will not save escalates, keeps its world, and continues once it %s', async (outcome) => {
+    gates.resourceCandidateTurnReleased = false;
+    const repo = await h.makeRepo(`resource-unsaved-${outcome.replace(' ', '-')}`);
+    const project = (await h.store.createProject(`Unsaved output ${outcome}`, { repos: [repo] }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Build data', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'build it' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [input({ taskId: task.id, projectId: project.id, repo, title: task.title,
+        prompt: '@resource-candidate-regression\n@write .gitignore ::data/\n'
+          + '@write build.js :: export const built = true;\n'
+          + '@run git add .gitignore build.js && git commit -q -m "build"\n@review Built data' })],
+    });
+    await expect.poll(() => Boolean(gates.releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
+    const taskWorld = (await h.store.currentWorld(task.id))!;
+    fs.mkdirSync(path.join(taskWorld.workdir ?? taskWorld.root, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'data/records.json'), '{}');
+    const proposed = await h.resources.proposePath(task.id, { path: 'data', name: 'Built data', target: { kind: 'path', path: 'data' } });
+    // Every save fails the way a paused sandbox made it fail, through all of its retries.
+    const stage = h.resources.stageCandidates.bind(h.resources);
+    let failing = true;
+    h.resources.stageCandidates = async (taskId, options = {}) => {
+      if (!failing) return stage(taskId, options);
+      await h.store.recordResourceCandidateError(proposed.candidate.id, 'the sandbox paused');
+      return { staged: [], failed: [{ candidateId: proposed.candidate.id, sourcePath: 'data', error: 'the sandbox paused' }] };
+    };
+    const at = (expected: string) => expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.status}`;
+    }, { timeout: 60_000 }).toBe(expected);
+    try {
+      gates.resourceCandidateTurnReleased = true;
+      gates.releaseResourceCandidateTurn!();
+      gates.releaseResourceCandidateTurn = undefined;
+      // An infrastructure failure escalates, like a provider error; nobody is asked to review unsaved output.
+      await at('escalated/blocked');
+      expect((await view(handle)).error).toBe('Could not save data: the sandbox paused. Nothing was deleted; Retry saves it again.');
+      expect(await h.store.getResourceCandidate(proposed.candidate.id)).toMatchObject({ state: 'pending', error: 'the sandbox paused' });
+      expect(await h.store.worldState(task.id)).not.toBe('released');
+      // Retrying while it still fails escalates again.
+      await handle.signal('retry');
+      await at('escalated/blocked');
+      if (outcome === 'saves') failing = false;
+      else await h.resources.setReviewExcluded(task.id, proposed.attachment.id, true);
+      await handle.signal('retry');
+      await at('review/waiting');
+      await handle.signal('confirm');
+      expect(await handle.result()).toMatchObject({ stage: 'done' });
+      expect((await h.store.getResourceCandidate(proposed.candidate.id))?.state).toBe(outcome === 'saves' ? 'adopted' : 'discarded');
+    } finally { h.resources.stageCandidates = stage; }
+  }, 180_000);
+
   it.each(['confirm', 'cancel', 'cancel after confirm'] as const)('staging resources: %s while it runs', async (scenario) => {
     gates.resourceCandidateTurnReleased = false;
     const repo = await h.makeRepo(`resource-candidate-stage-${scenario.replaceAll(' ', '-')}`);

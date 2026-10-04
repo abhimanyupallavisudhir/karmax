@@ -385,6 +385,36 @@ describe('E2B world transport', () => {
     await expect(w.listFiles()).rejects.toThrow('find: permission denied');
   });
 
+  it('holds the sandbox lease through commands and transfers, one renewal per interval however many there are', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+    try {
+      const box = Object.assign(sandbox(), { setTimeout: vi.fn(async () => undefined) });
+      const { world: w } = await world(box);
+      box.setTimeout.mockClear();
+      // A save is thousands of short commands: the first renews, the rest within the interval do not.
+      for (let i = 0; i < 50; i++) await w.exec('true', []);
+      expect(box.setTimeout).toHaveBeenCalledTimes(1);
+      expect(box.setTimeout).toHaveBeenCalledWith(90_000);
+      vi.advanceTimersByTime(31_000);
+      await w.exec('true', []);
+      expect(box.setTimeout).toHaveBeenCalledTimes(2);
+      // One long command keeps renewing while it runs, and stops when it ends.
+      let finish!: () => void;
+      box.commands.run.mockImplementationOnce(() => new Promise((resolve) => { finish = () => resolve({ stdout: '', stderr: '', exitCode: 0 }); }));
+      const running = w.exec('sleep', ['600']);
+      vi.advanceTimersByTime(31_000 * 4);
+      expect(box.setTimeout).toHaveBeenCalledTimes(6);
+      finish(); await running;
+      vi.advanceTimersByTime(31_000 * 4);
+      expect(box.setTimeout).toHaveBeenCalledTimes(6);
+      // File transfers hold it too.
+      vi.advanceTimersByTime(31_000);
+      box.files.read.mockResolvedValueOnce('x');
+      await w.readFile('a.txt');
+      expect(box.setTimeout).toHaveBeenCalledTimes(7);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('replays output a background process wrote before anyone listened, and renews the sandbox lease', async () => {
     const box = Object.assign(sandbox(), { setTimeout: vi.fn(async () => undefined) });
     const { world: w } = await world(box);

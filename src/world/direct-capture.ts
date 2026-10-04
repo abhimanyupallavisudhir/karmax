@@ -38,7 +38,9 @@ export interface DirectContext {
 interface Staged { id: string; file: string; bytes: number; size: number }
 
 const PACK_BYTES = CHUNK_BYTES;
-const SMALL_BYTES = 1024 * 1024;
+/** Below a pack's size a file goes into packs: one round trip reads thousands
+ * of them, where a file of its own costs several (pramana#1: 1-5 MB files). */
+const SMALL_BYTES = PACK_BYTES;
 /** One `pack` run reads at most this much, or this many files. */
 const SMALL_BATCH_BYTES = 128 * 1024 * 1024;
 const SMALL_BATCH_FILES = 8000;
@@ -127,6 +129,13 @@ export class DirectCapture<T> {
     run.catch(() => undefined); // raised by the next enqueue or flush
   }
 
+  /** Run once every upload so far is done, without waiting for it here. */
+  private after(recorded: () => void): void {
+    const run = this.inflight.then(recorded);
+    this.inflight = run;
+    run.catch(() => undefined); // raised by the next enqueue or flush
+  }
+
   private async small(batch: Array<{ input: DirectInput; original: T }>): Promise<void> {
     await this.ctx.checkContinue?.();
     const files = batch.map(({ input }) => input);
@@ -177,30 +186,36 @@ export class DirectCapture<T> {
       }
       const chunks: string[] = [];
       let offset = 0;
+      let sha256: string | undefined;
       this.unconfirmed.add(original);
       for (let eof = false; !eof;) {
         await this.ctx.checkContinue?.();
-        const result = await this.ctx.transfer.run<{ chunks: Staged[]; next: number; eof: boolean }>('chunks', {
+        const result = await this.ctx.transfer.run<{ chunks: Staged[]; next: number; eof: boolean; sha256?: string }>('chunks', {
           ...base, key: this.ctx.key.secret.toString('base64'), ...(this.ctx.namespace ? { ns: this.ctx.namespace } : {}),
           offset, count: CHUNK_BATCH, chunkBytes: CHUNK_BYTES });
         for (const chunk of result.chunks)
           if (chunk.size !== chunk.bytes + CHUNK_OVERHEAD || chunk.bytes > CHUNK_BYTES)
             throw new Error('direct capture staged an object larger than its contents');
         chunks.push(...result.chunks.map((chunk) => chunk.id));
-        offset = result.next; eof = result.eof;
+        offset = result.next; eof = result.eof; sha256 = result.sha256;
         const through = offset;
         await this.enqueue(result.chunks, [], () => this.ctx.progress(through));
         await prepared.renew?.();
         await this.ctx.tick();
       }
-      await this.inflight;
-      const hashed = await this.ctx.transfer.run<{ sha256: string; bytes: number }>('hash', base);
-      if (hashed.bytes !== offset || (input.bytes !== undefined && offset !== input.bytes))
+      // A file read in several runs is hashed whole, while its last upload runs.
+      if (!sha256) {
+        const hashed = await this.ctx.transfer.run<{ sha256: string; bytes: number }>('hash', base);
+        if (hashed.bytes !== offset) throw new Error(`${input.path} changed while it was being saved; save it again once it is settled`);
+        sha256 = hashed.sha256;
+      }
+      if (input.bytes !== undefined && offset !== input.bytes)
         throw new Error(`${input.path} changed while it was being saved; save it again once it is settled`);
       await prepared.verify?.();
-      this.ctx.add({ path: input.path, bytes: offset, sha256: hashed.sha256, chunks, key: this.ctx.key.id,
-        ...(input.observed ? { stamp: input.observed } : {}) });
-      this.unconfirmed.delete(original);
+      const entry: DirectEntry = { path: input.path, bytes: offset, sha256, chunks, key: this.ctx.key.id,
+        ...(input.observed ? { stamp: input.observed } : {}) };
+      // Recorded once its objects are stored; the next file is read meanwhile.
+      this.after(() => { this.ctx.add(entry); this.unconfirmed.delete(original); });
     } finally { await prepared.cleanup?.(); }
   }
 

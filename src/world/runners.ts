@@ -293,7 +293,10 @@ export class WorldLifecycleManager {
             && (!checkSelection || current.updatedAt === Number(candidate.updatedAt))
             && await this.store.activeWorldLeaseCount(candidate.handle.id) === 0
             && !(await this.worlds.hasActiveAccess(candidate.handle.id))
-            && (await this.store.taskMetadata(candidate.handle.id))?.lastView?.status !== 'active';
+            && (await this.store.taskMetadata(candidate.handle.id))?.lastView?.status !== 'active'
+            // Hibernating keeps only the checkpoint, never ignored output: a world
+            // holding proposed output that is not saved yet stays as it is.
+            && !(await holdsUnsavedOutput(this.store, candidate.handle.id));
         };
         if (!(await eligible(true))) return;
         let checkpoint = await this.store.latestWorldCheckpoint(candidate.handle.id);
@@ -503,4 +506,13 @@ function monthWindow(now: number): { from: number; to: number } {
   const date = new Date(now);
   return { from: Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1),
     to: Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1) };
+}
+
+/** Proposed output of this world's task that has no snapshot yet. */
+async function holdsUnsavedOutput(store: Store, taskId: string): Promise<boolean> {
+  for (const candidate of await store.listResourceCandidates(taskId, false)) {
+    if (candidate.state !== 'pending' || candidate.sourceKind !== 'path') continue;
+    if (!(await store.getResourceAttachment(candidate.attachmentId))?.currentRevisionId) return true;
+  }
+  return false;
 }

@@ -83,10 +83,11 @@ async function fixture(name: string) {
   };
   for (let i = 0; i < 300; i++) write(`pages/p-${String(i).padStart(4, '0')}.txt`, Buffer.from(`page ${i}\n`.repeat(i % 9 + 1)));
   write('large.bin', crypto.randomBytes(9 * 1024 * 1024 + 7));
+  write('scans/mid.bin', crypto.randomBytes(2.5 * 1024 * 1024));
   const db = new DatabaseSync(path.join(root, 'raw', 'library.db'));
   db.exec("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('kept')"); db.close();
   const cleanup = async () => { await world.destroy(); await presigning.close(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); };
-  return { store, task, project, resources, engine, broker, world, root, expected, objectsDir, cleanup };
+  return { store, task, project, resources, engine, broker, world, root, expected, objectsDir, cleanup, repo, worlds };
 }
 
 async function restore(f: Awaited<ReturnType<typeof fixture>>, attachmentId: string) {
@@ -110,7 +111,14 @@ describe('direct resource capture', () => {
       vi.spyOn(f.resources['worlds'], 'open').mockResolvedValue(f.world);
       const calls = vi.spyOn(f.world, 'exec').mockImplementation(exec);
       const streamed = vi.spyOn(f.world, 'readFileStream');
+      const runs = vi.spyOn(DirectTransfer.prototype, 'run');
       expect(await f.resources.stageCandidates(f.task.id, { final: true })).toEqual({ staged: [raw.candidate.id], failed: [] });
+      // Files below a pack's size go in packs; only the large file and the database take runs of their own,
+      // and a file read in one run needs no separate hash.
+      expect(runs.mock.calls.filter(([operation]) => operation === 'chunks').map(([, input]) => (input as { path: string }).path).sort())
+        .toEqual(['large.bin', 'library.db']);
+      expect(runs.mock.calls.filter(([operation]) => operation === 'hash')).toEqual([]);
+      runs.mockRestore();
       // No bytes came through the worker: no batched reads, no streams, no dd.
       expect(calls.mock.calls.some(([command, args]) => command === 'node' && String(args?.[1]).includes('readSync'))).toBe(false);
       expect(calls.mock.calls.some(([, args]) => String(args?.[1]).includes('dd '))).toBe(false);
@@ -177,6 +185,41 @@ describe('direct resource capture', () => {
       const fallback = new DirectTransfer(f.world);
       await f.engine.restore(revision, async (file) => { relayed.push(file); }, { direct: { transfer: fallback, path: (file) => file } });
       expect([...new Set(relayed)].sort()).toEqual([...f.expected.keys(), 'library.db'].sort());
+    } finally { vi.restoreAllMocks(); await f.cleanup(); }
+  }, 60_000);
+
+  it('publishes a writable resource directly, uploading only the files that changed', async () => {
+    const f = await fixture('publish');
+    try {
+      const volume = await f.store.createResourceAttachment({ organizationId: f.project.organizationId!, projectId: f.project.id,
+        name: 'Corpus', driver: 'object-tree@1', target: { kind: 'path', path: 'corpus' }, access: 'write',
+        isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+      const pages = Array.from({ length: 50 }, (_, i) => ({ path: `p-${i}.txt`, data: Buffer.from(`page ${i}\n`.repeat(i + 1)) }));
+      const big = { path: 'big.bin', data: crypto.randomBytes(5 * 1024 * 1024) };
+      await f.resources.importFiles(volume.id, [...pages, big]);
+      // A task whose world starts from that revision.
+      const task = await f.store.createTask({ projectId: f.project.id, title: 'Edit corpus', workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: 'edit it' } });
+      const world = await f.worlds.create('worktree', { taskId: task.id, repo: f.repo, base: 'main' });
+      world.handle = await f.resources.materialize(f.project.id, task.id, world, 1);
+      world.handle = (await f.store.registerWorld(world.handle, f.project.id)) as typeof world.handle;
+      vi.spyOn(f.resources['worlds'], 'open').mockResolvedValue(world);
+      const corpus = path.join(world.handle.workdir ?? world.handle.root, 'corpus');
+      fs.writeFileSync(path.join(corpus, 'p-3.txt'), 'rewritten page');
+      const before = new Set(chunkFiles(f.objectsDir));
+      const runs = vi.spyOn(DirectTransfer.prototype, 'run');
+      const published = await f.resources.promote(task.id, volume.id);
+      // The world packed and uploaded the one changed page; the large file was only hashed in place.
+      expect(runs.mock.calls.map(([operation]) => operation)).toContain('pack');
+      expect(runs.mock.calls.filter(([operation]) => operation === 'chunks')).toEqual([]);
+      expect(chunkFiles(f.objectsDir).filter((file) => !before.has(file))).toHaveLength(1);
+      const restored = new Map<string, Buffer>();
+      await f.engine.restore(published.revision, async (name, bytes, offset) => {
+        restored.set(name, offset ? Buffer.concat([restored.get(name)!, bytes]) : bytes);
+      });
+      expect(restored.get('p-3.txt')!.toString()).toBe('rewritten page');
+      expect(restored.get('big.bin')!.equals(big.data)).toBe(true);
+      expect(restored.get('p-7.txt')!.equals(pages[7]!.data)).toBe(true);
     } finally { vi.restoreAllMocks(); await f.cleanup(); }
   }, 60_000);
 
