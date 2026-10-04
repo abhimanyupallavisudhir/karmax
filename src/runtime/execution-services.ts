@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { WorldReferenceKeys, unreadableReferenceWarning } from '../world/reference-keys.js';
 import type { Client } from '@temporalio/client';
 import type { Store } from '../store/db.js';
@@ -79,8 +80,10 @@ export async function createExecutionServices(input: {
   if (bootstrap) await backfillConversationExports(store, objectStore, p.objects)
     .catch((error) => console.warn(`[conversation-exports] backfill failed: ${error instanceof Error ? error.message : String(error)}`));
   const snapshotEngine = new ObjectSnapshotEngine(objectStore, broker, storageLocations);
+  // Remote sandboxes reach the resource repositories at the public URL.
   const resources = new ProjectResourceService(store, worlds, snapshotEngine, broker,
-    { client, taskQueue: TASK_QUEUE }, storageLocations);
+    { client, taskQueue: TASK_QUEUE }, storageLocations, { objects: objectStore, cacheDir: path.join(p.home, 'cache', 'restic'),
+      world: () => process.env.KARMAX_PUBLIC_URL?.trim() || undefined });
   const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp, resources);
   const runners = new RunnerPoolService(store);
   const worldAccess = new WorldAccessService(store, worlds, runners, resources);

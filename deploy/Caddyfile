@@ -62,14 +62,33 @@
 
 {$KARMAX_DOMAIN} {
 	import karmax_security
-	import karmax_ratelimit
-	# The app sends each document its own policy (console, public pages, agent
-	# content). Anything it answers without one gets this locked-down default,
-	# so a page added later is not left unprotected. Previews are exempt: they
-	# serve people's own apps on their own origins.
-	header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
-	reverse_proxy 127.0.0.1:4505 {
-		header_up X-Forwarded-For {http.request.remote.host}
+	# Project resources are restic repositories that task sandboxes save to and
+	# restore from: a save is hundreds of requests a minute, and sandboxes may
+	# share an address, so they have their own budget, not the console's. Every
+	# request carries a signed grant for one repository, and the app enforces
+	# storage quotas.
+	handle /resource-repositories/* {
+		rate_limit {
+			zone repositories {
+				key {http.request.remote.host}
+				events 30000
+				window 1m
+			}
+		}
+		reverse_proxy 127.0.0.1:4505 {
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
+	}
+	handle {
+		import karmax_ratelimit
+		# The app sends each document its own policy (console, public pages, agent
+		# content). Anything it answers without one gets this locked-down default,
+		# so a page added later is not left unprotected. Previews are exempt: they
+		# serve people's own apps on their own origins.
+		header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+		reverse_proxy 127.0.0.1:4505 {
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
 	}
 }
 

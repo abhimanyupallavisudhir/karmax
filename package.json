@@ -14,6 +14,7 @@
   },
   "scripts": {
     "start": "tsx src/main.ts",
+    "postinstall": "node scripts/fetch-restic.mjs",
     "dev": "tsx watch --clear-screen=false src/main.ts",
     "preview:landing": "node scripts/preview-landing.mjs",
     "test": "vitest run",

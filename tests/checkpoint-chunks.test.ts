@@ -264,7 +264,7 @@ describe('chunked world checkpoints', () => {
     await fork.destroy();
   });
 
-  it('releases chunks exactly once on project deletion, keeping those a resource still holds', async () => {
+  it('releases chunks exactly once on project deletion, leaving the project\'s resources whole', async () => {
     const f = await fixture();
     const shared = crypto.randomBytes(5 * MiB);
     f.write('weights.bin', shared);
@@ -272,17 +272,16 @@ describe('chunked world checkpoints', () => {
     const attachment = await f.store.createResourceAttachment({ organizationId: f.organizationId, projectId: f.project.id,
       name: 'Weights', driver: 'volume@1', target: { kind: 'path', path: 'weights' }, access: 'read', isolation: 'fork',
       source: {}, credentialHandles: [], publish: 'discard' });
+    // Resources live in their own restic repositories, not in checkpoint chunks.
     const revision = await f.resources.importFiles(attachment.id, [{ path: 'weights.bin', data: shared }]);
-    const resourceChunks = f.chunkObjects();
-    expect(resourceChunks).toHaveLength(2);
+    expect(f.chunkObjects()).toHaveLength(0);
     const checkpoint = await f.service.checkpoint(f.world.handle);
-    expect(f.chunkObjects()).toHaveLength(3); // the weights are stored once, plus a pack
-    expect((await chunkRows(f.store)).filter(row => row.refs === 2)).toHaveLength(2);
+    expect(f.chunkObjects()).toHaveLength(3); // the weights' two chunks and a pack
     await Promise.all([f.service.deleteProject(f.project.id), f.service.deleteProject(f.project.id)]);
     expect(await f.store.listProjectCheckpoints(f.project.id)).toEqual([]);
     await expect(f.objects.get(checkpoint.filesystemDelta!.objectKey)).rejects.toThrow();
-    expect(f.chunkObjects().sort()).toEqual(resourceChunks.sort());
-    expect((await chunkRows(f.store)).map(row => row.refs)).toEqual([1, 1]);
+    expect(f.chunkObjects()).toEqual([]);
+    expect(await chunkRows(f.store)).toEqual([]);
     expect((await f.resources.verifyRevision(f.project.id, attachment.id, revision.id)).status).toBe('complete');
   });
 

@@ -1,8 +1,11 @@
 import crypto from 'node:crypto';
-import { transferResourceChunk, readResourceChunks } from './resource-transfer.js';
+import { transferResourceChunk } from './resource-transfer.js';
 import { forEachConcurrent } from '../util/async-batch.js';
 import { timed } from '../timing/index.js';
 import fs from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import type { Client } from '@temporalio/client';
 import type { CredentialBroker } from '../autonomy/broker.js';
@@ -15,7 +18,7 @@ import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
   WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
-import { worldRelativePath, worldRepos, worldWorkingRelativePath } from './types.js';
+import { worldRelativePath, worldRepos, worldWorkingDirectory, worldWorkingRelativePath } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL_RESOURCE_PUBLISH,
   SIG_ENQUEUE_RESOURCE_PUBLISH, SIG_RELEASE_RESOURCE_PUBLISH,
@@ -28,17 +31,16 @@ import { ensureWorldExcluded } from './secret-exclude.js';
 import { expandPath } from '../util/expand.js';
 import { managedRepoPath } from './worktree.js';
 import { screenEnvironment, type SkippedEnv } from '../util/work-env.js';
-import { CHUNK_BYTES, chunkId as contentChunkId, chunkObjectKey, fixedChunks, openCompressed, openDeterministic, openRandom,
-  organizationKey, organizationKeyHandle, sealCompressed, sealDeterministic, sealRandom, sha256 } from './chunk-store.js';
-import { READ_BATCH_BYTES, readCheckpointRanges } from './checkpoint-read.js';
-import { DirectCapture, type DirectSource } from './direct-capture.js';
-import { DirectTransfer, DirectTransferError } from './direct-transfer.js';
+import { CHUNK_BYTES, chunkObjectKey, openCompressed, openDeterministic, openRandom,
+  organizationKey, organizationKeyHandle, sha256 } from './chunk-store.js';
+import { REPOSITORY_ROUTE, RepositoryTokens, ResourceRepositoryServer, parseRepositoryName } from './resource-repository.js';
+import { RESTIC_ENGINE, ResticResources, resticRef, type Repository, type ResticCapture, type ResticPlace } from './restic-engine.js';
 
 const COPY_GLOB_SECRET_BYTES = 64 * 1024;
+const PACK_BYTES = CHUNK_BYTES;
 
 /** A file is its own chunks, or (version 2, when small) a slice of a shared pack. */
 type SnapshotEntry = { path: string; bytes: number; sha256: string } & ({ chunks: string[] } | { pack: number; offset: number });
-type SnapshotFile = SnapshotEntry;
 /** Version 3 adds per-capture keys: `keyed` names the key of every object not
  * under the organization key, and `keys` holds those keys, sealed with the
  * manifest under the organization key (wiki planned/direct-resource-uploads). */
@@ -47,46 +49,8 @@ interface SnapshotManifest { version: 1 | 2 | 3; attachmentId: string; files: Sn
 /** A key a world held while capturing, and the task it was made for. */
 interface CaptureKey { key: string; task?: string }
 interface SnapshotRef { objectKey: string; sha256: string; storageLocationId?: string }
-/** `data` is consumed only when the file must be read: an input whose
- * `observed` stamp matches the one recorded with the baseline reuses the
- * baseline's chunks. A small file with a `range` is read together with others
- * through its `reader` instead. */
-export interface SnapshotInputFile { path: string; data: Buffer | AsyncIterable<Buffer>; bytes?: number; observed?: string; range?: SnapshotRange;
-  /** Where the world can read the file itself, for a direct capture. */
-  direct?: DirectSource }
-/** Reads many whole files in one round trip, yielding each one's bytes in order,
- * or undefined for a file whose `stamp` no longer matches (it changed). */
-export interface SnapshotRange {
-  reader: (files: Array<{ source: string; stamp: string; bytes: number }>) => AsyncIterable<Buffer | undefined>;
-  source: string;
-  stamp: string;
-}
-export interface CaptureOptions {
-  baseline?: ResourceRevision;
-  observed?: string;
-  enforceQuota?: boolean;
-  /** Record progress so an interrupted capture's next attempt continues from it
-   * instead of reading and uploading everything again ({@link CaptureProgress}). */
-  resume?: boolean;
-  onProgress?: (done: { files: number; bytes: number }) => void;
-  /** Let the world read, encrypt and upload files itself, under a key made for
-   * this task's captures of this resource, when the store can presign URLs. */
-  direct?: { transfer: DirectTransfer; taskId: string };
-}
-
-/** Files smaller than this share compressed packs, as world checkpoints do: a
- * tree of 70,000 small files is a few thousand objects, not 70,000. */
-const PACKED_FILE_BYTES = 1024 * 1024;
-const PACK_BYTES = CHUNK_BYTES;
-/** One batched read returns at most this much (as base64), or this many files. */
-const BATCH_READ_BYTES = READ_BATCH_BYTES;
-const BATCH_READ_FILES = 128;
-const UPLOAD_CONCURRENCY = 4;
-/** How often a resumable capture records what it has saved. A record not
- * updated for PROGRESS_STALE_MS belongs to an attempt that died: a worker that
- * stopped heartbeating is retried no sooner than a minute later. */
-const PROGRESS_INTERVAL_MS = 10_000;
-const PROGRESS_STALE_MS = 45_000;
+/** A file for an import: an upload or a copied-over setting. */
+export interface SnapshotInputFile { path: string; data: Buffer | AsyncIterable<Buffer>; bytes?: number }
 export interface SnapshotVerification {
   status: 'complete' | 'partial' | 'failed';
   manifestVerified: boolean;
@@ -119,16 +83,7 @@ export interface ProposedResourceCandidate {
 /** A candidate that no retry can stage: its world or path is gone. */
 class UnstageableCandidate extends Error {}
 
-export interface RestoreOptions {
-  signal?: AbortSignal;
-  /** Let the world fetch what it can itself; `path` maps a file to its absolute
-   * path there. `started` records that it did, so a failure after that is not
-   * mistaken for a world that cannot run the transfer. */
-  direct?: { transfer: DirectTransfer; path: (file: string) => string; started?: boolean };
-}
-const RESTORE_BATCH_OBJECTS = 32;
-const RESTORE_CONCURRENCY = 16;
-const RESTORE_BATCH_SEGMENTS = 4000;
+export interface RestoreOptions { signal?: AbortSignal }
 
 /** How far staging is through one candidate (`index` of `count`). */
 export interface StagingProgress { path: string; index: number; count: number; files: number; totalFiles: number; bytes: number; totalBytes: number }
@@ -138,23 +93,12 @@ export interface StagedResourceCandidates {
   failed: Array<{ candidateId: string; sourcePath?: string; error: string }>;
 }
 
-/** Replaceable snapshot data-plane contract (SPEC §11.4). The built-in engine
- * keeps the first release self-contained; production deployments can substitute
- * Kopia without changing resource, lease, or workflow records. */
+/** Resource versions saved before restic (`object-snapshot@1`): read,
+ * verified and deleted here until convertLegacyRevisions has moved them into
+ * restic repositories; nothing writes them any more. */
 export interface SnapshotEngine {
   readonly id: string;
-  /** An `incremental` capture may reuse its `baseline` revision's chunks, and
-   * `unchanged: true` means it equals the baseline, whose sealedRef is returned
-   * instead of a new manifest. It also returns `observed`, an opaque sealed
-   * record of the file stamps it saw; passing that back with the revision this
-   * capture resolved to lets the next one skip files whose stamps match.
-   * `enforceQuota: false` counts new chunks without refusing them (checkpoints). */
-  capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>,
-    incremental?: CaptureOptions): Promise<{
-    sealedRef: string; rootDigest: string; bytes: number; files: number; storageLocationId?: string; unchanged?: boolean;
-    observed?: string;
-  }>;
-  /** Release what an interrupted resumable capture of this attachment saved. */
+  /** Release what an interrupted pre-restic capture of this attachment saved. */
   abandonProgress?(attachment: ResourceAttachment): Promise<void>;
   restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>,
     options?: RestoreOptions): Promise<void>;
@@ -164,9 +108,8 @@ export interface SnapshotEngine {
   delete?(revision: ResourceRevision, owner?: ResourceAttachment): Promise<void>;
 }
 
-/** Tenant-keyed, encrypted content-addressed engine over the configured object
- * store. Chunks are deliberately behind SnapshotEngine so a Kopia-backed engine
- * can replace this compatibility implementation without changing durable rows. */
+/** The pre-restic engine: tenant-keyed, encrypted content-addressed chunks over
+ * the configured object store, described by a sealed manifest per revision. */
 export class ObjectSnapshotEngine implements SnapshotEngine {
   readonly id = 'object-snapshot@1';
   constructor(private objects: ObjectStore, private broker: CredentialBroker,
@@ -178,333 +121,23 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     return id && this.storageLocations ? (await this.storageLocations.objectStore(id)) : this.objects;
   }
 
-  async capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>,
-    incremental?: CaptureOptions) {
-    const quota = { enforceQuota: incremental?.enforceQuota !== false };
-    const key = await this.key(attachment.organizationId);
-    const storageLocationId = this.storageLocations
-      ? (await this.storageLocations.requireForOrganization(attachment.organizationId, attachment.storageLocationId)).id
-      : attachment.storageLocationId;
-    const chunkNamespace = storageLocationId && this.storageLocations
-      && (await this.storageLocations.requireForOrganization(attachment.organizationId, storageLocationId)).kind === 's3'
-      ? storageLocationId : undefined;
-    const objects = storageLocationId && this.storageLocations ? (await this.storageLocations.objectStore(storageLocationId)) : this.objects;
-    // Chunks referenced by the baseline already exist in this location, so an
-    // unchanged file needs neither a read nor an upload (LT-11). The baseline's
-    // revision holds their references until the new one retains its own.
-    const baselineRevision = incremental?.baseline;
-    const baseline = baselineRevision?.attachmentId === attachment.id && baselineRevision.engine === this.id
-      && (baselineRevision.storageLocationId ?? undefined) === (storageLocationId ?? undefined)
-      ? await this.manifest(baselineRevision).catch(() => undefined) : undefined;
-    const stamps = baseline && incremental?.observed ? openStamps(key, incremental.observed, attachment.id, baseline.rootDigest) : undefined;
-    const previous = new Map(baseline?.files.map((file) => [file.path, file]));
-    // Objects known to exist: the baseline's, and whatever this capture (or the
-    // interrupted attempt it resumes) has finished uploading.
-    const present = new Set(baseline ? manifestObjects(baseline) : []);
-    /** References this capture holds: one per distinct object of its manifest once it completes. */
-    const held = new Map<string, number>();
-    const progress = incremental?.resume && this.progressStore
-      ? await CaptureProgress.claim(this.progressStore, key, attachment, storageLocationId) : undefined;
-    const resumed = new Map(progress?.files.map((file) => [file.path, file]));
-    for (const [id, bytes] of progress?.held ?? []) { held.set(id, bytes); present.add(id); }
-    /** Keys of objects not under the organization key: the baseline's, and those an interrupted attempt used. */
-    const knownKeys = new Map<string, CaptureKey>([...Object.entries(baseline?.keys ?? {}), ...Object.entries(progress?.keys ?? {})]);
-    const baselineKeyOf = (id: string) => baseline?.keyed?.[id];
-    const direct = incremental?.direct && objects.presign && objects.head ? incremental.direct : undefined;
-    // One key per task and resource: a retry, a resume and a later refresh by
-    // the same task reuse it, so they reuse its objects too.
-    let directKey: { id: string; secret: Buffer } | undefined;
-    if (direct) {
-      const own = [...knownKeys].find(([, value]) => value.task === direct.taskId);
-      const id = own?.[0] ?? crypto.randomBytes(8).toString('hex');
-      if (!own) knownKeys.set(id, { key: crypto.randomBytes(32).toString('base64'), task: direct.taskId });
-      directKey = { id, secret: Buffer.from(knownKeys.get(id)!.key, 'base64') };
-    }
-
-    /** Every file captured so far, by object id; numbered into a manifest at the end. */
-    const captured: ProgressFile[] = [];
-    /** Those a later attempt can resume from (stable stamps). */
-    const completed: ProgressFile[] = [];
-    const observed: Record<string, string> = {};
-    let total = 0;
-    let wrote = false;
-    const report = () => incremental?.onProgress?.({ files: captured.length, bytes: total });
-    const add = (entry: ProgressFile) => {
-      captured.push(entry);
-      if (entry.stamp) completed.push(entry);
-      total += entry.bytes;
-    };
-
-    const retain = async (chunks: Array<{ id: string; bytes: number }>) => {
-      const fresh = [...new Map(chunks.filter((chunk) => !held.has(chunk.id)).map((chunk) => [chunk.id, chunk])).values()];
-      if (!fresh.length) return;
-      await this.chunkAccounting?.retain(attachment.organizationId, fresh, storageLocationId, quota);
-      for (const chunk of fresh) held.set(chunk.id, chunk.bytes);
-    };
-    // Reusing an unchanged file retains its objects in batches, not per file.
-    let reusedPending: Array<{ id: string; bytes: number }> = [];
-    const retainReused = async () => { const pending = reusedPending; reusedPending = []; await retain(pending); };
-    /** Keep a baseline file as it is: its objects are already stored. */
-    const reuse = async (prior: SnapshotEntry, stamp: string | undefined) => {
-      const pack = 'pack' in prior ? baseline!.packs![prior.pack]! : undefined;
-      if (pack) reusedPending.push({ id: pack, bytes: PACK_BYTES });
-      else ('chunks' in prior ? prior.chunks : []).forEach((id, index) =>
-        reusedPending.push({ id, bytes: Math.min(CHUNK_BYTES, prior.bytes - index * CHUNK_BYTES) }));
-      if (reusedPending.length >= 1024) await retainReused();
-      const { pack: _index, ...rest } = prior as SnapshotEntry & { pack?: number };
-      const keyId = baselineKeyOf(pack ?? ('chunks' in prior ? prior.chunks[0]! : ''));
-      add({ ...rest, ...(pack ? { pack } : {}), ...(keyId ? { key: keyId } : {}), ...(stamp ? { stamp } : {}) });
-    };
-    const uploads = new BoundedUploads(UPLOAD_CONCURRENCY);
-    const uploading = new Set<string>();
-    const put = async (id: string, bytes: number, seal: () => Buffer | Promise<Buffer>) => {
-      await retain([{ id, bytes }]);
-      if (present.has(id) || uploading.has(id)) return;
-      uploading.add(id);
-      await uploads.add(async () => {
-        await objects.put(chunkObjectKey(attachment.organizationId, id), await seal());
-        present.add(id);
-        wrote = true;
-      });
-    };
-
-    let pack: Buffer[] = [];
-    let packBytes = 0;
-    let packed: ProgressFile[] = [];
-    const flushPack = async () => {
-      if (!packed.length) return;
-      const plain = Buffer.concat(pack, packBytes);
-      const id = contentChunkId(key, chunkNamespace, plain, 'pack');
-      await put(id, plain.length, () => sealCompressed(key, id, plain));
-      for (const file of packed) add({ ...file, pack: id });
-      pack = []; packBytes = 0; packed = [];
-    };
-    const addSmall = async (input: { path: string; observed?: string }, data: Buffer) => {
-      const digest = sha256(data);
-      // Read, but unchanged: packs are not content-addressed per file the way
-      // chunks are, so the baseline's slice is kept rather than packed again.
-      const prior = previous.get(input.path);
-      if (prior && prior.bytes === data.length && prior.sha256 === digest) return reuse(prior, input.observed);
-      if (packBytes && packBytes + data.length > PACK_BYTES) await flushPack();
-      packed.push({ path: input.path, bytes: data.length, sha256: digest, offset: packBytes,
-        ...(input.observed ? { stamp: input.observed } : {}) });
-      pack.push(data); packBytes += data.length;
-    };
-
-    // Small files a source can read together go out in one round trip per batch.
-    let batch: Array<{ input: SnapshotInputFile & { range: SnapshotRange }; path: string }> = [];
-    let batchBytes = 0;
-    const readBatch = async () => {
-      if (!batch.length) return;
-      const pending = batch; batch = []; batchBytes = 0;
-      let index = 0;
-      for await (const data of pending[0]!.input.range.reader(pending.map(({ input }) => ({ ...input.range, bytes: input.bytes! })))) {
-        const item = pending[index++];
-        if (!item) throw new Error('resource batch read returned too many files');
-        if (!data || data.length !== item.input.bytes) throw new Error(`${item.path} changed while it was being saved; save it again once it is settled`);
-        await addSmall({ path: item.path, observed: item.input.observed }, data);
-      }
-      if (index !== pending.length) throw new Error('resource batch read ended early');
-      report();
-    };
-
-    let lastSaved = Date.now();
-    let recorded = 0;
-    const saveProgress = async (park = false) => {
-      if (!progress) return;
-      // A part-filled pack is still a pack: saving it makes the files read so far
-      // resumable. A stopping attempt reads nothing more, and keeps what it read
-      // unless uploading is what failed.
-      if (!park) { await readBatch(); await flushPack(); await uploads.drain(); }
-      else {
-        if (!uploads.failed) await flushPack().catch(() => undefined);
-        await uploads.settle();
-      }
-      await retainReused();
-      // Only what is uploaded and held can be resumed from; each save adds the
-      // files completed since the last one.
-      const added = completed.slice(recorded).filter((file) => entryObjects(file).every((id) => held.has(id) && present.has(id)));
-      await progress.save(added, [...held].filter(([id]) => present.has(id)), park, Object.fromEntries(knownKeys));
-      recorded = completed.length;
-      lastSaved = Date.now();
-    };
-
-    /** Read a file through the worker: batched when small, streamed when large. */
-    const relay = async (input: SnapshotInputFile, relative: string) => {
-      if (input.range && input.bytes !== undefined && input.bytes < PACKED_FILE_BYTES) {
-        if (batch.length && (batch[0]!.input.range.reader !== input.range.reader || batch.length >= BATCH_READ_FILES
-          || batchBytes + input.bytes > BATCH_READ_BYTES)) await readBatch();
-        batch.push({ input: input as SnapshotInputFile & { range: SnapshotRange }, path: relative });
-        batchBytes += input.bytes;
-      } else {
-        await readBatch();
-        if (input.bytes !== undefined && input.bytes < PACKED_FILE_BYTES) {
-          const parts: Buffer[] = [];
-          for await (const data of fixedChunks(input.data)) parts.push(data);
-          const data = Buffer.concat(parts);
-          if (data.length !== input.bytes) throw new Error('resource capture size mismatch');
-          await addSmall({ path: relative, observed: input.observed }, data);
-        } else {
-          const chunks: string[] = [];
-          const digest = crypto.createHash('sha256');
-          let fileBytes = 0;
-          for await (const plain of fixedChunks(input.data)) {
-            const chunkId = contentChunkId(key, chunkNamespace, plain);
-            await put(chunkId, plain.length, () => sealDeterministic(key, chunkId, plain));
-            chunks.push(chunkId);
-            digest.update(plain);
-            fileBytes += plain.length;
-            incremental?.onProgress?.({ files: captured.length, bytes: total + fileBytes });
-            // A long file keeps its record fresh, and its uploaded chunks are
-            // kept for a retry, which re-reads the file but uploads only the rest.
-            if (progress && Date.now() - lastSaved >= PROGRESS_INTERVAL_MS) await saveProgress();
-          }
-          if (input.bytes !== undefined && fileBytes !== input.bytes)
-            throw new Error('resource capture size mismatch');
-          add({ path: relative, bytes: fileBytes, sha256: digest.digest('hex'), chunks,
-            ...(input.observed ? { stamp: input.observed } : {}) });
-          report();
-        }
-      }
-    };
-
-    const directCapture = direct && directKey ? new DirectCapture<{ input: SnapshotInputFile; relative: string }>({
-      organizationId: attachment.organizationId, key: directKey, namespace: chunkNamespace,
-      objects: objects as Required<Pick<ObjectStore, 'presign' | 'head'>>, transfer: direct.transfer,
-      baseline: (path) => previous.get(path),
-      reuse: (path, stamp) => reuse(previous.get(path)!, stamp),
-      retain, present,
-      add: (entry) => add(entry),
-      uploaded: () => { wrote = true; },
-      progress: (inFlight) => incremental?.onProgress?.({ files: captured.length, bytes: total + inFlight }),
-      tick: async () => { if (progress && Date.now() - lastSaved >= PROGRESS_INTERVAL_MS) await saveProgress(); },
-    }) : undefined;
-
-    try {
-      for await (const input of files) {
-        const relative = safePath(input.path);
-        if (incremental && input.observed) observed[relative] = input.observed;
-        const earlier = input.observed ? resumed.get(relative) : undefined;
-        if (earlier && earlier.stamp === input.observed && entryObjects(earlier).every((id) => held.has(id))
-          && (!earlier.key || knownKeys.has(earlier.key))) {
-          add(earlier);
-          continue;
-        }
-        const prior = previous.get(relative);
-        if (prior && input.observed && stamps?.[relative] === input.observed) {
-          await reuse(prior, input.observed);
-          continue;
-        }
-        if (directCapture && !directCapture.disabled && input.direct) {
-          const handed = await directCapture.add({ path: relative, bytes: input.bytes, observed: input.observed, ...input.direct },
-            { input, relative });
-          for (const item of handed ?? []) await relay(item.input, item.relative);
-        } else await relay(input, relative);
-        if (progress && Date.now() - lastSaved >= PROGRESS_INTERVAL_MS) await saveProgress();
-      }
-      for (const item of (await directCapture?.flush()) ?? []) await relay(item.input, item.relative);
-      await readBatch();
-      await flushPack();
-      await retainReused();
-      await uploads.drain();
-      report();
-      // Packs are numbered in path order, so the same files in the same packs
-      // make the same manifest however the capture encountered them.
-      captured.sort((a, b) => a.path.localeCompare(b.path));
-      const packs = [...new Set(captured.flatMap((file) => file.pack ? [file.pack] : []))];
-      const packIndex = new Map(packs.map((id, index) => [id, index]));
-      const manifestFiles = captured.map(({ stamp: _stamp, key: _key, pack, offset, chunks, ...file }): SnapshotEntry =>
-        pack ? { ...file, pack: packIndex.get(pack)!, offset: offset! } : { ...file, chunks: chunks! });
-      // Objects under a capture key, and those keys; none means a version-2 manifest.
-      const keyed: Record<string, string> = {};
-      for (const file of captured) if (file.key) for (const id of entryObjects(file)) keyed[id] = file.key;
-      const keys = Object.fromEntries([...new Set(Object.values(keyed))].map((id) => [id, knownKeys.get(id)!]));
-      const rootDigest = manifestDigest(manifestFiles, packs, keyed);
-      const sealedStamps = Object.keys(observed).length ? sealStamps(key, attachment.id, rootDigest, observed) : undefined;
-      const referenced = new Set([...packs, ...manifestFiles.flatMap((file) => 'chunks' in file ? file.chunks : [])]);
-      // The progress record is gone before any reference it names is released,
-      // so no later attempt can adopt (and release again) what is released here.
-      await progress?.clear();
-      if (baseline && rootDigest === baseline.rootDigest && !wrote) {
-        await this.releaseHeld(attachment.organizationId, objects, [...held.keys()]);
-        held.clear();
-        return { sealedRef: baselineRevision!.sealedRef, rootDigest, bytes: total, files: manifestFiles.length, storageLocationId,
-          unchanged: true, ...(sealedStamps ? { observed: sealedStamps } : {}) };
-      }
-      // A file that changed after an interrupted attempt saved it leaves objects nothing references.
-      const orphans = [...held.keys()].filter((id) => !referenced.has(id));
-      if (orphans.length) {
-        await this.releaseHeld(attachment.organizationId, objects, orphans);
-        for (const id of orphans) held.delete(id);
-      }
-      const manifest: SnapshotManifest = Object.keys(keyed).length
-        ? { version: 3, attachmentId: attachment.id, files: manifestFiles, packs, keys, keyed, rootDigest, bytes: total }
-        : { version: 2, attachmentId: attachment.id, files: manifestFiles, packs, rootDigest, bytes: total };
-      const encrypted = sealRandom(key, Buffer.from(JSON.stringify(manifest)));
-      const objectKey = `resources/${attachment.organizationId}/manifests/${attachment.id}/${newId('snapshot')}.bin`;
-      await objects.put(objectKey, encrypted);
-      return { sealedRef: JSON.stringify({ objectKey, sha256: sha256(encrypted), storageLocationId } satisfies SnapshotRef),
-        rootDigest, bytes: total, files: manifestFiles.length, storageLocationId,
-        ...(sealedStamps ? { observed: sealedStamps } : {}) };
-    } catch (error) {
-      await uploads.settle();
-      // Superseded: the references now belong to whoever took the record over.
-      if (error instanceof CaptureSuperseded || progress?.lost) throw error;
-      if (progress) {
-        // Keep what is saved for the next attempt; release only what never made
-        // it, which no record names (a record lists only uploaded objects).
-        try {
-          const unsaved = [...held.keys()].filter((id) => !present.has(id));
-          await this.releaseHeld(attachment.organizationId, objects, unsaved);
-          for (const id of unsaved) held.delete(id);
-          await saveProgress(true);
-        } catch { /* unrecorded references leak rather than risk releasing ones a record still names */ }
-        throw error;
-      }
-      await this.releaseHeld(attachment.organizationId, objects, [...held.keys()]);
-      throw error;
-    }
-  }
-
-  /** Give up an interrupted capture's saved progress, releasing what it holds.
-   * A capture still running loses its record and stops without releasing. */
+  /** Release what a capture interrupted before restic held (its kv progress record). */
   async abandonProgress(attachment: ResourceAttachment): Promise<void> {
     if (!this.progressStore) return;
-    const held = await CaptureProgress.take(this.progressStore, await this.key(attachment.organizationId, false)
+    const held = await takeProgress(this.progressStore, await this.key(attachment.organizationId, false)
       .catch(() => undefined), attachment.id);
     if (!held?.ids.length) return;
     const objects = held.storageLocationId && this.storageLocations
       ? (await this.storageLocations.objectStore(held.storageLocationId)) : this.objects;
-    await this.releaseHeld(attachment.organizationId, objects, held.ids);
-  }
-
-  private async releaseHeld(organizationId: string, objects: ObjectStore, ids: string[]): Promise<void> {
-    if (!ids.length) return;
-    const zero = (await this.chunkAccounting?.release(organizationId, ids)) ?? [];
-    await Promise.allSettled(zero.map((chunkId) => objects.delete(chunkObjectKey(organizationId, chunkId))));
+    const zero = (await this.chunkAccounting?.release(attachment.organizationId, held.ids)) ?? [];
+    await Promise.allSettled(zero.map((chunkId) => objects.delete(chunkObjectKey(attachment.organizationId, chunkId))));
   }
 
   async restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>,
     options: RestoreOptions = {}): Promise<void> {
     options.signal?.throwIfAborted();
     const manifest = await this.manifest(revision);
-    // Files whose objects are all under capture keys can go straight from the
-    // store to the world; anything under the organization key, whose key never
-    // leaves the worker, comes through it.
-    let relayed = manifest.files;
-    if (options.direct && manifest.keyed) {
-      const objects = await this.objectsForRevision(revision);
-      const direct = manifest.files.filter((file) => entryIds(manifest, file).every((id) => manifest.keyed![id]));
-      if (objects.presign && direct.length) {
-        try {
-          await this.restoreDirect(revision, manifest, direct, objects as Required<Pick<ObjectStore, 'presign'>> & ObjectStore, options.direct, options.signal);
-          relayed = manifest.files.filter((file) => !direct.includes(file));
-        } catch (error) {
-          // A world that cannot run the transfer at all is written through the worker.
-          if (!(error instanceof DirectTransferError) || options.direct.started) throw error;
-        }
-      }
-    }
+    const relayed = manifest.files;
     // Bound memory and request fan-out. Chunks of each file remain ordered;
     // independent files can transfer together. Settle all writes before cleanup.
     const packs = await this.packReader(revision, manifest);
@@ -528,60 +161,6 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     }, 4);
   }
 
-  /** Batches of whole files (pack slices) and chunk runs, each object fetched
-   * once by the world through its own presigned GET; only the keys of the
-   * objects in a batch go with it. */
-  private async restoreDirect(revision: ResourceRevision, manifest: SnapshotManifest, files: SnapshotEntry[],
-    objects: ObjectStore & Required<Pick<ObjectStore, 'presign'>>, direct: NonNullable<RestoreOptions['direct']>, signal?: AbortSignal): Promise<void> {
-    const attachment = await this.attachmentFor(revision);
-    const namespace = revision.storageLocationId && this.storageLocations
-      && (await this.storageLocations.requireForOrganization(attachment.organizationId, revision.storageLocationId)).kind === 's3'
-      ? revision.storageLocationId : undefined;
-    type Segment = { path: string; position: number; size: number; object: { id: string; kind: 'pack' | 'chunk' }; slice?: [number, number]; sha256?: string };
-    const batches: Segment[][] = [];
-    let current: Segment[] = [];
-    let objectsInBatch = new Set<string>();
-    const push = (segment: Segment) => {
-      if (!objectsInBatch.has(segment.object.id) && (objectsInBatch.size >= RESTORE_BATCH_OBJECTS || current.length >= RESTORE_BATCH_SEGMENTS)) {
-        batches.push(current); current = []; objectsInBatch = new Set();
-      }
-      objectsInBatch.add(segment.object.id);
-      current.push(segment);
-    };
-    const hashed: SnapshotEntry[] = [];
-    for (const file of files) {
-      const target = direct.path(file.path);
-      if ('pack' in file) push({ path: target, position: 0, size: file.bytes, object: { id: manifest.packs![file.pack]!, kind: 'pack' },
-        slice: [file.offset, file.offset + file.bytes], sha256: file.sha256 });
-      else {
-        file.chunks.forEach((id, index) => push({ path: target, position: index * CHUNK_BYTES, size: file.bytes, object: { id, kind: 'chunk' },
-          ...(file.chunks.length === 1 ? { sha256: file.sha256 } : {}) }));
-        if (file.chunks.length > 1) hashed.push(file);
-      }
-    }
-    if (current.length) batches.push(current);
-    // Two batches at once, each fetching many objects in parallel: one object
-    // at a time pays the store's latency on every 4 MiB.
-    await forEachConcurrent(batches, async (batch) => {
-      signal?.throwIfAborted();
-      const ids = [...new Set(batch.map((segment) => segment.object.id))];
-      const urls = new Map(await Promise.all(ids.map(async (id) =>
-        [id, await objects.presign('GET', chunkObjectKey(attachment.organizationId, id), 15 * 60)] as const)));
-      const keys = Object.fromEntries([...new Set(ids.map((id) => manifest.keyed![id]!))].map((id) => [id, manifest.keys![id]!.key]));
-      await direct.transfer.run('restore', { keys, ...(namespace ? { ns: namespace } : {}), concurrency: RESTORE_CONCURRENCY,
-        segments: batch.map((segment) => ({ ...segment, object: { ...segment.object, key: manifest.keyed![segment.object.id],
-          url: urls.get(segment.object.id) } })) });
-      direct.started = true;
-    }, 2);
-    // A file of several chunks was written a chunk at a time: check it whole.
-    for (const file of hashed) {
-      signal?.throwIfAborted();
-      const result = await direct.transfer.run<{ sha256: string; bytes: number }>('hash', { source: direct.path(file.path), path: file.path });
-      if (result.sha256 !== file.sha256 || result.bytes !== file.bytes) throw new Error('resource snapshot integrity mismatch');
-    }
-  }
-
-  /** One shared streaming integrity check for restore and verification. */
   private async *readFile(revision: ResourceRevision, manifest: SnapshotManifest, file: SnapshotEntry,
     packs: (index: number) => Promise<Buffer>): AsyncIterable<Buffer> {
     if ('pack' in file) {
@@ -749,15 +328,35 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
  * live provider-owned World. */
 export class ProjectResourceService {
   private publishLocks = new Map<string, Promise<void>>();
-  /** Whether a world moves resource bytes to the store itself (sandboxes with
-   * their own route to it), rather than through the worker.
-   * KARMAX_DIRECT_RESOURCE_TRANSFER=0 turns it off. */
-  directTransfer = (handle: WorldHandle): boolean => process.env.KARMAX_DIRECT_RESOURCE_TRANSFER !== '0'
-    && (handle.kind === 'e2b' || handle.kind === 'daytona');
+  /** The restic repositories resources are saved in, and the server restic reaches them at. */
+  readonly restic: ResticResources;
+  readonly repositoryServer: ResourceRepositoryServer;
+  private loopback?: Promise<string>;
 
+  /** `repositories.world` is where a remote sandbox reaches the repositories
+   * (the public URL); this host's own restic uses a loopback port. */
   constructor(private store: Store, private worlds: WorldRegistry, private engine: SnapshotEngine,
     private broker: CredentialBroker, private coordinator?: { client: Client; taskQueue: string },
-    private storageLocations?: StorageLocationService) {
+    private storageLocations?: StorageLocationService,
+    repositories: { objects?: ObjectStore; world?: (handle: WorldHandle) => string | undefined; cacheDir?: string;
+      proxyReads?: boolean } = {}) {
+    // A location must be the organization's own, whatever a row or URL names.
+    const locationOf = async (attachment: ResourceAttachment) => (await this.storageLocations?.requireForOrganization(
+      attachment.organizationId, attachment.storageLocationId))?.id ?? attachment.storageLocationId;
+    const objects = async (attachment: ResourceAttachment, storageLocationId: string | undefined) => {
+      if (storageLocationId && this.storageLocations) {
+        await this.storageLocations.requireForOrganization(attachment.organizationId, storageLocationId);
+        return this.storageLocations.objectStore(storageLocationId);
+      }
+      const fallback = repositories.objects ?? (engine instanceof ObjectSnapshotEngine ? await engine.objectStoreForAttachment(attachment) : undefined);
+      if (!fallback) throw new Error('resource storage is not configured');
+      return fallback;
+    };
+    const tokens = new RepositoryTokens(broker);
+    this.repositoryServer = new ResourceRepositoryServer({ store, tokens, objects, ...(repositories.proxyReads ? { proxyReads: true } : {}) });
+    this.restic = new ResticResources({ store, broker, tokens, locationOf, objects,
+      endpoints: { host: () => this.loopbackUrl(), world: repositories.world ?? (() => undefined) },
+      ...(repositories.cacheDir ? { cacheDir: repositories.cacheDir } : {}) });
     if (engine instanceof ObjectSnapshotEngine) engine.setAttachmentResolver(async (id) => (await store.getResourceAttachment(id)));
     if (engine instanceof ObjectSnapshotEngine) engine.setChunkAccounting({
       retain: async (organizationId, chunks, storageLocationId, options) => (await store.retainResourceChunks(organizationId, chunks, storageLocationId, options)),
@@ -765,10 +364,23 @@ export class ProjectResourceService {
     });
     if (engine instanceof ObjectSnapshotEngine) engine.setProgressStore({
       get: (key) => store.kvGet(key),
-      set: (key, value) => store.kvSet(key, value),
       compareAndSet: (key, expected, next) => store.kvCompareAndSet(key, expected, next),
       keys: async (prefix) => (await store.kvEntries(prefix)).map((entry) => entry.key),
       delete: (key) => store.kvDelete(key),
+    });
+  }
+
+  /** The repositories on a loopback port, for restic run by this process (and
+   * by test worlds that only claim to be remote). */
+  loopbackUrl(): Promise<string> {
+    return this.loopback ??= new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        if (!url.pathname.startsWith(REPOSITORY_ROUTE)) { res.writeHead(404).end(); return; }
+        void this.repositoryServer.handle(req, res, url.pathname.slice(REPOSITORY_ROUTE.length) + url.search);
+      });
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => { server.unref(); resolve(`http://127.0.0.1:${(server.address() as AddressInfo).port}`); });
     });
   }
 
@@ -782,7 +394,7 @@ export class ProjectResourceService {
       throw new Error('resource revision not found');
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
       throw new Error('offset must be a nonnegative integer; limit must be 1–1000');
-    if (!isSnapshotDriver(attachment.driver) || revision.engine !== this.engine.id || !this.engine.verify)
+    if (!isSnapshotDriver(attachment.driver) || (revision.engine !== RESTIC_ENGINE && (revision.engine !== this.engine.id || !this.engine.verify)))
       throw new Error('resource revision verification is unsupported');
     if (revision.storageLocationId && this.storageLocations) {
       try { (await this.storageLocations.requireForOrganization(attachment.organizationId, revision.storageLocationId)); }
@@ -790,7 +402,9 @@ export class ProjectResourceService {
     }
     return { projectId, resourceId: attachment.id, revisionId: revision.id,
       storageLocationId: revision.storageLocationId ?? null,
-      ...await this.engine.verify(revision, offset, limit) };
+      ...(revision.engine === RESTIC_ENGINE
+        ? await this.restic.verify(this.restic.of(attachment, revision), resticRef(revision).snapshot, offset, limit)
+        : await this.engine.verify!(revision, offset, limit)) };
   }
 
   async storageLocationFor(organizationId: string, requested?: string): Promise<string | undefined> {
@@ -838,28 +452,27 @@ export class ProjectResourceService {
           if (revisionId) {
             const revision = (await this.store.getResourceRevision(revisionId));
             if (!revision) throw new Error(`resource "${attachment.name}" revision is missing`);
-            if (compression === undefined) compression = world.handle.kind === 'e2b' &&
-              (await world.exec('bash', ['-lc', 'command -v gzip >/dev/null'], { cwd: world.handle.root })).code === 0;
-            let uploadedBytes = 0;
             const startedAt = Date.now();
             await this.store.appendEvent({ taskId, type: 'world.resource-restoring', ts: startedAt,
               payload: { attachmentId: attachment.id, revisionId, bytes: revision.bytes, files: revision.files } });
-            const relativeOf = (file: string) => fileShaped(attachment) ? target : target === '.' ? file : `${target}/${file}`;
-            // A sandbox with its own route to the store fetches what it can itself.
-            const direct = this.directTransfer(world.handle)
-              ? { transfer: new DirectTransfer(world), path: (file: string) => path.posix.join(world.handle.root, relativeOf(file)), started: false }
-              : undefined;
-            try {
+            const checkContinue = async () => { options.signal?.throwIfAborted(); };
+            if (revision.engine === RESTIC_ENGINE) {
+              await timed('resource.restore', () => this.restic.restore({ world, path: path.posix.join(world.handle.root, target),
+                file: fileShaped(attachment) }, this.restic.of(attachment, revision), resticRef(revision).snapshot, { key: `restore:${lease.id}`, checkContinue }),
+              { itemId: attachment.id });
+            } else {
+              // A version saved before restic, until it is converted (convertLegacyRevisions).
+              if (compression === undefined) compression = world.handle.kind === 'e2b' &&
+                (await world.exec('bash', ['-lc', 'command -v gzip >/dev/null'], { cwd: world.handle.root })).code === 0;
+              const relativeOf = (file: string) => fileShaped(attachment) ? target : target === '.' ? file : `${target}/${file}`;
               await timed('resource.restore', () => this.engine.restore(revision, async (file, data, offset) => {
                 options.signal?.throwIfAborted();
-                const sent = await timed('resource.transfer', () => transferResourceChunk(world, relativeOf(file), data, offset,
+                await timed('resource.transfer', () => transferResourceChunk(world, relativeOf(file), data, offset,
                   { compress: compression, signal: options.signal }));
-                uploadedBytes += sent;
-              }, { ...options, ...(direct ? { direct } : {}) }), { itemId: attachment.id });
-            } finally { await direct?.transfer.cleanup(); }
+              }, options), { itemId: attachment.id });
+            }
             await this.store.appendEvent({ taskId, type: 'world.resource-restored', ts: Date.now(),
-              payload: { attachmentId: attachment.id, revisionId, durationMs: Date.now() - startedAt, uploadedBytes,
-                ...(direct?.started ? { direct: true } : {}) } });
+              payload: { attachmentId: attachment.id, revisionId, durationMs: Date.now() - startedAt } });
           }
           if (attachment.access === 'read')
             await world.exec('bash', ['-lc', `test ! -e ${quote(target)} || chmod -R a-w ${quote(target)}`], { cwd: world.handle.root });
@@ -1040,27 +653,44 @@ export class ProjectResourceService {
   }
 
   async importFiles(attachmentId: string, files: Iterable<SnapshotInputFile> | AsyncIterable<SnapshotInputFile>, createdByTaskId?: string): Promise<ResourceRevision> {
-    const attachment = (await this.requiredAttachment(attachmentId));
-    if (!isSnapshotDriver(attachment.driver)) throw new Error('only snapshot-backed resources accept files');
-    const captured = await this.engine.capture(attachment, asAsync(files));
-    const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: attachment.currentRevisionId,
-      engine: this.engine.id, ...captured, metadata: { imported: true }, createdByTaskId }));
-    (await this.store.promoteResourceRevision(attachmentId, revision.id, attachment.currentRevisionId));
-    (await this.store.recordUsage({ organizationId: attachment.organizationId, projectId: attachment.projectId,
-      taskId: createdByTaskId, provider: this.engine.id, kind: 'resource.storage', quantity: captured.bytes,
-      unit: 'byte', costMicros: 0, fundingSource: (await this.store.getStorageLocation(captured.storageLocationId ?? ''))?.kind === 's3' ? 'byok' : 'managed',
-      startedAt: revision.createdAt, endedAt: revision.createdAt,
-      metadata: { attachmentId, revisionId: revision.id, files: captured.files } }));
-    return revision;
+    const scratch = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'karmax-import-'));
+    try {
+      for await (const file of asAsync(files)) {
+        const destination = path.join(scratch, ...safePath(file.path).split('/'));
+        await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+        await fs.promises.writeFile(destination, file.data as Buffer | AsyncIterable<Buffer>);
+      }
+      return await this.importPath(attachmentId, scratch, '.', createdByTaskId);
+    } finally { await fs.promises.rm(scratch, { recursive: true, force: true }); }
   }
 
   async importDirectory(attachmentId: string, source: string): Promise<ResourceRevision> {
     const root = path.resolve(source);
     const stat = await fs.promises.stat(root);
-    if (stat.isDirectory()) return this.importFiles(attachmentId, walkDirectory(root));
-    if (stat.isFile()) return this.importFiles(attachmentId,
-      [{ path: path.basename(root), data: fs.createReadStream(root) as AsyncIterable<Buffer>, bytes: stat.size }]);
+    if (stat.isDirectory()) return this.importPath(attachmentId, root, '.');
+    if (stat.isFile()) return this.importPath(attachmentId, path.dirname(root), path.basename(root));
     throw new Error('resource import source must be a regular file or directory');
+  }
+
+  /** Save `entry` of a directory on this host as the resource's new current version. */
+  private async importPath(attachmentId: string, directory: string, entry: string, createdByTaskId?: string): Promise<ResourceRevision> {
+    const attachment = (await this.requiredAttachment(attachmentId));
+    if (!isSnapshotDriver(attachment.driver)) throw new Error('only snapshot-backed resources accept files');
+    const restic = this.restic;
+    const repository = await restic.current(attachment);
+    const current = attachment.currentRevisionId ? await this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
+    const parent = this.parentIn(repository, current);
+    const capture = await restic.backupDirectory(directory, repository, { quota: true, entry, ...(parent ? { parent } : {}) });
+    const fields = restic.revisionFields(capture, repository);
+    const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: attachment.currentRevisionId,
+      ...fields, metadata: { imported: true }, createdByTaskId }));
+    (await this.store.promoteResourceRevision(attachmentId, revision.id, attachment.currentRevisionId));
+    (await this.store.recordUsage({ organizationId: attachment.organizationId, projectId: attachment.projectId,
+      taskId: createdByTaskId, provider: RESTIC_ENGINE, kind: 'resource.storage', quantity: capture.added,
+      unit: 'byte', costMicros: 0, fundingSource: (await this.store.getStorageLocation(fields.storageLocationId ?? ''))?.kind === 's3' ? 'byok' : 'managed',
+      startedAt: revision.createdAt, endedAt: revision.createdAt,
+      metadata: { attachmentId, revisionId: revision.id, files: capture.files } }));
+    return revision;
   }
 
   /** One-time exit ramp for the deprecated host-only copyGlobs setting. The
@@ -1164,16 +794,105 @@ export class ProjectResourceService {
    * failure deleting objects leaks bytes rather than leaving a dangling row. */
   async deleteRevision(revisionId: string, options: { allowCurrent?: boolean } = {}): Promise<ResourceRevision | undefined> {
     const revision = (await this.store.deleteResourceRevisionIfUnreferenced(revisionId, options));
-    if (revision) await this.engine.delete?.(revision).catch((error) =>
+    if (revision) await this.deleteRevisionData(revision).catch((error) =>
       console.warn(`resource revision ${revision.id}: objects not deleted: ${error instanceof Error ? error.message : String(error)}`));
     return revision;
+  }
+
+  /** A deleted revision's snapshot is forgotten (its data goes with the next
+   * prune); a legacy one releases its chunks. */
+  private async deleteRevisionData(revision: ResourceRevision, owner?: ResourceAttachment): Promise<void> {
+    if (revision.engine !== RESTIC_ENGINE) return this.engine.delete?.(revision, owner);
+    const attachment = owner ?? await this.store.getResourceAttachment(revision.attachmentId);
+    if (attachment) await this.restic.forget(this.restic.of(attachment, revision), [resticRef(revision).snapshot]);
+  }
+
+  /** Hourly upkeep of the resource repositories: forget snapshots no version
+   * names (after a day, so a save in progress is never touched), prune what
+   * that freed, and move a batch of versions saved before restic into it
+   * (10 GiB a run: the bytes pass through this host). */
+  async maintainRepositories(now = Date.now(), options: { convertBytes?: number } = {}): Promise<{ forgotten: number; pruned: number; converted: number }> {
+    let forgotten = 0;
+    const byRepository = new Map<string, string[]>();
+    for (const snapshot of await this.store.unreferencedRepositorySnapshots(now - 24 * 3_600_000))
+      byRepository.set(snapshot.repository, [...byRepository.get(snapshot.repository) ?? [], snapshot.name]);
+    for (const [name, snapshots] of byRepository) {
+      const repository = await this.repositoryNamed(name);
+      if (!repository) continue;
+      try { await this.restic.forget(repository, snapshots); forgotten += snapshots.length; }
+      catch (error) { console.warn(`resource repository ${name}: could not forget unused versions: ${message(error)}`); }
+    }
+    const converted = await this.convertLegacyRevisions(options.convertBytes ?? 10 * 2 ** 30);
+    return { forgotten, pruned: await this.pruneRepositories(), converted };
+  }
+
+  /** Delete the data of forgotten versions now, in every repository that has some. */
+  async pruneRepositories(): Promise<number> {
+    let pruned = 0;
+    for (const { key } of await this.store.kvEntries('restic-prune:')) {
+      const repository = await this.repositoryNamed(key.slice('restic-prune:'.length));
+      if (!repository) { await this.store.kvDelete(key); continue; }
+      // A save holding the repository makes this wait for the next run.
+      try { await this.restic.prune(repository); pruned++; }
+      catch (error) { console.warn(`resource repository ${repository.name}: prune deferred: ${message(error)}`); }
+    }
+    return pruned;
+  }
+
+  private async repositoryNamed(name: string): Promise<Repository | undefined> {
+    const parsed = parseRepositoryName(name);
+    const attachment = parsed && await this.store.getResourceAttachment(parsed.attachmentId);
+    return attachment ? this.restic.repository(attachment, parsed.storageLocationId) : undefined;
+  }
+
+  /** A revision's snapshot as the parent of a save into `repository`: only a
+   * snapshot in that same repository can be one. */
+  private parentIn(repository: Repository, revision: ResourceRevision | undefined): string | undefined {
+    return revision?.engine === RESTIC_ENGINE && revision.attachmentId === repository.attachment.id
+      && this.restic.of(repository.attachment, revision).name === repository.name ? resticRef(revision).snapshot : undefined;
+  }
+
+  /** Move versions saved before restic into their resource's repository, in
+   * place (the revision keeps its id), then release their old chunks. Current
+   * versions go first. Bytes pass through this host once, in a scratch directory. */
+  async convertLegacyRevisions(maxBytes: number): Promise<number> {
+    const restic = this.restic;
+    let converted = 0;
+    let bytes = 0;
+    for (const revision of await this.store.legacyResourceRevisions(1000)) {
+      if (bytes >= maxBytes) break;
+      const attachment = await this.store.getResourceAttachment(revision.attachmentId);
+      if (!attachment) continue;
+      const scratch = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'karmax-convert-'));
+      try {
+        await this.engine.restore(revision, async (file, data, offset) => {
+          const destination = path.join(scratch, ...safePath(file).split('/'));
+          await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+          const handle = await fs.promises.open(destination, offset ? 'r+' : 'w');
+          try { await handle.write(data, 0, data.length, offset); } finally { await handle.close(); }
+        });
+        // Converted into the location the version was saved in.
+        const repository = restic.repository(attachment, revision.storageLocationId);
+        const capture = await restic.backupDirectory(scratch, repository, { quota: false });
+        const fields = restic.revisionFields(capture, repository);
+        if (await this.store.convertResourceRevision(revision.id, revision.sealedRef, fields)) {
+          await this.engine.delete?.(revision, attachment);
+          converted++; bytes += revision.bytes;
+        } else await restic.forget(repository, [capture.snapshot]);
+      } catch (error) {
+        console.warn(`resource revision ${revision.id}: not converted to restic yet: ${message(error)}`);
+      } finally { await fs.promises.rm(scratch, { recursive: true, force: true }); }
+    }
+    return converted;
   }
 
   async deleteAttachment(attachmentId: string): Promise<void> {
     const attachment = (await this.store.getResourceAttachment(attachmentId));
     if (!attachment) return;
     await this.engine.abandonProgress?.(attachment);
-    for (const revision of (await this.store.listResourceRevisions(attachmentId))) await this.engine.delete?.(revision);
+    for (const revision of (await this.store.listResourceRevisions(attachmentId)))
+      if (revision.engine !== RESTIC_ENGINE) await this.engine.delete?.(revision);
+    await this.restic.removeRepositories(attachment);
     // Only the resource's own secret is its to delete. A vault item it projects
     // may control a live external account or serve another project, and any
     // other handle belongs to someone else (AU-40).
@@ -1299,47 +1018,49 @@ export class ProjectResourceService {
       if (baseline) return false;
       throw new UnstageableCandidate(`${sourcePath} no longer exists in the task world`);
     }
-    const stampsKey = `resource-candidate-observed:${candidate.id}`;
-    let totals = { files: 0, bytes: 0 };
-    // Multi-GB output takes minutes and outlives deploys: an interrupted attempt
-    // leaves its progress for the next one instead of starting over.
-    const transfer = this.directTransfer(handle) ? new DirectTransfer(world) : undefined;
-    let capture;
-    try {
-      capture = await this.engine.capture(attachment,
-        filesFromWorld(world, sourcePath, attachment, checkContinue, (listed) => { totals = listed; }),
-        { baseline, observed: baseline ? (await this.store.kvGet(stampsKey)) : undefined, resume: true,
-          onProgress: (done) => onProgress?.({ ...done, totalFiles: totals.files, totalBytes: totals.bytes }),
-          ...(transfer ? { direct: { transfer, taskId } } : {}) });
-    } finally { await transfer?.cleanup(); }
-    const { unchanged, observed, ...captured } = capture;
-    if (unchanged && baseline) {
-      if (observed) (await this.store.kvSet(stampsKey, observed));
-      return false;
-    }
-    let revision: ResourceRevision;
-    try {
-      revision = (await this.store.saveAndPromoteResourceRevision({ attachmentId: attachment.id, parentRevisionId: baseline?.id,
-        engine: this.engine.id, ...captured, metadata: { candidate: true, sourcePath }, createdByTaskId: taskId }, baseline?.id));
-    } catch (error) {
-      // Discarded or staged by someone else meanwhile. Nothing was recorded, so
-      // this upload's own references are released, and only these.
-      await this.engine.delete?.({ id: 'unsaved', attachmentId: attachment.id, engine: this.engine.id,
-        ...captured, createdAt: Date.now() }, attachment).catch(() => undefined);
-      throw error;
-    }
-    if (observed) (await this.store.kvSet(stampsKey, observed));
+    // restic resumes an interrupted save from what it already stored, and a
+    // retried activity finds the save still running in the world.
+    const place = { world, path: path.posix.resolve(worldWorkingDirectory(handle), sourcePath), file: fileShaped(attachment) };
+    const captured = await this.capture(place, attachment, baseline, { key: `candidate:${candidate.id}`, quota: true, checkContinue,
+      onProgress: (progress) => onProgress?.(progress) });
+    if (!captured) return false;
+    // Discarded or staged by someone else meanwhile, this throws; the snapshot
+    // no revision names goes with the next sweep (collectRepositoryGarbage).
+    const revision = (await this.store.saveAndPromoteResourceRevision({ attachmentId: attachment.id, parentRevisionId: baseline?.id,
+      ...captured.fields, metadata: { candidate: true, sourcePath }, createdByTaskId: taskId }, baseline?.id));
     (await this.store.recordUsage({ organizationId: project.organizationId!, projectId: project.id, taskId,
-      worldId: handle.id, provider: this.engine.id, kind: 'resource.storage', quantity: captured.bytes, unit: 'byte',
-      costMicros: 0, fundingSource: (await this.store.getStorageLocation(captured.storageLocationId ?? ''))?.kind === 's3' ? 'byok' : 'managed',
+      worldId: handle.id, provider: RESTIC_ENGINE, kind: 'resource.storage', quantity: captured.capture.added, unit: 'byte',
+      costMicros: 0, fundingSource: (await this.store.getStorageLocation(captured.fields.storageLocationId ?? ''))?.kind === 's3' ? 'byok' : 'managed',
       startedAt: candidate.createdAt, endedAt: Date.now(),
-      metadata: { candidateId: candidate.id, attachmentId: attachment.id, revisionId: revision.id, files: captured.files } }));
+      metadata: { candidateId: candidate.id, attachmentId: attachment.id, revisionId: revision.id, files: captured.fields.files } }));
     (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
       scopeKey: `project:${project.id}`, detail: { candidateId: candidate.id, attachmentId: attachment.id,
-        sourcePath, worldGeneration: candidate.worldGeneration, bytes: captured.bytes, files: captured.files,
+        sourcePath, worldGeneration: candidate.worldGeneration, bytes: captured.fields.bytes, files: captured.fields.files,
         ...(baseline ? { refreshedFrom: baseline.id } : {}) } }));
     return true;
   }
+
+  /** Save a resource from a world as a new snapshot, deduplicated against
+   * `baseline` (the version the world started from). Undefined when nothing
+   * changed since `baseline`: then there is no new version to record. */
+  private async capture(place: ResticPlace, attachment: ResourceAttachment, baseline: ResourceRevision | undefined,
+    options: { key: string; quota: boolean; checkContinue?: () => Promise<void>; onProgress?: (progress: { files: number;
+      totalFiles: number; bytes: number; totalBytes: number }) => void }): Promise<{ capture: ResticCapture;
+      fields: ReturnType<ResticResources['revisionFields']> } | undefined> {
+    const restic = this.restic;
+    const repository = await restic.current(attachment);
+    const parent = this.parentIn(repository, baseline);
+    const capture = await restic.backup(place, repository, { ...options, ...(parent ? { parent } : {}) });
+    if (parent) {
+      const changes = await restic.diff(repository, parent, capture.snapshot);
+      if (changes.added + changes.modified + changes.deleted === 0) {
+        await restic.forget(repository, [capture.snapshot]);
+        return undefined;
+      }
+    }
+    return { capture, fields: restic.revisionFields(capture, repository) };
+  }
+
 
   /** Create a reviewable projection of a vault item without resolving its
    * plaintext. Authorization/provenance of the item is checked by KarmaxApi. */
@@ -1535,9 +1256,15 @@ export class ProjectResourceService {
 
   async summarize(taskId: string, attachmentId: string): Promise<ResourceChangeSummary> {
     const { attachment, world, lease, target } = await this.worldResource(taskId, attachmentId);
-    const base = lease.revisionId ? await this.engine.manifest((await this.store.getResourceRevision(lease.revisionId))!) : emptyManifest(attachment.id);
-    const current = await manifestFromWorld(attachment, world, target);
-    const summary = compareManifests(attachment.id, lease.revisionId, base, current);
+    const started = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
+    // What the world holds now, saved: deduplicated against the version it
+    // started from, so mostly a scan, and its publication finds it all stored.
+    const repository = await this.restic.current(attachment);
+    const parent = this.parentIn(repository, started);
+    const inspected = await this.restic.backup({ world, path: target, file: fileShaped(attachment) }, repository, {
+      key: `inspect:${lease.id}`, quota: true, ...(parent ? { parent } : {}) });
+    const summary: ResourceChangeSummary = { attachmentId: attachment.id, baseRevisionId: lease.revisionId,
+      ...await this.changes(repository, started, inspected.snapshot) };
     // Keep the lease's original baseline (and its publication CAS fence), but
     // stop asking for a decision on bytes this task has already published.
     let publishedId = attachment.currentRevisionId;
@@ -1547,7 +1274,7 @@ export class ProjectResourceService {
       const published = await this.store.getResourceRevision(publishedId);
       if (!published) break;
       if (published.createdByTaskId === taskId) {
-        const reviewed = compareManifests(attachment.id, published.id, await this.engine.manifest(published), current);
+        const reviewed = await this.changes(repository, published, inspected.snapshot);
         summary.promoted = reviewed.added + reviewed.modified + reviewed.deleted === 0;
         break;
       }
@@ -1560,46 +1287,65 @@ export class ProjectResourceService {
     return summary;
   }
 
+  /** What a snapshot changes relative to a revision (none: everything is new). */
+  private async changes(repository: Repository, base: ResourceRevision | undefined, snapshot: string)
+    : Promise<Omit<ResourceChangeSummary, 'attachmentId' | 'baseRevisionId'>> {
+    const restic = this.restic;
+    const parent = this.parentIn(repository, base);
+    if (parent) return restic.diff(repository, parent, snapshot);
+    // A version in another repository (another location, or saved before
+    // restic) is compared by its listing: a file whose size is unchanged
+    // counts as unchanged.
+    const before = new Map((!base ? [] : base.engine === RESTIC_ENGINE
+      ? await restic.files(restic.of(repository.attachment, base), resticRef(base).snapshot)
+      : (await this.engine.manifest(base)).files).map((file) => [file.path, file.bytes]));
+    const after = await restic.files(repository, snapshot);
+    let added = 0; let modified = 0; let bytes = 0;
+    const changedPaths: string[] = [];
+    for (const file of after) {
+      const prior = before.get(file.path);
+      before.delete(file.path);
+      if (prior === undefined) added++;
+      else if (prior !== file.bytes) modified++;
+      else continue;
+      bytes += file.bytes;
+      if (changedPaths.length < 100) changedPaths.push(file.path);
+    }
+    for (const file of before.keys()) if (changedPaths.length < 100) changedPaths.push(file);
+    return { added, modified, deleted: before.size, bytes, changedPaths };
+  }
+
   /** Capture writable task forks for portable hibernation without promoting
    * them to the project's current baseline. */
   async checkpoint(handle: WorldHandle, checkContinue?: () => Promise<void>): Promise<Array<{ attachmentId: string; revisionId: string }>> {
     const world = await this.worlds.open(handle);
     const refs: Array<{ attachmentId: string; revisionId: string }> = [];
-    const transfer = this.directTransfer(handle) ? new DirectTransfer(world) : undefined;
-    try {
-      for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
-        await checkContinue?.();
-        if (lease.state !== 'active') continue;
-        const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
-        if (!attachment || !isSnapshotDriver(attachment.driver) || attachment.target.kind !== 'path') continue;
-        if (attachment.access === 'read' && lease.revisionId) {
-          refs.push({ attachmentId: attachment.id, revisionId: lease.revisionId });
-          continue;
-        }
-        // The previous park of this lease is the incremental baseline, else the
-        // revision the world started from: unchanged files are neither read nor
-        // uploaded, and an unchanged resource keeps its existing revision (LT-11).
-        // The stamps each park saw are kept with that pointer even when nothing
-        // changed, so only the first park after a restore reads every file.
-        const baselineKey = `resource-checkpoint:${handle.id}:${attachment.id}`;
-        let recorded: { leaseId?: string; revisionId?: string; observed?: string } = {};
-        try { recorded = JSON.parse((await this.store.kvGet(baselineKey)) ?? '{}'); } catch {}
-        const sameLease = recorded.leaseId === lease.id;
-        const baselineId = sameLease ? recorded.revisionId : lease.revisionId;
-        const baseline = baselineId ? (await this.store.getResourceRevision(baselineId)) : undefined;
-        const { unchanged, observed, ...captured } = await this.engine.capture(attachment,
-          filesFromWorld(world, resourceAbsolutePath(handle, attachment), attachment, checkContinue),
-          { baseline: baseline?.attachmentId === attachment.id ? baseline : undefined, observed: sameLease ? recorded.observed : undefined,
-            // A park's capture of the task's private copy is work in progress:
-            // counted, never refused (see WorldCheckpointService).
-            enforceQuota: false, ...(transfer ? { direct: { transfer, taskId: lease.taskId } } : {}) });
-        const revisionId = unchanged && baseline ? baseline.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
-          parentRevisionId: lease.revisionId, engine: this.engine.id, ...captured, metadata: { checkpoint: true },
-          createdByTaskId: lease.taskId })).id;
-        (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId, ...(observed ? { observed } : {}) })));
-        refs.push({ attachmentId: attachment.id, revisionId });
+    for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
+      await checkContinue?.();
+      if (lease.state !== 'active') continue;
+      const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
+      if (!attachment || !isSnapshotDriver(attachment.driver) || attachment.target.kind !== 'path') continue;
+      if (attachment.access === 'read' && lease.revisionId) {
+        refs.push({ attachmentId: attachment.id, revisionId: lease.revisionId });
+        continue;
       }
-    } finally { await transfer?.cleanup(); }
+      // The previous park of this lease is the baseline, else the revision the
+      // world started from: an unchanged resource keeps its existing revision (LT-11).
+      const baselineKey = `resource-checkpoint:${handle.id}:${attachment.id}`;
+      let recorded: { leaseId?: string; revisionId?: string } = {};
+      try { recorded = JSON.parse((await this.store.kvGet(baselineKey)) ?? '{}'); } catch {}
+      const baselineId = recorded.leaseId === lease.id ? recorded.revisionId : lease.revisionId;
+      const found = baselineId ? (await this.store.getResourceRevision(baselineId)) : undefined;
+      const baseline = found?.attachmentId === attachment.id ? found : undefined;
+      // A park's capture of the task's private copy is work in progress:
+      // counted, never refused (see WorldCheckpointService).
+      const captured = await this.capture({ world, path: resourceAbsolutePath(handle, attachment), file: fileShaped(attachment) },
+        attachment, baseline, { key: `checkpoint:${lease.id}`, quota: false, checkContinue });
+      const revisionId = !captured && baseline ? baseline.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
+        parentRevisionId: lease.revisionId, ...captured!.fields, metadata: { checkpoint: true }, createdByTaskId: lease.taskId })).id;
+      (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId })));
+      refs.push({ attachmentId: attachment.id, revisionId });
+    }
     return refs;
   }
 
@@ -1612,25 +1358,17 @@ export class ProjectResourceService {
     if (attachment.publish !== 'review' || attachment.access !== 'write' || attachment.isolation !== 'fork')
       throw new Error('resource is not configured for reviewed promotion');
     const summary = inspected ?? await this.summarize(taskId, attachmentId);
-    // Upload the immutable candidate before entering the singleton. The only
-    // serialized operation is the tiny baseline pointer CAS, so a multi-GB model
+    // Save the immutable candidate before entering the singleton. The only
+    // serialized operation is the tiny baseline pointer CAS, so a multi-GB
     // upload cannot block another publication merely while bytes are moving.
-    // The revision the world started from: unchanged files keep its objects.
     const started = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
-    const transfer = this.directTransfer(world.handle) ? new DirectTransfer(world) : undefined;
-    let capture: Awaited<ReturnType<SnapshotEngine['capture']>>;
-    try {
-      capture = await this.engine.capture(attachment, filesFromWorld(world, target, attachment), {
-        ...(started?.attachmentId === attachment.id ? { baseline: started } : {}), resume: true,
-        ...(transfer ? { direct: { transfer, taskId } } : {}) });
-    } finally { await transfer?.cleanup(); }
-    const { unchanged, observed: _observed, ...captured } = capture;
-    // Identical to what the world started from: there is nothing to publish (and
-    // its manifest belongs to that revision, so it must not become another's).
-    if (unchanged && started) return { attachment, revision: started, summary };
+    const captured = await this.capture({ world, path: target, file: fileShaped(attachment) },
+      attachment, started?.attachmentId === attachment.id ? started : undefined, { key: `publish:${lease.id}`, quota: true });
+    // Identical to what the world started from: there is nothing to publish.
+    if (!captured && started) return { attachment, revision: started, summary };
     const baseline = await this.publicationBaseline(taskId, attachment.currentRevisionId, lease.revisionId);
     const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: baseline,
-      engine: this.engine.id, ...captured, metadata: { summary }, createdByTaskId: taskId }));
+      ...captured!.fields, metadata: { summary }, createdByTaskId: taskId }));
     return this.serializePublish(attachmentId, taskId, async () => {
       const promoted = (await this.store.promoteResourceRevision(attachmentId, revision.id, baseline));
       (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:promote',
@@ -1784,20 +1522,6 @@ class EnvironmentWorld implements World {
   destroy() { return this.inner.destroy(); }
 }
 
-async function* walkDirectory(root: string): AsyncGenerator<SnapshotInputFile> {
-  const visit = async function* (directory: string): AsyncGenerator<SnapshotInputFile> {
-    const entries = await fs.promises.readdir(directory, { withFileTypes: true });
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-    for (const entry of entries) {
-      const absolute = path.join(directory, entry.name);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) yield* visit(absolute);
-      else if (entry.isFile()) yield { path: path.relative(root, absolute).split(path.sep).join('/'),
-        data: fs.createReadStream(absolute) as AsyncIterable<Buffer>, bytes: (await fs.promises.stat(absolute)).size };
-    }
-  };
-  yield* visit(root);
-}
 
 /** Read only files small enough to become credential-backed resources. The
  * extra byte closes the stat/read race: a file that grows while migration runs
@@ -1823,142 +1547,6 @@ async function readSmallFile(file: string, maximumBytes: number): Promise<Buffer
  * which an unchanged file in an incremental capture never does (LT-11). Small
  * files can be read many to a round trip through their `range`; larger ones
  * stream one at a time. */
-async function* filesFromWorld(world: World, target: string, attachment?: ResourceAttachment, checkContinue?: () => Promise<void>,
-  onListed?: (totals: { files: number; bytes: number }) => void): AsyncGenerator<SnapshotInputFile> {
-  await checkContinue?.();
-  const single = Boolean(attachment && fileShaped(attachment));
-  // -H follows a symlinked target the way `test -f` did, so a linked
-  // single-file resource is captured rather than recorded as empty.
-  const prefix = target === '.' ? '' : `${target}/`;
-  const listed = await world.exec('bash', ['-lc', `date +%s.%N && pwd && { test ! -e ${quote(target)} || find -H ${quote(target)} ${single ? '-maxdepth 0 ' : ''}-type f -not -path '*/.git/*' -not -path '*/.karmax-injection/*' -printf '%s %T@ %C@ %i %p\\0'; }`],
-    { timeoutMs: 30 * 60_000 });
-  const [listedAtLine, cwd] = listed.stdout.split('\n', 2);
-  const listedAt = Number(listedAtLine);
-  const header = `${listedAtLine}\n${cwd}\n`;
-  if (listed.code !== 0 || cwd === undefined || !listed.stdout.startsWith(header)) throw new Error(listed.stderr || `could not inspect resource path ${target}`);
-  const entries = listed.stdout.slice(header.length).split('\0').filter(Boolean).map((record) => {
-    const [size, mtime, ctime, inode, ...name] = record.split(' ');
-    return { file: name.join(' '), bytes: Number(size), stamp: `${size}:${mtime}:${ctime}:${inode}`, changedAt: Number(ctime),
-      // The batched reader's form of the same stamp: nanoseconds, as Node's bigint stat reports them.
-      exact: `${size}:${nanoseconds(mtime!)}:${nanoseconds(ctime!)}:${inode}` };
-  }).sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
-  const names = new Set(entries.map((entry) => entry.file));
-  const reader: SnapshotRange['reader'] = async function* (files) {
-    for await (const { data } of readCheckpointRanges(world, files.map((file) => ({ path: file.source, stamp: file.stamp,
-      offset: 0, length: file.bytes })), checkContinue)) yield data;
-  };
-  // A single-file target may be a link, which the batched reader never follows.
-  const ranged = !single && cwd.startsWith('/');
-  onListed?.({ files: entries.length, bytes: entries.reduce((sum, entry) => sum + (Number.isSafeInteger(entry.bytes) ? entry.bytes : 0), 0) });
-  for (const entry of entries) {
-    await checkContinue?.();
-    const relative = single ? path.posix.basename(target)
-      : prefix ? (entry.file.startsWith(prefix) ? entry.file.slice(prefix.length) : undefined) : entry.file;
-    if (!relative || (!single && (relative.startsWith('.git/') || relative.startsWith('.karmax-injection/')))) continue;
-    if (!Number.isSafeInteger(entry.bytes) || entry.bytes < 0) throw new Error(`could not size resource file ${entry.file}`);
-    // Git's racy-clean rule: a write after this capture could reuse a stamp
-    // from the listing's last timestamp tick (coarse filesystems tick in 1-2 s),
-    // so only an older ctime, which no one can set back, is trusted. SQLite can
-    // change through its WAL alone and goes through a transactional copy.
-    // With no WAL or rollback journal beside it, a SQLite file is the whole
-    // database, so its stamp is trustworthy too.
-    const sqlite = /\.(?:sqlite3?|db)$/i.test(entry.file);
-    const sidecar = single || names.has(`${entry.file}-wal`) || names.has(`${entry.file}-journal`);
-    const stable = (!sqlite || !sidecar) && Number.isFinite(listedAt) && entry.changedAt < listedAt - 2;
-    const source = path.posix.resolve(cwd, entry.file);
-    // A SQLite database is read from a consistent copy, or in place under a read lock.
-    const prepare = async () => {
-      const captured = await transactionalSnapshotPath(world, entry.file);
-      return { source: path.posix.resolve(cwd, captured.path), renew: captured.renew, verify: captured.verify, cleanup: captured.cleanup };
-    };
-    yield { path: safePath(relative), ...(sqlite ? {} : { bytes: entry.bytes }), ...(stable ? { observed: entry.stamp } : {}),
-      ...(ranged && !sqlite ? { range: { reader, source, stamp: entry.exact } } : {}),
-      ...(ranged ? { direct: sqlite ? { source, prepare } : { source, stamp: entry.exact } } : {}),
-      data: worldFileChunks(world, entry.file, sqlite ? undefined : entry.bytes, checkContinue) };
-  }
-}
-
-/** `find -printf %T@` (seconds with a fraction) as integer nanoseconds. */
-function nanoseconds(value: string): string {
-  const [seconds = '0', fraction = ''] = value.split('.');
-  return (BigInt(seconds) * 1_000_000_000n + BigInt((fraction + '000000000').slice(0, 9))).toString();
-}
-
-async function* worldFileChunks(world: World, file: string, bytes: number | undefined, checkContinue?: () => Promise<void>): AsyncGenerator<Buffer> {
-  const captured = await transactionalSnapshotPath(world, file);
-  let size = bytes;
-  if (size === undefined) {
-    const sized = await world.exec('stat', ['-c', '%s', captured.path]);
-    size = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
-  }
-  try {
-    // A provider that streams files sends one long response instead of a
-    // command per 16 MiB, about three times faster out of an E2B sandbox.
-    const streamed = world.readFileStream && Number.isFinite(size) ? worldStreamPath(world, captured.path) : undefined;
-    if (streamed) {
-      let read = 0;
-      for await (const piece of world.readFileStream!(streamed)) {
-        read += piece.length;
-        if (read > size!) throw new Error('resource file changed or was truncated during capture');
-        await checkContinue?.();
-        yield piece;
-        await captured.renew?.();
-      }
-      if (read !== size) throw new Error('resource file changed or was truncated during capture');
-    } else {
-      for await (const chunk of readResourceChunks(world, captured.path, Number.isFinite(size) ? size : undefined, checkContinue)) {
-        yield chunk;
-        await captured.renew?.();
-      }
-    }
-    await captured.verify?.();
-  } finally { await captured.cleanup?.(); }
-}
-
-/** A command-relative (or absolute) path as the world-root-relative path file APIs take. */
-function worldStreamPath(world: World, file: string): string | undefined {
-  const handle = world.handle;
-  if (!path.posix.isAbsolute(file)) return worldWorkingRelativePath(handle, file);
-  const root = (handle.root ?? '').replace(/\/+$/, '');
-  return root && file.startsWith(`${root}/`) ? worldRelativePath(file.slice(root.length + 1)) : undefined;
-}
-
-async function manifestFromWorld(attachment: ResourceAttachment, world: World, target: string): Promise<SnapshotManifest> {
-  const files: SnapshotFile[] = [];
-  let bytes = 0;
-  for await (const file of filesFromWorld(world, target, attachment)) {
-    const digest = crypto.createHash('sha256');
-    let fileBytes = 0;
-    for await (const chunk of fixedChunks(file.data)) { digest.update(chunk); fileBytes += chunk.length; }
-    bytes += fileBytes;
-    files.push({ path: file.path, bytes: fileBytes, sha256: digest.digest('hex'), chunks: [] });
-  }
-  files.sort((a, b) => a.path.localeCompare(b.path));
-  return { version: 1, attachmentId: attachment.id, files, rootDigest: sha256(Buffer.from(JSON.stringify(files))), bytes };
-}
-
-function compareManifests(attachmentId: string, baseRevisionId: string | undefined,
-  base: SnapshotManifest, current: SnapshotManifest): ResourceChangeSummary {
-  const before = new Map(base.files.map((file) => [file.path, file]));
-  const after = new Map(current.files.map((file) => [file.path, file]));
-  let added = 0; let modified = 0; let deleted = 0; let bytes = 0;
-  const changedPaths: string[] = [];
-  for (const [file, value] of after) {
-    const prior = before.get(file);
-    if (!prior) added++;
-    else if (prior.sha256 !== value.sha256) modified++;
-    else continue;
-    bytes += value.bytes;
-    if (changedPaths.length < 100) changedPaths.push(file);
-  }
-  for (const file of before.keys()) if (!after.has(file)) { deleted++; if (changedPaths.length < 100) changedPaths.push(file); }
-  return { attachmentId, baseRevisionId, added, modified, deleted, bytes, changedPaths };
-}
-
-function emptyManifest(attachmentId: string): SnapshotManifest {
-  return { version: 1, attachmentId, files: [], rootDigest: sha256(Buffer.from('[]')), bytes: 0 };
-}
-
 function pathContains(root: string, value: string): boolean {
   const normalizedRoot = root.replace(/\\/g, '/').replace(/\/$/, '');
   const normalizedValue = value.replace(/\\/g, '/').replace(/\/$/, '');
@@ -1976,83 +1564,6 @@ function likelySecretPath(value: string): boolean {
 
 async function* asAsync(values: Iterable<SnapshotInputFile> | AsyncIterable<SnapshotInputFile>): AsyncGenerator<SnapshotInputFile> {
   for await (const value of values as AsyncIterable<SnapshotInputFile>) yield value;
-}
-
-async function transactionalSnapshotPath(world: World, file: string): Promise<{ path: string; cleanup?: () => Promise<void>;
-  verify?: () => Promise<void>; renew?: () => Promise<void> }> {
-  if (!/\.(?:sqlite3?|db)$/i.test(file)) return { path: file };
-  const magic = await world.exec('bash', ['-lc', `head -c 16 ${quote(file)} | base64 -w0`]);
-  if (magic.code !== 0 || Buffer.from(magic.stdout.trim(), 'base64').toString('binary') !== 'SQLite format 3\0') return { path: file };
-  const temporary = `.karmax-injection/sqlite-backup-${crypto.randomBytes(8).toString('hex')}.db`;
-  // The consistent copy is as large as the database.
-  const space = await world.exec('bash', ['-lc', `mkdir -p .karmax-injection && printf '%s %s' "$(stat -L -c %s ${quote(file)})" "$(df -B1 --output=avail .karmax-injection | tail -1)"`]);
-  const [size, free] = space.stdout.trim().split(/\s+/).map(Number);
-  if (space.code === 0 && Number.isFinite(size) && Number.isFinite(free) && size! > free!) {
-    const locked = await sqliteReadLock(world, file);
-    if (locked) return locked;
-    throw new Error(`snapshotting SQLite database ${file} consistently needs ${formatGiB(size!)} of free disk in the task world, `
-      + `but only ${formatGiB(free!)} is free (or the database must be idle); free up space and propose it again`);
-  }
-  const script = 'import os,sqlite3,sys; os.makedirs(os.path.dirname(sys.argv[2]),exist_ok=True); s=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()';
-  const backup = await world.exec('python3', ['-c', script, file, temporary], { timeoutMs: 30 * 60_000 });
-  if (backup.code !== 0) {
-    await world.exec('rm', ['-f', temporary]); // a partial copy must not keep the disk full
-    throw new Error(`could not transactionally snapshot SQLite database ${file}: ${backup.stderr || backup.stdout}`);
-  }
-  return { path: temporary, cleanup: async () => { await world.exec('rm', ['-f', temporary]); } };
-}
-
-/** Read a database in place, without a copy, while a background process holds
- * a SQLite read transaction on it, so no rollback-journal writer can change the
- * file meanwhile. (In WAL mode a checkpoint still could; the stamp check then
- * rejects the snapshot.) The file's size/mtime/ctime/inode stamp and the holder
- * are checked again before the lock is released. The holder keeps its lock only
- * while the reader renews a short lease, so a reader that dies cannot leave a
- * database locked. Undefined when the lock cannot be taken (a writer is
- * active), the file is a symlink, or the database still has a WAL. */
-async function sqliteReadLock(world: World, file: string): Promise<{ path: string; cleanup: () => Promise<void>;
-  verify: () => Promise<void>; renew: () => Promise<void> } | undefined> {
-  const ready = `.karmax-injection/sqlite-lock-${crypto.randomBytes(8).toString('hex')}`;
-  const holder = 'import os,sqlite3,sys,time,urllib.parse\n'
-    + 'db,ready=sys.argv[1],sys.argv[2]\n'
-    + 'c=sqlite3.connect("file:"+urllib.parse.quote(db)+"?mode=ro",uri=True,timeout=0,isolation_level=None)\n'
-    + 'c.execute("BEGIN"); c.execute("SELECT count(*) FROM sqlite_master").fetchone()\n'
-    + 'open(ready+".tmp","w").write("locked"); os.rename(ready+".tmp",ready)\n'
-    + 'while True:\n'
-    + '  try:\n'
-    + '    if time.time()-os.path.getmtime(ready)>' + String(SQLITE_LOCK_LEASE_SECONDS) + ': break\n'
-    + '  except OSError: break\n'
-    + '  time.sleep(0.5)\n';
-  const quoted = quote(file);
-  const started = await world.exec('bash', ['-lc', `test ! -L ${quoted} && test ! -e ${quote(`${file}-wal`)} && mkdir -p .karmax-injection || exit 1; `
-    + `setsid nohup python3 -c ${quote(holder)} ${quoted} ${quote(ready)} </dev/null >/dev/null 2>${quote(`${ready}.err`)} & echo $!; `
-    + `for i in $(seq 1 100); do test -s ${quote(ready)} && exit 0; test -s ${quote(`${ready}.err`)} && exit 1; sleep 0.1; done; exit 1`]);
-  const pid = Number(started.stdout.trim().split('\n')[0]);
-  // The lock is gone once this returns: the holder is stopped, not just told to stop.
-  const release = async () => { await world.exec('bash', ['-lc', `rm -f ${quote(ready)} ${quote(`${ready}.err`)} ${quote(`${ready}.tmp`)}`
-    + (Number.isInteger(pid) && pid > 1 ? `; kill ${pid} 2>/dev/null; for i in $(seq 1 50); do kill -0 ${pid} 2>/dev/null || exit 0; sleep 0.1; done` : '')]); };
-  if (started.code !== 0 || !Number.isInteger(pid)) { await release(); return undefined; }
-  const stamp = async () => (await world.exec('bash', ['-lc',
-    `kill -0 ${pid} && test -e ${quote(ready)} && find ${quoted} -maxdepth 0 -printf '%s %T@ %C@ %i'`])).stdout;
-  const before = await stamp();
-  if (!before) { await release(); return undefined; }
-  let renewedAt = Date.now();
-  return { path: file, cleanup: release,
-    renew: async () => {
-      if (Date.now() - renewedAt < SQLITE_LOCK_LEASE_SECONDS * 250) return;
-      renewedAt = Date.now();
-      await world.exec('touch', ['-c', ready]);
-    },
-    verify: async () => {
-      if ((await stamp()) !== before) throw new Error(`SQLite database ${file} changed while it was being snapshotted`);
-    } };
-}
-
-/** How long the lock holder outlives its reader's last sign of life. */
-const SQLITE_LOCK_LEASE_SECONDS = 120;
-
-function formatGiB(bytes: number): string {
-  return `${(bytes / 2 ** 30).toFixed(1)} GiB`;
 }
 
 function isSecretLike(value: ResourceAttachment): boolean { return credentialResource(value); }
@@ -2108,21 +1619,8 @@ function copyGlobRepoNames(sources: string[]): string[] {
 }
 function safePath(value: string): string { return worldRelativePath(value); }
 function writtenPrefix(handle: WorldHandle): string { return `${handle.id}\0${handle.generation ?? 1}\0`; }
+function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }
-
-/** File stamps are world-local and never part of a revision: they live with
- * the lease's checkpoint pointer, sealed like a manifest (paths are private)
- * and bound to the content they describe. */
-function sealStamps(key: Buffer, attachmentId: string, rootDigest: string, stamps: Record<string, string>): string {
-  return sealRandom(key, Buffer.from(JSON.stringify({ attachmentId, rootDigest, stamps }))).toString('base64');
-}
-function openStamps(key: Buffer, sealed: string, attachmentId: string, rootDigest: string): Record<string, string> | undefined {
-  try {
-    const value = JSON.parse(openRandom(key, Buffer.from(sealed, 'base64')).toString('utf8'));
-    return value?.attachmentId === attachmentId && value.rootDigest === rootDigest && value.stamps && typeof value.stamps === 'object'
-      ? value.stamps : undefined;
-  } catch { return undefined; }
-}
 
 /** The key an object was sealed with: its capture key, else the organization's. */
 function objectKey(manifest: SnapshotManifest, organizationKey: Buffer, id: string): Buffer {
@@ -2133,152 +1631,35 @@ function objectKey(manifest: SnapshotManifest, organizationKey: Buffer, id: stri
 function manifestDigest(files: SnapshotEntry[], packs?: string[], keyed?: Record<string, string>): string {
   return sha256(Buffer.from(JSON.stringify(packs ? (keyed && Object.keys(keyed).length ? { packs, files, keyed } : { packs, files }) : files)));
 }
-function entryObjects(file: SnapshotEntry | ProgressFile): string[] {
-  return 'chunks' in file && file.chunks ? file.chunks : typeof (file as ProgressFile).pack === 'string' ? [(file as ProgressFile).pack!] : [];
-}
-/** The objects one file is stored in. */
-function entryIds(manifest: SnapshotManifest, file: SnapshotEntry): string[] {
-  return 'pack' in file ? [manifest.packs![file.pack]!] : file.chunks;
-}
 /** Every object a manifest references, once each. */
 function manifestObjects(manifest: SnapshotManifest): string[] {
   return [...new Set([...manifest.packs ?? [], ...manifest.files.flatMap((file) => 'chunks' in file ? file.chunks : [])])];
 }
 
-/** Bounded concurrent uploads. `add` waits for a free slot; the first failure
- * is raised by the next `add` or by `drain`. */
-class BoundedUploads {
-  private running = new Set<Promise<void>>();
-  private failure?: { error: unknown };
-  constructor(private limit: number) {}
-  async add(task: () => Promise<void>): Promise<void> {
-    this.raise();
-    while (this.running.size >= this.limit) await Promise.race(this.running);
-    this.raise();
-    const run: Promise<void> = task().catch((error) => { this.failure ??= { error }; })
-      .finally(() => { this.running.delete(run); });
-    this.running.add(run);
-  }
-  get failed(): boolean { return Boolean(this.failure); }
-  async drain(): Promise<void> { await this.settle(); this.raise(); }
-  async settle(): Promise<void> { while (this.running.size) await Promise.all(this.running); }
-  private raise(): void { if (this.failure) throw this.failure.error; }
-}
-
-/** A completed file in a progress record: its objects by id, and its stamp. */
-interface ProgressFile { path: string; bytes: number; sha256: string; chunks?: string[]; pack?: string; offset?: number; stamp?: string;
-  /** The capture key of its objects; absent for the organization key. */
-  key?: string }
 interface ProgressStore {
   get(key: string): Promise<string | undefined>;
-  set(key: string, value: string): Promise<void>;
   compareAndSet(key: string, expected: string | undefined, next: string | undefined): Promise<boolean>;
   /** Keys starting with a prefix. */
   keys(prefix: string): Promise<string[]>;
   delete(key: string): Promise<void>;
 }
-interface ProgressHead { attachmentId: string; storageLocationId?: string; owner?: string; at: number;
-  held: Array<[string, number]>; segments: string[]; keys?: Record<string, CaptureKey> }
-/** Another attempt took this capture's progress record over (or it was abandoned). */
-class CaptureSuperseded extends Error {
-  constructor() { super('resource capture was superseded by another attempt'); }
-}
 
-/**
- * What an interrupted resumable capture has saved, and the chunk references it
- * holds, sealed in kv: a small head under `resource-capture:<attachment>` and
- * the completed files in segments beside it, one per save, so a save writes only
- * what it adds. Exactly one capture owns a record: it claims one only when none
- * exists, when its owner stopped recording, or when its owner gave it up, and
- * every later write of the head is a compare-and-set against its own last
- * write, so an attempt that lost the record stops without releasing anything (a
- * leak, never a double release). A record never names an object that is not
- * uploaded, and it is gone before any reference it names is released.
- */
-class CaptureProgress {
-  lost = false;
-  private constructor(private store: ProgressStore, private key: Buffer, private recordKey: string,
-    private head: ProgressHead, private value: string | undefined, private owner: string,
-    readonly files: ProgressFile[], readonly held: Array<[string, number]>, readonly keys: Record<string, CaptureKey>) {}
-
-  static keyFor(attachmentId: string): string { return `resource-capture:${attachmentId}`; }
-
-  static async claim(store: ProgressStore, key: Buffer, attachment: ResourceAttachment,
-    storageLocationId: string | undefined): Promise<CaptureProgress | undefined> {
-    const recordKey = CaptureProgress.keyFor(attachment.id);
-    const owner = crypto.randomUUID();
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const value = await store.get(recordKey);
-      const head = value === undefined ? undefined : openSealed<ProgressHead>(key, value);
-      // A record that cannot be read is replaced; what it held leaks.
-      const usable = head && head.attachmentId === attachment.id && Array.isArray(head.held) && Array.isArray(head.segments)
-        && Number.isFinite(head.at) && (head.storageLocationId ?? undefined) === (storageLocationId ?? undefined);
-      if (usable && head.owner && Date.now() - head.at < PROGRESS_STALE_MS) return undefined; // a live attempt
-      const files: ProgressFile[] = [];
-      // A missing segment only means its files are read again; their objects are still held.
-      if (usable) for (const segment of head.segments) files.push(...(openSealed<ProgressFile[]>(key, (await store.get(segment)) ?? '') ?? []));
-      const next: ProgressHead = { attachmentId: attachment.id, ...(storageLocationId ? { storageLocationId } : {}), owner, at: Date.now(),
-        held: usable ? head.held : [], segments: usable ? head.segments : [], ...(usable && head.keys ? { keys: head.keys } : {}) };
-      const sealed = sealValue(key, next);
-      if (await store.compareAndSet(recordKey, value, sealed))
-        return new CaptureProgress(store, key, recordKey, next, sealed, owner, files, next.held, next.keys ?? {});
-    }
-    return undefined;
+/** Remove the progress record (`resource-capture:<attachment>`, a sealed head
+ * and its segments) a capture interrupted before restic left behind, returning
+ * the chunk references it held. */
+async function takeProgress(store: ProgressStore, key: Buffer | undefined, attachmentId: string)
+  : Promise<{ ids: string[]; storageLocationId?: string } | undefined> {
+  const recordKey = `resource-capture:${attachmentId}`;
+  const dropSegments = async () => { for (const segment of await store.keys(`${recordKey}:`)) await store.delete(segment); };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const value = await store.get(recordKey);
+    if (value === undefined) { await dropSegments(); return undefined; }
+    if (!await store.compareAndSet(recordKey, value, undefined)) continue;
+    await dropSegments();
+    let head: { attachmentId?: string; held?: Array<[string, number]>; storageLocationId?: string } | undefined;
+    try { head = key ? JSON.parse(openRandom(key, Buffer.from(value, 'base64')).toString('utf8')) : undefined; } catch { head = undefined; }
+    return head?.attachmentId === attachmentId && Array.isArray(head.held)
+      ? { ids: head.held.map(([id]) => id), storageLocationId: head.storageLocationId } : { ids: [] };
   }
-
-  /** Remove a record whatever its state, returning the references it held. */
-  static async take(store: ProgressStore, key: Buffer | undefined, attachmentId: string)
-    : Promise<{ ids: string[]; storageLocationId?: string } | undefined> {
-    const recordKey = CaptureProgress.keyFor(attachmentId);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const value = await store.get(recordKey);
-      if (value === undefined) { await CaptureProgress.dropSegments(store, recordKey); return undefined; }
-      if (!await store.compareAndSet(recordKey, value, undefined)) continue;
-      await CaptureProgress.dropSegments(store, recordKey);
-      const head = key ? openSealed<ProgressHead>(key, value) : undefined;
-      return head?.attachmentId === attachmentId && Array.isArray(head.held)
-        ? { ids: head.held.map(([id]) => id), storageLocationId: head.storageLocationId } : { ids: [] };
-    }
-    throw new Error('resource capture progress kept changing');
-  }
-
-  /** Record `files` completed since the last save. `park`: this attempt is
-   * stopping, so the next one may take the record over at once. */
-  async save(files: ProgressFile[], held: Array<[string, number]>, park: boolean, keys: Record<string, CaptureKey>): Promise<void> {
-    if (this.lost) throw new CaptureSuperseded();
-    const segments = [...this.head.segments];
-    if (files.length) {
-      const segment = `${this.recordKey}:${this.owner}:${segments.length}`;
-      await this.store.set(segment, sealValue(this.key, files));
-      segments.push(segment);
-    }
-    const { owner: _owner, ...rest } = this.head;
-    await this.write({ ...rest, ...(park ? {} : { owner: this.owner }), at: Date.now(), held, segments,
-      ...(Object.keys(keys).length ? { keys } : {}) });
-  }
-
-  async clear(): Promise<void> {
-    await this.write(undefined);
-    await CaptureProgress.dropSegments(this.store, this.recordKey);
-  }
-
-  private async write(next: ProgressHead | undefined): Promise<void> {
-    if (this.lost) throw new CaptureSuperseded();
-    const sealed = next && sealValue(this.key, next);
-    if (!await this.store.compareAndSet(this.recordKey, this.value, sealed)) { this.lost = true; throw new CaptureSuperseded(); }
-    this.value = sealed;
-    if (next) this.head = next;
-  }
-
-  /** Segments are written before the head names them, so a lost write can leave one behind. */
-  private static async dropSegments(store: ProgressStore, recordKey: string): Promise<void> {
-    for (const segment of await store.keys(`${recordKey}:`)) await store.delete(segment);
-  }
-}
-
-function sealValue(key: Buffer, value: unknown): string {
-  return sealRandom(key, Buffer.from(JSON.stringify(value))).toString('base64');
-}
-function openSealed<T>(key: Buffer, value: string): T | undefined {
-  try { return JSON.parse(openRandom(key, Buffer.from(value, 'base64')).toString('utf8')) as T; } catch { return undefined; }
+  throw new Error('resource capture progress kept changing');
 }

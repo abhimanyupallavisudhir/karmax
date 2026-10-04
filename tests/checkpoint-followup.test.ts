@@ -62,10 +62,11 @@ it('delivers follow-ups during real streamed checkpoint capture without parking 
       let entered!: () => void, release!: () => void;
       const atChunk = new Promise<void>(resolve => { entered = resolve; });
       const gate = new Promise<void>(resolve => { release = resolve; });
-      const stream = world.readFileStream!.bind(world);
-      const commands = vi.spyOn(world, 'readFileStream').mockImplementation(async function* (name: string) {
+      // Hold the resource save (restic) open until the follow-up has arrived.
+      const backup = resources.restic.backup.bind(resources.restic);
+      const commands = vi.spyOn(resources.restic, 'backup').mockImplementation(async (...args) => {
         reads++; entered(); await gate;
-        yield* stream(name);
+        return backup(...args);
       });
       const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'waiting',
         waitingFor: { kind: 'human', audience: ['@creator'] }, messages: [], actions: [], updatedAt: 1,

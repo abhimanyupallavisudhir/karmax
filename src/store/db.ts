@@ -595,6 +595,12 @@ export class Store {
         bytes INTEGER NOT NULL,
         PRIMARY KEY(organizationId, chunkId)
       );
+      CREATE TABLE IF NOT EXISTS resource_repository_files (
+        repository TEXT NOT NULL, attachmentId TEXT NOT NULL, organizationId TEXT NOT NULL, storageLocationId TEXT,
+        kind TEXT NOT NULL, name TEXT NOT NULL, bytes INTEGER NOT NULL, content TEXT,
+        createdAt INTEGER NOT NULL,
+        PRIMARY KEY (repository, kind, name)
+      );
       CREATE TABLE IF NOT EXISTS storage_locations (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL,
         kind TEXT NOT NULL, config TEXT NOT NULL, credentialHandle TEXT,
@@ -885,6 +891,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_artifacts_task ON promoted_artifacts(taskId, createdAt);
       CREATE INDEX IF NOT EXISTS idx_conversation_exports_used ON conversation_exports(usedAt);
       CREATE INDEX IF NOT EXISTS idx_conversation_exports_project ON conversation_exports(projectId);
+      CREATE INDEX IF NOT EXISTS idx_resource_repository_files_location ON resource_repository_files(storageLocationId);
+      CREATE INDEX IF NOT EXISTS idx_resource_repository_files_organization ON resource_repository_files(organizationId);
+      CREATE INDEX IF NOT EXISTS idx_resource_repository_files_attachment ON resource_repository_files(attachmentId);
       CREATE INDEX IF NOT EXISTS idx_executions_task ON executions(taskId, startedAt);
       CREATE INDEX IF NOT EXISTS idx_execution_frames ON execution_frames(executionId, seq);
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
@@ -2072,6 +2081,8 @@ export class Store {
       usage_admissions: (await selectRows(this.db, 'usage_admissions', 'organizationId=?', [organizationId])),
       promoted_artifacts: (await selectRows(this.db, 'promoted_artifacts', 'organizationId=?', [organizationId])),
       conversation_exports: (await selectRows(this.db, 'conversation_exports', 'organizationId=?', [organizationId])),
+      resource_repository_files: (await selectRows(this.db, 'resource_repository_files', 'organizationId=?', [organizationId]))
+        .map(({ content: _lock, ...row }) => row),
       executions: (await selectRows(this.db, 'executions', 'organizationId=?', [organizationId])),
       execution_frames: (await rowsFor(this.db, 'execution_frames', 'executionId', executionIds)),
       preview_leases: (await selectRows(this.db, 'preview_leases', 'organizationId=?', [organizationId]))
@@ -2356,6 +2367,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM runner_pools WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM world_provider_connections WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM resource_snapshot_chunks WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM resource_repository_files WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM storage_upload_reservations WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM storage_locations WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM delivery_preferences WHERE organizationId=?').run(organizationId));
@@ -6373,6 +6385,11 @@ export class Store {
     let retainedBytes = Number(((await this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
       FROM resource_snapshot_chunks WHERE organizationId=? AND storageLocationId=?`)
       .get(location.organizationId, locationId)) as any)?.bytes ?? 0);
+    // Resource repositories: every file but the locks restic keeps while it works.
+    retainedBytes += Number(((await this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
+      FROM resource_repository_files WHERE organizationId=? AND kind<>'locks'
+      AND (storageLocationId=? OR (storageLocationId IS NULL AND ?=1))`)
+      .get(location.organizationId, locationId, location.kind === 'managed' ? 1 : 0)) as { bytes?: number } | undefined)?.bytes ?? 0);
     if (location.kind === 'managed') {
       retainedBytes += Number(((await this.db.prepare('SELECT COALESCE(SUM(bytes), 0) bytes FROM promoted_artifacts WHERE organizationId=?')
         .get(location.organizationId)) as any)?.bytes ?? 0);
@@ -6472,6 +6489,67 @@ export class Store {
     catch (error) { (await this.db.exec('ROLLBACK')); throw error; }
   
     });
+  }
+
+  /** A resource repository's file, as its server recorded it (world/resource-repository.ts). */
+  async repositoryFile(repository: string, kind: string, name: string): Promise<{ bytes: number; content?: string } | undefined> {
+    const row = (await this.db.prepare('SELECT bytes, content FROM resource_repository_files WHERE repository=? AND kind=? AND name=?')
+      .get(repository, kind, name)) as { bytes: number; content: string | null } | undefined;
+    return row ? { bytes: Number(row.bytes), ...(row.content != null ? { content: row.content } : {}) } : undefined;
+  }
+
+  async listRepositoryFiles(repository: string, kind?: string): Promise<Array<{ kind: string; name: string; bytes: number }>> {
+    const rows = (await this.db.prepare(`SELECT kind, name, bytes FROM resource_repository_files WHERE repository=?
+      ${kind ? 'AND kind=?' : ''} ORDER BY kind, name`).all(...(kind ? [repository, kind] : [repository]))) as Array<{ kind: string; name: string; bytes: number }>;
+    return rows.map((row) => ({ kind: row.kind, name: row.name, bytes: Number(row.bytes) }));
+  }
+
+  /** Every repository file of an attachment, in all its locations. */
+  async attachmentRepositoryFiles(attachmentId: string): Promise<Array<{ repository: string; kind: string; name: string }>> {
+    return (await this.db.prepare('SELECT repository, kind, name FROM resource_repository_files WHERE attachmentId=?')
+      .all(attachmentId)) as Array<{ repository: string; kind: string; name: string }>;
+  }
+
+  async recordRepositoryFile(file: { repository: string; attachmentId: string; organizationId: string; storageLocationId?: string;
+    kind: string; name: string; bytes: number; content?: string }): Promise<void> {
+    (await this.db.prepare(`INSERT OR IGNORE INTO resource_repository_files
+      (repository, attachmentId, organizationId, storageLocationId, kind, name, bytes, content, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(file.repository, file.attachmentId, file.organizationId, file.storageLocationId ?? null, file.kind, file.name, file.bytes,
+        file.content ?? null, Date.now()));
+  }
+
+  /** Snapshots written before `before` that no revision names: an interrupted
+   * or superseded save, a Review inspection, an unchanged capture. */
+  async unreferencedRepositorySnapshots(before: number, limit = 1000): Promise<Array<{ repository: string; attachmentId: string; name: string }>> {
+    return ((await this.db.prepare(`SELECT f.repository, f.attachmentId, f.name FROM resource_repository_files f
+      WHERE f.kind='snapshots' AND f.createdAt < ? AND NOT EXISTS (SELECT 1 FROM resource_revisions r
+        WHERE r.attachmentId=f.attachmentId AND r.engine='restic@1' AND r.rootDigest=f.name)
+      ORDER BY f.repository LIMIT ?`).all(before, limit)) as Array<{ repository: string; attachmentId: string; name: string }>);
+  }
+
+  /** Revisions saved before restic, current ones first, then oldest first. */
+  async legacyResourceRevisions(limit: number): Promise<ResourceRevision[]> {
+    const rows = (await this.db.prepare(`SELECT r.* FROM resource_revisions r WHERE r.engine='object-snapshot@1'
+      ORDER BY CASE WHEN EXISTS (SELECT 1 FROM resource_attachments a WHERE a.currentRevisionId=r.id) THEN 0 ELSE 1 END, r.createdAt
+      LIMIT ?`).all(limit)) as Array<Record<string, unknown>>;
+    return rows.map(resourceRevisionRow);
+  }
+
+  /** Point a pre-restic revision at its restic snapshot, keeping its id (leases,
+   * checkpoints and children name it). False when it changed or went meanwhile. */
+  async convertResourceRevision(id: string, fromSealedRef: string, to: Pick<ResourceRevision, 'engine' | 'sealedRef' | 'rootDigest'
+    | 'bytes' | 'files' | 'storageLocationId'>): Promise<boolean> {
+    const result = (await this.db.prepare(`UPDATE resource_revisions SET engine=?, sealedRef=?, rootDigest=?, bytes=?, files=?,
+      storageLocationId=? WHERE id=? AND engine='object-snapshot@1' AND sealedRef=?`).run(to.engine, to.sealedRef, to.rootDigest,
+      to.bytes, to.files ?? null, to.storageLocationId ?? null, id, fromSealedRef)) as { changes?: number };
+    return Number(result?.changes ?? 0) > 0;
+  }
+
+  /** True when the file was there to delete. */
+  async deleteRepositoryFile(repository: string, kind: string, name: string): Promise<boolean> {
+    const result = (await this.db.prepare('DELETE FROM resource_repository_files WHERE repository=? AND kind=? AND name=?')
+      .run(repository, kind, name)) as { changes?: number };
+    return Number(result?.changes ?? 0) > 0;
   }
 
   async releaseResourceChunks(organizationId: string, chunkIds: string[]): Promise<string[]> {

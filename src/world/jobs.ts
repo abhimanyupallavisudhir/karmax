@@ -59,8 +59,8 @@ export function isJobId(value: unknown): value is string {
 }
 
 /** World path of a job's directory (as the agent sees it). */
-export function jobDirectory(world: Pick<World, 'handle'>, id: string): string {
-  return path.posix.join(world.handle.root.replace(/\\/g, '/'), JOB_ROOT, id);
+export function jobDirectory(world: Pick<World, 'handle'>, id: string, root = JOB_ROOT): string {
+  return path.posix.join(world.handle.root.replace(/\\/g, '/'), root, id);
 }
 
 // `alive DIR` — true while the job's session leader is the very process that
@@ -73,8 +73,8 @@ const ALIVE = `alive() { p=$(cat "$1/pid" 2>/dev/null) || return 1; [ -n "$p" ] 
 // Started with cwd = world root, so every path is root-relative: the same
 // script works on the host, in a container (root mounted elsewhere), and in a
 // remote sandbox.
-const LAUNCH = `set -e
-id=$1; cwd=$2; name=$3; d=${JOB_ROOT}/$id
+const launch = (root: string) => `set -e
+id=$1; cwd=$2; name=$3; d=${root}/$id
 mkdir -p "$d"; d=$(cd "$d" && pwd)
 cat > "$d/command"
 [ -z "$name" ] || printf '%s\n' "$name" > "$d/name"
@@ -92,7 +92,10 @@ export const MAX_JOB_NAME = 60;
 
 /** Start `command` as a durable job. `cwd` is relative to the agent's working
  * directory unless absolute. `env` carries the project's work secrets. */
-export async function startJob(world: World, spec: { command: string; cwd?: string; name?: string; env?: Record<string, string> }): Promise<JobStatus> {
+export async function startJob(world: World, spec: { command: string; cwd?: string; name?: string; env?: Record<string, string>;
+  /** Where the job lives; the platform's own jobs keep out of the agent's. */
+  root?: string }): Promise<JobStatus> {
+  const jobs = jobRoot(spec.root);
   const command = spec.command.trim();
   if (!command) throw new Error('command is required');
   // One line: the status script reads it back as one.
@@ -107,16 +110,23 @@ export async function startJob(world: World, spec: { command: string; cwd?: stri
   const launchCwd = !inside ? '.' : inside.startsWith('..') || path.posix.isAbsolute(inside) ? cwd : inside;
   await ensureWorldExcluded(world, '.karmax-injection').catch(() => {});
   const id = `job-${crypto.randomBytes(4).toString('hex')}`;
-  const result = await world.exec('bash', ['-c', LAUNCH, 'karmax-job-launch', id, launchCwd, name ?? ''], {
+  const result = await world.exec('bash', ['-c', launch(jobs), 'karmax-job-launch', id, launchCwd, name ?? ''], {
     cwd: world.handle.root, input: `${command}\n`, timeoutMs: 30_000, ...(spec.env ? { env: spec.env } : {}),
   });
   if (result.code !== 0) throw new Error(`could not start job: ${(result.stderr || result.stdout).trim().slice(0, 500) || `exit ${result.code}`}`);
-  return { id, state: 'running', command, ...(name ? { name } : {}), log: `${jobDirectory(world, id)}/log` };
+  return { id, state: 'running', command, ...(name ? { name } : {}), log: `${jobDirectory(world, id, jobs)}/log` };
 }
 
-const STATUS = `${ALIVE}
+/** Platform jobs (a resource save or restore) are not the agent's to list or stop. */
+export const SYSTEM_JOB_ROOT = '.karmax-injection/system-jobs';
+function jobRoot(root = JOB_ROOT): string {
+  if (root !== JOB_ROOT && root !== SYSTEM_JOB_ROOT) throw new Error(`unknown job root ${root}`);
+  return root;
+}
+
+const status = (root: string) => `${ALIVE}
 b=$1; lines=$2; shift 2
-for id in "$@"; do d=${JOB_ROOT}/$id
+for id in "$@"; do d=${root}/$id
   if [ ! -d "$d" ]; then printf '%s %s missing\\n' "$b" "$id"; continue; fi
   if [ -f "$d/exit" ]; then s="exited $(cat "$d/exit")"; elif alive "$d"; then s=running; else s=lost; fi
   printf '%s %s %s %s %s\\n' "$b" "$id" "$s" "$(cat "$d/started" 2>/dev/null)" "$(cat "$d/ended" 2>/dev/null)"
@@ -128,13 +138,14 @@ done
 printf '%s end\\n' "$b"`;
 
 /** One round trip for every job's state (and, with `tailLines`, its last output). */
-export async function jobStatuses(world: World, ids: string[], opts: { tailLines?: number } = {}): Promise<JobStatus[]> {
+export async function jobStatuses(world: World, ids: string[], opts: { tailLines?: number; root?: string } = {}): Promise<JobStatus[]> {
+  const root = jobRoot(opts.root);
   const valid = ids.filter(isJobId);
   const out = new Map<string, JobStatus>();
   for (const id of ids) if (!isJobId(id)) out.set(id, { id, state: 'missing', log: '' });
   if (valid.length) {
     const boundary = `@@karmax-job-${crypto.randomBytes(6).toString('hex')}`;
-    const result = await world.exec('bash', ['-c', STATUS, 'karmax-job-status', boundary, String(Math.max(0, opts.tailLines ?? 0)), ...valid],
+    const result = await world.exec('bash', ['-c', status(root), 'karmax-job-status', boundary, String(Math.max(0, opts.tailLines ?? 0)), ...valid],
       { cwd: world.handle.root, timeoutMs: 30_000 });
     if (result.code !== 0) throw new Error(`could not read job status: ${(result.stderr || result.stdout).trim().slice(0, 300) || `exit ${result.code}`}`);
     let current: JobStatus | undefined;
@@ -156,7 +167,7 @@ export async function jobStatuses(world: World, ids: string[], opts: { tailLines
       const [id, state, ...rest] = line.slice(boundary.length + 1).split(' ');
       if (id === 'end') break;
       if (!id || !isJobId(id)) continue;
-      const log = `${jobDirectory(world, id)}/log`;
+      const log = `${jobDirectory(world, id, root)}/log`;
       if (state === 'missing') { out.set(id, { id, state: 'missing', log }); continue; }
       const numbers = rest.map((value) => (value ? Number(value) : NaN));
       if (state === 'exited') {
@@ -189,9 +200,9 @@ export async function listJobs(world: World): Promise<string[]> {
 // them, not the session leader: a leader that dies on SIGTERM at once must not
 // spare a child that catches it (#466: a Vitest worker running Temporal, whose
 // Runtime traps SIGTERM, outlived two stop_job calls).
-const STOP = `${ALIVE}
+const stop = (root: string) => `${ALIVE}
 ids=" "; cookies=""; sessions=""
-for id in "$@"; do d=${JOB_ROOT}/$id; [ -d "$d" ] || continue
+for id in "$@"; do d=${root}/$id; [ -d "$d" ] || continue
   ids="$ids$id "; cookies="$cookies -e KARMAX_JOB=$id"
   if [ ! -f "$d/exit" ] && alive "$d"; then sessions="$sessions $(cat "$d/pid"):$id"; fi
 done
@@ -231,10 +242,10 @@ export interface JobStop {
 /** Stop jobs (all of this world's by default) and every process they started:
  * SIGTERM, then SIGKILL whatever is left after five seconds. Reports the jobs
  * that had any process left to stop. */
-export async function stopJobs(world: World, ids?: string[]): Promise<JobStop[]> {
+export async function stopJobs(world: World, ids?: string[], root?: string): Promise<JobStop[]> {
   const targets = (ids ?? (await listJobs(world))).filter(isJobId);
   if (!targets.length) return [];
-  const result = await world.exec('bash', ['-c', STOP, 'karmax-job-stop', ...targets], { cwd: world.handle.root, timeoutMs: 30_000 });
+  const result = await world.exec('bash', ['-c', stop(jobRoot(root)), 'karmax-job-stop', ...targets], { cwd: world.handle.root, timeoutMs: 30_000 });
   if (result.code !== 0) throw new Error(`could not stop jobs: ${(result.stderr || result.stdout).trim().slice(0, 300) || `exit ${result.code}`}`);
   const stops = new Map<string, JobStop>();
   for (const line of result.stdout.split('\n')) {

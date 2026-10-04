@@ -71,6 +71,9 @@ export class ManagedStorageService {
     let deletedRevisions = 0;
     for (const revision of (await store.unreferencedCheckpointRevisions(now - STORAGE_POLICY.unreferencedCheckpointRevisionMs)))
       if ((await this.deps.resources.deleteRevision(revision.id))) deletedRevisions++;
+    // Forget unused restic snapshots, prune, and convert pre-restic versions,
+    // before usage is measured against quotas.
+    await this.deps.resources.maintainRepositories(now);
     let notices = 0;
     if (store.hosted) for (const organization of (await store.listOrganizations()))
       notices += (await this.enforceQuota(organization.id, now));
@@ -131,6 +134,8 @@ export class ManagedStorageService {
     ];
     for (const step of steps.slice(0, limit)) {
       await step();
+      // A deleted restic version frees its data once the repository is pruned.
+      await resources.pruneRepositories();
       left = (await retained());
       if (left <= quotaBytes) break;
     }
@@ -201,6 +206,7 @@ export class ManagedStorageService {
       if (revision.id === attachment.currentRevisionId) continue;
       if ((await this.deps.resources.deleteRevision(revision.id))) { deleted++; bytes += revision.bytes; }
     }
+    await this.deps.resources.pruneRepositories();
     return { deleted, bytes };
   }
 

@@ -167,7 +167,7 @@ describe('work-environment screening', () => {
     const resources = new ProjectResourceService(store, worlds,
       new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
     for (const [id, name, variable, value] of [['resource_good', 'Good token', 'GOOD_TOKEN', 'good-value'],
-      ['resource_binary', 'Binary secret', 'BINARY_TOKEN', 'bin\u0000ary-value']] as const) {
+      ['resource_binary', 'Binary secret', 'BINARY_TOKEN', 'nul-head\u0000nul-tail']] as const) {
       (await broker.registerHandle(resourceSecretHandle(id), value, organizationScope(project.organizationId!)));
       (await store.createResourceAttachment({ id, organizationId: project.organizationId!, projectId: project.id,
         name, driver: 'secret@1', target: { kind: 'environment', name: variable },
@@ -201,7 +201,8 @@ describe('work-environment screening', () => {
         event.type === 'agent.activity' && (event.payload as any).id === 'work-environment');
       expect(notice?.payload).toMatchObject({ kind: 'status', phase: 'failed', title: '3 credentials not given to the agent' });
       const archived = JSON.stringify([received?.systemPrompt, (await store.eventsSince(task.id, 0)).map((event) => event.payload)]);
-      for (const value of ['bin', 'ary-value', 'leaked-name-value', 'AAAA']) expect(archived).not.toContain(value);
+      // Distinctive halves: a short one like 'bin' also occurs in random task ids.
+      for (const value of ['nul-head', 'nul-tail', 'leaked-name-value', 'AAAA']) expect(archived).not.toContain(value);
     } finally {
       vault.mockRestore();
       await core.destroyWorld(handle);

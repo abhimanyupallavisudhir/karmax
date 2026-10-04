@@ -1,3 +1,4 @@
+import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
 import type { PasskeyCredential } from '../autonomy/passkey.js';
@@ -1576,6 +1577,10 @@ export class Gateway {
     const receivedAt = req.method === 'POST' && (await this.cachedTimingEnabled()) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
+    // Resource repositories: restic in task worlds (and the worker), with
+    // grants of their own, never a session; not the browser API's limits.
+    if (p.startsWith(REPOSITORY_ROUTE) && this.deps.resources?.repositoryServer)
+      return this.deps.resources.repositoryServer.handle(req, res, p.slice(REPOSITORY_ROUTE.length) + url.search);
     const sensitiveNavigation = /^\/api\/tasks\/[^/]+\/(desktop|preview\/)/.test(p);
     if (p.startsWith('/api/') && (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET') || sensitiveNavigation)
       && !this.sameOriginRequest(req)) return this.json(res, 403, { error: 'cross-origin request forbidden' });
