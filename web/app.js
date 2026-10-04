@@ -11063,10 +11063,10 @@ function taskActionLabel(v, action) {
 // This is the footer bar that stays visible on every task-page tab, so the
 // proposal / confirmation / cancellation controls are always one click away.
 function taskActions(v) {
-  if (v.state?.applyingResources && v.status === 'active') return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Applying resources…</button></div>`;
-  if (v.state?.stagingResources && v.status === 'active') {
+  if ((v.state?.applyingResources || v.state?.stagingResources) && v.status === 'active') {
     const progress = stagingProgress();
-    return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true"${progress?.title ? ` title="${esc(progress.title)}"` : ''}>${esc(progress?.text || 'Saving resources…')}</button></div>`;
+    const idle = v.state?.applyingResources ? 'Applying resources…' : 'Saving resources…';
+    return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true"${progress?.title ? ` title="${esc(progress.title)}"` : ''}>${esc(progress?.text || idle)}</button></div>`;
   }
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];

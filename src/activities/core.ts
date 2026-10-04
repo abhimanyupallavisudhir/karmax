@@ -3571,11 +3571,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async settleResourceReview(taskId: string): Promise<void> {
       let context: ReturnType<typeof activityContext.current> | undefined;
       try { context = activityContext.current(); } catch { /* direct tests */ }
+      let progress: StagingProgress | undefined;
+      let reported = 0;
       const pulse = setInterval(() => {
-        try { context?.heartbeat({ taskId, operation: 'applying-resources' }); } catch { /* activity completion/cancellation */ }
+        try { context?.heartbeat({ taskId, operation: 'applying-resources', ...(progress ? { progress } : {}) }); }
+        catch { /* activity completion/cancellation */ }
       }, 5_000);
-      try { await deps.resources?.settleReview(taskId); }
-      finally { clearInterval(pulse); }
+      try {
+        await deps.resources?.settleReview(taskId, {
+          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); },
+          // Publishing a changed resource is a save too: Review shows how far it has got.
+          onProgress: (next) => {
+            progress = next;
+            if (Date.now() - reported < STAGING_PROGRESS_EVERY_MS) return;
+            reported = Date.now();
+            void record(taskId, 'staging.progress', { ...next }).catch(() => undefined);
+          },
+        });
+      } finally { clearInterval(pulse); }
     },
 
     /** Snapshot staged path candidates while the producing world is still live.

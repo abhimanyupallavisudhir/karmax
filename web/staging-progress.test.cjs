@@ -26,3 +26,16 @@ test('saving resources shows how far the save has got, and only while that is cu
   assert.equal(context.liveOnlyEvent('staging.progress'), true);
   assert.equal(context.liveOnlyEvent('view.updated'), false);
 });
+
+test('applying resources shows the same progress, so a long publication never looks stuck', () => {
+  const S = { taskEvents: [] };
+  const context = vm.createContext({ S });
+  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActions')].join('\n'), context);
+  const view = { taskId: 'task', status: 'active', state: { applyingResources: true } };
+  const label = () => context.taskActions(view).match(/<button[^>]*>([^<]*)<\/button>/)[1];
+  assert.equal(label(), 'Applying resources…');
+  S.taskEvents.push({ type: 'staging.progress', ts: Date.now(),
+    payload: { path: 'raw_data', index: 1, count: 2, files: 900, totalFiles: 70451, bytes: 2 * 1024 ** 3, totalBytes: 5.4 * 1024 ** 3 } });
+  assert.equal(label(), 'Saving raw_data · 2 GB of 5.4 GB');
+  assert.match(context.taskActions(view), /title="Resource 2 of 2"/);
+});
