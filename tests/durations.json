@@ -219,6 +219,7 @@
   "tests/landing-page.test.ts": 0,
   "tests/landing-wait.test.ts": 37.4,
   "tests/latency-validation.test.ts": 0,
+  "tests/launch-app.test.ts": 9,
   "tests/launch-legal.test.ts": 0,
   "tests/limits.test.ts": 0,
   "tests/lint-budget.test.ts": 0,

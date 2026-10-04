@@ -159,24 +159,32 @@ export interface AppProcess {
 /** The installed app itself — src/main.ts with its gateway, worker and
  *  embedded Temporal on `home`, as `npm start` runs it — with the mock agent. */
 export async function launchApp(home: string): Promise<AppProcess> {
-  const port = await findFreePortFrom(48950);
-  const url = `http://127.0.0.1:${port}`;
-  const log = fs.openSync(path.join(home, 'main.log'), 'a');
+  const logFile = path.join(home, 'main.log');
+  const log = fs.openSync(logFile, 'a');
+  const launchedAt = fs.fstatSync(log).size; // a relaunch appends to the same log
   const app = spawn(process.execPath, ['--import', 'tsx', '--max-old-space-size=512', 'src/main.ts'], {
     cwd: path.resolve('.'), stdio: ['ignore', log, log],
-    env: { PATH: process.env.PATH, HOME: process.env.HOME, KARMAX_HOME: home, KARMAX_HOST: '127.0.0.1', KARMAX_PORT: String(port),
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, KARMAX_HOME: home, KARMAX_HOST: '127.0.0.1', KARMAX_PORT: '48950',
       KARMAX_AGENT_PROVIDER: 'mock', KARMAX_AGENT_MIN_FREE_MB: '0', KARMAX_AGENT_MAX_LOAD_FACTOR: '0',
       ...(process.env.TEMPORAL_CLI ? { TEMPORAL_CLI: process.env.TEMPORAL_CLI } : {}) },
   });
   const exited = new Promise<void>((resolve) => app.once('exit', () => resolve()));
-  const stop = async () => { if (app.exitCode === null && app.signalCode === null) app.kill('SIGTERM'); await exited; fs.closeSync(log); };
+  let logOpen = true;
+  const stop = async () => {
+    if (app.exitCode === null && app.signalCode === null) app.kill('SIGTERM');
+    await exited;
+    if (logOpen) { logOpen = false; fs.closeSync(log); }
+  };
   const deadline = Date.now() + 90_000;
   for (;;) {
     if (app.exitCode !== null || Date.now() > deadline) {
       await stop();
-      throw new Error(`the app did not become ready:\n${fs.readFileSync(path.join(home, 'main.log'), 'utf8').slice(-6000)}`);
+      throw new Error(`the app did not become ready:\n${fs.readFileSync(logFile, 'utf8').slice(-6000)}`);
     }
-    const ready = await fetch(`${url}/api/health/ready`, { signal: AbortSignal.timeout(1000) }).then((r) => r.ok, () => false);
+    // The gateway walks past KARMAX_PORT to the next free port, so a port picked
+    // here can be taken before it binds: follow the URL it announces instead.
+    const url = fs.readFileSync(logFile).subarray(launchedAt).toString('utf8').match(/is running: +(http:\/\/\S+)/)?.[1];
+    const ready = !!url && await fetch(`${url}/api/health/ready`, { signal: AbortSignal.timeout(1000) }).then((r) => r.ok, () => false);
     if (ready) return { url, stop };
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
