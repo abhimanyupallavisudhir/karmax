@@ -122,8 +122,11 @@ export async function bootHarness(
   const objectHome = tempDir('karmax-objects-');
   const broker = new CredentialBroker(new Vault(vaultHome));
   const objects = new LocalObjectStore(objectHome);
+  // A test's "remote" world runs on this host, so the loopback port reaches it.
+  let repositoryUrl: string | undefined;
   const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker,
-    { client, taskQueue: TASK_QUEUE });
+    { client, taskQueue: TASK_QUEUE }, undefined, { world: () => repositoryUrl });
+  repositoryUrl = await resources.loopbackUrl();
 
   const tokens = new TokenAuthority(store);
   const authorization = (await AuthorizationService.create(store));

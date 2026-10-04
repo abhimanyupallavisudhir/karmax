@@ -370,8 +370,9 @@ export class ProjectResourceService {
     });
   }
 
-  /** The repositories on a loopback port, for restic run by this process. */
-  private loopbackUrl(): Promise<string> {
+  /** The repositories on a loopback port, for restic run by this process (and
+   * by test worlds that only claim to be remote). */
+  loopbackUrl(): Promise<string> {
     return this.loopback ??= new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => {
         const url = new URL(req.url ?? '/', 'http://localhost');
