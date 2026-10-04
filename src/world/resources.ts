@@ -85,6 +85,11 @@ class UnstageableCandidate extends Error {}
 
 export interface RestoreOptions { signal?: AbortSignal }
 
+/** A writable resource's world copy, saved, with what it changes. */
+interface Inspection { summary: ResourceChangeSummary; repository: Repository; capture: ResticCapture }
+/** Progress and cancellation for a long resource save. */
+export interface ResourceWork { checkContinue?: () => Promise<void>; onProgress?: (progress: StagingProgress) => void }
+
 /** How far staging is through one candidate (`index` of `count`). */
 export interface StagingProgress { path: string; index: number; count: number; files: number; totalFiles: number; bytes: number; totalBytes: number }
 
@@ -860,7 +865,9 @@ export class ProjectResourceService {
     let converted = 0;
     let bytes = 0;
     for (const revision of await this.store.legacyResourceRevisions(1000)) {
-      if (bytes >= maxBytes) break;
+      // Its bytes pass through the same process that relays worlds' saves: a
+      // task saving a resource goes first, and the rest waits for the next run.
+      if (bytes >= maxBytes || await restic.busy()) break;
       const attachment = await this.store.getResourceAttachment(revision.attachmentId);
       if (!attachment) continue;
       const scratch = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'karmax-convert-'));
@@ -1224,7 +1231,7 @@ export class ProjectResourceService {
     return unsaved;
   }
 
-  async settleReview(taskId: string): Promise<void> {
+  async settleReview(taskId: string, work: ResourceWork = {}): Promise<void> {
     const selection = await this.store.resourceReview(taskId, { freeze: true });
     const excluded = new Set(selection.excluded);
     const principal = `task:${taskId}:confirmation`;
@@ -1243,28 +1250,47 @@ export class ProjectResourceService {
     const world = await this.store.currentWorld(taskId) as WorldHandle | undefined;
     if (!world) return;
     const candidateIds = new Set(candidates.map((c) => c.attachmentId));
+    const forks: ResourceAttachment[] = [];
     for (const lease of await this.store.listResourceLeases(world.id, world.generation ?? 1)) {
       if (lease.state !== 'active' || candidateIds.has(lease.attachmentId)) continue;
       const resource = await this.store.getResourceAttachment(lease.attachmentId);
       if (!resource || resource.publish !== 'review' || resource.access !== 'write' || resource.isolation !== 'fork' || resource.target.kind !== 'path') continue;
       if (excluded.has(resource.id)) { await this.discard(taskId, resource.id); continue; }
-      const summary = await this.summarize(taskId, resource.id);
+      forks.push(resource);
+    }
+    for (const [index, resource] of forks.entries()) {
+      await work.checkContinue?.();
+      // One save per resource: the snapshot taken to see what changed is the
+      // one published (the world is idle once the task is confirmed).
+      const inspection = await this.inspect(taskId, resource.id, { ...work,
+        onProgress: work.onProgress && ((progress) => work.onProgress!({ ...progress, index, count: forks.length })) });
+      const { summary } = inspection;
       if (!summary.promoted && summary.added + summary.modified + summary.deleted > 0)
-        await this.promoteReviewed(taskId, resource.id, summary);
+        await this.promoteReviewed(taskId, resource.id, inspection);
+      else await this.restic.forget(inspection.repository, [inspection.capture.snapshot]);
     }
   }
 
   async summarize(taskId: string, attachmentId: string): Promise<ResourceChangeSummary> {
+    return (await this.inspect(taskId, attachmentId)).summary;
+  }
+
+  /** Save what a world holds of a writable resource, and what that changes
+   * from the version it started from. */
+  private async inspect(taskId: string, attachmentId: string, work: { checkContinue?: () => Promise<void>;
+    onProgress?: (progress: Omit<StagingProgress, 'index' | 'count'>) => void } = {}): Promise<Inspection> {
     const { attachment, world, lease, target } = await this.worldResource(taskId, attachmentId);
     const started = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
-    // What the world holds now, saved: deduplicated against the version it
-    // started from, so mostly a scan, and its publication finds it all stored.
+    // Deduplicated against the version it started from, so mostly a scan.
     const repository = await this.restic.current(attachment);
     const parent = this.parentIn(repository, started);
-    const inspected = await this.restic.backup({ world, path: target, file: fileShaped(attachment) }, repository, {
-      key: `inspect:${lease.id}`, quota: true, ...(parent ? { parent } : {}) });
+    const label = attachment.target.kind === 'path' ? attachment.target.path : attachment.name;
+    const capture = await this.restic.backup({ world, path: target, file: fileShaped(attachment) }, repository, {
+      key: `inspect:${lease.id}`, quota: true, ...(parent ? { parent } : {}),
+      ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}),
+      ...(work.onProgress ? { onProgress: (progress) => work.onProgress!({ path: label, ...progress }) } : {}) });
     const summary: ResourceChangeSummary = { attachmentId: attachment.id, baseRevisionId: lease.revisionId,
-      ...await this.changes(repository, started, inspected.snapshot) };
+      ...await this.changes(repository, started, capture.snapshot) };
     // Keep the lease's original baseline (and its publication CAS fence), but
     // stop asking for a decision on bytes this task has already published.
     let publishedId = attachment.currentRevisionId;
@@ -1274,7 +1300,7 @@ export class ProjectResourceService {
       const published = await this.store.getResourceRevision(publishedId);
       if (!published) break;
       if (published.createdByTaskId === taskId) {
-        const reviewed = await this.changes(repository, published, inspected.snapshot);
+        const reviewed = await this.changes(repository, published, capture.snapshot);
         summary.promoted = reviewed.added + reviewed.modified + reviewed.deleted === 0;
         break;
       }
@@ -1284,7 +1310,7 @@ export class ProjectResourceService {
     }
     (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:inspect',
       scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, summary } }));
-    return summary;
+    return { summary, repository, capture };
   }
 
   /** What a snapshot changes relative to a revision (none: everything is new). */
@@ -1353,22 +1379,23 @@ export class ProjectResourceService {
     return this.promoteReviewed(taskId, attachmentId);
   }
 
-  private async promoteReviewed(taskId: string, attachmentId: string, inspected?: ResourceChangeSummary): Promise<{ attachment: ResourceAttachment; revision: ResourceRevision; summary: ResourceChangeSummary }> {
-    const { attachment, world, lease, target } = await this.worldResource(taskId, attachmentId);
+  private async promoteReviewed(taskId: string, attachmentId: string, inspection?: Inspection): Promise<{ attachment: ResourceAttachment; revision: ResourceRevision; summary: ResourceChangeSummary }> {
+    const { attachment, lease } = await this.worldResource(taskId, attachmentId);
     if (attachment.publish !== 'review' || attachment.access !== 'write' || attachment.isolation !== 'fork')
       throw new Error('resource is not configured for reviewed promotion');
-    const summary = inspected ?? await this.summarize(taskId, attachmentId);
-    // Save the immutable candidate before entering the singleton. The only
+    // The immutable candidate is saved before entering the singleton. The only
     // serialized operation is the tiny baseline pointer CAS, so a multi-GB
     // upload cannot block another publication merely while bytes are moving.
+    const { summary, repository, capture } = inspection ?? await this.inspect(taskId, attachmentId);
     const started = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
-    const captured = await this.capture({ world, path: target, file: fileShaped(attachment) },
-      attachment, started?.attachmentId === attachment.id ? started : undefined, { key: `publish:${lease.id}`, quota: true });
     // Identical to what the world started from: there is nothing to publish.
-    if (!captured && started) return { attachment, revision: started, summary };
+    if (started?.attachmentId === attachment.id && summary.added + summary.modified + summary.deleted === 0) {
+      await this.restic.forget(repository, [capture.snapshot]);
+      return { attachment, revision: started, summary };
+    }
     const baseline = await this.publicationBaseline(taskId, attachment.currentRevisionId, lease.revisionId);
     const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: baseline,
-      ...captured!.fields, metadata: { summary }, createdByTaskId: taskId }));
+      ...this.restic.revisionFields(capture, repository), metadata: { summary }, createdByTaskId: taskId }));
     return this.serializePublish(attachmentId, taskId, async () => {
       const promoted = (await this.store.promoteResourceRevision(attachmentId, revision.id, baseline));
       (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:promote',

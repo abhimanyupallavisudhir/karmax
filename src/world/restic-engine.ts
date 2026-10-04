@@ -134,6 +134,8 @@ export class ResticResources {
       const settled = await this.backupOnce(place, attachment, { ...options, parent: summary.snapshot, dryRun: true, key: `${options.key}:${round}:check` });
       if (!settled.changed) {
         if (superseded.length) await this.forget(attachment, superseded);
+        // The finished figures, also for a save shorter than restic's progress interval.
+        options.onProgress?.({ files: summary.files, totalFiles: summary.files, bytes: summary.bytes, totalBytes: summary.bytes });
         return { snapshot: summary.snapshot, files: summary.files, bytes: summary.bytes, added: summary.added };
       }
       superseded.push(summary.snapshot);
@@ -256,6 +258,15 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const end = offset + base.verifiedFiles;
     return { ...base, status: offset === 0 && end === files.length ? 'complete' as const : 'partial' as const,
       ...(end < files.length ? { nextOffset: end } : {}), ...(limited ? { issue: 'byte-limit' as const } : {}) };
+  }
+
+  /** Whether a world is saving or restoring a resource right now (a job
+   * started within the last six hours that no waiter has finished with). */
+  async busy(): Promise<boolean> {
+    const cutoff = Date.now() - 6 * 3_600_000;
+    return (await this.deps.store.kvEntries('restic-job:')).some((entry) => {
+      try { return Number(JSON.parse(entry.value).at ?? 0) > cutoff; } catch { return false; }
+    });
   }
 
   /** Drop snapshots; their data goes with the next {@link prune}. */
@@ -392,7 +403,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       const env = { ...await this.env(attachment, base, access, quota),
         RESTIC_CACHE_DIR: path.posix.join(world.handle.root, CACHE_DIR) };
       job = (await startJob(world, { command, cwd: world.handle.root, env, root: SYSTEM_JOB_ROOT })).id;
-      recorded = JSON.stringify({ job, generation: world.handle.generation ?? 1, digest });
+      recorded = JSON.stringify({ job, generation: world.handle.generation ?? 1, digest, at: Date.now() });
       await this.deps.store.kvSet(recordKey, recorded);
     }
     const forget = () => this.deps.store.kvCompareAndSet(recordKey, recorded, undefined).catch(() => false);

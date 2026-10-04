@@ -152,7 +152,14 @@ describe('project resources', () => {
     const summary = await resources.summarize(task.id, volume.id);
     expect(summary).toMatchObject({ added: 0, modified: 1, deleted: 0 });
     await resources.beginReview(task.id);
-    await resources.settleReview(task.id);
+    // Confirming publishes with one save, reporting its progress as it goes.
+    const saves = vi.spyOn(resources.restic, 'backup');
+    const progress: Array<{ path: string; index: number; count: number }> = [];
+    await resources.settleReview(task.id, { onProgress: (p) => progress.push(p) });
+    expect(saves).toHaveBeenCalledTimes(1);
+    saves.mockRestore();
+    expect(progress.length).toBeGreaterThan(0);
+    expect(progress.at(-1)).toMatchObject({ path: 'resources/model', index: 0, count: 1 });
     const promoted = { revision: (await store.getResourceRevision((await store.getResourceAttachment(volume.id))!.currentRevisionId!))! };
     await resources.settleReview(task.id);
     expect(promoted.revision.parentRevisionId).toBe(initial.id);

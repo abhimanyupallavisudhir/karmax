@@ -74,6 +74,12 @@ it('converts versions saved before restic in place, current first, and releases 
   const before = { older: await expected(older.id), current: await expected(current.id) };
   expect(f.chunkFiles()).toBeGreaterThan(0);
 
+  // A world saving or restoring a resource goes first: conversion waits for the next run.
+  await f.store.kvSet('restic-job:world:save:0', JSON.stringify({ job: 'job-00000000', at: Date.now() }));
+  expect((await f.resources.maintainRepositories(Date.now())).converted).toBe(0);
+  // A record left by a save that died long ago does not hold it up.
+  await f.store.kvSet('restic-job:world:save:0', JSON.stringify({ job: 'job-00000000', at: Date.now() - 7 * 3_600_000 }));
+
   // A small budget converts the current version only.
   expect((await f.resources.maintainRepositories(Date.now(), { convertBytes: 1 })).converted).toBe(1);
   expect((await f.store.getResourceRevision(current.id))).toMatchObject({ id: current.id, engine: 'restic@1', parentRevisionId: older.id });
