@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { Gateway } from '../src/gateway/server.js';
 import { KarmaxApi } from '../src/platform/api.js';
@@ -28,7 +29,9 @@ async function fixture(quotaBytes?: number) {
   const managed = new LocalObjectStore(path.join(dir, 'objects'));
   const locations = new StorageLocationService(store, managed, broker, quotaBytes);
   const engine = new ObjectSnapshotEngine(managed, broker, locations);
-  const resources = new ProjectResourceService(store, new WorldRegistry(), engine, broker, undefined, locations);
+  // The customer bucket below exists only in this process's stubbed fetch, which
+  // restic cannot use: the repository server reads it for restic.
+  const resources = new ProjectResourceService(store, new WorldRegistry(), engine, broker, undefined, locations, { proxyReads: true });
   return { store, project, broker, locations, resources };
 }
 
@@ -69,7 +72,7 @@ describe('organization storage locations', () => {
     });
 
   it('enforces the managed physical-byte quota before retaining snapshot chunks', async () => {
-    const f = (await fixture(1024));
+    const f = (await fixture(4096));
     const managed = (await f.locations.defaultLocation(f.project.organizationId!));
     const attachment = (await f.store.createResourceAttachment({ organizationId: f.project.organizationId!,
       projectId: f.project.id, name: 'Large model', driver: 'volume@1', target: { kind: 'path', path: 'model' },
@@ -77,14 +80,16 @@ describe('organization storage locations', () => {
       publish: 'discard' }));
 
     await expect(f.resources.importFiles(attachment.id,
-      [{ path: 'model.bin', data: Buffer.alloc(2048, 7) }])).rejects.toThrow(/storage quota exceeded/i);
-    expect((await f.locations.list(f.project.organizationId!))[0]!.usage.retainedBytes).toBe(0);
+      [{ path: 'model.bin', data: crypto.randomBytes(8192) }])).rejects.toThrow(/storage quota exceeded/i);
+    // Nothing of the refused data is kept: only the empty repository (its key and config).
+    expect((await f.locations.list(f.project.organizationId!))[0]!.usage.retainedBytes).toBeLessThan(2048);
     expect((await f.store.listResourceRevisions(attachment.id))).toHaveLength(0);
 
-    (await f.locations.reserveUpload('upload-a', f.project.organizationId!, managed.id, 700, Date.now() + 60_000));
-    await expect((async () => (await f.locations.reserveUpload('upload-b', f.project.organizationId!, managed.id, 400, Date.now() + 60_000)))()).rejects.toThrow(/upload quota exceeded/i);
+    const free = 4096 - (await f.locations.list(f.project.organizationId!))[0]!.usage.retainedBytes;
+    (await f.locations.reserveUpload('upload-a', f.project.organizationId!, managed.id, free - 100, Date.now() + 60_000));
+    await expect((async () => (await f.locations.reserveUpload('upload-b', f.project.organizationId!, managed.id, 200, Date.now() + 60_000)))()).rejects.toThrow(/upload quota exceeded/i);
     (await f.locations.releaseUpload('upload-a'));
-    await (async () => (await f.locations.reserveUpload('upload-b', f.project.organizationId!, managed.id, 400, Date.now() + 60_000)))();
+    await (async () => (await f.locations.reserveUpload('upload-b', f.project.organizationId!, managed.id, 200, Date.now() + 60_000)))();
   });
 
   it('counts promoted artifacts against the same managed organization quota', async () => {
@@ -137,7 +142,7 @@ describe('organization storage locations', () => {
   });
 
   it('keeps customer S3 secrets vaulted and pins revisions to the tested location', async () => {
-    const f = (await fixture(1024));
+    const f = (await fixture(64 * 1024));
     const objects = new Map<string, Buffer>();
     const httpFetch = globalThis.fetch;
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -189,8 +194,9 @@ describe('organization storage locations', () => {
       revision = (await f.store.getResourceRevision(attachment.revision.id));
     } finally { await server.close(); }
     expect(revision.storageLocationId).toBe(ready.id);
-    expect([...objects.keys()].some((key) => key.includes('/tenant-data/krmax/acme/resources/'))).toBe(true);
-    expect((await f.locations.list(f.project.organizationId!)).find((candidate) => candidate.id === ready.id)?.usage.retainedBytes).toBe(4);
+    expect([...objects.keys()].some((key) => key.includes(`/tenant-data/krmax/acme/resource-repositories/${revision.attachmentId}/${ready.id}/data/`))).toBe(true);
+    // Counted against that location: the data, and restic's own metadata.
+    expect((await f.locations.list(f.project.organizationId!)).find((candidate) => candidate.id === ready.id)?.usage.retainedBytes).toBeGreaterThan(4);
     await expect((async () => (await f.locations.delete(f.project.organizationId!, ready.id)))()).rejects.toThrow(/still used/i);
     // Verification uses immutable revision placement even after the head moves to managed storage.
     const managed = (await f.locations.ensureManaged(f.project.organizationId!));

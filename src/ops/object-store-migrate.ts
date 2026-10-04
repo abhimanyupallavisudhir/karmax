@@ -215,6 +215,8 @@ export interface ObjectReferences {
   artifacts: Set<string>;
   uploadParts: Set<string>;
   conversationExports: Set<string>;
+  /** Object keys of resource repository files (restic) in the managed store. */
+  repositoryFiles: Set<string>;
 }
 
 export interface ReferenceDatabase { query(sql: string): Promise<Array<Record<string, unknown>>>; close(): Promise<void> }
@@ -239,7 +241,7 @@ export function openReferenceDatabase(target: string): ReferenceDatabase {
 export async function loadObjectReferences(db: Pick<ReferenceDatabase, 'query'>): Promise<ObjectReferences> {
   const json = (value: unknown): any => { try { return JSON.parse(String(value)); } catch { return undefined; } };
   const references: ObjectReferences = { chunks: new Set(), manifests: new Set(), attachments: new Set(), checkpoints: new Set(),
-    pendingCheckpointGc: new Set(), artifacts: new Set(), uploadParts: new Set(), conversationExports: new Set() };
+    pendingCheckpointGc: new Set(), artifacts: new Set(), uploadParts: new Set(), conversationExports: new Set(), repositoryFiles: new Set() };
   for (const row of await db.query('SELECT organizationId, chunkId, storageLocationId FROM resource_snapshot_chunks WHERE refs > 0')) {
     const location = row.storageLocationId == null ? '' : String(row.storageLocationId);
     if (!location || location.startsWith('storage-managed-')) references.chunks.add(`${row.organizationId}/${row.chunkId}`);
@@ -249,6 +251,12 @@ export async function loadObjectReferences(db: Pick<ReferenceDatabase, 'query'>)
     if (typeof key === 'string') references.manifests.add(key);
   }
   for (const row of await db.query('SELECT id FROM resource_attachments')) references.attachments.add(String(row.id));
+  for (const row of await db.query("SELECT repository, kind, name, storageLocationId FROM resource_repository_files WHERE kind<>'locks'")) {
+    const location = row.storageLocationId == null ? '' : String(row.storageLocationId);
+    if (location && !location.startsWith('storage-managed-')) continue;
+    const [attachment, place] = String(row.repository).split('@');
+    references.repositoryFiles.add(`resource-repositories/${attachment}/${place}/${row.kind === 'config' ? 'config' : `${row.kind}/${row.name}`}`);
+  }
   for (const row of await db.query('SELECT manifest FROM world_checkpoints')) {
     const key = json(row.manifest)?.filesystemDelta?.objectKey;
     if (typeof key === 'string') references.checkpoints.add(key);
@@ -324,6 +332,10 @@ function classify(key: string, references: ObjectReferences): { family: string; 
   if (parts[0] === 'resources' && parts[2] === 'manifests') {
     return { family: 'resource manifest', organization, state: references.manifests.has(key) ? 'referenced'
       : references.attachments.has(parts[3] ?? '') ? 'attachment exists, no revision' : 'attachment deleted' };
+  }
+  if (parts[0] === 'resource-repositories') {
+    return { family: 'resource repository', state: references.repositoryFiles.has(key) ? 'referenced'
+      : references.attachments.has(parts[1] ?? '') ? 'no repository file row' : 'attachment deleted' };
   }
   if (parts[0] === 'checkpoints') {
     return { family: 'checkpoint', organization, state: references.checkpoints.has(key) ? 'referenced'

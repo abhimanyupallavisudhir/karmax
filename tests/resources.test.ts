@@ -8,8 +8,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
-import { ObjectSnapshotEngine, ProjectResourceService, type SnapshotInputFile, type StagingProgress } from '../src/world/resources.js';
-import { chunkId, chunkObjectKey, openRandom, organizationKey, sealDeterministic, sealRandom, sha256 } from '../src/world/chunk-store.js';
+import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { resourceSecretHandle } from '../src/domain/resource-drivers.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { createRequire } from 'node:module';
@@ -20,8 +19,14 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { CapabilityError, KarmaxApi } from '../src/platform/api.js';
 import { worldWorkingRelativePath } from '../src/world/types.js';
 import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
+import type { ObjectStore } from '../src/store/objects.js';
+import { legacyRevision } from './helpers/legacy-resources.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+
+async function resourceService(store: Store, worlds: WorldRegistry, objects: ObjectStore, broker: CredentialBroker) {
+  return new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
+}
 
 describe('project resources', () => {
   it.each(['configured', 'default', 'legacy'] as const)('preserves %s global Git ignores alongside worktree secrets (WD-29)', async source => {
@@ -103,7 +108,7 @@ describe('project resources', () => {
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
-    const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
+    const resources = await resourceService(store, worlds, objects, broker);
 
     const volume = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Model', driver: 'volume@1', target: { kind: 'path', path: 'resources/model' }, access: 'write',
@@ -193,7 +198,7 @@ describe('project resources', () => {
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
     (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
-  });
+  }, 120_000); // ~60 restic commands, each deriving its key (about 0.5 s)
 
   // Task legibench3#10 (2026-10-01): a task that had already published its
   // spend ledger once could never publish it again. Every later confirmation
@@ -212,8 +217,7 @@ describe('project resources', () => {
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
-    const resources = new ProjectResourceService(store, worlds,
-      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const resources = await resourceService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const ledger = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Ledger', driver: 'volume@1', target: { kind: 'path', path: 'resources/ledger' }, access: 'write',
       isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
@@ -267,7 +271,7 @@ describe('project resources', () => {
     (await store.close());
   });
 
-  it('uses an online backup for SQLite volume revisions', async () => {
+  it('saves a SQLite database the task changed', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-sqlite-resource-'));
     const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
     await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
@@ -279,8 +283,7 @@ describe('project resources', () => {
     const task = (await store.createTask({ projectId: project.id, title: 'Edit DB', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'edit' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
-    const resources = new ProjectResourceService(store, worlds,
-      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const resources = await resourceService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const attachment = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'SQLite', driver: 'volume@1', target: { kind: 'path', path: 'resources/db' }, access: 'write',
       isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
@@ -298,27 +301,18 @@ describe('project resources', () => {
     await resources.release(world.handle); await world.destroy(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('streams snapshots larger than one storage chunk', async () => {
+  it('restores a version saved before restic, streamed a chunk at a time, and stops when cancelled', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-stream-'));
     const store = (await Store.create(':memory:')); const project = (await store.createProject('Stream'));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
-    const engine = new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker);
+    const objects = new LocalObjectStore(path.join(dir, 'objects'));
+    const engine = new ObjectSnapshotEngine(objects, broker);
     const resources = new ProjectResourceService(store, worlds, engine, broker);
     const attachment = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Weights', driver: 'volume@1', target: { kind: 'path', path: 'weights' }, access: 'read',
       isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' }));
-    for (const expectedBytes of [1, 3]) {
-      await expect(engine.capture(attachment, (async function* () {
-        yield { path: 'short.bin', bytes: expectedBytes, data: Buffer.from('ab') };
-      })())).rejects.toThrow('resource capture size mismatch');
-    }
     const bytes = Buffer.alloc(9 * 1024 * 1024 + 19, 0x71);
-    const captured = await engine.capture(attachment, (async function* () {
-      yield { path: 'model.bin', data: (async function* () {
-        for (let offset = 0; offset < bytes.length; offset += 700_000) yield bytes.subarray(offset, offset + 700_000);
-      })() };
-    })());
-    const revision = (await store.saveResourceRevision({ attachmentId: attachment.id, engine: engine.id, ...captured, metadata: {} }));
+    const revision = await legacyRevision(store, broker, objects, attachment, [{ path: 'model.bin', data: bytes }]);
     const restored: Buffer[] = [];
     await engine.restore(revision, async (_path, chunk) => { restored.push(chunk); });
     expect(crypto.createHash('sha256').update(Buffer.concat(restored)).digest('hex'))
@@ -341,15 +335,14 @@ describe('project resources', () => {
     try {
       const project = await store.createProject('Restore cancellation');
       const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
-      const engine = new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker);
+      const objects = new LocalObjectStore(path.join(dir, 'objects'));
+      const engine = new ObjectSnapshotEngine(objects, broker);
       new ProjectResourceService(store, new WorldRegistry(), engine, broker);
       const attachment = await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
         name: 'Files', driver: 'volume@1', target: { kind: 'path', path: 'files' }, access: 'read',
         isolation: 'fork', source: {}, credentialHandles: [], publish: 'discard' });
-      const captured = await engine.capture(attachment, (async function* () {
-        for (let i = 0; i < 8; i++) yield { path: `${i}.txt`, data: Buffer.from(String(i)) };
-      })());
-      const revision = await store.saveResourceRevision({ attachmentId: attachment.id, engine: engine.id, ...captured, metadata: {} });
+      const revision = await legacyRevision(store, broker, objects, attachment,
+        Array.from({ length: 8 }, (_, i) => ({ path: `${i}.txt`, data: Buffer.from(String(i)) })));
       const cancellation = new AbortController();
       let finish!: () => void;
       const gate = new Promise<void>(resolve => { finish = resolve; });
@@ -377,8 +370,7 @@ describe('project resources', () => {
       workflowVersion: '1.0.0', params: { prompt: 'download it' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
-    const resources = new ProjectResourceService(store, worlds,
-      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const resources = await resourceService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.exec('mkdir', ['-p', 'downloads']);
@@ -445,8 +437,7 @@ describe('project resources', () => {
       workflowVersion: '1.26.0', params: { prompt: 'build it' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
-    const resources = new ProjectResourceService(store, worlds,
-      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const resources = await resourceService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.exec('mkdir', ['-p', 'data', 'raw']);
@@ -463,9 +454,9 @@ describe('project resources', () => {
       const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
       // A transient failure is retried with the candidate kept…
       const exec = world.exec.bind(world);
-      const flaky = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
-        command === 'bash' && String(args?.[1]).includes("find -H 'data'") ? { code: 1, stdout: '', stderr: 'sandbox unavailable' }
-          : exec(command, args, options));
+      const backup = resources.restic.backup.bind(resources.restic);
+      const flaky = vi.spyOn(resources.restic, 'backup').mockImplementation(async (place, ...rest) =>
+        place.path.endsWith('/data') ? Promise.reject(new Error('sandbox unavailable')) : backup(place, ...rest));
       vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
       await expect(resources.stageCandidates(task.id)).rejects.toThrow('sandbox unavailable');
       expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('pending');
@@ -497,11 +488,8 @@ describe('project resources', () => {
     const { store, task, resources, world, cleanup } = await candidateFixture('stage-unsaved');
     try {
       const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
-      const exec = world.exec.bind(world);
       vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
-      const paused = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
-        command === 'bash' && String(args?.[1]).includes("find -H 'raw'") ? { code: 1, stdout: '', stderr: 'the sandbox paused' }
-          : exec(command, args, options));
+      const paused = vi.spyOn(resources.restic, 'backup').mockRejectedValue(new Error('the sandbox paused'));
       // Even the last attempt does not give it up: it is still in the world.
       expect(await resources.stageCandidates(task.id, { final: true })).toMatchObject({ staged: [],
         failed: [{ candidateId: raw.candidate.id, error: 'the sandbox paused' }] });
@@ -539,109 +527,26 @@ describe('project resources', () => {
     } finally { vi.restoreAllMocks(); await cleanup(); }
   });
 
-  it('reads a SQLite database too large to copy in place, under a read lock, and never leaves a partial copy', async () => {
-    const { store, task, resources, world, cleanup } = await candidateFixture('stage-sqlite');
-    try {
-      const root = world.handle.workdir ?? world.handle.root;
-      const file = path.join(root, 'data/records.db');
-      const db = new DatabaseSync(file);
-      db.exec('CREATE TABLE t (v TEXT); INSERT INTO t VALUES (\'kept\')'); db.close();
-      const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
-      const exec = world.exec.bind(world);
-      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
-      const tight = (command: string, args?: string[]) => command === 'bash' && String(args?.[1]).includes('df -B1')
-        ? { code: 0, stdout: `${8 * 2 ** 30} ${5 * 2 ** 30}`, stderr: '' } : undefined;
-      // A writer holding the database keeps the lock from being taken: say why.
-      const writer = new DatabaseSync(file);
-      writer.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; INSERT INTO t VALUES (\'uncommitted\')');
-      const calls = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
-        tight(command, args) ?? exec(command, args, options));
-      await expect(resources.stageCandidates(task.id)).rejects.toThrow(
-        'needs 8.0 GiB of free disk in the task world, but only 5.0 GiB is free (or the database must be idle)');
-      writer.exec('ROLLBACK'); writer.close();
-      // Idle, it is read in place: no copy, and a write attempted meanwhile waits for the lock.
-      let blocked = false;
-      calls.mockImplementation(async (command, args, options) => tight(command, args) ?? exec(command, args, options));
-      const stream = world.readFileStream!.bind(world);
-      const streamed = vi.spyOn(world, 'readFileStream').mockImplementation(async function* (name: string) {
-        for await (const piece of stream(name)) {
-          if (!blocked && name.endsWith('records.db')) {
-            const late = new DatabaseSync(file);
-            try { late.exec('INSERT INTO t VALUES (\'late\')'); } catch (error) { blocked = /locked/.test(String(error)); }
-            late.close();
-          }
-          yield piece;
-        }
-      });
-      expect(await resources.stageCandidates(task.id, { final: true })).toMatchObject({ staged: [data.candidate.id], failed: [] });
-      expect(blocked).toBe(true);
-      expect(streamed.mock.calls.map(([name]) => name)).toContain(worldWorkingRelativePath(world.handle, 'data/records.db'));
-      expect(calls.mock.calls.some(([command]) => command === 'python3')).toBe(false);
-      expect(fs.readdirSync(path.join(root, '.karmax-injection')).filter((name) => name.startsWith('sqlite-'))).toEqual([]);
-      const revision = (await store.getResourceRevision((await store.getResourceAttachment(data.attachment.id))!.currentRevisionId!))!;
-      const restored = path.join(root, 'restored'); fs.mkdirSync(restored);
-      await resources['engine'].restore(revision, async (name: string, bytes: Buffer, offset: number) => {
-        fs.mkdirSync(path.dirname(path.join(restored, name)), { recursive: true });
-        fs.writeFileSync(path.join(restored, name), bytes, { flag: offset ? 'a' : 'w' });
-      });
-      const copy = new DatabaseSync(path.join(restored, 'records.db'));
-      expect(copy.prepare('SELECT v FROM t ORDER BY rowid').all()).toEqual([{ v: 'kept' }]);
-      copy.close();
-      // With room to copy, a failed copy (disk full) is removed, not left filling the disk.
-      await world.exec('bash', ['-lc', 'echo more > data/more.txt']);
-      calls.mockImplementation(async (command, args, options) => {
-        if (command !== 'python3') return exec(command, args, options);
-        await exec('bash', ['-lc', `head -c 4096 /dev/zero > ${String(args?.[3])}`]);
-        return { code: 1, stdout: '', stderr: 'sqlite3.OperationalError: database or disk is full' };
-      });
-      const writerAgain = new DatabaseSync(file); writerAgain.exec('INSERT INTO t VALUES (\'changed\')'); writerAgain.close();
-      await expect(resources.stageCandidates(task.id)).rejects.toThrow('database or disk is full');
-      expect(fs.readdirSync(path.join(root, '.karmax-injection')).filter((name) => name.startsWith('sqlite-'))).toEqual([]);
-      // The snapshot already taken is kept when a refresh keeps failing.
-      await resources.stageCandidates(task.id, { final: true });
-      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('pending');
-      expect((await store.getResourceAttachment(data.attachment.id))?.currentRevisionId).toBe(revision.id);
-    } finally { vi.restoreAllMocks(); await cleanup(); }
-  }, 30_000);
-
-  it('refreshes a staged candidate that changed, reading only what changed', async () => {
+  it('refreshes a staged candidate that changed, storing only what changed', async () => {
     const { store, task, resources, world, cleanup } = await candidateFixture('stage-refresh');
     try {
       const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
       await world.writeFile('raw/old.txt', 'settled');
-      await new Promise((resolve) => setTimeout(resolve, 2_200)); // past the racy-clean window
       await resources.stageCandidates(task.id, { final: true });
-      const first = (await store.getResourceAttachment(raw.attachment.id))!.currentRevisionId!;
+      const first = (await store.getResourceRevision((await store.getResourceAttachment(raw.attachment.id))!.currentRevisionId!))!;
+      // Nothing changed: no new version.
       expect(await resources.stageCandidates(task.id)).toEqual({ staged: [], failed: [] });
-      expect((await store.getResourceAttachment(raw.attachment.id))!.currentRevisionId).toBe(first);
+      expect((await store.getResourceAttachment(raw.attachment.id))!.currentRevisionId).toBe(first.id);
       await world.writeFile('raw/page.txt', 'rescanned page');
-      const exec = world.exec.bind(world);
-      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
-      const reads = vi.spyOn(world, 'exec').mockImplementation(exec);
       expect(await resources.stageCandidates(task.id)).toEqual({ staged: [raw.candidate.id], failed: [] });
-      expect(reads.mock.calls.some(([, args]) => String(args?.[1]).includes('dd ') && String(args?.[1]).includes('old.txt'))).toBe(false);
       const second = (await store.getResourceRevision((await store.getResourceAttachment(raw.attachment.id))!.currentRevisionId!))!;
-      expect(second).toMatchObject({ parentRevisionId: first, files: 2,
+      expect(second).toMatchObject({ parentRevisionId: first.id, engine: 'restic@1', files: 2,
         bytes: Buffer.byteLength('settled') + Buffer.byteLength('rescanned page') });
+      const attachment = (await store.getResourceAttachment(raw.attachment.id))!;
+      expect(await resources.restic.diff(resources.restic.of(attachment, first), first.rootDigest, second.rootDigest))
+        .toMatchObject({ added: 0, modified: 1, deleted: 0, changedPaths: ['page.txt'] });
     } finally { vi.restoreAllMocks(); await cleanup(); }
   }, 30_000);
-
-  it('releases an upload whose candidate was discarded while it ran', async () => {
-    const { store, task, resources, cleanup, objects } = await candidateFixture('stage-discard-race');
-    try {
-      const data = await resources.proposePath(task.id, { path: 'data', name: 'Data', target: { kind: 'path', path: 'data' } });
-      const engine = resources['engine'];
-      const capture = engine.capture.bind(engine);
-      vi.spyOn(engine, 'capture').mockImplementation(async (...args: Parameters<typeof capture>) => {
-        const captured = await capture(...args);
-        await resources.discardCandidate(task.id, data.candidate.id, 'user:reviewer');
-        return captured;
-      });
-      expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [], failed: [] });
-      expect((await store.getResourceCandidate(data.candidate.id))?.state).toBe('discarded');
-      expect(allFiles(objects)).toHaveLength(0);
-    } finally { vi.restoreAllMocks(); await cleanup(); }
-  });
 
   it('stages a candidate once when two attempts race', async () => {
     const { store, task, resources, cleanup, objects } = await candidateFixture('stage-race');
@@ -657,234 +562,31 @@ describe('project resources', () => {
     } finally { await cleanup(); }
   });
 
-  /** Many small files and one large one, as a scraped corpus is. */
-  function writeCorpus(root: string, count: number) {
-    const expected = new Map<string, Buffer>();
-    for (let i = 0; i < count; i++) {
-      const name = `pages/page-${String(i).padStart(4, '0')}.txt`;
-      const data = Buffer.from(`scanned page ${i}\n`.repeat(i % 7 + 1));
-      fs.mkdirSync(path.join(root, 'raw', path.dirname(name)), { recursive: true });
-      fs.writeFileSync(path.join(root, 'raw', name), data);
-      expected.set(name, data);
-    }
-    const large = crypto.randomBytes(5 * 1024 * 1024 + 3);
-    fs.writeFileSync(path.join(root, 'raw', 'large.bin'), large);
-    expected.set('large.bin', large);
-    expected.set('page.txt', Buffer.from('scanned page'));
-    return expected;
-  }
-  async function restoreAll(resources: ProjectResourceService, store: Store, attachmentId: string, into: string) {
-    const revision = (await store.getResourceRevision((await store.getResourceAttachment(attachmentId))!.currentRevisionId!))!;
-    await resources['engine'].restore(revision, async (name: string, bytes: Buffer, offset: number) => {
-      fs.mkdirSync(path.dirname(path.join(into, name)), { recursive: true });
-      fs.writeFileSync(path.join(into, name), bytes, { flag: offset ? 'a' : 'w' });
-    });
-    return revision;
-  }
-  const readsOf = (calls: Array<unknown[]>) => calls.filter(([command, args]) => command === 'node' && String((args as string[])?.[0]) === '-e'
-    && String((args as string[])?.[1]).includes('readSync'))
-    .flatMap(([, args]) => (JSON.parse(String((args as string[])[2])) as Array<[string]>).map(([file]) => path.basename(file)));
-  async function chunkRows(store: Store) {
-    return (await store.db.prepare('SELECT chunkId, refs FROM resource_snapshot_chunks').all()) as Array<{ chunkId: string; refs: number }>;
-  }
-
-  it('saves thousands of small files a batch per round trip, packed into a few objects', async () => {
-    const { store, task, resources, world, cleanup, objects } = await candidateFixture('stage-many');
-    try {
-      const root = world.handle.workdir ?? world.handle.root;
-      const expected = writeCorpus(root, 600);
-      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
-      const exec = world.exec.bind(world);
-      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
-      const calls = vi.spyOn(world, 'exec').mockImplementation(exec);
-      const progress: StagingProgress[] = [];
-      expect(await resources.stageCandidates(task.id, { final: true, onProgress: (next) => progress.push(next) }))
-        .toEqual({ staged: [raw.candidate.id], failed: [] });
-      // 601 small files: a handful of batched reads, never a command per file.
-      expect(readsOf(calls.mock.calls)).toHaveLength(601);
-      expect(calls.mock.calls.length).toBeLessThan(20);
-      expect(calls.mock.calls.some(([, args]) => String(args?.[1]).includes('dd '))).toBe(false);
-      // The small files share packs: a few objects, not one per file.
-      expect(allFiles(objects).length).toBeLessThan(8);
-      const totalBytes = [...expected.values()].reduce((sum, data) => sum + data.length, 0);
-      expect(progress.at(-1)).toEqual({ path: 'raw', index: 0, count: 1, files: 602, totalFiles: 602, bytes: totalBytes, totalBytes });
-      const restored = path.join(root, '..', 'restored-many');
-      const revision = await restoreAll(resources, store, raw.attachment.id, restored);
-      for (const [name, data] of expected) expect(fs.readFileSync(path.join(restored, name)).equals(data)).toBe(true);
-      expect(await resources['engine'].verify!(revision, 0, 1000)).toMatchObject({ status: 'complete', verifiedFiles: 602 });
-      // A refresh with nothing changed reads nothing.
-      await new Promise((resolve) => setTimeout(resolve, 2_200)); // past the racy-clean window
-      await resources.stageCandidates(task.id, { final: true });
-      calls.mockClear();
-      expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [], failed: [] });
-      expect(readsOf(calls.mock.calls)).toEqual([]);
-      // Discarding releases every object.
-      await resources.discardCandidate(task.id, raw.candidate.id, 'user:reviewer');
-      expect(allFiles(objects)).toEqual([]);
-      expect(await chunkRows(store)).toEqual([]);
-    } finally { vi.restoreAllMocks(); await cleanup(); }
-  }, 60_000);
-
-  it('resumes an interrupted save where it stopped, reading and uploading only what it had not saved', async () => {
-    const { store, task, resources, world, cleanup, objects } = await candidateFixture('stage-resume');
-    try {
-      const root = world.handle.workdir ?? world.handle.root;
-      const expected = writeCorpus(root, 600);
-      await new Promise((resolve) => setTimeout(resolve, 2_200)); // stable stamps, as a finished build's are
-      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
-      const exec = world.exec.bind(world);
-      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
-      // Each batched read takes "11 seconds", so progress is recorded after each;
-      // the third fails as a sandbox that went away would.
-      let now = Date.now();
-      vi.spyOn(Date, 'now').mockImplementation(() => now);
-      let reads = 0;
-      const calls = vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) => {
-        if (command === 'node' && String(args?.[1]).includes('readSync')) {
-          now += 11_000;
-          if (++reads === 3) return { code: 1, stdout: '', stderr: 'sandbox unavailable' };
-        }
-        return exec(command, args, options);
-      });
-      const uploaded = vi.spyOn((resources['engine'] as ObjectSnapshotEngine)['objects'] as LocalObjectStore, 'put');
-      await expect(resources.stageCandidates(task.id)).rejects.toThrow('sandbox unavailable');
-      expect((await store.getResourceCandidate(raw.candidate.id))?.state).toBe('pending');
-      // Everything read before the failed batch was saved.
-      const readCalls = calls.mock.calls.filter(([command, args]) => command === 'node' && String(args?.[1]).includes('readSync'));
-      const saved = readsOf(readCalls.slice(0, -1));
-      const firstUploads = uploaded.mock.calls.map(([key]) => key);
-      expect(saved.length).toBeGreaterThanOrEqual(128);
-      expect(await store.kvGet(`resource-capture:${raw.attachment.id}`)).toBeTruthy();
-      // Each save adds a segment of what it completed, rather than rewriting them all.
-      expect((await store.kvEntries(`resource-capture:${raw.attachment.id}:`)).length).toBeGreaterThan(0);
-      calls.mockClear(); uploaded.mockClear();
-      const streamed = vi.spyOn(world, 'readFileStream');
-
-      expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [raw.candidate.id], failed: [] });
-      const secondReads = readsOf(calls.mock.calls);
-      // Nothing saved is read or uploaded again: not the large file, not a saved page.
-      expect(secondReads.filter((name) => saved.includes(name))).toEqual([]);
-      expect(secondReads).toHaveLength(601 - saved.length);
-      expect(streamed).not.toHaveBeenCalled();
-      expect(uploaded.mock.calls.map(([key]) => key).filter((key) => firstUploads.includes(key) && key.includes('/chunks/'))).toEqual([]);
-      expect(await store.kvEntries('resource-capture:')).toEqual([]);
-      const restored = path.join(root, '..', 'restored-resume');
-      await restoreAll(resources, store, raw.attachment.id, restored);
-      for (const [name, data] of expected) expect(fs.readFileSync(path.join(restored, name)).equals(data)).toBe(true);
-      // Each object is held once, by the revision, and nothing else is left behind.
-      const rows = await chunkRows(store);
-      expect(rows.every((row) => Number(row.refs) === 1)).toBe(true);
-      expect(allFiles(path.join(objects, 'resources')).filter((file) => file.includes('/chunks/'))).toHaveLength(rows.length);
-      await resources.discardCandidate(task.id, raw.candidate.id, 'user:reviewer');
-      expect(allFiles(objects)).toEqual([]);
-      expect(await chunkRows(store)).toEqual([]);
-    } finally { vi.restoreAllMocks(); await cleanup(); }
-  }, 60_000);
-
-  it('releases an interrupted save\'s progress when its candidate is discarded', async () => {
-    const { store, task, resources, world, cleanup, objects } = await candidateFixture('stage-abandon');
-    try {
-      writeCorpus(world.handle.workdir ?? world.handle.root, 300);
-      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
-      const exec = world.exec.bind(world);
-      vi.spyOn(resources['worlds'], 'open').mockResolvedValue(world);
-      let reads = 0;
-      vi.spyOn(world, 'exec').mockImplementation(async (command, args, options) =>
-        command === 'node' && String(args?.[1]).includes('readSync') && ++reads === 2
-          ? { code: 1, stdout: '', stderr: 'sandbox unavailable' } : exec(command, args, options));
-      await expect(resources.stageCandidates(task.id)).rejects.toThrow('sandbox unavailable');
-      expect((await chunkRows(store)).length).toBeGreaterThan(0);
-      await resources.discardCandidate(task.id, raw.candidate.id, 'user:reviewer');
-      expect(await store.kvEntries('resource-capture:')).toEqual([]);
-      expect(allFiles(objects)).toEqual([]);
-      expect(await chunkRows(store)).toEqual([]);
-    } finally { vi.restoreAllMocks(); await cleanup(); }
-  }, 30_000);
-
-  it('takes over a stopped save\'s progress, never a running one\'s, and the loser releases nothing', async () => {
-    const { store, task, resources, cleanup, objects } = await candidateFixture('stage-takeover');
-    try {
-      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
-      const attachment = (await store.getResourceAttachment(raw.attachment.id))!;
-      const engine = resources['engine'] as ObjectSnapshotEngine;
-      const key = await organizationKey(resources['broker'], attachment.organizationId);
-      const record = async () => {
-        const value = await store.kvGet(`resource-capture:${attachment.id}`);
-        return value ? JSON.parse(openRandom(key, Buffer.from(value, 'base64')).toString('utf8')) : undefined;
-      };
-      const contents = new Map<string, Buffer>([['a-large.bin', crypto.randomBytes(5 * 1024 * 1024 + 3)]]);
-      for (let i = 0; i < 300; i++) contents.set(`p-${String(i).padStart(4, '0')}.txt`, Buffer.from(`page ${i}\n`.repeat(i % 5 + 1)));
-      const reader = vi.fn(async function* (files: Array<{ source: string }>) { for (const file of files) yield contents.get(file.source); });
-      const inputs = () => [...contents].map(([name, data]): SnapshotInputFile => ({ path: name, bytes: data.length, observed: `stamp:${name}`, data,
-        ...(data.length < 1024 * 1024 ? { range: { reader, source: name, stamp: name } } : {}) }));
-      let now = Date.now();
-      vi.spyOn(Date, 'now').mockImplementation(() => now);
-      // The first save records its progress, then stops answering (a worker that died).
-      let hang!: (error: Error) => void;
-      const hung = new Promise<never>((_, reject) => { hang = reject; });
-      const first = engine.capture(attachment, (async function* () {
-        for (const [index, file] of inputs().entries()) {
-          if (index === 201) { now += 11_000; yield file; await hung; }
-          yield file;
-        }
-      })(), { resume: true });
-      first.catch(() => undefined);
-      await vi.waitFor(async () => expect((await record())?.segments.length).toBeGreaterThan(0));
-      // While its record is fresh, another attempt leaves it alone.
-      const parallel = await engine.capture(attachment, (async function* () { yield* inputs(); })(), { resume: true });
-      await engine.delete!({ id: 'parallel', attachmentId: attachment.id, engine: engine.id, ...parallel, createdAt: now }, attachment);
-      expect((await record())?.owner).toBeTruthy();
-      // Once it is stale, the next attempt takes it over and resumes from it.
-      now += 60_000;
-      reader.mockClear();
-      const second = await engine.capture(attachment, (async function* () { yield* inputs(); })(), { resume: true });
-      expect(reader.mock.calls.flatMap(([files]) => files).length).toBeLessThan(300 - 128);
-      expect(await record()).toBeUndefined();
-      // The stopped attempt wakes up, finds its record gone, and releases nothing.
-      hang(new Error('worker restarted'));
-      await expect(first).rejects.toThrow('worker restarted');
-      const revision = await store.saveResourceRevision({ attachmentId: attachment.id, engine: engine.id, ...second, createdByTaskId: task.id });
-      const restored = new Map<string, Buffer>();
-      await engine.restore(revision, async (name, bytes, offset) => {
-        restored.set(name, offset ? Buffer.concat([restored.get(name)!, bytes]) : bytes);
-      });
-      expect([...restored.keys()].sort()).toEqual([...contents.keys()].sort());
-      for (const [name, data] of contents) expect(restored.get(name)!.equals(data)).toBe(true);
-      await engine.delete!(revision, attachment);
-      // What the stopped attempt held after its last record leaks; nothing was released twice.
-      const rows = (await chunkRows(store)).map((row) => row.chunkId);
-      for (const file of allFiles(path.join(objects, 'resources')).filter((file) => file.includes('/chunks/')))
-        expect(rows).toContain(path.basename(file, '.bin'));
-    } finally { vi.restoreAllMocks(); await cleanup(); }
-  }, 60_000);
-
-  it('restores and refreshes from snapshots saved before packs (version 1)', async () => {
+  it('restores a version saved before restic and saves its refresh with restic', async () => {
     const { store, task, resources, world, cleanup } = await candidateFixture('stage-v1');
     try {
-      const root = world.handle.workdir ?? world.handle.root;
       const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
       const attachment = (await store.getResourceAttachment(raw.attachment.id))!;
       const engine = resources['engine'] as ObjectSnapshotEngine;
-      const key = await organizationKey(resources['broker'], attachment.organizationId);
-      const data = Buffer.from('scanned page');
-      const id = chunkId(key, undefined, data);
-      const objects = engine['objects'] as LocalObjectStore;
-      await objects.put(chunkObjectKey(attachment.organizationId, id), sealDeterministic(key, id, data));
-      await store.retainResourceChunks(attachment.organizationId, [{ id, bytes: data.length }]);
-      const files = [{ path: 'page.txt', bytes: data.length, sha256: sha256(data), chunks: [id] }];
-      const rootDigest = sha256(Buffer.from(JSON.stringify(files)));
-      const sealed = sealRandom(key, Buffer.from(JSON.stringify({ version: 1, attachmentId: attachment.id, files, rootDigest, bytes: data.length })));
-      const objectKey = `resources/${attachment.organizationId}/manifests/${attachment.id}/legacy.bin`;
-      await objects.put(objectKey, sealed);
-      const legacy = await store.saveAndPromoteResourceRevision({ attachmentId: attachment.id, engine: engine.id,
-        sealedRef: JSON.stringify({ objectKey, sha256: sha256(sealed) }), rootDigest, bytes: data.length, files: 1, createdByTaskId: task.id }, undefined);
+      const legacy = await legacyRevision(store, resources['broker'], engine['objects'], attachment,
+        [{ path: 'page.txt', data: Buffer.from('scanned page') }], { createdByTaskId: task.id });
+      await store.promoteResourceRevision(attachment.id, legacy.id, undefined);
       expect(await engine.verify!(legacy, 0, 10)).toMatchObject({ status: 'complete', verifiedFiles: 1 });
       await world.writeFile('raw/new.txt', 'new page');
       expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [raw.candidate.id], failed: [] });
-      const restored = path.join(root, '..', 'restored-v1');
-      await restoreAll(resources, store, raw.attachment.id, restored);
-      expect(fs.readFileSync(path.join(restored, 'page.txt'), 'utf8')).toBe('scanned page');
-      expect(fs.readFileSync(path.join(restored, 'new.txt'), 'utf8')).toBe('new page');
+      const refreshed = (await store.getResourceRevision((await store.getResourceAttachment(attachment.id))!.currentRevisionId!))!;
+      expect(refreshed).toMatchObject({ engine: 'restic@1', parentRevisionId: legacy.id, files: 2 });
+      await resources.adoptCandidate(task.id, raw.candidate.id, 'user:reviewer');
+      // Both restore into a new world: the legacy one through the worker, the new one with restic.
+      for (const revision of [legacy, refreshed]) {
+        const consumer = await store.createTask({ projectId: task.projectId, title: 'Read', workflow: 'software-dev',
+          workflowVersion: '1.26.0', params: { prompt: 'read' } });
+        const consumerWorld = await resources['worlds'].create('worktree', { taskId: consumer.id, repo: world.handle.repo!, base: 'main' });
+        consumerWorld.handle = await resources.materialize(task.projectId, consumer.id, consumerWorld, 1, { [attachment.id]: revision.id });
+        expect(await consumerWorld.readFile('raw/page.txt')).toBe('scanned page');
+        expect(await consumerWorld.exec('test', ['-e', 'raw/new.txt']).then((r) => r.code === 0)).toBe(revision === refreshed);
+        await resources.release(consumerWorld.handle); await consumerWorld.destroy();
+      }
     } finally { vi.restoreAllMocks(); await cleanup(); }
   });
 
@@ -899,8 +601,7 @@ describe('project resources', () => {
       workflowVersion: '1.0.0', params: { prompt: 'generate' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
-    const resources = new ProjectResourceService(store, worlds,
-      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const resources = await resourceService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     await world.exec('mkdir', ['-p', 'generated']); await world.writeFile('generated/data.bin', 'candidate bytes');
@@ -944,8 +645,7 @@ describe('project resources', () => {
       workflowVersion: '1.19.0', params: { prompt: 'create it' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
-    const resources = new ProjectResourceService(store, worlds,
-      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const resources = await resourceService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     // The item the agent stored, as KarmaxApi finds it before proposing it.
@@ -980,8 +680,7 @@ describe('project resources', () => {
     const store = (await Store.create(':memory:')); const project = (await store.createProject('Version gate', { repos: [repo] }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
-    const resources = new ProjectResourceService(store, worlds,
-      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const resources = await resourceService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const tokens = new TokenAuthority();
     const api = new KarmaxApi({ store, client: { workflow: {} } as any, taskQueue: 'karmax',
       tokens, worlds, resources, broker });
@@ -1033,8 +732,7 @@ describe('project resources', () => {
       workflowVersion: '1.19.0', params: { prompt: 'create it' } }));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
-    const resources = new ProjectResourceService(store, worlds,
-      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const resources = await resourceService(store, worlds, new LocalObjectStore(path.join(dir, 'objects')), broker);
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     const vault = new VaultItems(store, broker, path.join(dir, 'state'), project.organizationId!);

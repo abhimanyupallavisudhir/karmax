@@ -12,8 +12,12 @@ import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resou
 import { WorldRegistry } from '../src/world/registry.js';
 import { ManagedStorageService, STORAGE_POLICY, type StorageNotice } from '../src/world/managed-storage.js';
 import { storageNotifier } from '../src/world/storage-notices.js';
+import crypto from 'node:crypto';
+import { repositoryName } from '../src/world/resource-repository.js';
 
 const DAY = 24 * 60 * 60 * 1000;
+/** Above two 40 kB versions and restic's metadata, below three. */
+const QUOTA = 100_000;
 const dirs: string[] = [];
 const stores: Store[] = [];
 // The same suite runs on PostgreSQL (production's database) when
@@ -55,9 +59,12 @@ async function fixture(options: { hosted?: boolean } = {}) {
     credentialHandles: [], storageLocationId: managed.id, publish: 'review' });
   /** A park-time capture of a task's private copy, as ProjectResourceService.checkpoint saves it. */
   const checkpointRevision = async (attachmentId: string, data: Buffer, createdAt: number) => {
-    const captured = await engine.capture((await store.getResourceAttachment(attachmentId))!,
-      (async function* () { yield { path: 'file.bin', data }; })(), { enforceQuota: false });
-    return store.saveResourceRevision({ attachmentId, engine: engine.id, ...captured, metadata: { checkpoint: true }, createdAt });
+    const source = fs.mkdtempSync(path.join(dir, 'capture-'));
+    fs.writeFileSync(path.join(source, 'file.bin'), data);
+    const repository = await resources.restic.current((await store.getResourceAttachment(attachmentId))!);
+    const capture = await resources.restic.backupDirectory(source, repository, { quota: false });
+    return store.saveResourceRevision({ attachmentId, ...resources.restic.revisionFields(capture, repository),
+      metadata: { checkpoint: true }, createdAt });
   };
   const task = async (status: string, completedAt?: number) => {
     const created = (await store.createTask({ projectId: project.id, title: status, workflow: 'just-do',
@@ -79,10 +86,9 @@ async function fixture(options: { hosted?: boolean } = {}) {
     (await store.setWorldState(handle, state));
   };
   const usage = async () => (await store.storageLocationUsage(managed.id));
-  const chunkFiles = () => fs.existsSync(path.join(objectsDir, 'resources', organizationId, 'chunks'))
-    ? fs.readdirSync(path.join(objectsDir, 'resources', organizationId, 'chunks')).length : 0;
-  return { store, project, organizationId, managed, resources, service, notices, attachment, checkpointRevision,
-    task, worldCheckpoint, world, usage, chunkFiles, objects };
+  const snapshots = async (attachmentId: string) => (await store.listRepositoryFiles(repositoryName(attachmentId, managed.id), 'snapshots')).map((file) => file.name);
+  return { store, project, organizationId, managed, resources, service, notices, attachment, checkpointRevision, snapshots,
+    task, worldCheckpoint, world, usage, objects };
 }
 
 describe.each(BACKENDS)('%s', (name) => {
@@ -102,7 +108,7 @@ describe.each(BACKENDS)('%s', (name) => {
       const doing = (await f.task('waiting'));
       (await f.worldCheckpoint(doing.id, now, { resources: [{ attachmentId: data.id, revisionId: byCheckpoint.id }] }));
       (await f.store.kvSet(`resource-checkpoint:${doing.id}:${data.id}`, JSON.stringify({ leaseId: 'lease', revisionId: byBaseline.id })));
-      expect(f.chunkFiles()).toBe(5);
+      expect(await f.snapshots(data.id)).toHaveLength(5);
 
       const result = (await f.service.run(now));
 
@@ -110,7 +116,10 @@ describe.each(BACKENDS)('%s', (name) => {
       expect((await f.store.getResourceRevision(leaked.id))).toBeUndefined();
       for (const kept of [byCheckpoint, byBaseline, recent]) expect((await f.store.getResourceRevision(kept.id))).toBeDefined();
       expect((await f.store.listResourceRevisions(data.id))).toHaveLength(4);
-      expect(f.chunkFiles()).toBe(4);
+      // Its snapshot is forgotten and its data pruned.
+      expect(await f.snapshots(data.id)).not.toContain(leaked.rootDigest);
+      expect(await f.snapshots(data.id)).toHaveLength(4);
+      expect(await f.store.kvEntries('restic-prune:')).toEqual([]);
     });
 
     it('expires the saved workspaces of done and cancelled tasks after 30 days, and nothing else', async () => {
@@ -158,28 +167,29 @@ describe.each(BACKENDS)('%s', (name) => {
       const f = (await fixture());
       const now = Date.now();
       const older = (await f.attachment('older'));
-      (await f.resources.importFiles(older.id, [{ path: 'a.bin', data: Buffer.alloc(400, 1) }]));
-      (await f.resources.importFiles(older.id, [{ path: 'a.bin', data: Buffer.alloc(400, 2) }]));
+      // Random, so restic cannot compress it; the quota leaves room for its own metadata.
+      (await f.resources.importFiles(older.id, [{ path: 'a.bin', data: crypto.randomBytes(40_000) }]));
+      (await f.resources.importFiles(older.id, [{ path: 'a.bin', data: crypto.randomBytes(40_000) }]));
       const current = (await f.attachment('current'));
-      (await f.resources.importFiles(current.id, [{ path: 'b.bin', data: Buffer.alloc(400, 3) }]));
-      (await f.store.saveStorageLocation({ ...f.managed, quotaBytes: 900 }));
+      (await f.resources.importFiles(current.id, [{ path: 'b.bin', data: crypto.randomBytes(40_000) }]));
+      (await f.store.saveStorageLocation({ ...f.managed, quotaBytes: QUOTA }));
       return { ...f, now, older, current };
     }
 
     it('records when it went over, notices once per stage, and clears when back under', async () => {
       const f = (await overQuota());
-      expect((await f.usage()).retainedBytes).toBeGreaterThan(900);
+      expect((await f.usage()).retainedBytes).toBeGreaterThan(QUOTA);
       (await f.service.enforceQuota(f.organizationId, f.now));
       (await f.service.enforceQuota(f.organizationId, f.now + DAY));
       expect(f.notices.map((notice) => notice.stage)).toEqual(['over']);
-      expect(f.notices[0]).toMatchObject({ overSince: f.now, deleteAt: f.now + STORAGE_POLICY.overQuotaDeletionMs, quotaBytes: 900 });
+      expect(f.notices[0]).toMatchObject({ overSince: f.now, deleteAt: f.now + STORAGE_POLICY.overQuotaDeletionMs, quotaBytes: QUOTA });
 
       (await f.service.enforceQuota(f.organizationId, f.now + 336 * DAY));
       (await f.service.enforceQuota(f.organizationId, f.now + 359 * DAY));
       expect(f.notices.map((notice) => notice.stage)).toEqual(['over', '30d', '7d']);
       expect((await f.store.listResourceRevisions(f.older.id))).toHaveLength(2);
 
-      (await f.store.saveStorageLocation({ ...f.managed, quotaBytes: 10_000 }));
+      (await f.store.saveStorageLocation({ ...f.managed, quotaBytes: 10 * QUOTA }));
       (await f.service.enforceQuota(f.organizationId, f.now + 360 * DAY));
       expect((await f.store.storageOverQuota(f.organizationId))).toBeUndefined();
     });
@@ -187,7 +197,7 @@ describe.each(BACKENDS)('%s', (name) => {
     it('is read-only for new data while over, but still saves work in progress', async () => {
       const f = (await overQuota());
       await expect(f.resources.importFiles(f.current.id, [{ path: 'c.bin', data: Buffer.alloc(10, 9) }]))
-        .rejects.toThrow(/quota exceeded/);
+        .rejects.toThrow(/quota/);
       await expect(f.store.reserveStorageUpload('upload', f.organizationId, f.managed.id, 10, f.now + 60_000))
         .rejects.toThrow(/quota exceeded/);
       (await f.store.reserveStorageUpload('checkpoint', f.organizationId, f.managed.id, 10, f.now + 60_000, { enforceQuota: false }));
@@ -203,7 +213,7 @@ describe.each(BACKENDS)('%s', (name) => {
       const olderRevisions = (await f.store.listResourceRevisions(f.older.id));
       expect(olderRevisions.map((revision) => revision.id)).toEqual([(await f.store.getResourceAttachment(f.older.id))!.currentRevisionId]);
       expect((await f.store.listResourceRevisions(f.current.id))).toHaveLength(1);
-      expect((await f.usage()).retainedBytes).toBeLessThanOrEqual(900);
+      expect((await f.usage()).retainedBytes).toBeLessThanOrEqual(QUOTA);
       expect((await f.store.storageOverQuota(f.organizationId))).toBeUndefined();
     });
 

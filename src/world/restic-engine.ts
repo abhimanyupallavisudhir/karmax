@@ -1,0 +1,485 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import type { CredentialBroker } from '../autonomy/broker.js';
+import type { ResourceAttachment, ResourceChangeSummary, ResourceRevision } from '../domain/types.js';
+import type { Store } from '../store/db.js';
+import type { ObjectStore } from '../store/objects.js';
+import { SYSTEM_JOB_ROOT, jobStatuses, startJob, stopJobs } from './jobs.js';
+import { REPOSITORY_ROUTE, RepositoryTokens, parseRepositoryName, repositoryName, repositoryObjectKey, repositoryPassword,
+  type RepositoryAccess } from './resource-repository.js';
+import { RESTIC_VERSION, resticFailure, runHostRestic, worldResticBinary, type ResticRun } from './restic.js';
+import { ensureWorldExcluded } from './secret-exclude.js';
+import type { SnapshotVerification } from './resources.js';
+import type { World, WorldHandle } from './types.js';
+import { isRemoteWorldKind } from './types.js';
+
+/**
+ * Project resources saved and restored by restic (wiki features/resource-storage).
+ *
+ * Every resource is one restic repository behind the server in
+ * resource-repository.ts, and a revision is one of its snapshots. A remote
+ * sandbox runs restic itself, as a durable job, so its bytes move at the
+ * sandbox's own bandwidth and a worker restart only means reattaching to the
+ * job; a local world (a worktree or a container's bind mount) is on this host,
+ * so restic runs here. Either way it is one standard program doing the whole
+ * transfer: chunking, deduplication against every earlier version,
+ * encryption, parallel upload, resumption after an interruption.
+ */
+export const RESTIC_ENGINE = 'restic@1';
+
+export interface RepositoryEndpoints {
+  /** Base URL (no trailing slash) at which a remote world reaches this server. */
+  world(handle: WorldHandle): string | undefined;
+  /** Base URL at which this process reaches it. */
+  host(): string | Promise<string>;
+}
+
+export interface ResticDeps {
+  store: Store;
+  broker: CredentialBroker;
+  tokens: RepositoryTokens;
+  endpoints: RepositoryEndpoints;
+  /** Where an attachment's new versions are saved. */
+  locationOf(attachment: ResourceAttachment): Promise<string | undefined>;
+  objects(attachment: ResourceAttachment, storageLocationId: string | undefined): Promise<ObjectStore>;
+  /** restic's cache for commands this host runs. */
+  cacheDir?: string;
+}
+
+/** What a revision's `sealedRef` holds for this engine. */
+export interface ResticRef { snapshot: string; storageLocationId?: string }
+export function resticRef(revision: Pick<ResourceRevision, 'sealedRef'>): ResticRef {
+  const ref = JSON.parse(revision.sealedRef) as ResticRef;
+  if (!/^[0-9a-f]{64}$/.test(ref?.snapshot ?? '')) throw new Error('resource revision has no restic snapshot');
+  return ref;
+}
+
+/** A resource's repository in one storage location ({@link repositoryName}). */
+export interface Repository { attachment: ResourceAttachment; storageLocationId?: string; name: string }
+
+export interface ResticProgress { files: number; totalFiles: number; bytes: number; totalBytes: number }
+export interface ResticCapture { snapshot: string; files: number; bytes: number; added: number }
+
+/** Where a resource lives in a world: a directory saved whole, or one file. */
+export interface ResticPlace {
+  /** A remote world runs restic itself; otherwise this host does. */
+  world: World;
+  /** Absolute path of the resource in the world. */
+  path: string;
+  file?: boolean;
+}
+
+export interface ResticRunOptions {
+  /** Names the durable job, so a retried activity finds the one it started. */
+  key: string;
+  checkContinue?: () => Promise<void>;
+  onProgress?: (progress: ResticProgress) => void;
+}
+
+const BIN_DIR = '.karmax-injection/bin';
+const CACHE_DIR = '.karmax-injection/restic-cache';
+const TOKEN_HOURS = 24;
+const POLL_MS = 2_000;
+const CONNECTIONS = 8;
+const RESTORE_CONNECTIONS = 16;
+/** A save that finds files changed under it saves again, this many times. */
+const SETTLE_ROUNDS = 3;
+const VERIFY_MAX_BYTES = 256 * 1024 * 1024;
+/** A creator that has not finished by then has died. */
+const INIT_STALE_MS = 2 * 60_000;
+const HOST_CORES = Math.max(1, Math.min(2, Math.floor(os.cpus().length / 2)));
+
+export class ResticResources {
+  private initialized = new Set<string>();
+
+  constructor(private deps: ResticDeps) {}
+
+  /** The repository new versions of an attachment are saved in. */
+  async current(attachment: ResourceAttachment): Promise<Repository> {
+    return this.repository(attachment, await this.deps.locationOf(attachment));
+  }
+
+  /** The repository holding a revision's snapshot. */
+  of(attachment: ResourceAttachment, revision: Pick<ResourceRevision, 'sealedRef'>): Repository {
+    return this.repository(attachment, resticRef(revision).storageLocationId);
+  }
+
+  repository(attachment: ResourceAttachment, storageLocationId: string | undefined): Repository {
+    return { attachment, ...(storageLocationId ? { storageLocationId } : {}), name: repositoryName(attachment.id, storageLocationId) };
+  }
+
+  /** A revision's fields for a snapshot saved in `repository`. */
+  revisionFields(capture: ResticCapture, repository: Repository) {
+    const { storageLocationId } = repository;
+    return { engine: RESTIC_ENGINE, sealedRef: JSON.stringify({ snapshot: capture.snapshot, ...(storageLocationId ? { storageLocationId } : {}) }),
+      rootDigest: capture.snapshot, bytes: capture.bytes, files: capture.files, ...(storageLocationId ? { storageLocationId } : {}) };
+  }
+
+  /** Save `place` as a new snapshot. A file that changes while it is read
+   * makes the save run again (incrementally, from what it just stored), so a
+   * snapshot never mixes the before and after of a write. */
+  async backup(place: ResticPlace, attachment: Repository, options: ResticRunOptions & { parent?: string; quota: boolean }): Promise<ResticCapture> {
+    await this.ensureRepository(attachment);
+    const superseded: string[] = [];
+    let parent = options.parent;
+    for (let round = 0; round < SETTLE_ROUNDS; round++) {
+      const summary = await this.backupOnce(place, attachment, { ...options, parent, key: `${options.key}:${round}` })
+        .catch(async (error) => {
+          // What it uploaded before failing is in no index: the next prune deletes it.
+          await this.deps.store.kvSet(`restic-prune:${attachment.name}`, String(Date.now()));
+          throw error;
+        });
+      const settled = await this.backupOnce(place, attachment, { ...options, parent: summary.snapshot, dryRun: true, key: `${options.key}:${round}:check` });
+      if (!settled.changed) {
+        if (superseded.length) await this.forget(attachment, superseded);
+        return { snapshot: summary.snapshot, files: summary.files, bytes: summary.bytes, added: summary.added };
+      }
+      superseded.push(summary.snapshot);
+      parent = summary.snapshot;
+    }
+    await this.forget(attachment, superseded);
+    throw new Error(`${path.posix.basename(place.path)} kept changing while it was being saved; stop whatever is writing to it, then save it again`);
+  }
+
+  async restore(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions): Promise<void> {
+    const remote = isRemoteWorldKind(place.world.handle.kind);
+    const scratch = place.file ? path.posix.join(place.world.handle.root, `.karmax-injection/restore-${crypto.randomBytes(6).toString('hex')}`) : undefined;
+    const args = ['restore', snapshot, '--target', scratch ?? place.path, '--no-lock', '--json', '-o', `rest.connections=${RESTORE_CONNECTIONS}`];
+    if (remote) {
+      // One job does the restore and puts a single file in place.
+      const move = scratch ? `\nshopt -s dotglob nullglob; e=(${quote(scratch)}/*); [ \${#e[@]} -eq 1 ] || { echo "expected one file" >&2; exit 3; }
+mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.path)}; mv -f -- "\${e[0]}" ${quote(place.path)}; rm -rf -- ${quote(scratch)}` : '';
+      const prepare = scratch ? `rm -rf -- ${quote(scratch)}` : `mkdir -p -- ${quote(place.path)}`;
+      const run = await this.inWorld(place.world, attachment, 'read', false, args, { ...options, prefix: prepare, suffix: move });
+      if (run.code !== 0) throw resticFailure(run, 'restoring the resource');
+      return;
+    }
+    if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
+    else fs.mkdirSync(place.path, { recursive: true });
+    const run = await this.onHost(attachment, 'read', false, args, options);
+    if (run.code !== 0) throw resticFailure(run, 'restoring the resource');
+    if (scratch) {
+      const entries = fs.readdirSync(scratch);
+      if (entries.length !== 1) throw new Error('restoring the resource failed: expected one file');
+      fs.mkdirSync(path.dirname(place.path), { recursive: true });
+      fs.rmSync(place.path, { recursive: true, force: true });
+      fs.renameSync(path.join(scratch, entries[0]!), place.path);
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+
+  /** Save `entry` (`.`: all of it) of a directory on this host: an upload, an import. */
+  async backupDirectory(directory: string, attachment: Repository, options: { quota: boolean; parent?: string; entry?: string }): Promise<ResticCapture> {
+    await this.ensureRepository(attachment);
+    const run = await this.onHost(attachment, 'append', options.quota, [...backupArgs(options.parent), options.entry ?? '.'], { key: 'host', cwd: directory });
+    if (run.code !== 0) {
+      await this.deps.store.kvSet(`restic-prune:${attachment.name}`, String(Date.now()));
+      throw resticFailure(run, 'saving the resource');
+    }
+    return captureOf(run.stdout);
+  }
+
+  /** Files of a snapshot, by path relative to the resource. */
+  async files(attachment: Repository, snapshot: string): Promise<Array<{ path: string; bytes: number }>> {
+    const run = await this.onHost(attachment, 'read', false, ['ls', '--json', '--no-lock', snapshot], { key: 'host' });
+    if (run.code !== 0) throw resticFailure(run, 'listing the resource');
+    const files: Array<{ path: string; bytes: number }> = [];
+    for (const line of run.stdout.split('\n')) {
+      if (!line.startsWith('{')) continue;
+      const node = JSON.parse(line);
+      if (node.struct_type === 'node' && node.type === 'file') files.push({ path: String(node.path).replace(/^\/+/, ''), bytes: Number(node.size ?? 0) });
+    }
+    return files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  }
+
+  /** What changed between two snapshots of the same repository. Metadata
+   * alone (a restored file's new inode or owner) is not a change. */
+  async diff(attachment: Repository, from: string, to: string): Promise<Omit<ResourceChangeSummary, 'attachmentId' | 'baseRevisionId'>> {
+    const run = await this.onHost(attachment, 'read', false, ['diff', '--json', '--no-lock', from, to], { key: 'host' });
+    if (run.code !== 0) throw resticFailure(run, 'comparing versions of the resource');
+    let added = 0; let modified = 0; let deleted = 0; let bytes = 0;
+    const changedPaths: string[] = [];
+    for (const line of run.stdout.split('\n')) {
+      if (!line.startsWith('{')) continue;
+      const entry = JSON.parse(line);
+      if (entry.message_type === 'statistics') { bytes = Number(entry.added?.bytes ?? 0); continue; }
+      if (entry.message_type !== 'change' || String(entry.path).endsWith('/')) continue;
+      const modifier = String(entry.modifier ?? '');
+      if (modifier.includes('+')) added++;
+      else if (modifier.includes('-')) deleted++;
+      else if (/[MT]/.test(modifier)) modified++;
+      else continue;
+      if (changedPaths.length < 100) changedPaths.push(String(entry.path).replace(/^\/+/, ''));
+    }
+    return { added, modified, deleted, bytes, changedPaths };
+  }
+
+  /** Read back files of a snapshot, decrypting and checking every byte, a page at a time. */
+  async verify(attachment: Repository, snapshot: string, offset: number, limit: number): Promise<SnapshotVerification> {
+    let files: Array<{ path: string; bytes: number }>;
+    // restic's errors may name URLs and paths: report only that it failed.
+    try { files = await this.files(attachment, snapshot); }
+    catch { return { status: 'failed' as const, manifestVerified: false, offset, verifiedFiles: 0, verifiedBytes: 0, files: [], issue: 'unreadable-or-corrupt' as const }; }
+    const totalBytes = files.reduce((sum, file) => sum + file.bytes, 0);
+    const base = { manifestVerified: true, rootDigest: snapshot, totalFiles: files.length, totalBytes, offset,
+      verifiedFiles: 0, verifiedBytes: 0, files: [] as Array<{ path: string; bytes: number; sha256: string }> };
+    if (offset > files.length) return { ...base, status: 'failed' as const, issue: 'invalid-offset' as const };
+    // Nothing counts as verified unless every file of the page read back.
+    const failed = () => ({ ...base, verifiedFiles: 0, verifiedBytes: 0, files: [], status: 'failed' as const, issue: 'unreadable-or-corrupt' as const });
+    const page: typeof files = [];
+    let pageBytes = 0;
+    let limited = false;
+    for (const file of files.slice(offset, offset + limit)) {
+      if (pageBytes + file.bytes > VERIFY_MAX_BYTES) { limited = true; break; }
+      page.push(file); pageBytes += file.bytes;
+    }
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-verify-'));
+    try {
+      if (page.length) {
+        const includes = path.join(scratch, 'include');
+        fs.writeFileSync(includes, page.map((file) => `/${file.path.replace(/[\\*?[]/g, '\\$&')}`).join('\n'));
+        const run = await this.onHost(attachment, 'read', false, ['restore', snapshot, '--target', path.join(scratch, 'files'),
+          '--include-file', includes, '--no-lock', '--json'], { key: 'host' });
+        if (run.code !== 0) return failed();
+      }
+      for (const file of page) {
+        const data = fs.readFileSync(path.join(scratch, 'files', file.path));
+        if (data.length !== file.bytes) return failed();
+        base.files.push({ path: file.path, bytes: file.bytes, sha256: crypto.createHash('sha256').update(data).digest('hex') });
+        base.verifiedFiles++; base.verifiedBytes += file.bytes;
+      }
+    } catch {
+      return failed();
+    } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+    const end = offset + base.verifiedFiles;
+    return { ...base, status: offset === 0 && end === files.length ? 'complete' as const : 'partial' as const,
+      ...(end < files.length ? { nextOffset: end } : {}), ...(limited ? { issue: 'byte-limit' as const } : {}) };
+  }
+
+  /** Drop snapshots; their data goes with the next {@link prune}. */
+  async forget(attachment: Repository, snapshots: string[]): Promise<void> {
+    const present = new Set((await this.deps.store.listRepositoryFiles(attachment.name, 'snapshots')).map((file) => file.name));
+    const gone = snapshots.filter((snapshot) => present.has(snapshot));
+    if (!gone.length) return;
+    const run = await this.onHost(attachment, 'admin', false, ['forget', '--json', ...gone], { key: 'host' });
+    if (run.code !== 0) throw resticFailure(run, 'forgetting resource versions');
+    await this.deps.store.kvSet(`restic-prune:${attachment.name}`, String(Date.now()));
+  }
+
+  /** Delete the data no snapshot uses. Waits out a save in progress, which
+   * holds the repository; locks left by a world that died expire by themselves. */
+  async prune(attachment: Repository): Promise<void> {
+    const run = await this.onHost(attachment, 'admin', false, ['prune', '--max-unused', '5%', '--retry-lock', '1m'], { key: 'host' });
+    if (run.code !== 0) throw resticFailure(run, 'pruning the resource');
+    await this.deps.store.kvDelete(`restic-prune:${attachment.name}`);
+  }
+
+  /** Every repository of the attachment goes, with it. */
+  async removeRepositories(attachment: ResourceAttachment): Promise<void> {
+    const names = new Set((await this.deps.store.attachmentRepositoryFiles(attachment.id)).map((file) => file.repository));
+    for (const name of names) await this.removeRepository(this.repository(attachment, parseRepositoryName(name)?.storageLocationId));
+  }
+
+  private async removeRepository(repository: Repository): Promise<void> {
+    const objects = await this.deps.objects(repository.attachment, repository.storageLocationId);
+    for (const file of await this.deps.store.listRepositoryFiles(repository.name)) {
+      if (file.kind !== 'locks') await objects.delete(repositoryObjectKey(repository.name, file.kind, file.name));
+      await this.deps.store.deleteRepositoryFile(repository.name, file.kind, file.name);
+    }
+    this.initialized.delete(repository.name);
+    await this.deps.store.kvDelete(`restic-prune:${repository.name}`);
+  }
+
+  /** Create the repository once. Concurrent saves of a new resource wait for
+   * one creator: two `restic init`s would leave the loser's key beside the
+   * winner's config, and restic, trying that key first, could not open it. */
+  private async ensureRepository(attachment: Repository): Promise<void> {
+    if (this.initialized.has(attachment.name)) return;
+    const claimKey = `restic-init:${attachment.name}`;
+    const owner = crypto.randomUUID();
+    const deadline = Date.now() + 5 * 60_000;
+    while (!(await this.deps.store.repositoryFile(attachment.name, 'config', 'config'))) {
+      if (Date.now() > deadline) throw new Error('creating the resource repository timed out');
+      const held = await this.deps.store.kvGet(claimKey);
+      const stale = held !== undefined && Date.now() - Number(JSON.parse(held).at ?? 0) > INIT_STALE_MS;
+      const mine = JSON.stringify({ owner, at: Date.now() });
+      if ((held === undefined || stale) && await this.deps.store.kvCompareAndSet(claimKey, held, mine)) {
+        try {
+          // restic writes the config last: without one, whatever is there is
+          // an init that stopped half-way.
+          await this.removeRepository(attachment);
+          const run = await this.onHost(attachment, 'admin', false, ['init', '--json'], { key: 'host', create: true });
+          if (run.code !== 0) throw resticFailure(run, 'creating the resource repository');
+        } finally { await this.deps.store.kvCompareAndSet(claimKey, mine, undefined); }
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    this.initialized.add(attachment.name);
+  }
+
+  private async backupOnce(place: ResticPlace, attachment: Repository, options: ResticRunOptions & { parent?: string;
+    quota: boolean; dryRun?: boolean }): Promise<ResticCapture & { changed: boolean }> {
+    // A one-file resource is its content: a link is saved as what it points to.
+    const file = place.file ? await this.realPath(place) : undefined;
+    const directory = file ? path.posix.dirname(file) : place.path;
+    const args = [...backupArgs(options.parent), ...(options.dryRun ? ['--dry-run'] : []), file ? path.posix.basename(file) : '.'];
+    const progress = options.dryRun ? {} : { onProgress: options.onProgress };
+    const run = isRemoteWorldKind(place.world.handle.kind)
+      ? await this.inWorld(place.world, attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory })
+      : await this.onHost(attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory });
+    if (run.code !== 0) throw resticFailure(run, 'saving the resource');
+    const summary = summaryOf(run.stdout);
+    return { ...captureOf(run.stdout, options.dryRun), changed: Number(summary.files_new ?? 0) + Number(summary.files_changed ?? 0) > 0 };
+  }
+
+  private async realPath(place: ResticPlace): Promise<string> {
+    if (!isRemoteWorldKind(place.world.handle.kind)) return fs.realpathSync(place.path);
+    const resolved = await place.world.exec('readlink', ['-f', '--', place.path], { cwd: place.world.handle.root, timeoutMs: 30_000 });
+    if (resolved.code !== 0 || !resolved.stdout.trim()) throw new Error(`could not resolve ${place.path}: ${resolved.stderr.trim()}`);
+    return resolved.stdout.trim();
+  }
+
+  private async env(repository: Repository, base: string, access: RepositoryAccess, quota: boolean, create = false): Promise<Record<string, string>> {
+    const token = await this.deps.tokens.mint({ repository: repository.name, access, quota, expiresAt: Date.now() + TOKEN_HOURS * 3_600_000 });
+    return { RESTIC_REPOSITORY: `rest:${base.replace(/\/+$/, '')}${REPOSITORY_ROUTE}${repository.name}/`, RESTIC_REST_USERNAME: 'tavya',
+      RESTIC_REST_PASSWORD: token, RESTIC_PASSWORD: await repositoryPassword(this.deps.broker, repository.attachment, create), RESTIC_PROGRESS_FPS: '0.5' };
+  }
+
+  private async onHost(attachment: Repository, access: RepositoryAccess, quota: boolean, args: string[],
+    options: ResticRunOptions & { cwd?: string; create?: boolean }): Promise<ResticRun> {
+    // Half of a small host at most: the app serves everyone meanwhile.
+    const env = { ...await this.env(attachment, await this.deps.endpoints.host(), access, quota, options.create),
+      ...(this.deps.cacheDir ? { RESTIC_CACHE_DIR: this.deps.cacheDir } : {}), GOMAXPROCS: String(HOST_CORES) };
+    const controller = new AbortController();
+    let cancelled: unknown;
+    const watch = options.checkContinue && setInterval(() => {
+      options.checkContinue!().catch((error) => { cancelled = error; controller.abort(); });
+    }, POLL_MS);
+    try {
+      // A cache per repository, and old ones removed (unused for 30 days).
+      const run = await runHostRestic([...(this.deps.cacheDir ? ['--cleanup-cache'] : ['--no-cache']), ...args], env, { cwd: options.cwd, signal: controller.signal,
+        onLine: (line) => { const progress = progressOf(line); if (progress) options.onProgress?.(progress); } })
+        .catch((error) => { if (cancelled) throw cancelled; throw error; });
+      if (cancelled) throw cancelled;
+      return run;
+    } finally { if (watch) clearInterval(watch); }
+  }
+
+  /** Run restic in a remote world as a durable job. An activity retried while
+   * the job still runs (a worker restart) waits for that same job, found by
+   * `options.key`; one that finds it finished runs restic again, which then
+   * has everything already stored. */
+  private async inWorld(world: World, attachment: Repository, access: RepositoryAccess, quota: boolean, args: string[],
+    options: ResticRunOptions & { cwd?: string; prefix?: string; suffix?: string }): Promise<ResticRun> {
+    const base = this.deps.endpoints.world(world.handle);
+    if (!base) throw new Error('this world cannot reach the resource store (no public URL is configured)');
+    const binary = await this.worldBinary(world, base);
+    const command = `set -e\n${options.prefix ? `${options.prefix}\n` : ''}${options.cwd ? `cd -- ${quote(options.cwd)}\n` : ''}`
+      + `${quote(binary)} ${args.map(quote).join(' ')}${options.suffix ?? ''}`;
+    const recordKey = `restic-job:${world.handle.id}:${options.key}`;
+    const digest = crypto.createHash('sha256').update(command).digest('hex');
+    let recorded = await this.deps.store.kvGet(recordKey);
+    let job: string | undefined;
+    try {
+      const value = JSON.parse(recorded ?? '{}') as { job?: string; generation?: number; digest?: string };
+      if (value.digest === digest && value.generation === (world.handle.generation ?? 1) && value.job
+        && (await jobStatuses(world, [value.job], { root: SYSTEM_JOB_ROOT }))[0]?.state === 'running') job = value.job;
+    } catch { /* none */ }
+    if (!job) {
+      const env = { ...await this.env(attachment, base, access, quota),
+        RESTIC_CACHE_DIR: path.posix.join(world.handle.root, CACHE_DIR) };
+      job = (await startJob(world, { command, cwd: world.handle.root, env, root: SYSTEM_JOB_ROOT })).id;
+      recorded = JSON.stringify({ job, generation: world.handle.generation ?? 1, digest });
+      await this.deps.store.kvSet(recordKey, recorded);
+    }
+    const forget = () => this.deps.store.kvCompareAndSet(recordKey, recorded, undefined).catch(() => false);
+    try {
+      for (;;) {
+        await options.checkContinue?.();
+        const [status] = await jobStatuses(world, [job], { root: SYSTEM_JOB_ROOT, tailLines: 4 });
+        for (const line of (status?.tail ?? '').split('\n').reverse()) {
+          const progress = progressOf(line);
+          if (progress) { options.onProgress?.(progress); break; }
+        }
+        if (status?.state === 'exited') {
+          const log = await world.exec('bash', ['-c', `tail -c 1048576 ${quote(`${SYSTEM_JOB_ROOT}/${job}/log`)}`],
+            { cwd: world.handle.root, timeoutMs: 30_000 });
+          await forget();
+          return { code: status.exitCode ?? -1, stdout: log.stdout, stderr: log.stdout };
+        }
+        if (status?.state !== 'running') {
+          await forget();
+          throw new Error('restic stopped without finishing (the sandbox was restarted); it resumes from what it stored when retried');
+        }
+        await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+      }
+    } catch (error) {
+      // Cancelled: the job stops with the activity that waited on it.
+      if (await forget()) await stopJobs(world, [job], SYSTEM_JOB_ROOT).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** restic in a remote world: fetched once from this server and checked against its pinned digest. */
+  private async worldBinary(world: World, base: string): Promise<string> {
+    const relative = `${BIN_DIR}/restic-${RESTIC_VERSION}`;
+    const absolute = path.posix.join(world.handle.root, relative);
+    // Finished platform jobs are kept a day (another waiter may still read one).
+    const probe = await world.exec('bash', ['-c', `find ${SYSTEM_JOB_ROOT} -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} + 2>/dev/null; `
+      + `test -x ${quote(relative)} && echo present || uname -m`], { cwd: world.handle.root, timeoutMs: 30_000 });
+    if (probe.stdout.trim() === 'present') return absolute;
+    const arch = ({ x86_64: 'amd64', amd64: 'amd64', aarch64: 'arm64', arm64: 'arm64' } as Record<string, string>)[probe.stdout.trim()];
+    const binary = arch ? worldResticBinary(arch) : undefined;
+    if (!binary) throw new Error(`restic is not available for this world (${probe.stdout.trim() || probe.stderr.trim() || 'unknown architecture'})`);
+    await ensureWorldExcluded(world, '.karmax-injection').catch(() => undefined);
+    const url = `${base.replace(/\/+$/, '')}${REPOSITORY_ROUTE}restic/${RESTIC_VERSION}/linux-${arch}`;
+    const fetched = await world.exec('bash', ['-c', `set -e; mkdir -p ${BIN_DIR}; t=${BIN_DIR}/.restic-$$
+if command -v curl >/dev/null; then curl -fsSL --retry 3 "$1" -o "$t"
+elif command -v wget >/dev/null; then wget -q -O "$t" "$1"
+else node -e 'fetch(process.argv[1]).then(async r=>{if(!r.ok)throw new Error(r.status);require("fs").writeFileSync(process.argv[2],Buffer.from(await r.arrayBuffer()))})' "$1" "$t"; fi
+got=$(sha256sum "$t" 2>/dev/null | cut -d' ' -f1 || node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' "$t")
+[ "$got" = "$2" ] || { rm -f "$t"; echo "restic download does not match its digest" >&2; exit 1; }
+chmod +x "$t"; mv -f "$t" ${quote(relative)}`, 'restic-fetch', url, binary.sha256], { cwd: world.handle.root, timeoutMs: 5 * 60_000 });
+    if (fetched.code !== 0) throw new Error(`could not install restic in the world: ${(fetched.stderr || fetched.stdout).trim().slice(0, 300)}`);
+    return absolute;
+  }
+}
+
+function backupArgs(parent?: string): string[] {
+  // Inode and ctime differ in every world a resource is restored into; the
+  // size and nanosecond mtime restic restores are what say a file is
+  // unchanged, so a restored world is not read again in full. (An edit that
+  // keeps both, by setting the old mtime back, would go unnoticed.)
+  return ['backup', '--json', '--host', 'tavya', '--ignore-inode', '--exclude', '.git', '--exclude', '.karmax-injection',
+    '-o', `rest.connections=${CONNECTIONS}`, ...(parent ? ['--parent', parent] : [])];
+}
+
+function summaryOf(stdout: string): Record<string, unknown> {
+  for (const line of stdout.split('\n').reverse()) {
+    if (!line.startsWith('{')) continue;
+    try { const value = JSON.parse(line); if (value.message_type === 'summary') return value; } catch { /* partial line */ }
+  }
+  throw new Error('restic did not report a summary');
+}
+
+function captureOf(stdout: string, dryRun = false): ResticCapture {
+  const summary = summaryOf(stdout);
+  const snapshot = String(summary.snapshot_id ?? '');
+  if (!dryRun && !/^[0-9a-f]{64}$/.test(snapshot)) throw new Error('restic did not report a snapshot');
+  return { snapshot, files: Number(summary.total_files_processed ?? 0), bytes: Number(summary.total_bytes_processed ?? 0),
+    added: Number(summary.data_added_packed ?? summary.data_added ?? 0) };
+}
+
+function progressOf(line: string): ResticProgress | undefined {
+  if (!line.startsWith('{"message_type":"status"')) return undefined;
+  try {
+    const status = JSON.parse(line);
+    return { files: Number(status.files_done ?? status.files_restored ?? 0), totalFiles: Number(status.total_files ?? 0),
+      bytes: Number(status.bytes_done ?? status.bytes_restored ?? 0), totalBytes: Number(status.total_bytes ?? 0) };
+  } catch { return undefined; }
+}
+
+function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }

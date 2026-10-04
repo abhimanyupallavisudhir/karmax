@@ -8,6 +8,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
+import { legacyRevision } from './helpers/legacy-resources.js';
 
 async function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'revision-verify-'));
@@ -16,7 +17,11 @@ async function fixture() {
   const data = new Map<string, Buffer>();
   const objects = {
     async put(key: string, value: Buffer) { data.set(key, value); },
-    async get(key: string) { if (!data.has(key)) throw new Error('SECRET URL /private/key missing'); return data.get(key)!; },
+    async get(key: string) {
+      // Like a real store, a missing object is told apart from a failure.
+      if (!data.has(key)) throw Object.assign(new Error('SECRET URL /private/key missing'), { code: 'ENOENT' });
+      return data.get(key)!;
+    },
     async delete(key: string) { data.delete(key); },
   };
   const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
@@ -25,7 +30,9 @@ async function fixture() {
   const resource = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
     name: 'Snapshot', driver: 'object-tree@1', target: { kind: 'path', path: 'data' },
     access: 'write', isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' }));
-  return { store, project, resource, data, engine, service, broker, async close() { (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); } };
+  /** A version saved before restic, which verification still reads. */
+  const legacy = (files: Array<{ path: string; data: Buffer }>) => legacyRevision(store, broker, objects, resource, files);
+  return { store, project, resource, data, engine, service, broker, legacy, async close() { (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); } };
 }
 const sha = (data: Buffer) => crypto.createHash('sha256').update(data).digest('hex');
 
@@ -98,7 +105,7 @@ describe('historical snapshot byte verification', () => {
   it('recomputes the tree digest and file hashes even for authenticated objects', async () => {
     const f = (await fixture());
     try {
-      const revision = await f.service.importFiles(f.resource.id, [{ path: 'file', data: Buffer.from('original') }]);
+      const revision = await f.legacy([{ path: 'file', data: Buffer.from('original') }]);
       const manifest = await f.engine.manifest(revision);
       const handle = `resource-store:key:${f.project.organizationId}`;
       const key = Buffer.from(f.broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
@@ -123,21 +130,25 @@ describe('historical snapshot byte verification', () => {
   });
 
   it('does not create a replacement encryption key during a failed read', async () => {
-    const f = (await fixture());
-    try {
-      const revision = await f.service.importFiles(f.resource.id, [{ path: 'file', data: Buffer.from('original') }]);
-      const handle = `resource-store:key:${f.project.organizationId}`;
-      (await f.broker.deleteHandle(handle));
-      expect(await f.service.verifyRevision(f.project.id, f.resource.id, revision.id))
-        .toMatchObject({ status: 'failed', manifestVerified: false, verifiedFiles: 0 });
-      expect(f.broker.hasHandle(handle)).toBe(false);
-    } finally { (await f.close()); }
+    for (const saved of ['legacy', 'restic']) {
+      const f = (await fixture());
+      try {
+        const file = [{ path: 'file', data: Buffer.from('original') }];
+        const revision = saved === 'legacy' ? await f.legacy(file) : await f.service.importFiles(f.resource.id, file);
+        const handle = `resource-store:key:${f.project.organizationId}`;
+        (await f.broker.deleteHandle(handle));
+        expect(await f.service.verifyRevision(f.project.id, f.resource.id, revision.id))
+          .toMatchObject({ status: 'failed', manifestVerified: false, verifiedFiles: 0 });
+        expect(f.broker.hasHandle(handle)).toBe(false);
+      } finally { (await f.close()); }
+    }
   });
 
-  it.each(['manifest-missing', 'manifest-corrupt', 'chunk-missing', 'chunk-corrupt'])('reports %s without leaking provider errors or claiming byte verification', async (failure) => {
+  it.each(['manifest-missing', 'manifest-corrupt', 'chunk-missing', 'chunk-corrupt'])('reports a legacy %s without leaking provider errors or claiming byte verification', async (failure) => {
     const f = (await fixture());
     try {
-      const revision = await f.service.importFiles(f.resource.id, [{ path: 'file', data: Buffer.from('original') }]);
+      const revision = await f.legacy([{ path: 'file', data: Buffer.from('original') }]);
+      await f.store.promoteResourceRevision(f.resource.id, revision.id, undefined);
       const key = [...f.data.keys()].find((key) => key.includes(failure.startsWith('manifest') ? '/manifests/' : '/chunks/'))!;
       if (failure.endsWith('missing')) f.data.delete(key);
       else f.data.set(key, Buffer.from('corrupted'));
@@ -145,6 +156,23 @@ describe('historical snapshot byte verification', () => {
       expect(result).toMatchObject({ status: 'failed', issue: 'unreadable-or-corrupt', verifiedFiles: 0, files: [] });
       expect(result.manifestVerified).toBe(failure.startsWith('chunk'));
       expect(JSON.stringify(result)).not.toMatch(/SECRET|private|sealedRef|objectKey/);
+      expect((await f.store.getResourceAttachment(f.resource.id))?.currentRevisionId).toBe(revision.id);
+    } finally { (await f.close()); }
+  });
+
+  it.each(['snapshot-missing', 'data-missing', 'data-corrupt'])('reports a restic %s without leaking provider errors or claiming byte verification', async (failure) => {
+    const f = (await fixture());
+    try {
+      const revision = await f.service.importFiles(f.resource.id, [{ path: 'file', data: crypto.randomBytes(1000) }]);
+      // The file's own data is the largest pack; directory trees are packed apart.
+      const key = [...f.data.keys()].filter((key) => key.includes(failure.startsWith('snapshot') ? '/snapshots/' : '/data/'))
+        .sort((a, b) => f.data.get(b)!.length - f.data.get(a)!.length)[0]!;
+      if (failure.endsWith('missing')) f.data.delete(key);
+      else f.data.set(key, crypto.randomBytes(f.data.get(key)!.length));
+      const result = await f.service.verifyRevision(f.project.id, f.resource.id, revision.id);
+      expect(result).toMatchObject({ status: 'failed', issue: 'unreadable-or-corrupt', verifiedFiles: 0, files: [] });
+      expect(result.manifestVerified).toBe(failure.startsWith('data'));
+      expect(JSON.stringify(result)).not.toMatch(/SECRET|private|sealedRef|objectKey|127\.0\.0\.1/);
       expect((await f.store.getResourceAttachment(f.resource.id))?.currentRevisionId).toBe(revision.id);
     } finally { (await f.close()); }
   });

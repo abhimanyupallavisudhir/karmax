@@ -89,6 +89,15 @@ describe('public edge (Caddy) rate limiting', () => {
     for (const key of keys) expect(key).toBe('{http.request.remote.host}');
   });
 
+  it('meters resource repositories in a zone of their own, not the console budget', () => {
+    const site = read('Caddyfile').split('{$KARMAX_DOMAIN} {')[1]?.split('\n}')[0] ?? '';
+    const repositories = site.split('handle /resource-repositories/* {')[1]?.split('\n\t}')[0] ?? '';
+    expect(repositories).toContain('zone repositories');
+    expect(repositories).not.toContain('import karmax_ratelimit');
+    // Everything else still goes through the catch-all budget.
+    expect(site.split('handle {')[1] ?? '').toContain('import karmax_ratelimit');
+  });
+
   it('leaves preview origins unmetered so a user app is not throttled by the control plane', () => {
     // The preview block is lease-gated and serves someone's running app; a
     // shared control-plane budget there would throttle legitimate traffic.
@@ -286,7 +295,7 @@ it('preserves public IPv6 peers and exposes the app only on host loopback (CI-8)
     expect(config.networks?.default?.ipam).toBeUndefined();
   }
   expect(read('Caddyfile')).not.toContain('app:4505');
-  expect(read('Caddyfile').match(/header_up X-Forwarded-For \{http.request.remote.host\}/g)).toHaveLength(3);
+  expect(read('Caddyfile').match(/header_up X-Forwarded-For \{http.request.remote.host\}/g)).toHaveLength(4);
 });
 
 it('keeps Caddy\'s admin API off now that Caddy shares the host network (CI-8)', () => {

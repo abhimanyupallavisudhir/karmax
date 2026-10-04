@@ -1,0 +1,10 @@
+{
+  "version": "0.19.1",
+  "comment": "restic, pinned: the archive digests are the release's SHA256SUMS; the binary digests are of the unpacked files, which worlds check before running one.",
+  "binaries": {
+    "linux-amd64": { "archive": "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c", "binary": "20d4142678d0d95ec11a4759def1b73fd9190abc9ca19e4b62d067c0b387e639" },
+    "linux-arm64": { "archive": "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465", "binary": "2fb45ac6f9071b6f20eb883953a188f9e7c7cb6bbe43c67a2e47ada4e85ee7f0" },
+    "darwin-amd64": { "archive": "c38d579622cf602f665234c5a8c315030b6cf70656028fe6dc29a786b60e5f35" },
+    "darwin-arm64": { "archive": "7be0a144ccc377880f294204aa271d76e4b79554b42a751151d425ce6ebac143" }
+  }
+}
