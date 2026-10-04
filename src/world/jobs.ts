@@ -122,7 +122,8 @@ for id in "$@"; do d=${JOB_ROOT}/$id
   printf '%s %s %s %s %s\\n' "$b" "$id" "$s" "$(cat "$d/started" 2>/dev/null)" "$(cat "$d/ended" 2>/dev/null)"
   printf '%s\\n' "$(head -n 1 "$d/name" 2>/dev/null)"
   head -c 300 "$d/command" 2>/dev/null | head -n 1; echo
-  if [ "$lines" -gt 0 ] && [ -f "$d/log" ]; then tail -c 6000 "$d/log" | tail -n "$lines"; fi
+  # A log may end mid-line (progress output): end it, or the next header joins it.
+  if [ "$lines" -gt 0 ] && [ -f "$d/log" ]; then tail -c 6000 "$d/log" | tail -n "$lines"; echo; fi
 done
 printf '%s end\\n' "$b"`;
 
@@ -169,6 +170,9 @@ export async function jobStatuses(world: World, ids: string[], opts: { tailLines
       }
     }
     flush();
+    // Only the script may call a job missing; an unreported one is a garbled reply.
+    const unreported = valid.filter((id) => !out.has(id));
+    if (unreported.length) throw new Error(`could not read job status of ${unreported.join(', ')}`);
   }
   return ids.map((id) => out.get(id) ?? { id, state: 'missing', log: '' });
 }
