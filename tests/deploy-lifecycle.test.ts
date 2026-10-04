@@ -47,12 +47,21 @@ if (args.includes('pg_restore')) {
 if (args.join(' ').includes('--verify-deployment') && process.env.FAKE_TAMPER) fs.writeFileSync(process.env.FAKE_TAMPER, 'tampered');
 `, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  // The edge: refuses connections for its first FAKE_EDGE_DOWN requests, as
+  // Caddy does while it loads, then answers like Caddy's HTTPS redirect.
+  const curls = path.join(root, 'curl.log');
+  fs.writeFileSync(path.join(bin, 'curl'), `#!/bin/sh
+echo "$*" >> "${curls}"
+[ "$(wc -l < "${curls}")" -gt "\${FAKE_EDGE_DOWN:-0}" ] || { printf 000; exit 7; }
+printf 308
+`, { mode: 0o755 });
   const run = (args: string[], fail = '', input = '', env: Record<string, string> = {}) => spawnSync('sh', [path.join(deploy, 'karmax'), ...args], {
     encoding: 'utf8', input, timeout: 30_000,
     env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, FAKE_FAIL: fail, ...env },
   });
   const calls = () => fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]) : [];
-  return { root, deploy, run, calls, clear: () => fs.writeFileSync(log, '') };
+  const edgeRequests = () => fs.existsSync(curls) ? fs.readFileSync(curls, 'utf8').trim().split('\n') : [];
+  return { root, deploy, run, calls, edgeRequests, clear: () => fs.writeFileSync(log, '') };
 }
 
 it('names a backup taken without a destination as the operator\'s, so pruning keeps it', () => {
@@ -117,6 +126,27 @@ it('starts only after configuration validates, preserves secrets, and waits for 
   expect(result.stdout).toContain('Karmax is ready');
   expect(fs.readFileSync(path.join(h.deploy, '.turnkey.env'), 'utf8')).toContain('KEEP_SETTING=retained');
   expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
+});
+
+// Compose starts Caddy only once the app is healthy, so the app's own readiness
+// arrives while the edge is still loading: master CI #1453 found port 80 closed
+// 20 ms before Caddy listened. Plain HTTP needs neither DNS nor a certificate.
+it('reports readiness only once the edge serves the domain', () => {
+  const h = deployment();
+  const result = h.run(['up', 'example.com'], '', '', { FAKE_EDGE_DOWN: '3' });
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toContain('Karmax is ready');
+  expect(h.edgeRequests()).toHaveLength(4);
+  expect(h.edgeRequests().at(-1)).toContain('--resolve example.com:80:127.0.0.1 http://example.com/');
+});
+
+it('fails with Caddy\'s logs when the edge never serves the domain', () => {
+  const h = deployment();
+  const result = h.run(['up', 'example.com'], '', '', { FAKE_EDGE_DOWN: '1000' });
+  expect(result.status).not.toBe(0);
+  expect(result.stdout).not.toContain('Karmax is ready');
+  expect(result.stderr).toContain('Caddy is not serving example.com');
+  expect(h.calls().map(args => args.join(' '))).toContainEqual(expect.stringMatching(/logs --tail=50 caddy$/));
 });
 
 it('does not start containers when compose validation fails', () => {
