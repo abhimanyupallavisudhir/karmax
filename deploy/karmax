@@ -250,19 +250,40 @@ edge_answers() {
   [ "$code" = 200 ]
 }
 
-wait_edge() {
-  note 'Waiting for the public edge (Caddy) to reach the control plane…'
+# Compose starts Caddy only once the app is healthy, so the app can be ready
+# while Caddy is still loading. Plain HTTP needs neither DNS nor a certificate:
+# Caddy redirects it to HTTPS as soon as it serves this domain.
+edge_serves() {
+  domain=$(env_value KARMAX_DOMAIN)
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$domain:80:127.0.0.1" \
+    "http://$domain/" 2>/dev/null) || code=000
+  [ "$code" = 308 ]
+}
+
+# poll_edge PROBE FAILURE: wait up to a minute for PROBE, else show Caddy.
+poll_edge() {
   attempt=0
-  until edge_answers; do
+  until "$1"; do
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 30 ]; then
       dc ps caddy || true
       dc logs --tail=50 caddy >&2 || true
-      echo "karmax: https://$(env_value KARMAX_DOMAIN) no longer answers through Caddy; its logs are above" >&2
+      echo "karmax: $2; its logs are above" >&2
       return 1
     fi
     sleep 2
   done
+}
+
+wait_edge() {
+  note 'Waiting for the public edge (Caddy) to reach the control plane…'
+  poll_edge edge_answers "https://$(env_value KARMAX_DOMAIN) no longer answers through Caddy"
+}
+
+wait_edge_serving() {
+  command -v curl >/dev/null 2>&1 || { note 'curl is not installed, so Caddy is not checked.'; return 0; }
+  note 'Waiting for the public edge (Caddy) to start…'
+  poll_edge edge_serves "Caddy is not serving $(env_value KARMAX_DOMAIN)"
 }
 
 print_finish() {
@@ -289,6 +310,7 @@ cmd_up() {
   note 'Building and starting PostgreSQL, Temporal, Karmax, and Caddy…'
   dc up -d --build --remove-orphans
   wait_ready || die 'Karmax failed its readiness check'
+  wait_edge_serving || die 'Caddy failed to start'
   print_finish
 }
 
