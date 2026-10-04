@@ -29,3 +29,13 @@ runs:
     - if: steps.modules.outputs.cache-hit != 'true'
       shell: bash
       run: npm rebuild @swc/core esbuild node-pty protobufjs
+
+    # The pinned restic, which saves project resources. `npm ci` installs it
+    # (postinstall), but not here: scripts are off, and a cached node_modules
+    # skips the install altogether. The checked downloads are cached too.
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/karmax/restic
+        key: restic-${{ runner.os }}-${{ hashFiles('src/world/restic-release.json') }}
+    - shell: bash
+      run: node scripts/fetch-restic.mjs
