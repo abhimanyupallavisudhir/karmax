@@ -58,17 +58,14 @@ it('delivers follow-ups during real streamed checkpoint capture without parking 
       const bytes = Buffer.alloc(17 * 1024 * 1024, 7);
       await world.writeFileBuffer!(`data-${separate}/large.bin`, bytes);
       const open = vi.spyOn(worlds, 'open').mockResolvedValue(world);
-      const exec = world.exec.bind(world);
       let reads = 0;
       let entered!: () => void, release!: () => void;
       const atChunk = new Promise<void>(resolve => { entered = resolve; });
       const gate = new Promise<void>(resolve => { release = resolve; });
-      const commands = vi.spyOn(world, 'exec').mockImplementation(async (cmd, args, opts) => {
-        const result = await exec(cmd, args, opts);
-        if (cmd === 'bash' && args.some(arg => arg.includes('dd if='))) {
-          reads++; entered(); await gate;
-        }
-        return result;
+      const stream = world.readFileStream!.bind(world);
+      const commands = vi.spyOn(world, 'readFileStream').mockImplementation(async function* (name: string) {
+        reads++; entered(); await gate;
+        yield* stream(name);
       });
       const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'waiting',
         waitingFor: { kind: 'human', audience: ['@creator'] }, messages: [], actions: [], updatedAt: 1,

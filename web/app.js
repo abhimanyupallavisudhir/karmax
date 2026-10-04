@@ -3554,7 +3554,7 @@ function connectWs() {
     if (ev.type === 'timing' && !S.meta?.timingEnabled) return;
     if (document.hidden) { S.liveUpdatesStale = true; return; }
     // Streamed text chunks are the live bubble's, not activity (LT-5).
-    if (S.tab === 'activity' && ev.type !== 'agent.output' && (!ev.projectId || ev.projectId === S.projectId)) {
+    if (S.tab === 'activity' && !liveOnlyEvent(ev.type) && (!ev.projectId || ev.projectId === S.projectId)) {
       S.activity.unshift(ev);
       if (S.activity.length > 400) S.activity.pop();
       bgRenderMain();
@@ -9254,6 +9254,19 @@ function conversationPane(v, t) {
 // the two only for presentation. Activity updates with the same provider item id
 // replace in place, so a command is one row that moves running → completed rather
 // than two noisy rows.
+// Streamed text and progress figures are shown in place, never listed as activity.
+function liveOnlyEvent(type) { return type === 'agent.output' || type === 'staging.progress'; }
+
+// How far the save in flight has got: its latest progress event, unless that
+// is old enough that the figures may no longer be true.
+function stagingProgress() {
+  const event = (S.taskEvents || []).findLast((e) => e.type === 'staging.progress');
+  const p = event?.payload;
+  if (!p || !(Number(p.totalBytes) > 0) || Date.now() - Number(event.ts) > 60_000) return undefined;
+  return { text: `Saving ${p.path} · ${formatBytes(p.bytes)} of ${formatBytes(p.totalBytes)}`,
+    title: p.count > 1 ? `Resource ${p.index + 1} of ${p.count}` : '' };
+}
+
 function conversationEntries(t) {
   // Fetch/WS races can merge an older durable window with newer events in either
   // array order. Fold provider updates in their durable order so a stale
@@ -11046,7 +11059,10 @@ function taskActionLabel(v, action) {
 // proposal / confirmation / cancellation controls are always one click away.
 function taskActions(v) {
   if (v.state?.applyingResources && v.status === 'active') return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Applying resources…</button></div>`;
-  if (v.state?.stagingResources && v.status === 'active') return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Saving resources…</button></div>`;
+  if (v.state?.stagingResources && v.status === 'active') {
+    const progress = stagingProgress();
+    return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true"${progress?.title ? ` title="${esc(progress.title)}"` : ''}>${esc(progress?.text || 'Saving resources…')}</button></div>`;
+  }
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
@@ -11636,7 +11652,7 @@ async function seedActivity() {
   try {
     const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
     if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
-    S.activity = activity.filter(e => e.type !== 'agent.output' && (e.type !== 'timing' || S.meta?.timingEnabled === true)).reverse();
+    S.activity = activity.filter(e => !liveOnlyEvent(e.type) && (e.type !== 'timing' || S.meta?.timingEnabled === true)).reverse();
     renderMain();
   } catch {}
 }

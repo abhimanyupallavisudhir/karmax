@@ -30,7 +30,7 @@ const resourceActivities = proxyActivities<coreActivities>({
 const resourceStaging = proxyActivities<coreActivities>({
   // Heartbeats carry a cancel to the activity; a short timeout delivers it soon.
   startToCloseTimeout: '12 hours', heartbeatTimeout: '30 seconds',
-  retry: { maximumAttempts: 3, initialInterval: '30 seconds' },
+  retry: { maximumAttempts: 5, initialInterval: '30 seconds' },
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });

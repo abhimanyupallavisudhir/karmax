@@ -355,6 +355,28 @@ describe('E2B world transport', () => {
     expect(await w.readFilePrefix!('small.log', 100)).toEqual(Buffer.from([9]));
   });
 
+  it('streams a whole file, and a reader that stops early cancels the download', async () => {
+    const { world: w, box } = await world();
+    let pulled = 0, cancelled = false;
+    let signal: AbortSignal | undefined;
+    const stream = () => new ReadableStream<Uint8Array>({
+      pull(controller) { pulled++; controller.enqueue(new Uint8Array(4).fill(pulled)); if (pulled === 3) controller.close(); },
+      cancel() { cancelled = true; },
+    });
+    box.files.read.mockImplementationOnce(async () => stream() as any);
+    const pieces: Buffer[] = [];
+    for await (const piece of w.readFileStream!('data/big.db')) pieces.push(piece);
+    expect(Buffer.concat(pieces)).toEqual(Buffer.from([1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]));
+    expect(box.files.read).toHaveBeenLastCalledWith('/home/user/karmax/data/big.db', expect.objectContaining({ format: 'stream' }));
+    pulled = 0;
+    box.files.read.mockImplementationOnce(async (_file: string, options: any) => { signal = options.signal; return stream() as any; });
+    const reader = w.readFileStream!('data/big.db')[Symbol.asyncIterator]();
+    await reader.next();
+    await reader.return?.();
+    expect(cancelled).toBe(true);
+    expect(signal?.aborted).toBe(true);
+  });
+
   it('lists files through the sandbox shell and surfaces its failure', async () => {
     const { world: w, box } = await world();
     box.commands.run.mockResolvedValueOnce({ stdout: 'a.txt\n dir/b.txt \n\n', stderr: '', exitCode: 0 });

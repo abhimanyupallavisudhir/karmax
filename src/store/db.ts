@@ -8426,6 +8426,15 @@ export class Store {
     });
   }
 
+  /** Replace `expected` with `next` atomically; `undefined` is an absent key on
+   * either side. False, changing nothing, when the stored value is not `expected`. */
+  async kvCompareAndSet(k: string, expected: string | undefined, next: string | undefined): Promise<boolean> {
+    if (expected === undefined) return next === undefined ? !(await this.kvHas(k)) : this.kvClaim(k, next);
+    return this.db.transaction(async () => Number((next === undefined
+      ? await this.db.prepare('DELETE FROM kv WHERE k=? AND v=?').run(k, expected)
+      : await this.db.prepare('UPDATE kv SET v=? WHERE k=? AND v=?').run(next, k, expected)).changes) === 1);
+  }
+
   /** The first key after every key that starts with `prefix`, so a prefix
    * becomes a primary-key range (undefined when no such key exists). */
   private kvPrefixEnd(prefix: string): string | undefined {
