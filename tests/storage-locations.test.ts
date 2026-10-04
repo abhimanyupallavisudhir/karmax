@@ -110,6 +110,32 @@ describe('organization storage locations', () => {
     expect((await connect({ id: legacy.id, name: 'Legacy' })).config.prefix).toBe('karmax/acme');
   });
 
+  it('presigns and heads objects inside a customer location\'s prefix', async () => {
+    const f = (await fixture(1024));
+    const requests: string[] = [];
+    const stored = new Map<string, Buffer>();
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      requests.push(`${init?.method ?? 'GET'} ${url.pathname}`);
+      if (init?.method === 'PUT') { stored.set(url.pathname, Buffer.from(init.body as Uint8Array)); return new Response('', { status: 200 }); }
+      if (init?.method === 'DELETE') { stored.delete(url.pathname); return new Response(null, { status: 204 }); }
+      if (init?.method === 'HEAD') return new Response(null, { status: 200, headers: { 'content-length': '7', etag: '"e"' } });
+      const value = stored.get(url.pathname);
+      return value ? new Response(value, { status: 200 }) : new Response('missing', { status: 404 });
+    }));
+    try {
+      const location = await f.locations.connectS3(f.project.organizationId!, { name: 'Data lake',
+        endpoint: 'https://objects.example', bucket: 'tenant-data', region: 'eu-west-1', prefix: 'krmax/acme',
+        accessKeyId: 'AKIA_TEST', secretAccessKey: 'secret' });
+      const objects = await f.locations.objectStore(location.id);
+      const url = new URL(await objects.presign!('PUT', 'resources/o/chunks/a.bin', 60));
+      expect(`${url.origin}${url.pathname}`).toBe('https://objects.example/tenant-data/krmax/acme/resources/o/chunks/a.bin');
+      requests.length = 0;
+      expect(await objects.head!('resources/o/chunks/a.bin')).toEqual({ bytes: 7, etag: 'e' });
+      expect(requests).toEqual(['HEAD /tenant-data/krmax/acme/resources/o/chunks/a.bin']);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it('keeps customer S3 secrets vaulted and pins revisions to the tested location', async () => {
     const f = (await fixture(1024));
     const objects = new Map<string, Buffer>();

@@ -30,6 +30,20 @@ class MemoryObjects implements ObjectStore {
   }
 }
 
+describe('delayed deletion wrapper', () => {
+  it('passes presigning and head through only when the store has them', async () => {
+    const plain = new DeferredDeleteObjectStore(new MemoryObjects(), {} as Store, { delayMs: DAY });
+    expect(plain.presign).toBeUndefined();
+    expect(plain.head).toBeUndefined();
+    const inner = Object.assign(new MemoryObjects(), {
+      presign: vi.fn(async (method: string, key: string, seconds: number) => `https://s/${method}/${key}/${seconds}`),
+      head: vi.fn(async () => ({ bytes: 3, etag: 'e' })) });
+    const wrapped = new DeferredDeleteObjectStore(inner, {} as Store, { delayMs: DAY });
+    expect(await wrapped.presign!('PUT', 'k', 60)).toBe('https://s/PUT/k/60');
+    expect(await wrapped.head!('k')).toEqual({ bytes: 3, etag: 'e' });
+  });
+});
+
 const targets = ['sqlite', ...(process.env.KARMAX_TEST_POSTGRES_URL ? ['postgres'] : [])] as const;
 
 describe.each(targets)('delayed deletion of managed objects (%s)', (target) => {
