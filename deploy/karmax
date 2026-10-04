@@ -371,6 +371,33 @@ cmd_migrate_objects() {
   dc run --rm --no-deps -T app npm run --silent migrate-objects -- "$@"
 }
 
+# The resource repositories' edge: a Cloudflare Worker beside the R2 bucket, so
+# sandboxes save resources into R2 without the bytes passing through this host
+# (wiki features/resource-storage). Takes CLOUDFLARE_API_TOKEN from the
+# environment (Workers Scripts: Edit, Workers R2 Storage: Edit) and stores it
+# nowhere. Repeatable: also how a changed Worker or grant key reaches Cloudflare.
+# Records the URL as KARMAX_RESOURCE_EDGE_URL and restarts the app when it changed;
+# deleting that line from .turnkey.env (and restarting) turns the edge off.
+cmd_deploy_repository_edge() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || die 'set CLOUDFLARE_API_TOKEN (Workers Scripts: Edit, Workers R2 Storage: Edit)'
+  output=$(dc run --rm --no-deps -T -e CLOUDFLARE_API_TOKEN app npm run --silent deploy-repository-edge < /dev/null) \
+    || die 'the edge was not deployed; see above'
+  url=$(printf '%s\n' "$output" | tail -n 1)
+  case "$url" in https://*.workers.dev) ;; *) die "unexpected edge URL: $url" ;; esac
+  note "Deployed the resource repository edge at $url."
+  [ "$(env_value KARMAX_RESOURCE_EDGE_URL)" != "$url" ] || return 0
+  staged="$ENV_FILE.edge.$$"
+  if ! (umask 077 && { sed '/^KARMAX_RESOURCE_EDGE_URL=/d' "$ENV_FILE" && printf 'KARMAX_RESOURCE_EDGE_URL=%s\n' "$url"; } > "$staged"); then
+    rm -f "$staged"; die 'could not record the edge URL; nothing was changed'
+  fi
+  mv "$staged" "$ENV_FILE"
+  note 'Restarting the app with it…'
+  dc up -d --no-build app && wait_ready || die 'Karmax failed its readiness check after enabling the edge'
+  note 'Sandboxes now save resources in managed storage through the edge.'
+}
+
 cmd_backup() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured'
@@ -910,6 +937,8 @@ Usage: ./deploy/karmax COMMAND
   rotate-vault-key              Replace the vault's key encryption key (resumable)
   migrate-objects [--verify-only] [--concurrency N]
                                Copy local objects to the configured S3 store
+  deploy-repository-edge       Deploy the Cloudflare Worker sandboxes save resources through
+                               (needs CLOUDFLARE_API_TOKEN), and use it
   down                          Stop everything without deleting durable data
 EOF
 }
@@ -928,6 +957,7 @@ case "$command" in
   rotate-postgres-password) cmd_rotate_postgres_password "$@" ;;
   rotate-vault-key) cmd_rotate_vault_key "$@" ;;
   migrate-objects) cmd_migrate_objects "$@" ;;
+  deploy-repository-edge) cmd_deploy_repository_edge "$@" ;;
   down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;
   help|-h|--help) usage ;;
   *) usage >&2; die "unknown command: $command" ;;

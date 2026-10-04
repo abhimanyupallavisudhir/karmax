@@ -344,7 +344,9 @@ export class ProjectResourceService {
     private broker: CredentialBroker, private coordinator?: { client: Client; taskQueue: string },
     private storageLocations?: StorageLocationService,
     repositories: { objects?: ObjectStore; world?: (handle: WorldHandle) => string | undefined; cacheDir?: string;
-      proxyReads?: boolean } = {}) {
+      proxyReads?: boolean;
+      /** The repository edge (src/edge), which writes managed storage from Cloudflare's network. */
+      edge?: () => string | undefined } = {}) {
     // A location must be the organization's own, whatever a row or URL names.
     const locationOf = async (attachment: ResourceAttachment) => (await this.storageLocations?.requireForOrganization(
       attachment.organizationId, attachment.storageLocationId))?.id ?? attachment.storageLocationId;
@@ -358,9 +360,12 @@ export class ProjectResourceService {
       return fallback;
     };
     const tokens = new RepositoryTokens(broker);
-    this.repositoryServer = new ResourceRepositoryServer({ store, tokens, objects, ...(repositories.proxyReads ? { proxyReads: true } : {}) });
+    const edgeLocation = (storageLocationId: string | undefined) => !!repositories.edge?.() && !!storageLocationId?.startsWith('storage-managed-');
+    this.repositoryServer = new ResourceRepositoryServer({ store, tokens, objects, edgeLocation,
+      ...(repositories.proxyReads ? { proxyReads: true } : {}) });
     this.restic = new ResticResources({ store, broker, tokens, locationOf, objects,
-      endpoints: { host: () => this.loopbackUrl(), world: repositories.world ?? (() => undefined) },
+      endpoints: { host: () => this.loopbackUrl(),
+        world: (handle, repository) => edgeLocation(repository.storageLocationId) ? repositories.edge!() : repositories.world?.(handle) },
       ...(repositories.cacheDir ? { cacheDir: repositories.cacheDir } : {}) });
     if (engine instanceof ObjectSnapshotEngine) engine.setAttachmentResolver(async (id) => (await store.getResourceAttachment(id)));
     if (engine instanceof ObjectSnapshotEngine) engine.setChunkAccounting({

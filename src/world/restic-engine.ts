@@ -30,8 +30,9 @@ import { isRemoteWorldKind } from './types.js';
 export const RESTIC_ENGINE = 'restic@1';
 
 export interface RepositoryEndpoints {
-  /** Base URL (no trailing slash) at which a remote world reaches this server. */
-  world(handle: WorldHandle): string | undefined;
+  /** Base URL (no trailing slash) at which a remote world reaches a repository:
+   * the edge for managed storage when one is deployed, else this server. */
+  world(handle: WorldHandle, repository: Repository): string | undefined;
   /** Base URL at which this process reaches it. */
   host(): string | Promise<string>;
 }
@@ -385,7 +386,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
    * has everything already stored. */
   private async inWorld(world: World, attachment: Repository, access: RepositoryAccess, quota: boolean, args: string[],
     options: ResticRunOptions & { cwd?: string; prefix?: string; suffix?: string }): Promise<ResticRun> {
-    const base = this.deps.endpoints.world(world.handle);
+    const base = this.deps.endpoints.world(world.handle, attachment);
     if (!base) throw new Error('this world cannot reach the resource store (no public URL is configured)');
     const binary = await this.worldBinary(world, base);
     const command = `set -e\n${options.prefix ? `${options.prefix}\n` : ''}${options.cwd ? `cd -- ${quote(options.cwd)}\n` : ''}`

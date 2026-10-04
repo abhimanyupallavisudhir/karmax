@@ -36,6 +36,11 @@ export class LocalObjectStore implements ObjectStore {
   async get(key: string): Promise<Buffer> { return fs.promises.readFile(this.file(key)); }
   async delete(key: string): Promise<void> { await fs.promises.rm(this.file(key), { force: true }); }
 
+  async head(key: string): Promise<ObjectInfo | undefined> {
+    const data = await fs.promises.readFile(this.file(key)).catch(() => undefined);
+    return data && { bytes: data.length, etag: crypto.createHash('md5').update(data).digest('hex') };
+  }
+
   private file(key: string): string {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9/_.-]*$/.test(key) || key.includes('..')) throw new Error('invalid object key');
     const file = path.resolve(this.root, key);

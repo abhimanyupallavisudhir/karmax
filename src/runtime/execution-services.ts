@@ -83,7 +83,8 @@ export async function createExecutionServices(input: {
   // Remote sandboxes reach the resource repositories at the public URL.
   const resources = new ProjectResourceService(store, worlds, snapshotEngine, broker,
     { client, taskQueue: TASK_QUEUE }, storageLocations, { objects: objectStore, cacheDir: path.join(p.home, 'cache', 'restic'),
-      world: () => process.env.KARMAX_PUBLIC_URL?.trim() || undefined });
+      world: () => process.env.KARMAX_PUBLIC_URL?.trim() || undefined,
+      edge: () => process.env.KARMAX_RESOURCE_EDGE_URL?.trim() || undefined });
   const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp, resources);
   const runners = new RunnerPoolService(store);
   const worldAccess = new WorldAccessService(store, worlds, runners, resources);

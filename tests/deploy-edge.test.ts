@@ -306,3 +306,55 @@ it('keeps Caddy\'s admin API off now that Caddy shares the host network (CI-8)',
   const global = caddyfile.slice(caddyfile.indexOf('{'), caddyfile.indexOf('\n}\n'));
   expect(global).toMatch(/^\tadmin off$/m);
 });
+
+it('forwards the resource repository edge in both deployment profiles', () => {
+  for (const file of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    const app = read(file).split('\n  app:')[1]?.split('\n  caddy:')[0] ?? '';
+    expect(app, file).toMatch(/^\s+KARMAX_RESOURCE_EDGE_URL: \$\{KARMAX_RESOURCE_EDGE_URL:-\}$/m);
+  }
+});
+
+describe('deploy-repository-edge', () => {
+  /** Run the command with Docker stubbed: the one-off container prints `printed`. */
+  function deployEdge(seed: string, printed: string, token = 'cf-token') {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deploy-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.turnkey.env'), seed);
+      const log = path.join(dir, 'calls');
+      let status = 0; let output = '';
+      try {
+        output = execFileSync('sh', ['-c',
+          `. "${path.join(deployDir, 'karmax')}" >/dev/null 2>&1 || true\n`
+          + `DEPLOY_DIR="${dir}"; ENV_FILE="${dir}/.turnkey.env"\n`
+          + `need_docker() { :; }; wait_ready() { echo ready >> "${log}"; }\n`
+          + `dc() { echo "$* token=$CLOUDFLARE_API_TOKEN" >> "${log}"; case "$1" in run) printf 'bundling\\n%s\\n' '${printed}';; esac; }\n`
+          + `cmd_deploy_repository_edge`,
+        ], { encoding: 'utf8', env: { ...process.env, CLOUDFLARE_API_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (error) { status = (error as { status: number }).status; output = String((error as { stderr: string }).stderr); }
+      return { status, output, env: fs.readFileSync(path.join(dir, '.turnkey.env'), 'utf8'),
+        calls: fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [] };
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  const url = 'https://tavya-resource-repositories.tavya.workers.dev';
+
+  it('deploys from a one-off app container, records the URL and restarts the app with it', () => {
+    const run = deployEdge('KARMAX_DOMAIN=tavya.io\nKARMAX_RESOURCE_EDGE_URL=https://old.example.workers.dev\n', url);
+    expect(run.status).toBe(0);
+    expect(run.env).toBe(`KARMAX_DOMAIN=tavya.io\nKARMAX_RESOURCE_EDGE_URL=${url}\n`);
+    expect(run.calls).toEqual(['run --rm --no-deps -T -e CLOUDFLARE_API_TOKEN app npm run --silent deploy-repository-edge token=cf-token',
+      'up -d --no-build app token=cf-token', 'ready']);
+  });
+
+  it('leaves the app running when the URL is unchanged', () => {
+    const run = deployEdge(`KARMAX_RESOURCE_EDGE_URL=${url}\n`, url);
+    expect(run.status).toBe(0);
+    expect(run.calls).toHaveLength(1);
+  });
+
+  it('changes nothing without a token or on an unexpected answer', () => {
+    expect(deployEdge('KARMAX_DOMAIN=tavya.io\n', url, '')).toMatchObject({ status: 1, env: 'KARMAX_DOMAIN=tavya.io\n', calls: [] });
+    const odd = deployEdge('KARMAX_DOMAIN=tavya.io\n', 'deploy-repository-edge: CLOUDFLARE_API_TOKEN is not set');
+    expect(odd).toMatchObject({ status: 1, env: 'KARMAX_DOMAIN=tavya.io\n' });
+    expect(odd.output).toMatch(/unexpected edge URL/);
+  });
+});

@@ -145,6 +145,9 @@ services:
       KARMAX_S3_REGION: ${KARMAX_S3_REGION:-}
       KARMAX_S3_ACCESS_KEY_ID_FILE: /run/secrets/s3_access_key_id
       KARMAX_S3_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_access_key
+      # The Cloudflare Worker sandboxes save managed-storage resources through;
+      # written by `deploy/karmax deploy-repository-edge`, empty means none.
+      KARMAX_RESOURCE_EDGE_URL: ${KARMAX_RESOURCE_EDGE_URL:-}
       KARMAX_CLOUD_WORLD_PROVIDER: ${KARMAX_CLOUD_WORLD_PROVIDER:-e2b}
       # Optional sign-in providers, empty unless set in .turnkey.env. This block
       # is a whitelist, so a variable missing from it never reaches the app —

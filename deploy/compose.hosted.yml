@@ -42,6 +42,8 @@ services:
       KARMAX_MANAGED_MODEL_PRICING: ${KARMAX_MANAGED_MODEL_PRICING:-}
       KARMAX_S3_ACCESS_KEY_ID_FILE: /run/secrets/s3_access_key
       KARMAX_S3_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_key
+      # The Cloudflare Worker sandboxes save resources through (wiki features/resource-storage).
+      KARMAX_RESOURCE_EDGE_URL: ${KARMAX_RESOURCE_EDGE_URL:-}
       KARMAX_CLOUD_WORLD_PROVIDER: ${KARMAX_CLOUD_WORLD_PROVIDER:-e2b}
       # Optional sign-in providers — see the note in compose.turnkey.yml: this
       # block is a whitelist, so anything absent here silently never arrives.

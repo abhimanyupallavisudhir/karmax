@@ -51,7 +51,7 @@ const MAX_UPLOAD_BYTES = 160 * 1024 * 1024;
 /** Uploads held in memory at once, across every repository. */
 const UPLOAD_SLOTS = 24;
 const REDIRECT_SECONDS = 15 * 60;
-const TOKEN_KEY_HANDLE = 'resource-repositories:token-key';
+export const TOKEN_KEY_HANDLE = 'resource-repositories:token-key';
 export const REPOSITORY_ROUTE = '/resource-repositories/';
 
 /** A repository is a resource's in one storage location: a resource moved to
@@ -123,6 +123,8 @@ export interface RepositoryServerDeps {
   /** Serve reads itself instead of redirecting to the store: for a store that
    * restic (in a world, or on this host) cannot reach, such as a private endpoint. */
   proxyReads?: boolean;
+  /** Storage locations the edge writes (managed storage, when an edge is deployed). */
+  edgeLocation?: (storageLocationId: string | undefined) => boolean;
 }
 
 interface RepositoryPlace { attachment: ResourceAttachment; repository: string; storageLocationId?: string; objects(): Promise<ObjectStore> }
@@ -242,6 +244,8 @@ export class ResourceRepositoryServer {
     const { attachment, repository, storageLocationId } = place;
     if (grant.access === 'read' || (grant.access !== 'admin' && (kind === 'config' || kind === 'keys')))
       throw new HttpError(403, 'not allowed');
+    const edge = req.headers['x-tavya-edge'];
+    if (edge === 'intent' || edge === 'stored') return this.edgeWrite(req, res, place, grant, kind, name, edge);
     const declared = Number(req.headers['content-length']);
     if (!Number.isSafeInteger(declared) || declared < 0) throw new HttpError(411, 'a content length is required');
     if (declared > MAX_UPLOAD_BYTES) throw new HttpError(413, 'file too large');
@@ -267,6 +271,48 @@ export class ResourceRepositoryServer {
       await this.deps.store.recordRepositoryFile({ repository, attachmentId: attachment.id, organizationId: attachment.organizationId,
         storageLocationId, kind, name, bytes: body.length, ...(kind === 'locks' ? { content: body.toString('base64') } : {}) });
     } finally { this.release(); }
+    res.writeHead(200).end();
+  }
+
+  /**
+   * An upload through the edge (src/edge/resource-repository-worker.ts), which
+   * writes the bytes to R2 itself. `intent`: may this file be stored (the same
+   * checks as an upload here), and under which key. `stored`: it is, so it is
+   * recorded, once the store confirms an object of exactly the announced size
+   * (only the edge can write the bucket, and R2 checked the content against its
+   * name). Both carry the world's own grant; neither carries file bytes.
+   */
+  private async edgeWrite(req: http.IncomingMessage, res: http.ServerResponse, place: RepositoryPlace,
+    grant: RepositoryGrant, kind: string, name: string, step: 'intent' | 'stored'): Promise<void> {
+    req.resume();
+    const { attachment, repository, storageLocationId } = place;
+    if (!['data', 'index', 'snapshots'].includes(kind) || !this.deps.edgeLocation?.(storageLocationId))
+      throw new HttpError(409, 'this repository is not stored at the edge');
+    const declared = Number(req.headers['x-tavya-length']);
+    if (!Number.isSafeInteger(declared) || declared < 0) throw new HttpError(411, 'a content length is required');
+    if (declared > MAX_UPLOAD_BYTES) throw new HttpError(413, 'file too large');
+    const existing = await this.deps.store.repositoryFile(repository, kind, name);
+    if (existing) {
+      if (existing.bytes !== declared) throw new HttpError(403, 'this repository is append-only');
+      return void res.writeHead(200).end();
+    }
+    const key = repositoryObjectKey(repository, kind, name);
+    if (step === 'intent') {
+      if (grant.quota && storageLocationId) {
+        const usage = await this.deps.store.storageLocationUsage(storageLocationId);
+        if (usage.quotaBytes != null && usage.retainedBytes + declared > usage.quotaBytes)
+          throw new HttpError(507, `storage quota exceeded (${usage.retainedBytes} of ${usage.quotaBytes} bytes used)`);
+      }
+      return void res.writeHead(202, { 'x-tavya-object-key': key }).end();
+    }
+    // Written past the deferred-delete store, so its put() could not cancel a
+    // delete pending for this name (DeferredDeleteObjectStore). Cancel it first:
+    // a purge that ran before deleted the new object too, and the check below fails.
+    await this.deps.store.transaction(() => this.deps.store.deleteObjectTombstone(key));
+    const stored = await (await place.objects()).head?.(key);
+    if (stored?.bytes !== declared) throw new HttpError(409, 'the store does not hold that file');
+    await this.deps.store.recordRepositoryFile({ repository, attachmentId: attachment.id, organizationId: attachment.organizationId,
+      storageLocationId, kind, name, bytes: declared });
     res.writeHead(200).end();
   }
 

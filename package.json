@@ -34,7 +34,8 @@
     "object-store-check": "tsx src/scripts/object-store-check.ts",
     "replay-check": "tsx src/scripts/replay-check.ts",
     "benchmark:latency": "tsx benchmarks/latency.ts",
-    "timing:report": "tsx src/scripts/timing-report.ts"
+    "timing:report": "tsx src/scripts/timing-report.ts",
+    "deploy-repository-edge": "tsx src/scripts/deploy-repository-edge.ts"
   },
   "dependencies": {
     "@1password/sdk": "^0.4.1",
