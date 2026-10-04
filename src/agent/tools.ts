@@ -1114,18 +1114,23 @@ export function platformToolHandlers(
       const requested = Array.isArray(args?.jobs) ? [...new Set(args.jobs.map((id: unknown) => String(id)))] as string[] : [];
       let jobs: string[] = [];
       let jobNames: string[] = [];
-      if (requested.length) {
-        const statuses = await jobStatuses(world, requested, { tailLines: 20 });
-        const missing = statuses.filter((job) => job.state === 'missing').map((job) => job.id);
-        if (missing.length) return `error: no such job: ${missing.join(', ')}`;
-        const running = statuses.filter((job) => job.state === 'running');
-        jobs = running.map((job) => job.id);
-        jobNames = running.flatMap((job) => job.name ? [job.name] : []);
-        // Nothing left to wait for: hand the results back now, no turn needed.
-        if (!jobs.length) return `Every job has already finished — nothing to wait for.\n\n${describeJobs(statuses)}`;
+      let unlisted: string[];
+      try {
+        if (requested.length) {
+          const statuses = await jobStatuses(world, requested, { tailLines: 20 });
+          const missing = statuses.filter((job) => job.state === 'missing').map((job) => job.id);
+          if (missing.length) return `error: no such job: ${missing.join(', ')}`;
+          const running = statuses.filter((job) => job.state === 'running');
+          jobs = running.map((job) => job.id);
+          jobNames = running.flatMap((job) => job.name ? [job.name] : []);
+          // Nothing left to wait for: hand the results back now, no turn needed.
+          if (!jobs.length) return `Every job has already finished — nothing to wait for.\n\n${describeJobs(statuses)}`;
+        }
+        unlisted = (await jobStatuses(world, await listJobs(world)))
+          .filter((job) => job.state === 'running' && !jobs.includes(job.id)).map((job) => job.id);
+      } catch (e: any) {
+        return `error: ${e?.message ?? e}`;
       }
-      const unlisted = (await jobStatuses(world, await listJobs(world)))
-        .filter((job) => job.state === 'running' && !jobs.includes(job.id)).map((job) => job.id);
       if (unlisted.length)
         return `error: ${unlisted.join(', ')} ${unlisted.length > 1 ? 'are' : 'is'} still running. Pass ${unlisted.length > 1 ? 'them' : 'it'} in jobs: a pause without ${unlisted.length > 1 ? 'them' : 'it'} lets the world be suspended, which freezes ${unlisted.length > 1 ? 'them' : 'it'}. You are still resumed after minutes at the latest.`;
       let needsInput: AgentWait['needsInput'];

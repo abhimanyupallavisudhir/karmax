@@ -216,6 +216,25 @@ describe('durable jobs (real worktree world)', () => {
       expect(ctx.waits).toEqual([{ minutes: 10 }, { minutes: 90, jobs: [running.id] }]);
     });
 
+    // pramana#2: a job whose log ended mid-line (progress output) hid the next
+    // job's status line inside its tail, so pause called that job "no such job".
+    it('pause and the resume summary read every job, whatever its log ends with', async () => {
+      const ctx = { started: [] as string[], waits: [] as AgentWait[] };
+      const progress = await startJob(world, { command: "printf 'fetched 50 pages'; sleep 30" });
+      const quiet = await startJob(world, { command: 'sleep 30' });
+      const done = await startJob(world, { command: "printf 'no newline at the end'" });
+      await until(async () => (await jobStatuses(world, [done.id]))[0]!.state === 'exited'
+        && fs.readFileSync(progress.log, 'utf8') === 'fetched 50 pages');
+      const statuses = await jobStatuses(world, [progress.id, done.id, quiet.id], { tailLines: 20 });
+      expect(statuses.map(({ id, state, tail }) => ({ id, state, tail }))).toEqual([
+        { id: progress.id, state: 'running', tail: 'fetched 50 pages' },
+        { id: done.id, state: 'exited', tail: 'no newline at the end' },
+        { id: quiet.id, state: 'running', tail: undefined },
+      ]);
+      expect(await tools(ctx).pause!({ minutes: 60, jobs: [progress.id, quiet.id] })).toContain(`Waiting for ${progress.id}, ${quiet.id}`);
+      expect(ctx.waits).toEqual([{ minutes: 60, jobs: [progress.id, quiet.id] }]);
+    });
+
     // An agent that paused while waiting on someone's answer read "Paused", and
     // nobody was told. needs_input makes the same pause an ask.
     it('a job may be named, and the name follows it to every wait on it', async () => {
