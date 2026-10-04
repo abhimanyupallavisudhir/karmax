@@ -6,6 +6,11 @@ export interface ObjectStore {
   put(key: string, data: Buffer, contentType?: string): Promise<void>;
   get(key: string): Promise<Buffer>;
   delete(key: string, options?: ObjectRequestOptions): Promise<void>;
+  /** A URL that lets whoever holds it PUT or GET exactly this object for
+   * `seconds`, so a sandbox can move bytes without them passing through
+   * Karmax. Absent when the store has no URL of its own (local disk). */
+  presign?(method: 'PUT' | 'GET', key: string, seconds: number): Promise<string>;
+  head?(key: string, options?: ObjectRequestOptions): Promise<ObjectInfo | undefined>;
 }
 
 export interface ObjectRequestOptions {
@@ -77,6 +82,28 @@ export class S3ObjectStore implements ObjectStore {
     const response = await this.request('HEAD', key, { ...options, allowMissing: true });
     if (response.status === 404) return undefined;
     return { bytes: Number(response.headers.get('content-length') ?? 0), etag: unquote(response.headers.get('etag') ?? '') };
+  }
+
+  /** SigV4 query authentication (UNSIGNED-PAYLOAD, only `host` signed). The
+   * URL carries a signature: like a credential, it must never be logged. */
+  async presign(method: 'PUT' | 'GET', key: string, seconds: number): Promise<string> {
+    if (!key || key.includes('..')) throw new Error('invalid object key');
+    if (!Number.isInteger(seconds) || seconds < 1 || seconds > 7 * 24 * 3600) throw new Error('invalid presigned URL lifetime');
+    const url = new URL(this.options.endpoint.replace(/\/$/, '') + '/');
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/${uriEncode(this.options.bucket)}/${key.split('/').map(uriEncode).join('/')}`;
+    const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+    const date = amzDate.slice(0, 8);
+    const scope = `${date}/${this.options.region}/s3/aws4_request`;
+    const params: Record<string, string> = { 'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+      'X-Amz-Credential': `${this.options.accessKeyId}/${scope}`, 'X-Amz-Date': amzDate, 'X-Amz-Expires': String(seconds),
+      'X-Amz-SignedHeaders': 'host', ...(this.options.sessionToken ? { 'X-Amz-Security-Token': this.options.sessionToken } : {}) };
+    const query = Object.entries(params).map(([name, value]) => [uriEncode(name), uriEncode(value)] as const)
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([name, value]) => `${name}=${value}`).join('&');
+    const canonicalRequest = [method, url.pathname, query, `host:${url.host}\n`, 'host', 'UNSIGNED-PAYLOAD'].join('\n');
+    const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256(Buffer.from(canonicalRequest))].join('\n');
+    const signingKey = hmac(hmac(hmac(hmac(Buffer.from(`AWS4${this.options.secretAccessKey}`), date), this.options.region), 's3'), 'aws4_request');
+    url.search = `${query}&X-Amz-Signature=${hmac(signingKey, stringToSign).toString('hex')}`;
+    return url.toString();
   }
 
   /** Every object under `prefix`, a ListObjectsV2 page at a time. */

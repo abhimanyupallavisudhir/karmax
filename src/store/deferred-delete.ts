@@ -79,6 +79,10 @@ export class DeferredDeleteObjectStore implements ObjectStore {
     this.deleteTimeoutMs = options.deleteTimeoutMs ?? 5_000;
     this.immediatePrefixes = options.immediatePrefixes ?? ['resource-uploads/'];
     this.now = options.now ?? Date.now;
+    // A direct upload goes around put(): its object is retained first, and
+    // retaining cancels a pending delete, so no tombstone can purge it.
+    if (inner.presign) this.presign = (method, key, seconds) => inner.presign!(method, key, seconds);
+    if (inner.head) this.head = (key, request) => inner.head!(key, request);
   }
 
   async put(key: string, data: Buffer, contentType?: string): Promise<void> {
@@ -90,6 +94,8 @@ export class DeferredDeleteObjectStore implements ObjectStore {
   }
 
   get(key: string): Promise<Buffer> { return this.inner.get(key); }
+  readonly presign?: ObjectStore['presign'];
+  readonly head?: ObjectStore['head'];
 
   async delete(key: string, options?: ObjectRequestOptions): Promise<void> {
     if (this.options.delayMs <= 0 || this.immediatePrefixes.some((prefix) => key.startsWith(prefix)))

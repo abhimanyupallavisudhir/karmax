@@ -121,6 +121,34 @@ ${keys.map(([key, size]) => `<Contents><Key>${key}</Key><LastModified>2026-10-01
     expect(s3.requests[0]!.url.search).not.toContain('+');
   });
 
+  it('presigns a URL that lets its holder PUT or GET exactly one object, for a bounded time', async () => {
+    const s3 = r2(stubS3(() => new Response('')).fetch);
+    const url = new URL(await s3.presign('PUT', 'resources/org a/chunks/abc+def.bin', 900));
+    expect(url.origin).toBe('https://0123456789abcdef.eu.r2.cloudflarestorage.com');
+    expect(url.pathname).toBe('/tavya-objects/resources/org%20a/chunks/abc%2Bdef.bin');
+    const params = Object.fromEntries(url.searchParams);
+    expect(params).toMatchObject({ 'X-Amz-Algorithm': 'AWS4-HMAC-SHA256', 'X-Amz-Expires': '900', 'X-Amz-SignedHeaders': 'host' });
+    expect(params['X-Amz-Credential']).toMatch(/^AKIDEXAMPLE\/\d{8}\/auto\/s3\/aws4_request$/);
+    // What the server checks, rebuilt from the specification: the canonical
+    // request has the sorted query without the signature, only `host`, and an
+    // unsigned payload.
+    const encode = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+    const query = [...url.searchParams].filter(([name]) => name !== 'X-Amz-Signature').map(([n, v]) => [encode(n), encode(v)] as const)
+      .sort(([a], [b]) => a < b ? -1 : 1).map(([n, v]) => `${n}=${v}`).join('&');
+    const canonical = ['PUT', url.pathname, query, `host:${url.host}\n`, 'host', 'UNSIGNED-PAYLOAD'].join('\n');
+    const date = params['X-Amz-Date']!;
+    const hmac = (key: crypto.BinaryLike, value: string) => crypto.createHmac('sha256', key).update(value).digest();
+    const key = hmac(hmac(hmac(hmac(`AWS4${SECRET}`, date.slice(0, 8)), 'auto'), 's3'), 'aws4_request');
+    const toSign = ['AWS4-HMAC-SHA256', date, `${date.slice(0, 8)}/auto/s3/aws4_request`,
+      crypto.createHash('sha256').update(canonical).digest('hex')].join('\n');
+    expect(params['X-Amz-Signature']).toBe(hmac(key, toSign).toString('hex'));
+    // A GET URL is a different signature; nothing else is signed.
+    expect(new URL(await s3.presign('GET', 'resources/org a/chunks/abc+def.bin', 900)).searchParams.get('X-Amz-Signature'))
+      .not.toBe(params['X-Amz-Signature']);
+    await expect(s3.presign('PUT', '../escape', 900)).rejects.toThrow('invalid object key');
+    await expect(s3.presign('PUT', 'k', 8 * 24 * 3600)).rejects.toThrow('lifetime');
+  });
+
   it('aborts a request after its timeout', async () => {
     const fetch = ((_: URL, init: RequestInit) => new Promise((_resolve, reject) => {
       init.signal!.addEventListener('abort', () => reject(init.signal!.reason));
