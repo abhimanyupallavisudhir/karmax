@@ -291,7 +291,8 @@ describe('E2B cloud world provider', () => {
     await terminal.write('pwd\n');
     await terminal.resize(120, 40);
     await terminal.close();
-    expect(timeoutRefreshes).toBeGreaterThanOrEqual(2); // process + PTY leases
+    // One renewal covers every holder within the interval (process, PTY, commands); each keeps renewing while held.
+    expect(timeoutRefreshes).toBeGreaterThanOrEqual(1);
     expect(terminal.pid).toBeUndefined(); // remote pid must never enter the host process registry
     expect(ptyOptions.cmd).toBeUndefined();
     expect(terminalOutput).toBe('ready🌍 नमस्ते');

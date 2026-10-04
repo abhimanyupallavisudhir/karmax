@@ -64,6 +64,7 @@ beforeEach(() => {
   wf.info = { runId: 'run', historyLength: 1, historySize: 0 };
   wf.activities = {
     restoreChildTasks: vi.fn(async () => []),
+    unsavedResourceCandidates: vi.fn(async () => []),
     settledChildTasks: vi.fn(async () => []),
     createWorld: vi.fn(async () => ({ id: 'task', kind: 'worktree', root: '/tmp/test', branch: 'b', base: 'main' })),
     publishView: vi.fn(async () => undefined),

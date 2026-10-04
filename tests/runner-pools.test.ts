@@ -559,6 +559,29 @@ describe('runner capacity and world lifecycle', () => {
     expect((await store.worldState(world.handle.id))).toBe('hibernated');
   });
 
+  it('never hibernates a world holding proposed output that is not saved yet', async () => {
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Unsaved', { hibernateAfterMs: 0 }));
+    const worlds = new WorldRegistry();
+    const task = await store.createTask({ projectId: project.id, title: 'Build data', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'build it' } });
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    world.handle.meta = { projectId: project.id };
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
+    (await store.saveWorldCheckpoint({ id: 'checkpoint-u', worldId: world.handle.id, generation: 1, projectId: project.id,
+      runnerPoolId: 'local', environmentDigest: 'test', repos: [], createdAt: Date.now() }));
+    const attachment = await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: 'Raw data', driver: 'object-tree@1', target: { kind: 'path', path: 'raw_data' }, access: 'read', isolation: 'fork',
+      source: { candidate: true }, credentialHandles: [], publish: 'discard', enabled: false });
+    await store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id, taskId: task.id,
+      worldId: world.handle.id, worldGeneration: 1, attachmentId: attachment.id, sourceKind: 'path', sourcePath: 'raw_data' });
+    (await store.setWorldState(world.handle, 'parked'));
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
+    await lifecycle.sweep(Date.now() + 1);
+    // Hibernating would keep the checkpoint, which never holds ignored output like this.
+    expect((await store.worldState(world.handle.id))).toBe('parked');
+  });
+
   it('marks an active world degraded when the provider reports its sandbox missing', async () => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Reconcile', {}));

@@ -1221,9 +1221,41 @@ async function softwareDevImpl(
     return true;
   }
 
+  /** Proposed output that failed every staging attempt escalates the task with
+   * the reason, like a provider failure: Retry stages it again (resuming what was
+   * uploaded). Nothing is discarded; only a person excluding it gives it up, and
+   * the world keeps it meanwhile (pramana#1 lost raw_data to a silent discard). */
+  async function ensureResourcesSaved(): Promise<'saved' | 'cancelled' | 'do'> {
+    for (;;) {
+      const unsaved = await core.unsavedResourceCandidates(taskId);
+      if (!unsaved.length) return 'saved';
+      const priorStage = stage;
+      stage = 'escalated';
+      status = 'blocked';
+      retryRequested = false;
+      error = `Could not save ${unsaved.map((item) => item.path).join(', ')}`
+        + `${unsaved[0]!.error ? `: ${unsaved[0]!.error}` : ''}. Nothing was deleted; Retry saves it again.`;
+      if (input.parentTaskId) {
+        waitingFor = { kind: 'parent' };
+        await notifyParent('blocked', error);
+      }
+      const seenAtEscalation = msgs.length;
+      await publish();
+      await condition(() => retryRequested || cancelled || (followUpWakesEscalation && msgs.length > seenAtEscalation));
+      waitingFor = undefined;
+      error = undefined;
+      stage = priorStage;
+      status = 'active';
+      if (cancelled) return 'cancelled';
+      if (!retryRequested) return 'do'; // a follow-up goes to the agent, with the world as it is
+      retryRequested = false;
+      if (await stageResources() && cancelled) return 'cancelled';
+    }
+  }
+
   /** False when a cancel stopped staging: nothing is adopted for a cancelled task. */
-  async function applyReviewedResources(): Promise<boolean> {
-    if (await stageResources() && cancelled) return false;
+  async function applyReviewedResources(stage = true): Promise<boolean> {
+    if (stage && await stageResources() && cancelled) return false;
     applyingResources = true;
     status = 'active';
     await publish();
@@ -1250,6 +1282,12 @@ async function softwareDevImpl(
     const automaticResources = resourceCandidateReview && patched('automatic-resource-review-v1');
     if (automaticResources) await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
     if (await stageResources() && cancelled) return 'cancelled';
+    // Review shows saved output only: a save that failed every retry is an
+    // infrastructure error, escalated like any other, never a routine question.
+    if (automaticResources && patched('unsaved-resources-escalate-v1')) {
+      const saved = await ensureResourcesSaved();
+      if (saved !== 'saved') return saved;
+    }
     if (resourceCandidateReview && !automaticResources) {
       let resolutionAtWait = resourceResolutionEpoch;
       let pending = await core.pendingResourceCandidates(taskId);
@@ -1360,7 +1398,14 @@ async function softwareDevImpl(
       }
     }
 
-    if (automaticResources && !(await applyReviewedResources())) return 'cancelled';
+    if (automaticResources && patched('unsaved-resources-escalate-v1')) {
+      // Confirm refreshes what changed; output that still will not save escalates
+      // rather than being lost with the task's world when it completes.
+      if (await stageResources() && cancelled) return 'cancelled';
+      const saved = await ensureResourcesSaved();
+      if (saved !== 'saved') return saved;
+      if (!(await applyReviewedResources(false))) return 'cancelled';
+    } else if (automaticResources && !(await applyReviewedResources())) return 'cancelled';
     confirmed = true;
     if (intentAuthorizedLanding) {
       landing = {

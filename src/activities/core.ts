@@ -3608,6 +3608,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } finally { clearInterval(pulse); }
     },
 
+    async unsavedResourceCandidates(taskId: string): Promise<Array<{ path: string; error?: string }>> {
+      return (await deps.resources?.unsavedCandidates(taskId)) ?? [];
+    },
+
     async pendingResourceCandidates(taskId: string): Promise<number> {
       return (await store.listResourceCandidates(taskId)).filter((candidate) =>
         candidate.state === 'pending' || candidate.state === 'discarding').length;

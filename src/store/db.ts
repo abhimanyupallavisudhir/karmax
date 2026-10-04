@@ -6183,6 +6183,13 @@ export class Store {
     return (rows as any[]).map(resourceCandidateRow);
   }
 
+  /** Why a pending candidate is not saved yet; null once it is. */
+  async recordResourceCandidateError(id: string, error: string | null): Promise<void> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare("UPDATE resource_candidates SET error=? WHERE id=? AND state='pending'").run(error, id));
+    });
+  }
+
   async resolveResourceCandidate(id: string, state: 'adopted' | 'discarded', resolvedBy: string, error?: string): Promise<ResourceCandidate> {
     return this.db.transaction(async () => {
 

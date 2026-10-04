@@ -451,7 +451,16 @@ export class E2BWorldProvider implements WorldProvider {
 class E2BWorld implements World {
   constructor(public handle: WorldHandle, private sandbox: E2BSandboxLike, private idleMs: number, private onDestroy: () => void) {}
 
+  /** Every command holds the sandbox's lease while it runs: E2B pauses a
+   * sandbox when its timeout lapses, whatever it is doing, and a long series of
+   * short commands (a resource save) never refreshed it (pramana#1: paused
+   * every 10 minutes for an hour, until the save gave up). */
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
+    const release = this.keepAlive();
+    try { return await this.execOnce(cmd, args, opts); } finally { release(); }
+  }
+
+  private async execOnce(cmd: string, args: string[], opts: ExecOptions): Promise<ExecResult> {
     const line = [cmd, ...args].map(shellQuote).join(' ');
     const runOpts = { cwd: this.cwd(opts.cwd), envs: this.remoteEnv(opts.env), timeoutMs: opts.timeoutMs ?? 120_000 };
     // STDIN path (a secret fed to an in-world helper, kept out of argv/env/files
@@ -518,6 +527,7 @@ class E2BWorld implements World {
       { format: 'stream', signal: abort.signal }) as unknown as ReadableStream<Uint8Array>,
     async () => (await this.directTransfer('read', file, undefined, abort.signal)).body ?? new Blob([]).stream());
     const reader = stream.getReader();
+    const release = this.keepAlive();
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -525,6 +535,7 @@ class E2BWorld implements World {
         yield Buffer.from(value.buffer, value.byteOffset, value.byteLength);
       }
     } finally {
+      release();
       // A consumer that stops early must not leave the download running.
       abort.abort();
       await reader.cancel().catch(() => undefined);
@@ -552,6 +563,11 @@ class E2BWorld implements World {
    * is not transport, so it is never rerouted.
    */
   private async transfer<T>(viaSession: () => Promise<T>, direct: () => Promise<T>): Promise<T> {
+    const release = this.keepAlive();
+    try { return await this.transferOnce(viaSession, direct); } finally { release(); }
+  }
+
+  private async transferOnce<T>(viaSession: () => Promise<T>, direct: () => Promise<T>): Promise<T> {
     const id = this.sandbox.sandboxId;
     const available = !!this.sandbox.uploadUrl && !!this.sandbox.downloadUrl;
     if (available && droppedTransferSessions.has(id)) return direct();
@@ -834,12 +850,20 @@ class E2BWorld implements World {
   private keepAlive(): () => void {
     if (!this.sandbox.setTimeout) return () => {};
     let stopped = false;
-    const refresh = () => { if (!stopped) void this.sandbox.setTimeout!(this.idleMs).catch(() => undefined); };
+    const interval = Math.max(30_000, Math.min(60_000, Math.floor(this.idleMs / 3)));
+    // Shared across everything holding the lease, so thousands of short
+    // commands cost one control-plane call per interval, not one each.
+    const refresh = () => {
+      if (stopped || Date.now() - this.leaseRefreshedAt < interval) return;
+      this.leaseRefreshedAt = Date.now();
+      void this.sandbox.setTimeout!(this.idleMs).catch(() => { this.leaseRefreshedAt = 0; });
+    };
     refresh();
-    const timer = setInterval(refresh, Math.max(30_000, Math.min(60_000, Math.floor(this.idleMs / 3))));
+    const timer = setInterval(refresh, interval);
     timer.unref();
     return () => { if (!stopped) { stopped = true; clearInterval(timer); } };
   }
+  private leaseRefreshedAt = 0;
 }
 
 /** Go's signal names, as envd reports a signalled process ("signal: killed"). */

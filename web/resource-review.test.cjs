@@ -192,3 +192,18 @@ test('an interrupted discard is not offered for inclusion or adoption', async ()
     if (!automaticReview) assert.match(h.wrap.innerHTML, /Retry discard/);
   }
 });
+
+test('output whose save failed reads Not saved, with the reason, and can still be excluded', async () => {
+  const failed = { ...candidate, candidate: { ...candidate.candidate, error: 'the sandbox paused' } };
+  const h = setup(async (url, options) => options?.method === 'PUT' ? { excluded: true } : [failed]);
+  h.context.resourceNotSaved = undefined;
+  vm.runInContext(extract('resourceNotSaved'), h.context);
+  await h.context.wireResourceReview(reviewView);
+  assert.match(h.wrap.innerHTML, /class="task-sub resource-not-saved"[^>]*title="Couldn’t save it: the sandbox paused"[^>]*>Not saved</);
+  assert.match(h.wrap.innerHTML, /resource-exclude/);
+  // Once it has a snapshot, an old error no longer marks it.
+  const saved = setup(async () => [{ ...failed, revision: { id: 'rev1' } }]);
+  vm.runInContext(extract('resourceNotSaved'), saved.context);
+  await saved.context.wireResourceReview(reviewView);
+  assert.doesNotMatch(saved.wrap.innerHTML, /Not saved/);
+});

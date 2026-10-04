@@ -8687,6 +8687,11 @@ async function wireResourceInventory(v, force = false) {
 }
 // A candidate the platform could not snapshot stays visible (as "Not saved")
 // until the same path is proposed again.
+// Proposed output whose save failed and has no snapshot yet: it still exists
+// only in the task's workspace.
+function resourceNotSaved(item) {
+  return item.candidate?.state === 'pending' && Boolean(item.candidate.error) && !item.revision;
+}
 function resourceReviewNeedsAction(item, all = []) {
   const candidate = item.candidate;
   if (candidate?.state === 'discarded' && candidate.error)
@@ -8727,7 +8732,7 @@ async function wireResourceReview(v, force = false) {
         ? `<span class="task-sub">Discard pending</span>${legacy ? `<button class="btn sm resource-legacy" data-resource-id="${esc(resource.id)}" data-action="discard">Retry discard</button>` : ''}`
         : legacy
         ? `<button class="btn sm resource-legacy" data-resource-id="${esc(resource.id)}" data-action="${item.candidate ? 'adopt' : 'promote'}">${item.candidate ? 'Adopt' : 'Update'}</button><button class="btn sm resource-legacy" data-resource-id="${esc(resource.id)}" data-action="discard">Discard</button>`
-        : `<span class="task-sub resource-selection-state">${item.excluded ? 'Excluded' : 'Included'}</span><button class="btn sm resource-exclude" data-resource-id="${esc(resource.id)}" aria-label="${item.excluded ? 'Include' : 'Exclude'} ${esc(resource.name)}" aria-pressed="${!!item.excluded}" ${item.selectionFrozen || v.state?.applyingResources ? 'disabled' : ''}>${item.excluded ? 'Include' : 'Exclude'}</button>`;
+        : `${resourceNotSaved(item) ? `<span class="task-sub resource-not-saved" style="color:var(--danger)" title="${esc(`Couldn’t save it: ${item.candidate.error}`)}">Not saved</span>` : ''}<span class="task-sub resource-selection-state">${item.excluded ? 'Excluded' : 'Included'}</span><button class="btn sm resource-exclude" data-resource-id="${esc(resource.id)}" aria-label="${item.excluded ? 'Include' : 'Exclude'} ${esc(resource.name)}" aria-pressed="${!!item.excluded}" ${item.selectionFrozen || v.state?.applyingResources ? 'disabled' : ''}>${item.excluded ? 'Include' : 'Exclude'}</button>`;
       return `<div class="resource-review-row"><div class="resource-review-name"><b>${esc(resource.name)}</b><span class="task-sub" title="${esc(detail)}">${esc(target || detail)}</span></div><div class="resource-review-controls">${controls}</div></div>`;
     }).join('')}</div>`;
     if (atBottom) thread.scrollTop = thread.scrollHeight;
