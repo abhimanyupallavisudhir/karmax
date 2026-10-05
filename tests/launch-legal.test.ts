@@ -135,6 +135,16 @@ describe('paid-launch policies', () => {
     expect(bullets.find((bullet) => bullet.startsWith('one.com'))).not.toMatch(/local objects/);
   });
 
+  it('names Cloudflare Workers as the relay for resource saves, which data passes through but is not stored in', () => {
+    const bullets = policyDocument('subprocessors')!.sections.flatMap((section) => section.bullets ?? []);
+    const workers = bullets.find((bullet) => bullet.startsWith('Cloudflare (Workers)'));
+    expect(workers).toMatch(/resource saves and reads/);
+    expect(workers).toMatch(/encrypted before it leaves the sandbox/);
+    expect(workers).toMatch(/outside the EU/);
+    expect(workers).toMatch(/not stored there/);
+    expect(policyDocument('subprocessors')!.version).toBe('2026-10-05.1');
+  });
+
   it('incorporates a scoped processing addendum without claiming execution or launch approval', () => {
     const dpa = policyDocument('dpa')!;
     expect(dpa.title).toBe('Data Processing Addendum');
