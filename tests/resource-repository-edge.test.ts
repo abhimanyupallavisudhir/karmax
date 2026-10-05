@@ -7,7 +7,6 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { Store } from '../src/store/db.js';
-import { LocalObjectStore } from '../src/store/objects.js';
 import { DeferredDeleteObjectStore } from '../src/store/deferred-delete.js';
 import { StorageLocationService } from '../src/store/storage-locations.js';
 import { Vault } from '../src/autonomy/vault.js';
@@ -16,10 +15,18 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { REPOSITORY_ROUTE } from '../src/world/resource-repository.js';
-import edge, { type EdgeBucket, type EdgeEnv } from '../src/edge/resource-repository-worker.js';
+import { SYSTEM_JOB_ROOT } from '../src/world/jobs.js';
+import edge, { type EdgeEnv } from '../src/edge/resource-repository-worker.js';
+import { fakeS3 } from './helpers/fake-s3.js';
 import { ensureIdentity, gitOrThrow } from '../src/world/git.js';
 
 const sha256 = (data: Buffer) => crypto.createHash('sha256').update(data).digest('hex');
+/** The rest.connections of every save the world ran as a platform job. */
+function savesConnections(root: string): string[] {
+  const jobs = path.join(root, SYSTEM_JOB_ROOT);
+  return [...new Set(fs.readdirSync(jobs).map((id) => fs.readFileSync(path.join(jobs, id, 'command'), 'utf8'))
+    .filter((command) => /\bbackup\b/.test(command)).map((command) => /rest\.connections=(\d+)/.exec(command)?.[1] ?? ''))];
+}
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
@@ -30,32 +37,7 @@ async function listen(handler: http.RequestListener): Promise<string> {
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
 
-/** R2 as the Worker sees it, over the same directory tavya's store reads:
- * `put` with `sha256` refuses content that does not match, as R2 does. */
-function bucket(objects: string, puts: { bytes: number }): EdgeBucket {
-  const file = (key: string) => path.join(objects, ...key.split('/'));
-  return {
-    async put(key, value, options) {
-      const body = Buffer.from(await new Response(value as ReadableStream).arrayBuffer());
-      if (options?.sha256 && sha256(body) !== options.sha256) throw new Error('checksum mismatch');
-      fs.mkdirSync(path.dirname(file(key)), { recursive: true });
-      fs.writeFileSync(file(key), body);
-      puts.bytes += body.length;
-      return {};
-    },
-    async get(key, options) {
-      if (!fs.existsSync(file(key))) return null;
-      const size = fs.statSync(file(key)).size;
-      const match = /^bytes=(\d+)-(\d*)$/.exec(options?.range?.get('range') ?? '');
-      const offset = match ? Number(match[1]) : 0;
-      const end = match?.[2] ? Math.min(Number(match[2]) + 1, size) : size;
-      return { size, ...(match ? { range: { offset, length: end - offset } } : {}),
-        body: Readable.toWeb(fs.createReadStream(file(key), { start: offset, end: Math.max(offset, end - 1) })) as ReadableStream };
-    },
-  };
-}
-
-async function fixture() {
+async function fixture(options: { verifiesChecksums?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-repository-edge-'));
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
@@ -66,8 +48,10 @@ async function fixture() {
   cleanups.push(() => store.close());
   const project = await store.createProject('Edge', { repos: [repo] });
   const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
-  const objectsDir = path.join(dir, 'objects');
-  const objects = new LocalObjectStore(objectsDir);
+  // The managed store: an S3 bucket that verifies checksums, as R2 does, unless told not to.
+  const s3 = await fakeS3(options);
+  cleanups.push(() => s3.close());
+  const objects = s3.client;
   const locations = new StorageLocationService(store, objects, broker);
   const managed = await locations.ensureManaged(project.organizationId!);
   const worlds = new WorldRegistry();
@@ -83,12 +67,8 @@ async function fixture() {
     if (req.method === 'POST' && !req.headers['x-tavya-edge']) origin.uploadBytes += Number(req.headers['content-length'] ?? 0);
     void resources.repositoryServer.handle(req, res, url.pathname.slice(REPOSITORY_ROUTE.length) + url.search);
   });
-  // The Worker, with its R2 binding over the same objects.
-  // The grant key the edge shares with tavya (created with the first grant).
-  await (resources.restic as any).deps.tokens.mint({ repository: 'x@y', access: 'read', quota: false, expiresAt: Date.now() + 1000 });
-  const tokenKey = broker.resolve('resource-repositories:token-key', { caps: ['use-credential:resource-repositories:token-key'] });
-  const r2 = { bytes: 0 };
-  const env: EdgeEnv = { BUCKET: bucket(objectsDir, r2), TOKEN_KEY: tokenKey, ORIGIN: originUrl };
+  // The Worker, knowing only tavya's URL.
+  const env: EdgeEnv = { ORIGIN: originUrl };
   edgeUrl = await listen(async (req, res) => {
     // Buffered: workerd forwards a body of known length with its content-length, where Node's fetch would stream it chunked.
     const chunks: Buffer[] = [];
@@ -113,10 +93,10 @@ async function fixture() {
     vi.spyOn(worlds, 'open').mockResolvedValue(world);
     return { task, world };
   };
-  return { dir, store, project, managed, objects, resources, attachment, sandbox, origin, r2, edgeUrl, originUrl, env };
+  return { dir, store, project, managed, objects, s3, resources, attachment, sandbox, origin, edgeUrl, originUrl, env };
 }
 
-it('saves from a world into R2 through the edge, its bytes never passing through tavya, and restores from it', async () => {
+it('saves from a world straight into the store through the edge, its bytes never passing through tavya, and restores', async () => {
   const f = await fixture();
   const corpus = [{ path: 'big.bin', data: crypto.randomBytes(6 * 1024 * 1024) },
     ...Array.from({ length: 30 }, (_, i) => ({ path: `pages/${i}.txt`, data: crypto.randomBytes(2000) }))];
@@ -128,13 +108,15 @@ it('saves from a world into R2 through the edge, its bytes never passing through
 
   const changed = crypto.randomBytes(3 * 1024 * 1024);
   fs.writeFileSync(path.join(world.handle.root, 'data/big.bin'), changed);
-  const before = { origin: f.origin.uploadBytes, r2: f.r2.bytes };
+  const before = { origin: f.origin.uploadBytes, direct: f.s3.counters.presignedBytes };
   const promoted = await f.resources.promote(task.id, f.attachment.id);
   expect(promoted.revision).toMatchObject({ engine: 'restic@1', parentRevisionId: first.id });
-  // The new data went to R2 from the edge; tavya received none of it.
-  expect(f.r2.bytes - before.r2).toBeGreaterThan(changed.length);
+  // The new data went from the edge into the store, through URLs bound to its content; tavya received none of it.
+  expect(f.s3.counters.presignedBytes - before.direct).toBeGreaterThan(changed.length);
   expect(f.origin.uploadBytes - before.origin).toBeLessThan(4096); // its locks
-  // Recorded by tavya (listing, quota) and readable from the edge.
+  // With more connections than the relay allows: each upload waits on tavya twice.
+  expect(savesConnections(world.handle.root)).toEqual(['32']);
+  // Recorded by tavya (listing, quota) and readable through the edge (redirects to the store).
   const verified = await f.resources.verifyRevision(f.project.id, f.attachment.id, promoted.revision.id, 0, 1000);
   expect(verified.status).toBe('complete');
   expect(verified.files.find((file) => file.path === 'big.bin')?.sha256).toBe(sha256(changed));
@@ -178,12 +160,12 @@ it('refuses an upload over the storage quota before any byte is stored', async (
   const token = await (f.resources.restic as any).deps.tokens.mint({ repository: repository.name, access: 'append', quota: true,
     expiresAt: Date.now() + 60_000 });
   const body = crypto.randomBytes(1000);
-  const before = f.r2.bytes;
+  const before = f.s3.counters.presignedBytes;
   const response = await fetch(`${f.edgeUrl}${REPOSITORY_ROUTE}${repository.name}/data/${sha256(body)}`,
     { method: 'POST', headers: { authorization: `Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`, 'content-length': '1000' },
       body: new Uint8Array(body) });
   expect(response.status).toBe(507);
-  expect(f.r2.bytes).toBe(before);
+  expect(f.s3.counters.presignedBytes).toBe(before);
 });
 
 it('keeps a file written again through the edge while its earlier delete was pending', async () => {
@@ -202,4 +184,27 @@ it('keeps a file written again through the edge while its earlier delete was pen
   expect(response.status).toBe(200);
   expect(await new DeferredDeleteObjectStore(f.objects, f.store, { delayMs: 1 }).purgeDue()).toEqual({ purged: 0, failed: 0 });
   expect(await f.objects.head(key)).toMatchObject({ bytes: 1000 });
+});
+
+it('sends uploads through tavya for a store that does not verify checksums', async () => {
+  // Some S3-compatible stores ignore the checksum header: a URL could then store anything under a name.
+  const f = await fixture({ verifiesChecksums: false });
+  await f.resources.importFiles(f.attachment.id, [{ path: 'seed.txt', data: Buffer.from('seed') }]);
+  const { world } = await f.sandbox();
+  fs.mkdirSync(path.join(world.handle.root, 'data'), { recursive: true });
+  const data = crypto.randomBytes(2 * 1024 * 1024);
+  fs.writeFileSync(path.join(world.handle.root, 'data/big.bin'), data);
+  const repository = await f.resources.restic.current(f.attachment);
+  const saved = await f.resources.restic.backup({ world, path: path.join(world.handle.root, 'data') }, repository, { key: 'relay', quota: false });
+  expect(saved.files).toBe(1);
+  expect(f.s3.counters.presignedBytes).toBe(0);
+  expect(f.origin.uploadBytes).toBeGreaterThan(data.length);
+  expect(savesConnections(world.handle.root)).toEqual(['8']);
+  // The edge is not trusted with such a store even when asked directly.
+  const token = await (f.resources.restic as any).deps.tokens.mint({ repository: repository.name, access: 'append', quota: false,
+    expiresAt: Date.now() + 60_000 });
+  const intent = await fetch(`${f.originUrl}${REPOSITORY_ROUTE}${repository.name}/data/${sha256(data)}`, { method: 'POST',
+    headers: { authorization: `Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`, 'x-tavya-edge': 'intent', 'x-tavya-length': '1' } });
+  expect(intent.status).toBe(409);
+  expect(intent.headers.get('x-tavya-upload-url')).toBeNull();
 });

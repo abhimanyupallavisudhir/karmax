@@ -341,7 +341,7 @@ describe('deploy-repository-edge', () => {
     const run = deployEdge('KARMAX_DOMAIN=tavya.io\nKARMAX_RESOURCE_EDGE_URL=https://old.example.workers.dev\n', url);
     expect(run.status).toBe(0);
     expect(run.env).toBe(`KARMAX_DOMAIN=tavya.io\nKARMAX_RESOURCE_EDGE_URL=${url}\n`);
-    expect(run.calls).toEqual(['run --rm --no-deps -T -e CLOUDFLARE_API_TOKEN app npm run --silent deploy-repository-edge token=cf-token',
+    expect(run.calls).toEqual(['run --rm --no-deps -T -e CLOUDFLARE_API_TOKEN -e CLOUDFLARE_ACCOUNT_ID app npm run --silent deploy-repository-edge token=cf-token',
       'up -d --no-build app token=cf-token', 'ready']);
   });
 

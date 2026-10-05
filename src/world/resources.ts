@@ -345,7 +345,8 @@ export class ProjectResourceService {
     private storageLocations?: StorageLocationService,
     repositories: { objects?: ObjectStore; world?: (handle: WorldHandle) => string | undefined; cacheDir?: string;
       proxyReads?: boolean;
-      /** The repository edge (src/edge), which writes managed storage from Cloudflare's network. */
+      /** The repository edge (src/edge): remote worlds reach every repository
+       * through it, and it uploads into stores that verify checksums. */
       edge?: () => string | undefined } = {}) {
     // A location must be the organization's own, whatever a row or URL names.
     const locationOf = async (attachment: ResourceAttachment) => (await this.storageLocations?.requireForOrganization(
@@ -360,12 +361,12 @@ export class ProjectResourceService {
       return fallback;
     };
     const tokens = new RepositoryTokens(broker);
-    const edgeLocation = (storageLocationId: string | undefined) => !!repositories.edge?.() && !!storageLocationId?.startsWith('storage-managed-');
-    this.repositoryServer = new ResourceRepositoryServer({ store, tokens, objects, edgeLocation,
+    this.repositoryServer = new ResourceRepositoryServer({ store, tokens, objects, edge: () => !!repositories.edge?.(),
       ...(repositories.proxyReads ? { proxyReads: true } : {}) });
     this.restic = new ResticResources({ store, broker, tokens, locationOf, objects,
       endpoints: { host: () => this.loopbackUrl(),
-        world: (handle, repository) => edgeLocation(repository.storageLocationId) ? repositories.edge!() : repositories.world?.(handle) },
+        world: (handle) => repositories.edge?.() ?? repositories.world?.(handle),
+        direct: (repository) => this.repositoryServer.directUploads(repository.name) },
       ...(repositories.cacheDir ? { cacheDir: repositories.cacheDir } : {}) });
     if (engine instanceof ObjectSnapshotEngine) engine.setAttachmentResolver(async (id) => (await store.getResourceAttachment(id)));
     if (engine instanceof ObjectSnapshotEngine) engine.setChunkAccounting({

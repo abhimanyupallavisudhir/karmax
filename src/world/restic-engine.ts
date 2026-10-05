@@ -30,9 +30,12 @@ import { isRemoteWorldKind } from './types.js';
 export const RESTIC_ENGINE = 'restic@1';
 
 export interface RepositoryEndpoints {
-  /** Base URL (no trailing slash) at which a remote world reaches a repository:
-   * the edge for managed storage when one is deployed, else this server. */
-  world(handle: WorldHandle, repository: Repository): string | undefined;
+  /** Base URL (no trailing slash) at which a remote world reaches the
+   * repositories: the edge when one is deployed, else this server. */
+  world(handle: WorldHandle): string | undefined;
+  /** Whether a world's uploads go from the edge straight into the store,
+   * holding none of them in this server's memory. */
+  direct?(repository: Repository): Promise<boolean>;
   /** Base URL at which this process reaches it. */
   host(): string | Promise<string>;
 }
@@ -84,6 +87,11 @@ const CACHE_DIR = '.karmax-injection/restic-cache';
 const TOKEN_HOURS = 24;
 const POLL_MS = 2_000;
 const CONNECTIONS = 8;
+/** Each upload through the edge waits on two calls to this server, an ocean
+ * away from many sandboxes: measured from E2B (Seattle) to R2 EU, 8, 16 and 32
+ * connections uploaded at 46, 55 and 85 MiB/s. The relay keeps 8: it buffers
+ * every upload in memory, in slots all worlds share. */
+const EDGE_CONNECTIONS = 32;
 const RESTORE_CONNECTIONS = 16;
 /** A save that finds files changed under it saves again, this many times. */
 const SETTLE_ROUNDS = 3;
@@ -337,9 +345,11 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     // A one-file resource is its content: a link is saved as what it points to.
     const file = place.file ? await this.realPath(place) : undefined;
     const directory = file ? path.posix.dirname(file) : place.path;
-    const args = [...backupArgs(options.parent), ...(options.dryRun ? ['--dry-run'] : []), file ? path.posix.basename(file) : '.'];
+    const remote = isRemoteWorldKind(place.world.handle.kind);
+    const connections = remote && await this.deps.endpoints.direct?.(attachment) ? EDGE_CONNECTIONS : CONNECTIONS;
+    const args = [...backupArgs(options.parent, connections), ...(options.dryRun ? ['--dry-run'] : []), file ? path.posix.basename(file) : '.'];
     const progress = options.dryRun ? {} : { onProgress: options.onProgress };
-    const run = isRemoteWorldKind(place.world.handle.kind)
+    const run = remote
       ? await this.inWorld(place.world, attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory })
       : await this.onHost(attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory });
     if (run.code !== 0) throw resticFailure(run, 'saving the resource');
@@ -386,7 +396,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
    * has everything already stored. */
   private async inWorld(world: World, attachment: Repository, access: RepositoryAccess, quota: boolean, args: string[],
     options: ResticRunOptions & { cwd?: string; prefix?: string; suffix?: string }): Promise<ResticRun> {
-    const base = this.deps.endpoints.world(world.handle, attachment);
+    const base = this.deps.endpoints.world(world.handle);
     if (!base) throw new Error('this world cannot reach the resource store (no public URL is configured)');
     const binary = await this.worldBinary(world, base);
     const command = `set -e\n${options.prefix ? `${options.prefix}\n` : ''}${options.cwd ? `cd -- ${quote(options.cwd)}\n` : ''}`
@@ -460,13 +470,13 @@ chmod +x "$t"; mv -f "$t" ${quote(relative)}`, 'restic-fetch', url, binary.sha25
   }
 }
 
-function backupArgs(parent?: string): string[] {
+function backupArgs(parent?: string, connections = CONNECTIONS): string[] {
   // Inode and ctime differ in every world a resource is restored into; the
   // size and nanosecond mtime restic restores are what say a file is
   // unchanged, so a restored world is not read again in full. (An edit that
   // keeps both, by setting the old mtime back, would go unnoticed.)
   return ['backup', '--json', '--host', 'tavya', '--ignore-inode', '--exclude', '.git', '--exclude', '.karmax-injection',
-    '-o', `rest.connections=${CONNECTIONS}`, ...(parent ? ['--parent', parent] : [])];
+    '-o', `rest.connections=${connections}`, ...(parent ? ['--parent', parent] : [])];
 }
 
 function summaryOf(stdout: string): Record<string, unknown> {

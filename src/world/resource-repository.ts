@@ -5,7 +5,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
 import type { ResourceAttachment } from '../domain/types.js';
 import type { Store } from '../store/db.js';
-import type { ObjectStore } from '../store/objects.js';
+import { verifiesChecksums, type ObjectStore } from '../store/objects.js';
 import { organizationKey } from './chunk-store.js';
 import { RESTIC_VERSION, worldResticBinary } from './restic.js';
 
@@ -51,7 +51,9 @@ const MAX_UPLOAD_BYTES = 160 * 1024 * 1024;
 /** Uploads held in memory at once, across every repository. */
 const UPLOAD_SLOTS = 24;
 const REDIRECT_SECONDS = 15 * 60;
-export const TOKEN_KEY_HANDLE = 'resource-repositories:token-key';
+/** The edge starts its upload as soon as it has the URL. */
+const UPLOAD_URL_SECONDS = 15 * 60;
+const TOKEN_KEY_HANDLE = 'resource-repositories:token-key';
 export const REPOSITORY_ROUTE = '/resource-repositories/';
 
 /** A repository is a resource's in one storage location: a resource moved to
@@ -123,8 +125,9 @@ export interface RepositoryServerDeps {
   /** Serve reads itself instead of redirecting to the store: for a store that
    * restic (in a world, or on this host) cannot reach, such as a private endpoint. */
   proxyReads?: boolean;
-  /** Storage locations the edge writes (managed storage, when an edge is deployed). */
-  edgeLocation?: (storageLocationId: string | undefined) => boolean;
+  /** Whether an edge is deployed (src/edge/resource-repository-worker.ts): it
+   * may then upload files straight into stores that verify checksums. */
+  edge?: () => boolean;
 }
 
 interface RepositoryPlace { attachment: ResourceAttachment; repository: string; storageLocationId?: string; objects(): Promise<ObjectStore> }
@@ -134,8 +137,30 @@ class HttpError extends Error { constructor(readonly status: number, message: st
 export class ResourceRepositoryServer {
   private slots = UPLOAD_SLOTS;
   private waiting: Array<() => void> = [];
+  /** Per storage location: does its store refuse content that does not match a signed checksum? */
+  private checksums = new Map<string, { verified: Promise<boolean>; until: number }>();
 
   constructor(private deps: RepositoryServerDeps) {}
+
+  /** Whether the edge uploads this repository's files straight into its store.
+   * Only a store that refuses content not matching the checksum signed into
+   * its upload URL qualifies: the URL then lets whoever holds it store exactly
+   * the file its name hashes, nothing else. Others keep the relay. Checked once
+   * a day per storage location (an hour after a store failed the check). A
+   * store only this server can reach (`proxyReads`) is out of the edge's reach too. */
+  async directUploads(repository: string): Promise<boolean> {
+    if (!this.deps.edge?.() || this.deps.proxyReads) return false;
+    const parsed = parseRepositoryName(repository);
+    const attachment = parsed && await this.deps.store.getResourceAttachment(parsed.attachmentId);
+    if (!parsed || !attachment) return false;
+    const id = parsed.storageLocationId ?? 'default';
+    const known = this.checksums.get(id);
+    if (known && known.until > Date.now()) return known.verified;
+    const verified = this.deps.objects(attachment, parsed.storageLocationId).then((objects) => verifiesChecksums(objects), () => false);
+    this.checksums.set(id, { verified, until: Date.now() + 3_600_000 });
+    if (await verified) this.checksums.set(id, { verified, until: Date.now() + 24 * 3_600_000 });
+    return verified;
+  }
 
   /** `path` is everything after {@link REPOSITORY_ROUTE}: `<attachment>/<restic path>`. */
   async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string): Promise<void> {
@@ -276,18 +301,19 @@ export class ResourceRepositoryServer {
 
   /**
    * An upload through the edge (src/edge/resource-repository-worker.ts), which
-   * writes the bytes to R2 itself. `intent`: may this file be stored (the same
-   * checks as an upload here), and under which key. `stored`: it is, so it is
-   * recorded, once the store confirms an object of exactly the announced size
-   * (only the edge can write the bucket, and R2 checked the content against its
-   * name). Both carry the world's own grant; neither carries file bytes.
+   * streams the bytes into the store itself. `intent`: may this file be stored
+   * (the same checks as an upload here)? 202 carries a presigned PUT bound to
+   * the file's key and checksum; 409 sends the upload through this server.
+   * `stored`: it is, so it is recorded once the store holds an object of
+   * exactly the announced size (the store checked its content). Both carry the
+   * world's own grant; neither carries file bytes.
    */
   private async edgeWrite(req: http.IncomingMessage, res: http.ServerResponse, place: RepositoryPlace,
     grant: RepositoryGrant, kind: string, name: string, step: 'intent' | 'stored'): Promise<void> {
     req.resume();
     const { attachment, repository, storageLocationId } = place;
-    if (!['data', 'index', 'snapshots'].includes(kind) || !this.deps.edgeLocation?.(storageLocationId))
-      throw new HttpError(409, 'this repository is not stored at the edge');
+    if (!['data', 'index', 'snapshots'].includes(kind) || !(await this.directUploads(repository)))
+      throw new HttpError(409, 'upload this file here');
     const declared = Number(req.headers['x-tavya-length']);
     if (!Number.isSafeInteger(declared) || declared < 0) throw new HttpError(411, 'a content length is required');
     if (declared > MAX_UPLOAD_BYTES) throw new HttpError(413, 'file too large');
@@ -297,19 +323,21 @@ export class ResourceRepositoryServer {
       return void res.writeHead(200).end();
     }
     const key = repositoryObjectKey(repository, kind, name);
+    const objects = await place.objects();
     if (step === 'intent') {
       if (grant.quota && storageLocationId) {
         const usage = await this.deps.store.storageLocationUsage(storageLocationId);
         if (usage.quotaBytes != null && usage.retainedBytes + declared > usage.quotaBytes)
           throw new HttpError(507, `storage quota exceeded (${usage.retainedBytes} of ${usage.quotaBytes} bytes used)`);
       }
-      return void res.writeHead(202, { 'x-tavya-object-key': key }).end();
+      const url = await objects.presign!('PUT', key, UPLOAD_URL_SECONDS, { sha256: name });
+      return void res.writeHead(202, { 'x-tavya-upload-url': url, 'cache-control': 'no-store' }).end();
     }
     // Written past the deferred-delete store, so its put() could not cancel a
     // delete pending for this name (DeferredDeleteObjectStore). Cancel it first:
     // a purge that ran before deleted the new object too, and the check below fails.
     await this.deps.store.transaction(() => this.deps.store.deleteObjectTombstone(key));
-    const stored = await (await place.objects()).head?.(key);
+    const stored = await objects.head?.(key);
     if (stored?.bytes !== declared) throw new HttpError(409, 'the store does not hold that file');
     await this.deps.store.recordRepositoryFile({ repository, attachmentId: attachment.id, organizationId: attachment.organizationId,
       storageLocationId, kind, name, bytes: declared });

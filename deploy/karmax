@@ -371,18 +371,19 @@ cmd_migrate_objects() {
   dc run --rm --no-deps -T app npm run --silent migrate-objects -- "$@"
 }
 
-# The resource repositories' edge: a Cloudflare Worker beside the R2 bucket, so
-# sandboxes save resources into R2 without the bytes passing through this host
-# (wiki features/resource-storage). Takes CLOUDFLARE_API_TOKEN from the
-# environment (Workers Scripts: Edit, Workers R2 Storage: Edit) and stores it
-# nowhere. Repeatable: also how a changed Worker or grant key reaches Cloudflare.
-# Records the URL as KARMAX_RESOURCE_EDGE_URL and restarts the app when it changed;
-# deleting that line from .turnkey.env (and restarting) turns the edge off.
+# The resource repositories' edge: a Cloudflare Worker that sandboxes save
+# resources through, so the bytes go into storage without passing through this
+# host (wiki features/resource-storage). Takes CLOUDFLARE_API_TOKEN (Workers
+# Scripts: Edit) from the environment and stores it nowhere; the account is
+# CLOUDFLARE_ACCOUNT_ID, else the managed R2 bucket's. Repeatable: also how a
+# changed Worker reaches Cloudflare. Records the URL as KARMAX_RESOURCE_EDGE_URL
+# and restarts the app when it changed; deleting that line from .turnkey.env
+# (and restarting) turns the edge off.
 cmd_deploy_repository_edge() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured'
-  [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || die 'set CLOUDFLARE_API_TOKEN (Workers Scripts: Edit, Workers R2 Storage: Edit)'
-  output=$(dc run --rm --no-deps -T -e CLOUDFLARE_API_TOKEN app npm run --silent deploy-repository-edge < /dev/null) \
+  [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || die 'set CLOUDFLARE_API_TOKEN (Workers Scripts: Edit)'
+  output=$(dc run --rm --no-deps -T -e CLOUDFLARE_API_TOKEN -e CLOUDFLARE_ACCOUNT_ID app npm run --silent deploy-repository-edge < /dev/null) \
     || die 'the edge was not deployed; see above'
   url=$(printf '%s\n' "$output" | tail -n 1)
   case "$url" in https://*.workers.dev) ;; *) die "unexpected edge URL: $url" ;; esac
@@ -395,7 +396,7 @@ cmd_deploy_repository_edge() {
   mv "$staged" "$ENV_FILE"
   note 'Restarting the app with it…'
   dc up -d --no-build app && wait_ready || die 'Karmax failed its readiness check after enabling the edge'
-  note 'Sandboxes now save resources in managed storage through the edge.'
+  note 'Sandboxes now save resources through the edge.'
 }
 
 cmd_backup() {
