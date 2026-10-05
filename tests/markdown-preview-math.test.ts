@@ -42,6 +42,20 @@ describe('Markdown preview math', () => {
     await ui.close();
   });
 
+  // Hard-wrapped agent prose breaks lines mid-formula (tavya lvpm#1).
+  it('typesets inline math that wraps onto the next line', async () => {
+    const ui = await consolePage();
+    const wrapped = 'If $Y\\sim\np$, then\n$\\mathbb E[\\sum_{v\\in H}\\log p_\\theta(v|\\mathrm{pa}_v)+\\tau\\sum_{v\\in Y}\\log\np_\\theta(v|\\mathrm{pa}_v)]$ holds.';
+    await ui.run(`showArtifactReader(${JSON.stringify(wrapped)}, 'markdown', 'note.md', new Blob(['x']))`);
+    const content = ui.page.locator('.artifact-reader-content');
+    await content.locator('mjx-container').nth(1).waitFor();
+    expect(await content.locator('mjx-container').count()).toBe(2);
+    expect(await content.locator('mjx-merror, em').count()).toBe(0);
+    expect(await content.innerText()).not.toContain('$');
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
   it('keeps plain-text previews free of a TeX button', async () => {
     const ui = await consolePage();
     await ui.run(`showArtifactReader('$x$', 'text', 'notes.txt', new Blob(['x']))`);

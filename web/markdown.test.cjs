@@ -145,6 +145,24 @@ ok(withTexDelimiters.includes('<span class="md-math">\\(q_i\\)</span>'), 'TeX in
 ok(withTexDelimiters.includes('<span class="md-math">\\[\nV(q)=\\min_'), 'TeX display delimiters preserved raw');
 ok(withTexDelimiters.includes('\\operatorname{conv}(\\Omega)') && withTexDelimiters.includes('\\middle\\|'), 'TeX commands survive Markdown rendering');
 ok(!withTexDelimiters.includes('<em>'), 'underscores inside TeX-delimited math are not italicised');
+// Inline math may wrap onto the next line of its paragraph (an agent's prose is
+// hard-wrapped mid-formula); its subscripts must not turn into emphasis.
+const wrapped = renderMarkdown(
+  'If $Y\\sim\np$, then\n$\\mathbb E[\\sum_{v\\in H}\\log p(v|\\mathrm{pa}_v)+\\tau\\sum_{v\\in Y}\\log\np(v|\\mathrm{pa}_v)]$ and \\(a_1\nb_2\\).',
+  { math: true },
+);
+ok(wrapped.includes('<span class="md-math">$Y\\sim\np$</span>'), 'inline $…$ spans a soft line break');
+ok(wrapped.includes('<span class="md-math">$\\mathbb E[\\sum_{v\\in H}\\log p(v|\\mathrm{pa}_v)+\\tau\\sum_{v\\in Y}\\log\np(v|\\mathrm{pa}_v)]$</span>'),
+  'a wrapped formula is kept whole');
+ok(wrapped.includes('<span class="md-math">\\(a_1\nb_2\\)</span>'), 'inline \\(…\\) spans a soft line break');
+ok(!wrapped.includes('<em>'), 'underscores in wrapped math are not italicised');
+const paragraphs = renderMarkdown('costs $5\n\nnot math$ here', { math: true });
+ok(!paragraphs.includes('md-math') && paragraphs.includes('costs $5'), 'inline math never crosses a blank line');
+const currency = renderMarkdown('between $5 and $10, or $x$ and $y$2', { math: true });
+ok(currency.includes('between $5 and $10, or <span class="md-math">$x$</span>'), 'prices are not math');
+ok(!currency.includes('$y$</span>'), 'a closing $ followed by a digit is not a delimiter');
+const escaped = renderMarkdown('pay \\$5 or \\$6 for $\\$x$', { math: true });
+ok(escaped.includes('pay $5 or $6 for <span class="md-math">$\\$x$</span>'), 'escaped dollars are literal, inside and outside math');
 const noMath = renderMarkdown('cost $5 and $10 today', { math: false });
 ok(noMath.includes('cost $5 and $10 today'), 'currency $ untouched when math is off');
 
