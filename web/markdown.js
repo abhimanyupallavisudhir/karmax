@@ -8,7 +8,10 @@
   // headings, lists, blockquotes, rules, bold/italic/strike, links, and — when
   // math is on — $…$ / $$…$$ and \(…\) / \[…\] spans left intact for MathJax to
   // typeset. Code and math are stashed up front so inline formatting can't
-  // corrupt their contents;
+  // corrupt their contents. Inline math follows Pandoc's rules: it may wrap onto
+  // the next line but never crosses a blank one, `$` opens only before a
+  // non-space and closes only after one (and not before a digit, so "$5 and $10"
+  // stay prices), and `\$` is a literal dollar;
   // the single stash is restored once at the end (nested blocks recurse through
   // mdBlocks, never renderMarkdown, so indices never clash).
   function renderMarkdown(src, opts = {}) {
@@ -24,8 +27,12 @@
     if (withMath) s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, body) => keep(`<span class="md-math">$$${esc(body)}$$</span>`));
     if (withMath) s = s.replace(/\\\[([\s\S]+?)\\\]/g, (_, body) => keep(`<span class="md-math">\\[${esc(body)}\\]</span>`));
     s = s.replace(/`([^`\n]+)`/g, (_, body) => keep(`<code class="md-inline">${esc(body)}</code>`));
-    if (withMath) s = s.replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (_, body) => keep(`<span class="md-math">$${esc(body)}$</span>`));
-    if (withMath) s = s.replace(/\\\(([^\n]+?)\\\)/g, (_, body) => keep(`<span class="md-math">\\(${esc(body)}\\)</span>`));
+    // A line break inside inline math, but not a blank line (a paragraph break).
+    const softBreak = String.raw`\\?\n(?![ \t]*\n)`;
+    if (withMath) s = s.replace(new RegExp(String.raw`(?<!\\)\$(?![\s$])((?:\\[^\n]|[^\\$\n]|${softBreak})+?)(?<!\s)\$(?!\d)`, 'g'),
+      (_, body) => keep(`<span class="md-math">$${esc(body)}$</span>`));
+    if (withMath) s = s.replace(new RegExp(String.raw`\\\(((?:[^\n]|${softBreak})+?)\\\)`, 'g'),
+      (_, body) => keep(`<span class="md-math">\\(${esc(body)}\\)</span>`));
     let html = mdBlocks(s, stash);
     html = html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
     return sanitizeMarkdownHtml(html, source);
@@ -265,7 +272,7 @@
     // Backslash escapes: stash the escaped punctuation (as \u0001N\u0001) so the
     // emphasis/link passes treat it as a literal, then restore it at the very end.
     const lit = [];
-    x = x.replace(/\\([\\`*_{}[\]()#+\-.!~|>])/g, (_, ch) => `\u0001${lit.push(ch) - 1}\u0001`);
+    x = x.replace(/\\([\\`*_{}[\]()#+\-.!~|>$])/g, (_, ch) => `\u0001${lit.push(ch) - 1}\u0001`);
     // Generated anchors must not go through the emphasis regexes: doing so lets
     // Markdown punctuation in a URL rewrite the generated href attribute. Keep
     // each complete anchor behind an opaque placeholder until formatting is done.
