@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { S3ObjectStore, managedS3Options } from '../src/store/objects.js';
+import { S3ObjectStore, checksumHeader, managedS3Options, verifiesChecksums } from '../src/store/objects.js';
 
 const SECRET = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
 
@@ -147,6 +147,47 @@ ${keys.map(([key, size]) => `<Contents><Key>${key}</Key><LastModified>2026-10-01
       .not.toBe(params['X-Amz-Signature']);
     await expect(s3.presign('PUT', '../escape', 900)).rejects.toThrow('invalid object key');
     await expect(s3.presign('PUT', 'k', 8 * 24 * 3600)).rejects.toThrow('lifetime');
+  });
+
+  it('binds a presigned PUT to one content by signing its SHA-256 checksum header', async () => {
+    const s3 = r2(stubS3(() => new Response('')).fetch);
+    const sha256 = crypto.createHash('sha256').update('pack').digest('hex');
+    const url = new URL(await s3.presign('PUT', 'repo/data/x', 900, { sha256 }));
+    const params = Object.fromEntries(url.searchParams);
+    expect(params['X-Amz-SignedHeaders']).toBe('host;x-amz-checksum-sha256');
+    expect(checksumHeader(sha256)).toEqual({ 'x-amz-checksum-sha256': Buffer.from(sha256, 'hex').toString('base64') });
+    // The server's canonical request includes the header the uploader sends: drop or change it and the signature fails.
+    const encode = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+    const query = [...url.searchParams].filter(([name]) => name !== 'X-Amz-Signature').map(([n, v]) => [encode(n), encode(v)] as const)
+      .sort(([a], [b]) => a < b ? -1 : 1).map(([n, v]) => `${n}=${v}`).join('&');
+    const signature = (checksum: string) => {
+      const canonical = ['PUT', url.pathname, query, `host:${url.host}\nx-amz-checksum-sha256:${checksum}\n`, 'host;x-amz-checksum-sha256',
+        'UNSIGNED-PAYLOAD'].join('\n');
+      const date = params['X-Amz-Date']!;
+      const hmac = (key: crypto.BinaryLike, value: string) => crypto.createHmac('sha256', key).update(value).digest();
+      const key = hmac(hmac(hmac(hmac(`AWS4${SECRET}`, date.slice(0, 8)), 'auto'), 's3'), 'aws4_request');
+      return hmac(key, ['AWS4-HMAC-SHA256', date, `${date.slice(0, 8)}/auto/s3/aws4_request`,
+        crypto.createHash('sha256').update(canonical).digest('hex')].join('\n')).toString('hex');
+    };
+    expect(params['X-Amz-Signature']).toBe(signature(checksumHeader(sha256)['x-amz-checksum-sha256']!));
+    expect(params['X-Amz-Signature']).not.toBe(signature(checksumHeader('0'.repeat(64))['x-amz-checksum-sha256']!));
+    await expect(s3.presign('GET', 'repo/data/x', 900, { sha256 })).rejects.toThrow('checksum');
+    await expect(s3.presign('PUT', 'repo/data/x', 900, { sha256: 'not hex' })).rejects.toThrow('checksum');
+  });
+
+  it('trusts a store with direct uploads only if it refuses content that does not match the signed checksum', async () => {
+    for (const [status, verified] of [[400, true], [200, false], [403, false]] as const) {
+      const store = stubS3(() => new Response(''));
+      const s3 = r2(store.fetch);
+      const probes = stubS3(() => new Response(status === 400 ? '<Error><Code>BadDigest</Code></Error>' : '', { status }));
+      expect(await verifiesChecksums(s3, probes.fetch)).toBe(verified);
+      const [probe] = probes.requests;
+      expect(probe!.method).toBe('PUT');
+      expect(probe!.headers['x-amz-checksum-sha256']).toBeDefined();
+      expect(probe!.body.toString()).not.toBe('karmax checksum probe');
+      // A store that kept the wrong content has the probe deleted again.
+      expect(store.requests.map((request) => request.method)).toEqual(status === 200 ? ['DELETE'] : []);
+    }
   });
 
   it('aborts a request after its timeout', async () => {

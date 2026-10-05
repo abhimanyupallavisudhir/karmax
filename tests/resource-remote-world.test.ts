@@ -95,6 +95,11 @@ it('restores into and saves from a remote world with restic running there as a d
   expect(verified.status).toBe('complete');
   expect(verified.files.find((file) => file.path === 'pages/7.txt')?.sha256)
     .toBe(crypto.createHash('sha256').update('rewritten page').digest('hex'));
+  // Through this server, whose relay buffers each upload, with restic's few connections.
+  const commands = fs.readdirSync(path.join(world.handle.root, SYSTEM_JOB_ROOT))
+    .map((id) => fs.readFileSync(path.join(world.handle.root, SYSTEM_JOB_ROOT, id, 'command'), 'utf8')).filter((command) => /\bbackup\b/.test(command));
+  expect(commands.length).toBeGreaterThan(0);
+  for (const command of commands) expect(command).toContain('rest.connections=8');
   // Its jobs are the platform's own, apart from the agent's.
   expect(fs.readdirSync(path.join(world.handle.root, SYSTEM_JOB_ROOT)).length).toBeGreaterThan(0);
   expect(await listJobs(world)).toEqual([]);

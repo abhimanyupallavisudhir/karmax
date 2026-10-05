@@ -9,7 +9,7 @@ export interface ObjectStore {
   /** A URL that lets whoever holds it PUT or GET exactly this object for
    * `seconds`, so a sandbox can move bytes without them passing through
    * Karmax. Absent when the store has no URL of its own (local disk). */
-  presign?(method: 'PUT' | 'GET', key: string, seconds: number): Promise<string>;
+  presign?(method: 'PUT' | 'GET', key: string, seconds: number, options?: PresignOptions): Promise<string>;
   head?(key: string, options?: ObjectRequestOptions): Promise<ObjectInfo | undefined>;
 }
 
@@ -17,6 +17,35 @@ export interface ObjectRequestOptions {
   /** Abort the request after this long. A purge holds a database transaction
    *  open around its delete, so it must not wait on a stalled connection. */
   timeoutMs?: number;
+}
+
+export interface PresignOptions {
+  /** PUT only: the content's SHA-256 (hex). The URL is then valid only with a
+   * matching `x-amz-checksum-sha256` header (`checksumHeader`), and a store
+   * that verifies checksums refuses any other content (`verifiesChecksums`). */
+  sha256?: string;
+}
+
+/** The header a PUT to a URL presigned with `sha256` must carry. */
+export function checksumHeader(sha256: string): Record<string, string> {
+  return { 'x-amz-checksum-sha256': Buffer.from(sha256, 'hex').toString('base64') };
+}
+
+/** Whether a store refuses content that does not match the checksum its
+ * presigned PUT URL was signed with (S3 and R2 do; some S3-compatible stores
+ * ignore the header). Probes with a deliberately wrong body. */
+export async function verifiesChecksums(objects: ObjectStore, fetcher: typeof fetch = fetch): Promise<boolean> {
+  if (!objects.presign) return false;
+  const key = `.karmax-connection-test/${crypto.randomBytes(12).toString('hex')}`;
+  const expected = crypto.createHash('sha256').update('karmax checksum probe').digest('hex');
+  try {
+    const url = await objects.presign('PUT', key, 60, { sha256: expected });
+    const response = await fetcher(url, { method: 'PUT', headers: checksumHeader(expected), body: 'not the announced content',
+      signal: AbortSignal.timeout(15_000) });
+    await response.arrayBuffer().catch(() => undefined);
+    if (response.ok) await objects.delete(key).catch(() => undefined);
+    return response.status === 400;
+  } catch { return false; }
 }
 
 /** What `head` and `list` report: the stored size and the ETag without quotes. */
@@ -84,9 +113,10 @@ export class S3ObjectStore implements ObjectStore {
     return { bytes: Number(response.headers.get('content-length') ?? 0), etag: unquote(response.headers.get('etag') ?? '') };
   }
 
-  /** SigV4 query authentication (UNSIGNED-PAYLOAD, only `host` signed). The
-   * URL carries a signature: like a credential, it must never be logged. */
-  async presign(method: 'PUT' | 'GET', key: string, seconds: number): Promise<string> {
+  /** SigV4 query authentication (UNSIGNED-PAYLOAD; `host` signed, and the
+   * checksum header for a PUT with `sha256`). The URL carries a signature:
+   * like a credential, it must never be logged. */
+  async presign(method: 'PUT' | 'GET', key: string, seconds: number, options: PresignOptions = {}): Promise<string> {
     if (!key || key.includes('..')) throw new Error('invalid object key');
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 7 * 24 * 3600) throw new Error('invalid presigned URL lifetime');
     const url = new URL(this.options.endpoint.replace(/\/$/, '') + '/');
@@ -94,12 +124,16 @@ export class S3ObjectStore implements ObjectStore {
     const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
     const date = amzDate.slice(0, 8);
     const scope = `${date}/${this.options.region}/s3/aws4_request`;
+    if (options.sha256 !== undefined && (method !== 'PUT' || !/^[0-9a-f]{64}$/.test(options.sha256))) throw new Error('invalid presigned checksum');
+    const headers: Record<string, string> = { host: url.host, ...(options.sha256 ? checksumHeader(options.sha256) : {}) };
+    const signed = Object.keys(headers).sort();
     const params: Record<string, string> = { 'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
       'X-Amz-Credential': `${this.options.accessKeyId}/${scope}`, 'X-Amz-Date': amzDate, 'X-Amz-Expires': String(seconds),
-      'X-Amz-SignedHeaders': 'host', ...(this.options.sessionToken ? { 'X-Amz-Security-Token': this.options.sessionToken } : {}) };
+      'X-Amz-SignedHeaders': signed.join(';'), ...(this.options.sessionToken ? { 'X-Amz-Security-Token': this.options.sessionToken } : {}) };
     const query = Object.entries(params).map(([name, value]) => [uriEncode(name), uriEncode(value)] as const)
       .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([name, value]) => `${name}=${value}`).join('&');
-    const canonicalRequest = [method, url.pathname, query, `host:${url.host}\n`, 'host', 'UNSIGNED-PAYLOAD'].join('\n');
+    const canonicalRequest = [method, url.pathname, query, signed.map((name) => `${name}:${headers[name]}\n`).join(''),
+      signed.join(';'), 'UNSIGNED-PAYLOAD'].join('\n');
     const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256(Buffer.from(canonicalRequest))].join('\n');
     const signingKey = hmac(hmac(hmac(hmac(Buffer.from(`AWS4${this.options.secretAccessKey}`), date), this.options.region), 's3'), 'aws4_request');
     url.search = `${query}&X-Amz-Signature=${hmac(signingKey, stringToSign).toString('hex')}`;

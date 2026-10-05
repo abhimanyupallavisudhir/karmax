@@ -81,7 +81,7 @@ export class DeferredDeleteObjectStore implements ObjectStore {
     this.now = options.now ?? Date.now;
     // A direct upload goes around put(): its object is retained first, and
     // retaining cancels a pending delete, so no tombstone can purge it.
-    if (inner.presign) this.presign = (method, key, seconds) => inner.presign!(method, key, seconds);
+    if (inner.presign) this.presign = (method, key, seconds, options) => inner.presign!(method, key, seconds, options);
     if (inner.head) this.head = (key, request) => inner.head!(key, request);
   }
 
