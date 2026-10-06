@@ -902,6 +902,10 @@ async function softwareDevImpl(
   /** Who last called each agent, so its reply goes back to them. */
   const calledBy: Record<string, string> = { ...continued?.participants?.calledBy };
   let runningParticipant: string | undefined;
+  /** Reviewer "revise" rounds since a person last spoke: two agents must not
+   * pass a proposal back and forth forever without anyone deciding. */
+  let automatedRevisions = 0;
+  const MAX_AUTOMATED_REVISIONS = 5;
   /** A redirect of the request a Responder agent is answering (v1.27 `reroute`). */
   let pendingReroute: { audience: string[]; detail?: string } | undefined;
   /** Whether anything after `from` calls the main agent. Before 1.27 every
@@ -1451,7 +1455,8 @@ async function softwareDevImpl(
         if (layerIndex >= gates.length) break;
         const layer = gates[layerIndex]!;
         const gateDetail = gates.length > 1 ? `confirm layer ${layerIndex + 1}/${gates.length}` : undefined;
-        if (layer.kind === 'agent') {
+        const revisionBound = multiAgent && layer.kind === 'agent' && automatedRevisions >= MAX_AUTOMATED_REVISIONS;
+        if (layer.kind === 'agent' && !revisionBound) {
           waitingFor = { kind: 'confirm', ...(gateDetail ? { detail: gateDetail } : {}) };
           await publish();
           const decision = await confirmTurn(layer,
@@ -1469,6 +1474,7 @@ async function softwareDevImpl(
             return 'cancelled';
           }
           if (decision?.action === 'revise') {
+            automatedRevisions++;
             if (!multiAgent) msgs.push({
               id: `cv-${msgs.length}`, role: 'user',
               text: decision.text || 'Please revise the work per the reviewer feedback.', ts: msgs.length,
@@ -1478,7 +1484,9 @@ async function softwareDevImpl(
         }
         if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
         waitingFor = {
-          kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
+          kind: 'human',
+          ...(revisionBound ? { detail: `The Reviewer asked for changes ${automatedRevisions} times in a row. Confirm, or send guidance.` }
+            : gateDetail ? { detail: gateDetail } : {}),
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'],
         };
         await publish();
@@ -1595,6 +1603,7 @@ async function softwareDevImpl(
         responderRounds = 0;
         subtaskNags = 0;
       }
+      if (message.role === 'user') automatedRevisions = 0;
       whenLoaded(() => {
         if (msgs.some((candidate) => candidate.id === message.id)) return;
         msgs.push({ ...message, ts: message.ts || msgs.length });
@@ -1652,6 +1661,7 @@ async function softwareDevImpl(
     await landingWatcher?.signal('providerChanged').catch(() => undefined);
   });
   setHandler(confirmSignal, () => {
+    automatedRevisions = 0;
     if (awaitingResourceDecision) return;
     if (stage === 'escalated' && escalationAction) {
       if (escalationAction === 'confirm') manualEscalationRequested = true;

@@ -12038,7 +12038,7 @@ function newAgentFormsHtml(v, key) {
   return Object.entries(agents).map(([agentKey, spec]) => `<div class="followup-new-agent" data-agent-key="${esc(agentKey)}">
       <div class="fna-head"><b>${esc(participantLabelOf(agentKey, v))}</b><span class="pal-sub">new agent</span><span style="flex:1"></span>
         <button type="button" class="icon-btn fna-remove" aria-label="Remove ${esc(participantLabelOf(agentKey, v))}" title="Remove">×</button></div>
-      ${agentBlockHtml(`fna-${agentKey}`, spec, { role: 'agent', inherited: v.agents?.do || {}, authority: { label: 'Agent', inherited: taskAuthorityOf(taskRecord(v.taskId)) } })}
+      <div class="parameter-fields">${agentBlockHtml(`fna-${agentKey}`, spec, { role: 'agent', inherited: v.agents?.do || {}, authority: { label: 'Agent', inherited: taskAuthorityOf(taskRecord(v.taskId)) } })}</div>
     </div>`).join('');
 }
 function readNewAgentForm(el) {

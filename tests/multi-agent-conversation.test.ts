@@ -111,6 +111,23 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.result();
   });
 
+  it('a Reviewer and the Agent do not pass a proposal back and forth forever', async () => {
+    const repo = await h.makeRepo('revise-loop');
+    const taskId = newId('task');
+    const handle = await start(taskId, {
+      ...input({ taskId, repo, title: 'ReviseLoop', prompt: 'Do.\n@write a.txt :: x\n@run git add -A && git commit -qm x' }),
+      confirm: { layers: [{ kind: 'agent', provider: 'mock', prompt: '@confirm revise :: not yet' }] },
+    });
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 90_000 })
+      .toMatch(/asked for changes 5 times/);
+    const v = await view(handle);
+    expect(v.stage).toBe('review');
+    expect(v.waitingFor).toMatchObject({ kind: 'human', audience: ['@creator'] });
+    expect(v.messages.filter((m: any) => m.author === 'confirm')).toHaveLength(5);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 120_000);
+
   it('escalating a pending request redirects it to other people without interrupting the task', async () => {
     const repo = await h.makeRepo('redirect');
     const taskId = newId('task');
