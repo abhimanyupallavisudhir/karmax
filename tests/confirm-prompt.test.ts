@@ -27,10 +27,11 @@ describe('renderConfirmPrompt (the per-Review request message)', () => {
     expect(CONFIRM_PROMPT_DEFAULT).toContain('{{response}}');
   });
 
-  it('is pre-filled into the confirmer field of every workflow that has one', () => {
+  it('is only recognised as a legacy stored prompt, never pre-filled as instructions', () => {
     for (const wf of ['software-dev', 'merge-only']) {
       const f = manifest(wf)?.params.find((p) => p.type === 'confirmer');
-      expect(f?.promptDefault).toBe(CONFIRM_PROMPT_DEFAULT);
+      expect(f?.legacyPrompt).toBe(CONFIRM_PROMPT_DEFAULT);
+      expect(f).not.toHaveProperty('promptDefault');
     }
   });
 });

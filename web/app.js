@@ -1042,16 +1042,18 @@ const resetBtn = (name, label = 'Reset to default', kind = 'primary') =>
 // buttons (primary → data-inherit, alt → data-inherit-alt).
 const resetBtns = (name, alt) =>
   alt ? resetBtn(name, alt.primaryLabel, 'primary') + resetBtn(name, alt.altLabel, 'alt') : resetBtn(name);
+// Explanations live in a tooltip (hover or tap), never as text under the label.
 const fieldLabel = (f, alt) =>
-  `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtns(f.name, alt)}</div>` +
-  (f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : '');
+  `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.help ? policyTip(f.help) : ''}<span class="label-row-fill"></span>${f.required ? '' : resetBtns(f.name, alt)}</div>`;
 
-function renderField(f, own, inherited, withChips, alt) {
+// `agentOpts`: agentBlockHtml options for an agent field (e.g. the main agent's
+// Authorization row in the task form).
+function renderField(f, own, inherited, withChips, alt, agentOpts) {
   const v = eff(own, inherited) ?? '';
   const label = fieldLabel(f, alt);
   const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}${altAttr}`;
-  if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
+  if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited, agentOpts)}</div>`;
   if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited, alt)}</div>`;
   if (f.type === 'responder') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderResponderField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
@@ -1106,9 +1108,42 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   return html.join('');
 }
 
-function renderAgentField(f, spec, inherited) {
-  const inh = inherited || {};
-  const role = f.role || f.name;
+function renderAgentField(f, spec, inherited, opts) {
+  return agentBlockHtml(opts?.prefix, spec, { role: f.role || f.name, inherited, ...opts });
+}
+
+// ── The Agent block (wiki planned/collaboration-model) ───────────────────────
+// One control for everything an agent can be given, used wherever an agent is
+// configured: the task form (Agent, Responder, Reviewers), Task defaults, the
+// Parameters tab, and "New agent…" in the follow-up composer. Free of form
+// globals: everything it needs comes in through its arguments.
+//
+//   agentBlockHtml(prefix, spec, opts) → HTML of one `.agent-field` block
+//     prefix  id prefix unique on the page ('tf-responder'); omitted ⇒ generated.
+//     spec    the AgentSpec shown: provider, model, effort, mcpConnections,
+//             resumeFrom, avatarId, authority, prompt (its instructions).
+//     opts    role          'do' | 'responder' | 'confirm' | 'agent' (data-agent)
+//             inherited     the AgentSpec it inherits (resets, tool inheritance)
+//             fork          show "Fork a previous agent" (default true)
+//             instructions  show the optional Instructions box (Responder, Reviewers, …)
+//             authority     false/omitted — no Authorization row;
+//                           { html, summary } — a caller-owned body (the main
+//                             agent: the task's own authorization, vault, cards);
+//                           { inherited, label } — this agent's own authority,
+//                             "Same as <label>" until changed; `inherited` is
+//                             {authorization, credentialGrants, credentialPolicies,
+//                             paymentPolicy} it starts from.
+//   wireAgentBlock(root, ctx) → wires a rendered block (`root` is the `.agent-field`)
+//     ctx     projectId, organizationId — vault items and cards to offer
+//             projects — the authorization scope choices
+//             inheritedAuthority() — live values an untouched block follows
+//   readAgentBlock(root) → the AgentSpec, with `authority` only when this agent
+//     has its own and `prompt` only when it has instructions.
+function agentBlockHtml(prefix, spec, opts) {
+  opts ||= {};
+  prefix ||= `agent-block-${agentBlockHtml.nextId = (agentBlockHtml.nextId || 0) + 1}`;
+  const inh = opts.inherited || {};
+  const role = opts.role || 'do';
   const pendingAvatarId = role === 'do' ? S.pendingAvatarId : null;
   const requestedAvatarId = spec?.avatarId || pendingAvatarId || inh.avatarId || '';
   const selectedAvatar = (S.avatars || []).find((avatar) => avatar.id === requestedAvatarId);
@@ -1123,23 +1158,25 @@ function renderAgentField(f, spec, inherited) {
   const availableAvatars = (S.avatars || []).filter((avatar) => avatar.callable && avatar.effectiveEnabled
     && (!avatar.roles?.length || avatar.roles.includes(role)));
   if (selectedAvatar && !availableAvatars.some((avatar) => avatar.id === selectedAvatar.id)) availableAvatars.push(selectedAvatar);
-  return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
+  return `<div class="agent-field agent-block" data-agent="${esc(role)}" data-prefix="${esc(prefix)}" ${inhAttr(inh)}>
+    ${opts.instructions ? `<textarea class="ab-instructions" rows="2" aria-label="Instructions" placeholder="Instructions for this agent (optional)">${esc(agentInstructions(spec?.prompt))}</textarea>` : ''}
     ${availableAvatars.length ? `<select class="af-avatar" aria-label="Agent identity">
       <option value="">Project/default agent</option>
       ${availableAvatars.map((avatar) => `<option value="${esc(avatar.id)}" ${avatar.id === selectedAvatar?.id ? 'selected' : ''}>${esc(avatar.name)} · Avatar</option>`).join('')}
     </select>` : ''}
     <div class="af-avatar-note" ${selectedAvatar ? '' : 'hidden'}>${selectedAvatar ? `${esc(selectedAvatar.purpose || 'Owner-controlled prompt and delegated authority')} · owned by ${esc(avatarOwnerName(selectedAvatar))}` : ''}</div>
     <div class="agent-controls" ${selectedAvatar ? 'hidden' : ''}>
-      <select class="af-provider">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
+      <select class="af-provider" aria-label="Agent harness">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <div class="combo af-model-combo" style="flex:1;min-width:140px">
-        <input class="af-model" placeholder="model" value="${esc(model || '')}" autocomplete="off" />
+        <input class="af-model" placeholder="model" aria-label="Model" value="${esc(model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
         <div class="combo-menu" hidden></div>
       </div>
       ${effortSelectHtml('af-effort', provider, model, effort || '')}
+      ${opts.extraControls || ''}
     </div>
     ${mcpPickerHtml(spec?.mcpConnections, inh.mcpConnections)}
-    <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> Fork a previous agent</label>
+    ${opts.fork === false ? '' : `<label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> Fork a previous agent</label>
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
@@ -1148,8 +1185,190 @@ function renderAgentField(f, spec, inherited) {
         <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
         <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
       </div>
-    </div>
+    </div>`}
+    ${agentAuthorityHtml(prefix, spec, opts.authority)}
   </div>`;
+}
+
+// A stored Responder/Reviewer prompt that is just the old pre-filled request
+// template is not instructions (manifest `legacyPrompt`): show it as empty.
+function agentInstructions(prompt) {
+  const text = typeof prompt === 'string' ? prompt : '';
+  const legacy = (S.schema || []).flatMap((workflow) => (workflow.params || []).map((field) => field.legacyPrompt)).filter(Boolean);
+  return legacy.includes(text) ? '' : text;
+}
+
+/** What people call one of a task's agents (`participants.ts` participantLabel). */
+function agentParticipantLabel(key) {
+  if (key === 'do') return 'Agent';
+  if (key === 'responder') return 'Responder';
+  if (key === 'confirm') return 'Reviewer';
+  const reviewer = /^confirm-(\d+)$/.exec(key || '');
+  if (reviewer) return `Reviewer ${reviewer[1]}`;
+  const agent = /^agent-(\d+)$/.exec(key || '');
+  return agent ? `Agent ${agent[1]}` : key;
+}
+
+// "▸ Authorization" — collapsed by default. The main agent's body belongs to its
+// host (the task's own authorization, vault grants and payments); every other
+// agent's body is built on first open from its own authority, or "Same as …".
+function agentAuthorityHtml(prefix, spec, authority) {
+  if (!authority) return '';
+  const head = (summary) => `<summary><span class="aa-title">Authorization</span><span class="aa-summary">${esc(summary || '')}</span></summary>`;
+  if (authority.html !== undefined)
+    return `<details class="agent-authority" data-mode="task">${head(authority.summary)}<div class="aa-body">${authority.html}</div></details>`;
+  const label = authority.label || 'Agent';
+  const own = spec?.authority || null;
+  return `<details class="agent-authority" data-mode="agent" data-prefix="${esc(prefix)}" data-explicit="${own ? '1' : ''}"
+    data-authority="${esc(JSON.stringify(own))}" data-inherited="${esc(JSON.stringify(authority.inherited || null))}" data-label="${esc(label)}">
+    ${head(own ? agentAuthoritySummary(own) : `Same as ${label}`)}<div class="aa-body"></div></details>`;
+}
+
+/** One line for a collapsed Authorization row: level · scope · credentials · cards · budget. */
+function agentAuthoritySummary(authority, projects = S.projects) {
+  if (!authority) return '';
+  const parts = authority.authorization ? [authorizationSummary(authority.authorization, projects)] : [];
+  const credentials = (authority.credentialGrants || []).length;
+  if (credentials) parts.push(`${credentials} credential${credentials === 1 ? '' : 's'}`);
+  const payments = authority.paymentPolicy;
+  if (payments?.cardIds) parts.push(payments.cardIds.length ? `${payments.cardIds.length} card${payments.cardIds.length === 1 ? '' : 's'}` : 'no cards');
+  if (payments?.cardIds?.length && payments.budget !== undefined) parts.push(payments.budget === null ? 'no budget limit'
+    : `${fromMinorUnits(payments.budget, payments.currency || 'usd')} ${(payments.currency || 'usd').toUpperCase()}`);
+  return parts.join(' · ');
+}
+
+// The organization's vault items, shared by every block on a page for a moment.
+const vaultItemRequests = new Map();
+function vaultItemsFor(organizationId) {
+  const cached = vaultItemRequests.get(organizationId);
+  if (cached && cached.at > Date.now() - 30_000) return cached.request;
+  const request = api(`/api/vault/items${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`);
+  vaultItemRequests.set(organizationId, { at: Date.now(), request });
+  request.catch(() => vaultItemRequests.delete(organizationId));
+  return request;
+}
+
+function wireAgentBlock(root, ctx) {
+  if (!root) return;
+  ctx ||= {};
+  root._agentCtx = ctx;
+  wireAgentBox(root);
+  const instructions = root.querySelector('.ab-instructions');
+  if (instructions && typeof wireWikiMention === 'function') wireWikiMention(instructions, ctx.projectId || S.projectId);
+  const details = root.querySelector(':scope > .agent-authority[data-mode="agent"]');
+  if (details) wireAgentAuthority(details, ctx);
+}
+
+/** An agent's own authority editor (not the main agent's). Built on first open,
+ * so a page of untouched blocks costs nothing; changing anything in it makes
+ * the authority this agent's own, and "Same as …" hands it back. */
+function wireAgentAuthority(details, ctx) {
+  const prefix = details.dataset.prefix;
+  const body = details.querySelector('.aa-body');
+  const summary = details.querySelector('.aa-summary');
+  const label = details.dataset.label || 'Agent';
+  const projectId = ctx.projectId || S.projectId;
+  const organizationId = ctx.organizationId || S.projects.find((project) => project.id === projectId)?.organizationId || S.organizationId;
+  const projects = ctx.projects || S.projects.filter((project) => project.organizationId === organizationId);
+  const own = () => JSON.parse(details.dataset.authority || 'null');
+  const inherited = () => (ctx.inheritedAuthority?.() ?? JSON.parse(details.dataset.inherited || 'null')) || {};
+  let built = false;
+  let hydrating = false;
+  let ids = new Set();
+  let policies = {};
+  let items = [];
+  const explicit = () => details.dataset.explicit === '1';
+  const current = () => {
+    const base = inherited();
+    const mine = explicit() ? own() || {} : {};
+    return {
+      authorization: mine.authorization || base.authorization || { level: 'developer', scope: 'projects', projectIds: projectId ? [projectId] : [] },
+      credentialGrants: mine.credentialGrants || base.credentialGrants || [],
+      credentialPolicies: mine.credentialPolicies || (mine.credentialGrants ? {} : base.credentialPolicies) || {},
+      paymentPolicy: mine.paymentPolicy || base.paymentPolicy,
+    };
+  };
+  const read = () => {
+    if (!built) return own() || undefined;
+    const value = {
+      authorization: readAuthorizationEditor(details.querySelector('.authz-editor')),
+      credentialGrants: [...ids].sort().map((id) => `use-credential:item:${id}`),
+      credentialPolicies: Object.fromEntries(Object.entries(policies).filter(([id]) => ids.has(id))),
+    };
+    const payments = readTaskPayments(details.querySelector('.task-payments'));
+    if (payments) value.paymentPolicy = payments;
+    return value;
+  };
+  details._readAuthority = () => (explicit() ? read() : undefined);
+  const paint = () => {
+    summary.textContent = explicit() ? agentAuthoritySummary(read(), projects) : `Same as ${label}`;
+    const reset = details.querySelector('.aa-reset');
+    if (reset) reset.hidden = !explicit();
+    const count = details.querySelector('.tf-vault-count');
+    if (count && items) count.textContent = `${items.filter((item) => ids.has(item.id)).length} selected`;
+  };
+  const changed = () => {
+    if (hydrating) return;
+    details.dataset.explicit = '1';
+    details.dataset.authority = JSON.stringify(read());
+    paint();
+    details.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  const fill = () => {
+    const value = current();
+    hydrating = true;
+    ids = new Set(value.credentialGrants.filter((grant) => grant.startsWith('use-credential:item:')).map((grant) => grant.slice('use-credential:item:'.length)));
+    policies = structuredClone(value.credentialPolicies || {});
+    body.innerHTML = `${authorizationEditorHtml(`${prefix}-authorization`, value.authorization, projects, projectId)}
+      <div class="aa-resources">
+        <button type="button" class="btn tf-vault-button aa-vault" disabled title="Vault credentials this agent may use"><span>Vault credentials</span><span class="tf-vault-count">…</span></button>
+        ${taskPaymentsHtml(`${prefix}-payments`)}
+      </div>
+      <button type="button" class="btn sm aa-reset" hidden>↺ Same as ${esc(label)}</button>`;
+    wireAuthorizationEditor(body.querySelector('.authz-editor'), projects, changed);
+    const payments = body.querySelector('.task-payments');
+    wireTaskPayments(payments, projectId, value.paymentPolicy, undefined, organizationId);
+    payments.addEventListener('change', (event) => { if (event.target === payments || event.isTrusted) changed(); });
+    payments.addEventListener('input', changed);
+    body.querySelector('.aa-reset').addEventListener('click', () => {
+      details.dataset.explicit = '';
+      details.dataset.authority = 'null';
+      fill();
+      details.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const vault = body.querySelector('.aa-vault');
+    vaultItemsFor(organizationId).then((list) => {
+      if (!vault.isConnected) return;
+      items = list || [];
+      vault.disabled = false;
+      paint();
+    }).catch(() => vault.remove());
+    vault.addEventListener('click', () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => {
+      ids = new Set(selected);
+      policies = overrides;
+      changed();
+    }));
+    built = true;
+    hydrating = false;
+    paint();
+  };
+  details.addEventListener('toggle', () => {
+    // An untouched block always opens on what it currently inherits.
+    if (details.open && (!built || !explicit())) fill();
+  });
+}
+
+function readAgentBlock(root) {
+  const spec = readAgentSpec(root);
+  const details = root.querySelector(':scope > .agent-authority[data-mode="agent"]');
+  if (details && !spec.avatarId) {
+    const authority = details._readAuthority ? details._readAuthority()
+      : details.dataset.explicit === '1' ? JSON.parse(details.dataset.authority || 'null') : undefined;
+    if (authority) spec.authority = authority;
+  }
+  const instructions = root.querySelector('.ab-instructions')?.value ?? '';
+  if (instructions.trim()) spec.prompt = instructions;
+  return spec;
 }
 
 // Where a fork starts: the source's unpublished branch, or where the source
@@ -1306,12 +1525,10 @@ function readAgentSpec(box) {
 
 // The confirmer field: an ordered LIST of confirm layers, played sequentially at
 // the Review gate — each layer is a human confirmation or a review agent; zero
-// layers ⇒ auto-confirm. Layers can be added, removed and reordered; an agent
-// layer reuses the SAME agent sub-form as Do/Merge/Resolve (renderAgentField, so
-// provider/model/effort + "Fork a previous agent" all work identically) plus the
-// review-request prompt template — pre-filled with the built-in default
-// (f.promptDefault) and stored only when edited, so it keeps inheriting otherwise.
-// Legacy single-gate values ({mode:…}) are normalized to layers on read.
+// layers ⇒ auto-confirm. Layers can be added, removed and reordered. A layer is
+// one compact row (kind · who · ↑↓✕); an agent layer adds the same Agent block
+// as every other agent (harness, tools, fork, its own authority) with optional
+// Instructions. Legacy single-gate values ({mode:…}) are normalized on read.
 function cfLayersOf(v) {
   if (Array.isArray(v?.layers)) return v.layers;
   const mode = v?.mode || 'human';
@@ -1334,26 +1551,25 @@ function audienceComboHtml(className, audience, label) {
 function wireAudienceCombos(root) {
   root.querySelectorAll('.audience-combo').forEach((combo) => wireCombo(combo, humanAudienceOptions, null, { multiple: true }));
 }
+// An agent other than the main one: its block carries Instructions and its own
+// Authorization row (inheriting the main agent's until changed).
+const routeAgentBlock = (f, spec, inherited) =>
+  renderAgentField(f, spec, inherited, { instructions: true, authority: { label: 'Agent' } });
 function cfLayerHtml(f, layer, agentDefault) {
   const isAgent = layer.kind === 'agent';
-  const promptVal = (isAgent ? layer.prompt ?? f.promptDefault : f.promptDefault) || '';
   const audience = (layer.audience?.length ? layer.audience : ['@creator']).join(', ');
   return `<div class="cf-layer" data-kind="${esc(layer.kind)}">
-    <div class="cf-layer-head" style="display:flex;gap:8px;align-items:center">
-      <span class="cf-layer-num" style="font-size:11px;color:var(--ink-3);min-width:14px;text-align:right"></span>
-      <select class="cf-kind">${[['human', 'Human confirms'], ['agent', 'Agent reviews']].map(([k, l]) => `<option value="${k}" ${k === layer.kind ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
-      <span style="flex:1"></span>
-      <button type="button" class="btn sm cf-move" data-dir="-1" title="Move this step up">↑</button>
-      <button type="button" class="btn sm cf-move" data-dir="1" title="Move this step down">↓</button>
-      <button type="button" class="btn sm cf-del" title="Remove this step">✕</button>
+    <div class="cf-layer-head route-row">
+      <span class="cf-layer-num"></span>
+      <select class="cf-kind" aria-label="Review step">${[['human', 'Human confirms'], ['agent', 'Agent reviews']].map(([k, l]) => `<option value="${k}" ${k === layer.kind ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+      <div class="cf-human" ${isAgent ? 'hidden' : ''}>${audienceComboHtml('cf-audience', audience, 'Who confirms')}</div>
+      <span class="cf-layer-tools">
+        <button type="button" class="btn sm cf-move" data-dir="-1" title="Move this step up" aria-label="Move this step up">↑</button>
+        <button type="button" class="btn sm cf-move" data-dir="1" title="Move this step down" aria-label="Move this step down">↓</button>
+        <button type="button" class="btn sm cf-del" title="Remove this step" aria-label="Remove this step">✕</button>
+      </span>
     </div>
-    <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-      <div class="form-row"><span class="form-row-head">Who confirms ${policyTip('Separate people or teams with commas. Add steps for reviews in sequence.')}</span>${audienceComboHtml('cf-audience', audience, 'Who confirms')}</div>
-    </div>
-    <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review prompt ${policyTip('Sent at each review. Type [[ for wiki context. Variables: {{prompt}}, {{response}}, {{reviewInfo}}, {{changedFiles}}, {{transcript}}.')}</div>
-      <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
-    </div>
+    <div class="cf-agent" ${isAgent ? '' : 'hidden'}>${routeAgentBlock(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}</div>
   </div>`;
 }
 function cfListHtml(f, layers, agentDefault) {
@@ -1364,38 +1580,44 @@ function renderConfirmerField(f, own, inherited, alt) {
   const layers = cfLayersOf(own || inh);
   const agentDefault = inh.agentDefault || {};
   const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
-  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}' data-agent-default='${esc(JSON.stringify(agentDefault))}'>
+  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-agent-default='${esc(JSON.stringify(agentDefault))}'>
     <div class="cf-layers">${cfListHtml(f, layers, agentDefault)}</div>
-    <div class="cf-empty" style="font-size:12px;color:var(--ink-3);padding:2px 0;${layers.length ? 'display:none' : ''}">No reviewers — this task auto-confirms at Review.</div>
-    <button type="button" class="btn sm cf-add" style="margin-top:6px">+ Add a review step</button>
+    <div class="cf-empty" ${layers.length ? 'hidden' : ''}>Auto-confirms</div>
+    <button type="button" class="btn sm cf-add">+ Add step</button>
   </div>`;
 }
 
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 const normSpec = (s, inherited) => (s ? { avatarId: s.avatarId || '', provider: s.provider, model: s.model || '', effort: s.effort || '', mcpConnections: s.mcpConnections ?? inherited?.mcpConnections } : null);
+// Canonical shape of an agent's own authority, for changed-vs-inherited checks.
+function normAuthority(a) {
+  if (!a) return null;
+  const sortObject = (value) => Object.fromEntries(Object.entries(value || {}).sort(([x], [y]) => x.localeCompare(y)));
+  return {
+    authorization: a.authorization ? { level: a.authorization.level, scope: a.authorization.scope,
+      projectIds: a.authorization.scope === 'projects' ? [...(a.authorization.projectIds || [])].sort() : [] } : null,
+    credentialGrants: a.credentialGrants ? [...a.credentialGrants].sort() : null,
+    credentialPolicies: a.credentialPolicies ? sortObject(a.credentialPolicies) : null,
+    paymentPolicy: a.paymentPolicy ? { cardIds: a.paymentPolicy.cardIds ? [...a.paymentPolicy.cardIds].sort() : null,
+      budget: a.paymentPolicy.budget ?? null, currency: a.paymentPolicy.currency || null } : null,
+  };
+}
 // Canonical shape of a confirm layer for changed-vs-inherited comparison.
 const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
-      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null, mcpConnections: l.mcpConnections }
+      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: agentInstructions(l.prompt), resume: l.resumeFrom || null, mcpConnections: l.mcpConnections, authority: l.avatarId ? null : normAuthority(l.authority) }
       : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
 // Read a confirmer box's layer list back out of the DOM (the stored value shape).
 function readConfirmerLayers(box) {
-  const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
   return [...box.querySelectorAll('.cf-layer')].map((row) => {
     if (row.querySelector('.cf-kind')?.value !== 'agent') {
       const audience = (row.querySelector('.cf-audience')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
       return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
     }
-    const ab = row.querySelector('.agent-field');
-    const spec = { kind: 'agent', ...readAgentSpec(ab) };
-    // Store the review-request prompt only when it diverges from the built-in
-    // default; the pre-filled default itself is never persisted.
-    const prompt = row.querySelector('.cf-prompt')?.value ?? '';
-    if (prompt.trim() !== '' && prompt !== promptDefault) spec.prompt = prompt;
-    return spec;
+    return { kind: 'agent', ...readAgentBlock(row.querySelector('.agent-field')) };
   });
 }
 
@@ -1408,7 +1630,7 @@ function responderOf(v) {
 }
 function normResponder(route) {
   return route?.kind === 'agent'
-    ? { kind: 'agent', avatarId: route.avatarId || '', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null, mcpConnections: route.mcpConnections }
+    ? { kind: 'agent', avatarId: route.avatarId || '', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: agentInstructions(route.prompt), resume: route.resumeFrom || null, mcpConnections: route.mcpConnections, authority: route.avatarId ? null : normAuthority(route.authority) }
     : { kind: 'human', audience: route?.audience?.length ? [...route.audience] : ['@creator'] };
 }
 function renderResponderField(f, own, inherited, alt) {
@@ -1417,21 +1639,13 @@ function renderResponderField(f, own, inherited, alt) {
   const isAgent = route.kind === 'agent';
   const agentDefault = inh.agentDefault || {};
   const audience = (route.audience?.length ? route.audience : ['@creator']).join(', ');
-  const promptVal = (isAgent ? route.prompt ?? f.promptDefault : f.promptDefault) || '';
   const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
-  return `<div class="responder-field" data-responder="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}' data-agent-default='${esc(JSON.stringify(agentDefault))}'>
-    <div class="cf-layer" data-kind="${esc(route.kind)}">
-      <div class="cf-layer-head" style="display:flex;gap:8px;align-items:center">
-        <select class="cf-kind rf-kind"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
-      </div>
-      <div class="cf-human rf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-        <div class="form-row"><span class="form-row-head">Who responds ${policyTip('Separate people or teams with commas. Any selected person may answer.')}</span>${audienceComboHtml('cf-audience rf-audience', audience, 'Who responds')}</div>
-      </div>
-      <div class="cf-agent rf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}
-        <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Response prompt — sent whenever the task waits for input. Type [[ to add wiki context. Placeholders: {{title}}, {{prompt}}, {{question}}, {{transcript}}.</div>
-        <textarea class="cf-prompt rf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
-      </div>
+  return `<div class="responder-field" data-responder="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-agent-default='${esc(JSON.stringify(agentDefault))}'>
+    <div class="route-row">
+      <select class="cf-kind rf-kind" aria-label="Who responds"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
+      <div class="cf-human rf-human" ${isAgent ? 'hidden' : ''}>${audienceComboHtml('cf-audience rf-audience', audience, 'Who responds')}</div>
     </div>
+    <div class="cf-agent rf-agent" ${isAgent ? '' : 'hidden'}>${routeAgentBlock(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}</div>
   </div>`;
 }
 function readResponder(box) {
@@ -1439,12 +1653,8 @@ function readResponder(box) {
     const audience = (box.querySelector('.rf-audience')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
     return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
   }
-  const ab = box.querySelector('.agent-field');
-  const route = { kind: 'agent', ...readAgentSpec(ab) };
+  const route = { kind: 'agent', ...readAgentBlock(box.querySelector('.agent-field')) };
   if (route.avatarId) return { kind: 'human', audience: [`avatar:${route.avatarId}`] };
-  const prompt = box.querySelector('.rf-prompt')?.value ?? '';
-  const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
-  if (prompt.trim() !== '' && prompt !== promptDefault) route.prompt = prompt;
   return route;
 }
 
@@ -1680,7 +1890,7 @@ function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
   const names = new Map((projects || []).map((project) => [project.id, project.name]));
   const chips = selected.scope === 'organization' ? ['@organization'] : (selected.projectIds || []);
   return `<div class="authz-editor" id="${esc(id)}" data-authorization="${esc(JSON.stringify(selected))}">
-    <select class="authz-level-select" aria-label="Authorization level" aria-describedby="${esc(id)}-description">${(authorizationLevels().some((candidate) => candidate.id === level.id) ? authorizationLevels() : [...authorizationLevels(), level]).map((candidate) =>
+    <select class="authz-level-select" aria-label="Authorization level" aria-describedby="${esc(id)}-description" title="${esc(level.description || '')}">${(authorizationLevels().some((candidate) => candidate.id === level.id) ? authorizationLevels() : [...authorizationLevels(), level]).map((candidate) =>
       `<option value="${esc(candidate.id)}" ${candidate.id === selected.level ? 'selected' : ''}>${esc(candidate.name)}</option>`).join('')}</select>
     <p class="authz-description task-sub" id="${esc(id)}-description" aria-live="polite">${esc(level.description || "Custom capabilities in the selected scope.")}</p>
     ${authorizationWarningHtml(level)}
@@ -1817,6 +2027,7 @@ function wireAuthorizationEditor(root, projects, onChange) {
   const drawChips = () => {
     const description = root.querySelector('.authz-description');
     if (description) description.textContent = levelOf().description || 'Custom capabilities in the selected scope.';
+    levelSelect.title = levelOf().description || '';
     const warning = root.querySelector('.authz-warning');
     if (warning) warning.outerHTML = authorizationWarningHtml(levelOf());
     const selected = value.scope === 'organization' ? ['@organization'] : (value.projectIds || []);
@@ -2015,6 +2226,9 @@ function wireAgentBox(box) {
     const controls = box.querySelector('.agent-controls');
     const note = box.querySelector('.af-avatar-note');
     if (controls) controls.hidden = !!avatar;
+    // An Avatar acts with the authority its owner delegated to it.
+    const authority = box.querySelector(':scope > .agent-authority');
+    if (authority) authority.hidden = !!avatar;
     if (note) {
       note.hidden = !avatar;
       note.textContent = avatar ? `${avatar.purpose || 'Owner-controlled prompt and delegated authority'} · owned by ${avatarOwnerName(avatar)}` : '';
@@ -2204,10 +2418,13 @@ function wireAgentBox(box) {
   syncForkState();
   syncAvatar();
 }
-function wireAgentFields(root) {
-  root.querySelectorAll('.agent-field').forEach(wireAgentBox);
-  root.querySelectorAll('.confirmer-field').forEach(wireConfirmerField);
-  root.querySelectorAll('.responder-field').forEach(wireResponderField);
+// `ctx` is wireAgentBlock's: the project and organization whose vault items,
+// cards and projects the agents' Authorization rows offer.
+function wireAgentFields(root, ctx) {
+  ctx ||= {};
+  root.querySelectorAll('.confirmer-field').forEach((box) => wireConfirmerField(box, ctx));
+  root.querySelectorAll('.responder-field').forEach((box) => wireResponderField(box, ctx));
+  root.querySelectorAll('.agent-field').forEach((box) => { if (!box._agentCtx) wireAgentBlock(box, ctx); });
 }
 
 // Renumber the layer rows and toggle the "auto-confirm" empty state.
@@ -2215,24 +2432,16 @@ function cfSync(box) {
   const rows = [...box.querySelectorAll('.cf-layer')];
   rows.forEach((r, i) => { const n = r.querySelector('.cf-layer-num'); if (n) n.textContent = `${i + 1}.`; });
   const empty = box.querySelector('.cf-empty');
-  if (empty) empty.style.display = rows.length ? 'none' : '';
-}
-
-// Review-request prompts accept the same project/org wiki references as the task
-// prompt and follow-up composer. The resolver scans the rendered request when the
-// Confirm turn starts; wireWikiMention supplies search, decoration, and links.
-function wireConfirmerWikiPrompts(root) {
-  // Kept guarded for hosts upgrading from a build before wiki mentions existed;
-  // current builds always provide the shared picker.
-  if (typeof wireWikiMention !== 'function') return;
-  root.querySelectorAll('.cf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
+  if (empty) empty.hidden = !!rows.length;
 }
 
 // Confirmer fields: an editable layer list. Row controls are delegated to the box
 // so a reset (which re-renders the rows) needs no re-wiring; only dynamically
-// added agent sub-forms are wired as they appear.
-function wireConfirmerField(box) {
-  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+// added agent blocks are wired as they appear, with the field's context.
+function wireConfirmerField(box, ctx) {
+  ctx ||= {};
+  box._agentCtx = ctx;
+  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer') };
   const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
   const list = box.querySelector('.cf-layers');
   const changed = () => box.dispatchEvent(new Event('change', { bubbles: true }));
@@ -2262,39 +2471,38 @@ function wireConfirmerField(box) {
       const row = tpl.content.firstElementChild;
       if (kind === 'agent' && firstHuman) list.insertBefore(row, firstHuman);
       else list.appendChild(row);
-      row.querySelectorAll('.agent-field').forEach(wireAgentBox);
+      row.querySelectorAll('.agent-field').forEach((block) => wireAgentBlock(block, box._agentCtx));
       wireAudienceCombos(row);
-      wireConfirmerWikiPrompts(row);
       cfSync(box); changed();
     }
   });
-  // Kind flip: show the agent sub-form only for agent layers.
+  // Kind flip: show the agent block only for agent layers.
   box.addEventListener('change', (e) => {
     if (!e.target.classList?.contains('cf-kind')) return;
     const row = e.target.closest('.cf-layer');
     row.setAttribute('data-kind', e.target.value);
     const ab = row.querySelector('.cf-agent');
-    if (ab) ab.style.display = e.target.value === 'agent' ? '' : 'none';
+    if (ab) ab.hidden = e.target.value !== 'agent';
     const hb = row.querySelector('.cf-human');
-    if (hb) hb.style.display = e.target.value === 'human' ? '' : 'none';
+    if (hb) hb.hidden = e.target.value !== 'human';
   });
+  list.querySelectorAll('.agent-field').forEach((block) => wireAgentBlock(block, ctx));
   wireAudienceCombos(box);
-  wireConfirmerWikiPrompts(box);
   cfSync(box);
 }
 
-function wireResponderField(box) {
+function wireResponderField(box, ctx) {
+  ctx ||= {};
+  box._agentCtx = ctx;
   box.querySelector('.rf-kind')?.addEventListener('change', (event) => {
     const isAgent = event.target.value === 'agent';
     const agent = box.querySelector('.rf-agent');
     const human = box.querySelector('.rf-human');
-    if (agent) agent.style.display = isAgent ? '' : 'none';
-    if (human) human.style.display = isAgent ? 'none' : '';
+    if (agent) agent.hidden = !isAgent;
+    if (human) human.hidden = isAgent;
   });
+  box.querySelectorAll('.agent-field').forEach((block) => wireAgentBlock(block, ctx));
   wireAudienceCombos(box);
-  if (typeof wireWikiMention === 'function') {
-    box.querySelectorAll('.rf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
-  }
 }
 
 // Wire per-field "Reset to default" buttons: show the button whenever the field
@@ -2392,21 +2600,22 @@ function resetAgentField(box, attr = 'data-inherit') {
     picker.dataset.inherited = JSON.stringify(inh.mcpConnections ?? ['browser:chrome-devtools']);
     wireMcpPicker(picker, picker.dataset.scope);
   }
+  const authority = box.querySelector(':scope > .agent-authority[data-mode="agent"]');
+  if (authority?.dataset.explicit === '1') authority.querySelector('.aa-reset')?.click();
   avatar?.dispatchEvent(new Event('change', { bubbles: true }));
   box.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 function resetConfirmerField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
-  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer') };
   const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
   const list = box.querySelector('.cf-layers');
   // Re-render the rows from the inherited layers; row controls are delegated to
-  // the box, so only the fresh agent sub-forms need wiring.
+  // the box, so only the fresh agent blocks need wiring.
   list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
-  list.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  list.querySelectorAll('.agent-field').forEach((block) => wireAgentBlock(block, box._agentCtx));
   wireAudienceCombos(list);
-  wireConfirmerWikiPrompts(list);
   cfSync(box);
   // This composite control is rebuilt rather than assigned through an input.
   // Emit the same event as a user edit so draft auto-save persists the reset;
@@ -2416,14 +2625,13 @@ function resetConfirmerField(box, attr = 'data-inherit') {
 
 function resetResponderField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
-  const f = { role: box.getAttribute('data-responder'), name: box.getAttribute('data-responder'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+  const f = { role: box.getAttribute('data-responder'), name: box.getAttribute('data-responder') };
   const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
   const replacement = document.createElement('template');
   replacement.innerHTML = renderResponderField(f, responderOf(inh), { ...inh, agentDefault });
   const fresh = replacement.content.firstElementChild;
   box.innerHTML = fresh.innerHTML;
-  box.querySelectorAll('.agent-field').forEach(wireAgentBox);
-  wireResponderField(box);
+  wireResponderField(box, box._agentCtx);
   box.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
@@ -5801,8 +6009,7 @@ function triggersSection(values, selfId) {
   ).join('');
   return `
     <details class="advanced" style="margin-top:10px" ${existing.length ? 'open' : ''}>
-      <summary>Triggers — start this task after dependencies, on a schedule</summary>
-      <p class="task-sub" style="color:var(--ink-3);margin-top:0">When both are set, the task waits for its dependencies and the scheduled time. Leave empty to start immediately.</p>
+      <summary>Triggers ${policyTip('Start this task after other tasks finish, on a schedule, or both (it waits for all of them). Leave empty to start now.')}</summary>
       <div class="form-row">
         <div class="label-row"><label>Task dependencies</label></div>
         <div class="chip-input" id="dep-box">
@@ -5827,7 +6034,7 @@ function repeatableToggleHtml(values) {
   return `
     <div class="form-row repeat-row">
       <label class="repeat-toggle"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
-        <span><b>Repeatable</b> — each run is kept; a trigger (or “Run again”) spawns a fresh run instead of running once.</span>
+        <span><b>Repeatable</b> ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</span>
       </label>
     </div>`;
 }
@@ -6222,6 +6429,25 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // metadata (priority/tags, authorization, attempts, notes) lives in a sidebar.
   // Everything stays inside #tf-body so collect/auto-save wiring sees one form.
   const restFields = promptField ? fields.filter((f) => f.name !== promptField.name) : fields;
+  // The main column reads like the task it describes: the prompt, the agent
+  // that does it, who answers its questions, who reviews it, then where it runs
+  // and when it starts.
+  const agentRank = (f) => (f.type === 'agent' ? 0 : f.type === 'responder' ? 1 : f.type === 'confirmer' ? 2 : 3);
+  const agentFields = restFields.filter((f) => agentRank(f) < 3).sort((a, b) => agentRank(a) - agentRank(b));
+  const otherFields = restFields.filter((f) => agentRank(f) === 3);
+  const mainAgentField = agentFields.find((f) => f.type === 'agent' && (f.role || f.name) === 'do') || agentFields.find((f) => f.type === 'agent');
+  // The main agent acts with the task's own authority: its level and projects,
+  // vault credentials, cards and budget — the same API fields as always.
+  const mainAuthorityHtml = `<div class="form-row" data-row="__authorization">${authorizationEditorHtml('tf-authorization', selectedAuthorization, authorizationProjects, projectId)}</div>
+    <div class="aa-resources">
+      <div class="form-row" data-row="__vault"><button type="button" class="btn tf-vault-button" id="tf-vault-open" disabled
+        title="Credentials (site logins, API keys, SSH keys, .env bags) the agent may use. It can request more mid-task; you approve each request.">
+        <span>Vault credentials</span><span class="tf-vault-count" id="tf-vault-count">Loading…</span></button></div>
+      ${taskPaymentsHtml('tf-payments')}
+    </div>`;
+  const agentSectionHtml = (f) => f === mainAgentField
+    ? renderField(f, values[f.name], inherited[f.name], false, undefined, { authority: { html: mainAuthorityHtml, summary: authorizationSummary(selectedAuthorization, authorizationProjects) } })
+    : renderField(f, values[f.name], inherited[f.name]);
   root.innerHTML = `
     <div class="task-form-page" id="tf-page" tabindex="-1">
       <div class="tf-head">
@@ -6240,7 +6466,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         <div class="tf-columns parameter-fields" id="tf-body">
           <div class="tf-main">
             ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
-            ${restFields.length ? `<div class="section-h">Parameters</div>${renderFields(restFields, values, inherited)}` : ''}
+            ${agentFields.map((f) => `<section class="tf-section tf-${esc(f.type)}">${agentSectionHtml(f)}</section>`).join('')}
+            ${otherFields.length ? `<section class="tf-section tf-where">${renderFields(otherFields, values, inherited)}</section>` : ''}
             ${promptField ? '' : `<div class="form-row" data-row="__images">
               <div class="label-row"><label>Attachments</label></div>
               <div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
@@ -6255,25 +6482,13 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               <div class="label-row"><label>Priority &amp; tags</label></div>
               ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
             </div>
-            <div class="form-row" data-row="__authorization">
-              <div class="label-row"><label>Authorization</label></div>
-              ${authorizationEditorHtml('tf-authorization', selectedAuthorization, authorizationProjects, projectId)}
-            </div>
             ${['software-dev', 'goal'].includes(wf) ? `<div class="form-row" data-row="__github-merge" id="tf-github-merge" style="display:none"></div>` : ''}
             ${!draft ? `<div class="form-row tf-inline" data-row="__attempts" title="Attempts created here are queued together. Attempts added later start as editable drafts.">
               <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
             </div>` : ''}
-            <div class="form-row" data-row="__vault">
-              <button type="button" class="btn tf-vault-button" id="tf-vault-open" disabled
-                title="Choose which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Agents can request more mid-task; you approve each request.">
-                <span>Vault credentials</span>
-                <span class="tf-vault-count" id="tf-vault-count">Loading…</span>
-              </button>
-            </div>
-            ${taskPaymentsHtml("tf-payments")}
             <div class="form-row" data-row="__creds">
-              <div class="label-row"><label title="Drag to reorder, toggle to disable — for this task only.">Codex/Claude</label></div>
+              <div class="label-row"><label>Codex/Claude</label>${policyTip('Drag to reorder, toggle to disable — for this task only.')}<span class="label-row-fill"></span></div>
               <div id="cred-editor-newtask">Loading…</div>
             </div>
             <div class="form-row" data-row="__notes">
@@ -6291,7 +6506,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         </div>
       </div>
     </div>`;
-  wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
+  const mainPaymentsReady = wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
   const formKeyController = new AbortController();
   activeTaskFormKeyController = formKeyController;
   const releaseFormKeys = () => {
@@ -6329,7 +6544,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     }
   });
   $('#tf-close').addEventListener('click', () => closeForm());
-  wireAgentFields($('#tf-body'));
+  // The other agents' Authorization rows start from the main agent's, live.
+  const mainAuthority = () => ({
+    authorization: readAuthorizationEditor($('#tf-authorization')),
+    credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
+    credentialPolicies: vaultCredentialPolicies,
+    paymentPolicy: readTaskPayments($('#tf-payments')) ?? values.paymentPolicy,
+  });
+  wireAgentFields($('#tf-body'), { projectId, organizationId: projectOrganizationId, projects: authorizationProjects,
+    inheritedAuthority: mainAuthority });
   // "Start with this Avatar" is a one-shot seed for the new task form.
   S.pendingAvatarId = null;
   wireFieldResets($('#tf-body'), fields);
@@ -6432,7 +6655,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const localCred = !draft;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
-  wireAuthorizationEditor($('#tf-authorization'), authorizationProjects, () => autoSaveSoon());
+  // The main agent's collapsed Authorization row says what it holds.
+  const paintMainAuthority = () => {
+    const summary = $('#tf-authorization')?.closest('.agent-authority')?.querySelector('.aa-summary');
+    if (summary) summary.textContent = agentAuthoritySummary({ ...mainAuthority(),
+      credentialGrants: inheritedVault.error ? undefined : mainAuthority().credentialGrants }, authorizationProjects);
+  };
+  wireAuthorizationEditor($('#tf-authorization'), authorizationProjects, () => { paintMainAuthority(); autoSaveSoon(); });
+  $('#tf-payments')?.addEventListener('change', paintMainAuthority);
+  $('#tf-payments')?.addEventListener('input', paintMainAuthority);
   // The vault credential picker (wiki plans/PLAN-passwords §6): item grants layered onto
   // the authorization package. Keep selection in form-local state so the task
   // sidebar stays one compact button; the full checkbox list lives in a modal.
@@ -6452,8 +6683,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       vaultCredentialPolicies = policies;
       refreshVaultCount();
     },
-    changed: () => autoSaveSoon(),
+    changed: () => { paintMainAuthority(); autoSaveSoon(); },
   });
+  paintMainAuthority();
+  mainPaymentsReady.then(paintMainAuthority);
   (async () => {
     const button = $('#tf-vault-open');
     const count = $('#tf-vault-count');
@@ -6476,6 +6709,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       selected.forEach((id) => vaultGrantIds.add(id));
       vaultCredentialPolicies = policies;
       refreshCount();
+      paintMainAuthority();
       button.dispatchEvent(new Event('change', { bubbles: true }));
     }));
   })();
@@ -6570,7 +6804,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           draftId = created.id;
         } else {
           await Promise.all([
-            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) }),
+            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true }) }),
             api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
           ]);
           // Authorization is stored inside params, so it must follow the params
@@ -6639,7 +6873,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   closeForm = () => { clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st); leavePage(navigating); };
 
   let submitInFlight = false;
-  const submit = async (draftMode, authorizationDecision, activeFeedback) => {
+  // `accepted`: the agents (`do` is the main one) whose limited authorization
+  // the user chose to run with ("Use my authorization").
+  const submit = async (draftMode, accepted = [], activeFeedback) => {
     const ownsFeedback = !activeFeedback;
     if (ownsFeedback && submitInFlight) return false;
     const submitButtons = [$('#tf-draft'), $('#tf-queue')].filter(Boolean);
@@ -6668,14 +6904,18 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       let knownDraftAttemptIds = [];
       const authorizationOptions = {
         ...(draftMode ? { allowAttenuation: true } : {}),
-        ...(authorizationDecision === 'limit' ? { acceptAttenuation: true } : {}),
+        ...(accepted.includes('do') ? { acceptAttenuation: true } : {}),
       };
+      // Agents other than the main one carry their authority in their specs.
+      const agentAccepted = accepted.filter((key) => key !== 'do');
+      const paramsOptions = { ...(draftMode ? { allowAttenuation: true } : {}), ...(agentAccepted.length ? { acceptAttenuation: agentAccepted } : {}) };
+      const createOptions = { ...(draftMode ? { allowAttenuation: true } : {}), ...(accepted.length ? { acceptAttenuation: accepted } : {}) };
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
         // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await Promise.all([
-          api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) }),
+          api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode, ...paramsOptions }) }),
           api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
         ]);
         await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, ...authorizationOptions }) });
@@ -6683,9 +6923,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         // The usual expanded-form path was just persisted by auto-save. Do not
         // spend another RTT writing identical params and notes before queueing.
-        if (!currentStateAlreadySaved) {
+        // Accepting an agent's limited authority is recorded with its params.
+        if (!currentStateAlreadySaved || agentAccepted.length) {
           await Promise.all([
-            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) }),
+            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true, ...paramsOptions }) }),
             api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
           ]);
         }
@@ -6703,13 +6944,13 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount, allowAttenuation: true, ...authorizationOptions }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount, ...createOptions, allowAttenuation: true }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount, ...authorizationOptions }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount, ...createOptions }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -6764,10 +7005,14 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     } catch (e) {
       if (!draftMode && isAuthorizationGrantGap(e)) {
         try {
-          const decision = await chooseAuthorizationGrant(projectId, st.authorization, 'task agent');
+          // The refusal names the agent whose authority exceeds the user's (`do`,
+          // or absent, is the main agent): ask about exactly that one.
+          const participant = e.participant && e.participant !== 'do' ? e.participant : null;
+          const decision = await chooseAuthorizationGrant(projectId, participant ? e.authorization || st.authorization : st.authorization,
+            participant ? agentParticipantLabel(participant) : 'task agent');
           if (!decision) return false;
           if (decision.action === 'limit') {
-            succeeded = await submit(false, 'limit', activeFeedback);
+            succeeded = await submit(false, [...new Set([...accepted, participant || 'do'])], activeFeedback);
             return succeeded;
           }
           let targetId = draftId || draft?.id;
@@ -6779,6 +7024,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
             }) });
             targetId = draftId = created.id;
           } else {
+            await api(`/api/tasks/${targetId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true }) });
             await api(`/api/tasks/${targetId}/authorization`, { method: 'PATCH', body: JSON.stringify({
               authorization: st.authorization, credentialGrants: st.credentialGrants,
               credentialPolicies: st.credentialPolicies, allowAttenuation: true,
@@ -6787,8 +7033,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               await api(`/api/tasks/${targetId}/attempts`, { method: 'POST', body: '{}' });
           }
           await api(`/api/authorization-requests?projectId=${encodeURIComponent(projectId)}`, { method: 'POST', body: JSON.stringify({
-            projectId, target: { kind: 'task', taskId: targetId, queueAfterApproval: true },
-            authorization: st.authorization, audience: decision.audience, reason: decision.reason,
+            projectId, target: { kind: 'task', taskId: targetId, queueAfterApproval: true, ...(participant ? { participant } : {}) },
+            authorization: participant ? e.authorization || st.authorization : st.authorization, audience: decision.audience, reason: decision.reason,
           }) });
           releaseFormKeys();
           root.innerHTML = '';

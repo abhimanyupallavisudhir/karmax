@@ -457,11 +457,12 @@ function projectPrincipalFromBody(value: unknown, organizationId: string): Proje
 
 /** What a refused grant tells the client: which agent, so the console can ask
  * about exactly that one (`chooseAuthorizationGrant`). */
-function grantRefusal(e: unknown): { code?: string; participant?: string } {
-  const error = e as { code?: unknown; participant?: unknown } | undefined;
+function grantRefusal(e: unknown): { code?: string; participant?: string; authorization?: AuthorizationSelection } {
+  const error = e as { code?: unknown; participant?: unknown; authorization?: AuthorizationSelection } | undefined;
   return {
     ...(error?.code ? { code: String(error.code) } : {}),
-    ...(typeof error?.participant === 'string' ? { participant: error.participant } : {}),
+    ...(typeof error?.participant === 'string' ? { participant: error.participant,
+      ...(error.authorization ? { authorization: error.authorization } : {}) } : {}),
   };
 }
 

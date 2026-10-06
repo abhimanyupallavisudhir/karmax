@@ -33,9 +33,9 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // each a human confirmation or a review agent; zero layers ⇒ auto-confirm.
 // Unlike the agent fields it spans all scopes (task/project/global) so the layer
 // list has the usual default-inheritance; an agent layer carries the same agent
-// knobs (provider/model/effort/fork) as the Do/Merge fields, PLUS the
-// review-request prompt template (pre-filled with `promptDefault`, editable per
-// task/project/global).
+// knobs (provider/model/effort/tools/fork/authority) as the Do field, PLUS
+// optional instructions for that agent (`prompt`; the old pre-filled request
+// template is `legacyPrompt`, so forms can show a stored copy of it as empty).
 // `untilUsed`: the route is consumed by the gate it drives, not by queueing — so
 // it stays editable in-flight right up to the moment Review passes (SPEC §4.5/§5.5).
 // That is exactly when re-routing is useful ("actually, have Bob look at this"),
@@ -43,7 +43,7 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // reaching Review while someone is mid-edit now simply picks up the saved route.
 // The workflows re-read the layers at every gate iteration and replay the gate
 // from its first layer when the route changes under them.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, promptDefault: CONFIRM_PROMPT_DEFAULT, mutable: 'untilUsed' });
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, legacyPrompt: CONFIRM_PROMPT_DEFAULT, mutable: 'untilUsed' });
 // Ordinary input pauses have one responder, not a chain of approval gates. The
 // control intentionally mirrors one Review-route row (human audience or agent +
 // prompt) while forbidding zero/multiple steps: a question must have an owner.
@@ -51,7 +51,7 @@ const responderField = (): FieldSpec => ({
   name: 'responder', type: 'responder', label: 'Responder',
   help: 'Who answers when the working agent pauses at Needs input. Choose a person/team or an agent. Review and protected authorization gates keep their own routes.',
   scopes: ALL, bind: 'responder', role: 'responder',
-  default: { kind: 'human', audience: ['@creator'] }, promptDefault: RESPOND_PROMPT_DEFAULT,
+  default: { kind: 'human', audience: ['@creator'] }, legacyPrompt: RESPOND_PROMPT_DEFAULT,
   // A task can ask for ordinary input more than once, so there is no first-use
   // point after which this route becomes load-bearing forever. Keep it live until
   // the workflow's point of no return; an edit also reroutes a pause already open.

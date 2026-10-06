@@ -46,10 +46,10 @@ const root = __dirname;
       S.tasks = [record]; S.projects = [{ id: 'p1', slug: 'project', name: 'Project', organizationId: 'o1', config: {} }];
       S.projectId = 'p1'; S.organizationId = 'o1'; S.organizations = [{ id: 'o1', slug: 'test' }];
       S.meta = { workflows: [] };
-      S.schema = [{ name: 'software-dev', params: [{ name: 'confirmer', label: 'Review', type: 'confirmer', scopes: ['task'], promptDefault: 'Review carefully' }] }];
+      S.schema = [{ name: 'software-dev', params: [{ name: 'confirmer', label: 'Review', type: 'confirmer', scopes: ['task'], legacyPrompt: 'Review carefully' }] }];
       await openTask('fixture', 'parameters');
     }, { record });
-    const textarea = page.locator('.cf-prompt');
+    const textarea = page.locator('.ab-instructions');
     await textarea.waitFor({ state: 'visible' });
     await page.evaluate(() => window.parameterTest.refreshTask());
     // Even a pristine focused control must remain connected on refresh.

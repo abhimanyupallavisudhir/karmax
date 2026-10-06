@@ -1430,9 +1430,10 @@ export interface FieldSpec {
   bind: FieldBind;
   /** For agent, confirmer, and responder fields — the role this configures. */
   role?: string;
-  /** For confirmer/responder fields — the default auxiliary-agent prompt template
-   *  the form pre-fills (and inherits back to on reset) when none is stored. */
-  promptDefault?: string;
+  /** For confirmer/responder fields — the request template forms used to pre-fill
+   *  before an agent's prompt became its optional instructions. A stored prompt
+   *  equal to it is not instructions: forms show it empty. */
+  legacyPrompt?: string;
   /** In-flight editability window (SPEC §4.5/§5.5). Omitted ⇒ `queue`. */
   mutable?: FieldMutable;
 }

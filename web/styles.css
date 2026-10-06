@@ -3080,3 +3080,66 @@ html[data-theme="dark"] .github-signin-btn:active,
 .storage-project { padding: 6px 0; border-top: 1px solid var(--line); }
 .storage-project .storage-item { padding-left: 14px; font-size: .92em; color: var(--ink-2); }
 .storage-project .storage-item > span:first-child { flex: 1; }
+
+/* ── The Agent block (task form, Task defaults, Parameters, New agent…) ─────
+   One compact control per agent: Instructions (agents other than the main one),
+   harness · model · effort, Tools, Fork, and a collapsed Authorization row. */
+.label-row:has(.label-row-fill) label { flex: 0 1 auto; }
+.label-row-fill { flex: 1; }
+.agent-block { display: grid; gap: 8px; }
+.agent-block > .mcp-picker { margin: 0; }
+.agent-block .ab-instructions { width: 100%; min-height: 44px; resize: vertical; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font: inherit; font-size: 13px; }
+.agent-block .ab-instructions:focus { border-color: var(--accent); outline: none; }
+.agent-block .af-resume-toggle { margin: 0; }
+.agent-authority { border-top: 1px dashed var(--line); padding-top: 6px; min-width: 0; }
+.agent-authority[hidden] { display: none; }
+.agent-authority > summary {
+  display: flex; align-items: baseline; gap: 10px; cursor: pointer; list-style: none;
+  font-size: 12px; color: var(--ink-2); user-select: none; padding: 2px 0;
+}
+.agent-authority > summary::-webkit-details-marker { display: none; }
+.agent-authority > summary::before { content: '▸'; color: var(--ink-3); font-size: 10px; width: 8px; transition: transform .12s; }
+.agent-authority[open] > summary::before { transform: rotate(90deg); }
+.agent-authority .aa-title { font-weight: 600; }
+.agent-authority .aa-summary { color: var(--ink-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-authority .aa-body { display: grid; gap: 8px; padding: 8px 0 2px 18px; }
+.agent-authority .aa-body > .form-row { margin: 0; padding: 0; }
+/* Level and projects side by side; the explanation is the select's tooltip. */
+.agent-authority .authz-editor { grid-template-columns: minmax(150px, .8fr) minmax(0, 1.6fr); align-items: start; }
+.agent-authority .authz-description { display: none; }
+.agent-authority .authz-warning { grid-column: 1 / -1; }
+.agent-authority .aa-resources { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.agent-authority .aa-resources > .form-row { margin: 0; padding: 0; }
+.agent-authority .tf-vault-button { width: auto; gap: 10px; min-height: 36px; }
+.agent-authority .aa-resources { flex-wrap: nowrap; }
+/* Vault · Cards · Budget on one line: the payment controls join the row. */
+.agent-authority .aa-resources > .task-payments { display: contents; }
+.agent-authority .payment-cards-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.agent-authority .payment-picker { flex: 1 1 160px; min-width: 140px; }
+.agent-authority .payment-budget { width: 90px; }
+@media (max-width: 700px) { .agent-authority .aa-resources { flex-wrap: wrap; } }
+.agent-authority .aa-reset { justify-self: start; }
+@media (max-width: 700px) { .agent-authority .authz-editor { grid-template-columns: 1fr; } }
+
+/* Responder and Review-route rows: kind · who on one line. */
+.route-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.route-row > select { flex: 0 0 auto; width: auto; }
+.route-row > .cf-human { flex: 1 1 auto; min-width: 0; }
+.route-row .cf-layer-num { font-size: 11px; color: var(--ink-3); min-width: 14px; text-align: right; }
+.route-row .cf-layer-tools { display: inline-flex; gap: 4px; margin-left: auto; }
+.cf-human[hidden], .cf-agent[hidden], .cf-empty[hidden] { display: none; }
+.confirmer-field .cf-layer { padding: 8px 10px; }
+.confirmer-field .cf-agent, .responder-field .cf-agent { margin-top: 8px; }
+.confirmer-field .cf-agent { margin-left: 22px; }
+.cf-empty { font-size: 12px; color: var(--ink-3); padding: 2px 0 6px; }
+
+/* Task form main column: one section per agent, then where/when it runs. */
+.tf-main > .tf-section { padding: 16px 0 4px; border-top: 1px solid var(--line); margin-top: 14px; }
+.tf-main > .tf-section > .form-row { margin-bottom: 8px; }
+/* Inside a form row the generic input rules would box the cards search again. */
+.agent-authority .task-payments .payment-search { border: 0; background: transparent; box-shadow: none; padding: 5px; min-height: 0; height: auto; }
+.agent-authority .payment-budget-row { flex-wrap: nowrap; }
+.agent-authority .payment-budget-row label { white-space: nowrap; }
+.agent-authority .payment-budget { height: 36px; }
+/* A Reviewer's block sits inside its layer card; one frame is enough. */
+.parameter-fields .cf-layer .agent-field { border: 0; padding: 0; background: none; }
