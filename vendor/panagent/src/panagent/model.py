@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
-from pathlib import Path
 
 from .errors import FormatError
 
 SCHEMA = "https://panagent.dev/schema/conversation/v1"
 ROLES = {"system", "developer", "user", "assistant", "tool"}
 BLOCK_TYPES = {"text", "code", "reasoning", "tool_call", "tool_result", "image", "attachment"}
+# Source kinds that are visible snapshots of a web chat rather than an agent's own
+# history. Native targets receive them as one guarded context message by default.
+SNAPSHOT_KINDS = {"public-share-snapshot", "browser-rendered-export", "browser-export", "account-export"}
 
 
 def utc_now() -> str:
@@ -34,7 +38,9 @@ def new_conversation(
         "acquired_at": utc_now(),
     }
     if source_uri:
-        source["uri"] = Path(source_uri).name if source_uri.startswith(("/", "file://")) else source_uri
+        # Keep web URLs; reduce local paths to a file name so host paths never leak into exports.
+        is_web = urlparse(source_uri).scheme in {"http", "https"}
+        source["uri"] = source_uri if is_web else re.split(r"[\\/]", source_uri)[-1]
     if conversation_id:
         source["conversation_id"] = conversation_id
     return {
@@ -109,6 +115,11 @@ def normalize_timestamp(value: str | float | int | None) -> str | None:
 
 def text_block(text: Any) -> dict[str, Any]:
     return {"type": "text", "text": str(text)}
+
+
+def default_mode(conv: dict[str, Any]) -> str:
+    """How a native target should receive this conversation unless told otherwise."""
+    return "context" if conv.get("source", {}).get("kind") in SNAPSHOT_KINDS else "transcript"
 
 
 def validate_conversation(value: Any) -> dict[str, Any]:

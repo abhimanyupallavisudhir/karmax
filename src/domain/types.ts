@@ -1496,7 +1496,7 @@ export interface AgentSpec {
   resumeFrom?: {
     taskId?: string;
     role?: string;
-    /** A public chatgpt.com/share / claude.ai/share URL, or a native provider id
+    /** A public chatgpt.com/share, claude.ai/share or tavya share URL, or a native provider id
      * when the Karmax console is host-local. */
     sessionId?: string;
     upload?: {
