@@ -119,6 +119,8 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
 
     // A stored copy of the old request template is not instructions.
     await page.locator('#tf-close').click();
+    // Lists open on For me; this draft has no creator, so it is under All.
+    await page.locator('.views-bar [data-view="__all__"]').click();
     await page.locator('#main').getByText('Legacy', { exact: true }).first().click();
     await expect.poll(() => page.locator('#tf-body .responder-field .ab-instructions').inputValue()).toBe('');
     expect(errors).toEqual([]);
