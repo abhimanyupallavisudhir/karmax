@@ -72,7 +72,7 @@ import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from 
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
-import { assertAgentSpec, selectableAvatar } from './agent-params.js';
+import { assertAgentSpec } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
 import { MAIN_AGENT, isParticipantKey, participantLabel } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';

@@ -34,7 +34,7 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
   const client = { workflow: { getHandle: () => ({ query: async () => [] }), start: async () => ({}) } } as any;
   const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: dir });
   // A draft saved when the Responder's prompt was still the pre-filled template.
-  const legacy = await store.createTask({ projectId: project.id, title: 'Legacy', workflow: 'software-dev', workflowVersion: '1.26.0',
+  await store.createTask({ projectId: project.id, title: 'Legacy', workflow: 'software-dev', workflowVersion: '1.26.0',
     params: { prompt: 'Legacy', draft: true, responder: { kind: 'agent', provider: 'mock', prompt: RESPOND_PROMPT_DEFAULT } } });
   const gateway = await Gateway.create({ store, tokens, worlds, client, api, bus: new KarmaxBus(),
     contributions: new ContributionRegistry(), overlays: new Overlays(), taskQueue: 'test', staticDir: path.resolve('web'),
@@ -64,7 +64,7 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
     // The task's own authority lives in the main Agent block, collapsed; the
     // sidebar keeps only organization metadata and logins.
     const main = body.locator('.tf-agent .agent-authority');
-    expect(await main.evaluate((el: HTMLDetailsElement) => el.open)).toBe(false);
+    expect(await main.evaluate((el) => (el as unknown as { open: boolean }).open)).toBe(false);
     expect(await main.locator('#tf-authorization, #tf-vault-open, #tf-payments').count()).toBe(3);
     expect(await page.locator('.tf-side').locator('#tf-authorization, #tf-vault-open, #tf-payments').count()).toBe(0);
     expect(await page.locator('.tf-side [data-row]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-row'))))

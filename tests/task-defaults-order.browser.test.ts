@@ -62,7 +62,7 @@ for (const scope of ['project', 'global'] as const) {
       expect(await card.locator('[data-field="remote"]').count()).toBe(1);
       // The authorization, vault and payment defaults are the default Agent's.
       const authority = card.locator('[data-profile] .agent-authority');
-      expect(await authority.evaluate((el: HTMLDetailsElement) => el.open)).toBe(false);
+      expect(await authority.evaluate((el) => (el as unknown as { open: boolean }).open)).toBe(false);
       expect(await authority.locator('[data-resource-defaults] .authz-editor, .resource-vault, .task-payments').count()).toBe(3);
       await expect.poll(() => authority.locator('.aa-summary').textContent()).toContain('1 credential');
 
