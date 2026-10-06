@@ -5801,7 +5801,12 @@ function openFilterPicker(fieldKey, onAdd) {
 // `defaults` are the facets hidden unless the query mentions them (the list's
 // transparent -is:archived -is:run treatment, parameterized per caller — the
 // fork search deliberately keeps archived tasks in).
+// Forking may start from any project the organization can read: the agent
+// picker searches organization-wide, starting at `project:<this project>` so
+// deleting that one token widens it.
 function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'run'], exclude, onPick }) {
+  const organizationWide = mode === 'agent' && !!S.organizationId;
+  const ownProject = organizationWide ? projectById(S.projectId) : undefined;
   const root = $('#modal-root');
   const host = document.createElement('div');
   root.appendChild(host);
@@ -5824,7 +5829,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   let closed = false;
   let selection = 0; // ignore agent lookups after closing, searching or choosing another task
   const close = () => { closed = true; selection++; host.remove(); };
-  let q = '';
+  let q = organizationWide && ownProject ? `project:${projectSlug(ownProject)}` : '';
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
   const sessions = new Map(); // taskId → [{ task: exact attempt, sessions: role→session }]
@@ -5866,7 +5871,9 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     const epoch = ++runEpoch;
     let next;
     try {
-      next = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`);
+      next = await api(organizationWide
+        ? `/api/organizations/${encodeURIComponent(S.organizationId)}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`
+        : `/api/projects/${S.projectId}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`);
     } catch { next = { tasks: [] }; }
     if (epoch !== runEpoch) return; // a newer query (a click after a slow keystroke) already owns the list
     result = next;
@@ -5883,7 +5890,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
       <span class="status-dot ${status}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}</div>
-        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
+        <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectChip(t) : ''}<span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
     </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
@@ -5986,6 +5993,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   $('#pk-scrim', host).addEventListener('click', (e) => { if (e.target.id === 'pk-scrim') close(); });
   $('#pk-close', host).addEventListener('click', close);
 
+  search.value = q;
   paintControls();
   run();
   search.focus();

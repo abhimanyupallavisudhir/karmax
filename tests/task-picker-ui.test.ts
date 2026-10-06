@@ -79,3 +79,38 @@ describe('tag chips in the task picker', () => {
     await ui.close();
   });
 });
+
+// Forking is not confined to the open project: the agent picker searches the
+// organization, starting at `project:<this project>`; clearing that token
+// reaches every project, whose rows say where they are.
+describe('fork picker across projects', () => {
+  it('starts at this project and widens to the organization', async () => {
+    const queries: string[] = [];
+    const projects = [{ id: 'p', organizationId: 'o', name: 'Workspace', config: {} }, { id: 'q', organizationId: 'o', name: 'Website', config: {} }];
+    const ui = await consolePage({ path: '/org/workspace', api: signedIn(({ method, path }) => {
+      const pathname = path.split('?')[0];
+      if (method === 'GET' && pathname === '/api/organizations/o/search') {
+        const q = new URL(`http://x${path}`).searchParams.get('q') || '';
+        queries.push(q);
+        return { tasks: [
+          { id: 'task_p', num: 1, projectId: 'p', title: 'Here', workflow: 'software-dev', params: {}, lastView: { status: 'done' } },
+          ...(q.includes('project:workspace') ? [] : [{ id: 'task_q', num: 2, projectId: 'q', title: 'Elsewhere', workflow: 'software-dev', params: {}, lastView: { status: 'done' } }]),
+        ] };
+      }
+      return undefined;
+    }, { projects }) });
+    await ui.run('boot()');
+    await ui.page.locator('#main').waitFor();
+    await ui.run(`openTaskPicker({ title: 'Fork a previous agent', mode: 'agent', defaults: ['run'], onPick: () => {} })`);
+    const search = ui.page.locator('#pk-search');
+    await expect.poll(() => search.inputValue()).toBe('project:workspace');
+    await ui.page.locator('#pk-list .pick-row').filter({ hasText: 'Here' }).waitFor();
+    expect(queries[0]).toContain('project:workspace');
+    await search.fill('');
+    const elsewhere = ui.page.locator('#pk-list .pick-row').filter({ hasText: 'Elsewhere' });
+    await elsewhere.waitFor();
+    expect(await elsewhere.locator('.task-project').innerText()).toBe('Website');
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+});
