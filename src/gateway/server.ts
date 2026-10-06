@@ -59,6 +59,8 @@ import { withTimeout } from '../util/timeout.js';
 import { AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
+import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
+import { WorkspaceConflict } from '../world/resources.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
@@ -314,6 +316,13 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/explanation-settings$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
+  // The tavya CLI (wiki planned/tavya-cli). Grants to read a resource are a
+  // read, whatever the method; saving one is a settings write (or a task edit).
+  if (/^\/api\/projects\/[^/]+\/workspace$/.test(p)) return 'repository:read';
+  if (/^\/api\/projects\/[^/]+\/secrets\/values$/.test(p)) return 'project:secret:use';
+  if (/^\/api\/projects\/[^/]+\/resources\/[^/]+\/read-grant$/.test(p)) return 'project:settings:read';
+  if (/^\/api\/tasks\/[^/]+\/workspace$/.test(p) || /^\/api\/tasks\/[^/]+\/resources\/[^/]+\/read-grant$/.test(p)) return 'task:read';
+  if (/^\/api\/tasks\/[^/]+\/resources\/[^/]+\/append-grant$/.test(p) || /^\/api\/tasks\/[^/]+\/import-local$/.test(p)) return 'task:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources|checkout)(?:\/|$)/.test(p))
     return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/github-merge-eligibility$/.test(p)) return 'project:read';
@@ -2080,6 +2089,7 @@ export class Gateway {
       return this.json(res, 200, {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
+        cli: { minVersion: MIN_CLI_VERSION },
         ...(consoleRevision ? { consoleRevision } : {}),
         timingEnabled: (await this.cachedTimingEnabled()),
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
@@ -4654,6 +4664,59 @@ export class Gateway {
           }
         }
       }
+      const projectWorkspace = p.match(/^\/api\/projects\/([^/]+)\/workspace$/);
+      if (projectWorkspace && method === 'GET') {
+        try { return this.json(res, 200, await this.workspaces().project(projectWorkspace[1]!)); }
+        catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const secretValues = p.match(/^\/api\/projects\/([^/]+)\/secrets\/values$/);
+      if (secretValues && method === 'POST') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const body = await this.body(req);
+        const names = Array.isArray(body.names) ? body.names.map(String) : undefined;
+        res.setHeader('cache-control', 'no-store');
+        try { return this.json(res, 200, { secrets: await this.deps.resources.workspaceSecretValues(secretValues[1]!, actorPrincipal(callerIdentity.actor), names) }); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const workspaceGrant = p.match(/^\/api\/(projects|tasks)\/([^/]+)\/resources\/([^/]+)\/(read|append)-grant$/);
+      if (workspaceGrant && method === 'POST') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const [, kind, scopeId, attachmentId, access] = workspaceGrant;
+        // A project's append grant is a settings write (routeCapability); a task's is
+        // only for the task's own world, so only resources a task may write.
+        const projectId = kind === 'projects' ? scopeId! : (await store.getTask(scopeId!))?.projectId;
+        const attachment = await store.getResourceAttachment(attachmentId!);
+        if (!attachment || !projectId || attachment.projectId !== projectId) return this.json(res, 404, { error: 'resource not found' });
+        if (kind === 'tasks' && access === 'append' && attachment.access !== 'write')
+          return this.json(res, 403, { error: `resource "${attachment.name}" is read-only in tasks` });
+        const body = await this.body(req);
+        try {
+          const revisionId = typeof body.revisionId === 'string' ? body.revisionId
+            : kind === 'tasks' && access === 'read' ? await this.deps.resources.workspaceRevision(attachment, scopeId) : undefined;
+          res.setHeader('cache-control', 'no-store');
+          return this.json(res, 200, await this.deps.resources.workspaceGrant(attachment.id, { access: access as 'read' | 'append',
+            ...(revisionId ? { revisionId } : {}), ...(typeof body.baseRevisionId === 'string' ? { baseRevisionId: body.baseRevisionId } : {}),
+            publicUrl: this.publicUrl(req) }));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const workspaceRevision = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/revisions$/);
+      if (workspaceRevision && method === 'POST') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const attachment = await store.getResourceAttachment(workspaceRevision[2]!);
+        if (!attachment || attachment.projectId !== workspaceRevision[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (stagedResourceCandidate(attachment)) return this.json(res, 409, { error: 'staged resource candidates cannot be modified before Review' });
+        const body = await this.body(req);
+        if (typeof body.snapshot !== 'string') return this.json(res, 400, { error: 'snapshot is required' });
+        try {
+          const adopted = await this.deps.resources.adoptWorkspaceSnapshot(attachment.id, body.snapshot,
+            typeof body.baseRevisionId === 'string' ? body.baseRevisionId : null, actorPrincipal(callerIdentity.actor));
+          return this.json(res, 200, { unchanged: adopted.unchanged, revision: redactResourceRevision(adopted.revision) });
+        } catch (error) {
+          if (error instanceof WorkspaceConflict)
+            return this.json(res, 409, { error: error.message, code: 'resource_changed', currentRevisionId: error.currentRevisionId });
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       const projectCheckout = p.match(/^\/api\/projects\/([^/]+)\/checkout$/);
       if (projectCheckout && method === 'GET') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
@@ -5188,6 +5251,24 @@ export class Gateway {
         // A path into this install's checkout only means something to the machine it lives on.
         const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/tavya.js', import.meta.url))] : [BRAND];
         return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
+      }
+      const taskWorkspace = p.match(/^\/api\/tasks\/([^/]+)\/workspace$/);
+      if (taskWorkspace && method === 'GET') {
+        try { return this.json(res, 200, await this.workspaces().task(taskWorkspace[1]!)); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const importLocal = p.match(/^\/api\/tasks\/([^/]+)\/import-local$/);
+      if (importLocal && method === 'POST') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        const taskId = importLocal[1]!;
+        const body = await this.body(req);
+        const resources = Array.isArray(body.resources) ? body.resources
+          .filter((entry: any) => typeof entry?.id === 'string' && typeof entry?.snapshot === 'string')
+          .map((entry: any) => ({ id: String(entry.id), snapshot: String(entry.snapshot) })) : [];
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
+        if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
+        try { return this.json(res, 200, await this.deps.handoffs.importLocal(taskId, view, { git: body.git !== false, resources })); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
       if (checkoutMatch && method === 'GET') {
@@ -9093,6 +9174,11 @@ export class Gateway {
    *  sandbox or a container) rather than on this host? */
   private agentRunsInWorld(handle: WorldHandle): boolean {
     return handle.kind === 'container' || worldHandleIsRemote(handle) || !!this.deps.worlds.get(handle.kind)?.capabilities?.remote;
+  }
+
+  private workspaceService?: WorkspaceService;
+  private workspaces(): WorkspaceService {
+    return this.workspaceService ??= new WorkspaceService(this.deps.store, this.deps.resources, this.deps.handoffs);
   }
 
   private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {

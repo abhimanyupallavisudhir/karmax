@@ -22,7 +22,7 @@ export const CAPABILITIES = [
   'task:event:read', 'task:git:publish', 'task:git:import', 'task:review:write', 'task:review:execute', 'review:approve',
   'task:assign', 'task:subscribe', 'task:manage-own',
   'project:read', 'project:create', 'project:edit', 'project:delete',
-  'project:settings:read', 'project:settings:write',
+  'project:settings:read', 'project:settings:write', 'project:secret:use',
   'project:transfer-out', 'project:transfer-in',
   'project:resource:shared-write',
   'organization:read', 'organization:create', 'organization:edit', 'organization:delete', 'organization:wiki:write',
@@ -50,7 +50,7 @@ export const ORGANIZATION_WIKI_WRITE_DENIED =
 /** Ordinary developer operations shared by every role that works in a task
  * world. Workflow-internal decisions are added by concrete role declarations. */
 export const DEVELOPER_WORKSPACE_CAPABILITIES: Capability[] = [
-  'project:read', 'project:settings:read',
+  'project:read', 'project:settings:read', 'project:secret:use',
   'task:read', 'task:create', 'task:conversation:read', 'task:conversation:fork',
   'task:event:read', 'task:git:import', 'task:escalate', 'task:manage-own',
   'diagnostic:read', 'process:read',
@@ -159,6 +159,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['project:transfer-in', 'Accept project moves', 'Accept project data and ownership into this organization.'],
       ['project:settings:read', 'View project settings', 'Read effective project and workflow settings.'],
       ['project:settings:write', 'Edit project settings', 'Change project defaults and workflow settings.'],
+      ['project:secret:use', 'Use project secrets locally', 'Read project secret values on your own machine (tavya run, tavya env); every read is audited.'],
       ['project:resource:shared-write', 'Propose shared writes', 'Allow an agent to propose a writable shared service or database connection for explicit Review.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },
