@@ -46,6 +46,8 @@ global.priorityFlag = () => '';
 global.tagChips = () => '';
 global.pipeline = () => '';
 eval(extractFn('customBranch'));
+global.attentionChip = () => '';
+global.projectChip = () => '';
 eval(extractFn('taskRow'));
 
 let pass = 0, fail = 0;

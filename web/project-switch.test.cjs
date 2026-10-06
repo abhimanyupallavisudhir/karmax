@@ -52,6 +52,9 @@ global.openTask = async (id) => { calls.push(`openTask:${id}`); };
 global.renderTaskPage = () => {};
 global.taskRecord = (id) => S.tasks.find((task) => task.id === id) || null;
 global.closeTaskDom = () => { calls.push('closeTaskDom'); };
+global.DEFAULT_LIST_QUERY = 'for:me';
+global.api = async () => [];
+global.firstProjectForOrganization = () => null;
 global.syncOrganizationSwitcher = () => { calls.push(`syncOrganizationSwitcher:${S.organizationId}`); };
 
 // Previous project 'A' with a live query, a stale search result and a roving
@@ -60,6 +63,8 @@ global.S = {
   projectId: 'A',
   tasks: [{ id: 't_old', projectId: 'A' }],
   search: 'status:running assignee:me',
+  searchScope: 'A',
+  fields: [],
   searchResult: { tasks: [{ id: 't_old' }] },
   cursorId: 't_old',
   orgProjectId: 'A',
@@ -71,6 +76,7 @@ global.S = {
 };
 
 eval(extractFn('applyRoute'));
+eval(extractFn('applyHomeRoute'));
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
@@ -186,6 +192,29 @@ const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('
   ok(S.organizationId === 'org_initech', 'the organization URL selects its organization');
   ok(calls.includes('renderOnboarding:org_initech'), 'organization navigation hides stale onboarding state immediately');
   ok(calls.includes('refreshOnboarding:org_initech'), 'organization navigation refreshes onboarding for the selected organization');
+
+  // The bare organization path is its home: one list over every project, with
+  // its own query (for:me unless the URL says otherwise).
+  calls = [];
+  location.pathname = '/initech';
+  S.search = 'tag:bug';
+  global.parseRoute = () => ({ name: 'global', org: 'initech', tab: 'home', q: 'for:me' });
+  global.runSearch = async () => { calls.push(`runSearch:${S.tab}`); S.searchResult = { tasks: [] }; };
+  await applyRoute();
+  ok(S.tab === 'home', 'the organization path opens the home, not a project');
+  ok(S.search === 'for:me' && S.searchScope === 'org:org_initech', 'the home owns its own for:me query');
+  ok(calls.includes('runSearch:home') && calls.at(-1) === 'renderMain', 'the home searches, then paints the result');
+
+  // Leaving the home for a project list never carries the home's query along.
+  calls = [];
+  location.pathname = '/initech/c';
+  S.search = 'project:c status:waiting';
+  global.parseRoute = () => ({ name: 'project', org: 'initech', slug: 'c', tab: 'tasks', taskKey: '3', q: 'for:me' });
+  global.projectBySlug = (slug) => (slug === 'c' ? { id: 'C', name: 'C', organizationId: 'org_initech' } : null);
+  global.resolveProjectTaskKey = async () => 't3';
+  S.projectId = 'C';
+  await applyRoute();
+  ok(S.searchScope === 'C' && S.search === 'for:me', 'a task opened from the home leaves its project list at the default view');
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
