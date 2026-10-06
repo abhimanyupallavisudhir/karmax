@@ -168,6 +168,10 @@ export interface CompactTask {
   priority: number;
   draft: boolean;
   tags: string[];
+  /** On an organization search: the task's project. */
+  projectId?: string;
+  /** On a `for:` search: why it waits on the people named (inbox kinds, `draft`). */
+  for?: string[];
 }
 
 function tagPathOf(id: string, byId: Map<string, any>): string {
@@ -194,8 +198,15 @@ export function compactSearch(result: any, tags: any[]): { total: number; tasks:
     priority: Number(t.params?.priority ?? 0),
     draft: !!t.params?.draft,
     tags: (t.tags ?? []).map((id: string) => tagPathOf(id, byId)),
+    ...(t.projectId && result?.projects ? { projectId: t.projectId } : {}),
+    ...(result?.reasons?.[t.id] ? { for: result.reasons[t.id] } : {}),
   });
   return { total: result?.total ?? 0, tasks: (result?.tasks ?? []).map(one) };
+}
+
+/** An organization search carries its own tag catalogue (every project's). */
+export function compactOrganizationSearch(result: { tags?: unknown[] } | undefined): { total: number; tasks: CompactTask[] } {
+  return compactSearch(result, result?.tags ?? []);
 }
 
 export function compactTags(tags: any[]): { path: string; kind?: string; description?: string }[] {

@@ -131,6 +131,7 @@ export const PLATFORM_API_CATALOG = {
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',
     'GET /api/search?q= (cross-project search; at least 2 characters; each project requires project:read and task:read; up to 100 tasks per project)',
+    'GET /api/organizations/:organizationId/search?q=&limit=&offset= (the organization task list: one query over every project you can read, sorted together; tasks carry projectId; `for:me` adds reasons)',
     'GET /api/projects/:projectId/search?q=', 'GET|POST /api/projects/:projectId/tags',
     'PATCH|DELETE /api/tags/:id', 'GET|POST /api/projects/:projectId/views',
     'PATCH|DELETE /api/views/:id', 'POST /api/views/:id/reorder',

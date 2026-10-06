@@ -3,7 +3,7 @@ import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { humanAudience, reviewAudience, runAudience, runAudienceAsync } from './task-audience.js';
 import { credentialIds, taskSelectionTimes, decayVaultUsage, type VaultSelectionUsage, type VaultUsage } from '../util/vault-usage.js';
-import { canonicalAccountName } from '../domain/account-names.js';
+import { assertAccountNameAllowed, canonicalAccountName } from '../domain/account-names.js';
 import { validGitBranch } from '../util/git-ref.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -224,7 +224,7 @@ export class Store {
   }
    db!: SqlDatabase;
    hosted!: boolean;
-  private userNames?: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>;
+  private userNames?: () => Array<{ id: string; name: string; email?: string }> | Promise<Array<{ id: string; name: string; email?: string }>>;
   private organizationEntitlementListeners = new Set<(organizationId: string) => unknown>();
   private recordedEventListeners = new Set<(event: KarmaxEvent & { seq: number }) => unknown>();
 
@@ -1687,8 +1687,16 @@ export class Store {
    * gateway connects the two stores after both have run their own schema
    * migrations, giving every organization write the same cross-store guard.
    */
-  connectUserNames(lookup: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>): void {
+  connectUserNames(lookup: () => Array<{ id: string; name: string; email?: string }> | Promise<Array<{ id: string; name: string; email?: string }>>): void {
     this.userNames = lookup;
+  }
+
+  /** The members of an organization (every project member is one) with the
+   *  names and emails a `for:<person>` search may name them by. */
+  async organizationPeople(organizationId: string): Promise<Array<{ id: string; name: string; email?: string }>> {
+    const ids = new Set((await this.listOrganizationMemberships(organizationId)).map((member) => member.userId));
+    return ((await this.userNames?.()) ?? []).filter((user) => ids.has(user.id))
+      .map((user) => ({ id: user.id, name: user.name, ...(user.email ? { email: user.email } : {}) }));
   }
 
   /**
@@ -1797,9 +1805,12 @@ export class Store {
   private async assertOrganizationNameAvailable(name: string, options: {
     excludeOrganizationId?: string;
     allowUserId?: string;
+    /** A boot migration copying an existing user name: never fail the boot over a reserved word. */
+    existingName?: boolean;
   } = {}): Promise<string> {
     const value = name.trim();
     if (!value) throw new Error('organization name is required');
+    if (!options.existingName) assertAccountNameAllowed(value);
     const key = canonicalAccountName(value);
     const organization = (await this.listOrganizations()).find((candidate) =>
       candidate.id !== options.excludeOrganizationId && canonicalAccountName(candidate.name) === key);
@@ -2450,7 +2461,7 @@ export class Store {
         if (!userName || row.name === userName) continue;
         if (!row.name.endsWith("'s workspace") && row.name !== 'Personal workspace') continue;
         const next = (await this.assertOrganizationNameAvailable(userName,
-          { excludeOrganizationId: row.id, allowUserId: row.userId }));
+          { excludeOrganizationId: row.id, allowUserId: row.userId, existingName: true }));
         (await this.db.prepare('UPDATE organizations SET name=? WHERE id=?').run(next, row.id));
         changed++;
       }
@@ -3541,15 +3552,23 @@ export class Store {
 
   /** Internal scans do not recount the entire project for every page. Full
    * histories are opt-in; ordinary task lists/search retain compact projection. */
-  async *taskReadPages(projectId: string, options: { includeArchived?: boolean; includeConversation?: boolean } = {}): AsyncGenerator<TaskRecord[], void> {
+  async *taskReadPages(projectId: string, options: { includeArchived?: boolean; includeConversation?: boolean;
+    /** Read only these tasks (an attempt or logical id) and drafts — a `for:` search's candidates. */
+    candidateIds?: string[] } = {}): AsyncGenerator<TaskRecord[], void> {
     // Freeze membership/order using only logical IDs. OFFSET against a changing
     // list can duplicate/skip tasks; slicing this small ID index also avoids
     // rescanning earlier rows on every page. Resolve the current principal when
     // reading each intent, so switching attempts cannot duplicate a logical task.
+    const candidates = options.candidateIds;
+    const draft = this.db.dialect === 'postgres'
+      ? "COALESCE((t.params::jsonb ->> 'draft')::boolean, false)" : "COALESCE(json_extract(t.params, '$.draft'), 0)<>0";
+    const narrowed = candidates ? candidates.length
+      ? ` AND (${draft} OR t.id IN (${candidates.map(() => '?').join(',')}) OR i.id IN (${candidates.map(() => '?').join(',')}))`
+      : ` AND ${draft}` : '';
     const identities = await this.readRows<{ id: string }>(`SELECT i.id FROM tasks t
       JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
-      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${this.taskArchivePredicate(options.includeArchived ?? true)}
-      ORDER BY root.ord, root.createdAt, root.id`, [projectId]);
+      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${this.taskArchivePredicate(options.includeArchived ?? true)}${narrowed}
+      ORDER BY root.ord, root.createdAt, root.id`, [projectId, ...(candidates ?? []), ...(candidates ?? [])]);
     for (let offset = 0; offset < identities.length; offset += 200) {
       const ids = identities.slice(offset, offset + 200).map(row => row.id);
       const page = await this.readTaskPage(projectId, { includeArchived: true },
@@ -4522,6 +4541,21 @@ export class Store {
   async listInbox(userId: string, organizationId: string, opts: { unreadOnly?: boolean; limit?: number } = {}): Promise<InboxItem[]> {
     const sql = `SELECT * FROM inbox WHERE userId=? AND organizationId=?${opts.unreadOnly ? ' AND unread=1' : ''} ORDER BY urgency DESC, createdAt DESC LIMIT ?`;
     return ((await this.db.prepare(sql).all(userId, organizationId, Math.max(1, Math.min(opts.limit ?? 200, 1000)))) as any[]).map(rowToInbox);
+  }
+
+  /**
+   * What needs this person in this organization now: task id → the kinds of the
+   * live asks routed to them. An actionable row is a live ask by construction
+   * (it is deleted when discharged); a mention asks for attention until it is
+   * read. Routine `update` rows never do. Reads by the (userId, …) indexes.
+   */
+  async attentionAsks(userId: string, organizationId: string): Promise<Map<string, string[]>> {
+    const rows = (await this.db.prepare(`SELECT taskId, kind FROM inbox WHERE userId=? AND organizationId=?
+      AND kind<>'update' AND (actionable=1 OR unread=1) AND subject IS NULL ORDER BY urgency DESC, createdAt DESC`)
+      .all(userId, organizationId)) as Array<{ taskId: string; kind: string }>;
+    const out = new Map<string, string[]>();
+    for (const row of rows) (out.get(String(row.taskId)) ?? out.set(String(row.taskId), []).get(String(row.taskId))!).push(String(row.kind));
+    return out;
   }
 
   /**
@@ -8808,7 +8842,9 @@ const RESERVED_ROUTE_SLUGS = new Set([
   // gateway-owned top-level prefixes
   'api', 'ws',
   // top-level routes / legacy org paths (an org slug is the first URL segment)
-  'invite', 'projects', 'organization', 'organizations',
+  'invite', 'projects', 'organization', 'organizations', 'installation',
+  // `for:me` is the signed-in person in every search (and /me is kept free)
+  'me',
   // organization-level views — ORG_VIEWS (a project slug is the segment after the org)
   'insights', 'dashboard', 'settings', 'inbox', 'wiki', 'profile',
   // project-level tabs

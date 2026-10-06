@@ -6,7 +6,7 @@ import { PLATFORM_API_CATALOG } from './catalog.js';
 import { URGENCY_LEVELS, type AgentSpec, type Provider, type Urgency } from '../domain/types.js';
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
-  PRIORITY_NAMES, compactSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
+  PRIORITY_NAMES, compactSearch, compactOrganizationSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
   platformRequestPathError,
   type CompactTask,
 } from './platform-request.js';
@@ -43,6 +43,8 @@ export interface PlatformOps {
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
+  /** The organization task list: every project of it the caller can read. */
+  searchOrganizationTasks(organizationId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
   listTags(projectId: string): Promise<{ path: string; kind?: string; description?: string }[]>;
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
@@ -113,6 +115,9 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     searchTasks: async (pid, query) => {
       const [result, tags] = await Promise.all([api.searchTasks(getToken(), pid, query), api.listTags(getToken(), pid)]);
       return compactSearch(result, tags);
+    },
+    searchOrganizationTasks: async (organizationId, query) => {
+      return compactOrganizationSearch(await api.searchOrganizationTasks(getToken(), organizationId, query));
     },
     listTags: async (pid) => compactTags(await api.listTags(getToken(), pid)),
     tagTask: (id, add, remove) => api.tagTask(getToken(), id, { add, remove }),
@@ -206,6 +211,9 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     searchTasks: async (pid, query) => {
       const [result, tags] = await Promise.all([req(`/api/projects/${pid}/search?q=${encodeURIComponent(query)}`), req(`/api/projects/${pid}/tags`)]);
       return compactSearch(result, tags as any[]);
+    },
+    searchOrganizationTasks: async (organizationId, query) => {
+      return compactOrganizationSearch(await req(`/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent(query)}`) as { tags?: unknown[] });
     },
     listTags: async (pid) => compactTags((await req(`/api/projects/${pid}/tags`)) as any[]),
     tagTask: (id, add, remove) => req(`/api/tasks/${id}/tag`, { method: 'POST', body: JSON.stringify({ add, remove }) }) as Promise<{ tags: string[] }>,
@@ -749,11 +757,16 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'workflow, created, updated, num, is:<facet> (open/draft/archived/pr/untagged/armed/scheduled/recurring/blocked-on-deps/series/run/…), ' +
         'trigger (dependency|schedule|event|none, groupable), schedule (cron text), nextRun (sortable date), ' +
         'dependsOn:#N / blocks:#N (the dependency graph), and any workflow param via `param.<key>` / `agent_<role>.model`. ' +
-        'Add `sort:priority-desc` and `group:tag` to order/bucket. Empty query returns all tasks (runs of a series included — ' +
-        'add `-is:run` to hide them). E.g. `is:scheduled sort:nextRun-asc`, `dependsOn:#42`, `is:blocked-on-deps`.',
-      inputSchema: { projectId: z.string(), query: z.string().default('') },
+        '`for:me` / `for:<name|email|user:id>` = tasks waiting on that person (review, input, approval, assignment, unread mention) plus their drafts; ' +
+        '`project:<id|slug|name>`. Add `sort:priority-desc` and `group:tag` to order/bucket. Empty query returns all tasks (runs of a series included — ' +
+        'add `-is:run` to hide them). E.g. `is:scheduled sort:nextRun-asc`, `dependsOn:#42`, `is:blocked-on-deps`. ' +
+        'Pass `organizationId` instead of `projectId` to search every project of the organization you can read (results carry projectId).',
+      inputSchema: { projectId: z.string().optional(), organizationId: z.string().optional(), query: z.string().default('') },
     },
-    async (a) => wrap(() => ops.searchTasks(a.projectId, a.query ?? '')),
+    async (a) => wrap(() => {
+      if (!a.projectId === !a.organizationId) throw new Error('pass exactly one of projectId or organizationId');
+      return a.organizationId ? ops.searchOrganizationTasks(a.organizationId, a.query ?? '') : ops.searchTasks(a.projectId!, a.query ?? '');
+    }),
   );
   server.registerTool('list_tags', { description: 'List a project\'s tag catalogue as `a/b/c` paths, with kind and optional section description.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTags(a.projectId)));
   server.registerTool(
