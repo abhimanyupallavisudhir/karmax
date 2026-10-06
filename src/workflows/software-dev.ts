@@ -796,7 +796,9 @@ async function softwareDevImpl(
   const settledCollaborations = new Set<string>(continued?.collaborations.settled);
   const pendingCollaborations = new Set<string>(continued?.collaborations.pending
     .filter((id) => !settledCollaborations.has(id)));
-  let pointOfNoReturnPassed = carried?.pointOfNoReturnPassed ?? false;
+  // A replacement of a partly landed run starts past the point of no return,
+  // so it never offers the cancellation or reset that would strand the rest.
+  let pointOfNoReturnPassed = carried?.pointOfNoReturnPassed ?? !!recovery?.pointOfNoReturnPassed;
   let lifecycleTransitionBlocked = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).

@@ -1796,6 +1796,9 @@ export interface TaskRecoveryCheckpoint {
   /** The preserved intent-authorized proposal changed in Do and needs an
    * automatic integration review before provider re-admission. */
   repairValidationPending?: boolean;
+  /** Part of the proposal already landed: the replacement must never offer
+   * cancellation or a discarding reset, and must reconcile the rest. */
+  pointOfNoReturnPassed?: boolean;
   /** Set when the run continued as new to bound its history. */
   continued?: TaskContinuation;
 }
