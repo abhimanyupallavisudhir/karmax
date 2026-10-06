@@ -753,6 +753,17 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'my_authorization',
+    description: 'What your authorization covers: level, projects/organization, the capabilities you hold and the exact ones you lack (ask for those with request_permission). Pass method and path to learn whether that platform_request would be allowed, and what to request if not, without making it. Check here before asking a person to do something for you.',
+    parameters: {
+      type: 'object',
+      properties: {
+        method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
+        path: { type: 'string', description: 'A /api/... path, with its query string, as platform_request would call it.' },
+      },
+    },
+  },
+  {
     name: 'request_permission',
     description:
       `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
@@ -1472,6 +1483,10 @@ export function platformToolHandlers(
         message: String(args?.message ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
       }));
+    },
+    async my_authorization(args) {
+      const query = args?.path ? `?${new URLSearchParams({ method: String(args?.method ?? 'GET').toUpperCase(), path: String(args.path) })}` : '';
+      return JSON.stringify(await platformRequest('GET', `/api/authorization/me${query}`));
     },
     async request_permission(args) {
       return JSON.stringify(await platformRequest('POST', '/api/agent/permission-requests', {

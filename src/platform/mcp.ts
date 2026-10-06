@@ -465,6 +465,18 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     async (a) => wrap(async () => (await ops.escalateToHuman(a))),
   );
   server.registerTool(
+    'my_authorization',
+    {
+      description: 'What your authorization covers: level, projects/organization, the capabilities you hold and the exact ones you lack (ask for those with request_permission). Pass method and path to learn whether that platform_request would be allowed, and what to request if not, without making it. Check here before asking a person to do something for you.',
+      inputSchema: {
+        method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']).optional(),
+        path: z.string().startsWith('/api/').optional(),
+      },
+    },
+    async (a) => wrap(async () => (await ops.platformRequest('GET',
+      `/api/authorization/me${a.path ? `?${new URLSearchParams({ method: a.method ?? 'GET', path: a.path })}` : ''}`))),
+  );
+  server.registerTool(
     'request_permission',
     {
       description:

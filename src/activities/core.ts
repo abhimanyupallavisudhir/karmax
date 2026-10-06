@@ -52,6 +52,7 @@ import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import type { AuthorizationService } from '../platform/authorization.js';
+import { authorizationPromptContext, resolveAuthorizationSummary } from '../platform/authorization-summary.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems, removeTurnKeys, turnKeyDirectory } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
@@ -1944,6 +1945,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // cannot be used to interrupt peer work or widen the agent's authority.
       const preparationTask = await store.getTask(args.taskId);
       const storedAuthorization = preparationTask?.params?._authorization as {
+        level?: string;
         capabilities?: string[];
         principal?: string;
         scope?: 'projects' | 'organization' | 'global';
@@ -1980,25 +1982,32 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? [...new Set(grant)]
         : [...new Set([...roleCeiling(args.role), ...approvedPermissions])];
       const effective = attenuate(ceiling, grant);
+      const authorizationScope = storedAuthorization?.scope;
+      const delegatedScope = delegatedAuthorization?.scope;
+      const tokenScope = {
+        projectId: avatar ? (delegatedScope ? undefined : args.task.projectId)
+          : authorizationScope ? undefined : args.task.projectId,
+        projectIds: avatar
+          ? delegatedScope === 'projects' ? delegatedAuthorization?.projectIds : undefined
+          : authorizationScope === 'projects' ? storedAuthorization?.projectIds : undefined,
+        organizationId: avatar
+          ? delegatedScope === 'global' ? undefined : (delegatedAuthorization?.organizationId ?? avatar.organizationId)
+          : authorizationScope === 'global' ? undefined
+            : (storedAuthorization?.organizationId ?? (await store.getProject(args.task.projectId))?.organizationId),
+      };
+      // Stated in the prompt so the agent neither asks a person to do what it
+      // may do itself nor learns what it lacks only from a refusal.
+      const authorizationContext = authorizationPromptContext(await resolveAuthorizationSummary(store, deps.authorization,
+        { caps: effective, level: avatar ? delegatedAuthorization?.level : storedAuthorization?.level, ...tokenScope }));
       let token: string | undefined;
       if (deps.tokens) {
-        const authorizationScope = storedAuthorization?.scope;
-        const delegatedScope = delegatedAuthorization?.scope;
         const minted = (await deps.tokens.mint({
           taskId: args.taskId,
           profileId: profile.id,
           role: args.role,
           principal: avatar ? avatarPrincipal(avatar.id)
             : args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
-          projectId: avatar ? (delegatedScope ? undefined : args.task.projectId)
-            : authorizationScope ? undefined : args.task.projectId,
-          projectIds: avatar
-            ? delegatedScope === 'projects' ? delegatedAuthorization?.projectIds : undefined
-            : authorizationScope === 'projects' ? storedAuthorization?.projectIds : undefined,
-          organizationId: avatar
-            ? delegatedScope === 'global' ? undefined : (delegatedAuthorization?.organizationId ?? avatar.organizationId)
-            : authorizationScope === 'global' ? undefined
-              : (storedAuthorization?.organizationId ?? (await store.getProject(args.task.projectId))?.organizationId),
+          ...tokenScope,
           audience: 'karmax-platform',
           executionId: args.agentTurnId ?? legacyAgentTurnId,
           executionAttempt: activityAttempt,
@@ -2407,6 +2416,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         world: args.worldHandle,
         globalInstructions: (globalInstructions ?? '') + forkContext + attemptContext + paymentContext,
         projectInstructions,
+        authorization: authorizationContext,
         bindings,
       });
       // Snapshot the journaled turn input (SPEC §5.4).

@@ -167,3 +167,18 @@ it('tells the next Do turn, once, which files its last checkpoint could not save
   expect(delivered[1]![2]).toBe('and again');
   expect(checkpoints.takeNotice).toHaveBeenCalledTimes(2);
 });
+
+it('tells the agent what its authorization lets it do and what it must request', async () => {
+  const { project, task, run } = await fixture();
+  const { DEFAULT_AUTHORIZATION_PROFILES } = await import('../src/platform/authorization.js');
+  const maintainer = DEFAULT_AUTHORIZATION_PROFILES.find((profile) => profile.id === 'maintainer')!.capabilities;
+  await store.updateTaskParams(task.id, { prompt: 'fixture', _authorization: { level: 'maintainer', scope: 'projects',
+    projectIds: [project.id], organizationId: project.organizationId, capabilities: maintainer } } as any);
+  const prompt = await run();
+  expect(prompt).toContain('# Authorization');
+  expect(prompt).toContain('authorized as Project maintainer');
+  expect(prompt).toContain(`in project Prompt (${project.id})`);
+  expect(prompt).toMatch(/You hold: [^\n]*project:settings:write/);
+  expect(prompt).toMatch(/You lack: [^\n]*organization:edit/);
+  expect(prompt).not.toMatch(/You lack: [^\n]*project:settings:write/);
+});
