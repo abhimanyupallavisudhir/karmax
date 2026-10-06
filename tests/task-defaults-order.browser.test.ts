@@ -1,92 +1,100 @@
-import fs from 'node:fs';
-import { chromium } from 'playwright';
-import { expect, it } from 'vitest';
+import { afterAll, expect, it } from 'vitest';
 import { MANIFESTS } from '../src/contrib/manifests.js';
+import { closeConsoleBrowser, consolePage, emptySettings } from './helpers/console-page.js';
 
-for (const scope of ['project', 'global']) {
-  it(`orders ${scope} task defaults and saves the agent routes without losing branch defaults`, async () => {
-    const browser = await chromium.launch({ headless: true });
+afterAll(closeConsoleBrowser);
+
+/**
+ * Task defaults mirror the task form (wiki planned/collaboration-model): the
+ * default Agent — whose collapsed Authorization row holds the authorization,
+ * vault and payment defaults — then the Responder, the Review route, and where
+ * tasks run, saved together without disturbing what the card does not own.
+ */
+for (const scope of ['project', 'global'] as const) {
+  it(`lays out ${scope} task defaults like the task form and saves them together`, async () => {
+    const inherited = { confirm: { layers: [{ kind: 'human', audience: ['@creator'] }] },
+      responder: { kind: 'human', audience: ['@creator'] } };
+    let common: Record<string, unknown> = { base: 'develop', target: 'main', remote: 'pr', gitProfile: 'personal',
+      confirm: { layers: [{ kind: 'human', audience: ['@owners'] }] },
+      responder: { kind: 'human', audience: ['@project'] } };
+    const puts: Array<{ path: string; values: any }> = [];
+    const settings = scope === 'project' ? '/api/settings/project/project' : '/api/organizations/org/settings';
+    const ui = await consolePage({ api: (call) => {
+      const path = call.path.split('?')[0]!;
+      if (call.method === 'PUT') {
+        puts.push({ path, values: call.body.values });
+        if (path.endsWith('/__common__')) common = call.body.values;
+        return { ok: true };
+      }
+      if (path.includes('/api/defaults/')) return { [scope]: { own: common, inherited },
+        [scope === 'project' ? 'projectQuick' : 'globalQuick']: { own: {}, inherited: {} } };
+      if (path.endsWith('/__common__')) return common;
+      if (path === '/api/profiles') return [{ id: 'prof_do', role: 'do', name: 'Default agent', provider: 'claude', scope: 'inherited', inherited: {} }];
+      if (path === `${settings}/vault`) return { credentialGrants: ['use-credential:item:gh'] };
+      if (path.endsWith('/settings/vault')) return {};
+      if (path.endsWith('/settings/authorization')) return {};
+      if (path.endsWith('/settings/payments')) return { cardIds: [], budget: 0, currency: 'usd' };
+      if (path === '/api/vault/items') return [{ id: 'gh', label: 'GitHub', type: 'login', policy: {} }];
+      if (path === '/api/cards') return [];
+      if (path.includes('explanation-settings')) return { own: {}, inherited: { endpoint: 'e', model: 'm', prompt: 'p' }, effective: { model: 'm' } };
+      return emptySettings(call) ?? [];
+    } });
+    const { page } = ui;
     try {
-      const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-      const errors: string[] = [];
-      page.on('pageerror', error => errors.push(error.message));
-      const inherited = { confirm: { layers: [{ kind: 'human', audience: ['@creator'] }] },
-        responder: { kind: 'human', audience: ['@creator'] } };
-      let common = { base: 'develop', target: 'main', remote: 'pr', gitProfile: 'personal',
-        confirm: { layers: [{ kind: 'human', audience: ['@owners'] }] },
-        responder: { kind: 'human', audience: ['@project'] } };
-      let saves = 0;
-      await page.route('http://defaults.test/**', route => {
-        const url = new URL(route.request().url());
-        if (url.pathname.includes('/api/defaults/')) return route.fulfill({ json: {
-          [scope]: { own: common, inherited },
-          [scope === 'project' ? 'projectQuick' : 'globalQuick']: { own: {}, inherited: {} },
-        } });
-        if (url.pathname.endsWith('/__common__')) {
-          if (route.request().method() === 'PUT') { common = route.request().postDataJSON().values; saves++; }
-          return route.fulfill({ json: common });
-        }
-        if (url.pathname.startsWith('/api/')) return route.fulfill({ json: [] });
-        return route.fulfill({ contentType: 'text/html', body: '<main id="main"></main>' });
-      });
-      await page.goto('http://defaults.test/');
-      await page.addScriptTag({ content: fs.readFileSync('web/totp-qr.js', 'utf8') });
-      await page.addScriptTag({ content: fs.readFileSync('web/markdown.js', 'utf8') });
-      await page.addScriptTag({ content: fs.readFileSync('web/app.js', 'utf8').replace(/^boot\(\)\.catch\(.*$/m, '') });
-      await page.evaluate(({ scope, schema }) => (globalThis as any).eval(`(async () => {
-        S.schema = ${JSON.stringify(schema)};
-        S.organizationId = 'org';
-        S.organizations = [{ id: 'org', name: 'Organization' }];
-        S.projects = [{ id: 'project', name: 'Project', organizationId: 'org' }];
-        S.projectId = 'project';
-        document.querySelector('#main').innerHTML = ${scope === 'project' ? "settingsView(S.projects[0])" : 'organizationView()'};
-        await hydrateSettingsForms('${scope}', ${scope === 'project' ? "'project'" : 'undefined'}, 'org');
-        await hydrateReviewRoute('${scope}', ${scope === 'project' ? "'project'" : 'undefined'}, 'org');
-        await hydrateQuickSettingsForms('${scope}', ${scope === 'project' ? "'project'" : 'undefined'}, 'org');
-      })()`), { scope, schema: MANIFESTS });
+      const projectId = scope === 'project' ? "'project'" : 'undefined';
+      await ui.run(`(async () => {
+        S.schema = ${JSON.stringify(MANIFESTS)};
+        S.organizationId = 'org'; S.organizations = [{ id: 'org', name: 'Organization' }];
+        S.projects = [{ id: 'project', name: 'Project', organizationId: 'org' }]; S.projectId = 'project';
+        document.querySelector('#main').innerHTML = ${scope === 'project' ? 'settingsView(S.projects[0])' : 'organizationView()'};
+        await hydrateSettingsForms('${scope}', ${projectId}, 'org');
+        await hydrateProfiles('${scope}', ${projectId}, 'org');
+        await hydrateReviewRoute('${scope}', ${projectId}, 'org');
+        await hydrateQuickSettingsForms('${scope}', ${projectId}, 'org');
+        wireTaskDefaultsSave('${scope}', ${projectId}, 'org');
+      })()`);
+      const card = page.locator(`#task-defaults-${scope}`);
+      // Agent → Responder → Review route → where tasks run, then Quick tasks.
+      expect(await card.locator('[data-profile], [data-row="responder"], [data-row="confirm"], [data-row="base"]').evaluateAll((rows) =>
+        rows.map((row) => row.getAttribute('data-profile') ? 'agent' : row.getAttribute('data-row')))).toEqual(['agent', 'responder', 'confirm', 'base']);
+      expect(await page.locator('.task-defaults ~ [data-qwf]').count()).toBe(1);
+      expect(await card.locator('[data-row="multiPr"]').count()).toBe(1);
+      expect(await card.locator('[data-field="remote"]').count()).toBe(1);
+      // The authorization, vault and payment defaults are the default Agent's.
+      const authority = card.locator('[data-profile] .agent-authority');
+      expect(await authority.evaluate((el) => (el as unknown as { open: boolean }).open)).toBe(false);
+      expect(await authority.locator('[data-resource-defaults] .authz-editor, .resource-vault, .task-payments').count()).toBe(3);
+      await expect.poll(() => authority.locator('.aa-summary').textContent()).toContain('1 credential');
 
-      const order = await page.locator('[data-wf="__common__"], .agent-profile-settings, [data-qwf], .resource-defaults, .explanation-settings, details[data-wf]').evaluateAll(elements =>
-        elements.map(el => el.matches('[data-wf="__common__"]') ? 'branches'
-          : el.matches('.agent-profile-settings') ? 'agent'
-          : el.matches('[data-qwf]') ? 'quick'
-          : el.matches('.resource-defaults') ? 'resources'
-          : el.matches('.explanation-settings') ? 'explanation'
-          : 'workflow'));
-      expect(order).toEqual(['branches', 'agent', 'quick', 'resources', 'explanation', 'workflow']);
-      const sharingId = scope === 'project' ? 'project-conversation-sharing' : 'organization-conversation-sharing';
-      const peoplePane = scope === 'project' ? 'project-people' : 'settings-people';
-      await page.evaluate(() => (globalThis as any).eval('wireSettingsNavigation()'));
-      expect(await page.locator(`#${sharingId}`).evaluate(el => el.closest('.settings-pane')?.getAttribute('data-pane'))).toBe(peoplePane);
-      await page.locator(`.settings-nav a[href="#${peoplePane}"]`).click();
-      expect(await page.locator(`#${sharingId}`).evaluate(el => el.closest('.settings-pane')?.classList.contains('active'))).toBe(true);
-      const branch = page.locator('[data-wf="__common__"]');
-      expect(await branch.locator('[data-field="remote"]').count()).toBe(1);
-      expect(await branch.locator('[data-field="landingAuthority"]').count()).toBe(1);
-      expect(await branch.locator('[data-row="responder"]').count()).toBe(0);
-      const agent = page.locator('.agent-profile-settings');
-      expect(await agent.locator('[data-row="confirm"]').count()).toBe(1);
-      expect(await agent.locator('[data-row="responder"]').count()).toBe(1);
-      expect(await agent.locator('.rf-audience').inputValue()).toBe('@project');
-      await agent.locator('.rf-audience').fill('@owners');
-      await agent.locator('[data-save-review-route]').click();
-      await expect.poll(() => saves).toBe(1);
+      expect(await card.locator('.rf-audience').inputValue()).toBe('@project');
+      await card.locator('.rf-audience').fill('@owners');
+      // A Reviewer default with its own, narrower authority.
+      await card.locator('.cf-add').click();
+      const reviewer = card.locator('.cf-layer[data-kind="agent"] .agent-block');
+      await reviewer.locator('.agent-authority > summary').click();
+      await expect.poll(() => reviewer.locator('.authz-level-select').inputValue()).toBe('developer');
+      await reviewer.locator('.authz-level-select').selectOption('viewer');
+      // The default task authorization.
+      await authority.locator('summary').click();
+      await authority.locator('.authz-level-select').selectOption('maintainer');
+      await card.locator('[data-save-task-defaults]').click();
+      await expect.poll(() => puts.map((put) => put.path)).toEqual([`${settings}/authorization`, `${settings}/__common__`]);
+      expect(puts[0]!.values).toEqual({ level: 'maintainer', scope: 'projects' });
       expect(common).toMatchObject({ base: 'develop', target: 'main', remote: 'pr', gitProfile: 'personal',
-        confirm: { layers: [{ kind: 'human', audience: ['@owners'] }] },
-        responder: { kind: 'human', audience: ['@owners'] } });
-      await page.evaluate(scope => (globalThis as any).eval(`hydrateReviewRoute('${scope}', ${scope === 'project' ? "'project'" : 'undefined'}, 'org')`), scope);
-      expect(await agent.locator('.rf-audience').inputValue()).toBe('@owners');
-      await agent.locator('[data-reset="responder"]').click();
-      expect(await agent.locator('.rf-audience').inputValue()).toBe('@creator');
-      await agent.locator('[data-save-review-route]').click();
-      await expect.poll(() => saves).toBe(2);
+        responder: { kind: 'human', audience: ['@owners'] },
+        confirm: { layers: [{ kind: 'agent', authority: { authorization: { level: 'viewer' }, credentialGrants: ['use-credential:item:gh'] } },
+          { kind: 'human', audience: ['@owners'] }] } });
+      // The untouched default Agent did not become an override.
+      expect(puts.some((put) => put.path === '/api/profiles')).toBe(false);
+
+      await card.locator('[data-reset="responder"]').click();
+      expect(await card.locator('.rf-audience').inputValue()).toBe('@creator');
+      await card.locator('[data-save-task-defaults]').click();
+      await expect.poll(() => puts.length).toBe(3);
       expect(common).not.toHaveProperty('responder');
-      expect(common).toMatchObject({ base: 'develop', gitProfile: 'personal',
-        confirm: { layers: [{ kind: 'human', audience: ['@owners'] }] } });
       await page.locator('.quick-defaults-enabled').check();
       expect(await page.locator('.quick-defaults-body').isVisible()).toBe(true);
-      await page.locator('.quick-defaults-enabled').uncheck();
-      expect(await page.locator('.quick-defaults-body').isVisible()).toBe(false);
-      expect(errors).toEqual([]);
-    } finally { await browser.close(); }
+      expect(ui.errors).toEqual([]);
+    } finally { await ui.close(); }
   });
 }

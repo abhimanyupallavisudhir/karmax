@@ -58,8 +58,8 @@ export interface ScopedToken {
   profileId: string;
   /** Workflow role running with this token; authorization comes from the task grant. */
   role?: string;
-  /** Which agent of the task holds this token (software-dev ≥1.27:
-   * `do`, `responder`, `confirm`, `agent-3`…); attribution, never authority. */
+  /** Which of the task's agents holds it (`do`, `responder`, `confirm-2`,
+   * `agent-3`): its own authority, vault policies, cards and budget apply. */
   participant?: string;
   principal: string; // the granting user/principal id
   projectId?: string;

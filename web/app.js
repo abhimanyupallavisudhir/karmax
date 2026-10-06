@@ -1084,16 +1084,18 @@ const resetBtn = (name, label = 'Reset to default', kind = 'primary') =>
 // buttons (primary → data-inherit, alt → data-inherit-alt).
 const resetBtns = (name, alt) =>
   alt ? resetBtn(name, alt.primaryLabel, 'primary') + resetBtn(name, alt.altLabel, 'alt') : resetBtn(name);
+// Explanations live in a tooltip (hover or tap), never as text under the label.
 const fieldLabel = (f, alt) =>
-  `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtns(f.name, alt)}</div>` +
-  (f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : '');
+  `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.help ? policyTip(f.help) : ''}<span class="label-row-fill"></span>${f.required ? '' : resetBtns(f.name, alt)}</div>`;
 
-function renderField(f, own, inherited, withChips, alt) {
+// `agentOpts`: agentBlockHtml options for an agent field (e.g. the main agent's
+// Authorization row in the task form).
+function renderField(f, own, inherited, withChips, alt, agentOpts) {
   const v = eff(own, inherited) ?? '';
   const label = fieldLabel(f, alt);
   const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}${altAttr}`;
-  if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
+  if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited, agentOpts)}</div>`;
   if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited, alt)}</div>`;
   if (f.type === 'responder') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderResponderField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
@@ -1148,9 +1150,42 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   return html.join('');
 }
 
-function renderAgentField(f, spec, inherited) {
-  const inh = inherited || {};
-  const role = f.role || f.name;
+function renderAgentField(f, spec, inherited, opts) {
+  return agentBlockHtml(opts?.prefix, spec, { role: f.role || f.name, inherited, ...opts });
+}
+
+// ── The Agent block (wiki planned/collaboration-model) ───────────────────────
+// One control for everything an agent can be given, used wherever an agent is
+// configured: the task form (Agent, Responder, Reviewers), Task defaults, the
+// Parameters tab, and "New agent…" in the follow-up composer. Free of form
+// globals: everything it needs comes in through its arguments.
+//
+//   agentBlockHtml(prefix, spec, opts) → HTML of one `.agent-field` block
+//     prefix  id prefix unique on the page ('tf-responder'); omitted ⇒ generated.
+//     spec    the AgentSpec shown: provider, model, effort, mcpConnections,
+//             resumeFrom, avatarId, authority, prompt (its instructions).
+//     opts    role          'do' | 'responder' | 'confirm' | 'agent' (data-agent)
+//             inherited     the AgentSpec it inherits (resets, tool inheritance)
+//             fork          show "Fork a previous agent" (default true)
+//             instructions  show the optional Instructions box (Responder, Reviewers, …)
+//             authority     false/omitted — no Authorization row;
+//                           { html, summary } — a caller-owned body (the main
+//                             agent: the task's own authorization, vault, cards);
+//                           { inherited, label } — this agent's own authority,
+//                             "Same as <label>" until changed; `inherited` is
+//                             {authorization, credentialGrants, credentialPolicies,
+//                             paymentPolicy} it starts from.
+//   wireAgentBlock(root, ctx) → wires a rendered block (`root` is the `.agent-field`)
+//     ctx     projectId, organizationId — vault items and cards to offer
+//             projects — the authorization scope choices
+//             inheritedAuthority() — live values an untouched block follows
+//   readAgentBlock(root) → the AgentSpec, with `authority` only when this agent
+//     has its own and `prompt` only when it has instructions.
+function agentBlockHtml(prefix, spec, opts) {
+  opts ||= {};
+  prefix ||= `agent-block-${agentBlockHtml.nextId = (agentBlockHtml.nextId || 0) + 1}`;
+  const inh = opts.inherited || {};
+  const role = opts.role || 'do';
   const pendingAvatarId = role === 'do' ? S.pendingAvatarId : null;
   const requestedAvatarId = spec?.avatarId || pendingAvatarId || inh.avatarId || '';
   const selectedAvatar = (S.avatars || []).find((avatar) => avatar.id === requestedAvatarId);
@@ -1165,23 +1200,28 @@ function renderAgentField(f, spec, inherited) {
   const availableAvatars = (S.avatars || []).filter((avatar) => avatar.callable && avatar.effectiveEnabled
     && (!avatar.roles?.length || avatar.roles.includes(role)));
   if (selectedAvatar && !availableAvatars.some((avatar) => avatar.id === selectedAvatar.id)) availableAvatars.push(selectedAvatar);
-  return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
+  // Frozen (a running task's used parameter): the agent's controls are shown
+  // disabled. A host-owned Authorization row (the main agent's) keeps its own state.
+  const hostAuthority = opts.authority && opts.authority.html !== undefined;
+  const body = `
+    ${opts.instructions ? `<textarea class="ab-instructions" rows="2" aria-label="Instructions" placeholder="Instructions for this agent (optional)">${esc(agentInstructions(spec?.prompt))}</textarea>` : ''}
     ${availableAvatars.length ? `<select class="af-avatar" aria-label="Agent identity">
       <option value="">Project/default agent</option>
       ${availableAvatars.map((avatar) => `<option value="${esc(avatar.id)}" ${avatar.id === selectedAvatar?.id ? 'selected' : ''}>${esc(avatar.name)} · Avatar</option>`).join('')}
     </select>` : ''}
     <div class="af-avatar-note" ${selectedAvatar ? '' : 'hidden'}>${selectedAvatar ? `${esc(selectedAvatar.purpose || 'Owner-controlled prompt and delegated authority')} · owned by ${esc(avatarOwnerName(selectedAvatar))}` : ''}</div>
     <div class="agent-controls" ${selectedAvatar ? 'hidden' : ''}>
-      <select class="af-provider">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
+      <select class="af-provider" aria-label="Agent harness">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <div class="combo af-model-combo" style="flex:1;min-width:140px">
-        <input class="af-model" placeholder="model" value="${esc(model || '')}" autocomplete="off" />
+        <input class="af-model" placeholder="model" aria-label="Model" value="${esc(model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
         <div class="combo-menu" hidden></div>
       </div>
       ${effortSelectHtml('af-effort', provider, model, effort || '')}
+      ${opts.extraControls || ''}
     </div>
     ${mcpPickerHtml(spec?.mcpConnections, inh.mcpConnections)}
-    <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> Fork a previous agent</label>
+    ${opts.fork === false ? '' : `<label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> Fork a previous agent</label>
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
@@ -1190,8 +1230,201 @@ function renderAgentField(f, spec, inherited) {
         <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
         <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
       </div>
-    </div>
+    </div>`}
+    ${hostAuthority ? '' : agentAuthorityHtml(prefix, spec, opts.authority)}`;
+  return `<div class="agent-field agent-block" data-agent="${esc(role)}" data-prefix="${esc(prefix)}" ${inhAttr(inh)}>
+    ${opts.frozen ? `<fieldset class="ab-frozen" disabled>${body}</fieldset>` : body}
+    ${hostAuthority ? agentAuthorityHtml(prefix, spec, opts.authority) : ''}
   </div>`;
+}
+
+// A stored Responder/Reviewer prompt that is just the old pre-filled request
+// template is not instructions (manifest `legacyPrompt`): show it as empty.
+function agentInstructions(prompt) {
+  const text = typeof prompt === 'string' ? prompt : '';
+  const legacy = (S.schema || []).flatMap((workflow) => (workflow.params || []).map((field) => field.legacyPrompt)).filter(Boolean);
+  return legacy.includes(text) ? '' : text;
+}
+
+/** What people call one of a task's agents (`participants.ts` participantLabel). */
+function agentParticipantLabel(key) {
+  if (key === 'do') return 'Agent';
+  if (key === 'responder') return 'Responder';
+  if (key === 'confirm') return 'Reviewer';
+  const reviewer = /^confirm-(\d+)$/.exec(key || '');
+  if (reviewer) return `Reviewer ${reviewer[1]}`;
+  const agent = /^agent-(\d+)$/.exec(key || '');
+  return agent ? `Agent ${agent[1]}` : key;
+}
+
+// "▸ Authorization" — collapsed by default. The main agent's body belongs to its
+// host (the task's own authorization, vault grants and payments); every other
+// agent's body is built on first open from its own authority, or "Same as …".
+function agentAuthorityHtml(prefix, spec, authority) {
+  if (!authority) return '';
+  const head = (summary) => `<summary><span class="aa-title">Authorization</span><span class="aa-summary">${esc(summary || '')}</span></summary>`;
+  if (authority.html !== undefined)
+    return `<details class="agent-authority" data-mode="task"${authority.open ? ' open' : ''}>${head(authority.summary)}<div class="aa-body">${authority.html}</div></details>`;
+  const label = authority.label || 'Agent';
+  const own = spec?.authority || null;
+  return `<details class="agent-authority" data-mode="agent" data-prefix="${esc(prefix)}" data-explicit="${own ? '1' : ''}"
+    data-authority="${esc(JSON.stringify(own))}" data-inherited="${esc(JSON.stringify(authority.inherited || null))}" data-label="${esc(label)}">
+    ${head(own ? agentAuthoritySummary(own) : `Same as ${label}`)}<div class="aa-body"></div></details>`;
+}
+
+/** One line for a collapsed Authorization row: level · scope · credentials · cards · budget. */
+function agentAuthoritySummary(authority, projects = S.projects) {
+  if (!authority) return '';
+  // A defaults' project list left empty means each task's own project.
+  const authorization = authority.authorization;
+  const parts = authorization ? [authorization.scope === 'projects' && !authorization.projectIds?.length
+    ? `${authorizationSummary(authorization, projects).replace(/ · $/, '')} · its project` : authorizationSummary(authorization, projects)] : [];
+  const credentials = (authority.credentialGrants || []).length;
+  if (credentials) parts.push(`${credentials} credential${credentials === 1 ? '' : 's'}`);
+  const payments = authority.paymentPolicy;
+  if (payments?.cardIds) parts.push(payments.cardIds.length ? `${payments.cardIds.length} card${payments.cardIds.length === 1 ? '' : 's'}` : 'no cards');
+  if (payments?.cardIds?.length && payments.budget !== undefined) parts.push(payments.budget === null ? 'no budget limit'
+    : `${fromMinorUnits(payments.budget, payments.currency || 'usd')} ${(payments.currency || 'usd').toUpperCase()}`);
+  return parts.join(' · ');
+}
+
+// The organization's vault items, shared by every block on a page for a moment.
+const vaultItemRequests = new Map();
+function vaultItemsFor(organizationId) {
+  const cached = vaultItemRequests.get(organizationId);
+  if (cached && cached.at > Date.now() - 30_000) return cached.request;
+  const request = api(`/api/vault/items${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`);
+  vaultItemRequests.set(organizationId, { at: Date.now(), request });
+  request.catch(() => vaultItemRequests.delete(organizationId));
+  return request;
+}
+
+function wireAgentBlock(root, ctx) {
+  if (!root) return;
+  ctx ||= {};
+  root._agentCtx = ctx;
+  wireAgentBox(root);
+  const instructions = root.querySelector('.ab-instructions');
+  if (instructions && typeof wireWikiMention === 'function') wireWikiMention(instructions, ctx.projectId || S.projectId);
+  const details = root.querySelector('.agent-authority[data-mode="agent"]');
+  if (details) wireAgentAuthority(details, ctx);
+}
+
+/** An agent's own authority editor (not the main agent's). Built on first open,
+ * so a page of untouched blocks costs nothing; changing anything in it makes
+ * the authority this agent's own, and "Same as …" hands it back. */
+function wireAgentAuthority(details, ctx) {
+  const prefix = details.dataset.prefix;
+  const body = details.querySelector('.aa-body');
+  const summary = details.querySelector('.aa-summary');
+  const label = details.dataset.label || 'Agent';
+  const projectId = ctx.projectId || S.projectId;
+  const organizationId = ctx.organizationId || S.projects.find((project) => project.id === projectId)?.organizationId || S.organizationId;
+  const projects = ctx.projects || S.projects.filter((project) => project.organizationId === organizationId);
+  const own = () => JSON.parse(details.dataset.authority || 'null');
+  const inherited = () => (ctx.inheritedAuthority?.() ?? JSON.parse(details.dataset.inherited || 'null')) || {};
+  let built = false;
+  let hydrating = false;
+  // Until the user changes something here, the agent's authority is exactly
+  // what it was (the editors only show what it inherits for the rest).
+  let touched = false;
+  let ids = new Set();
+  let policies = {};
+  let items = [];
+  const explicit = () => details.dataset.explicit === '1';
+  const current = () => {
+    const base = inherited();
+    const mine = explicit() ? own() || {} : {};
+    return {
+      authorization: mine.authorization || base.authorization || { level: 'developer', scope: 'projects', projectIds: projectId ? [projectId] : [] },
+      credentialGrants: mine.credentialGrants || base.credentialGrants || [],
+      credentialPolicies: mine.credentialPolicies || (mine.credentialGrants ? {} : base.credentialPolicies) || {},
+      paymentPolicy: mine.paymentPolicy || base.paymentPolicy,
+    };
+  };
+  const read = () => {
+    if (!built || !touched) return own() || undefined;
+    const value = {
+      authorization: readAuthorizationEditor(details.querySelector('.authz-editor')),
+      credentialGrants: [...ids].sort().map((id) => `use-credential:item:${id}`),
+      credentialPolicies: Object.fromEntries(Object.entries(policies).filter(([id]) => ids.has(id))),
+    };
+    const payments = readTaskPayments(details.querySelector('.task-payments'));
+    if (payments) value.paymentPolicy = payments;
+    return value;
+  };
+  details._readAuthority = () => (explicit() ? read() : undefined);
+  const paint = () => {
+    summary.textContent = explicit() ? agentAuthoritySummary(read(), projects) : `Same as ${label}`;
+    const reset = details.querySelector('.aa-reset');
+    if (reset) reset.hidden = !explicit();
+    const count = details.querySelector('.tf-vault-count');
+    if (count && items) count.textContent = `${items.filter((item) => ids.has(item.id)).length} selected`;
+  };
+  const changed = () => {
+    if (hydrating) return;
+    touched = true;
+    details.dataset.explicit = '1';
+    details.dataset.authority = JSON.stringify(read());
+    paint();
+    details.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  const fill = () => {
+    const value = current();
+    hydrating = true;
+    ids = new Set(value.credentialGrants.filter((grant) => grant.startsWith('use-credential:item:')).map((grant) => grant.slice('use-credential:item:'.length)));
+    policies = structuredClone(value.credentialPolicies || {});
+    body.innerHTML = `${authorizationEditorHtml(`${prefix}-authorization`, value.authorization, projects, projectId)}
+      <div class="aa-resources">
+        <button type="button" class="btn tf-vault-button aa-vault" disabled title="Vault credentials this agent may use"><span>Vault credentials</span><span class="tf-vault-count">…</span></button>
+        ${taskPaymentsHtml(`${prefix}-payments`)}
+      </div>
+      <button type="button" class="btn sm aa-reset" hidden>↺ Same as ${esc(label)}</button>`;
+    wireAuthorizationEditor(body.querySelector('.authz-editor'), projects, changed);
+    const payments = body.querySelector('.task-payments');
+    wireTaskPayments(payments, projectId, value.paymentPolicy, undefined, organizationId);
+    payments.addEventListener('change', (event) => { if (event.target === payments || event.isTrusted) changed(); });
+    payments.addEventListener('input', changed);
+    body.querySelector('.aa-reset').addEventListener('click', () => {
+      touched = false;
+      details.dataset.explicit = '';
+      details.dataset.authority = 'null';
+      fill();
+      details.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const vault = body.querySelector('.aa-vault');
+    vaultItemsFor(organizationId).then((list) => {
+      if (!vault.isConnected) return;
+      items = list || [];
+      vault.disabled = false;
+      paint();
+    }).catch(() => vault.remove());
+    vault.addEventListener('click', () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => {
+      ids = new Set(selected);
+      policies = overrides;
+      changed();
+    }));
+    built = true;
+    hydrating = false;
+    paint();
+  };
+  details.addEventListener('toggle', () => {
+    // An untouched block always opens on what it currently inherits.
+    if (details.open && (!built || !explicit())) fill();
+  });
+}
+
+function readAgentBlock(root) {
+  const spec = readAgentSpec(root);
+  const details = root.querySelector('.agent-authority[data-mode="agent"]');
+  if (details && !spec.avatarId) {
+    const authority = details._readAuthority ? details._readAuthority()
+      : details.dataset.explicit === '1' ? JSON.parse(details.dataset.authority || 'null') : undefined;
+    if (authority) spec.authority = authority;
+  }
+  const instructions = root.querySelector('.ab-instructions')?.value ?? '';
+  if (instructions.trim()) spec.prompt = instructions;
+  return spec;
 }
 
 // Where a fork starts: the source's unpublished branch, or where the source
@@ -1348,12 +1581,10 @@ function readAgentSpec(box) {
 
 // The confirmer field: an ordered LIST of confirm layers, played sequentially at
 // the Review gate — each layer is a human confirmation or a review agent; zero
-// layers ⇒ auto-confirm. Layers can be added, removed and reordered; an agent
-// layer reuses the SAME agent sub-form as Do/Merge/Resolve (renderAgentField, so
-// provider/model/effort + "Fork a previous agent" all work identically) plus the
-// review-request prompt template — pre-filled with the built-in default
-// (f.promptDefault) and stored only when edited, so it keeps inheriting otherwise.
-// Legacy single-gate values ({mode:…}) are normalized to layers on read.
+// layers ⇒ auto-confirm. Layers can be added, removed and reordered. A layer is
+// one compact row (kind · who · ↑↓✕); an agent layer adds the same Agent block
+// as every other agent (harness, tools, fork, its own authority) with optional
+// Instructions. Legacy single-gate values ({mode:…}) are normalized on read.
 function cfLayersOf(v) {
   if (Array.isArray(v?.layers)) return v.layers;
   const mode = v?.mode || 'human';
@@ -1378,26 +1609,25 @@ function audienceComboHtml(className, audience, label) {
 function wireAudienceCombos(root) {
   root.querySelectorAll('.audience-combo').forEach((combo) => wireCombo(combo, humanAudienceOptions, null, { multiple: true }));
 }
+// An agent other than the main one: its block carries Instructions and its own
+// Authorization row (inheriting the main agent's until changed).
+const routeAgentBlock = (f, spec, inherited) =>
+  renderAgentField(f, spec, inherited, { instructions: true, authority: { label: 'Agent' } });
 function cfLayerHtml(f, layer, agentDefault) {
   const isAgent = layer.kind === 'agent';
-  const promptVal = (isAgent ? layer.prompt ?? f.promptDefault : f.promptDefault) || '';
   const audience = (layer.audience?.length ? layer.audience : ['@creator']).join(', ');
   return `<div class="cf-layer" data-kind="${esc(layer.kind)}">
-    <div class="cf-layer-head" style="display:flex;gap:8px;align-items:center">
-      <span class="cf-layer-num" style="font-size:11px;color:var(--ink-3);min-width:14px;text-align:right"></span>
-      <select class="cf-kind">${[['human', 'Human confirms'], ['agent', 'Agent reviews']].map(([k, l]) => `<option value="${k}" ${k === layer.kind ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
-      <span style="flex:1"></span>
-      <button type="button" class="btn sm cf-move" data-dir="-1" title="Move this step up">↑</button>
-      <button type="button" class="btn sm cf-move" data-dir="1" title="Move this step down">↓</button>
-      <button type="button" class="btn sm cf-del" title="Remove this step">✕</button>
+    <div class="cf-layer-head route-row">
+      <span class="cf-layer-num"></span>
+      <select class="cf-kind" aria-label="Review step">${[['human', 'Human confirms'], ['agent', 'Agent reviews']].map(([k, l]) => `<option value="${k}" ${k === layer.kind ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+      <div class="cf-human" ${isAgent ? 'hidden' : ''}>${audienceComboHtml('cf-audience', audience, 'Who confirms')}</div>
+      <span class="cf-layer-tools">
+        <button type="button" class="btn sm cf-move" data-dir="-1" title="Move this step up" aria-label="Move this step up">↑</button>
+        <button type="button" class="btn sm cf-move" data-dir="1" title="Move this step down" aria-label="Move this step down">↓</button>
+        <button type="button" class="btn sm cf-del" title="Remove this step" aria-label="Remove this step">✕</button>
+      </span>
     </div>
-    <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-      <div class="form-row"><span class="form-row-head">Who confirms ${policyTip('Separate people or teams with commas. Add steps for reviews in sequence.')}</span>${audienceComboHtml('cf-audience', audience, 'Who confirms')}</div>
-    </div>
-    <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review prompt ${policyTip('Sent at each review. Type [[ for wiki context. Variables: {{prompt}}, {{response}}, {{reviewInfo}}, {{changedFiles}}, {{transcript}}.')}</div>
-      <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
-    </div>
+    <div class="cf-agent" ${isAgent ? '' : 'hidden'}>${routeAgentBlock(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}</div>
   </div>`;
 }
 function cfListHtml(f, layers, agentDefault) {
@@ -1408,38 +1638,44 @@ function renderConfirmerField(f, own, inherited, alt) {
   const layers = cfLayersOf(own || inh);
   const agentDefault = inh.agentDefault || {};
   const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
-  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}' data-agent-default='${esc(JSON.stringify(agentDefault))}'>
+  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-agent-default='${esc(JSON.stringify(agentDefault))}'>
     <div class="cf-layers">${cfListHtml(f, layers, agentDefault)}</div>
-    <div class="cf-empty" style="font-size:12px;color:var(--ink-3);padding:2px 0;${layers.length ? 'display:none' : ''}">No reviewers — this task auto-confirms at Review.</div>
-    <button type="button" class="btn sm cf-add" style="margin-top:6px">+ Add a review step</button>
+    <div class="cf-empty" ${layers.length ? 'hidden' : ''}>Auto-confirms</div>
+    <button type="button" class="btn sm cf-add">+ Add step</button>
   </div>`;
 }
 
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 const normSpec = (s, inherited) => (s ? { avatarId: s.avatarId || '', provider: s.provider, model: s.model || '', effort: s.effort || '', mcpConnections: s.mcpConnections ?? inherited?.mcpConnections } : null);
+// Canonical shape of an agent's own authority, for changed-vs-inherited checks.
+function normAuthority(a) {
+  if (!a) return null;
+  const sortObject = (value) => Object.fromEntries(Object.entries(value || {}).sort(([x], [y]) => x.localeCompare(y)));
+  return {
+    authorization: a.authorization ? { level: a.authorization.level, scope: a.authorization.scope,
+      projectIds: a.authorization.scope === 'projects' ? [...(a.authorization.projectIds || [])].sort() : [] } : null,
+    credentialGrants: a.credentialGrants ? [...a.credentialGrants].sort() : null,
+    credentialPolicies: a.credentialPolicies ? sortObject(a.credentialPolicies) : null,
+    paymentPolicy: a.paymentPolicy ? { cardIds: a.paymentPolicy.cardIds ? [...a.paymentPolicy.cardIds].sort() : null,
+      budget: a.paymentPolicy.budget ?? null, currency: a.paymentPolicy.currency || null } : null,
+  };
+}
 // Canonical shape of a confirm layer for changed-vs-inherited comparison.
 const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
-      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null, mcpConnections: l.mcpConnections }
+      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: agentInstructions(l.prompt), resume: l.resumeFrom || null, mcpConnections: l.mcpConnections, authority: l.avatarId ? null : normAuthority(l.authority) }
       : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
 // Read a confirmer box's layer list back out of the DOM (the stored value shape).
 function readConfirmerLayers(box) {
-  const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
   return [...box.querySelectorAll('.cf-layer')].map((row) => {
     if (row.querySelector('.cf-kind')?.value !== 'agent') {
       const audience = (row.querySelector('.cf-audience')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
       return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
     }
-    const ab = row.querySelector('.agent-field');
-    const spec = { kind: 'agent', ...readAgentSpec(ab) };
-    // Store the review-request prompt only when it diverges from the built-in
-    // default; the pre-filled default itself is never persisted.
-    const prompt = row.querySelector('.cf-prompt')?.value ?? '';
-    if (prompt.trim() !== '' && prompt !== promptDefault) spec.prompt = prompt;
-    return spec;
+    return { kind: 'agent', ...readAgentBlock(row.querySelector('.agent-field')) };
   });
 }
 
@@ -1452,7 +1688,7 @@ function responderOf(v) {
 }
 function normResponder(route) {
   return route?.kind === 'agent'
-    ? { kind: 'agent', avatarId: route.avatarId || '', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null, mcpConnections: route.mcpConnections }
+    ? { kind: 'agent', avatarId: route.avatarId || '', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: agentInstructions(route.prompt), resume: route.resumeFrom || null, mcpConnections: route.mcpConnections, authority: route.avatarId ? null : normAuthority(route.authority) }
     : { kind: 'human', audience: route?.audience?.length ? [...route.audience] : ['@creator'] };
 }
 function renderResponderField(f, own, inherited, alt) {
@@ -1461,21 +1697,13 @@ function renderResponderField(f, own, inherited, alt) {
   const isAgent = route.kind === 'agent';
   const agentDefault = inh.agentDefault || {};
   const audience = (route.audience?.length ? route.audience : ['@creator']).join(', ');
-  const promptVal = (isAgent ? route.prompt ?? f.promptDefault : f.promptDefault) || '';
   const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
-  return `<div class="responder-field" data-responder="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}' data-agent-default='${esc(JSON.stringify(agentDefault))}'>
-    <div class="cf-layer" data-kind="${esc(route.kind)}">
-      <div class="cf-layer-head" style="display:flex;gap:8px;align-items:center">
-        <select class="cf-kind rf-kind"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
-      </div>
-      <div class="cf-human rf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
-        <div class="form-row"><span class="form-row-head">Who responds ${policyTip('Separate people or teams with commas. Any selected person may answer.')}</span>${audienceComboHtml('cf-audience rf-audience', audience, 'Who responds')}</div>
-      </div>
-      <div class="cf-agent rf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}
-        <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Response prompt — sent whenever the task waits for input. Type [[ to add wiki context. Placeholders: {{title}}, {{prompt}}, {{question}}, {{transcript}}.</div>
-        <textarea class="cf-prompt rf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
-      </div>
+  return `<div class="responder-field" data-responder="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-agent-default='${esc(JSON.stringify(agentDefault))}'>
+    <div class="route-row">
+      <select class="cf-kind rf-kind" aria-label="Who responds"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
+      <div class="cf-human rf-human" ${isAgent ? 'hidden' : ''}>${audienceComboHtml('cf-audience rf-audience', audience, 'Who responds')}</div>
     </div>
+    <div class="cf-agent rf-agent" ${isAgent ? '' : 'hidden'}>${routeAgentBlock(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}</div>
   </div>`;
 }
 function readResponder(box) {
@@ -1483,12 +1711,8 @@ function readResponder(box) {
     const audience = (box.querySelector('.rf-audience')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
     return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
   }
-  const ab = box.querySelector('.agent-field');
-  const route = { kind: 'agent', ...readAgentSpec(ab) };
+  const route = { kind: 'agent', ...readAgentBlock(box.querySelector('.agent-field')) };
   if (route.avatarId) return { kind: 'human', audience: [`avatar:${route.avatarId}`] };
-  const prompt = box.querySelector('.rf-prompt')?.value ?? '';
-  const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
-  if (prompt.trim() !== '' && prompt !== promptDefault) route.prompt = prompt;
   return route;
 }
 
@@ -1714,8 +1938,8 @@ function normalizedAuthorization(value, fallbackProjectId) {
 
 // The hint is the empty state of the one scope field — once a scope is chosen the
 // chips say where the grant applies, so the placeholder gets out of their way.
-function authorizationScopePlaceholder(chips) {
-  return chips.length ? '' : 'Project name or @organization';
+function authorizationScopePlaceholder(chips, root) {
+  return chips.length ? '' : root?.dataset.emptyPlaceholder || 'Project name or @organization';
 }
 
 function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
@@ -1724,7 +1948,7 @@ function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
   const names = new Map((projects || []).map((project) => [project.id, project.name]));
   const chips = selected.scope === 'organization' ? ['@organization'] : (selected.projectIds || []);
   return `<div class="authz-editor" id="${esc(id)}" data-authorization="${esc(JSON.stringify(selected))}">
-    <select class="authz-level-select" aria-label="Authorization level" aria-describedby="${esc(id)}-description">${(authorizationLevels().some((candidate) => candidate.id === level.id) ? authorizationLevels() : [...authorizationLevels(), level]).map((candidate) =>
+    <select class="authz-level-select" aria-label="Authorization level" aria-describedby="${esc(id)}-description" title="${esc(level.description || '')}">${(authorizationLevels().some((candidate) => candidate.id === level.id) ? authorizationLevels() : [...authorizationLevels(), level]).map((candidate) =>
       `<option value="${esc(candidate.id)}" ${candidate.id === selected.level ? 'selected' : ''}>${esc(candidate.name)}</option>`).join('')}</select>
     <p class="authz-description task-sub" id="${esc(id)}-description" aria-live="polite">${esc(level.description || "Custom capabilities in the selected scope.")}</p>
     ${authorizationWarningHtml(level)}
@@ -1986,11 +2210,12 @@ function wireAuthorizationEditor(root, projects, onChange) {
   const drawChips = () => {
     const description = root.querySelector('.authz-description');
     if (description) description.textContent = levelOf().description || 'Custom capabilities in the selected scope.';
+    levelSelect.title = levelOf().description || '';
     const warning = root.querySelector('.authz-warning');
     if (warning) warning.outerHTML = authorizationWarningHtml(levelOf());
     const selected = value.scope === 'organization' ? ['@organization'] : (value.projectIds || []);
     chips.innerHTML = selected.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : projectById.get(scope)?.name || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('');
-    input.placeholder = authorizationScopePlaceholder(selected);
+    input.placeholder = authorizationScopePlaceholder(selected, root);
     chips.querySelectorAll('button').forEach((button) => button.addEventListener('click', () => {
       const scope = button.closest('[data-scope]').dataset.scope;
       value = scope === '@organization' ? { level: value.level, scope: 'projects', projectIds: [] }
@@ -2184,6 +2409,9 @@ function wireAgentBox(box) {
     const controls = box.querySelector('.agent-controls');
     const note = box.querySelector('.af-avatar-note');
     if (controls) controls.hidden = !!avatar;
+    // An Avatar acts with the authority its owner delegated to it.
+    const authority = box.querySelector('.agent-authority');
+    if (authority) authority.hidden = !!avatar;
     if (note) {
       note.hidden = !avatar;
       note.textContent = avatar ? `${avatar.purpose || 'Owner-controlled prompt and delegated authority'} · owned by ${avatarOwnerName(avatar)}` : '';
@@ -2373,10 +2601,13 @@ function wireAgentBox(box) {
   syncForkState();
   syncAvatar();
 }
-function wireAgentFields(root) {
-  root.querySelectorAll('.agent-field').forEach(wireAgentBox);
-  root.querySelectorAll('.confirmer-field').forEach(wireConfirmerField);
-  root.querySelectorAll('.responder-field').forEach(wireResponderField);
+// `ctx` is wireAgentBlock's: the project and organization whose vault items,
+// cards and projects the agents' Authorization rows offer.
+function wireAgentFields(root, ctx) {
+  ctx ||= {};
+  root.querySelectorAll('.confirmer-field').forEach((box) => wireConfirmerField(box, ctx));
+  root.querySelectorAll('.responder-field').forEach((box) => wireResponderField(box, ctx));
+  root.querySelectorAll('.agent-field').forEach((box) => { if (!box._agentCtx) wireAgentBlock(box, ctx); });
 }
 
 // Renumber the layer rows and toggle the "auto-confirm" empty state.
@@ -2384,24 +2615,16 @@ function cfSync(box) {
   const rows = [...box.querySelectorAll('.cf-layer')];
   rows.forEach((r, i) => { const n = r.querySelector('.cf-layer-num'); if (n) n.textContent = `${i + 1}.`; });
   const empty = box.querySelector('.cf-empty');
-  if (empty) empty.style.display = rows.length ? 'none' : '';
-}
-
-// Review-request prompts accept the same project/org wiki references as the task
-// prompt and follow-up composer. The resolver scans the rendered request when the
-// Confirm turn starts; wireWikiMention supplies search, decoration, and links.
-function wireConfirmerWikiPrompts(root) {
-  // Kept guarded for hosts upgrading from a build before wiki mentions existed;
-  // current builds always provide the shared picker.
-  if (typeof wireWikiMention !== 'function') return;
-  root.querySelectorAll('.cf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
+  if (empty) empty.hidden = !!rows.length;
 }
 
 // Confirmer fields: an editable layer list. Row controls are delegated to the box
 // so a reset (which re-renders the rows) needs no re-wiring; only dynamically
-// added agent sub-forms are wired as they appear.
-function wireConfirmerField(box) {
-  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+// added agent blocks are wired as they appear, with the field's context.
+function wireConfirmerField(box, ctx) {
+  ctx ||= {};
+  box._agentCtx = ctx;
+  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer') };
   const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
   const list = box.querySelector('.cf-layers');
   const changed = () => box.dispatchEvent(new Event('change', { bubbles: true }));
@@ -2431,39 +2654,38 @@ function wireConfirmerField(box) {
       const row = tpl.content.firstElementChild;
       if (kind === 'agent' && firstHuman) list.insertBefore(row, firstHuman);
       else list.appendChild(row);
-      row.querySelectorAll('.agent-field').forEach(wireAgentBox);
+      row.querySelectorAll('.agent-field').forEach((block) => wireAgentBlock(block, box._agentCtx));
       wireAudienceCombos(row);
-      wireConfirmerWikiPrompts(row);
       cfSync(box); changed();
     }
   });
-  // Kind flip: show the agent sub-form only for agent layers.
+  // Kind flip: show the agent block only for agent layers.
   box.addEventListener('change', (e) => {
     if (!e.target.classList?.contains('cf-kind')) return;
     const row = e.target.closest('.cf-layer');
     row.setAttribute('data-kind', e.target.value);
     const ab = row.querySelector('.cf-agent');
-    if (ab) ab.style.display = e.target.value === 'agent' ? '' : 'none';
+    if (ab) ab.hidden = e.target.value !== 'agent';
     const hb = row.querySelector('.cf-human');
-    if (hb) hb.style.display = e.target.value === 'human' ? '' : 'none';
+    if (hb) hb.hidden = e.target.value !== 'human';
   });
+  list.querySelectorAll('.agent-field').forEach((block) => wireAgentBlock(block, ctx));
   wireAudienceCombos(box);
-  wireConfirmerWikiPrompts(box);
   cfSync(box);
 }
 
-function wireResponderField(box) {
+function wireResponderField(box, ctx) {
+  ctx ||= {};
+  box._agentCtx = ctx;
   box.querySelector('.rf-kind')?.addEventListener('change', (event) => {
     const isAgent = event.target.value === 'agent';
     const agent = box.querySelector('.rf-agent');
     const human = box.querySelector('.rf-human');
-    if (agent) agent.style.display = isAgent ? '' : 'none';
-    if (human) human.style.display = isAgent ? 'none' : '';
+    if (agent) agent.hidden = !isAgent;
+    if (human) human.hidden = isAgent;
   });
+  box.querySelectorAll('.agent-field').forEach((block) => wireAgentBlock(block, ctx));
   wireAudienceCombos(box);
-  if (typeof wireWikiMention === 'function') {
-    box.querySelectorAll('.rf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
-  }
 }
 
 // Wire per-field "Reset to default" buttons: show the button whenever the field
@@ -2561,21 +2783,22 @@ function resetAgentField(box, attr = 'data-inherit') {
     picker.dataset.inherited = JSON.stringify(inh.mcpConnections ?? ['browser:chrome-devtools']);
     wireMcpPicker(picker, picker.dataset.scope);
   }
+  const authority = box.querySelector('.agent-authority[data-mode="agent"]');
+  if (authority?.dataset.explicit === '1') authority.querySelector('.aa-reset')?.click();
   avatar?.dispatchEvent(new Event('change', { bubbles: true }));
   box.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 function resetConfirmerField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
-  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer') };
   const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
   const list = box.querySelector('.cf-layers');
   // Re-render the rows from the inherited layers; row controls are delegated to
-  // the box, so only the fresh agent sub-forms need wiring.
+  // the box, so only the fresh agent blocks need wiring.
   list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
-  list.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  list.querySelectorAll('.agent-field').forEach((block) => wireAgentBlock(block, box._agentCtx));
   wireAudienceCombos(list);
-  wireConfirmerWikiPrompts(list);
   cfSync(box);
   // This composite control is rebuilt rather than assigned through an input.
   // Emit the same event as a user edit so draft auto-save persists the reset;
@@ -2585,14 +2808,13 @@ function resetConfirmerField(box, attr = 'data-inherit') {
 
 function resetResponderField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
-  const f = { role: box.getAttribute('data-responder'), name: box.getAttribute('data-responder'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+  const f = { role: box.getAttribute('data-responder'), name: box.getAttribute('data-responder') };
   const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
   const replacement = document.createElement('template');
   replacement.innerHTML = renderResponderField(f, responderOf(inh), { ...inh, agentDefault });
   const fresh = replacement.content.firstElementChild;
   box.innerHTML = fresh.innerHTML;
-  box.querySelectorAll('.agent-field').forEach(wireAgentBox);
-  wireResponderField(box);
+  wireResponderField(box, box._agentCtx);
   box.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
@@ -6128,8 +6350,7 @@ function triggersSection(values, selfId) {
   ).join('');
   return `
     <details class="advanced" style="margin-top:10px" ${existing.length ? 'open' : ''}>
-      <summary>Triggers — start this task after dependencies, on a schedule</summary>
-      <p class="task-sub" style="color:var(--ink-3);margin-top:0">When both are set, the task waits for its dependencies and the scheduled time. Leave empty to start immediately.</p>
+      <summary>Triggers ${policyTip('Start this task after other tasks finish, on a schedule, or both (it waits for all of them). Leave empty to start now.')}</summary>
       <div class="form-row">
         <div class="label-row"><label>Task dependencies</label></div>
         <div class="chip-input" id="dep-box">
@@ -6154,7 +6375,7 @@ function repeatableToggleHtml(values) {
   return `
     <div class="form-row repeat-row">
       <label class="repeat-toggle"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
-        <span><b>Repeatable</b> — each run is kept; a trigger (or “Run again”) spawns a fresh run instead of running once.</span>
+        <span><b>Repeatable</b> ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</span>
       </label>
     </div>`;
 }
@@ -6549,6 +6770,25 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // metadata (priority/tags, authorization, attempts, notes) lives in a sidebar.
   // Everything stays inside #tf-body so collect/auto-save wiring sees one form.
   const restFields = promptField ? fields.filter((f) => f.name !== promptField.name) : fields;
+  // The main column reads like the task it describes: the prompt, the agent
+  // that does it, who answers its questions, who reviews it, then where it runs
+  // and when it starts.
+  const agentRank = (f) => (f.type === 'agent' ? 0 : f.type === 'responder' ? 1 : f.type === 'confirmer' ? 2 : 3);
+  const agentFields = restFields.filter((f) => agentRank(f) < 3).sort((a, b) => agentRank(a) - agentRank(b));
+  const otherFields = restFields.filter((f) => agentRank(f) === 3);
+  const mainAgentField = agentFields.find((f) => f.type === 'agent' && (f.role || f.name) === 'do') || agentFields.find((f) => f.type === 'agent');
+  // The main agent acts with the task's own authority: its level and projects,
+  // vault credentials, cards and budget — the same API fields as always.
+  const mainAuthorityHtml = `<div class="form-row" data-row="__authorization">${authorizationEditorHtml('tf-authorization', selectedAuthorization, authorizationProjects, projectId)}</div>
+    <div class="aa-resources">
+      <div class="form-row" data-row="__vault"><button type="button" class="btn tf-vault-button" id="tf-vault-open" disabled
+        title="Credentials (site logins, API keys, SSH keys, .env bags) the agent may use. It can request more mid-task; you approve each request.">
+        <span>Vault credentials</span><span class="tf-vault-count" id="tf-vault-count">Loading…</span></button></div>
+      ${taskPaymentsHtml('tf-payments')}
+    </div>`;
+  const agentSectionHtml = (f) => f === mainAgentField
+    ? renderField(f, values[f.name], inherited[f.name], false, undefined, { authority: { html: mainAuthorityHtml, summary: authorizationSummary(selectedAuthorization, authorizationProjects) } })
+    : renderField(f, values[f.name], inherited[f.name]);
   root.innerHTML = `
     <div class="task-form-page" id="tf-page" tabindex="-1">
       <div class="tf-head">
@@ -6567,7 +6807,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         <div class="tf-columns parameter-fields" id="tf-body">
           <div class="tf-main">
             ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
-            ${restFields.length ? `<div class="section-h">Parameters</div>${renderFields(restFields, values, inherited)}` : ''}
+            ${agentFields.map((f) => `<section class="tf-section tf-${esc(f.type)}">${agentSectionHtml(f)}</section>`).join('')}
+            ${otherFields.length ? `<section class="tf-section tf-where">${renderFields(otherFields, values, inherited)}</section>` : ''}
             ${promptField ? '' : `<div class="form-row" data-row="__images">
               <div class="label-row"><label>Attachments</label></div>
               <div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
@@ -6582,25 +6823,13 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               <div class="label-row"><label>Priority &amp; tags</label></div>
               ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
             </div>
-            <div class="form-row" data-row="__authorization">
-              <div class="label-row"><label>Authorization</label></div>
-              ${authorizationEditorHtml('tf-authorization', selectedAuthorization, authorizationProjects, projectId)}
-            </div>
             ${['software-dev', 'goal'].includes(wf) ? `<div class="form-row" data-row="__github-merge" id="tf-github-merge" style="display:none"></div>` : ''}
             ${!draft ? `<div class="form-row tf-inline" data-row="__attempts" title="Attempts created here are queued together. Attempts added later start as editable drafts.">
               <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
             </div>` : ''}
-            <div class="form-row" data-row="__vault">
-              <button type="button" class="btn tf-vault-button" id="tf-vault-open" disabled
-                title="Choose which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Agents can request more mid-task; you approve each request.">
-                <span>Vault credentials</span>
-                <span class="tf-vault-count" id="tf-vault-count">Loading…</span>
-              </button>
-            </div>
-            ${taskPaymentsHtml("tf-payments")}
             <div class="form-row" data-row="__creds">
-              <div class="label-row"><label title="Drag to reorder, toggle to disable — for this task only.">Codex/Claude</label></div>
+              <div class="label-row"><label>Codex/Claude</label>${policyTip('Drag to reorder, toggle to disable — for this task only.')}<span class="label-row-fill"></span></div>
               <div id="cred-editor-newtask">Loading…</div>
             </div>
             <div class="form-row" data-row="__notes">
@@ -6618,7 +6847,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         </div>
       </div>
     </div>`;
-  wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
+  const mainPaymentsReady = wireTaskPayments($('#tf-payments'), projectId, values.paymentPolicy);
   const formKeyController = new AbortController();
   activeTaskFormKeyController = formKeyController;
   const releaseFormKeys = () => {
@@ -6656,7 +6885,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     }
   });
   $('#tf-close').addEventListener('click', () => closeForm());
-  wireAgentFields($('#tf-body'));
+  // The other agents' Authorization rows start from the main agent's, live.
+  const mainAuthority = () => ({
+    authorization: readAuthorizationEditor($('#tf-authorization')),
+    credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
+    credentialPolicies: vaultCredentialPolicies,
+    paymentPolicy: readTaskPayments($('#tf-payments')) ?? values.paymentPolicy,
+  });
+  wireAgentFields($('#tf-body'), { projectId, organizationId: projectOrganizationId, projects: authorizationProjects,
+    inheritedAuthority: mainAuthority });
   // "Start with this Avatar" is a one-shot seed for the new task form.
   S.pendingAvatarId = null;
   wireFieldResets($('#tf-body'), fields);
@@ -6759,7 +6996,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const localCred = !draft;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
-  wireAuthorizationEditor($('#tf-authorization'), authorizationProjects, () => autoSaveSoon());
+  // The main agent's collapsed Authorization row says what it holds.
+  const paintMainAuthority = () => {
+    const summary = $('#tf-authorization')?.closest('.agent-authority')?.querySelector('.aa-summary');
+    if (summary) summary.textContent = agentAuthoritySummary({ ...mainAuthority(),
+      credentialGrants: inheritedVault.error ? undefined : mainAuthority().credentialGrants }, authorizationProjects);
+  };
+  wireAuthorizationEditor($('#tf-authorization'), authorizationProjects, () => { paintMainAuthority(); autoSaveSoon(); });
+  $('#tf-payments')?.addEventListener('change', paintMainAuthority);
+  $('#tf-payments')?.addEventListener('input', paintMainAuthority);
   // The vault credential picker (wiki plans/PLAN-passwords §6): item grants layered onto
   // the authorization package. Keep selection in form-local state so the task
   // sidebar stays one compact button; the full checkbox list lives in a modal.
@@ -6779,8 +7024,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       vaultCredentialPolicies = policies;
       refreshVaultCount();
     },
-    changed: () => autoSaveSoon(),
+    changed: () => { paintMainAuthority(); autoSaveSoon(); },
   });
+  paintMainAuthority();
+  mainPaymentsReady.then(paintMainAuthority);
   (async () => {
     const button = $('#tf-vault-open');
     const count = $('#tf-vault-count');
@@ -6803,6 +7050,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       selected.forEach((id) => vaultGrantIds.add(id));
       vaultCredentialPolicies = policies;
       refreshCount();
+      paintMainAuthority();
       button.dispatchEvent(new Event('change', { bubbles: true }));
     }));
   })();
@@ -6897,7 +7145,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           draftId = created.id;
         } else {
           await Promise.all([
-            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) }),
+            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true }) }),
             api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
           ]);
           // Authorization is stored inside params, so it must follow the params
@@ -6966,7 +7214,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   closeForm = () => { clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st); leavePage(navigating); };
 
   let submitInFlight = false;
-  const submit = async (draftMode, authorizationDecision, activeFeedback) => {
+  // `accepted`: the agents (`do` is the main one) whose limited authorization
+  // the user chose to run with ("Use my authorization").
+  const submit = async (draftMode, accepted = [], activeFeedback) => {
     const ownsFeedback = !activeFeedback;
     if (ownsFeedback && submitInFlight) return false;
     const submitButtons = [$('#tf-draft'), $('#tf-queue')].filter(Boolean);
@@ -6995,14 +7245,18 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       let knownDraftAttemptIds = [];
       const authorizationOptions = {
         ...(draftMode ? { allowAttenuation: true } : {}),
-        ...(authorizationDecision === 'limit' ? { acceptAttenuation: true } : {}),
+        ...(accepted.includes('do') ? { acceptAttenuation: true } : {}),
       };
+      // Agents other than the main one carry their authority in their specs.
+      const agentAccepted = accepted.filter((key) => key !== 'do');
+      const paramsOptions = { ...(draftMode ? { allowAttenuation: true } : {}), ...(agentAccepted.length ? { acceptAttenuation: agentAccepted } : {}) };
+      const createOptions = { ...(draftMode ? { allowAttenuation: true } : {}), ...(accepted.length ? { acceptAttenuation: accepted } : {}) };
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
         // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await Promise.all([
-          api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) }),
+          api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode, ...paramsOptions }) }),
           api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
         ]);
         await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, ...authorizationOptions }) });
@@ -7010,9 +7264,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         // The usual expanded-form path was just persisted by auto-save. Do not
         // spend another RTT writing identical params and notes before queueing.
-        if (!currentStateAlreadySaved) {
+        // Accepting an agent's limited authority is recorded with its params.
+        if (!currentStateAlreadySaved || agentAccepted.length) {
           await Promise.all([
-            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) }),
+            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true, ...paramsOptions }) }),
             api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
           ]);
         }
@@ -7030,13 +7285,13 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount, allowAttenuation: true, ...authorizationOptions }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount, ...createOptions, allowAttenuation: true }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount, ...authorizationOptions }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount, ...createOptions }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -7091,10 +7346,14 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     } catch (e) {
       if (!draftMode && isAuthorizationGrantGap(e)) {
         try {
-          const decision = await chooseAuthorizationGrant(projectId, st.authorization, 'task agent');
+          // The refusal names the agent whose authority exceeds the user's (`do`,
+          // or absent, is the main agent): ask about exactly that one.
+          const participant = e.participant && e.participant !== 'do' ? e.participant : null;
+          const decision = await chooseAuthorizationGrant(projectId, participant ? e.authorization || st.authorization : st.authorization,
+            participant ? agentParticipantLabel(participant) : 'task agent');
           if (!decision) return false;
           if (decision.action === 'limit') {
-            succeeded = await submit(false, 'limit', activeFeedback);
+            succeeded = await submit(false, [...new Set([...accepted, participant || 'do'])], activeFeedback);
             return succeeded;
           }
           let targetId = draftId || draft?.id;
@@ -7106,6 +7365,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
             }) });
             targetId = draftId = created.id;
           } else {
+            await api(`/api/tasks/${targetId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, allowAttenuation: true }) });
             await api(`/api/tasks/${targetId}/authorization`, { method: 'PATCH', body: JSON.stringify({
               authorization: st.authorization, credentialGrants: st.credentialGrants,
               credentialPolicies: st.credentialPolicies, allowAttenuation: true,
@@ -7114,8 +7374,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               await api(`/api/tasks/${targetId}/attempts`, { method: 'POST', body: '{}' });
           }
           await api(`/api/authorization-requests?projectId=${encodeURIComponent(projectId)}`, { method: 'POST', body: JSON.stringify({
-            projectId, target: { kind: 'task', taskId: targetId, queueAfterApproval: true },
-            authorization: st.authorization, audience: decision.audience, reason: decision.reason,
+            projectId, target: { kind: 'task', taskId: targetId, queueAfterApproval: true, ...(participant ? { participant } : {}) },
+            authorization: participant ? e.authorization || st.authorization : st.authorization, audience: decision.audience, reason: decision.reason,
           }) });
           releaseFormKeys();
           root.innerHTML = '';
@@ -8054,7 +8314,7 @@ function patchTaskPage(main, html) {
   const oldParams = main.querySelector('#tp-params');
   const newParams = template.content.querySelector('#tp-params');
   if (oldParams && newParams && oldParams.dataset.renderKey === newParams.dataset.renderKey) {
-    const fields = schemaFor(S.view.workflow).filter((f) => f.scopes.includes('task') && (S.view.editableParams || []).includes(f.name));
+    const fields = paramFields(S.view).filter((f) => (S.view.editableParams || []).includes(f.name));
     const current = collectParamEdits(oldParams, fields);
     const incoming = collectParamEdits(newParams, fields);
     const draft = S.paramEditDrafts[S.view.taskId];
@@ -8075,7 +8335,15 @@ function patchTaskPage(main, html) {
     return false;
   }
   if (sameThread) patchConversationRows(previous, next);
-  for (const [fresh, old] of retained.ancestors) patchChildren(old, fresh, retained.nodes);
+  for (const [fresh, old] of retained.ancestors) {
+    // A keyed container kept only for a retained section inside it (the
+    // parameter form around the main agent's authorization) takes its new key.
+    if (fresh.dataset?.renderKey !== undefined) old.dataset.renderKey = fresh.dataset.renderKey;
+    // A live section kept only for a retained section inside it has fresh
+    // content: it takes its new key and is hydrated again.
+    if (fresh.dataset?.liveKey !== undefined) { old.dataset.liveKey = fresh.dataset.liveKey; old.liveWired = false; }
+    patchChildren(old, fresh, retained.nodes);
+  }
   return !!sameThread;
 }
 
@@ -8085,8 +8353,13 @@ function patchTaskPage(main, html) {
 function retainedTaskNodes(main, fragment, pairs) {
   if (!pairs.length) return null;
   const nodes = new Map(), ancestors = new Map();
+  const retainedFresh = new Set(pairs.map(([, fresh]) => fresh));
+  // Inside another retained node, a retained node is kept with its container's
+  // own children: nothing between them is patched.
+  const nested = (fresh) => { for (let f = fresh.parentNode; f; f = f.parentNode) if (retainedFresh.has(f)) return true; return false; };
   for (const [old, fresh] of pairs) {
     nodes.set(fresh, old);
+    if (nested(fresh)) continue;
     let o = old, f = fresh;
     while (o !== main) {
       o = o.parentNode; f = f.parentNode;
@@ -8096,7 +8369,7 @@ function retainedTaskNodes(main, fragment, pairs) {
     }
   }
   for (const [fresh, old] of ancestors) if (!nodes.has(fresh)) nodes.set(fresh, old);
-  for (const [fresh] of pairs) ancestors.delete(fresh); // a retained node keeps its own children
+  for (const [, fresh] of pairs) ancestors.delete(fresh); // a retained node keeps its own children
   return { nodes, ancestors };
 }
 
@@ -10420,13 +10693,12 @@ async function copyNativeAttachCommand(v) {
 function parametersTab(v) {
   // Priority + tags (organization metadata) live in the page header, above the
   // tabs, so they're visible/editable on every tab — not just here (see renderTaskPage).
+  // The rest mirrors the task form: its agents, where it runs, when it starts,
+  // and the logins it may use.
   return `
     ${workflowSection(v)}
     ${paramsSection(v)}
-    ${authorizationSection(v)}
-    ${taskRecord(v.taskId)?.params?.draft ? '' : taskPaymentsHtml('tp-payments', paymentsLiveKey(v))}
-    <div class="section-h">Codex/Claude</div>
-    <p class="task-sub" style="color:var(--ink-3);margin-top:0">Drag to reorder, toggle to disable — for this task only.</p>
+    <div class="label-row tp-creds-head"><label>Codex/Claude</label>${policyTip('Drag to reorder, toggle to disable — for this task only.')}<span class="label-row-fill"></span></div>
     <div id="cred-editor-task" data-live-key="${esc(v.taskId)}">Loading…</div>`;
 }
 
@@ -10442,52 +10714,42 @@ function paymentsLiveKey(v) {
   return JSON.stringify([v.taskId, taskRecord(v.taskId)?.params?.paymentPolicy || null, ['done', 'cancelled', 'failed'].includes(v.status)]);
 }
 
-// Agent authorization + per-task vault grants — the same controls the task form
-// offers, editable in-flight (SPEC §5.5). The change re-points the task's live
-// grant, so it takes effect at the next agent turn. Hidden for drafts (they edit
-// in the full form); once frozen (terminal, or past the point of no return) it
-// stays as a read-only record of what the task's agents were allowed.
-function authorizationSection(v) {
+// The main agent's Authorization row on the Parameters tab: the task's own
+// authorization, vault grants, cards and budget — the same controls the task form
+// offers, editable in-flight (SPEC §5.5) under one save. A change re-points the
+// task's live grant, so it takes effect at the next agent turn. Once frozen
+// (terminal, or past the point of no return) it is a read-only record of what
+// the task's agents were allowed; spending stays visible.
+function mainAuthorityParams(v) {
   const rec = taskRecord(v.taskId);
-  if (rec?.params?.draft) return '';
   const organizationId = S.projects.find((project) => project.id === rec?.projectId)?.organizationId;
   const projects = S.projects.filter((project) => project.organizationId === organizationId);
   const stored = rec?.params?._authorization || {};
-  if (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) {
-    if (!rec) return '';
-    const credentials = (stored.capabilities || []).filter((c) => c.startsWith('use-credential:item:')).length;
-    const frozenTitle = TERMINAL_STAGES.includes(v.stage) ? 'Frozen — this task has finished' : 'Frozen — this task is landing';
-    return `<div class="section-h">Authorization</div>
-    <div class="parameter-fields" id="tp-auth-frozen">
-      <div class="form-row" data-row="__authorization" style="position:relative">
-        <span style="position:absolute;right:0;top:0;color:var(--ink-3)" title="${frozenTitle}">🔒</span>
-        <div class="label-row"><label>Authorization</label></div>
-        <div class="task-sub">${esc(authorizationSummary({ level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
-          projectIds: stored.projectIds || [rec.projectId].filter(Boolean) }, projects))}${credentials ? ` · ${credentials} vault credential${credentials === 1 ? '' : 's'}` : ''}</div>
-      </div>
-    </div>`;
-  }
-  const selected = S.authorizationEdits?.[v.taskId]?.values.authorization || {
-    level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
+  const payments = taskPaymentsHtml('tp-payments', paymentsLiveKey(v));
+  const storedSelection = { level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
     projectIds: stored.projectIds || [rec?.projectId].filter(Boolean) };
-  return `<div class="section-h">Authorization</div>
-    <div id="tp-auth" class="parameter-fields" data-live-key="${esc(authorizationLiveKey(v.taskId))}">
-      <div class="form-row" data-row="__authorization">
-        <div class="label-row"><label>Authorization</label></div>
-        ${authorizationEditorHtml('tp-authorization', selected, projects, rec?.projectId)}
-      </div>
-      <div class="form-row" data-row="__vault">
-        <button type="button" class="btn tf-vault-button" id="tp-vault-open" disabled
-          title="Choose which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Takes effect at the next agent turn.">
-          <span>Vault credentials</span>
-          <span class="tf-vault-count" id="tp-vault-count">Loading…</span>
-        </button>
+  const credentials = (stored.capabilities || []).filter((c) => c.startsWith('use-credential:item:'));
+  const summary = agentAuthoritySummary({ authorization: storedSelection, credentialGrants: credentials,
+    paymentPolicy: rec?.params?.paymentPolicy }, projects);
+  if (!rec) return { html: payments, summary: '' };
+  if (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) {
+    const frozenTitle = TERMINAL_STAGES.includes(v.stage) ? 'Frozen — this task has finished' : 'Frozen — this task is landing';
+    return { summary, html: `<div id="tp-auth-frozen" class="task-sub" title="${frozenTitle}">🔒 ${esc(summary)}</div>${payments}` };
+  }
+  const selected = S.authorizationEdits?.[v.taskId]?.values.authorization || storedSelection;
+  return { summary, html: `<div id="tp-auth" data-live-key="${esc(authorizationLiveKey(v.taskId))}">
+      ${authorizationEditorHtml('tp-authorization', selected, projects, rec?.projectId)}
+      <div class="aa-resources">
+        <div class="form-row" data-row="__vault"><button type="button" class="btn tf-vault-button" id="tp-vault-open" disabled
+          title="Credentials (site logins, API keys, SSH keys, .env bags) the agent may use. Takes effect at the next agent turn.">
+          <span>Vault credentials</span><span class="tf-vault-count" id="tp-vault-count">Loading…</span></button></div>
+        ${payments}
       </div>
       <div class="params-save-bar" data-save-state="saved">
         <span class="params-save-status" id="tp-auth-status" role="status" aria-live="polite">All authorization changes saved</span>
         <button class="btn sm primary" id="tp-auth-save" disabled>Save authorization</button>
       </div>
-    </div>`;
+    </div>` };
 }
 
 // Fill + wire the in-flight authorization controls (profiles + vault items load
@@ -10521,10 +10783,13 @@ async function wireTaskAuthorization(v) {
   });
   const draft = previous || { saved: read(), values: read(), saving: false };
   const status = document.getElementById('tp-auth-status');
+  // Cards and budget sit in the same row and save with the same button.
+  const payments = () => document.getElementById('tp-payments');
+  const paymentsDirty = () => !!S.paymentEdits?.[v.taskId];
   syncAuthorization = () => {
     draft.values = read();
-    const dirty = !sameJson(draft.saved, draft.values);
-    if (dirty || draft.saving) edits[v.taskId] = draft;
+    const dirty = !sameJson(draft.saved, draft.values) || paymentsDirty();
+    if (!sameJson(draft.saved, draft.values) || draft.saving) edits[v.taskId] = draft;
     else delete edits[v.taskId];
     saveBtn.disabled = draft.saving || !dirty;
     saveBtn.textContent = draft.saving ? 'Saving authorization…' : 'Save authorization';
@@ -10533,20 +10798,29 @@ async function wireTaskAuthorization(v) {
   };
   draft.sync = syncAuthorization;
   syncAuthorization();
+  const paymentsBox = payments();
+  // After the payments control has recorded the edit.
+  paymentsBox?.addEventListener('input', () => queueMicrotask(() => syncAuthorization()));
+  paymentsBox?.addEventListener('change', () => queueMicrotask(() => syncAuthorization()));
   saveBtn.addEventListener('click', async () => {
-    if (draft.saving || sameJson(draft.saved, draft.values)) return;
+    const authorizationDirty = !sameJson(draft.saved, draft.values);
+    if (draft.saving || (!authorizationDirty && !paymentsDirty())) return;
     const submitted = structuredClone(draft.values);
     draft.saving = true; draft.sync();
     try {
-      const updated = await saveTaskAuthorization(v.taskId, projectId, submitted);
-      if (!updated) return;
-      const currentRecord = taskRecord(v.taskId);
-      if (currentRecord && updated?.params) currentRecord.params = updated.params;
-      // The section already shows what was saved; don't repaint it for that.
-      const section = select.closest('[data-live-key]');
-      if (section) section.dataset.liveKey = authorizationLiveKey(v.taskId);
-      draft.saved = submitted;
-      toast('Authorization saved — applies at the next agent turn');
+      if (authorizationDirty) {
+        const updated = await saveTaskAuthorization(v.taskId, projectId, submitted);
+        if (!updated) return;
+        const currentRecord = taskRecord(v.taskId);
+        if (currentRecord && updated?.params) currentRecord.params = updated.params;
+        // The section already shows what was saved; don't repaint it for that.
+        const section = select.closest('[data-live-key]');
+        if (section) section.dataset.liveKey = authorizationLiveKey(v.taskId);
+        draft.saved = submitted;
+      }
+      // The payments save reports its own outcome.
+      if (paymentsDirty()) await payments()?._save?.().catch(() => {});
+      else toast('Authorization saved — applies at the next agent turn');
       setTimeout(refreshTasks, 400);
     } catch (e) { toast(e.message, true); }
     finally { draft.saving = false; draft.sync(); }
@@ -11157,19 +11431,43 @@ function workflowSection(v) {
         ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
       </select>`
     : `<span>${esc(workflowLabel(v.workflow))}</span>`;
-  return `<div class="section-h">Workflow</div>
-    <div class="tp-workflow">${mode}${version ? `<span class="mono" title="Workflow version this task is pinned to">v${esc(version)}</span>` : ''}</div>`;
+  return `<div class="tp-workflow"><label>Workflow</label>${mode}${version ? `<span class="mono" title="Workflow version this task is pinned to">v${esc(version)}</span>` : ''}</div>`;
+}
+
+// The fields the Parameters tab shows: the workflow's task fields plus one
+// agent field per agent called into the task with `@` (`agent:agent-N`, its spec
+// in params; listed by `v.participants`, or by the params of a task whose view
+// predates them).
+function paramFields(v) {
+  const rec = taskRecord(v.taskId);
+  const participants = Array.isArray(v.participants) ? v.participants : null;
+  const keys = participants
+    ? participants.filter((p) => /^agent-\d+$/.test(p.key)).map((p) => p.key)
+    : Object.keys(rec?.params || {}).map((name) => /^agent:(agent-\d+)$/.exec(name)?.[1]).filter(Boolean);
+  return [
+    ...schemaFor(v.workflow).filter((f) => f.scopes.includes('task')),
+    ...keys.map((key) => ({ name: `agent:${key}`, type: 'agent', role: key, scopes: ['task'], calledAgent: true,
+      label: agentParticipantLabel(key), participant: participants?.find((p) => p.key === key) })),
+  ];
+}
+
+/** The task's own authority, which agents without their own start from. */
+function taskAuthorityOf(rec) {
+  const stored = rec?.params?._authorization || {};
+  return {
+    authorization: { level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
+      projectIds: stored.projectIds || [rec?.projectId].filter(Boolean) },
+    credentialGrants: (stored.capabilities || []).filter((c) => c.startsWith('use-credential:item:')),
+    credentialPolicies: stored.credentialPolicies || {},
+    paymentPolicy: rec?.params?.paymentPolicy,
+  };
 }
 
 function paramsSection(v) {
   const rec = taskRecord(v.taskId);
   // Drafts are composed in the full task form (all fields editable pre-queue).
-  if (rec?.params?.draft) {
-    return `<div class="section-h">Parameters</div>
-      <button class="btn sm" id="edit-draft-params">Edit parameters…</button>`;
-  }
-  const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task'));
-  if (!fields.length) return '';
+  if (rec?.params?.draft) return `<button class="btn sm" id="edit-draft-params">Edit parameters…</button>`;
+  const fields = paramFields(v);
   // Finishing a task freezes its configuration; it does not erase the record of
   // what ran. Keep terminal-task parameters visible, but defensively ignore any
   // stale editable window left on an older persisted view.
@@ -11180,33 +11478,57 @@ function paramsSection(v) {
   const frozenTitle = terminal
     ? 'Frozen — this task has finished'
     : 'Frozen — this parameter has already been used (send a follow-up to change direction)';
-  const lock = `<span title="${frozenTitle}" style="color:var(--ink-3)">🔒</span>`;
-  const rows = fields
-    .map((f) => {
-      // Live workflow events repaint this page frequently. If the operator has
-      // an unsaved value, render that value back into its control instead of
-      // replacing it with the last server snapshot during the repaint.
-      const isEditable = editable.has(f.name);
-      const own = isEditable && isParamDraftField(editDraft, f.name)
-        ? editDraft.values[f.name] ?? ''
-        : paramCurrentValue(f, v, rec);
-      const inherited = isEditable && isParamDraftField(editDraft, f.name) ? undefined : inheritedAll[f.name];
-      // Agent fields show the full control (provider · model · effort · resume),
-      // exactly like the task form — interactive when editable, disabled when frozen.
-      if (f.type === 'agent') {
-        const control = renderField(f, own, inherited); // full control incl. its own label
-        if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${control}</div>`;
-        // frozen: same control, disabled (read-only), with a lock in the corner
-        return `<div class="form-row" data-row="${esc(f.name)}" style="position:relative">
-          <span style="position:absolute;right:0;top:0" title="${frozenTitle}">🔒</span>
-          <fieldset disabled style="border:none;padding:0;margin:0;min-inline-size:auto;opacity:.65">${control}</fieldset></div>`;
-      }
-      if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
-      // frozen non-agent: read-only effective value (own override, else inherited default)
-      return `<div class="form-row"><div class="label-row"><label>${esc(f.label)}</label>${lock}</div>
-        <div class="pf-ro" style="padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--ink-2);white-space:pre-wrap;overflow-wrap:anywhere">${esc(displayParam(f, eff(own, inherited)))}</div></div>`;
-    })
-    .join('');
+  const lock = `<span class="pf-lock" title="${frozenTitle}">🔒</span>`;
+  const frozenLabel = (f) => `<div class="label-row"><label>${esc(f.label)}</label>${lock}<span class="label-row-fill"></span></div>`;
+  const mainAgent = fields.find((f) => f.type === 'agent' && (f.role || f.name) === 'do') || fields.find((f) => f.type === 'agent' && !f.calledAgent);
+  const rowFor = (f) => {
+    // Live workflow events repaint this page frequently. If the operator has
+    // an unsaved value, render that value back into its control instead of
+    // replacing it with the last server snapshot during the repaint.
+    const isEditable = editable.has(f.name);
+    const own = isEditable && isParamDraftField(editDraft, f.name)
+      ? editDraft.values[f.name] ?? ''
+      : paramCurrentValue(f, v, rec);
+    const inherited = isEditable && isParamDraftField(editDraft, f.name) ? undefined : inheritedAll[f.name];
+    // Every agent is the same block as in the task form — interactive when
+    // editable, its controls disabled when frozen. The main agent's row also
+    // holds the task's own (separately editable) authorization.
+    if (f.type === 'agent') {
+      const opts = f === mainAgent
+        ? { frozen: !isEditable, authority: { ...mainAuthorityParams(v), open: !!S.mainAuthorityOpen?.[v.taskId] } }
+        : { frozen: !isEditable, ...(f.calledAgent ? { authority: { label: 'Agent' } } : {}) };
+      const state = f.participant?.state && f.participant.state !== 'idle' ? `<span class="chip pf-agent-state">${esc(f.participant.state)}</span>` : '';
+      const label = isEditable ? fieldLabel(f) : frozenLabel(f);
+      const block = renderAgentField(f, own || undefined, inherited, opts);
+      const row = `<div class="form-row">${label.replace('</label>', `</label>${state}`)}${block}</div>`;
+      return isEditable ? `<div class="pf-edit-row" data-row="${esc(f.name)}">${row}</div>`
+        : `<div class="pf-frozen" data-row="${esc(f.name)}">${row}</div>`;
+    }
+    if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
+    // A frozen route keeps its shape (who, in order, and each agent's block).
+    if (f.type === 'confirmer' || f.type === 'responder') {
+      const value = own === undefined || own === null || own === '' ? inherited : own;
+      const control = f.type === 'confirmer' ? renderConfirmerField(f, value, inherited) : renderResponderField(f, value, inherited);
+      return `<div class="form-row pf-frozen" data-row="${esc(f.name)}">${frozenLabel(f)}<fieldset disabled class="pf-fieldset">${control}</fieldset></div>`;
+    }
+    // frozen scalar: read-only effective value (own override, else inherited default)
+    return `<div class="form-row pf-frozen" data-row="${esc(f.name)}">${frozenLabel(f)}
+      <div class="pf-ro">${esc(displayParam(f, eff(own, eff(inherited, f.default))))}</div></div>`;
+  };
+  // The task form's order: the prompt, its agents, then where it runs.
+  const rank = (f) => (f.bind === 'prompt' ? -1 : f.type === 'agent' && !f.calledAgent ? 0 : f.type === 'responder' ? 1
+    : f.type === 'confirmer' ? 2 : f.calledAgent ? 3 : 4);
+  const agentFields = fields.filter((f) => rank(f) < 4).sort((a, b) => rank(a) - rank(b));
+  const whereFields = fields.filter((f) => rank(f) === 4);
+  // Base, target and environment share one row, as in the task form.
+  const pair = ['base', 'target', 'worldProvider'].map((name) => whereFields.find((f) => f.name === name)).filter(Boolean);
+  const where = [
+    pair.length > 1 ? `<div class="branch-pair${pair.length === 3 ? ' cols-3' : ''}">${pair.map(rowFor).join('')}</div>` : '',
+    ...whereFields.filter((f) => pair.length < 2 || !pair.includes(f)).map(rowFor),
+  ].join('');
+  const triggers = Array.isArray(rec?.params?.triggers) && rec.params.triggers.length
+    ? `<div class="form-row pf-frozen" data-row="__triggers"><div class="label-row"><label>Triggers</label>${lock}<span class="label-row-fill"></span></div>
+        <div class="pf-ro">${esc(triggerSummary(rec.params.triggers))}</div></div>` : '';
   const footer = editable.size
     ? `<div class="params-save-bar" data-save-state="${editDraft?.dirtyNames?.length ? 'dirty' : 'saved'}">
         <span class="params-save-status" id="params-save-status" role="status" aria-live="polite">
@@ -11220,9 +11542,18 @@ function paramsSection(v) {
       : 'Locked after queue — send a follow-up to change direction.'}</div>`;
   // Identity and lifecycle/schema changes must replace the form. Ordinary task
   // events retain the connected controls, preserving native editing state.
-  const renderKey = JSON.stringify([v.taskId, v.workflow, terminal, fields, [...editable], inheritedAll,
-    fields.filter((f) => !editable.has(f.name)).map((f) => paramCurrentValue(f, v, rec))]);
-  return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields" data-render-key="${esc(renderKey)}">${rows}${footer}</div>`;
+  const renderKey = JSON.stringify([v.taskId, v.workflow, terminal, fields.map(({ participant: _p, ...f }) => f), [...editable], inheritedAll,
+    fields.filter((f) => !editable.has(f.name)).map((f) => paramCurrentValue(f, v, rec)),
+    TERMINAL_STAGES.includes(v.stage) || !!v.pointOfNoReturnPassed, (v.participants || []).map((p) => [p.key, p.state]),
+    authorizationLiveKey(v.taskId), paymentsLiveKey(v)]);
+  // A workflow without an agent field still shows the task's own authority.
+  const authorityOnly = mainAgent ? '' : `<section class="tp-section"><div class="form-row" data-row="__authorization">
+    ${agentAuthorityHtml('tp-main', null, { ...mainAuthorityParams(v), open: !!S.mainAuthorityOpen?.[v.taskId] })}</div></section>`;
+  return `<div id="tp-params" class="parameter-fields" data-render-key="${esc(renderKey)}">
+    ${authorityOnly}
+    ${agentFields.map((f) => `<section class="tp-section tp-${esc(f.type)}">${rowFor(f)}</section>`).join('')}
+    ${where || triggers ? `<section class="tp-section tp-where">${where}${triggers}</section>` : ''}
+    ${footer}</div>`;
 }
 
 function isParamDraftField(draft, name) {
@@ -11233,6 +11564,7 @@ function isParamDraftField(draft, name) {
 // the task record holds the rest of the user's own overrides).
 function paramCurrentValue(f, v, rec) {
   const own = (rec && rec.params) || {};
+  if (f.calledAgent) return own[f.name] ?? v.agents?.[f.role] ?? f.participant?.spec;
   if (f.bind === 'prompt') return own.prompt ?? (v.messages || []).find((m) => m.role === 'user')?.text ?? '';
   if (f.name === 'target') return v.targetBranch ?? own.target ?? '';
   if (f.name === 'base') return v.base ?? own.base ?? '';
@@ -11283,7 +11615,7 @@ function collectParamEdits(root, fields) {
       // form's collectForm produces). Editable agent fields always send a spec.
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
-      out[f.name] = readAgentSpec(box);
+      out[f.name] = readAgentBlock(box);
       continue;
     }
     if (f.type === 'confirmer') {
@@ -11335,13 +11667,28 @@ function wireParams(v) {
     return;
   }
   const root = document.getElementById('tp-params');
-  if (root?.paramsWired) return; // retained controls already own their handlers
-  if (root) root.paramsWired = true;
-  if (root) wireAgentFields(root); // make editable agent controls (model combo, effort, resume) work
+  // Retained controls already own their handlers. The form element itself can
+  // outlive its controls (it is kept around a retained authorization section),
+  // so the mark is on its content and its own listeners are replaced.
+  const marker = root?.firstElementChild;
+  if (marker?.paramsWired) return;
+  if (marker) marker.paramsWired = true;
+  root?.paramsWiring?.abort();
+  const wiring = root ? (root.paramsWiring = new AbortController()) : null;
+  if (root) {
+    // Make the agent blocks work; agents without their own authority start
+    // from the task's.
+    const rec = taskRecord(v.taskId);
+    const projectId = rec?.projectId || S.projectId;
+    const organizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
+    wireAgentFields(root, { projectId, organizationId, inheritedAuthority: () => taskAuthorityOf(taskRecord(v.taskId)) });
+    const main = root.querySelector('#tp-auth, #tp-auth-frozen')?.closest('.agent-authority');
+    main?.addEventListener('toggle', () => { (S.mainAuthorityOpen ||= {})[v.taskId] = main.open; });
+  }
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
   const status = document.getElementById('params-save-status');
-  const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task') && (v.editableParams || []).includes(f.name));
+  const fields = paramFields(v).filter((f) => (v.editableParams || []).includes(f.name));
   const existing = S.paramEditDrafts[v.taskId];
   const currentAtRender = collectParamEdits(root, fields);
   // Rebase untouched controls onto the newest server render, while preserving
@@ -11371,8 +11718,8 @@ function wireParams(v) {
     return current;
   };
   draft.sync = sync;
-  root.addEventListener('input', sync);
-  root.addEventListener('change', sync);
+  root.addEventListener('input', sync, { signal: wiring.signal });
+  root.addEventListener('change', sync, { signal: wiring.signal });
   sync();
   saveBtn.addEventListener('click', async () => {
     if (draft.saving) return;
@@ -11691,27 +12038,20 @@ function newAgentFormsHtml(v, key) {
   return Object.entries(agents).map(([agentKey, spec]) => `<div class="followup-new-agent" data-agent-key="${esc(agentKey)}">
       <div class="fna-head"><b>${esc(participantLabelOf(agentKey, v))}</b><span class="pal-sub">new agent</span><span style="flex:1"></span>
         <button type="button" class="icon-btn fna-remove" aria-label="Remove ${esc(participantLabelOf(agentKey, v))}" title="Remove">×</button></div>
-      ${typeof agentBlockHtml === 'function' ? agentBlockHtml(`fna-${agentKey}`, spec, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, compact: true })
-        : `<div class="fna-fields"><select class="fna-provider" aria-label="Harness">${[...new Set(['claude', 'codex', 'opencode', ...(spec.provider ? [spec.provider] : [])])]
-          .map((provider) => `<option value="${provider}" ${spec.provider === provider ? 'selected' : ''}>${esc({ claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', mock: 'Mock' }[provider] || provider)}</option>`).join('')}</select>
-          <input class="fna-model" placeholder="Model" value="${esc(spec.model || '')}" aria-label="Model">
-          <select class="fna-effort" aria-label="Reasoning effort"><option value="">Default effort</option>${['low', 'medium', 'high', 'xhigh', 'max']
-            .map((effort) => `<option ${spec.effort === effort ? 'selected' : ''}>${effort}</option>`).join('')}</select></div>`}
+      ${agentBlockHtml(`fna-${agentKey}`, spec, { role: 'agent', inherited: v.agents?.do || {}, authority: { label: 'Agent', inherited: taskAuthorityOf(taskRecord(v.taskId)) } })}
     </div>`).join('');
 }
 function readNewAgentForm(el) {
-  if (typeof readAgentBlock === 'function' && el.querySelector('[data-agent-block]')) return readAgentBlock(el);
-  const spec = { provider: el.querySelector('.fna-provider')?.value || 'claude' };
-  const model = el.querySelector('.fna-model')?.value.trim();
-  const effort = el.querySelector('.fna-effort')?.value;
-  return { ...spec, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+  const block = el.querySelector('.agent-field');
+  return block ? readAgentBlock(block) : {};
 }
 function wireNewAgentForms(box, v, key) {
   const agents = followupNewAgents(key);
   box.querySelectorAll('.followup-new-agent').forEach((el) => {
     const agentKey = el.dataset.agentKey;
     const save = () => { if (agents[agentKey]) agents[agentKey] = readNewAgentForm(el); };
-    if (typeof wireAgentBlock === 'function' && el.querySelector('[data-agent-block]')) wireAgentBlock(el, { onChange: save, projectId: taskRecord(v.taskId)?.projectId || S.projectId });
+    wireAgentBlock(el.querySelector('.agent-field'), { projectId: taskRecord(v.taskId)?.projectId || S.projectId,
+      inheritedAuthority: () => taskAuthorityOf(taskRecord(v.taskId)) });
     el.addEventListener('input', save);
     el.addEventListener('change', save);
     el.querySelector('.fna-remove')?.addEventListener('click', () => {
@@ -13161,10 +13501,10 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'multiPr', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // Review route and Responder stay shared/common values on the wire, but their
 // controls live in the Agent card.
-const agentRouteSettingsFields = (scope) => ['confirm', 'responder']
+const agentRouteSettingsFields = (scope) => ['responder', 'confirm']
   .map((name) => settingsFields('software-dev', scope).find((field) => field.name === name)).filter(Boolean);
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && !['confirm', 'responder'].includes(field.name));
 // The stored `__common__` row is shared by several forms (task defaults here; the
@@ -13188,9 +13528,17 @@ function settingsForms(scope, projectId) {
   const wfs = S.schema
     // Host admission is installation-wide and has a dedicated operator card.
     .filter((s) => s.name !== 'agent-queue' && WORKFLOWS.some((w) => w.id === s.name));
-  const common = `<div class="card" data-wf="__common__" data-schema-wf="software-dev">
-      <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
-      <button class="btn primary sm" data-save="__common__">Save task defaults</button>
+  // Task defaults mirror the task form: the Agent (its harness, tools and
+  // collapsed Authorization row with the authorization, vault and payment
+  // defaults), the Responder, the Review route, then where tasks run — saved
+  // together.
+  const common = `<div class="card task-defaults parameter-fields" id="task-defaults-${scope}">
+      <section class="td-section td-agent"><div id="profiles-list-${scope}">Loading…</div></section>
+      <section class="td-section td-routes"><div id="review-route-${scope}">Loading…</div></section>
+      <section class="td-section td-where" data-wf="__common__" data-schema-wf="software-dev">
+        <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
+      </section>
+      <div class="td-actions"><button class="btn primary sm" data-save-task-defaults>Save task defaults</button><span class="resource-error" role="status"></span></div>
     </div>`;
   const unique = wfs
     .map((s) => {
@@ -13203,17 +13551,50 @@ function settingsForms(scope, projectId) {
       </details>`;
     })
     .join('');
-  return common + profilesCard(scope) + quickSettingsForms(scope, projectId)
-    + resourceDefaultsHtml(scope) + explanationSettingsCard(scope) + unique;
+  return common + quickSettingsForms(scope, projectId) + explanationSettingsCard(scope) + unique;
 }
 
+// The default Agent's Authorization row in Task defaults: the authorization a
+// task gets when it names none, its vault credentials, cards and budget.
 function resourceDefaultsHtml(scope) {
-  return `<div class="card resource-defaults" data-resource-defaults="${scope}">
-    <div class="form-row"><button type="button" class="btn tf-vault-button resource-vault" disabled><span>Vault credentials</span><span class="tf-vault-count">Loading…</span></button></div>
-    ${taskPaymentsHtml(`resource-payments-${scope}`)}
-    <button class="btn primary sm resource-save" type="button" disabled>Save defaults</button>
-    <button class="btn sm resource-reset" type="button" disabled>Reset to inherited</button>
-    <span class="resource-error" role="status"></span></div>`;
+  return `<div class="resource-defaults" data-resource-defaults="${scope}">
+    <div class="form-row" data-row="__authorization">${authorizationEditorHtml(`td-authorization-${scope}`, { level: 'developer', scope: 'projects', projectIds: [] }, [], undefined)}</div>
+    <div class="aa-resources">
+      <div class="form-row"><button type="button" class="btn tf-vault-button resource-vault" disabled><span>Vault credentials</span><span class="tf-vault-count">Loading…</span></button></div>
+      ${taskPaymentsHtml(`resource-payments-${scope}`)}
+    </div>
+    <button class="btn sm resource-reset" type="button" disabled title="Inherit the ${scope === 'project' ? 'organization' : 'built-in'} defaults">↺ Reset to inherited</button>
+  </div>`;
+}
+
+// One save for the whole Task defaults card. Each part saves only what changed;
+// the Responder, Review route and branch defaults share the __common__ row and
+// are written together.
+function wireTaskDefaultsSave(scope, projectId, organizationId) {
+  const card = $(`#task-defaults-${scope}`);
+  const button = card?.querySelector('[data-save-task-defaults]');
+  if (!button) return;
+  button.addEventListener('click', async () => {
+    const error = card.querySelector('.td-actions .resource-error');
+    error.textContent = '';
+    try {
+      for (const save of Object.values(card._savers || {})) await save();
+      const routes = card.querySelector(`#review-route-${scope} .wf-form`);
+      const where = card.querySelector('[data-wf="__common__"] .wf-form');
+      const owned = [...(routes ? agentRouteSettingsFields(scope) : []), ...(where ? commonSettingsFields(scope) : [])];
+      const values = { ...(routes ? collectForm(routes, agentRouteSettingsFields(scope)) : {}),
+        ...(where ? collectForm(where, commonSettingsFields(scope)) : {}) };
+      await saveCommonSettings(scope, projectId, organizationId, owned.map((field) => field.name), values);
+      if (scope === 'project') await loadProjects();
+      flashSaved(button);
+    } catch (e) { error.textContent = e.message; toast(e.message, true); }
+  });
+}
+
+/** The default Agent's authority in a Task defaults card, which the other
+ * agents' "Same as Agent" rows start from. */
+function taskDefaultsAuthority(scope) {
+  return document.querySelector(`[data-resource-defaults="${scope}"]`)?._current?.() || {};
 }
 async function readVaultDefaults(projectId, organizationId) {
   const [org, project] = await Promise.all([
@@ -13228,44 +13609,68 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
   const box = document.querySelector(`[data-resource-defaults="${scope}"]`); if (!box) return;
   const current = beginAsyncElementRender(box);
   const base = projectId ? `/api/settings/project/${encodeURIComponent(projectId)}` : `/api/organizations/${encodeURIComponent(organizationId)}/settings`;
+  const card = box.closest('.task-defaults');
+  const summary = box.closest('.agent-authority')?.querySelector('.aa-summary');
+  const projects = S.projects.filter((project) => project.organizationId === organizationId);
   try {
-    const [defaults, items] = await Promise.all([
+    const [defaults, items, ownAuthorization, inheritedAuthorization] = await Promise.all([
       readVaultDefaults(projectId, organizationId), api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId)}`),
+      api(`${base}/authorization`).catch(() => ({})),
+      projectId ? api(`/api/organizations/${encodeURIComponent(organizationId)}/settings/authorization`).catch(() => ({})) : {},
     ]);
     if (!current()) return;
     let ids = new Set((defaults.credentialGrants || []).map(id => id.slice('use-credential:item:'.length)));
-    let policies = defaults.credentialPolicies || {}, vaultDirty = false;
+    let policies = defaults.credentialPolicies || {}, vaultDirty = false, authorizationDirty = false;
     const paymentDirty = new Set();
+    // The authorization a task gets when it names none. A project list left
+    // empty means each task's own project.
+    const chosen = ownAuthorization?.level ? ownAuthorization : inheritedAuthorization?.level ? inheritedAuthorization : { level: 'developer', scope: 'projects' };
+    const editorRow = box.querySelector('[data-row="__authorization"]');
+    editorRow.innerHTML = authorizationEditorHtml(`td-authorization-${scope}`, { level: chosen.level, scope: chosen.scope, projectIds: chosen.projectIds || [] }, projects, undefined);
+    const editor = editorRow.querySelector('.authz-editor');
+    editor.dataset.emptyPlaceholder = 'The task\u2019s own project';
+    const paint = () => {
+      if (summary) summary.textContent = agentAuthoritySummary(box._current(), projects);
+      button.querySelector('.tf-vault-count').textContent = `${ids.size} selected`;
+    };
+    box._current = () => ({ authorization: readAuthorizationEditor(editor), credentialGrants: [...ids].map(id => `use-credential:item:${id}`),
+      credentialPolicies: policies, paymentPolicy: readTaskPayments(payments) });
+    wireAuthorizationEditor(editor, projects, () => { authorizationDirty = true; paint(); });
+    editor.querySelector('.authz-level-select').title = 'The authorization a task gets unless it chooses one; never more than its creator holds. An empty project list means the task’s own project.';
     const button = box.querySelector('.resource-vault');
-    const count = () => { button.querySelector('.tf-vault-count').textContent = `${ids.size} selected`; };
-    count(); button.disabled = false;
-    button.onclick = () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => { ids = new Set(selected); policies = overrides; vaultDirty = true; count(); });
+    button.disabled = false;
+    button.onclick = () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => { ids = new Set(selected); policies = overrides; vaultDirty = true; paint(); });
     const payments = box.querySelector('.task-payments');
     await wireTaskPayments(payments, projectId, undefined, undefined, organizationId);
     if (!current()) return;
-    payments.onchange = event => { if (event.target === payments) paymentDirty.add('cardIds'); else if (event.target.matches('.payment-budget, .payment-currency')) paymentDirty.add('budget').add('currency'); };
-    payments.oninput = event => { if (event.target.matches('.payment-budget')) paymentDirty.add('budget').add('currency'); };
-    box.querySelector('.resource-save').disabled = false;
+    payments.onchange = event => { if (event.target === payments) paymentDirty.add('cardIds'); else if (event.target.matches('.payment-budget, .payment-currency')) paymentDirty.add('budget').add('currency'); paint(); };
+    payments.oninput = event => { if (event.target.matches('.payment-budget')) paymentDirty.add('budget').add('currency'); paint(); };
+    paint();
     box.querySelector('.resource-reset').disabled = false;
-    box.querySelector('.resource-save').onclick = async event => {
-      try {
-        if (vaultDirty) await api(`${base}/vault`, { method: 'PUT', body: JSON.stringify({ values: { credentialGrants: [...ids].map(id => `use-credential:item:${id}`), credentialPolicies: policies } }) });
-        if (paymentDirty.size) {
-          const payment = readTaskPayments(payments); if (!payment) throw new Error('Payment defaults are still loading');
-          await api(`${base}/payments`, { method: 'PUT', body: JSON.stringify({ values: { ...await api(`${base}/payments`), ...Object.fromEntries([...paymentDirty].map(key => [key, payment[key]])) } }) });
-        }
-        flashSaved(event.currentTarget); vaultDirty = false; paymentDirty.clear();
-      } catch (error) { box.querySelector('.resource-error').textContent = error.message; }
+    if (card) (card._savers ||= {}).resources = async () => {
+      if (authorizationDirty) {
+        const value = readAuthorizationEditor(editor);
+        await api(`${base}/authorization`, { method: 'PUT', body: JSON.stringify({ values: value.scope === 'projects'
+          ? { level: value.level, scope: 'projects', ...(value.projectIds?.length ? { projectIds: value.projectIds } : {}) }
+          : { level: value.level, scope: value.scope } }) });
+      }
+      if (vaultDirty) await api(`${base}/vault`, { method: 'PUT', body: JSON.stringify({ values: { credentialGrants: [...ids].map(id => `use-credential:item:${id}`), credentialPolicies: policies } }) });
+      if (paymentDirty.size) {
+        const payment = readTaskPayments(payments); if (!payment) throw new Error('Payment defaults are still loading');
+        await api(`${base}/payments`, { method: 'PUT', body: JSON.stringify({ values: { ...await api(`${base}/payments`), ...Object.fromEntries([...paymentDirty].map(key => [key, payment[key]])) } }) });
+      }
+      authorizationDirty = false; vaultDirty = false; paymentDirty.clear();
     };
     box.querySelector('.resource-reset').onclick = async () => {
       try {
+        await api(`${base}/authorization`, { method: 'PUT', body: JSON.stringify({ values: {} }) });
         await api(`${base}/vault`, { method: 'PUT', body: JSON.stringify({ values: {} }) });
         const { cardIds, budget, currency, allowance, threshold, ...rest } = await api(`${base}/payments`);
         await api(`${base}/payments`, { method: 'PUT', body: JSON.stringify({ values: rest }) });
         await hydrateResourceDefaults(scope, projectId, organizationId);
-      } catch (error) { box.querySelector('.resource-error').textContent = error.message; }
+      } catch (error) { toast(error.message, true); }
     };
-  } catch (error) { if (current()) box.querySelector('.resource-error').textContent = error.message; }
+  } catch (error) { if (current()) toast(error.message, true); }
 }
 
 function explanationSettingsCard(scope) {
@@ -14962,6 +15367,7 @@ function wireSettingsView(proj) {
   renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
   hydrateReviewRoute('project', proj.id);
+  wireTaskDefaultsSave('project', proj.id, proj.organizationId);
   hydrateWorkflowPins(proj.id);
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {
@@ -17416,39 +17822,12 @@ async function wireOutboundEmailCard() {
   });
 }
 
-function profileRow(p, scope) {
-  const inherited = p.scope === 'inherited';
-  const ownScope = scope === 'project' ? 'project' : 'organization';
-  const providerVisible = AGENT_PROVIDERS.includes(p.provider);
-  const provider = agentProviderChoice(p.provider);
-  const model = providerVisible ? p.model : '';
-  const effort = providerVisible ? p.effort : '';
-  const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
-  return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
-    <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} ${usedBy}
-      ${inherited ? `<span class="chip" title="Using the next default up; edit to create a ${ownScope} override">inherited</span>` : `<span class="chip">${ownScope} override</span>`}</div>
-    <div class="agent-profile-controls">
-      <select class="pf-provider">${AGENT_PROVIDERS.map((x) => `<option ${x === provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
-      <div class="combo pf-model-combo" style="flex:1;min-width:140px">
-        <input class="pf-model" placeholder="model" value="${esc(model || '')}" autocomplete="off" />
-        <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
-        <div class="combo-menu" hidden></div>
-      </div>
-      ${effortSelectHtml('pf-effort', provider, model, effort || '')}
-      <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
-    </div>
-    ${mcpPickerHtml(inherited ? undefined : p.mcpConnections, p.inherited?.mcpConnections)}
-    <div style="display:flex;gap:8px">
-      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save agent</button>
-      ${p.scope === ownScope ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
-    </div>
-  </div>`;
-}
-
 // Render + wire the shared operational Agent editor for an organization or
-// project. All coding workflows, including Merge-only, resolve this one profile.
-// Standing Confirm/Responder profiles are not shown: those agents are configured
-// directly in their Review route / Responder controls.
+// project — the same Agent block as the task form. All coding workflows,
+// including Merge-only, resolve this one profile. Standing Confirm/Responder
+// profiles are not shown: those agents are configured directly in their Review
+// route / Responder controls. The main profile's Authorization row holds the
+// task authorization, vault and payment defaults.
 async function hydrateProfiles(scope, projectId, organizationId) {
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
@@ -17459,41 +17838,52 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   try { profiles = await api(`/api/profiles${query}`); } catch {}
   if (!renderIsCurrent()) return;
   profiles = profiles.filter((p) => p.role !== 'confirm' && p.role !== 'responder');
-  list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
-    : profiles.map((p) => profileRow(p, scope)).join('');
-  list.querySelectorAll('[data-profile]').forEach((card) => {
-    wireMcpPicker(card.querySelector('.mcp-picker'), query);
-    const combo = card.querySelector('.pf-model-combo');
-    const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
-    if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort'));
-    card.querySelector('.pf-provider')?.addEventListener('change', () => {
-      card.querySelector('.pf-model').value = ''; // model choices are provider-specific
-      refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
-    });
+  const ownScope = scope === 'project' ? 'project' : 'organization';
+  const main = profiles.find((p) => p.role === 'do') || profiles[0];
+  const knobs = (block) => ({
+    ...readAgentSpec(block),
+    maxTurns: block.querySelector('.pf-maxturns').value ? Number(block.querySelector('.pf-maxturns').value) : undefined,
   });
-  list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
-    const card = b.closest('[data-profile]');
-    const knobs = {
-      provider: card.querySelector('.pf-provider').value,
-      model: card.querySelector('.pf-model').value.trim() || undefined,
-      effort: card.querySelector('.pf-effort').value || undefined,
-      mcpConnections: readMcpPicker(card),
-      maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
-    };
-    const targets = [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
-    try {
-      for (const orig of targets) {
-        await api(`/api/profiles${query}`, { method: 'PUT', body: JSON.stringify({
-          role: orig.role, name: orig.name,
-          projectId: scope === 'project' ? projectId : undefined,
-          organizationId: scope === 'global' ? organizationId : undefined,
-          ...knobs,
-        }) });
-      }
-      await hydrateProfiles(scope, projectId, organizationId);
-      flashSaved($(`#profiles-list-${scope}`)?.querySelector(`[data-saveprofile="${b.dataset.saveprofile}"]`));
-    } catch (e) { toast(e.message, true); }
-  }));
+  list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>' : profiles.map((p) => {
+    const inherited = p.scope === 'inherited';
+    const usedBy = (p.roleWorkflows || []).length > 1 ? policyTip(`Shared by ${p.roleWorkflows.join(', ')}`) : '';
+    return `<div class="form-row td-profile" data-profile="${esc(p.id)}" data-role="${esc(p.role)}">
+      <div class="label-row"><label>${esc(p === main ? 'Agent' : p.name)}</label>${usedBy}
+        ${inherited ? `<span class="chip" title="Using the next default up; edit to create a ${ownScope} override">inherited</span>` : ''}
+        <span class="label-row-fill"></span>
+        ${p.scope === ownScope ? `<button type="button" class="field-reset" data-resetprofile="${esc(p.id)}" title="Drop this override and inherit">↺ Reset to inherited</button>` : ''}</div>
+      ${agentBlockHtml(`td-agent-${scope}-${p.id}`, { provider: p.provider, model: p.model, effort: p.effort, mcpConnections: inherited ? undefined : p.mcpConnections },
+        { role: p.role, fork: false, inherited: { mcpConnections: p.inherited?.mcpConnections },
+          extraControls: `<input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." aria-label="Max turns" value="${p.maxTurns ?? ''}" />`,
+          ...(p === main ? { authority: { html: resourceDefaultsHtml(scope), summary: 'Loading…' } } : {}) })}
+    </div>`;
+  }).join('');
+  const ctx = { projectId, organizationId };
+  list.dataset.mcpScope = mcpScope(projectId || null, organizationId);
+  const blocks = [...list.querySelectorAll('[data-profile]')];
+  const saved = new Map();
+  for (const row of blocks) {
+    const block = row.querySelector('.agent-field');
+    wireAgentBlock(block, ctx);
+    saved.set(row.dataset.profile, JSON.stringify(knobs(block)));
+  }
+  // Saved with the rest of the Task defaults: only a changed agent becomes an override.
+  const card = list.closest('.task-defaults');
+  if (card) (card._savers ||= {}).profiles = async () => {
+    for (const row of blocks) {
+      const orig = profiles.find((p) => p.id === row.dataset.profile);
+      const next = knobs(row.querySelector('.agent-field'));
+      if (!orig || JSON.stringify(next) === saved.get(orig.id)) continue;
+      const { avatarId: _avatar, resumeFrom: _resume, ...values } = next;
+      await api(`/api/profiles${query}`, { method: 'PUT', body: JSON.stringify({
+        role: orig.role, name: orig.name,
+        projectId: scope === 'project' ? projectId : undefined,
+        organizationId: scope === 'global' ? organizationId : undefined,
+        ...values,
+      }) });
+      saved.set(orig.id, JSON.stringify(next));
+    }
+  };
   list.querySelectorAll('[data-resetprofile]').forEach((b) => b.addEventListener('click', async () => {
     const ids = [b.dataset.resetprofile];
     try {
@@ -17502,6 +17892,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
       hydrateProfiles(scope, projectId, organizationId);
     } catch (e) { toast(e.message, true); }
   }));
+  hydrateResourceDefaults(scope, projectId, organizationId);
 }
 
 // Review route and Responder share the task-defaults row (__common__) but are
@@ -17521,19 +17912,11 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
     inherited = d[scope].inherited;
   } catch {}
   if (!renderIsCurrent()) return;
-  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields(fields, own, inherited)}</div>
-    <button class="btn primary sm" data-save-review-route>Save routes</button>`;
+  // Saved by the card's "Save task defaults" (wireTaskDefaultsSave).
+  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields(fields, own, inherited)}</div>`;
   box.dataset.mcpScope = mcpScope(projectId || null, organizationId);
-  wireAgentFields(box);
+  wireAgentFields(box, { projectId, organizationId, inheritedAuthority: () => taskDefaultsAuthority(scope) });
   wireFieldResets(box, fields);
-  const saveButton = box.querySelector('[data-save-review-route]');
-  saveButton.addEventListener('click', async () => {
-    const values = collectForm(box.querySelector('.wf-form'), fields);
-    try {
-      await saveCommonSettings(scope, projectId, organizationId, fields.map((field) => field.name), values);
-      flashSaved(saveButton);
-    } catch (err) { toast(err.message, true); }
-  });
 }
 
 // The logins + API keys now live in the unified credential manager (#cred-editor-global:
@@ -17541,16 +17924,6 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
 // refreshes it after a connect/register/delete.
 async function hydrateAccounts(organizationId = S.organizationId) {
   await Promise.all([renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }), renderAccountStatus(organizationId)]);
-}
-
-function profilesCard(scope) {
-  return `<div class="card agent-profile-settings" id="profiles-card-${scope}">
-    <div class="section-h">Agent</div>
-    <p style="color:var(--ink-2);margin-top:0">Who does the work: model, turn cap, and account pool.${scope === 'project' ? ' Overrides the organization defaults for this project.' : ''}</p>
-    <div id="profiles-list-${scope}">Loading…</div>
-    <div class="settings-divider"></div>
-    <div id="review-route-${scope}">Loading…</div>
-  </div>`;
 }
 
 function wireGlobalSettings(organizationId) {
@@ -17563,6 +17936,7 @@ function wireGlobalSettings(organizationId) {
   renderAccountStatus(organizationId || S.organizationId);
   hydrateProfiles('global', undefined, organizationId);
   hydrateReviewRoute('global', undefined, organizationId);
+  wireTaskDefaultsSave('global', undefined, organizationId);
   hydrateWorkflows(organizationId);
   wireVaultCards(organizationId);
   hydrateNativeConnections(organizationId || S.organizationId);
@@ -21319,7 +21693,9 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
     }
     if (save) {
       save.disabled = !S.paymentEdits?.[taskId];
-      save.onclick = async () => {
+      // Also called by a host that saves the payments with its own button
+      // (the main agent's Authorization row on the Parameters tab).
+      box._save = async () => {
         save.disabled = true;
         try {
           const policy = readTaskPayments(box);
@@ -21331,8 +21707,10 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
           if (rec) rec.params = { ...rec.params, paymentPolicy: policy };
           if (S.view?.taskId === taskId) box.dataset.liveKey = paymentsLiveKey(S.view);
           toast(result.released.length ? 'Budget saved; pending payment approved' : 'Payments saved');
-        } catch (e) { save.disabled = false; toast(e.message, true); }
+          box.dispatchEvent(new Event('change', { bubbles: true }));
+        } catch (e) { save.disabled = false; toast(e.message, true); throw e; }
       };
+      save.onclick = () => box._save().catch(() => {});
     }
   } catch (e) { box.querySelector('.payment-error').textContent = e.message; }
 }

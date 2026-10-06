@@ -192,6 +192,7 @@ export function assembleTaskInput(
                   ...(l.mcpConnections !== undefined ? { mcpConnections: l.mcpConnections } : {}),
                   ...(l.resumeFrom ? { resumeFrom: l.resumeFrom } : {}),
                   ...(l.prompt?.trim() ? { prompt: l.prompt } : {}),
+                  ...agentIdentity(l),
                 }
               : { kind: l.kind, audience: l.audience?.length ? [...l.audience] : ['@creator'] },
           );
@@ -211,6 +212,7 @@ export function assembleTaskInput(
                 ...(route.mcpConnections !== undefined ? { mcpConnections: route.mcpConnections } : {}),
                 ...(route.resumeFrom ? { resumeFrom: route.resumeFrom } : {}),
                 ...(route.prompt?.trim() ? { prompt: route.prompt } : {}),
+                ...agentIdentity(route),
               }
             : { kind: 'human', audience: route.audience?.length ? [...route.audience] : ['@creator'] };
         }
@@ -229,6 +231,18 @@ export function assembleTaskInput(
   for (const f of manifest.params) if (f.mutable && f.mutable !== 'queue') windows[f.name] = f.mutable;
   if (Object.keys(windows).length) input.paramWindows = windows;
   return input;
+}
+
+/** Who a Responder/Reviewer agent is and what it may do: its Avatar and its own
+ * authority (wiki planned/collaboration-model). The authority's effective,
+ * attenuated form is `params._agentAuthorization`; the request rides along so the
+ * workflow can show and re-route it. */
+function agentIdentity(spec: Partial<AgentSpec>): Partial<AgentSpec> {
+  return {
+    ...(spec.avatarId ? { avatarId: spec.avatarId } : {}),
+    ...(spec.avatarPurpose ? { avatarPurpose: spec.avatarPurpose } : {}),
+    ...(spec.authority && typeof spec.authority === 'object' ? { authority: spec.authority } : {}),
+  };
 }
 
 function toList(v: unknown): string[] {

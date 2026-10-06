@@ -44,24 +44,19 @@ const root = __dirname;
       S.teams = [{ id: 't1', slug: 'leaders', name: 'Leaders' }];
       S.meta = { workflows: [] };
       S.schema = [{ name: 'software-dev', params: [
-        { name: 'confirmer', label: 'Review', type: 'confirmer', scopes: ['task'], promptDefault: 'Review carefully' },
-        { name: 'responder', label: 'Input', type: 'responder', scopes: ['task'], promptDefault: 'Answer' },
+        { name: 'confirmer', label: 'Review', type: 'confirmer', scopes: ['task'], legacyPrompt: 'Review carefully' },
+        { name: 'responder', label: 'Input', type: 'responder', scopes: ['task'], legacyPrompt: 'Answer' },
       ] }];
       await openTask('fixture', 'parameters');
     }, { record });
 
-    // The ⓘ sits on the heading line, and clicking the heading text does not open it.
-    for (const [selector, heading] of [['.confirmer-field .cf-human', 'Who confirms'], ['.responder-field .rf-human', 'Who responds']]) {
+    // Each route is one compact row: who (human or agent) beside whom.
+    for (const [selector, label] of [['.confirmer-field .cf-layer-head', 'Who confirms'], ['.responder-field .route-row', 'Who responds']]) {
       const row = page.locator(selector).first();
       await row.waitFor({ state: 'visible' });
-      const head = row.locator('.form-row-head');
-      assert.equal((await head.textContent()).replace('ⓘ', '').trim(), heading);
-      const dot = await head.locator('.info-dot').boundingBox(), text = await head.boundingBox();
-      assert.ok(dot.y >= text.y && dot.y + dot.height <= text.y + text.height + 1, `${heading}: ⓘ is on the heading line`);
-      assert.equal(await row.locator('.cf-audience').getAttribute('aria-label'), heading);
-      assert.deepEqual(await head.evaluate(el => { const c = getComputedStyle(el); return [c.fontSize, c.fontWeight]; }), ['12px', '600'], `${heading}: styled like other form headings`);
-      await head.click({ position: { x: 2, y: text.height / 2 } });
-      assert.equal(await page.locator('.toast').count(), 0, `${heading}: clicking the heading does not open the tip`);
+      assert.equal(await row.locator('.cf-audience').getAttribute('aria-label'), label);
+      const kind = await row.locator('.cf-kind').boundingBox(), who = await row.locator('.cf-audience').boundingBox();
+      assert.ok(Math.abs((kind.y + kind.height / 2) - (who.y + who.height / 2)) < 6, `${label}: kind and audience share one line`);
     }
 
     const suggestions = (input) => input.evaluate(el => [...el.closest('.combo').querySelectorAll('.combo-menu:not([hidden]) .combo-opt')].map(o => o.dataset.v));

@@ -459,6 +459,23 @@ function projectPrincipalFromBody(value: unknown, organizationId: string): Proje
   return principalFromBody(value);
 }
 
+/** What a refused grant tells the client: which agent, so the console can ask
+ * about exactly that one (`chooseAuthorizationGrant`). */
+function grantRefusal(e: unknown): { code?: string; participant?: string; authorization?: AuthorizationSelection } {
+  const error = e as { code?: unknown; participant?: unknown; authorization?: AuthorizationSelection } | undefined;
+  return {
+    ...(error?.code ? { code: String(error.code) } : {}),
+    ...(typeof error?.participant === 'string' ? { participant: error.participant,
+      ...(error.authorization ? { authorization: error.authorization } : {}) } : {}),
+  };
+}
+
+/** `acceptAttenuation`: `true` for every agent, or the participant keys. */
+function attenuationAcceptance(value: unknown): boolean | string[] | undefined {
+  if (value === true) return true;
+  return Array.isArray(value) ? value.map(String) : undefined;
+}
+
 function authorizationSelectionFromBody(value: unknown): AuthorizationSelection | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const candidate = value as Record<string, unknown>;
@@ -5032,12 +5049,13 @@ export class Gateway {
         // A waiting (armed) task or a repeatable series hasn't started its own
         // workflow — edit its stored params + triggers in place, then re-arm (or
         // drop to a draft). `keepArmed:false` (Save as draft) disarms it.
+        const attenuation = { allowAttenuation: b.allowAttenuation === true, acceptAttenuation: attenuationAcceptance(b.acceptAttenuation) };
         if (t.params?.triggerState === 'armed' || t.params?.repeatable) {
           try {
-            const updated = await api.updateArmedParams(token, id, b.params ?? {}, { replace: b.replace === true, keepArmed: b.keepArmed !== false });
+            const updated = await api.updateArmedParams(token, id, b.params ?? {}, { replace: b.replace === true, keepArmed: b.keepArmed !== false, ...attenuation });
             return this.json(res, 200, updated);
           } catch (e) {
-            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+            return this.json(res, grantRefusal(e).code ? 403 : 400, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
           }
         }
         // A draft has no running workflow — edit its stored params in place; they
@@ -5050,10 +5068,11 @@ export class Gateway {
             const updated = await api.updateArmedParams(token, id, b.params ?? {}, {
               replace: b.replace === true,
               keepArmed: false,
+              ...attenuation,
             });
             return this.json(res, 200, updated);
           } catch (e) {
-            return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+            return this.json(res, grantRefusal(e).code ? 403 : 409, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
           }
         }
         // Once queued, params are frozen except the ones the workflow declares
@@ -5061,13 +5080,24 @@ export class Gateway {
         // let the validator reject anything frozen — a clear 409, never a silent
         // no-op on the stored record (which the running workflow would ignore).
         try {
-          const applied = await api.updateParams(token, id, b.params ?? {});
+          const applied = await api.updateParams(token, id, b.params ?? {}, { acceptAttenuation: attenuation.acceptAttenuation });
           // Authoritative read: reflect the just-applied update, not a snapshot that
           // may pre-date the workflow's next publish.
           return this.json(res, 200, { ...applied, view: await api.getTaskView(token, id, { live: true }) });
         } catch (e) {
-          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+          return this.json(res, grantRefusal(e).code ? 403 : 409, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
         }
+      }
+      // One agent's own authority (not the main agent's, which is the task's
+      // authorization below): the Responder, a Reviewer, or an agent called in.
+      const agentAuthorityMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents\/([^/]+)\/authority$/);
+      if (agentAuthorityMatch && (method === 'PUT' || method === 'DELETE')) {
+        const b = method === 'PUT' ? await this.body(req) : {};
+        try {
+          return this.json(res, 200, await api.setAgentAuthority(token, agentAuthorityMatch[1]!, decodeURIComponent(agentAuthorityMatch[2]!),
+            method === 'PUT' ? b.authority as any : undefined,
+            { allowAttenuation: b.allowAttenuation === true, acceptAttenuation: b.acceptAttenuation === true }));
+        } catch (e) { return this.fail(res, e); }
       }
       const workflowMatch = p.match(/^\/api\/tasks\/([^/]+)\/workflow$/);
       if (workflowMatch && method === 'PATCH') {
@@ -6596,7 +6626,7 @@ export class Gateway {
         // is authoritative and cannot be spoofed — auth() validated it against
         // membership; the query-param org only ever narrows within it.
         const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
-        const vault = new VaultItems(store, this.deps.broker, undefined, organizationId);
+        const vault = new VaultItems(store, this.deps.broker, undefined, organizationId, authRecord?.participant);
         const caps = authRecord?.caps ?? [];
         // A human session's token is task-unscoped; per-task passes/extensions
         // only ever apply to real task-agent bearers.
@@ -9595,8 +9625,7 @@ export class Gateway {
     const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
     try {
       this.json(res, declared ?? (e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500),
-        { error: String((e as Error)?.message ?? e),
-          ...((e as any)?.code ? { code: String((e as any).code) } : {}),
+        { error: String((e as Error)?.message ?? e), ...grantRefusal(e),
           ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
     } catch {
       /* ignore */
