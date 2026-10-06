@@ -62,7 +62,8 @@ describe('default organization browser behavior', () => {
     expect(profile).toContain('S.defaultOrganizationId');
     expect(wiring).toContain("method: 'PUT'");
     expect(wiring).toContain("toast('Default organization updated')");
-    expect(routing).toContain('firstProjectForOrganization(S.organizationId)');
+    // Home is the selected organization's own task list, not some first project.
+    expect(routing).toContain('homeRoute(org, DEFAULT_LIST_QUERY)');
     expect(routing).not.toContain('S.projects[0]?.id');
     expect(tabSwitch).toContain('firstProjectForOrganization(S.organizationId)');
   });

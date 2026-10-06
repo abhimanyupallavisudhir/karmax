@@ -156,7 +156,8 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/agent/github/actions/runs/:runId (rerun-failed/rerun/cancel with github:actions:write)',
     'POST /api/agent/github/actions/dispatch (body {repository?, workflow, ref, inputs?}; github:actions:write)',
     'POST /api/agent/resource-candidates (calling task inferred from its token)',
-    'POST /api/agent/escalate (calling task inferred from its token; body {audience, message, urgency?: low|normal|high|critical})',
+    'POST /api/agent/escalate (calling task inferred from its token, or taskId of a sub-task whose request you redirect; body {taskId?, audience?, message, urgency?: low|normal|high|critical}; on a task already waiting it redirects the request; no audience asks the task\'s Responder route)',
+    'POST /api/agent/notify (calling task inferred from its token; body {to: [agent:<key> | person/team/Avatar selector], message, urgency?}; people are notified now, the task\'s agents are called when your turn ends)',
     'POST /api/agent/permission-requests (body {capabilities, projectIds?, audience?, reason, urgency?}; exact task elevation and additive project scope (capabilities: [] for scope only) routed to people, teams, or Avatars; no audience summons the lowest of @maintainers, @admins, @superadmins that can grant it; high urgency by default)',
     'GET /api/agent/escalation-targets (people, teams, Avatars, and special audience selectors — @creator, @maintainers, @admins, @superadmins, @owners, @project, @all — available to the calling task)',
     'GET /api/permission-requests?taskId=&organizationId=',
@@ -175,7 +176,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/tasks/:taskId/fork-agent', 'GET /api/tasks/:taskId/sessions',
     'POST /api/conversation-imports?projectId= (raw Codex/Claude JSONL upload)',
     'GET /api/tasks/:taskId/events?since=',
-    'GET /api/tasks/:taskId/timing (correlated response timing, counts/median/p95, missing data, spans and content-free observations; task:event:read)', 'POST /api/tasks/:taskId/signal (followUp + role messages an agent; task:signal)', 'POST /api/tasks/:taskId/messages (body {text, role}; message an agent with task:conversation:message)',
+    'GET /api/tasks/:taskId/timing (correlated response timing, counts/median/p95, missing data, spans and content-free observations; task:event:read)', 'POST /api/tasks/:taskId/signal (followUp + role messages an agent; task:signal)', 'POST /api/tasks/:taskId/messages (body {text, role} messages one agent; or {text, to: [agent:do | agent:responder | agent:confirm | agent:agent-<n> | person/team/Avatar selectors], agents?: {"agent-<n>": agent spec}, images?, files?} says it in the shared conversation, calls the agents in order and notifies the people; task:conversation:message, task:edit to add agents)',
     'GET|POST /api/tasks/:taskId/explanations (durable annotations; POST body {role, sourceKey, settings?})',
   ],
   review: [
