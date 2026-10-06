@@ -247,7 +247,8 @@ describe('wiki-mention wiring', () => {
     expect(app).toContain('wireWikiRefDecoration(ta, projectId, signal)');
     expect(app).toContain("window.open(wikiRefHref(ref, projectId), '_blank', 'noopener')");
     expect(app).toContain("querySelector('textarea[data-field=\"prompt\"]')");
-    expect(app).toContain("querySelectorAll('.cf-prompt')");
+    // Responder/Reviewer instructions are wired by the shared Agent block.
+    expect(app).toContain("wireWikiMention(instructions, ctx.projectId || S.projectId)");
     expect(app).toContain("querySelector('.followup-input')");
     expect(css).toContain('.wiki-ref-backdrop .wiki-ref');
   });
@@ -310,7 +311,7 @@ describe('copy', () => {
     // "layer" is the internal name for the confirmer stack.
     expect(app).not.toContain('Add layer');
     expect(app).not.toContain('No layers');
-    expect(app).toContain('No reviewers — this task auto-confirms at Review.');
+    expect(app).toContain('>Auto-confirms</div>');
     expect(app).not.toContain('No account coordinator running');
   });
 

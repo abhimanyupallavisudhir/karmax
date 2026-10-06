@@ -30,8 +30,21 @@ export interface EvalContext {
   now: number;
   /** Project tag catalogue, for hierarchy expansion + name/path resolution. */
   tags?: Tag[];
-  /** Authenticated user, used only for caller-relative facets such as `is:mine`. */
+  /** Authenticated user, used only for caller-relative facets such as `is:mine`
+   *  and for resolving `for:me`. */
   userId?: string;
+  /**
+   * userId → task id → what each live ask routed to that person is (inbox kinds:
+   * `review-requested`, `escalated`, `approval-requested`, `assigned`, `mentioned`).
+   * The API precomputes it from the inbox for the people a query's `for:` clauses
+   * name, so this module stays pure. Absent ⇒ nobody has an ask (drafts still count).
+   */
+  attention?: Map<string, Map<string, string[]>>;
+  /** Lower-cased person name or email → userId, for `for:<name|email>` (the
+   *  organization's members; anything else matches nobody). */
+  people?: Map<string, string>;
+  /** project id → its name and URL slug, for `project:` and `group:project`. */
+  projects?: Map<string, { name: string; slug?: string }>;
 }
 export interface FieldContext extends EvalContext {
   /** task id → per-project number, so deps can be shown/matched as `#num`. */
@@ -76,6 +89,9 @@ export interface FieldDef {
   get(t: SearchTask, ctx?: FieldContext): string | number | string[] | undefined;
   /** Extract a sort key (numbers sort numerically; strings lexically). */
   sortKey?(t: SearchTask, ctx?: FieldContext): number | string;
+  /** Exact-match override for fields whose values name something to resolve (a
+   *  person, a project) rather than text to search. Replaces the type's matcher. */
+  matches?(t: SearchTask, value: string, ctx: FieldContext): boolean;
 }
 
 // ─── helpers to read live state off the cached view ──────────────────────────
@@ -233,6 +249,27 @@ const principalValue = (principal: TaskRecord['assignee']): string | undefined =
   }
 };
 
+// ─── for: (what needs a person) and project: ────────────────────────────────
+/** The user a `for:` value names: `me` (the caller), `user:<id>`, or a member's
+ *  name/email resolved by the API into `ctx.people`. Undefined ⇒ nobody. */
+function personFor(value: string, ctx?: EvalContext): string | undefined {
+  const v = value.trim();
+  if (v.toLowerCase() === 'me') return ctx?.userId;
+  if (/^user:/i.test(v)) return v.slice(5) || undefined;
+  return ctx?.people?.get(v.toLowerCase());
+}
+const ownDraft = (t: SearchTask, userId: string): boolean =>
+  !!t.params?.draft && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
+/** Why `t` needs `userId`: the kinds of the live asks routed to them (matched on
+ *  the attempt or its logical task), plus `draft` for their own draft. */
+function attentionReasons(t: SearchTask, userId: string, ctx?: EvalContext): string[] {
+  const asks = ctx?.attention?.get(userId);
+  const out = [...(asks?.get(t.id) ?? []), ...(t.intentId && t.intentId !== t.id ? asks?.get(t.intentId) ?? [] : [])];
+  if (ownDraft(t, userId)) out.push('draft');
+  return [...new Set(out)];
+}
+const projectOf = (t: SearchTask, ctx?: EvalContext) => ctx?.projects?.get(t.projectId);
+
 // ─── the searchable-field registry ───────────────────────────────────────────
 export const FIELDS: FieldDef[] = [
   { key: 'title', label: 'Title', type: 'text', get: (t) => t.title, sortable: true, sortKey: (t) => lc(t.title) },
@@ -259,6 +296,27 @@ export const FIELDS: FieldDef[] = [
   { key: 'delegate', label: 'Delegate', type: 'text', get: (t) => principalValue(t.delegate), groupable: true },
   { key: 'subscriber', label: 'Subscriber', type: 'text', aliases: ['subscribed'], get: (t) => (t.subscribers ?? []).map((p) => principalValue(p)!).filter(Boolean), groupable: true },
   { key: 'reviewer', label: 'Reviewer', type: 'text', aliases: ['reviewers'], get: (t) => (t.reviewers ?? []).map((id) => `user:${id}`), groupable: true },
+  // `for:me` / `for:<name|email|user:id>` — tasks waiting on that person (a live
+  // inbox ask: review, input, approval, assignment, mention) and their drafts.
+  {
+    key: 'for', label: 'For', type: 'text',
+    get: (t, ctx) => {
+      const users = new Set(ctx?.attention?.keys());
+      if (t.createdBy?.kind === 'user') users.add(t.createdBy.userId);
+      return [...users].filter((u) => attentionReasons(t, u, ctx).length).map((u) => `user:${u}`);
+    },
+    matches: (t, value, ctx) => { const user = personFor(value, ctx); return !!user && attentionReasons(t, user, ctx).length > 0; },
+  },
+  {
+    key: 'project', label: 'Project', type: 'text', groupable: true, sortable: true,
+    get: (t, ctx) => projectOf(t, ctx)?.name ?? t.projectId,
+    sortKey: (t, ctx) => lc(projectOf(t, ctx)?.name ?? t.projectId),
+    matches: (t, value, ctx) => {
+      const v = value.trim().toLowerCase();
+      const p = projectOf(t, ctx);
+      return v === t.projectId.toLowerCase() || (!!p && (v === p.name.toLowerCase() || v === p.slug?.toLowerCase()));
+    },
+  },
   { key: 'participant', label: 'Participant', type: 'text', get: (t) => [t.createdBy, t.assignee, t.delegate, ...(t.subscribers ?? [])].map((p) => principalValue(p)).filter((p): p is string => Boolean(p)), groupable: true },
   // ── trigger / schedule / dependency fields (this feature) ──
   { key: 'trigger', label: 'Trigger', type: 'enum', options: TRIGGER_OPTIONS, get: primaryTriggerKind, groupable: true, sortable: true, sortKey: (t) => primaryTriggerKind(t) },
@@ -405,6 +463,10 @@ function parseDateValue(value: string, now: number): DateVal | undefined {
 function matchClause(t: SearchTask, clause: FilterClause, ctx: FieldContext): boolean {
   const field = fieldByKey(clause.field);
   if (!field) return true; // unknown field ⇒ inert (don't silently drop everything)
+  if (field.matches) {
+    const ok = clause.values.some((v) => field.matches!(t, v, ctx));
+    return clause.negate ? !ok : ok;
+  }
   const raw = field.get(t, ctx);
   let ok: boolean;
   switch (field.type) {
@@ -542,6 +604,9 @@ export interface EvalResult {
   groups?: TaskGroup[];
   /** Tells clients that `groups` is a tag forest with nested `children`. */
   hierarchical?: boolean;
+  /** For a query with a positive `for:` clause: task id → why it needs the people
+   *  named (inbox kinds, or `draft`), so a list can say why each row is there. */
+  reasons?: Record<string, string[]>;
   total: number;
 }
 
@@ -584,7 +649,48 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
   const groupField = query.group ? fieldByKey(query.group) : undefined;
   if (query.group) groups = groupTasks(out, query.group, ectx);
 
-  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), total: out.length };
+  const asked = positiveForUsers(query, ctx);
+  let reasons: Record<string, string[]> | undefined;
+  if (asked.length) {
+    reasons = {};
+    for (const t of out) {
+      const why = [...new Set(asked.flatMap((u) => attentionReasons(t, u, ctx)))];
+      if (why.length) reasons[t.id] = why;
+    }
+  }
+  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons } : {}), total: out.length };
+}
+
+/** Every value of every `for:` clause (negated ones too) — what the API resolves. */
+export function forClauseValues(query: TaskQuery): string[] {
+  return (query.filters ?? []).filter((c) => fieldByKey(c.field)?.key === 'for').flatMap((c) => c.values);
+}
+
+/** The users the query's positive `for:` clauses name. */
+function positiveForUsers(query: TaskQuery, ctx: EvalContext): string[] {
+  const users = (query.filters ?? []).filter((c) => !c.negate && fieldByKey(c.field)?.key === 'for')
+    .flatMap((c) => c.values.map((v) => personFor(v, ctx)));
+  return [...new Set(users.filter((u): u is string => !!u))];
+}
+
+/**
+ * The task ids a store may narrow its read to for this query, or undefined when
+ * every task is needed. A positive `for:` clause ANDs with the rest, so only
+ * tasks with an ask for one of its people — plus drafts, which the caller must
+ * always include — can match. Relational fields need the full project index.
+ */
+export function attentionCandidates(query: TaskQuery, ctx: EvalContext): Set<string> | undefined {
+  const keys = [...(query.filters ?? []).map((c) => c.field), ...(query.sort ?? []).map((c) => c.field), query.group]
+    .map((key) => (key ? fieldByKey(key)?.key : undefined));
+  if (keys.includes('dependsOn') || keys.includes('blocks')) return undefined;
+  const clause = (query.filters ?? []).find((c) => !c.negate && fieldByKey(c.field)?.key === 'for');
+  if (!clause) return undefined;
+  const out = new Set<string>();
+  for (const value of clause.values) {
+    const user = personFor(value, ctx);
+    for (const id of (user && ctx.attention?.get(user)?.keys()) || []) out.add(id);
+  }
+  return out;
 }
 
 function sortTasks(tasks: SearchTask[], sort: SortClause[], ctx: FieldContext): SearchTask[] {

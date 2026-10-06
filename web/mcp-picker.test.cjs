@@ -16,6 +16,7 @@ const read = value => context.readMcpPicker({ querySelector: () => ({ dataset: {
 assert.equal(read(null), undefined, 'untouched field keeps following parent defaults');
 assert.deepEqual(Array.from(read([])), [], 'clearing every chip persists an explicit empty set');
 assert.deepEqual(Array.from(read(['browser:chrome-devtools', 'browser:playwright'])), ['browser:chrome-devtools', 'browser:playwright']);
+context.agentInstructions = (prompt) => prompt || '';
 vm.runInContext(source.slice(source.indexOf('const sameJson ='), source.indexOf('function renderResponderField('))
   + '\nglobalThis.normalizeTools = { spec: normSpec, layers: normLayers, responder: normResponder };', context);
 const normalize = context.normalizeTools;

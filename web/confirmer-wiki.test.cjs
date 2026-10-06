@@ -1,4 +1,4 @@
-// Regression coverage for wiki mentions in Agent-review prompt fields.
+// Regression coverage for wiki mentions in agents' Instructions.
 // Run: node web/confirmer-wiki.test.cjs
 const fs = require('fs');
 const path = require('path');
@@ -17,25 +17,23 @@ function extractFn(name) {
   throw new Error(`unterminated ${name}`);
 }
 
-const prompts = [{ id: 'first' }, { id: 'second' }];
+// Instructions for a Reviewer or Responder accept the same wiki references as
+// the task prompt: every Agent block wires its Instructions box to the picker.
 const wired = [];
 global.S = { projectId: 'project-1' };
 global.wireWikiMention = (prompt, projectId) => wired.push([prompt.id, projectId]);
-
-eval(extractFn('wireConfirmerWikiPrompts'));
-wireConfirmerWikiPrompts({ querySelectorAll: (selector) => (selector === '.cf-prompt' ? prompts : []) });
+global.wireAgentBox = () => {};
+global.wireAgentAuthority = () => {};
+eval(extractFn('wireAgentBlock'));
+const block = (id) => ({ querySelector: (selector) => (selector === '.ab-instructions' ? { id } : null) });
+wireAgentBlock(block('reviewer'), { projectId: 'project-2' });
+wireAgentBlock(block('responder'));
 
 let pass = 0;
 let fail = 0;
 const ok = (condition, message) => condition ? pass++ : (fail++, console.error('FAIL:', message));
-ok(JSON.stringify(wired) === JSON.stringify([['first', 'project-1'], ['second', 'project-1']]), 'every review prompt uses the shared wiki picker and current project');
-
-const wireConfirmer = extractFn('wireConfirmerField');
-const resetConfirmer = extractFn('resetConfirmerField');
-ok(wireConfirmer.includes('wireConfirmerWikiPrompts(row)'), 'newly added review layers are wired');
-ok(wireConfirmer.includes('wireConfirmerWikiPrompts(box)'), 'initial review layers are wired');
-ok(resetConfirmer.includes('wireConfirmerWikiPrompts(list)'), 'reset/re-rendered review layers are wired');
-ok(src.includes('Type [[ for wiki context.'), 'the field advertises wiki context search');
+ok(JSON.stringify(wired) === JSON.stringify([['reviewer', 'project-2'], ['responder', 'project-1']]),
+  'each agent\'s instructions use the shared wiki picker and the block\'s project');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

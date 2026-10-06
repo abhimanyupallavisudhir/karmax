@@ -56,7 +56,7 @@ import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
+import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, mergeModels,
@@ -192,6 +192,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
   if (p === '/api/organization-directory' && read) return 'none';
   if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
+  // The organization task list spans its projects; like global search, each
+  // project is authorized in searchableProjects / searchOrganizationTasks.
+  if (/^\/api\/organizations\/[^/]+\/search$/.test(p) && read) return 'none';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -338,6 +341,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets'
     || p === '/api/agent/permission-requests') return 'task:escalate';
   if (p === '/api/permission-requests' || /^\/api\/permission-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
+  if (p === '/api/agent/notify') return 'task:conversation:message';
   if (p === '/api/agent/collaboration/request'
     || /^\/api\/agent\/collaboration\/[^/]+\/cancel$/.test(p)) return 'task:conversation:message';
   if (/\/(?:file|open-command|file-checkout)$/.test(p)) return 'task:conversation:read';
@@ -453,6 +457,23 @@ function projectPrincipalFromBody(value: unknown, organizationId: string): Proje
       return { kind: 'organization', organizationId };
   }
   return principalFromBody(value);
+}
+
+/** What a refused grant tells the client: which agent, so the console can ask
+ * about exactly that one (`chooseAuthorizationGrant`). */
+function grantRefusal(e: unknown): { code?: string; participant?: string; authorization?: AuthorizationSelection } {
+  const error = e as { code?: unknown; participant?: unknown; authorization?: AuthorizationSelection } | undefined;
+  return {
+    ...(error?.code ? { code: String(error.code) } : {}),
+    ...(typeof error?.participant === 'string' ? { participant: error.participant,
+      ...(error.authorization ? { authorization: error.authorization } : {}) } : {}),
+  };
+}
+
+/** `acceptAttenuation`: `true` for every agent, or the participant keys. */
+function attenuationAcceptance(value: unknown): boolean | string[] | undefined {
+  if (value === true) return true;
+  return Array.isArray(value) ? value.map(String) : undefined;
 }
 
 function authorizationSelectionFromBody(value: unknown): AuthorizationSelection | undefined {
@@ -3755,7 +3776,7 @@ export class Gateway {
               const effective = (await this.deps.authorization?.taskGrant(ownerPrincipal, projectId, selection, ownerCaps))
                 ?? { ...selection, profileId: selection.level, capabilities: ownerCaps, attenuated: false };
               if (effective.attenuated && b.limitAuthorization !== true)
-                throw new AuthorizationGrantError('you cannot grant the Avatar more authorization than you have');
+                throw await api.authorizationGap(token, projectId, selection, { kind: 'avatar', ...(existing ? { avatarId: existing.id } : {}) });
               authorization = { ...effective, principal: ownerPrincipal };
             }
           }
@@ -3818,6 +3839,7 @@ export class Gateway {
           return this.json(res, Number((error as any)?.status ?? 400), {
             error: error instanceof Error ? error.message : String(error),
             ...((error as any)?.code ? { code: (error as any).code } : {}),
+            ...(error instanceof AuthorizationGrantError ? error.gap : {}),
           });
         }
       }
@@ -4793,6 +4815,11 @@ export class Gateway {
         return this.json(res, 200, await this.searchProjects(req, res, session, query));
       }
       if (p === '/api/search/fields' && method === 'GET') return this.json(res, 200, (await api.searchFields(token)));
+      const organizationSearch = p.match(/^\/api\/organizations\/([^/]+)\/search$/);
+      if (organizationSearch && method === 'GET') {
+        if ((url.searchParams.get('q') ?? '').length > 2000) return this.json(res, 400, { error: 'Search is too long' });
+        return await this.searchOrganization(res, session, decodeURIComponent(organizationSearch[1]!), url);
+      }
 
       // Evaluate a query against a project: `?q=<query string>` (Linear-style token
       // syntax) → { tasks, groups, total }. Every list surface — the default list
@@ -5022,12 +5049,13 @@ export class Gateway {
         // A waiting (armed) task or a repeatable series hasn't started its own
         // workflow — edit its stored params + triggers in place, then re-arm (or
         // drop to a draft). `keepArmed:false` (Save as draft) disarms it.
+        const attenuation = { allowAttenuation: b.allowAttenuation === true, acceptAttenuation: attenuationAcceptance(b.acceptAttenuation) };
         if (t.params?.triggerState === 'armed' || t.params?.repeatable) {
           try {
-            const updated = await api.updateArmedParams(token, id, b.params ?? {}, { replace: b.replace === true, keepArmed: b.keepArmed !== false });
+            const updated = await api.updateArmedParams(token, id, b.params ?? {}, { replace: b.replace === true, keepArmed: b.keepArmed !== false, ...attenuation });
             return this.json(res, 200, updated);
           } catch (e) {
-            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+            return this.json(res, grantRefusal(e).code ? 403 : 400, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
           }
         }
         // A draft has no running workflow — edit its stored params in place; they
@@ -5040,10 +5068,11 @@ export class Gateway {
             const updated = await api.updateArmedParams(token, id, b.params ?? {}, {
               replace: b.replace === true,
               keepArmed: false,
+              ...attenuation,
             });
             return this.json(res, 200, updated);
           } catch (e) {
-            return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+            return this.json(res, grantRefusal(e).code ? 403 : 409, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
           }
         }
         // Once queued, params are frozen except the ones the workflow declares
@@ -5051,13 +5080,24 @@ export class Gateway {
         // let the validator reject anything frozen — a clear 409, never a silent
         // no-op on the stored record (which the running workflow would ignore).
         try {
-          const applied = await api.updateParams(token, id, b.params ?? {});
+          const applied = await api.updateParams(token, id, b.params ?? {}, { acceptAttenuation: attenuation.acceptAttenuation });
           // Authoritative read: reflect the just-applied update, not a snapshot that
           // may pre-date the workflow's next publish.
           return this.json(res, 200, { ...applied, view: await api.getTaskView(token, id, { live: true }) });
         } catch (e) {
-          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+          return this.json(res, grantRefusal(e).code ? 403 : 409, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
         }
+      }
+      // One agent's own authority (not the main agent's, which is the task's
+      // authorization below): the Responder, a Reviewer, or an agent called in.
+      const agentAuthorityMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents\/([^/]+)\/authority$/);
+      if (agentAuthorityMatch && (method === 'PUT' || method === 'DELETE')) {
+        const b = method === 'PUT' ? await this.body(req) : {};
+        try {
+          return this.json(res, 200, await api.setAgentAuthority(token, agentAuthorityMatch[1]!, decodeURIComponent(agentAuthorityMatch[2]!),
+            method === 'PUT' ? b.authority as AgentAuthority | undefined : undefined,
+            { allowAttenuation: b.allowAttenuation === true, acceptAttenuation: b.acceptAttenuation === true }));
+        } catch (e) { return this.fail(res, e); }
       }
       const workflowMatch = p.match(/^\/api\/tasks\/([^/]+)\/workflow$/);
       if (workflowMatch && method === 'PATCH') {
@@ -5084,6 +5124,7 @@ export class Gateway {
           return this.json(res, Number((e as any)?.status ?? 409), {
             error: e instanceof Error ? e.message : String(e),
             ...((e as any)?.code ? { code: (e as any).code } : {}),
+            ...(e instanceof AuthorizationGrantError ? e.gap : {}),
           });
         }
       }
@@ -5121,8 +5162,28 @@ export class Gateway {
       const messageMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages$/);
       if (messageMatch && method === 'POST') {
         const b = await this.body(req);
+        // Recipients (@ mentions) and agents added for them: one shared conversation.
+        if (Array.isArray(b.to) || (b.agents && typeof b.agents === 'object')) {
+          const posted = await api.postTaskMessage(token, messageMatch[1]!, {
+            text: String(b.text ?? ''),
+            ...(Array.isArray(b.to) ? { to: b.to.map(String) } : {}),
+            ...(b.agents && typeof b.agents === 'object' && !Array.isArray(b.agents) ? { agents: b.agents } : {}),
+            ...(Array.isArray(b.images) ? { images: b.images } : {}),
+            ...(Array.isArray(b.files) ? { files: b.files } : {}),
+            ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
+          });
+          return this.json(res, 200, { ok: true, ...posted });
+        }
         const message = await api.messageAgent(token, messageMatch[1]!, String(b.text ?? ''), b.role);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
+      }
+      const mergeEligibilityMatch = p.match(/^\/api\/tasks\/([^/]+)\/merge-eligibility$/);
+      if (mergeEligibilityMatch && method === 'GET') {
+        try {
+          const answer = await api.mergeEligibility(token, mergeEligibilityMatch[1]!);
+          const names = new Map(((await this.deps.identity?.listUsers()) ?? []).map((user) => [user.id, { name: user.name, email: user.email }]));
+          return this.json(res, 200, { ...answer, people: answer.eligibleUserIds.map((id) => ({ id, selector: `user:${id}`, ...names.get(id) })) });
+        } catch (e) { return this.badRequest(res, e); }
       }
       const escalateMatch = p.match(/^\/api\/tasks\/([^/]+)\/escalate$/);
       if (escalateMatch && method === 'POST') {
@@ -5326,6 +5387,7 @@ export class Gateway {
         const b = await this.body(req);
         try {
           return this.json(res, 200, await api.escalateToHuman(token, {
+            ...(typeof b.taskId === 'string' && b.taskId ? { taskId: b.taskId } : {}),
             audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
             message: String(b.message ?? ''),
             ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
@@ -5333,6 +5395,14 @@ export class Gateway {
         } catch (error) {
           return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      if (p === '/api/agent/notify' && method === 'POST') {
+        const b = await this.body(req);
+        return this.json(res, 200, await api.notify(token, {
+          to: Array.isArray(b.to) ? b.to.map(String) : [],
+          message: String(b.message ?? ''),
+          ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
+        }));
       }
       if (p === '/api/agent/permission-requests' && method === 'POST') {
         const b = await this.body(req);
@@ -6556,7 +6626,7 @@ export class Gateway {
         // is authoritative and cannot be spoofed — auth() validated it against
         // membership; the query-param org only ever narrows within it.
         const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
-        const vault = new VaultItems(store, this.deps.broker, undefined, organizationId);
+        const vault = new VaultItems(store, this.deps.broker, undefined, organizationId, authRecord?.participant);
         const caps = authRecord?.caps ?? [];
         // A human session's token is task-unscoped; per-task passes/extensions
         // only ever apply to real task-agent bearers.
@@ -8113,7 +8183,9 @@ export class Gateway {
       // caller-facing answer, not a server fault: surface its own code rather
       // than letting `fail` flatten everything but CapabilityError to a 500.
       const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
-      if (declared) return this.json(res, declared, { error: (e as Error).message });
+      const code = (e as { code?: unknown })?.code;
+      if (declared) return this.json(res, declared, { error: (e as Error).message,
+        ...(code ? { code: String(code) } : {}), ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
       throw e;
     }
   }
@@ -9183,36 +9255,70 @@ export class Gateway {
   private async searchProjects(_req: http.IncomingMessage, res: http.ServerResponse, session: Session, query: string) {
     const results: { projectId: string; tasks: EvalResult['tasks']; total: number }[] = [];
     if (query.length < 2) return results;
-    const { authorization, identity, store, tokens, api } = this.deps;
-    const member = session.userId && identity && authorization ? session.userId : undefined;
+    const { api } = this.deps;
+    const member = this.searchMember(session);
+    for (const project of await this.searchableProjects(res, session)) {
+      if (res.destroyed) break;
+      const result = member ? await api.searchAuthorizedTasks(project.id, query, `user:${member}`)
+        : await api.searchTasks(session.apiToken, project.id, query);
+      results.push({ projectId: project.id, tasks: result.tasks.slice(0, 100), total: result.total });
+    }
+    return results;
+  }
+
+  /** The organization task list: one query over every project of the
+   *  organization the caller can read, sorted together and paged. */
+  private async searchOrganization(res: http.ServerResponse, session: Session, organizationId: string, url: URL) {
+    const query = url.searchParams.get('q') ?? '';
+    const page = { limit: Number(url.searchParams.get('limit') ?? 200), offset: Number(url.searchParams.get('offset') ?? 0) };
+    if (!(await this.deps.store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+    const member = this.searchMember(session);
+    if (!member) return this.json(res, 200, await this.deps.api.searchOrganizationTasks(session.apiToken, organizationId, query, page));
+    const projects = await this.searchableProjects(res, session, organizationId);
+    // An empty list is an answer only to a member; anyone else is refused, like
+    // every other route that names a foreign organization.
+    if (!projects.length && !(await this.deps.store.organizationMembership(organizationId, member)))
+      return this.json(res, 403, { error: 'You are not a member of this organization' });
+    return this.json(res, 200, await this.deps.api.searchAuthorizedOrganization(projects, query, `user:${member}`, page));
+  }
+
+  /** A browser session searches as its signed-in person; a bearer by its token. */
+  private searchMember(session: Session): string | undefined {
+    const { authorization, identity } = this.deps;
+    return session.userId && identity && authorization ? session.userId : undefined;
+  }
+
+  /** The projects a search may visit, optionally within one organization. */
+  private async searchableProjects(res: http.ServerResponse, session: Session, organizationId?: string): Promise<Project[]> {
+    const { authorization, store, tokens } = this.deps;
+    const member = this.searchMember(session);
     let projects: Project[];
     if (member) projects = await store.listProjectsReachableBy(member);
     else {
       const record = await tokens.verify(session.apiToken);
-      if (!record || !allows(record.caps, 'project:read') || !allows(record.caps, 'task:read')) return results;
+      if (!record || !allows(record.caps, 'project:read') || !allows(record.caps, 'task:read')) return [];
       const ids = record.projectId ? [record.projectId] : record.projectIds;
       projects = ids?.length ? (await Promise.all(ids.map(id => store.getProject(id)))).filter((p): p is Project => !!p)
         : record.organizationId ? await store.listOrganizationProjects(record.organizationId)
         : await store.listProjects(); // installation-wide authority
     }
+    const out: Project[] = [];
     for (const project of projects) {
       if (res.destroyed) break;
-      let result: EvalResult;
+      const projectOrganization = project.organizationId ?? 'org_personal';
+      if (organizationId && projectOrganization !== organizationId) continue;
       if (member) {
-        const organizationId = project.organizationId ?? 'org_personal';
-        const caps = await authorization!.capabilitiesAsync(`user:${member}`, project.id, organizationId);
+        const caps = await authorization!.capabilitiesAsync(`user:${member}`, project.id, projectOrganization);
         if (!allows(caps, 'project:read') || !allows(caps, 'task:read')
-          || !(await this.ssoAdmits(member, session.email, organizationId))) continue;
-        result = await api.searchAuthorizedTasks(project.id, query, `user:${member}`);
+          || !(await this.ssoAdmits(member, session.email, projectOrganization))) continue;
       } else {
-        const scope = { projectId: project.id };
+        const scope = { projectId: project.id, organizationId: projectOrganization };
         if (!(await tokens.check(session.apiToken, 'project:read', scope)).ok
           || !(await tokens.check(session.apiToken, 'task:read', scope)).ok) continue;
-        result = await api.searchTasks(session.apiToken, project.id, query);
       }
-      results.push({ projectId: project.id, tasks: result.tasks.slice(0, 100), total: result.total });
+      out.push(project);
     }
-    return results;
+    return out;
   }
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {
@@ -9519,8 +9625,8 @@ export class Gateway {
     const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
     try {
       this.json(res, declared ?? (e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500),
-        { error: String((e as Error)?.message ?? e),
-          ...((e as any)?.code ? { code: String((e as any).code) } : {}) });
+        { error: String((e as Error)?.message ?? e), ...grantRefusal(e),
+          ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
     } catch {
       /* ignore */
     }

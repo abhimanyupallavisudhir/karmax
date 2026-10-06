@@ -279,7 +279,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   list_projects: 'project:read', create_project: 'project:create', edit_project: 'project:edit', delete_project: 'project:delete',
   get_settings: 'settings:read', set_settings: 'settings:write',
   list_agents: 'task:conversation:read', get_conversation: 'task:conversation:read',
-  fork_agent: 'task:conversation:fork', message_agent: 'task:conversation:message',
+  fork_agent: 'task:conversation:fork', message_agent: 'task:conversation:message', notify: 'task:conversation:message', escalate: 'task:escalate',
   request_agent_action: 'task:conversation:message', cancel_agent_action: 'task:conversation:message',
   publish_task_branch: 'task:git:publish', import_task_branch: 'task:git:import', refresh_upstream: 'task:git:import',
   propose_project_resource: 'task:review:write', adopt_project_resource: 'task:review:execute',

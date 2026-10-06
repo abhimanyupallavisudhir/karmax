@@ -1,4 +1,5 @@
 import type { World } from '../world/types.js';
+import { participantAuthorization } from '../platform/agent-authority.js';
 import { decayVaultUsage, type VaultUsage, type VaultSelectionUsage } from '../util/vault-usage.js';
 import crypto from 'node:crypto';
 import os from 'node:os';
@@ -316,6 +317,9 @@ export class VaultItems {
     /** The owning organization (tenant boundary). Every item/request key is
      *  scoped to it; the gateway binds it from the caller's token org. */
     private organizationId = 'org_personal',
+    /** The task agent acting (`responder`, `agent-3`…, from its token). An agent
+     *  with its own authority uses its own per-item policy overrides. */
+    private participant?: string,
   ) {}
 
   // ── items ──
@@ -633,7 +637,13 @@ export class VaultItems {
   }
 
   async effectivePolicy(taskId: string | undefined, item: VaultItem): Promise<VaultItemPolicy> {
-    const override = taskId ? (await this.taskPolicies(taskId))[item.id] : undefined;
+    // The full store also reads tasks: an agent's own overrides live in its
+    // `params._agentAuthorization` entry.
+    const tasks = this.store as { getTask?(id: string): Promise<{ params?: Record<string, unknown> } | undefined> };
+    const agent = taskId && this.participant && tasks.getTask
+      ? participantAuthorization((await tasks.getTask(taskId))?.params, this.participant) : undefined;
+    const override = agent ? agent.credentialPolicies?.[item.id]
+      : taskId ? (await this.taskPolicies(taskId))[item.id] : undefined;
     return { ...item.policy, ...override };
   }
 
