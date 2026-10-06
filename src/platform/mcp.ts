@@ -460,12 +460,12 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
         'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
       inputSchema: {
-        audience: z.array(z.string()).min(1).max(32),
+        audience: z.array(z.string()).max(32).optional(),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
     },
-    async (a) => wrap(async () => (await ops.escalateToHuman(a))),
+    async (a) => wrap(async () => (await ops.escalateToHuman({ ...a, audience: a.audience ?? [] }))),
   );
   server.registerTool(
     'notify',

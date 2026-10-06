@@ -739,7 +739,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'One or more person/team/Avatar routing selectors; any selected principal may respond.',
+          description: 'One or more person/team/Avatar routing selectors; any selected principal may respond. Default: the task\'s Responder (people), else its creator.',
         },
         message: {
           type: 'string',
@@ -749,7 +749,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         },
         urgency: URGENCY_PARAMETER,
       },
-      required: ['audience', 'message'],
+      required: ['message'],
     },
   },
   {

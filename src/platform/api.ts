@@ -73,7 +73,7 @@ import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 import { assertAgentSpec, selectableAvatar } from './agent-params.js';
-import { AGENT_SELECTOR, MAIN_AGENT, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
+import { AGENT_SELECTOR, MAIN_AGENT, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
@@ -3259,8 +3259,13 @@ export class KarmaxApi {
     if (!redirect && !(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
-    const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
-    if (!audience.length) throw new Error('choose at least one person, team, or Avatar');
+    let audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
+    // Without an audience, ask whoever answers this task's questions: its human
+    // Responder route, else the person the task works for.
+    if (!audience.length) {
+      const route = task.params?.responder as { kind?: string; audience?: string[] } | undefined;
+      audience = route?.kind === 'human' && route.audience?.length ? [...route.audience] : ['@creator'];
+    }
     if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
     const avatarRecipients: import('../domain/types.js').Avatar[] = [];
     const initiatingUserId = (await this.deps.store.taskCreatorUserId(task.id));
@@ -3969,7 +3974,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     (await this.require(token, 'list_agents', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const view = await this.getTaskView(token, taskId);
-    const transcripts = view?.transcripts?.length
+    // One conversation with several agents: each agent, with what it said.
+    const transcripts = view?.participants
+      ? view.participants.map((p) => ({ role: p.key, label: p.label,
+        messages: (view.messages ?? []).filter((m) => m.role === 'agent' && (m.author ?? MAIN_AGENT) === p.key) }))
+      : view?.transcripts?.length
       ? view.transcripts
       : [{ role: 'do', label: 'Agent', messages: view?.messages ?? [] }];
     return (await __asyncCollections.map(transcripts, async (t) => {
@@ -3985,6 +3994,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     (await this.require(token, 'get_conversation', { projectId: task?.projectId, taskId }));
     const view = await this.getTaskView(token, taskId);
     if (!view) throw new Error(`task ${taskId} has no conversation yet`);
+    // A shared conversation is the same thread for every agent, read as that agent reads it.
+    if (view.participants) return { role, session: (await this.deps.store.kvGet(`session:${taskId}:${role}`)) || undefined,
+      messages: conversationFor(view.messages, isParticipantKey(role) ? role : MAIN_AGENT).map((m) => ({ ...m })) };
     const transcript = role === 'do' ? undefined : view.transcripts?.find((t) => t.role === role);
     return { role, session: (await this.deps.store.kvGet(`session:${taskId}:${role}`)) || undefined, messages: (transcript?.messages ?? view.messages).map((m) => ({ ...m })) };
   }
@@ -4491,8 +4503,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       const known = [...listed];
       const patch: Record<string, unknown> = {};
       for (const [key, spec] of newAgents) {
-        if (!/^agent-\d+$/.test(key) || !isParticipantKey(key) || listed.has(key))
-          throw new ValidationError(`${key} is not a free agent number; use ${nextAgentKey(known)}`);
+        // Agents are numbered in order, after every agent the task lists.
+        if (key !== nextAgentKey(known)) throw new ValidationError(`${key} is not the next agent number; use ${nextAgentKey(known)}`);
         if (!spec || typeof spec !== 'object' || !spec.provider) throw new ValidationError(`${participantLabel(key)} needs a harness`);
         (await assertAgentSpec(this.deps.store, project, spec, key, caller.humanSubject?.userId));
         const { authority: _authority, ...harness } = spec;

@@ -4876,7 +4876,9 @@ export class Store {
       // published yet (the workflow applies a redirect asynchronously).
       users = Array.isArray(ev.payload.audience) && ev.payload.audience.length
         ? (await this.humanAudience(task.id, ev.payload.audience.map(String)))
-        : (await this.escalationAudience(task));
+        : [];
+      // An ask that resolves to nobody still reaches someone who can act.
+      if (!users.length) users = (await this.escalationAudience(task));
     } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated)) {
       // The lifecycle states that are an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was

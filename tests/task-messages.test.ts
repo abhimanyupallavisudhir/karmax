@@ -47,8 +47,11 @@ describe('task messages, mentions, notify and escalation (real Temporal + git, m
       .toMatchObject({ role: 'agent', to: ['user:a'] });
     const v = await view(handle);
     expect(v.stage).toBe('review');
-    // The caller is told the agent answered: an ask in their inbox.
-    await expect.poll(() => inbox('a', task.id), { timeout: 10_000 }).toContainEqual({ kind: 'mentioned', actionable: true });
+    // The caller is told the agent answered. They are already asked to review
+    // this task, and a mention never displaces that stronger ask.
+    await expect.poll(async () => (await h.store.eventsOfType(task.id, ['task.mentioned'])).map((e: any) => e.payload.recipients), { timeout: 10_000 })
+      .toContainEqual(['user:a']);
+    expect(await inbox('a', task.id)).toEqual([{ kind: 'review-requested', actionable: true }]);
   });
 
   it('mentions people without waking the agent, and answering a mention discharges it', async () => {
