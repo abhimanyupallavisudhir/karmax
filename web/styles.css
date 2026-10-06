@@ -161,6 +161,7 @@ button.action-pending::after, [role="button"].action-pending::after, a.action-pe
 @keyframes action-error { 40% { box-shadow: 0 0 0 2px var(--danger); } }
 a { color: var(--accent); text-decoration: none; }
 .mono { font-family: var(--font-mono); font-feature-settings: "ss01"; }
+.nowrap { white-space: nowrap; }
 
 /* ── layout shell ───────────────────────────────────────────── */
 #app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }

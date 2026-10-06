@@ -154,10 +154,13 @@ export class ResticResources {
     throw new Error(`${path.posix.basename(place.path)} kept changing while it was being saved; stop whatever is writing to it, then save it again`);
   }
 
-  async restore(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions): Promise<void> {
+  /** `mirror` also deletes what the snapshot does not have, so the place ends
+   * up exactly the snapshot (a laptop's push into a task world). */
+  async restore(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions & { mirror?: boolean }): Promise<void> {
     const remote = isRemoteWorldKind(place.world.handle.kind);
     const scratch = place.file ? path.posix.join(place.world.handle.root, `.karmax-injection/restore-${crypto.randomBytes(6).toString('hex')}`) : undefined;
-    const args = ['restore', snapshot, '--target', scratch ?? place.path, '--no-lock', '--json', '-o', `rest.connections=${RESTORE_CONNECTIONS}`];
+    const args = ['restore', snapshot, '--target', scratch ?? place.path, '--no-lock', '--json', '-o', `rest.connections=${RESTORE_CONNECTIONS}`,
+      ...(options.mirror && !scratch ? ['--delete'] : [])];
     if (remote) {
       // One job does the restore and puts a single file in place.
       const move = scratch ? `\nshopt -s dotglob nullglob; e=(${quote(scratch)}/*); [ \${#e[@]} -eq 1 ] || { echo "expected one file" >&2; exit 3; }
@@ -179,6 +182,21 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       fs.renameSync(path.join(scratch, entries[0]!), place.path);
       fs.rmSync(scratch, { recursive: true, force: true });
     }
+  }
+
+  /** Create the repository if it does not exist yet: before a client outside
+   * any world (the tavya CLI) is given an append grant for it. */
+  async prepare(repository: Repository): Promise<void> { await this.ensureRepository(repository); }
+
+  /** Whether `snapshot` was saved in `repository` (its file is listed there). */
+  async hasSnapshot(repository: Repository, snapshot: string): Promise<boolean> {
+    return /^[0-9a-f]{64}$/.test(snapshot) && Boolean(await this.deps.store.repositoryFile(repository.name, 'snapshots', snapshot));
+  }
+
+  /** restic's environment for a client outside any world: the same grant a
+   * sandbox gets, for `base` (the edge, else the public URL). */
+  clientEnvironment(repository: Repository, base: string, access: 'read' | 'append'): Promise<Record<string, string>> {
+    return this.env(repository, base, access, access === 'append');
   }
 
   /** Save `entry` (`.`: all of it) of a directory on this host: an upload, an import. */
