@@ -9990,7 +9990,7 @@ async function cliHandoffDialog({ command, note, gitOnly }) {
   const opened = await localHandoffDialog({ loading: '', load: async () => null, render: () => `
     <div class="inline-form"><pre class="raw" style="flex:1;margin:0">${esc(command)}</pre><button class="btn sm primary local-copy" data-value="${esc(command)}">Copy</button></div>
     ${note ? `<p class="task-sub">${note}</p>` : ''}
-    <details class="local-git-only"><summary class="task-sub">Git only</summary><div class="local-git-only-body"><div class="tf-loading" role="status"><span class="global-search-loading">Loading…</span></div></div></details>` });
+    <details class="local-git-only advanced"><summary>Git only</summary><div class="local-git-only-body"><div class="tf-loading" role="status"><span class="global-search-loading">Loading…</span></div></div></details>` });
   if (!opened) return null;
   let loaded = false;
   opened.host.querySelector('.local-git-only')?.addEventListener('toggle', async (event) => {
@@ -10009,7 +10009,7 @@ async function openLocalCheckout(v) {
   const project = projectById(rec?.projectId || S.projectId);
   return cliHandoffDialog({
     command: `npx tavya clone ${cliTarget(project, rec?.num)}`,
-    note: `Code, data and secrets, as this task's world has them. <span class="mono">tavya push</span> brings your work back here; <span class="mono">tavya resume --fork</span> continues its agent on your machine.`,
+    note: `Code, data and secrets, as this task's world has them. <span class="mono nowrap">tavya push</span> brings your work back here; <span class="mono nowrap">tavya resume --fork</span> continues its agent on your machine.`,
     gitOnly: async (body) => {
       const [plan, preparedSessions] = await Promise.all([
         api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`),
@@ -10038,7 +10038,7 @@ async function openProjectCheckout(project) {
   if (!project?.id) return;
   return cliHandoffDialog({
     command: `npx tavya clone ${cliTarget(project)}`,
-    note: `Code, data and secrets, as a task's world has them. <span class="mono">tavya pull</span> and <span class="mono">tavya push</span> keep them in step.`,
+    note: `Code, data and secrets, as a task's world has them. <span class="mono nowrap">tavya pull</span> and <span class="mono nowrap">tavya push</span> keep them in step.`,
     gitOnly: async (body) => {
       const plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`);
       body.innerHTML = `<div class="section-h">First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
