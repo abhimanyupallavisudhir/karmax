@@ -753,6 +753,39 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'notify',
+    description:
+      'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, @creator, ' +
+      '@owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now; agents of this task ' +
+      '(agent:do for the main agent, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends, in order. ' +
+      'The message is said in the task conversation.',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32 },
+        message: { type: 'string', minLength: 1, maxLength: 4_000 },
+        urgency: URGENCY_PARAMETER,
+      },
+      required: ['to', 'message'],
+    },
+  },
+  {
+    name: 'escalate',
+    description:
+      'Redirect a request you received but cannot answer yourself to people who can — the question you were asked as a ' +
+      'Responder, or a request a sub-task routed to you (pass its task_id). The request waits for them instead; your own ' +
+      'work is not interrupted. Audience selectors as for notify (people, teams, Avatars).',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32 },
+        note: { type: 'string', minLength: 1, maxLength: 4_000 },
+        task_id: { type: 'string' },
+      },
+      required: ['to', 'note'],
+    },
+  },
+  {
     name: 'request_permission',
     description:
       `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
@@ -1471,6 +1504,20 @@ export function platformToolHandlers(
         audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
         message: String(args?.message ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
+      }));
+    },
+    async notify(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/notify', {
+        to: Array.isArray(args?.to) ? args.to.map(String) : [],
+        message: String(args?.message ?? ''),
+        ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
+      }));
+    },
+    async escalate(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/escalate', {
+        ...(args?.task_id ? { taskId: String(args.task_id) } : {}),
+        audience: Array.isArray(args?.to) ? args.to.map(String) : [],
+        message: String(args?.note ?? ''),
       }));
     },
     async request_permission(args) {

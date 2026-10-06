@@ -1691,6 +1691,11 @@ export class Store {
     this.userNames = lookup;
   }
 
+  /** A person's current display name, for labelling what they said. */
+  async userDisplayName(userId: string): Promise<string | undefined> {
+    return (await this.userNames?.())?.find((candidate) => candidate.id === userId)?.name || undefined;
+  }
+
   /**
    * Observe organization mutations that can change hosted admission. The store
    * owns the transactional billing/member write boundary; control-plane
@@ -4516,6 +4521,11 @@ export class Store {
       .map((r) => JSON.parse(r.principal));
   }
 
+  /** Someone spoke in a task: whatever mentioned them there is answered. */
+  async dischargeMentions(taskId: string, userId: string): Promise<void> {
+    (await this.deleteInbox("taskId=? AND userId=? AND kind='mentioned'", [taskId, userId]));
+  }
+
   /** Urgency first, recency second: the most urgent ask is always at the top,
    * and the limit therefore truncates the least urgent tail rather than a
    * high-urgency ask that happens to be older. */
@@ -4839,8 +4849,15 @@ export class Store {
       if (task.assignee) users = (await this.expandPrincipal(task.assignee, task.projectId));
     } else if (ev.type === 'task.mentioned') {
       kind = 'mentioned';
-      const mentioned = ev.payload.principal as PrincipalRef | undefined;
-      if (mentioned) users = (await this.expandPrincipal(mentioned, task.projectId));
+      // An @mention in a task's conversation is addressed to people: an ask, like
+      // a review request. (Historical single-principal mentions stay routine.)
+      if (Array.isArray(ev.payload.recipients)) {
+        actionable = true;
+        users = (await this.humanAudience(task.id, ev.payload.recipients.map(String)));
+      } else {
+        const mentioned = ev.payload.principal as PrincipalRef | undefined;
+        if (mentioned) users = (await this.expandPrincipal(mentioned, task.projectId));
+      }
     } else if (ev.type === 'credential.approval-requested' || ev.type === 'connection.requested') {
       kind = 'approval-requested'; actionable = true;
       users = (await this.humanAudience(task.id, ['@creator']));
@@ -4855,7 +4872,11 @@ export class Store {
       kind = 'review-requested'; actionable = true; users = (await this.reviewAudience(task));
     } else if (ev.type.includes('escalat')) {
       kind = 'escalated'; actionable = true;
-      users = (await this.escalationAudience(task));
+      // An escalation names who it goes to; the view that will say so may not be
+      // published yet (the workflow applies a redirect asynchronously).
+      users = Array.isArray(ev.payload.audience) && ev.payload.audience.length
+        ? (await this.humanAudience(task.id, ev.payload.audience.map(String)))
+        : (await this.escalationAudience(task));
     } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated)) {
       // The lifecycle states that are an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
@@ -4888,7 +4909,11 @@ export class Store {
           .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id));
         continue;
       }
-      if (actionable) (await this.deleteInbox('userId=? AND taskId=? AND actionable=1', [userId, task.id]));
+      if (actionable && kind === 'mentioned') {
+        // A mention never displaces a stronger ask on the same task: the person is
+        // already asked to look at it.
+        if ((await this.db.prepare("SELECT 1 FROM inbox WHERE userId=? AND taskId=? AND actionable=1 AND kind<>'mentioned'").get(userId, task.id))) continue;
+      } else if (actionable) (await this.deleteInbox('userId=? AND taskId=? AND actionable=1', [userId, task.id]));
       const item: InboxItem = { id: newId('inbox'), organizationId: project.organizationId, userId, eventSeq,
         taskId: task.id, kind, urgency: requested ?? DEFAULT_URGENCY[kind], unread: true, actionable, createdAt: ev.ts };
       const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox

@@ -73,6 +73,7 @@ import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 import { assertAgentSpec, selectableAvatar } from './agent-params.js';
+import { AGENT_SELECTOR, MAIN_AGENT, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
@@ -3241,14 +3242,21 @@ export class KarmaxApi {
     const caller = (await this.require(token, 'escalate_to_human'));
     const taskId = args.taskId ?? (caller.taskId !== '*' ? caller.taskId : undefined);
     if (!taskId) throw new Error('taskId is required for a non-task caller');
-    if (caller.taskId !== '*' && caller.taskId !== taskId)
-      throw new CapabilityError('a task agent may only escalate its own task');
-
     const task = (await this.deps.store.getTask(taskId));
-    (await this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId }));
+    // A task agent escalates its own task's requests, and those its sub-tasks
+    // routed to it (it is their default audience).
+    if (caller.taskId !== '*' && caller.taskId !== taskId && task?.parentTaskId !== caller.taskId)
+      throw new CapabilityError('a task agent may only escalate its own task or a request from its sub-task');
+    if (caller.taskId === '*' || caller.taskId === taskId)
+      (await this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId }));
     if (!task) throw new Error(`no task ${taskId}`);
     const view = await this.transitionSourceView(task);
-    if (!(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
+    // Escalating a request the task is already waiting on redirects it: the
+    // same wait, asking other people (software-dev ≥1.27). Anything else is the
+    // historical lifecycle move that stops the work and holds for input.
+    const waitingOn = view.waitingFor?.kind;
+    const redirect = this.sharedConversation(task) && (waitingOn === 'human' || waitingOn === 'parent' || waitingOn === 'responder');
+    if (!redirect && !(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
     const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
@@ -3275,8 +3283,15 @@ export class KarmaxApi {
     if (!detail) throw new Error('message is required');
     if ([...detail].length > 4_000) throw new Error('message must be at most 4000 characters');
 
-    await this.stopTaskActivity(task, view, `Escalated to ${audience.join(', ')}`);
-    const held = await this.startTransitionReplacement(task, view, view.stage, true, { audience, detail });
+    let held: TaskView;
+    if (redirect) {
+      await (await this.workflowHandle(taskId)).signal('reroute', { audience: audience.filter((selector) => !selector.startsWith('avatar:')).length
+        ? audience : [...audience, '@creator'], detail });
+      held = { ...view, waitingFor: { ...view.waitingFor!, kind: 'human', audience, detail } };
+    } else {
+      await this.stopTaskActivity(task, view, `Escalated to ${audience.join(', ')}`);
+      held = await this.startTransitionReplacement(task, view, view.stage, true, { audience, detail });
+    }
     const requestedBy = caller.taskId !== '*'
       ? `task-agent:${caller.taskId}:${caller.profileId}`
       : caller.principal;
@@ -4432,11 +4447,169 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   /** `message_agent`: a follow-up into one of a task's agent conversations. That
    *  is exactly what task:conversation:message grants, so it is authorized as
    *  that — not as task:signal, which also confirms, cancels and retries. */
+  /** Whether a task speaks in one multi-agent conversation (software-dev ≥1.27). */
+  private sharedConversation(task: Pick<TaskRecord, 'workflow' | 'workflowVersion' | 'lastView'>): boolean {
+    if (task.lastView?.participants) return true;
+    const minor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
+    return (task.workflow === 'software-dev' || task.workflow === 'goal') && minor >= 27;
+  }
+
+  /**
+   * Say something in a task's conversation and call whoever it is addressed to
+   * (SPEC §7.4; the follow-up box's @ mentions, and an agent's `notify`). `to`
+   * lists recipients in mention order: agents as `agent:<key>` — called in that
+   * order, each when the running agent's turn ends — and people, teams and
+   * Avatars as audience selectors, notified at once. `agents` adds agents to the
+   * task (`agent-N` → its spec) before they are called. Without `to` the message
+   * is for the main agent, as every follow-up was before.
+   */
+  async postTaskMessage(token: string, taskId: string, input: {
+    text: string; to?: string[]; agents?: Record<string, AgentSpec>;
+    images?: ImageRef[]; files?: FileRef[]; urgency?: Urgency;
+  }): Promise<{ message?: Message; notified: string[] }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'message_agent', { projectId: task.projectId, taskId }));
+    const text = String(input.text ?? '');
+    if (!text.trim() && !input.images?.length && !input.files?.length) throw new ValidationError('a message needs text or an attachment');
+    if ([...text].length > 100_000) throw new ValidationError('a message must be at most 100000 characters');
+    const shared = this.sharedConversation(task);
+    const to = input.to === undefined ? undefined
+      : [...new Set(input.to.map((selector) => String(selector).trim()).filter(Boolean))];
+    if (to && to.length > 32) throw new ValidationError('at most 32 recipients');
+    const newAgents = Object.entries(input.agents ?? {});
+    const listed = new Set((task.lastView?.participants ?? []).map((participant) => participant.key));
+    listed.add(MAIN_AGENT);
+    if (!shared && (newAgents.length || (to ?? []).some((selector) => selector.startsWith(AGENT_SELECTOR) && selectorAgent(selector) !== MAIN_AGENT)))
+      throw new ValidationError('this task predates conversations with several agents; send a follow-up to its agent');
+    // New agents join the task as parameters first, so the workflow knows them
+    // before it is asked to call them, and the Parameters tab lists them.
+    if (newAgents.length) {
+      (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
+      const project = (await this.deps.store.getProject(task.projectId));
+      if (!project) throw new NotFoundError('project not found');
+      const known = [...listed];
+      const patch: Record<string, unknown> = {};
+      for (const [key, spec] of newAgents) {
+        if (!/^agent-\d+$/.test(key) || !isParticipantKey(key) || listed.has(key))
+          throw new ValidationError(`${key} is not a free agent number; use ${nextAgentKey(known)}`);
+        if (!spec || typeof spec !== 'object' || !spec.provider) throw new ValidationError(`${participantLabel(key)} needs a harness`);
+        (await assertAgentSpec(this.deps.store, project, spec, key, caller.humanSubject?.userId));
+        const { authority: _authority, ...harness } = spec;
+        patch[`agent:${key}`] = harness;
+        known.push(key);
+        listed.add(key);
+      }
+      (await this.updateParams(token, taskId, patch));
+      const current = (await this.deps.store.getTask(taskId));
+      if (current) (await this.deps.store.updateTaskParams(taskId, { ...current.params, ...patch }));
+      for (const [key, spec] of newAgents) if (spec.authority && typeof (this as any).setAgentAuthority === 'function')
+        await (this as any).setAgentAuthority(token, taskId, key, spec.authority);
+    }
+    for (const selector of to ?? []) {
+      const key = selectorAgent(selector);
+      if (selector.startsWith(AGENT_SELECTOR)) {
+        if (!key || !listed.has(key)) throw new ValidationError(`${selector} is not an agent on this task`);
+        continue;
+      }
+      if (selector.startsWith('avatar:')) continue; // validated where it is dispatched
+      if (!(await this.deps.store.humanAudience(task.id, [selector])).length)
+        throw new ValidationError(`${selector} does not resolve to anyone in this organization`);
+    }
+    // Who is speaking: the task's own agent (by the agent its token was minted
+    // for), a person, or another task's agent.
+    const ownAgent = caller.kind === 'agent' && caller.taskId === taskId;
+    const speakerKey = ownAgent ? (caller.participant ?? (caller.role && isParticipantKey(caller.role) ? caller.role : MAIN_AGENT)) : undefined;
+    const userId = caller.humanSubject?.userId;
+    const authorFields: Partial<Message> = ownAgent && shared
+      ? { role: 'agent', author: speakerKey }
+      : userId ? { author: `user:${userId}`, ...((await this.deps.store.userDisplayName(userId)) ? { authorLabel: (await this.deps.store.userDisplayName(userId))! } : {}) }
+        : caller.kind === 'agent' && caller.taskId && caller.taskId !== '*'
+          ? { author: `task:${caller.taskId}`, authorLabel: `Task ${(await this.deps.store.getTask(caller.taskId))?.num ? `#${(await this.deps.store.getTask(caller.taskId))!.num}` : caller.taskId}` }
+          : {};
+    const callsAgents = to === undefined || to.some((selector) => selector.startsWith(AGENT_SELECTOR));
+    let message: Message | undefined;
+    if (shared || callsAgents) {
+      // Own-agent messages are its words, not input to itself; everything else is
+      // a follow-up the workflow routes by `to`.
+      message = (await this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, undefined, input.images, input.files,
+        undefined, undefined, { ...authorFields, ...(to !== undefined ? { to } : {}) }));
+    }
+    const people = (to ?? []).filter((selector) => !selector.startsWith(AGENT_SELECTOR));
+    const humans = people.filter((selector) => !selector.startsWith('avatar:'));
+    if (humans.length) {
+      const event = { taskId, type: 'task.mentioned', ts: Date.now(), payload: {
+        recipients: humans, by: authorFields.author ?? caller.principal, text: text.slice(0, 500),
+        ...(message ? { messageId: message.id } : {}),
+        urgency: normalizeUrgency(input.urgency, DEFAULT_URGENCY.mentioned),
+      } };
+      const seq = (await this.deps.store.appendEvent(event));
+      this.deps.bus?.emit({ ...event, seq });
+    }
+    const avatars = people.filter((selector) => selector.startsWith('avatar:'));
+    if (avatars.length) await this.dispatchAvatarResponders(token, task, avatars, text, speakerKey ?? MAIN_AGENT);
+    // Speaking in a task answers whatever mentioned you there.
+    if (userId) (await this.deps.store.dischargeMentions(taskId, userId));
+    return { ...(message ? { message } : {}), notified: people };
+  }
+
+  /** `notify`: a task's agent tells or calls people and agents without ending
+   * its turn — people are notified now, agents are called when it ends. */
+  async notify(token: string, args: { to: string[]; message: string; urgency?: Urgency }): Promise<{ message?: Message; notified: string[] }> {
+    const caller = (await this.require(token, 'notify'));
+    if (!caller.taskId || caller.taskId === '*') throw new ValidationError('notify is for a task agent; use POST /api/tasks/:id/messages');
+    if (!args.to?.length) throw new ValidationError('notify needs at least one recipient');
+    return this.postTaskMessage(token, caller.taskId, { text: args.message, to: args.to, ...(args.urgency ? { urgency: args.urgency } : {}) });
+  }
+
+  /** Ask Avatars to respond to a task: each runs as its own small task that
+   * answers through the same follow-up API a person uses. */
+  private async dispatchAvatarResponders(token: string, task: TaskRecord, selectors: string[], detail: string, role: string): Promise<void> {
+    const initiatingUserId = (await this.deps.store.taskCreatorUserId(task.id));
+    for (const selector of selectors) {
+      const avatar = (await this.deps.store.getAvatar(selector.slice(7)));
+      if (!avatar || avatar.projectId !== task.projectId || !(await avatarEnabled(this.deps.store, avatar)))
+        throw new ValidationError(`Avatar route ${selector} is not available in this project`);
+      if (avatar.roles.length && !avatar.roles.includes('respond'))
+        throw new ValidationError(`Avatar "${avatar.name}" is not configured to respond to tasks`);
+      if (!initiatingUserId || !(await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))
+        throw new CapabilityError(`the task creator is not allowed to call Avatar "${avatar.name}"`);
+      try {
+        await this.createTask(token, {
+          projectId: task.projectId,
+          workflow: 'just-do',
+          title: `${avatar.name}: respond to task #${task.num ?? task.id}`,
+          prompt: `You were asked to respond in task #${task.num ?? task.id} (${JSON.stringify(task.title)}):
+
+${untrustedBlock('the request', detail)}
+
+Act according to your Avatar instructions. When ready, call platform_request POST /api/tasks/${task.id}/messages with {"text": "<your concrete guidance or decision>", "to": ["agent:${role}"]}. Then briefly report what you sent.`,
+          params: {
+            'agent:do': {
+              avatarId: avatar.id,
+              avatarPurpose: 'respond',
+              provider: avatar.runtime.provider,
+              ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
+              ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}),
+            },
+          },
+        });
+      } catch (error) {
+        const failed = { taskId: task.id, type: 'avatar.response-dispatch-failed', ts: Date.now(),
+          payload: { avatarId: avatar.id, error: error instanceof Error ? error.message : String(error) } };
+        const failedSeq = (await this.deps.store.appendEvent(failed));
+        this.deps.bus?.emit({ ...failed, seq: failedSeq });
+      }
+    }
+  }
+
   async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<Message | undefined> {
     return this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
   }
 
-  private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number }): Promise<Message | undefined> {
+  private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number },
+    /** Shared-conversation fields of a follow-up: who says it and to whom. */
+    addressed?: Partial<Pick<Message, 'role' | 'author' | 'authorLabel' | 'to'>>): Promise<Message | undefined> {
     receivedAt ??= (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const scopedTask = (await this.deps.store.getTask(taskId));
     const caller = (await this.require(token, tool, { projectId: scopedTask?.projectId, taskId }));
@@ -4571,7 +4744,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
       if (signal === SIG.followUp) {
         const now = Date.now();
-        const msg: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) };
+        const msg: Message = { id: `u${randomUUID()}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}), ...addressed };
         const messages = terminal.messages.map((m) => ({ ...m }));
         const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
@@ -4624,7 +4797,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // input releases it immediately. Replacing from the persisted checkpoint
     // also repairs already-parked v1.5/v1.6 executions whose hold condition only
     // listened for Retry.
-    if (signal === SIG.followUp && scopedTask && heldView && heldOrigin) {
+    // In a shared conversation a message for other agents or people is not the
+    // main agent's input: the workflow's hold calls them and keeps holding.
+    const forMainAgent = !addressed?.to || addressed.to.includes(`${AGENT_SELECTOR}${MAIN_AGENT}`);
+    if (signal === SIG.followUp && scopedTask && heldView && heldOrigin && forMainAgent) {
       const holdRole = this.humanHoldRole(heldView);
       if (!holdRole)
         throw new Error(`the ${stageName(heldOrigin)} hold has no agent conversation to follow up; use Resume ${stageName(heldOrigin)}`);
@@ -4638,6 +4814,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         ts: now,
         ...(images?.length ? { images } : {}),
         ...(files?.length ? { files } : {}),
+        ...addressed,
       };
       const nextView = this.withConversationMessage(heldView, holdRole, followUp);
       await this.stopTaskActivity(scopedTask, heldView, `Human supplied input for the ${stageName(heldOrigin)} hold`);
@@ -4732,6 +4909,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           ts: now,
           ...(images?.length ? { images } : {}),
           ...(files?.length ? { files } : {}),
+          ...addressed,
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
         // and route every follow-up to their sole conversation.

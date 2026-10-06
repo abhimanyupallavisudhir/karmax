@@ -1907,6 +1907,13 @@ export interface TaskContinuation {
   error?: string;
   counters: { responderRounds: number; subtaskNags: number; subagentNudges: number; shellNudges: number;
     landingWatchSequence: number; resourceReviewSequence: number };
+  /** v1.27: every agent but the main one — its provider session and how much
+   * of the conversation it has read — plus agents called and not yet run. */
+  participants?: {
+    sessions: Record<string, { session?: string; home?: string; seen: number }>;
+    queue: string[];
+    calledBy?: Record<string, string>;
+  };
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────

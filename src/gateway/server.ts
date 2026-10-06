@@ -338,6 +338,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets'
     || p === '/api/agent/permission-requests') return 'task:escalate';
   if (p === '/api/permission-requests' || /^\/api\/permission-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
+  if (p === '/api/agent/notify') return 'task:conversation:message';
   if (p === '/api/agent/collaboration/request'
     || /^\/api\/agent\/collaboration\/[^/]+\/cancel$/.test(p)) return 'task:conversation:message';
   if (/\/(?:file|open-command|file-checkout)$/.test(p)) return 'task:conversation:read';
@@ -5121,6 +5122,18 @@ export class Gateway {
       const messageMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages$/);
       if (messageMatch && method === 'POST') {
         const b = await this.body(req);
+        // Recipients (@ mentions) and agents added for them: one shared conversation.
+        if (Array.isArray(b.to) || (b.agents && typeof b.agents === 'object')) {
+          const posted = await api.postTaskMessage(token, messageMatch[1]!, {
+            text: String(b.text ?? ''),
+            ...(Array.isArray(b.to) ? { to: b.to.map(String) } : {}),
+            ...(b.agents && typeof b.agents === 'object' && !Array.isArray(b.agents) ? { agents: b.agents } : {}),
+            ...(Array.isArray(b.images) ? { images: b.images } : {}),
+            ...(Array.isArray(b.files) ? { files: b.files } : {}),
+            ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
+          });
+          return this.json(res, 200, { ok: true, ...posted });
+        }
         const message = await api.messageAgent(token, messageMatch[1]!, String(b.text ?? ''), b.role);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
@@ -5326,6 +5339,7 @@ export class Gateway {
         const b = await this.body(req);
         try {
           return this.json(res, 200, await api.escalateToHuman(token, {
+            ...(typeof b.taskId === 'string' && b.taskId ? { taskId: b.taskId } : {}),
             audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
             message: String(b.message ?? ''),
             ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
@@ -5333,6 +5347,14 @@ export class Gateway {
         } catch (error) {
           return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      if (p === '/api/agent/notify' && method === 'POST') {
+        const b = await this.body(req);
+        return this.json(res, 200, await api.notify(token, {
+          to: Array.isArray(b.to) ? b.to.map(String) : [],
+          message: String(b.message ?? ''),
+          ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
+        }));
       }
       if (p === '/api/agent/permission-requests' && method === 'POST') {
         const b = await this.body(req);

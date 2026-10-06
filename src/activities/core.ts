@@ -1,4 +1,5 @@
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
+import { conversationFor } from '../domain/participants.js';
 import { createHash } from 'node:crypto';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
@@ -416,6 +417,13 @@ const CONVERSATION_PAGE_BYTES = 512 * 1024;
 export interface RunAgentTurnArgs {
   taskId: string;
   role: AgentRole;
+  /** The agent taking this turn in a shared multi-agent conversation
+   * (software-dev ≥1.27: `do`, `responder`, `confirm`, `agent-3`…). When set,
+   * `messages` is the whole conversation and is delivered as this agent reads
+   * it (participants.ts `conversationFor`), and this agent's own authority
+   * applies. Absent for historical executions, whose roles keep their own
+   * transcripts. */
+  participant?: string;
   worldHandle: WorldHandle;
   messages: Message[];
   /** `messages` continue this acknowledged conversation snapshot, so a turn's
@@ -1851,9 +1859,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
       // materializing the source session needs this turn's config home + world path.
-      const conversationTaskId = args.role === 'confirm' ? (args.task.intentId ?? args.taskId) : args.taskId;
+      // The agent speaking (v1.27 shared conversation), else the historical role.
+      const speaker = args.participant ?? args.role;
+      const sharedConversation = !!args.participant;
+      const conversationTaskId = args.role === 'confirm' && !sharedConversation ? (args.task.intentId ?? args.taskId) : args.taskId;
       let session = args.session;
-      let messages = args.messages; // may be replaced by the shared confirmer transcript
+      // One conversation, read as this agent hears it: its own replies stay its
+      // own, everyone else's are labelled input (participants.ts). Historical
+      // roles keep their own transcripts (and the shared confirmer transcript).
+      const ownView = sharedConversation ? conversationFor(args.messages, speaker) : args.messages;
+      let messages = ownView;
       let deliveredMessages = args.deliveredMessages;
       let fork = false; // true → the adapter branches a NEW session id from `session`
 
@@ -1988,6 +2003,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           taskId: args.taskId,
           profileId: profile.id,
           role: args.role,
+          ...(args.participant ? { participant: args.participant } : {}),
           principal: avatar ? avatarPrincipal(avatar.id)
             : args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
           projectId: avatar ? (delegatedScope ? undefined : args.task.projectId)
@@ -2144,7 +2160,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           });
           if (imported.kind === 'native') session = imported.sessionId;
           else {
-            messages = [imported.message, ...args.messages];
+            messages = [imported.message, ...ownView];
             deliveredMessages = 0;
           }
           if (imported.warnings?.length) await record(args.taskId, 'session.import.warnings', { warnings: imported.warnings });
@@ -2304,11 +2320,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // as context. NOT a native fork — flagged `native: false`.
             const srcView = (await store.getTask(spec.resumeFrom.taskId))?.lastView;
             const srcMsgs =
+              (srcView?.participants?.length && srcView.messages ? conversationFor(srcView.messages, srcRole) : undefined) ??
               srcView?.transcripts?.find((t) => t.role === srcRole)?.messages ??
               (srcRole === 'do' ? srcView?.messages : undefined) ??
               [];
             if (srcMsgs.length) {
-              messages = [...srcMsgs, ...args.messages];
+              messages = [...srcMsgs, ...ownView];
               (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: srcMsgs.length, native: false }));
             }
           }
@@ -2425,8 +2442,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               query: async (fromIndex: number) => {
                 try {
                   const handle = deps.client!.workflow.getHandle(args.taskId);
-                  const out = (await handle.query('pendingMessages', args.role, fromIndex)) as Message[] | undefined;
-                  return Array.isArray(out) ? await materializeFileAttachments(world, out) : [];
+                  const out = (await handle.query('pendingMessages', speaker, fromIndex)) as Message[] | undefined;
+                  const pending = Array.isArray(out) && sharedConversation ? conversationFor(out, speaker) : out;
+                  return Array.isArray(pending) ? await materializeFileAttachments(world, pending) : [];
                 } catch {
                   return []; // query not registered / workflow gone / transient — no injection
                 }
@@ -2441,9 +2459,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Confirm turns for sibling attempts share one durable transcript and run
       // serially. Fresh provider sessions replay that canonical transcript, which
       // also works across account/config-home rotation (native sessions are home-bound).
-      const releaseConfirm = args.role === 'confirm' ? await acquireConfirmLock(conversationTaskId, signal) : () => {};
+      const releaseConfirm = args.role === 'confirm' && !sharedConversation ? await acquireConfirmLock(conversationTaskId, signal) : () => {};
       let confirmTranscript: Message[] | undefined;
-      if (args.role === 'confirm') {
+      if (args.role === 'confirm' && !sharedConversation) {
         let shared: Message[];
         try { shared = JSON.parse((await store.kvGet(`confirm-transcript:${conversationTaskId}`)) ?? '[]'); }
         catch { shared = []; }
@@ -2773,7 +2791,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const text = source === 'assistant' ? secrets.scrubPartial(t) : secrets.scrub(t);
             if (text === lastEmit || !text && source === 'assistant') return;
             lastEmit = text;
-            const payload = { text, source, role: args.role, turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt };
+            const payload = { text, source, role: args.role, ...(sharedConversation ? { participant: speaker } : {}),
+              turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt };
             if (source !== 'assistant') { (await record(args.taskId, 'agent.output', payload)); return; }
             // Each publication supersedes the last (#396 review item 2).
             const event = { type: 'agent.output', taskId: args.taskId, ts: Date.now(), payload };
@@ -2794,6 +2813,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             (await record(args.taskId, 'agent.activity', {
               ...(await taskSecrets.refresh()).scrubValue(activity),
               role: args.role,
+              ...(sharedConversation ? { participant: speaker } : {}),
               attempt: activityAttempt, workflowRunId,
               ...(turnId ? { turnId } : {}),
             }));
@@ -2808,9 +2828,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // minted provider session immediately so a restart on the next instruction
             // still resumes this exact turn.
             heartbeat?.();
-            (await store.kvSet(`session:${conversationTaskId}:${args.role}`, s));
+            (await store.kvSet(`session:${conversationTaskId}:${speaker}`, s));
             (await store.kvSet(
-              `sessionmeta:${conversationTaskId}:${args.role}`,
+              `sessionmeta:${conversationTaskId}:${speaker}`,
               JSON.stringify({
                 home: resolvedAuth?.configHome ?? '',
                 provider: profile.provider,
@@ -2818,7 +2838,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 ...(profile.effort ? { effort: profile.effort } : {}),
               }),
             ));
-            (await record(args.taskId, 'session.started', { role: args.role }));
+            (await record(args.taskId, 'session.started', { role: args.role, ...(sharedConversation ? { participant: speaker } : {}) }));
           },
           ...(deps.payments
             ? {
@@ -2927,7 +2947,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // A resumed attempt was handed only a continuation notice, so its adapter's
         // count is not in the workflow's index space. The replaced attempt already
         // delivered the scheduled batch plus whatever it injected mid-turn.
-        if (resumedActivityAttempt && args.role !== 'confirm') {
+        if (resumedActivityAttempt && (args.role !== 'confirm' || sharedConversation)) {
           result.delivered = Math.max(restoredJournal?.delivered ?? 0, args.messages.length);
         }
         if (args.role === 'confirm' && result.confirmDecision?.action === 'confirm' && result.confirmDecision.otherAttempts) {
@@ -3001,9 +3021,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // which config home + provider minted it — provider sessions are home-bound, so
       // the CLI resume-command needs the right CONFIG_DIR/CODEX_HOME (§2.5, #2/#3).
       if (result.session) {
-        (await store.kvSet(`session:${conversationTaskId}:${args.role}`, result.session));
+        (await store.kvSet(`session:${conversationTaskId}:${speaker}`, result.session));
         (await store.kvSet(
-          `sessionmeta:${conversationTaskId}:${args.role}`,
+          `sessionmeta:${conversationTaskId}:${speaker}`,
           JSON.stringify({
             home: resolvedAuth?.configHome ?? '',
             provider: profile.provider,

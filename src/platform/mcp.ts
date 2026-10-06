@@ -48,7 +48,8 @@ export interface PlatformOps {
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
   messageAgent(taskId: string, text: string, role?: string): Promise<void>;
-  escalateToHuman(a: { audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
+  escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
+  notify(a: { to: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
@@ -120,6 +121,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     signalTask: async (id, sig, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await api.signalTask(getToken(), id, sig as any, text, role, undefined, undefined, { otherAttempts, saveOtherAttemptsDefault })),
     messageAgent: async (id, text, role) => void (await api.messageAgent(getToken(), id, text, role)),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
+    notify: (a) => api.notify(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
     requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
     cancelAgentAction: (requestId) => api.cancelAgentAction(getToken(), requestId),
@@ -213,6 +215,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     signalTask: async (id, signal, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role, otherAttempts, saveOtherAttemptsDefault }) })),
     messageAgent: async (id, text, role) => void (await req(`/api/tasks/${id}/messages`, { method: 'POST', body: JSON.stringify({ text, role }) })),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
+    notify: (a) => req('/api/agent/notify', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
     requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
     cancelAgentAction: (requestId) => req(`/api/agent/collaboration/${encodeURIComponent(requestId)}/cancel`, {
@@ -463,6 +466,37 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       },
     },
     async (a) => wrap(async () => (await ops.escalateToHuman(a))),
+  );
+  server.registerTool(
+    'notify',
+    {
+      description:
+        'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, ' +
+        '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now and keep ' +
+        'their own pace; agents of this task (agent:do for the main agent, agent:responder, agent:confirm, ' +
+        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation.',
+      inputSchema: {
+        to: z.array(z.string()).min(1).max(32),
+        message: z.string().trim().min(1).max(4_000),
+        urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
+      },
+    },
+    async (a) => wrap(async () => (await ops.notify(a))),
+  );
+  server.registerTool(
+    'escalate',
+    {
+      description:
+        'Redirect a request you received but cannot answer yourself to people who can — the question you were asked ' +
+        'as a Responder, or a request a sub-task routed to you (pass its task_id). The request waits for them instead; ' +
+        'your own work is not interrupted. Audience selectors as for notify (people, teams, Avatars).',
+      inputSchema: {
+        to: z.array(z.string()).min(1).max(32),
+        note: z.string().trim().min(1).max(4_000),
+        task_id: z.string().optional(),
+      },
+    },
+    async (a) => wrap(async () => (await ops.escalateToHuman({ ...(a.task_id ? { taskId: a.task_id } : {}), audience: a.to, message: a.note }))),
   );
   server.registerTool(
     'request_permission',
