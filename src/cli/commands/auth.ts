@@ -87,10 +87,11 @@ export async function token(api: Api, args: string[], out: Output, flags: { name
     return out.result(created, created.token);
   }
   if (action === 'list' || action === 'ls') {
-    const grants = await api.get<Array<{ id: string; name: string; kind: string; createdAt: number; lastUsedAt?: number; expiresAt?: number }>>('/api/user/app-grants');
-    const date = (value?: number) => value ? new Date(value).toISOString().slice(0, 10) : '—';
-    return out.result(grants, table([['ID', 'NAME', 'KIND', 'CREATED', 'LAST USED', 'EXPIRES'],
-      ...grants.map((grant) => [grant.id, grant.name, grant.kind, date(grant.createdAt), date(grant.lastUsedAt), date(grant.expiresAt)])]));
+    const { grants } = await api.get<{ grants: Array<{ id: string; name: string; kind: string; scope: string; createdAt: number;
+      lastUsedAt?: number | null; expiresAt?: number; current?: boolean }> }>('/api/user/app-grants');
+    const date = (value?: number | null) => value ? new Date(value).toISOString().slice(0, 10) : '—';
+    return out.result(grants, table([['ID', 'NAME', 'KIND', 'SCOPE', 'LAST USED', 'EXPIRES'],
+      ...grants.map((grant) => [grant.id, `${grant.name}${grant.current ? ' (this one)' : ''}`, grant.kind, grant.scope, date(grant.lastUsedAt), date(grant.expiresAt)])]));
   }
   if (action === 'revoke' || action === 'rm') {
     if (!id) throw new CliError('usage: tavya token revoke <id>', EXIT.usage);

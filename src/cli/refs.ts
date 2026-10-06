@@ -47,19 +47,20 @@ export async function resolveTarget(api: Api, ref: string, fallbackProjectId?: s
   if (parsed.project) {
     if (/^proj[_-]/.test(parsed.project)) project = await api.get<Project>(`/api/projects/${encodeURIComponent(parsed.project)}`);
     else {
-      const [organizations, projects] = await Promise.all([api.get<Organization[]>('/api/organizations'), api.get<Project[]>('/api/projects')]);
-      const orgMatches = parsed.organization
+      // A login limited to projects cannot list organizations; its project list is then the whole scope.
+      const [organizations, projects] = await Promise.all([api.get<Organization[]>('/api/organizations').catch(() => undefined), api.get<Project[]>('/api/projects')]);
+      const orgMatches = parsed.organization && organizations
         ? organizations.filter((entry) => (entry.slug ?? slug(entry.name)) === parsed.organization || entry.id === parsed.organization)
-        : organizations;
-      if (parsed.organization && !orgMatches.length) throw new CliError(`no organization "${parsed.organization}" that you can access`, EXIT.notFound);
+        : organizations ?? [];
+      if (parsed.organization && organizations && !orgMatches.length) throw new CliError(`no organization "${parsed.organization}" that you can access`, EXIT.notFound);
       const allowed = new Set(orgMatches.map((entry) => entry.id));
-      const matches = projects.filter((entry) => (!parsed.organization || allowed.has(entry.organizationId ?? 'org_personal'))
+      const matches = projects.filter((entry) => (!parsed.organization || !organizations || allowed.has(entry.organizationId ?? 'org_personal'))
         && (slug(entry.name) === slug(parsed.project!) || entry.id === parsed.project));
       if (!matches.length) throw new CliError(`no project "${parsed.organization ? `${parsed.organization}/` : ''}${parsed.project}" that you can access`, EXIT.notFound);
       if (matches.length > 1) throw new CliError(`"${parsed.project}" names ${matches.length} projects; say which organization: ${matches
-        .map((entry) => `${orgSlug(organizations.find((o) => o.id === entry.organizationId))}/${slug(entry.name)}`).join(', ')}`, EXIT.usage);
+        .map((entry) => `${orgSlug(organizations?.find((o) => o.id === entry.organizationId))}/${slug(entry.name)}`).join(', ')}`, EXIT.usage);
       project = matches[0]!;
-      organization = organizations.find((entry) => entry.id === project!.organizationId);
+      organization = organizations?.find((entry) => entry.id === project!.organizationId);
     }
   } else if (fallbackProjectId) project = await api.get<Project>(`/api/projects/${encodeURIComponent(fallbackProjectId)}`);
   else throw new CliError(`"${ref}" does not name a project; use <organization>/<project>[#<task>]`, EXIT.usage);

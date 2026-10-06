@@ -31,13 +31,13 @@ describe('durable authorization policy', () => {
     try {
       const authz = (await AuthorizationService.create(store));
       for (const id of ['maintainer', 'administrator']) {
-        // Those releases predate organization:wiki:write, and Administrator was
-        // then "Full access inside one organization".
+        // Those releases predate organization:wiki:write and project:secret:use, and
+        // Administrator was then "Full access inside one organization".
         const profile = id === 'administrator'
           ? [...SHIPPED_BUILTIN_PROFILES].find((version) => version.id === id && version.capabilities.includes('credential:*'))!
           : (await authz.profile(id))!;
         (await store.setAuthorizationProfile('global', { ...profile, builtin: true,
-          capabilities: [...profile.capabilities.filter((cap) => cap !== 'organization:wiki:write'), 'workflow:install'] } as any));
+          capabilities: [...profile.capabilities.filter((cap) => cap !== 'organization:wiki:write' && cap !== 'project:secret:use'), 'workflow:install'] } as any));
       }
       const upgraded = (await AuthorizationService.create(store));
       for (const id of ['maintainer', 'administrator']) {
