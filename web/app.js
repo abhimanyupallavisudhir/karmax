@@ -9130,7 +9130,8 @@ function checkinTab(v) {
   const transcripts = taskTranscripts(v);
   const sel = checkinSelection(v);
   const liveRole = liveRoleFor(v);
-  const items = transcripts
+  // A shared conversation is the only one: its agents are the list.
+  const items = transcripts.filter((t) => !t.shared)
     .map((t) => `<div class="ck-item ${sel === t.role ? 'sel' : ''}" data-checkin="${esc(t.role)}">
         <span class="ck-name">${esc(t.label || t.role)}</span>
         ${!t.shared && t.role === liveRole && v.status === 'active' ? '<span class="ck-live" title="agent working"></span>' : ''}
@@ -9140,7 +9141,7 @@ function checkinTab(v) {
   const hasWorld = !!(v.worldAvailable || v.worldPath);
   return `<div class="ck-layout">
     <div class="ck-side">
-      <div class="ck-side-h">Agents</div>
+      ${sharedConversation(v) ? '' : '<div class="ck-side-h">Agents</div>'}
       ${items}
       <div class="ck-side-h">Shell</div>
       <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
@@ -9856,6 +9857,7 @@ function wireCheckinSidebar(v) {
   );
   // An agent in the list starts a message to it.
   $('#main').querySelectorAll('[data-call-agent]').forEach((el) => el.addEventListener('click', () => {
+    if (checkinSelection(v) === 'terminal') selectCheckinPane(v, 'do');
     const ta = $('#main').querySelector('.followup-box[data-role="do"] .followup-input');
     if (!ta || ta.disabled) return;
     const key = `${v.taskId}/do`;
@@ -11361,7 +11363,7 @@ function newAgentFormsHtml(v, key) {
       <div class="fna-head"><b>${esc(participantLabelOf(agentKey, v))}</b><span class="pal-sub">new agent</span><span style="flex:1"></span>
         <button type="button" class="icon-btn fna-remove" aria-label="Remove ${esc(participantLabelOf(agentKey, v))}" title="Remove">×</button></div>
       ${typeof agentBlockHtml === 'function' ? agentBlockHtml(`fna-${agentKey}`, spec, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, compact: true })
-        : `<div class="fna-fields"><select class="fna-provider" aria-label="Harness">${['claude', 'codex', 'opencode', ...(S.meta?.mockAgent ? ['mock'] : [])]
+        : `<div class="fna-fields"><select class="fna-provider" aria-label="Harness">${[...new Set(['claude', 'codex', 'opencode', ...(spec.provider ? [spec.provider] : [])])]
           .map((provider) => `<option value="${provider}" ${spec.provider === provider ? 'selected' : ''}>${esc({ claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', mock: 'Mock' }[provider] || provider)}</option>`).join('')}</select>
           <input class="fna-model" placeholder="Model" value="${esc(spec.model || '')}" aria-label="Model">
           <select class="fna-effort" aria-label="Reasoning effort"><option value="">Default effort</option>${['low', 'medium', 'high', 'xhigh', 'max']
@@ -11481,6 +11483,8 @@ function wireAgentMention(ta, box, v, key) {
       if (agent && !agentItems().some((a) => String(a.index).startsWith(q) && a.index !== Number(q))) return choose(agent);
     }
     items = build();
+    // A word that names no one is just text after an @.
+    if (!items.length && !peopleMode) return close();
     active = Math.min(active, Math.max(0, items.length - 1));
     render();
   };

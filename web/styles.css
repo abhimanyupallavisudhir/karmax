@@ -3083,7 +3083,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 
 /* ── One conversation, several agents (software-dev ≥1.27) ───────────────── */
 .msg.agent.other-agent { background: color-mix(in srgb, var(--accent) 6%, var(--surface-2)); border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); }
-.msg-to { font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }
+.msg-to { font-size: 11px; color: currentColor; opacity: .72; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }
 .activity-speaker { flex: none; font: 10px/1.6 var(--font-mono); text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-right: 6px; }
 .ck-participant { width: 100%; border: 0; background: none; text-align: left; font: inherit; }
 .ck-participant .ck-num { flex: none; width: 16px; font: 11px var(--font-mono); color: var(--ink-3); }
