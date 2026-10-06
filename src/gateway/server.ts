@@ -3755,7 +3755,7 @@ export class Gateway {
               const effective = (await this.deps.authorization?.taskGrant(ownerPrincipal, projectId, selection, ownerCaps))
                 ?? { ...selection, profileId: selection.level, capabilities: ownerCaps, attenuated: false };
               if (effective.attenuated && b.limitAuthorization !== true)
-                throw new AuthorizationGrantError('you cannot grant the Avatar more authorization than you have');
+                throw await api.authorizationGap(token, projectId, selection, { kind: 'avatar', ...(existing ? { avatarId: existing.id } : {}) });
               authorization = { ...effective, principal: ownerPrincipal };
             }
           }
@@ -3818,6 +3818,7 @@ export class Gateway {
           return this.json(res, Number((error as any)?.status ?? 400), {
             error: error instanceof Error ? error.message : String(error),
             ...((error as any)?.code ? { code: (error as any).code } : {}),
+            ...(error instanceof AuthorizationGrantError ? error.gap : {}),
           });
         }
       }
@@ -5084,6 +5085,7 @@ export class Gateway {
           return this.json(res, Number((e as any)?.status ?? 409), {
             error: e instanceof Error ? e.message : String(e),
             ...((e as any)?.code ? { code: (e as any).code } : {}),
+            ...(e instanceof AuthorizationGrantError ? e.gap : {}),
           });
         }
       }
@@ -5123,6 +5125,14 @@ export class Gateway {
         const b = await this.body(req);
         const message = await api.messageAgent(token, messageMatch[1]!, String(b.text ?? ''), b.role);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
+      }
+      const mergeEligibilityMatch = p.match(/^\/api\/tasks\/([^/]+)\/merge-eligibility$/);
+      if (mergeEligibilityMatch && method === 'GET') {
+        try {
+          const answer = await api.mergeEligibility(token, mergeEligibilityMatch[1]!);
+          const names = new Map(((await this.deps.identity?.listUsers()) ?? []).map((user) => [user.id, { name: user.name, email: user.email }]));
+          return this.json(res, 200, { ...answer, people: answer.eligibleUserIds.map((id) => ({ id, selector: `user:${id}`, ...names.get(id) })) });
+        } catch (e) { return this.badRequest(res, e); }
       }
       const escalateMatch = p.match(/^\/api\/tasks\/([^/]+)\/escalate$/);
       if (escalateMatch && method === 'POST') {
@@ -8113,7 +8123,9 @@ export class Gateway {
       // caller-facing answer, not a server fault: surface its own code rather
       // than letting `fail` flatten everything but CapabilityError to a 500.
       const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
-      if (declared) return this.json(res, declared, { error: (e as Error).message });
+      const code = (e as { code?: unknown })?.code;
+      if (declared) return this.json(res, declared, { error: (e as Error).message,
+        ...(code ? { code: String(code) } : {}), ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
       throw e;
     }
   }
@@ -9520,7 +9532,8 @@ export class Gateway {
     try {
       this.json(res, declared ?? (e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500),
         { error: String((e as Error)?.message ?? e),
-          ...((e as any)?.code ? { code: String((e as any).code) } : {}) });
+          ...((e as any)?.code ? { code: String((e as any).code) } : {}),
+          ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
     } catch {
       /* ignore */
     }

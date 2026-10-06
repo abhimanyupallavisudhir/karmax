@@ -82,6 +82,7 @@ import {
   type GithubActionsFailureDecision,
 } from '../integrations/github-actions.js';
 import { isGithubWorkflowPermissionRejection, type GitHubRepositoryPermission } from '../integrations/github-app.js';
+import { mergeCapableUsers } from '../integrations/github-merge-rights.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService, paymentPromptContext } from '../autonomy/payments.js';
 import { fillViaCdp } from '../autonomy/fill.js';
@@ -3868,16 +3869,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
 
       if (!actorUserId) {
-        const eligibleUserIds: string[] = [];
-        // This scan is advisory only (for the reviewer picker). Revalidation
-        // above always happens again immediately before a real merge request.
-        for (const userId of (await store.humanAudience(handle.id, ['@project']))) {
-          const accountId = (await deps.githubApp.activeUserAccountId(userId));
-          if (!accountId) continue;
-          const checks = await Promise.all(prs.filter((ref) => !ref.merged).map((ref) =>
-            deps.githubApp!.repositoryPermission(userId, ref.slug, accountId).catch(() => undefined)));
-          if (checks.length && checks.every((permission) => permission?.canMerge)) eligibleUserIds.push(userId);
-        }
+        // This scan is advisory only (for the reviewer picker); it is the same
+        // answer GET /api/tasks/:id/merge-eligibility gives. Revalidation above
+        // always happens again immediately before a real merge request.
+        const eligibleUserIds = await mergeCapableUsers(deps.githubApp, (await store.humanAudience(handle.id, ['@project'])),
+          [...new Set(prs.filter((ref) => !ref.merged).map((ref) => ref.slug))]);
         (await record(handle.id, 'github.merge.authorization-required', { eligibleUserIds, repositories: prs.map((ref) => ref.slug) }));
         return {
           status: 'needs-authorizer', prs,

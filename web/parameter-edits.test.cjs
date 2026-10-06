@@ -112,7 +112,7 @@ async function main() {
       return new Promise((resolve) => { authComplete = resolve; });
     },
   });
-  vm.runInContext(fn('wireTaskAuthorization'), authContext);
+  vm.runInContext([fn('isAuthorizationGrantGap'), fn('saveTaskAuthorization'), fn('wireTaskAuthorization')].join('\n'), authContext);
   const renderAuth = async (selection) => {
     const select = new Element(), button = new Element(), vault = new Element(), status = new Element(), bar = new Element();
     select.selection = selection; select.closest = () => null; button.closest = () => bar;
