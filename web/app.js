@@ -17334,7 +17334,7 @@ function markInboxItemReadLocally(item) {
 const INBOX_TABS = [
   { key: 'approval-requested', label: 'Approvals' },
   { key: 'review-requested', label: 'Review' },
-  { key: 'escalated', label: 'Escalated' },
+  { key: 'escalated', label: 'Needs input' },
   { key: 'assigned', label: 'Assigned' },
   { key: 'mentioned', label: 'Mentions' },
   { key: 'update', label: 'Updates' },
