@@ -6,7 +6,7 @@ import { Pool } from 'pg';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { canonicalAccountName } from '../domain/account-names.js';
+import { assertAccountNameAllowed, canonicalAccountName } from '../domain/account-names.js';
 import { openSqlDatabase, type SqlDatabase } from '../store/sql.js';
 import { importSqliteDatabase, type SqliteImportResult } from '../store/postgres-migration.js';
 import { BRAND, DEFAULT_SITE_NAME } from '../domain/brand.js';
@@ -259,6 +259,9 @@ export class IdentityService {
         } } },
         user: { create: { before: async (user: Record<string, unknown>) => {
           (await this.assertUserNameAvailable(String(user.name ?? '')));
+        } }, update: { before: async (user: Record<string, unknown>) => {
+          // A rename (Better Auth's update-user) may not take a reserved name either.
+          if (typeof user.name === 'string') assertAccountNameAllowed(user.name);
         } } },
         account: {
           create: { before: async (account: Record<string, unknown>) => {
@@ -416,6 +419,7 @@ export class IdentityService {
   async assertUserNameAvailable(name: string): Promise<string> {
     const value = name.trim();
     if (!value) throw new Error('user name is required');
+    assertAccountNameAllowed(value);
     const key = canonicalAccountName(value);
     if ((await this.listUsers()).some((user) => canonicalAccountName(user.name) === key))
       throw new Error(`name "${value}" is already used by a user`);

@@ -184,6 +184,16 @@ describe('service connections', () => {
     await expect(service.connect(org, 'alice', { id: (await service.request(org, 'gmail', 'task_d', 'do', 'x')).id, useConnectionId: account }))
       .rejects.toThrow('not connected');
   });
+  it('offers reusable accounts newest first, with when each was connected', async () => {
+    const day = 86_400_000, then = Date.UTC(2026, 8, 12);
+    vi.spyOn(Date, 'now').mockReturnValue(then);
+    const older = await connected('task_a');
+    vi.mocked(backend.authorize).mockResolvedValueOnce({ id: 'ca_second', url: 'https://connect.composio.dev/link/second' });
+    vi.mocked(Date.now).mockReturnValue(then + day);
+    const newer = await connected('task_b');
+    expect((await service.reusable(org, 'alice', 'gmail')).map(({ id, createdAt }) => ({ id, createdAt })))
+      .toEqual([{ id: newer, createdAt: then + day }, { id: older, createdAt: then }]);
+  });
   it('detects revoked access before execution; reconnects without widening grants', async () => {
     const id = await connected(); vi.mocked(backend.active).mockResolvedValue(false);
     await expect(service.execute(org, id, 'task_a', project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow('expired');

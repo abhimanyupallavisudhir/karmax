@@ -120,7 +120,7 @@ body {
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
-.mobile-menu, .rail-scrim { display: none; }
+.rail-scrim { display: none; }
 button, input, textarea, select { font: inherit; color: inherit; }
 
 /* A request starts here on the same frame as its click/change. The two-pixel
@@ -173,7 +173,10 @@ a { color: var(--accent); text-decoration: none; }
   border-bottom: 1px solid var(--line);
   z-index: 30;
 }
-.brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -0.01em; }
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -0.01em; color: inherit; text-decoration: none; border-radius: 7px; }
+.brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+/* ☰ sits flush with the logo; the rail it folds is the column below it. */
+.topbar .mobile-menu { flex: none; margin-right: -8px; }
 /* The artwork carries its own background and rounded corners (see web/brand/),
    so the mark is just a sized image — no gradient plate behind it. */
 .brand .mark {
@@ -233,6 +236,17 @@ a { color: var(--accent); text-decoration: none; }
 .topbar-user:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface); }
 
 .body { flex: 1; min-height: 0; display: grid; grid-template-columns: 232px 1fr; overflow: hidden; }
+/* Folding the rail (☰ on a wide screen): the column closes smoothly and the
+   rail stops taking focus (inert) once it is out of sight. */
+@media (min-width: 721px) {
+  .body { transition: grid-template-columns .18s ease; }
+  .rail { transition: visibility 0s; }
+  html.rail-collapsed .body { grid-template-columns: 0 1fr; }
+  html.rail-collapsed .rail { visibility: hidden; overflow: hidden; min-width: 0; padding-left: 0; padding-right: 0; border-right-width: 0;
+    transition: visibility 0s .18s, padding 0s .18s, border-width 0s .18s; }
+  html.rail-collapsed .task-form-page { left: 0; }
+}
+@media (prefers-reduced-motion: reduce) { .body, html.rail-collapsed .rail { transition: none; } }
 
 /* ── projects rail ──────────────────────────────────────────── */
 .rail {
@@ -391,7 +405,10 @@ a { color: var(--accent); text-decoration: none; }
 .task-title { font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* Human-facing sequential task id (SPEC §10.6): a quiet monospace tag before the title. */
 .task-num { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); font-weight: 500; }
-.task-sub { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-3); margin-top: 3px; }
+.task-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 12px; color: var(--ink-3); margin-top: 3px; }
+.task-sub > .chip { white-space: nowrap; }
+/* A phone gives the title the row: the dot and stage chip already say where it is. */
+@media (max-width: 700px) { .task-row > .task-right > .pipeline { display: none; } }
 /* The flex row above is for a strip of metadata (a div of chips). A <p> is prose:
    as a flex container every inline <a>/<span> in the sentence became its own item,
    gapped and wrapped away from the words around it. Prose flows as prose. */
@@ -606,6 +623,11 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .chip.blocked, .chip.failed { background: var(--danger-weak); color: var(--danger); border-color: transparent; }
 .chip.done { background: var(--merged-weak); color: var(--merged); border-color: transparent; }
 .chip.approval-needed { background: var(--working-weak); color: var(--working); border-color: transparent; }
+/* Why a row is in "For me": the ask waiting on you. */
+.chip.attention { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
+.chip.attention.escalated { background: var(--working-weak); color: var(--working); }
+/* The organization home names each row's project. */
+.chip.task-project { display: inline-block; color: var(--ink-2); background: var(--surface-2); max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* GitHub pull request, in the task byline: link + live state. */
 .pr-link {
@@ -1094,6 +1116,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .approval-request-actions .vreq-pick { gap: 8px; max-width: 260px; }
 .approval-request-actions .vreq-pick .tf-vault-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .approval-request-actions .vreq-add { font-size: 12px; white-space: nowrap; }
+.approval-request-actions .connection-account { max-width: 200px; padding: 4px 8px; font-size: 13px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); }
 .approval-request-help { margin-top: 7px; color: var(--ink-2); font-size: 12px; }
 .approval-request-warn { margin-top: 7px; color: var(--danger); font-size: 12px; }
 .approval-request-warn.caution { color: var(--ink-2); }
@@ -2716,43 +2739,35 @@ html[data-theme="dark"] .github-signin-btn:active,
 /* Credential import modal + inline info dots (Passwords settings) */
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 60; }
 .modal-card { background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--r); padding: 18px; box-shadow: 0 12px 40px rgba(0,0,0,.35); }
-.authorization-gap-overlay { z-index: 80; padding: 14px; }
-.authorization-gap-card { position: relative; width: min(680px, 100%); max-height: min(820px, calc(100vh - 28px)); overflow: auto; padding: 0; }
-.authorization-gap-head { display: grid; grid-template-columns: 42px 1fr; gap: 14px; padding: 24px 52px 20px 24px; border-bottom: 1px solid var(--line); }
-.authorization-gap-mark { width: 38px; height: 38px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 50%; color: var(--accent); font-size: 21px; }
-.authorization-gap-head .section-h { margin: 0 0 5px; }
-.authorization-gap-head h2 { margin: 0; font-size: 20px; letter-spacing: -.02em; }
-.authorization-gap-head p { margin: 7px 0 0; color: var(--ink-3); line-height: 1.5; }
-.authorization-gap-close { position: absolute; top: 14px; right: 14px; }
-.authorization-gap-paths { padding: 10px 24px 4px; }
-.authorization-gap-path { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 16px 0; }
-.authorization-gap-number { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 50%; background: var(--surface-2); color: var(--ink-2); font: 600 12px var(--font-mono); }
-.authorization-gap-path-copy { display: grid; gap: 3px; }
-.authorization-gap-path-copy > span { color: var(--ink-3); font-size: 12px; line-height: 1.4; }
-.authorization-gap-recipients { margin: 0 0 4px 40px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
-.authorization-gap-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; max-height: 240px; overflow: auto; }
-.authorization-gap-recipient { display: grid; grid-template-columns: auto 28px minmax(0, 1fr); gap: 8px; align-items: center; padding: 8px; border: 1px solid transparent; border-radius: 8px; cursor: pointer; }
-.authorization-gap-recipient:hover { background: var(--surface); border-color: var(--line); }
-.authorization-gap-recipient-icon { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 7px; background: var(--surface-2); color: var(--ink-2); font: 650 12px var(--font-mono); }
-.authorization-gap-recipient-icon.avatar { color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); }
-.authorization-gap-recipient span:last-child { display: grid; min-width: 0; }
-.authorization-gap-recipient b, .authorization-gap-recipient small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.authorization-gap-recipient small { color: var(--ink-3); font-size: 11px; }
-.authorization-gap-reason { display: grid; gap: 5px; margin: 12px 0; color: var(--ink-3); font-size: 12px; }
-.authorization-gap-reason textarea { width: 100%; resize: vertical; }
-.authorization-gap-empty { color: var(--ink-3); font-size: 13px; padding: 8px; }
-.authorization-gap-details { margin: 4px 24px 22px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: 12px; }
-.authorization-gap-details summary { cursor: pointer; margin-bottom: 9px; }
-.authorization-gap-details .chip { margin: 2px 2px 0 0; }
-@media (max-width: 620px) {
-  .authorization-gap-head { grid-template-columns: 1fr; padding-left: 18px; }
-  .authorization-gap-mark { display: none; }
-  .authorization-gap-paths { padding-inline: 18px; }
-  .authorization-gap-path { grid-template-columns: 24px 1fr; }
-  .authorization-gap-path .btn { grid-column: 2; justify-self: start; }
-  .authorization-gap-recipients { margin-left: 0; }
-  .authorization-gap-list { grid-template-columns: 1fr; }
-}
+.summon-overlay { z-index: 80; padding: 14px; }
+.summon-card { position: relative; width: min(440px, 100%); display: grid; gap: 12px; padding: 18px 18px 16px; }
+.summon-head { display: flex; align-items: flex-start; gap: 8px; padding-right: 28px; }
+.summon-head h2 { margin: 0; font-size: 17px; line-height: 1.3; letter-spacing: -.01em; }
+.summon-head .info-dot { flex: none; margin-top: 3px; }
+.summon-close { position: absolute; top: 12px; right: 12px; }
+.summon-missing-toggle { justify-self: start; margin-top: -6px; padding: 0; border: 0; background: none; color: var(--ink-3); font: inherit; font-size: 12px; cursor: pointer; }
+.summon-missing-toggle::after { content: ' ▸'; }
+.summon-missing-toggle[aria-expanded="true"]::after { content: ' ▾'; }
+.summon-missing-toggle:hover { color: var(--ink); }
+.summon-missing { display: flex; flex-wrap: wrap; gap: 4px; max-height: 120px; overflow: auto; }
+.summon-actions { display: grid; gap: 8px; }
+.summon-actions > .btn { justify-content: center; }
+.summon-someone { position: relative; display: flex; gap: 6px; }
+.summon-field { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.summon-field:focus-within { border-color: var(--accent); }
+.summon-picked { display: contents; }
+.summon-chip { display: inline-flex; align-items: center; gap: 3px; padding: 2px 4px 2px 8px; border-radius: 999px; background: var(--accent-weak); color: var(--accent); font-size: 12px; }
+.summon-chip button { border: 0; background: none; color: inherit; cursor: pointer; padding: 0 3px; font-size: 13px; }
+.summon-input { flex: 1; min-width: 90px; border: 0 !important; outline: 0; background: transparent !important; padding: 4px 0 !important; font: inherit; box-shadow: none !important; }
+.summon-menu { position: absolute; z-index: 2; top: calc(100% + 4px); left: 0; right: 0; max-height: 220px; overflow: auto; padding: 4px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow, 0 8px 24px rgba(0,0,0,.25)); }
+.summon-option { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; align-items: center; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+.summon-option:hover, .summon-option.active { background: var(--surface-2); }
+.summon-option span:last-child { display: grid; min-width: 0; }
+.summon-option b, .summon-option small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 550; }
+.summon-option small { color: var(--ink-3); font-size: 11px; font-weight: 400; }
+.summon-kind { width: 22px; height: 22px; display: grid; place-items: center; border-radius: 6px; background: var(--surface-2); color: var(--ink-2); font: 650 11px var(--font-mono); }
+.summon-kind.avatar { color: var(--accent); }
+.summon-empty { padding: 8px; color: var(--ink-3); font-size: 12px; }
 .vault-grant-modal { width: min(720px, 92vw); }
 .vault-grant-modal > .section-h { margin-bottom: 4px; }
 .vault-grant-help { margin: 0 0 12px; color: var(--ink-2); font-size: 12px; }
@@ -3120,3 +3135,118 @@ html[data-theme="dark"] .github-signin-btn:active,
 .grant-msg:empty { display: none; }
 .app-token-form .grant-limit, .app-token-form .form-row { margin: 0; }
 .app-token-once > .btn { justify-self: start; }
+
+/* ── One conversation, several agents (software-dev ≥1.27) ───────────────── */
+.msg.agent.other-agent { background: color-mix(in srgb, var(--accent) 6%, var(--surface-2)); border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); }
+.msg-to { font-size: 11px; color: currentColor; opacity: .72; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }
+.activity-speaker { flex: none; font: 10px/1.6 var(--font-mono); text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-right: 6px; }
+.ck-participant { width: 100%; border: 0; background: none; text-align: left; font: inherit; }
+.ck-participant .ck-num { flex: none; width: 16px; font: 11px var(--font-mono); color: var(--ink-3); }
+.ck-participant .ck-queued { margin-left: auto; color: var(--ink-3); font-weight: 700; letter-spacing: .1em; }
+.ck-participant .ck-live { margin-left: auto; }
+.agent-mention-menu { min-width: 240px; }
+.agent-mention-menu .am-key { flex: none; width: 26px; font: 11px var(--font-mono); color: var(--ink-3); }
+.agent-mention-menu .am-sep { height: 1px; margin: 4px 6px; background: var(--line); }
+.followup-new-agent { margin-top: 8px; padding: 8px 10px; border: 1px dashed color-mix(in srgb, var(--accent) 40%, var(--line)); border-radius: 8px; background: var(--surface); }
+.followup-new-agent .parameter-fields .agent-field { margin: 0; }
+.followup-new-agent .fna-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12.5px; }
+.followup-new-agent .fna-fields { display: flex; flex-wrap: wrap; gap: 6px; }
+.followup-new-agent .fna-fields select, .followup-new-agent .fna-fields input { flex: 1 1 120px; min-width: 0; }
+.escalate-form { display: flex; flex-direction: column; gap: 10px; width: min(440px, 92vw); }
+
+/* ── The Agent block (task form, Task defaults, Parameters, New agent…) ─────
+   One compact control per agent: Instructions (agents other than the main one),
+   harness · model · effort, Tools, Fork, and a collapsed Authorization row. */
+.label-row:has(.label-row-fill) label { flex: 0 1 auto; }
+.label-row-fill { flex: 1; }
+.agent-block { display: grid; gap: 8px; }
+.agent-block > .mcp-picker { margin: 0; }
+.agent-block .ab-instructions { width: 100%; min-height: 44px; resize: vertical; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font: inherit; font-size: 13px; }
+.agent-block .ab-instructions:focus { border-color: var(--accent); outline: none; }
+.agent-block .af-resume-toggle { margin: 0; }
+.agent-authority { border-top: 1px dashed var(--line); padding-top: 6px; min-width: 0; }
+.agent-authority[hidden] { display: none; }
+.agent-authority > summary {
+  display: flex; align-items: baseline; gap: 10px; cursor: pointer; list-style: none;
+  font-size: 12px; color: var(--ink-2); user-select: none; padding: 2px 0;
+}
+.agent-authority > summary::-webkit-details-marker { display: none; }
+.agent-authority > summary::before { content: '▸'; color: var(--ink-3); font-size: 10px; width: 8px; transition: transform .12s; }
+.agent-authority[open] > summary::before { transform: rotate(90deg); }
+.agent-authority .aa-title { font-weight: 600; }
+.agent-authority .aa-summary { color: var(--ink-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-authority .aa-body { display: grid; gap: 8px; padding: 8px 0 2px 18px; }
+.agent-authority .aa-body > .form-row { margin: 0; padding: 0; }
+/* Level and projects side by side; the explanation is the select's tooltip. */
+.agent-authority .authz-editor { grid-template-columns: minmax(150px, .8fr) minmax(0, 1.6fr); align-items: start; }
+.agent-authority .authz-description { display: none; }
+.agent-authority .authz-warning { grid-column: 1 / -1; }
+.agent-authority .aa-resources { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.agent-authority .aa-resources > .form-row { margin: 0; padding: 0; }
+.agent-authority .tf-vault-button { width: auto; gap: 10px; min-height: 36px; }
+.agent-authority .aa-resources { flex-wrap: nowrap; }
+/* Vault · Cards · Budget on one line: the payment controls join the row. */
+.agent-authority .aa-resources > .task-payments { display: contents; }
+.agent-authority .payment-cards-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.agent-authority .payment-picker { flex: 1 1 160px; min-width: 140px; }
+.agent-authority .payment-budget { width: 90px; }
+@media (max-width: 700px) { .agent-authority .aa-resources { flex-wrap: wrap; } }
+.agent-authority .aa-reset { justify-self: start; }
+@media (max-width: 700px) { .agent-authority .authz-editor { grid-template-columns: 1fr; } }
+
+/* Responder and Review-route rows: kind · who on one line. */
+.route-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.route-row > select { flex: 0 0 auto; width: auto; }
+.route-row > .cf-human { flex: 1 1 auto; min-width: 0; }
+.route-row .cf-layer-num { font-size: 11px; color: var(--ink-3); min-width: 14px; text-align: right; }
+.route-row .cf-layer-tools { display: inline-flex; gap: 4px; margin-left: auto; }
+.cf-human[hidden], .cf-agent[hidden], .cf-empty[hidden] { display: none; }
+.confirmer-field .cf-layer { padding: 8px 10px; }
+.confirmer-field .cf-agent, .responder-field .cf-agent { margin-top: 8px; }
+.confirmer-field .cf-agent { margin-left: 22px; }
+.cf-empty { font-size: 12px; color: var(--ink-3); padding: 2px 0 6px; }
+
+/* Task form main column: one section per agent, then where/when it runs. */
+.tf-main > .tf-section { padding: 16px 0 4px; border-top: 1px solid var(--line); margin-top: 14px; }
+.tf-main > .tf-section > .form-row { margin-bottom: 8px; }
+/* Inside a form row the generic input rules would box the cards search again. */
+.agent-authority .task-payments .payment-search { border: 0; background: transparent; box-shadow: none; padding: 5px; min-height: 0; height: auto; }
+.agent-authority .payment-budget-row { flex-wrap: nowrap; }
+.agent-authority .payment-budget-row label { white-space: nowrap; }
+.agent-authority .payment-budget { height: 36px; }
+/* A Reviewer's block sits inside its layer card; one frame is enough. */
+.parameter-fields .cf-layer .agent-field { border: 0; padding: 0; background: none; }
+
+/* Parameters tab: the task form's shape, frozen parts read-only in place. */
+.tp-section { padding: 12px 0 2px; border-top: 1px solid var(--line); }
+.tp-section:first-child { border-top: 0; padding-top: 4px; }
+.tp-section > .form-row, .tp-section > .pf-edit-row { margin-bottom: 8px; }
+.pf-lock { color: var(--ink-3); font-size: 11px; }
+.pf-agent-state { font-size: 10px; text-transform: lowercase; }
+.pf-ro { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ab-frozen, .pf-fieldset { border: 0; padding: 0; margin: 0; min-inline-size: auto; display: grid; gap: 8px; }
+.ab-frozen > *, .pf-fieldset > * { opacity: .7; }
+.tp-creds-head { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
+.tp-creds-head label, .tp-workflow > label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.tp-workflow { margin-bottom: 10px; }
+.agent-authority #tp-auth { display: grid; gap: 8px; }
+.agent-authority #tp-auth .params-save-bar { position: static; margin-top: 0; padding-top: 4px; background: none; }
+/* The main agent's cards and budget save with its authorization. */
+.agent-authority .payment-save { display: none; }
+.agent-authority .aa-resources > .task-payments > .payment-spent { white-space: nowrap; }
+
+/* Task defaults (organization and project): the task form's shape. */
+.task-defaults { display: grid; gap: 0; }
+.task-defaults > .td-section { padding: 14px 0 6px; border-top: 1px solid var(--line); }
+.task-defaults > .td-section:first-child { border-top: 0; padding-top: 2px; }
+.task-defaults .td-profile { margin-bottom: 8px; }
+.task-defaults .td-actions { display: flex; align-items: center; gap: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.task-defaults .td-actions .resource-error { color: var(--danger); font-size: 12px; }
+.parameter-fields .agent-controls:has(.pf-maxturns) { grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr) 90px; }
+.parameter-fields .agent-field .agent-controls .pf-maxturns { width: 100%; }
+.resource-defaults { display: grid; gap: 8px; }
+.resource-defaults .resource-reset { justify-self: start; }
+@media (max-width: 700px) { .parameter-fields .agent-controls:has(.pf-maxturns) { grid-template-columns: 1fr; } }
+
+.cf-max-revisions { display: inline-flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
+.cf-max-revisions input { width: 72px; }

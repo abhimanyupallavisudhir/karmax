@@ -1277,6 +1277,25 @@ export interface Message {
    * comparing prose (which is brittle across line-ending/format normalization).
    */
   sourceActivity?: { turnId: string; id: string; attempt: number };
+  /**
+   * Who said it, in one shared multi-agent conversation (software-dev ≥1.27).
+   * Agent messages carry the participant key (`do`, `responder`, `confirm`,
+   * `agent-3`; absent ⇒ `do`). Human messages carry the sender's principal
+   * (`user:<id>`, `avatar:<id>`, `task:<parentId>`; absent ⇒ the task's
+   * creator or the platform). Each agent receives the others' messages as input
+   * labelled with their speaker (`participants.ts`), never as templates.
+   */
+  author?: string;
+  /** Display name of a human `author`, stamped at the edge (names can change). */
+  authorLabel?: string;
+  /**
+   * Who the message is addressed to, in mention order: participants as
+   * `agent:<key>` and people as audience selectors (`user:<id>`, `@team:<slug>`,
+   * `@creator`, `avatar:<id>`…). Absent ⇒ the main agent (the historical
+   * meaning of every message). An empty list addresses nobody: the message is
+   * context for whoever runs next.
+   */
+  to?: string[];
 }
 
 /**
@@ -1411,11 +1430,41 @@ export interface FieldSpec {
   bind: FieldBind;
   /** For agent, confirmer, and responder fields — the role this configures. */
   role?: string;
-  /** For confirmer/responder fields — the default auxiliary-agent prompt template
-   *  the form pre-fills (and inherits back to on reset) when none is stored. */
-  promptDefault?: string;
+  /** For confirmer/responder fields — the request template forms used to pre-fill
+   *  before an agent's prompt became its optional instructions. A stored prompt
+   *  equal to it is not instructions: forms show it empty. */
+  legacyPrompt?: string;
   /** In-flight editability window (SPEC §4.5/§5.5). Omitted ⇒ `queue`. */
   mutable?: FieldMutable;
+}
+
+/** An agent's authority: the same three things a task grants its main agent. */
+export interface AgentAuthority {
+  /** Job-shaped level and scope; attenuated against the principal who set it. */
+  authorization?: AuthorizationSelection;
+  /** `use-credential:item:…` / `:tag:…` / `:domain:…` vault grants. */
+  credentialGrants?: string[];
+  /** Per-item blind-use/plaintext policy overrides for those grants. */
+  credentialPolicies?: Record<string, { use?: 'auto' | 'ask'; reveal?: 'auto' | 'ask' | 'never' }>;
+  /** Cards this agent may use and its own cumulative budget (smallest unit of
+   * `currency`; null ⇒ no own limit). Always within the task's policy. */
+  paymentPolicy?: { cardIds?: string[]; budget?: number | null; currency?: string };
+}
+
+/** One agent taking part in a task's conversation (software-dev ≥1.27). */
+export interface TaskParticipant {
+  /** Stable key: `do`, `responder`, `confirm`, `confirm-2`, `agent-3`. */
+  key: string;
+  /** Display label: Agent, Responder, Reviewer, Reviewer 2, Agent 3. */
+  label: string;
+  /** The workflow role whose prompt and duties it runs under. */
+  role: AgentRole;
+  /** Effective harness selection (authority is projected separately). */
+  spec?: Partial<AgentSpec>;
+  /** queued: called and waiting for the running agent's turn to end. */
+  state: 'idle' | 'queued' | 'running';
+  /** Messages this agent has authored. */
+  messages: number;
 }
 
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
@@ -1432,6 +1481,14 @@ export interface AgentSpec {
   avatarPurpose?: 'authorize' | 'respond';
   /** @deprecated Replay-only. Routing comes from the model id + Credentials policy. */
   modelProvider?: string;
+  /**
+   * What this agent may do and spend, for agents other than the main one (the
+   * main agent's authority is the task's own `authorization`, vault grants and
+   * payment policy). Omitted ⇒ the task's authority. Attenuated against the
+   * principal who set it, exactly like the task's own, and stored as
+   * `params._agentAuthorization[<participant key>]`.
+   */
+  authority?: AgentAuthority;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** Fork prior context from a task agent, a public share link, a host-local
@@ -1439,7 +1496,7 @@ export interface AgentSpec {
   resumeFrom?: {
     taskId?: string;
     role?: string;
-    /** A public chatgpt.com/share / claude.ai/share URL, or a native provider id
+    /** A public chatgpt.com/share, claude.ai/share or tavya share URL, or a native provider id
      * when the Karmax console is host-local. */
     sessionId?: string;
     upload?: {
@@ -1482,6 +1539,10 @@ export interface ConfirmLayer extends Partial<AgentSpec> {
    * @project, @team:<slug>, user:<id>, and legacy team:<id>. Multiple selectors mean any matching
    * person may satisfy this layer; use sequential layers for sequential gates. */
   audience?: HumanAudience;
+  /** Agent layers: how many times in a row this Reviewer may send the work
+   * back ("revise") with no person speaking before the Review goes to the
+   * task's people instead. Absent ⇒ no limit. */
+  maxRevisions?: number;
   /** Agent layers: the review-request message template sent each time the task
    *  reaches Review — optional instructions/guidance ("ensure X, Y and Z"), with
    *  {{prompt}} / {{response}} placeholders for the task prompt and the Do agent's
@@ -1588,6 +1649,9 @@ export interface TaskView {
    * its durable execution snapshot, so the UI never has to guess from mutable
    * defaults or from the compact `agent:unified` form representation. */
   agents?: Record<string, AgentSpec>;
+  /** Every agent in the shared conversation, main agent first (software-dev
+   * ≥1.27). Absent for historical executions, which keep `transcripts`. */
+  participants?: TaskParticipant[];
   reviewInfo?: ReviewInfo;
   actions: DeclaredAction[];
   /** Mandatory structured state — keeps search/audit/auto-render working (§10.2). */
@@ -1643,6 +1707,11 @@ export interface TaskView {
     until?: number;
     /** `human`: how loudly the ask was raised; omitted means the inbox kind's default. */
     urgency?: Urgency;
+    /** `human`: why people are asked. `input` (default) is an agent's question;
+     * `error` a failure automatic recovery could not fix (the stage is kept —
+     * there is no Escalated stage from software-dev 1.27); `authorization` and
+     * `merge` an authority the task lacks. */
+    reason?: 'input' | 'error' | 'authorization' | 'merge';
     /** Durable jobs this wait watches (a `job` wait, or an ask that also waits
      * on jobs): their world must keep running, or parking it freezes them. */
     jobs?: string[] };
@@ -1796,6 +1865,9 @@ export interface TaskRecoveryCheckpoint {
   /** The preserved intent-authorized proposal changed in Do and needs an
    * automatic integration review before provider re-admission. */
   repairValidationPending?: boolean;
+  /** Part of the proposal already landed: the replacement must never offer
+   * cancellation or a discarding reset, and must reconcile the rest. */
+  pointOfNoReturnPassed?: boolean;
   /** Set when the run continued as new to bound its history. */
   continued?: TaskContinuation;
 }
@@ -1843,6 +1915,15 @@ export interface TaskContinuation {
   error?: string;
   counters: { responderRounds: number; subtaskNags: number; subagentNudges: number; shellNudges: number;
     landingWatchSequence: number; resourceReviewSequence: number };
+  /** v1.27: every agent but the main one — its provider session and how much
+   * of the conversation it has read — plus agents called and not yet run. */
+  participants?: {
+    sessions: Record<string, { session?: string; home?: string; seen: number }>;
+    queue: string[];
+    calledBy?: Record<string, string>;
+    /** Reviewer "revise" rounds in a row since a person last spoke. */
+    revisions?: Record<string, number>;
+  };
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────

@@ -12,7 +12,7 @@ function setup() {
   const S = { approvalRequests: [], permissionRequests: [], authorizationRequests: [], connections: [], approvalItems: [], user: { id: 'user' }, projects: [] };
   const context = vm.createContext({ S, esc: String, credentialRequestTaskLink: () => '',
     authorizationSummary: () => 'Developer', policyTip: () => '', sortVaultItems: (v: any) => v });
-  for (const name of ['credentialRequestRows', 'permissionRequestRows', 'authorizationRequestRows', 'connectionRows', 'conversationApprovalRequests', 'resourceReviewNeedsAction']) {
+  for (const name of ['credentialRequestRows', 'permissionRequestRows', 'authorizationRequestRows', 'connectionAccountNames', 'connectionRows', 'conversationApprovalRequests', 'resourceReviewNeedsAction']) {
     vm.runInContext(fn(name), context);
   }
   return context;
@@ -55,8 +55,19 @@ describe('check-in pending decisions', () => {
     expect(one).toContain('data-connection-action="allow" data-use-connection="mine"');
     expect(one).toContain('>Allow<');
     expect(one).toContain('>Other account<');
-    const two = c.connectionRows([{ ...request, reusable: [{ id: 'a', label: 'Work' }, { id: 'b', label: 'Home' }] }], true);
-    expect(two).toContain('>Use Work<'); expect(two).toContain('>Use Home<');
+    // Several accounts of one app share its name, so one Allow uses the account picked by
+    // date (newest first) instead of repeating identical "Use gmail" buttons.
+    const two = c.connectionRows([{ ...request, reusable: [
+      { id: 'new', label: 'gmail', createdAt: Date.UTC(2026, 8, 30, 12) }, { id: 'old', label: 'gmail', createdAt: Date.UTC(2026, 8, 12, 12) }] }], true);
+    expect(two.match(/data-connection-action="allow"/g)).toHaveLength(1);
+    expect(two).not.toContain('Use gmail');
+    const options = [...two.matchAll(/<option value="([^"]+)"[^>]*>([^<]+)</g)].map(m => [m[1], m[2]]);
+    expect(options.map(o => o[0])).toEqual(['new', 'old']);
+    expect(new Set(options.map(o => o[1])).size).toBe(2);
+    expect(options[0]![1]).toContain('30'); expect(options[1]![1]).toContain('12');
+    const sameDay = c.connectionRows([{ ...request, reusable: [
+      { id: 'a', label: 'gmail', createdAt: Date.UTC(2026, 8, 30, 9) }, { id: 'b', label: 'gmail', createdAt: Date.UTC(2026, 8, 30, 15) }] }], true);
+    expect(new Set([...sameDay.matchAll(/<option value="[^"]+"[^>]*>([^<]+)</g)].map(m => m[1])).size).toBe(2);
     expect(c.connectionRows([{ ...request, status: 'active', ownerId: 'user', grantedConnectionId: 'mine' }], true)).toContain('>Revoke<');
   });
   it('removes settled resource cards but keeps pending decisions and failures', () => {

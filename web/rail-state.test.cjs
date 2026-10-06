@@ -42,6 +42,9 @@ global.ICON = { edit: '<svg></svg>', chevron: '<svg class="i-chevron"></svg>', p
 global.wireProjectDrag = () => {};
 global.newProject = () => {};
 global.commandHint = (label) => label;
+global.homeRoute = () => '/o1';
+global.currentOrg = () => ({ id: 'o1' });
+global.DEFAULT_LIST_QUERY = 'for:me';
 global.draggingProject = null;
 global.editingRailItem = null;
 // The tab list renderRail shares with renderMain (a module constant, not a function).

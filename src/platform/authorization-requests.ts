@@ -4,7 +4,9 @@ import { newId } from '../util/id.js';
 import type { Capability } from './capabilities.js';
 
 export type AuthorizationRequestTarget =
-  | { kind: 'task'; taskId: string; queueAfterApproval?: boolean }
+  | { kind: 'task'; taskId: string; /** One of the task's agents other than the
+       * main one (`responder`, `confirm-2`, `agent-3`); absent ⇒ the task's own. */
+      participant?: string; queueAfterApproval?: boolean }
   | { kind: 'avatar'; avatarId: string; enableAfterApproval?: boolean };
 
 export interface AuthorizationRequest {
@@ -57,9 +59,9 @@ export class AuthorizationRequests {
     if (!audience.length || (!recipients.length && !avatarRecipients.length))
       throw new Error('choose at least one eligible person, team, or Avatar');
     const all = (await this.requests());
-    const targetKey = input.target.kind === 'task' ? `task:${input.target.taskId}` : `avatar:${input.target.avatarId}`;
-    const existing = all.find((request) => request.status === 'pending'
-      && (request.target.kind === 'task' ? `task:${request.target.taskId}` : `avatar:${request.target.avatarId}`) === targetKey);
+    const keyOf = (target: AuthorizationRequestTarget) => target.kind === 'task'
+      ? `task:${target.taskId}${target.participant ? `#${target.participant}` : ''}` : `avatar:${target.avatarId}`;
+    const existing = all.find((request) => request.status === 'pending' && keyOf(request.target) === keyOf(input.target));
     if (existing) return existing;
     const request: AuthorizationRequest = {
       ...input,

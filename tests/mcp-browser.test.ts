@@ -67,8 +67,8 @@ describe.skipIf(!cdp)('MCP settings in a real browser', () => {
     await js(`document.querySelector('${field} .mcp-filter').focus();document.querySelector('${field} [data-mcp-id="${id}"]').click()`);
   }
   async function saveProfile() {
-    await js("document.querySelector('[data-saveprofile]').click()");
-    await wait('document.querySelector("[data-saveprofile]").textContent.includes("Saved")');
+    await js("document.querySelector('[data-save-task-defaults]').click()");
+    await wait('document.querySelector("[data-save-task-defaults]").textContent.includes("Saved")');
   }
   it('prepopulates defaults, allows both browsers, saves custom MCPs directly into the field, and preserves explicit emptiness', async () => {
     expect(await js(`document.querySelector('[data-profile] .mcp-picker').dataset.value === 'null'`)).toBe(true);

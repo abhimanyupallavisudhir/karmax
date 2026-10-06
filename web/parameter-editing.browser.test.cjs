@@ -46,10 +46,10 @@ const root = __dirname;
       S.tasks = [record]; S.projects = [{ id: 'p1', slug: 'project', name: 'Project', organizationId: 'o1', config: {} }];
       S.projectId = 'p1'; S.organizationId = 'o1'; S.organizations = [{ id: 'o1', slug: 'test' }];
       S.meta = { workflows: [] };
-      S.schema = [{ name: 'software-dev', params: [{ name: 'confirmer', label: 'Review', type: 'confirmer', scopes: ['task'], promptDefault: 'Review carefully' }] }];
+      S.schema = [{ name: 'software-dev', params: [{ name: 'confirmer', label: 'Review', type: 'confirmer', scopes: ['task'], legacyPrompt: 'Review carefully' }] }];
       await openTask('fixture', 'parameters');
     }, { record });
-    const textarea = page.locator('.cf-prompt');
+    const textarea = page.locator('.ab-instructions');
     await textarea.waitFor({ state: 'visible' });
     await page.evaluate(() => window.parameterTest.refreshTask());
     // Even a pristine focused control must remain connected on refresh.
@@ -95,7 +95,8 @@ const root = __dirname;
     view.stage = 'done'; view.editableParams = [];
     await page.evaluate(() => window.parameterTest.refreshTask());
     assert.equal(await page.locator('#params-save').count(), 0, 'terminal transition freezes controls');
-    assert.equal(await textarea.count(), 0);
+    // The route stays visible, read-only, in the task form's shape.
+    assert.equal(await textarea.isDisabled(), true);
     assert.deepEqual(errors, []);
     console.log('PASS: live refresh preserves textarea, focus, selection, resize and scroll; failed save, retry, persistence, and lifecycle locking');
   } finally { await browser.close(); }

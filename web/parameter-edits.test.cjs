@@ -32,18 +32,19 @@ async function main() {
   await menu.fire('mousedown', { preventDefault() {}, target: { closest: () => ({ dataset: { v: 'new-model' } }) } });
   assert.equal(input.value, 'new-model'); assert.equal(changes, 1);
 
-  const state = { paramEditDrafts: {}, avatars: [] };
+  const state = { paramEditDrafts: {}, avatars: [], projects: [] };
   const record = { params: {} };
   let elements, complete, requests = [];
   const context = vm.createContext({
-    S: state, CSS: { escape: (x) => x }, sameJson, Object, structuredClone,
+    S: state, CSS: { escape: (x) => x }, sameJson, Object, structuredClone, AbortController,
     document: { getElementById: (id) => elements[id] || null },
     wireAgentFields() {}, taskRecord: () => record,
     schemaFor: () => [{ name: 'target', label: 'Target', type: 'string', scopes: ['task'] }],
     api: (_path, options) => { requests.push(JSON.parse(options.body)); return new Promise((resolve) => { complete = resolve; }); },
     toast() {}, setTimeout() {}, refreshTask() {}, refreshTasks() {},
   });
-  vm.runInContext(['collectParamEdits', 'paramDirtyNames', 'setParamSaveState', 'wireParams', 'readMcpPicker', 'readAgentSpec'].map(fn).join('\n'), context);
+  vm.runInContext(['collectParamEdits', 'paramDirtyNames', 'setParamSaveState', 'wireParams', 'readMcpPicker', 'readAgentSpec', 'readAgentBlock',
+    'paramFields', 'agentParticipantLabel', 'taskAuthorityOf'].map(fn).join('\n'), context);
   const render = (value) => {
     const root = new Element(), button = new Element(), field = new Element(), bar = new Element();
     field.value = value;
@@ -112,7 +113,7 @@ async function main() {
       return new Promise((resolve) => { authComplete = resolve; });
     },
   });
-  vm.runInContext(fn('wireTaskAuthorization'), authContext);
+  vm.runInContext([fn('isAuthorizationGrantGap'), fn('saveTaskAuthorization'), fn('wireTaskAuthorization')].join('\n'), authContext);
   const renderAuth = async (selection) => {
     const select = new Element(), button = new Element(), vault = new Element(), status = new Element(), bar = new Element();
     select.selection = selection; select.closest = () => null; button.closest = () => bar;

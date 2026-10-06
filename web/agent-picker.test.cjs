@@ -35,6 +35,7 @@ function harness({ tasks, groups, attempts, agents, failure, mode = 'agent' }) {
     viewIdForQuery: () => 'all', queryToolbarHtml: () => '', wireQueryToolbar() {},
     effectiveQuery: q => q, stageLabel: () => 'Done', workflowLabel: () => 'Software',
     priorityFlag: () => '', tagChips: () => '', agentRoleLabel: role => role,
+    projectById: () => undefined, projectSlug: () => '', projectChip: () => '',
     setTimeout, clearTimeout, toast: message => errors.push(message),
     api: async url => {
       calls.push(url);

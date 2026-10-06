@@ -8,7 +8,7 @@ test('UI-32: agent entry points are discoverable', () => {
 });
 test('UI-33: obsolete resources hydrator and mismatched footer are removed', () => {
   assert.ok(!src.includes('async function hydrateProjectResources('));
-  const form = src.slice(src.indexOf('<div class="tf-foot">'), src.indexOf('  wireTaskPayments', src.indexOf('<div class="tf-foot">')));
+  const form = src.slice(src.indexOf('<div class="tf-foot">'), src.indexOf('wireTaskPayments(', src.indexOf('<div class="tf-foot">')));
   assert.ok(!form.includes('</footer>'));
 });
 test('UI-34: OAuth callback uses the configured brand', () => {

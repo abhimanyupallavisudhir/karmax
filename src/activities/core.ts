@@ -1,4 +1,5 @@
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
+import { conversationFor, workDigest } from '../domain/participants.js';
 import { createHash } from 'node:crypto';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
@@ -82,8 +83,10 @@ import {
   type GithubActionsFailureDecision,
 } from '../integrations/github-actions.js';
 import { isGithubWorkflowPermissionRejection, type GitHubRepositoryPermission } from '../integrations/github-app.js';
+import { mergeCapableUsers } from '../integrations/github-merge-rights.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService, paymentPromptContext } from '../autonomy/payments.js';
+import { defaultParticipant, participantAuthorization } from '../platform/agent-authority.js';
 import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
@@ -91,6 +94,7 @@ import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { publicShare, publicConversationHtml } from '../gateway/conversation-sharing.js';
 import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
@@ -416,6 +420,13 @@ const CONVERSATION_PAGE_BYTES = 512 * 1024;
 export interface RunAgentTurnArgs {
   taskId: string;
   role: AgentRole;
+  /** The agent taking this turn in a shared multi-agent conversation
+   * (software-dev ≥1.27: `do`, `responder`, `confirm`, `agent-3`…). When set,
+   * `messages` is the whole conversation and is delivered as this agent reads
+   * it (participants.ts `conversationFor`). Its own authority
+   * (`params._agentAuthorization[participant]`), cards and budget apply; absent,
+   * the role's own agent. Historical executions keep per-role transcripts. */
+  participant?: string;
   worldHandle: WorldHandle;
   messages: Message[];
   /** `messages` continue this acknowledged conversation snapshot, so a turn's
@@ -487,6 +498,18 @@ export async function ownSubTaskResponses(store: Pick<Store, 'getTask'>, taskId:
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
+  /** For a Reviewer choosing between attempts: the other attempts, and how to
+   * compare them without leaving its own conversation. */
+  const siblingAttemptsContext = async (taskId: string): Promise<string> => {
+    const group = await store.attemptGroup(taskId);
+    const others = (group?.attempts ?? []).filter((attempt) => attempt.id !== taskId);
+    if (!others.length) return '';
+    const lines = others.map((attempt) => {
+      const view = attempt.lastView;
+      return `- ${attempt.num ? `#${attempt.num} ` : ''}${attempt.id}: ${view ? `${view.stage}/${view.status}` : 'not started'}${view?.branch ? `, branch ${view.branch}` : ''}`;
+    });
+    return `\nThe other attempts:\n${lines.join('\n')}\nCompare them before choosing: get_conversation(task_id) shows an attempt's conversation, and import_task_branch(task_id) fetches its branch so you can diff it against this one.`;
+  };
   const turnProfile = async (task: TaskInput, role: AgentRole, explicitProfileId?: string) => {
     const base = (await profiles.resolve(role, task.profiles, explicitProfileId, task.projectId));
     const avatar = (await avatarForRole(store, task, role));
@@ -1851,9 +1874,35 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
       // materializing the source session needs this turn's config home + world path.
-      const conversationTaskId = args.role === 'confirm' ? (args.task.intentId ?? args.taskId) : args.taskId;
+      // The agent speaking (v1.27 shared conversation), else the historical role.
+      const speaker = args.participant ?? args.role;
+      const sharedConversation = !!args.participant;
+      const conversationTaskId = args.role === 'confirm' && !sharedConversation ? (args.task.intentId ?? args.taskId) : args.taskId;
       let session = args.session;
-      let messages = args.messages; // may be replaced by the shared confirmer transcript
+      // One conversation, read as this agent hears it: its own replies stay its
+      // own, everyone else's are labelled input (participants.ts). Historical
+      // roles keep their own transcripts (and the shared confirmer transcript).
+      // Each other agent's message carries a digest of what it did on the way,
+      // read for just the turns this agent is about to be handed.
+      let workOf: ((m: Message) => string | undefined) | undefined;
+      if (sharedConversation) {
+        const handed = args.session ? args.messages.slice(args.deliveredMessages ?? 0) : args.messages;
+        const turns = new Set(handed.filter((m) => m.role === 'agent' && (m.author ?? 'do') !== speaker && m.sourceActivity)
+          .map((m) => m.sourceActivity!.turnId));
+        if (turns.size) {
+          const byTurn = new Map<string, Map<string, { kind?: string; title?: string; phase?: string }>>();
+          for (const event of (await store.eventsOfType(args.taskId, 'agent.activity'))) {
+            const item = event.payload as { turnId?: string; id?: string; kind?: string; title?: string; phase?: string };
+            if (!item.turnId || !turns.has(item.turnId) || !item.id) continue;
+            const items = byTurn.get(item.turnId) ?? new Map();
+            items.set(item.id, item);
+            byTurn.set(item.turnId, items);
+          }
+          workOf = (m) => m.sourceActivity ? workDigest([...(byTurn.get(m.sourceActivity.turnId)?.values() ?? [])]) : undefined;
+        }
+      }
+      const ownView = sharedConversation ? conversationFor(args.messages, speaker, undefined, workOf) : args.messages;
+      let messages = ownView;
       let deliveredMessages = args.deliveredMessages;
       let fork = false; // true → the adapter branches a NEW session id from `session`
 
@@ -1937,13 +1986,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Approved credential escalations recorded after creation
       // (wiki plans/PLAN-passwords §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
-      const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
+      const participant = args.participant ?? defaultParticipant(args.role);
+      const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId, participant);
       const approvedPermissions = (await new PermissionRequests(store, organizationId).extensionCaps(args.taskId, args.role));
       // Requesting human input is a non-removable safety valve for every task
       // agent. The API restricts task-scoped callers to their own task, so this
       // cannot be used to interrupt peer work or widen the agent's authority.
       const preparationTask = await store.getTask(args.taskId);
-      const storedAuthorization = preparationTask?.params?._authorization as {
+      // An agent other than the main one acts with its own authority when it has
+      // one (wiki features/collaboration-model); otherwise with the task's.
+      const agentAuthorization = participantAuthorization(preparationTask?.params, participant);
+      const storedAuthorization = (agentAuthorization ?? preparationTask?.params?._authorization) as {
         capabilities?: string[];
         principal?: string;
         scope?: 'projects' | 'organization' | 'global';
@@ -1988,8 +2041,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           taskId: args.taskId,
           profileId: profile.id,
           role: args.role,
+          participant,
           principal: avatar ? avatarPrincipal(avatar.id)
-            : args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
+            : args.task.parentTaskId ? `task:${args.task.parentTaskId}`
+              : (agentAuthorization?.principal ?? args.task.grantPrincipal ?? 'system:legacy-task'),
           projectId: avatar ? (delegatedScope ? undefined : args.task.projectId)
             : authorizationScope ? undefined : args.task.projectId,
           projectIds: avatar
@@ -2004,7 +2059,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           executionAttempt: activityAttempt,
           executionRunId: workflowRunId,
           worldGeneration: args.worldHandle.generation,
-          delegationId: avatar ? undefined : (storedAuthorization?.delegationId ?? args.task.delegationId),
+          delegationId: avatar ? undefined : agentAuthorization ? agentAuthorization.delegationId
+            : (storedAuthorization?.delegationId ?? args.task.delegationId),
           externalIdentities: avatar?.githubAccountId ? { githubAccountId: avatar.githubAccountId } : undefined,
           ceiling,
           grantorCaps: grant,
@@ -2012,6 +2068,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         token = minted.token;
         (await record(args.taskId, 'token.minted', { tokenId: minted.record.id, profile: profile.id, caps: effective,
           audience: minted.record.audience, executionId: minted.record.executionId, expiresAt: minted.record.expiresAt,
+          participant,
           ...(avatar ? { avatarId: avatar.id, avatarOwnerUserId: avatar.ownerUserId, promptVersion: avatar.promptVersion } : {}) }));
       }
 
@@ -2144,7 +2201,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           });
           if (imported.kind === 'native') session = imported.sessionId;
           else {
-            messages = [imported.message, ...args.messages];
+            messages = [imported.message, ...ownView];
             deliveredMessages = 0;
           }
           if (imported.warnings?.length) await record(args.taskId, 'session.import.warnings', { warnings: imported.warnings });
@@ -2155,14 +2212,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const allowProviderId = deps.hostLocal ?? deploymentHostLocal();
         if (spec.resumeFrom.sessionId && !share && looksLikeConversationUrl(spec.resumeFrom.sessionId)) {
           throw ApplicationFailure.create({
-            message: 'Use a public HTTPS ChatGPT or Claude share link, or upload a conversation file.',
+            message: `Use a public HTTPS ChatGPT, Claude or ${BRAND} share link, or upload a conversation file.`,
             type: 'agent-error',
             nonRetryable: true,
           });
         }
         if (spec.resumeFrom.sessionId && !share && !allowProviderId) {
           throw ApplicationFailure.create({
-            message: `Provider conversation IDs are available only on a host-local ${BRAND}. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.`,
+            message: `Provider conversation IDs are available only on a host-local ${BRAND}. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT, Claude or ${BRAND} share link.`,
             type: 'agent-error',
             nonRetryable: true,
           });
@@ -2175,7 +2232,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const kind = await applyPanagent({ data, name: upload.name }, 'transcript', `upload:${upload.id}`);
           (await record(args.taskId, 'session.imported', { source: 'upload', format: upload.format, provider: profile.provider, kind }));
         } else if (share) {
-          const kind = await applyPanagent({ url: share }, 'context', `share:${share}`);
+          // A share of this installation is read from the store (exactly what
+          // its public page shows) rather than fetched back over the internet.
+          const local = share.id ? await publicShare(store, share.id) : undefined;
+          const source: PanagentSource = local
+            ? { data: Buffer.from(publicConversationHtml(local)), name: 'share.html' } : { url: share.url };
+          const kind = await applyPanagent(source, 'context', `share:${share.url}`);
           (await record(args.taskId, 'session.imported', { source: 'share', provider: profile.provider, kind }));
         } else if (spec.resumeFrom.sessionId) {
           // A raw id is meaningful only on a host-local install, where the UI and
@@ -2304,11 +2366,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // as context. NOT a native fork — flagged `native: false`.
             const srcView = (await store.getTask(spec.resumeFrom.taskId))?.lastView;
             const srcMsgs =
+              (srcView?.participants?.length && srcView.messages ? conversationFor(srcView.messages, srcRole) : undefined) ??
               srcView?.transcripts?.find((t) => t.role === srcRole)?.messages ??
               (srcRole === 'do' ? srcView?.messages : undefined) ??
               [];
             if (srcMsgs.length) {
-              messages = [...srcMsgs, ...args.messages];
+              messages = [...srcMsgs, ...ownView];
               (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: srcMsgs.length, native: false }));
             }
           }
@@ -2393,13 +2456,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? `\n\nThis task has ${attemptGroup.attempts} attempts. Other attempts: ${attemptGroup.otherAttempts ?? (await store.otherAttemptsDefault(args.taskId))}. `
           + (args.role === 'confirm' && !attemptGroup.committedAttemptId
             ? 'When accepting, set otherAttempts in confirm_decision to keep or cancel. Keep allows complementary proposals to continue and merge; cancel stops the alternatives. Follow an explicit project default; otherwise decide based on the value of the alternatives.'
+              + (sharedConversation ? await siblingAttemptsContext(args.taskId) : '')
             : 'If other attempts are kept, integrate against the latest target and assess combined behavior, redundant changes, and incompatible assumptions, as well as textual conflicts. Validate the combined result.')
         : '';
       const paymentService = deps.payments ? new BudgetService(store, deps.paymentRegistry ?? deps.payments) : undefined;
-      const paymentCards = (await paymentService?.cards({ projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant })) ?? [];
-      const paymentPolicy = (await paymentService?.policy(args.task.projectId, args.taskId));
+      const paymentParticipant = args.participant ?? defaultParticipant(args.role);
+      const paymentCards = (await paymentService?.cards({ projectId: args.task.projectId, taskId: args.taskId,
+        capabilities: args.task.grant, participant: paymentParticipant })) ?? [];
+      // This agent's own cards and budget: the task's, narrowed by its authority.
+      const paymentPolicy = (await paymentService?.participantPolicy(args.task.projectId, args.taskId, paymentParticipant));
       const paymentContext = paymentPromptContext(paymentCards, paymentPolicy,
-        paymentCards.length ? (await store.paymentSpent(args.taskId, false, paymentPolicy?.currency)) : 0);
+        paymentCards.length && paymentPolicy ? paymentPolicy.spent : 0, paymentPolicy?.own ? 'Your budget' : 'Task budget');
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
@@ -2425,8 +2492,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               query: async (fromIndex: number) => {
                 try {
                   const handle = deps.client!.workflow.getHandle(args.taskId);
-                  const out = (await handle.query('pendingMessages', args.role, fromIndex)) as Message[] | undefined;
-                  return Array.isArray(out) ? await materializeFileAttachments(world, out) : [];
+                  const out = (await handle.query('pendingMessages', speaker, fromIndex)) as Message[] | undefined;
+                  const pending = Array.isArray(out) && sharedConversation ? conversationFor(out, speaker) : out;
+                  return Array.isArray(pending) ? await materializeFileAttachments(world, pending) : [];
                 } catch {
                   return []; // query not registered / workflow gone / transient — no injection
                 }
@@ -2441,9 +2509,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Confirm turns for sibling attempts share one durable transcript and run
       // serially. Fresh provider sessions replay that canonical transcript, which
       // also works across account/config-home rotation (native sessions are home-bound).
-      const releaseConfirm = args.role === 'confirm' ? await acquireConfirmLock(conversationTaskId, signal) : () => {};
+      // Reviews of an intent's attempts run one at a time, so their keep/cancel
+      // choices cannot race (each attempt's Reviewer now reads its own thread).
+      const releaseConfirm = args.role === 'confirm'
+        ? await acquireConfirmLock(sharedConversation ? (args.task.intentId ?? args.taskId) : conversationTaskId, signal) : () => {};
       let confirmTranscript: Message[] | undefined;
-      if (args.role === 'confirm') {
+      if (args.role === 'confirm' && !sharedConversation) {
         let shared: Message[];
         try { shared = JSON.parse((await store.kvGet(`confirm-transcript:${conversationTaskId}`)) ?? '[]'); }
         catch { shared = []; }
@@ -2773,7 +2844,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const text = source === 'assistant' ? secrets.scrubPartial(t) : secrets.scrub(t);
             if (text === lastEmit || !text && source === 'assistant') return;
             lastEmit = text;
-            const payload = { text, source, role: args.role, turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt };
+            const payload = { text, source, role: args.role, ...(sharedConversation ? { participant: speaker } : {}),
+              turnId: args.agentTurnId ?? legacyAgentTurnId, workflowRunId, attempt: activityAttempt };
             if (source !== 'assistant') { (await record(args.taskId, 'agent.output', payload)); return; }
             // Each publication supersedes the last (#396 review item 2).
             const event = { type: 'agent.output', taskId: args.taskId, ts: Date.now(), payload };
@@ -2794,6 +2866,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             (await record(args.taskId, 'agent.activity', {
               ...(await taskSecrets.refresh()).scrubValue(activity),
               role: args.role,
+              ...(sharedConversation ? { participant: speaker } : {}),
               attempt: activityAttempt, workflowRunId,
               ...(turnId ? { turnId } : {}),
             }));
@@ -2808,9 +2881,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // minted provider session immediately so a restart on the next instruction
             // still resumes this exact turn.
             heartbeat?.();
-            (await store.kvSet(`session:${conversationTaskId}:${args.role}`, s));
+            (await store.kvSet(`session:${conversationTaskId}:${speaker}`, s));
             (await store.kvSet(
-              `sessionmeta:${conversationTaskId}:${args.role}`,
+              `sessionmeta:${conversationTaskId}:${speaker}`,
               JSON.stringify({
                 home: resolvedAuth?.configHome ?? '',
                 provider: profile.provider,
@@ -2818,7 +2891,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 ...(profile.effort ? { effort: profile.effort } : {}),
               }),
             ));
-            (await record(args.taskId, 'session.started', { role: args.role }));
+            (await record(args.taskId, 'session.started', { role: args.role, ...(sharedConversation ? { participant: speaker } : {}) }));
           },
           ...(deps.payments
             ? {
@@ -2828,6 +2901,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   taskId: args.taskId,
                   organizationId: (await store.getProject(args.task.projectId))?.organizationId,
                   capabilities: effective,
+                  participant,
                 },
                 onSpend: async (req: any, outcome: any) => { await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }); },
                 fillPaymentCard: async (fill: {
@@ -2840,12 +2914,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   // before a fill attempt is counted against the reservation.
                   const cdpUrl = isRemoteAgentWorld(world) ? WORLD_CDP_URL : localTaskBrowserUrl(args.taskId);
                   const { request, domain } = await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).claimFill({
-                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective, participant,
                   }, fill.requestId);
                   const card = request.cardId ? (await store.getCard(request.cardId)) : undefined;
                   if (!card) throw new Error('secure fill requires a reserved card');
                   if (!(await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).cards({
-                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective, participant,
                   })).some(c => c.id === card.id)) throw new Error('card is no longer selected for this task');
                   // Any rail that can resolve a card's secret half is fillable; the
                   // mock rail deliberately cannot, because it moves no real money.
@@ -2927,7 +3001,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // A resumed attempt was handed only a continuation notice, so its adapter's
         // count is not in the workflow's index space. The replaced attempt already
         // delivered the scheduled batch plus whatever it injected mid-turn.
-        if (resumedActivityAttempt && args.role !== 'confirm') {
+        if (resumedActivityAttempt && (args.role !== 'confirm' || sharedConversation)) {
           result.delivered = Math.max(restoredJournal?.delivered ?? 0, args.messages.length);
         }
         if (args.role === 'confirm' && result.confirmDecision?.action === 'confirm' && result.confirmDecision.otherAttempts) {
@@ -3001,9 +3075,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // which config home + provider minted it — provider sessions are home-bound, so
       // the CLI resume-command needs the right CONFIG_DIR/CODEX_HOME (§2.5, #2/#3).
       if (result.session) {
-        (await store.kvSet(`session:${conversationTaskId}:${args.role}`, result.session));
+        (await store.kvSet(`session:${conversationTaskId}:${speaker}`, result.session));
         (await store.kvSet(
-          `sessionmeta:${conversationTaskId}:${args.role}`,
+          `sessionmeta:${conversationTaskId}:${speaker}`,
           JSON.stringify({
             home: resolvedAuth?.configHome ?? '',
             provider: profile.provider,
@@ -3868,16 +3942,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
 
       if (!actorUserId) {
-        const eligibleUserIds: string[] = [];
-        // This scan is advisory only (for the reviewer picker). Revalidation
-        // above always happens again immediately before a real merge request.
-        for (const userId of (await store.humanAudience(handle.id, ['@project']))) {
-          const accountId = (await deps.githubApp.activeUserAccountId(userId));
-          if (!accountId) continue;
-          const checks = await Promise.all(prs.filter((ref) => !ref.merged).map((ref) =>
-            deps.githubApp!.repositoryPermission(userId, ref.slug, accountId).catch(() => undefined)));
-          if (checks.length && checks.every((permission) => permission?.canMerge)) eligibleUserIds.push(userId);
-        }
+        // This scan is advisory only (for the reviewer picker); it is the same
+        // answer GET /api/tasks/:id/merge-eligibility gives. Revalidation above
+        // always happens again immediately before a real merge request.
+        const eligibleUserIds = await mergeCapableUsers(deps.githubApp, (await store.humanAudience(handle.id, ['@project'])),
+          [...new Set(prs.filter((ref) => !ref.merged).map((ref) => ref.slug))]);
         (await record(handle.id, 'github.merge.authorization-required', { eligibleUserIds, repositories: prs.map((ref) => ref.slug) }));
         return {
           status: 'needs-authorizer', prs,

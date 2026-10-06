@@ -33,9 +33,9 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // each a human confirmation or a review agent; zero layers ⇒ auto-confirm.
 // Unlike the agent fields it spans all scopes (task/project/global) so the layer
 // list has the usual default-inheritance; an agent layer carries the same agent
-// knobs (provider/model/effort/fork) as the Do/Merge fields, PLUS the
-// review-request prompt template (pre-filled with `promptDefault`, editable per
-// task/project/global).
+// knobs (provider/model/effort/tools/fork/authority) as the Do field, PLUS
+// optional instructions for that agent (`prompt`; the old pre-filled request
+// template is `legacyPrompt`, so forms can show a stored copy of it as empty).
 // `untilUsed`: the route is consumed by the gate it drives, not by queueing — so
 // it stays editable in-flight right up to the moment Review passes (SPEC §4.5/§5.5).
 // That is exactly when re-routing is useful ("actually, have Bob look at this"),
@@ -43,7 +43,7 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // reaching Review while someone is mid-edit now simply picks up the saved route.
 // The workflows re-read the layers at every gate iteration and replay the gate
 // from its first layer when the route changes under them.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, promptDefault: CONFIRM_PROMPT_DEFAULT, mutable: 'untilUsed' });
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, legacyPrompt: CONFIRM_PROMPT_DEFAULT, mutable: 'untilUsed' });
 // Ordinary input pauses have one responder, not a chain of approval gates. The
 // control intentionally mirrors one Review-route row (human audience or agent +
 // prompt) while forbidding zero/multiple steps: a question must have an owner.
@@ -51,7 +51,7 @@ const responderField = (): FieldSpec => ({
   name: 'responder', type: 'responder', label: 'Responder',
   help: 'Who answers when the working agent pauses at Needs input. Choose a person/team or an agent. Review and protected authorization gates keep their own routes.',
   scopes: ALL, bind: 'responder', role: 'responder',
-  default: { kind: 'human', audience: ['@creator'] }, promptDefault: RESPOND_PROMPT_DEFAULT,
+  default: { kind: 'human', audience: ['@creator'] }, legacyPrompt: RESPOND_PROMPT_DEFAULT,
   // A task can ask for ordinary input more than once, so there is no first-use
   // point after which this route becomes load-bearing forever. Keep it live until
   // the workflow's point of no return; an edit also reroutes a pause already open.
@@ -282,55 +282,75 @@ Candidate resolution skills (read any that look relevant before acting):
 
 Always finish by calling resolve_decision exactly once.`,
 };
+// Every agent shares the task's world, tools and conversation; a role only says
+// when it is called and what its final message means. The conversation arrives
+// as it happened, each speaker labelled (domain/participants.ts) — no templated
+// digest of another agent's transcript. Executions pinned before 1.27 still add
+// their per-round request message, which carries the same facts.
+const SHARED_ROLE_HEAD = `{{toolsPreamble}}
+
+# Task
+{{title}}
+
+{{prompt}}
+
+# World
+Working directory: {{worldPath}} (branch {{branch}}; recorded base {{base}}; target {{target}}).
+{{worldRepos}}
+
+{{instructions}}`;
 const CONFIRM_ROLE: WorkflowRole = {
   name: 'confirm',
-  label: 'Confirm agent',
+  label: 'Reviewer',
   capabilities: ['confirm-decision', 'signal-completion', 'task:escalate'],
   defaults: { effort: 'low' },
-  // The task recap + the Do agent's response arrive as a per-Review conversation
-  // message (domain/confirm-prompt.ts, template user-editable via the confirmer
-  // field), so repeated Reviews read as one transcript; this system prompt carries
-  // the role, the current state of the world under review, and the same shared
-  // global/project instructions (including resolved wiki context) as the Do agent.
-  promptTemplate: `{{toolsPreamble}}
+  promptTemplate: `${SHARED_ROLE_HEAD}
 
-You are the CONFIRM (review) agent for task "{{title}}". The Do agent has opened the finished proposal and it has reached the Review gate. Your job is to decide whether to accept this pull request — NOT to keep building it. Each time the task reaches Review you receive a message with the task and the agent's latest response; judge the CURRENT state of the work and its exact proposed head.
-
-# Work under review
-Worktree: {{worldPath}} (branch {{branch}}; recorded base {{base}}; target {{target}}).
-{{worldRepos}}
+# Your role: {{participant}}
+You review this task's work for the people who asked for it. The conversation you receive is the task's own: the request, the main agent ("Agent") and anyone else who spoke, each labelled. You are called when the agent has submitted its proposal for Review. You have the agent's workspace and tools: read the diff and the files, run the build and tests, and judge whether the work does what was asked.
 Review summary: {{reviewInfo}}
 Changed files:
 {{changedFiles}}
+{{agentInstructions}}
 
-Recent Do-agent transcript:
-{{transcript}}
-
-{{instructions}}
-
-## How to review
-Inspect the diff and the worktree (read files, run the build/tests) to judge whether the work actually satisfies the task. Then finish by calling confirm_decision exactly once:
-- action:"confirm" — the pull request is acceptable; it proceeds to merge.
-- action:"revise"  — it needs changes; put specific, actionable feedback in \`text\` and it goes back to the Do agent.
-- action:"reject"  — it is unsalvageable or the task should not proceed; say why in \`text\` (this cancels the task).
-
-Do not implement the task yourself. Decide, then call confirm_decision.`,
+Say briefly what you found, then call confirm_decision exactly once:
+- action:"confirm" — acceptable as it stands; it proceeds.
+- action:"revise" — it needs changes; your message (or \`text\`) goes to the agent, who continues in this conversation.
+- action:"reject" — the task should not proceed; say why (this cancels the task).
+Do not take over the work yourself.`,
 };
 const RESPONDER_ROLE: WorkflowRole = {
   name: 'responder',
-  label: 'Responder agent',
+  label: 'Responder',
   capabilities: ['signal-completion'],
   defaults: { effort: 'low' },
-  promptTemplate: `{{toolsPreamble}}
+  promptTemplate: `${SHARED_ROLE_HEAD}
 
-You are the RESPONDER for task "{{title}}". The working agent has paused and needs one decision or piece of information before it can continue. Answer that request; do not take over the task, edit its work, or review its finished proposal.
+# Your role: {{participant}}
+You answer questions for this task. The conversation you receive is the task's own, each speaker labelled. You are called when the main agent ("Agent") has stopped to ask for something it needs before it can continue — usually its last message. You have its workspace and tools: look things up and check the code before you decide. Your final message is your answer and goes straight back to the agent.
+{{agentInstructions}}
 
-Worktree (read-only context if needed): {{worldPath}} (branch {{branch}}; recorded base {{base}}; target {{target}}).
-{{worldRepos}}
+Answer concisely and decisively. Do not do the task or review it, and do not call open_pr or confirm_decision. If only a person can answer (an approval, a secret, a personal decision), call escalate with the people who can, and say so in one line.`,
+};
+// An agent someone called into a running task with @ (software-dev ≥1.27).
+// Private like the legacy roles: it is configured per call, so it seeds no
+// profile and has no settings of its own. Same authority model as Do.
+const CALLED_AGENT_ROLE: WorkflowRole = {
+  name: 'agent',
+  label: 'Agent',
+  capabilities: [
+    'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
+    'task:*', 'project:*', 'organization:*', 'team:*', 'repository:*', 'inbox:*',
+    'queue:*', 'workflow:*', 'profile:*', 'skill:write',
+    'diagnostic:read', 'process:*', 'credential:*', 'vault:store', 'use-credential:*',
+    'payment:*', 'use-card:*', 'settings:*',
+    'authorization:*', 'user:*',
+  ],
+  promptTemplate: `${SHARED_ROLE_HEAD}
 
-{{instructions}}
-
-Your final response is sent back to the working agent as its input. Be concise and decisive. Do not call task lifecycle controls such as open_pr or confirm_decision.`,
+# Your role: {{participant}}
+Someone called you into this task's conversation (each speaker is labelled; the main agent is "Agent"). You share its workspace and tools. Do what the latest message addressed to you asks, then reply: your final message goes back to whoever called you. Use notify to bring someone else in. The main agent owns the proposal: do not call open_pr or confirm_decision, and leave work you were not asked to do alone.
+{{agentInstructions}}`,
 };
 
 // Lifecycle stages per bundled workflow (the pipeline the UI renders).
@@ -411,7 +431,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.26.0',
+    version: '1.27.0',
     description: `World → do/wait → review → optional per-PR provider/external landing or canonical ${BRAND} fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.`,
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -519,7 +539,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.26.0',
+    version: '1.27.0',
     description: 'Software Dev in autonomous completion mode with prerequisite-aware lifecycle restoration, GitHub-authoritative PR state, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -707,6 +727,7 @@ export function agentRoleDef(name: string, manifests: WorkflowManifest[] = MANIF
   return roleDef(name, manifests)
     ?? (name === 'merge' ? { ...LEGACY_MERGE_ROLE, workflows: [] }
       : name === 'resolve' ? { ...LEGACY_RESOLVE_ROLE, workflows: [] }
+      : name === 'agent' ? { ...CALLED_AGENT_ROLE, workflows: [] }
       : undefined);
 }
 

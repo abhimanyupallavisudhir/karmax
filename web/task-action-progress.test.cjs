@@ -29,7 +29,7 @@ test('task buttons acknowledge immediately, prevent repeated requests, and recov
       reflectAcceptedTaskAction() {}, toast: message => toasts.push(message),
       setTimeout() {}, refreshTask() {}, refreshTasks() {},
     });
-    vm.runInContext([fn('actionToast'), fn('waitResourceChoices'), fn('otherAttemptsConfirmation'), fn('wireActions')].join('\n'), context);
+    vm.runInContext([fn('hasOpenPullRequest'), fn('confirmMergeRights'), fn('actionToast'), fn('waitResourceChoices'), fn('otherAttemptsConfirmation'), fn('wireActions')].join('\n'), context);
     context.wireActions({ taskId: 'task' });
     const pending = click();
     assert.deepEqual(feedback, ['start']);
@@ -63,7 +63,7 @@ test('pending attempt choice prevents repeated clicks and dismissing it never co
       reflectAcceptedTaskAction() {}, toast: message => toasts.push(message),
       setTimeout() {}, refreshTask() {}, refreshTasks() {},
     });
-    vm.runInContext([fn('actionToast'), fn('waitResourceChoices'), fn('wireActions')].join('\n'), context);
+    vm.runInContext([fn('hasOpenPullRequest'), fn('confirmMergeRights'), fn('actionToast'), fn('waitResourceChoices'), fn('wireActions')].join('\n'), context);
     context.wireActions({ taskId: 'task' });
     const pending = click();
     assert.equal(btn.disabled, true);
@@ -109,7 +109,7 @@ test('confirmation waits for resource saves and recovers without confirming a fa
       api: async (_url, options) => requests.push(JSON.parse(options.body)),
       toast: message => toasts.push(message), setTimeout() {}, refreshTask() {}, refreshTasks() {},
     });
-    vm.runInContext([fn('actionToast'), fn('waitResourceChoices'), fn('wireActions')].join('\n'), context);
+    vm.runInContext([fn('hasOpenPullRequest'), fn('confirmMergeRights'), fn('actionToast'), fn('waitResourceChoices'), fn('wireActions')].join('\n'), context);
     context.wireActions({ taskId: 'task' });
     const pending = click();
     await new Promise(setImmediate);

@@ -3,7 +3,7 @@ import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { humanAudience, reviewAudience, runAudience, runAudienceAsync } from './task-audience.js';
 import { credentialIds, taskSelectionTimes, decayVaultUsage, type VaultSelectionUsage, type VaultUsage } from '../util/vault-usage.js';
-import { canonicalAccountName } from '../domain/account-names.js';
+import { assertAccountNameAllowed, canonicalAccountName } from '../domain/account-names.js';
 import { validGitBranch } from '../util/git-ref.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -224,7 +224,7 @@ export class Store {
   }
    db!: SqlDatabase;
    hosted!: boolean;
-  private userNames?: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>;
+  private userNames?: () => Array<{ id: string; name: string; email?: string }> | Promise<Array<{ id: string; name: string; email?: string }>>;
   private organizationEntitlementListeners = new Set<(organizationId: string) => unknown>();
   private recordedEventListeners = new Set<(event: KarmaxEvent & { seq: number }) => unknown>();
 
@@ -776,7 +776,7 @@ export class Store {
         taskId TEXT NOT NULL, cardId TEXT, amount INTEGER NOT NULL, currency TEXT NOT NULL,
         merchant TEXT, why TEXT, status TEXT NOT NULL, reason TEXT, shortfall INTEGER,
         providerAuthorizationId TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
-        expiresAt INTEGER NOT NULL, resolvedBy TEXT
+        expiresAt INTEGER NOT NULL, resolvedBy TEXT, participant TEXT
       );
       CREATE TABLE IF NOT EXISTS payment_transactions (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT,
@@ -1003,6 +1003,9 @@ export class Store {
     if (!cardCols.some((c) => c.name === 'status')) (await this.db.exec("ALTER TABLE cards ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"));
     if (!cardCols.some((c) => c.name === 'cardholderId')) (await this.db.exec('ALTER TABLE cards ADD COLUMN cardholderId TEXT'));
     if (!cardCols.some((c) => c.name === 'last4')) (await this.db.exec('ALTER TABLE cards ADD COLUMN last4 TEXT'));
+    // Which of the task's agents asked: an agent's own budget counts only its spend.
+    const spendCols = (await this.db.prepare('PRAGMA table_info(payment_spend_requests)').all()) as { name: string }[];
+    if (!spendCols.some((c) => c.name === 'participant')) (await this.db.exec('ALTER TABLE payment_spend_requests ADD COLUMN participant TEXT'));
     (await this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_provider_external ON cards(provider, externalId) WHERE externalId IS NOT NULL'));
     // One inbox row per (user, task, kind): a notification is a LIVE ask, not a
     // copy of the event log. Older builds keyed rows by EVENT, so a task sitting
@@ -1687,8 +1690,21 @@ export class Store {
    * gateway connects the two stores after both have run their own schema
    * migrations, giving every organization write the same cross-store guard.
    */
-  connectUserNames(lookup: () => Array<{ id: string; name: string }> | Promise<Array<{ id: string; name: string }>>): void {
+  connectUserNames(lookup: () => Array<{ id: string; name: string; email?: string }> | Promise<Array<{ id: string; name: string; email?: string }>>): void {
     this.userNames = lookup;
+  }
+
+  /** A person's current display name, for labelling what they said. */
+  async userDisplayName(userId: string): Promise<string | undefined> {
+    return (await this.userNames?.())?.find((candidate) => candidate.id === userId)?.name || undefined;
+  }
+
+  /** The members of an organization (every project member is one) with the
+   *  names and emails a `for:<person>` search may name them by. */
+  async organizationPeople(organizationId: string): Promise<Array<{ id: string; name: string; email?: string }>> {
+    const ids = new Set((await this.listOrganizationMemberships(organizationId)).map((member) => member.userId));
+    return ((await this.userNames?.()) ?? []).filter((user) => ids.has(user.id))
+      .map((user) => ({ id: user.id, name: user.name, ...(user.email ? { email: user.email } : {}) }));
   }
 
   /**
@@ -1797,9 +1813,12 @@ export class Store {
   private async assertOrganizationNameAvailable(name: string, options: {
     excludeOrganizationId?: string;
     allowUserId?: string;
+    /** A boot migration copying an existing user name: never fail the boot over a reserved word. */
+    existingName?: boolean;
   } = {}): Promise<string> {
     const value = name.trim();
     if (!value) throw new Error('organization name is required');
+    if (!options.existingName) assertAccountNameAllowed(value);
     const key = canonicalAccountName(value);
     const organization = (await this.listOrganizations()).find((candidate) =>
       candidate.id !== options.excludeOrganizationId && canonicalAccountName(candidate.name) === key);
@@ -2450,7 +2469,7 @@ export class Store {
         if (!userName || row.name === userName) continue;
         if (!row.name.endsWith("'s workspace") && row.name !== 'Personal workspace') continue;
         const next = (await this.assertOrganizationNameAvailable(userName,
-          { excludeOrganizationId: row.id, allowUserId: row.userId }));
+          { excludeOrganizationId: row.id, allowUserId: row.userId, existingName: true }));
         (await this.db.prepare('UPDATE organizations SET name=? WHERE id=?').run(next, row.id));
         changed++;
       }
@@ -3541,15 +3560,23 @@ export class Store {
 
   /** Internal scans do not recount the entire project for every page. Full
    * histories are opt-in; ordinary task lists/search retain compact projection. */
-  async *taskReadPages(projectId: string, options: { includeArchived?: boolean; includeConversation?: boolean } = {}): AsyncGenerator<TaskRecord[], void> {
+  async *taskReadPages(projectId: string, options: { includeArchived?: boolean; includeConversation?: boolean;
+    /** Read only these tasks (an attempt or logical id) and drafts — a `for:` search's candidates. */
+    candidateIds?: string[] } = {}): AsyncGenerator<TaskRecord[], void> {
     // Freeze membership/order using only logical IDs. OFFSET against a changing
     // list can duplicate/skip tasks; slicing this small ID index also avoids
     // rescanning earlier rows on every page. Resolve the current principal when
     // reading each intent, so switching attempts cannot duplicate a logical task.
+    const candidates = options.candidateIds;
+    const draft = this.db.dialect === 'postgres'
+      ? "COALESCE((t.params::jsonb ->> 'draft')::boolean, false)" : "COALESCE(json_extract(t.params, '$.draft'), 0)<>0";
+    const narrowed = candidates ? candidates.length
+      ? ` AND (${draft} OR t.id IN (${candidates.map(() => '?').join(',')}) OR i.id IN (${candidates.map(() => '?').join(',')}))`
+      : ` AND ${draft}` : '';
     const identities = await this.readRows<{ id: string }>(`SELECT i.id FROM tasks t
       JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
-      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${this.taskArchivePredicate(options.includeArchived ?? true)}
-      ORDER BY root.ord, root.createdAt, root.id`, [projectId]);
+      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${this.taskArchivePredicate(options.includeArchived ?? true)}${narrowed}
+      ORDER BY root.ord, root.createdAt, root.id`, [projectId, ...(candidates ?? []), ...(candidates ?? [])]);
     for (let offset = 0; offset < identities.length; offset += 200) {
       const ids = identities.slice(offset, offset + 200).map(row => row.id);
       const page = await this.readTaskPage(projectId, { includeArchived: true },
@@ -4516,12 +4543,32 @@ export class Store {
       .map((r) => JSON.parse(r.principal));
   }
 
+  /** Someone spoke in a task: whatever mentioned them there is answered. */
+  async dischargeMentions(taskId: string, userId: string): Promise<void> {
+    (await this.deleteInbox("taskId=? AND userId=? AND kind='mentioned'", [taskId, userId]));
+  }
+
   /** Urgency first, recency second: the most urgent ask is always at the top,
    * and the limit therefore truncates the least urgent tail rather than a
    * high-urgency ask that happens to be older. */
   async listInbox(userId: string, organizationId: string, opts: { unreadOnly?: boolean; limit?: number } = {}): Promise<InboxItem[]> {
     const sql = `SELECT * FROM inbox WHERE userId=? AND organizationId=?${opts.unreadOnly ? ' AND unread=1' : ''} ORDER BY urgency DESC, createdAt DESC LIMIT ?`;
     return ((await this.db.prepare(sql).all(userId, organizationId, Math.max(1, Math.min(opts.limit ?? 200, 1000)))) as any[]).map(rowToInbox);
+  }
+
+  /**
+   * What needs this person in this organization now: task id → the kinds of the
+   * live asks routed to them. An actionable row is a live ask by construction
+   * (it is deleted when discharged); a mention asks for attention until it is
+   * read. Routine `update` rows never do. Reads by the (userId, …) indexes.
+   */
+  async attentionAsks(userId: string, organizationId: string): Promise<Map<string, string[]>> {
+    const rows = (await this.db.prepare(`SELECT taskId, kind FROM inbox WHERE userId=? AND organizationId=?
+      AND kind<>'update' AND (actionable=1 OR unread=1) AND subject IS NULL ORDER BY urgency DESC, createdAt DESC`)
+      .all(userId, organizationId)) as Array<{ taskId: string; kind: string }>;
+    const out = new Map<string, string[]>();
+    for (const row of rows) (out.get(String(row.taskId)) ?? out.set(String(row.taskId), []).get(String(row.taskId))!).push(String(row.kind));
+    return out;
   }
 
   /**
@@ -4730,6 +4777,13 @@ export class Store {
     return runAudienceAsync(humanAudience(taskId, requested), async (sql, params) => (await this.db.prepare(sql).all(...params)));
   }
 
+  /** Resolve project-relative selectors (`@maintainers`, `@admins`, `@team:…`)
+   * where there is no task yet, such as a task being created. */
+  async projectAudience(projectId: string, requested: string[]): Promise<string[]> {
+    return runAudienceAsync(humanAudience({ id: '', projectId, createdBy: undefined, lastView: undefined }, requested),
+      async (sql, params) => (await this.db.prepare(sql).all(...params)));
+  }
+
   async humanMayAct(taskId: string, userId: string): Promise<boolean> {
     return (await this.humanAudience(taskId)).includes(userId);
   }
@@ -4839,8 +4893,15 @@ export class Store {
       if (task.assignee) users = (await this.expandPrincipal(task.assignee, task.projectId));
     } else if (ev.type === 'task.mentioned') {
       kind = 'mentioned';
-      const mentioned = ev.payload.principal as PrincipalRef | undefined;
-      if (mentioned) users = (await this.expandPrincipal(mentioned, task.projectId));
+      // An @mention in a task's conversation is addressed to people: an ask, like
+      // a review request. (Historical single-principal mentions stay routine.)
+      if (Array.isArray(ev.payload.recipients)) {
+        actionable = true;
+        users = (await this.humanAudience(task.id, ev.payload.recipients.map(String)));
+      } else {
+        const mentioned = ev.payload.principal as PrincipalRef | undefined;
+        if (mentioned) users = (await this.expandPrincipal(mentioned, task.projectId));
+      }
     } else if (ev.type === 'credential.approval-requested' || ev.type === 'connection.requested') {
       kind = 'approval-requested'; actionable = true;
       users = (await this.humanAudience(task.id, ['@creator']));
@@ -4855,7 +4916,13 @@ export class Store {
       kind = 'review-requested'; actionable = true; users = (await this.reviewAudience(task));
     } else if (ev.type.includes('escalat')) {
       kind = 'escalated'; actionable = true;
-      users = (await this.escalationAudience(task));
+      // An escalation names who it goes to; the view that will say so may not be
+      // published yet (the workflow applies a redirect asynchronously).
+      users = Array.isArray(ev.payload.audience) && ev.payload.audience.length
+        ? (await this.humanAudience(task.id, ev.payload.audience.map(String)))
+        : [];
+      // An ask that resolves to nobody still reaches someone who can act.
+      if (!users.length) users = (await this.escalationAudience(task));
     } else if (ev.type === 'view.updated' && (ev.payload.waitingFor === 'human' || escalated)) {
       // The lifecycle states that are an ask: the task is parked ON a human.
       // While an approval is outstanding that approval IS the ask, and it was
@@ -4888,7 +4955,11 @@ export class Store {
           .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id));
         continue;
       }
-      if (actionable) (await this.deleteInbox('userId=? AND taskId=? AND actionable=1', [userId, task.id]));
+      if (actionable && kind === 'mentioned') {
+        // A mention never displaces a stronger ask on the same task: the person is
+        // already asked to look at it.
+        if ((await this.db.prepare("SELECT 1 FROM inbox WHERE userId=? AND taskId=? AND actionable=1 AND kind<>'mentioned'").get(userId, task.id))) continue;
+      } else if (actionable) (await this.deleteInbox('userId=? AND taskId=? AND actionable=1', [userId, task.id]));
       const item: InboxItem = { id: newId('inbox'), organizationId: project.organizationId, userId, eventSeq,
         taskId: task.id, kind, urgency: requested ?? DEFAULT_URGENCY[kind], unread: true, actionable, createdAt: ev.ts };
       const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
@@ -6025,6 +6096,14 @@ export class Store {
           || Object.entries(policy).some(([key, value]) => key === 'use' ? !['auto', 'ask'].includes(value as string)
             : key === 'reveal' ? !['auto', 'ask', 'never'].includes(value as string) : true))))
         throw new Error('Invalid vault credential default policies');
+    }
+    // Task defaults: the authorization level a task gets when it names none.
+    if (workflow === 'authorization' && Object.keys(values).length) {
+      const { level, scope, projectIds } = values as { level?: unknown; scope?: unknown; projectIds?: unknown };
+      if (typeof level !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/i.test(level)
+        || !['projects', 'organization', 'global'].includes(scope as string)
+        || (projectIds !== undefined && (!Array.isArray(projectIds) || projectIds.some((id) => typeof id !== 'string'))))
+        throw new Error('Default authorization must be {level, scope, projectIds?}');
     }
     // A fresh epoch prevents an in-flight span crossing a rapid off/on cycle.
     if (scopeKey === 'global' && workflow === 'timing') values = { ...values, revision: crypto.randomUUID() };
@@ -7931,7 +8010,7 @@ export class Store {
 
   async createPaymentSpendRequest(input: { organizationId: string; projectId: string; taskId: string;
     cardId?: string; amount: number; currency?: string; merchant?: string; why?: string;
-    status: string; reason?: string; shortfall?: number; expiresAt?: number }): Promise<any> {
+    status: string; reason?: string; shortfall?: number; expiresAt?: number; participant?: string }): Promise<any> {
     return this.db.transaction(async () => {
 
     await this.assertProjectOrganization(input.projectId, input.organizationId);
@@ -7939,11 +8018,12 @@ export class Store {
     const id = newId('spend');
     (await this.db.prepare(`INSERT INTO payment_spend_requests
       (id, organizationId, projectId, taskId, cardId, amount, currency, merchant, why,
-       status, reason, shortfall, providerAuthorizationId, createdAt, updatedAt, expiresAt, resolvedBy)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)`)
+       status, reason, shortfall, providerAuthorizationId, createdAt, updatedAt, expiresAt, resolvedBy, participant)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?)`)
       .run(id, input.organizationId, input.projectId, input.taskId, input.cardId ?? null, input.amount,
         input.currency ?? 'usd', input.merchant ?? null, input.why ?? null, input.status,
-        input.reason ?? null, input.shortfall ?? null, now, now, input.expiresAt ?? now + 30 * 60_000));
+        input.reason ?? null, input.shortfall ?? null, now, now, input.expiresAt ?? now + 30 * 60_000,
+        input.participant ?? null));
     // The `spent:<taskId>` kv mirror below is DEAD in production: nothing reads
     // it — `paymentSpent` recomputes the sum from `payment_spend_requests` on
     // every call, as it must (authorizations expire on a clock). It is retained
@@ -8031,15 +8111,17 @@ export class Store {
   }
 
   /** Minor units spent or reserved; pass `currency` to count one currency only (AU-36). */
-  async paymentSpent(taskId: string, family = false, currency?: string): Promise<number> {
+  /** `participant`: only what that agent of the task spent (unattributed rows
+   * are the main agent's), for an agent's own budget. */
+  async paymentSpent(taskId: string, family = false, currency?: string, participant?: string): Promise<number> {
     return this.db.transaction(async () => {
 
     (await this.expirePaymentSpendRequests());
     const ids = family ? (await this.paymentBudgetFamily(taskId)).taskIds : [taskId];
     const row = (await this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
       WHERE taskId IN (${ids.map(() => '?').join(',')}) AND (status IN ('authorizing','consumed','settled')
-        OR (status='authorized' AND expiresAt>?))${currency ? ' AND LOWER(currency)=?' : ''}`)
-      .get(...ids, Date.now(), ...(currency ? [currency] : []))) as any;
+        OR (status='authorized' AND expiresAt>?))${currency ? ' AND LOWER(currency)=?' : ''}${participant ? " AND COALESCE(participant, 'do')=?" : ''}`)
+      .get(...ids, Date.now(), ...(currency ? [currency] : []), ...(participant ? [participant] : []))) as any;
     return Number(row?.amount ?? 0);
   
     });
@@ -8810,7 +8892,9 @@ const RESERVED_ROUTE_SLUGS = new Set([
   // app sign-in approval (web/app.js renderDeviceApproval)
   'device',
   // top-level routes / legacy org paths (an org slug is the first URL segment)
-  'invite', 'projects', 'organization', 'organizations',
+  'invite', 'projects', 'organization', 'organizations', 'installation',
+  // `for:me` is the signed-in person in every search (and /me is kept free)
+  'me',
   // organization-level views — ORG_VIEWS (a project slug is the segment after the org)
   'insights', 'dashboard', 'settings', 'inbox', 'wiki', 'profile',
   // project-level tabs

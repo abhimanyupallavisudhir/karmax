@@ -6,7 +6,7 @@ import { PLATFORM_API_CATALOG } from './catalog.js';
 import { URGENCY_LEVELS, type AgentSpec, type Provider, type Urgency } from '../domain/types.js';
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
-  PRIORITY_NAMES, compactSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
+  PRIORITY_NAMES, compactSearch, compactOrganizationSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
   platformRequestPathError,
   type CompactTask,
 } from './platform-request.js';
@@ -43,13 +43,16 @@ export interface PlatformOps {
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
+  /** The organization task list: every project of it the caller can read. */
+  searchOrganizationTasks(organizationId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
   listTags(projectId: string): Promise<{ path: string; kind?: string; description?: string }[]>;
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
   messageAgent(taskId: string, text: string, role?: string): Promise<void>;
-  escalateToHuman(a: { audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
-  requestPermission(a: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
+  escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
+  notify(a: { to: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
+  requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
@@ -114,12 +117,16 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
       const [result, tags] = await Promise.all([api.searchTasks(getToken(), pid, query), api.listTags(getToken(), pid)]);
       return compactSearch(result, tags);
     },
+    searchOrganizationTasks: async (organizationId, query) => {
+      return compactOrganizationSearch(await api.searchOrganizationTasks(getToken(), organizationId, query));
+    },
     listTags: async (pid) => compactTags(await api.listTags(getToken(), pid)),
     tagTask: (id, add, remove) => api.tagTask(getToken(), id, { add, remove }),
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await api.signalTask(getToken(), id, sig as any, text, role, undefined, undefined, { otherAttempts, saveOtherAttemptsDefault })),
     messageAgent: async (id, text, role) => void (await api.messageAgent(getToken(), id, text, role)),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
+    notify: (a) => api.notify(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
     requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
     cancelAgentAction: (requestId) => api.cancelAgentAction(getToken(), requestId),
@@ -208,12 +215,16 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
       const [result, tags] = await Promise.all([req(`/api/projects/${pid}/search?q=${encodeURIComponent(query)}`), req(`/api/projects/${pid}/tags`)]);
       return compactSearch(result, tags as any[]);
     },
+    searchOrganizationTasks: async (organizationId, query) => {
+      return compactOrganizationSearch(await req(`/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent(query)}`) as { tags?: unknown[] });
+    },
     listTags: async (pid) => compactTags((await req(`/api/projects/${pid}/tags`)) as any[]),
     tagTask: (id, add, remove) => req(`/api/tasks/${id}/tag`, { method: 'POST', body: JSON.stringify({ add, remove }) }) as Promise<{ tags: string[] }>,
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role, otherAttempts, saveOtherAttemptsDefault }) })),
     messageAgent: async (id, text, role) => void (await req(`/api/tasks/${id}/messages`, { method: 'POST', body: JSON.stringify({ text, role }) })),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
+    notify: (a) => req('/api/agent/notify', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
     requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
     cancelAgentAction: (requestId) => req(`/api/agent/collaboration/${encodeURIComponent(requestId)}/cancel`, {
@@ -459,33 +470,77 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     {
       description:
         'Pause your current task at its exact stage and request input from selected people, teams, or Avatars. ' +
-        'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+        'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
         'Calling this stops the current turn; the task resumes when a selected principal responds. ' +
         'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
         'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
       inputSchema: {
-        audience: z.array(z.string()).min(1).max(32),
+        audience: z.array(z.string()).max(32).optional(),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
     },
-    async (a) => wrap(async () => (await ops.escalateToHuman(a))),
+    async (a) => wrap(async () => (await ops.escalateToHuman({ ...a, audience: a.audience ?? [] }))),
+  );
+  server.registerTool(
+    'notify',
+    {
+      description:
+        'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, ' +
+        '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now and keep ' +
+        'their own pace; agents of this task (agent:do for the main agent, agent:responder, agent:confirm, ' +
+        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation.',
+      inputSchema: {
+        to: z.array(z.string()).min(1).max(32),
+        message: z.string().trim().min(1).max(4_000),
+        urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
+      },
+    },
+    async (a) => wrap(async () => (await ops.notify(a))),
+  );
+  server.registerTool(
+    'escalate',
+    {
+      description:
+        'Redirect a request you received but cannot answer yourself to people who can — the question you were asked ' +
+        'as a Responder, or a request a sub-task routed to you (pass its task_id). The request waits for them instead; ' +
+        'your own work is not interrupted. Audience selectors as for notify (people, teams, Avatars).',
+      inputSchema: {
+        to: z.array(z.string()).min(1).max(32),
+        note: z.string().trim().min(1).max(4_000),
+        task_id: z.string().optional(),
+      },
+    },
+    async (a) => wrap(async () => (await ops.escalateToHuman({ ...(a.task_id ? { taskId: a.task_id } : {}), audience: a.to, message: a.note }))),
+  );
+  server.registerTool(
+    'my_authorization',
+    {
+      description: 'What your authorization covers: level, projects/organization, the capabilities you hold and the exact ones you lack (ask for those with request_permission). Pass method and path to learn whether that platform_request would be allowed, and what to request if not, without making it. Check here before asking a person to do something for you.',
+      inputSchema: {
+        method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']).optional(),
+        path: z.string().startsWith('/api/').optional(),
+      },
+    },
+    async (a) => wrap(async () => (await ops.platformRequest('GET',
+      `/api/authorization/me${a.path ? `?${new URLSearchParams({ method: a.method ?? 'GET', path: a.path })}` : ''}`))),
   );
   server.registerTool(
     'request_permission',
     {
       description:
         'Request exact capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in the task Approval Requests tab ' +
-        'and is routed to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, ' +
-        '@project, or @all. Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
+        'and is routed to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, ' +
+        '@superadmins, @owners, @project, or @all; omit audience to summon the lowest level that can grant it (@maintainers, @admins or @superadmins). ' +
+        'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
         'Only a selected principal that already holds the requested capabilities and can grant the full task authorization across the expanded scope can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
         'pass urgency to raise or lower how loudly the human is alerted.',
       inputSchema: {
         capabilities: z.array(z.string().trim().min(1)).max(32),
         projectIds: z.array(z.string().trim().min(1)).max(32).optional(),
-        audience: z.array(z.string().trim().min(1)).min(1).max(32),
+        audience: z.array(z.string().trim().min(1)).min(1).max(32).optional(),
         reason: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
@@ -757,11 +812,16 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'workflow, created, updated, num, is:<facet> (open/draft/archived/pr/untagged/armed/scheduled/recurring/blocked-on-deps/series/run/…), ' +
         'trigger (dependency|schedule|event|none, groupable), schedule (cron text), nextRun (sortable date), ' +
         'dependsOn:#N / blocks:#N (the dependency graph), and any workflow param via `param.<key>` / `agent_<role>.model`. ' +
-        'Add `sort:priority-desc` and `group:tag` to order/bucket. Empty query returns all tasks (runs of a series included — ' +
-        'add `-is:run` to hide them). E.g. `is:scheduled sort:nextRun-asc`, `dependsOn:#42`, `is:blocked-on-deps`.',
-      inputSchema: { projectId: z.string(), query: z.string().default('') },
+        '`for:me` / `for:<name|email|user:id>` = tasks waiting on that person (review, input, approval, assignment, unread mention) plus their drafts; ' +
+        '`project:<id|slug|name>`. Add `sort:priority-desc` and `group:tag` to order/bucket. Empty query returns all tasks (runs of a series included — ' +
+        'add `-is:run` to hide them). E.g. `is:scheduled sort:nextRun-asc`, `dependsOn:#42`, `is:blocked-on-deps`. ' +
+        'Pass `organizationId` instead of `projectId` to search every project of the organization you can read (results carry projectId).',
+      inputSchema: { projectId: z.string().optional(), organizationId: z.string().optional(), query: z.string().default('') },
     },
-    async (a) => wrap(() => ops.searchTasks(a.projectId, a.query ?? '')),
+    async (a) => wrap(() => {
+      if (!a.projectId === !a.organizationId) throw new Error('pass exactly one of projectId or organizationId');
+      return a.organizationId ? ops.searchOrganizationTasks(a.organizationId, a.query ?? '') : ops.searchTasks(a.projectId!, a.query ?? '');
+    }),
   );
   server.registerTool('list_tags', { description: 'List a project\'s tag catalogue as `a/b/c` paths, with kind and optional section description.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTags(a.projectId)));
   server.registerTool(

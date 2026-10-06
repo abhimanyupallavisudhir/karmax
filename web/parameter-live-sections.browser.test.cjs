@@ -56,6 +56,8 @@ const root = __dirname;
       S.meta = { workflows: [] }; S.schema = [{ name: 'software-dev', params: [] }];
       await openTask('fixture', 'parameters');
     }, { record });
+    // The task's own authority, cards and budget are its agent's collapsed Authorization row.
+    await page.locator('#tp-params .agent-authority > summary').click();
     const vaultCount = page.locator('#tp-vault-count');
     const budget = page.locator('#tp-payments .payment-budget');
     await page.waitForFunction(() => document.querySelector('#tp-vault-count')?.textContent === '1 selected'
@@ -88,7 +90,7 @@ const root = __dirname;
     await budget.evaluate(el => { window.budgetNode = el; });
     await page.evaluate(() => window.parameterTest.refreshTask());
     assert.equal(await budget.evaluate(el => el === window.budgetNode && document.activeElement === el && el.value === '7.5'), true);
-    assert.equal(await page.locator('#tp-payments .payment-save').isDisabled(), false);
+    assert.equal(await page.locator('#tp-auth-save').isDisabled(), false, 'cards and budget save with the authorization');
     // Cards in two currencies let the budget choose its own (AU-36).
     const currency = page.locator('#tp-payments .payment-currency');
     assert.deepEqual(await currency.evaluate(el => [el.hidden, el.value, [...el.options].map(o => o.value)]), [false, 'usd', ['usd', 'eur']]);
@@ -100,8 +102,9 @@ const root = __dirname;
     await page.waitForFunction(() => document.querySelector('#tp-payments .payment-spent').textContent === '$2.50 spent');
 
     // Saving is not followed by a Loading… repaint either.
-    await page.locator('#tp-payments .payment-save').click();
-    await page.waitForFunction(() => document.querySelector('#tp-payments .payment-save').disabled);
+    await page.locator('#tp-auth-save').click();
+    await page.waitForFunction(() => document.querySelector('#tp-auth-save').disabled
+      && document.querySelector('#tp-auth-status').textContent === 'All authorization changes saved');
     assert.deepEqual(puts, [{ cardIds: ['c1'], budget: 750, currency: 'eur' }]);
     assert.equal(await page.locator('#tp-payments .payment-spent').textContent(), `${new Intl.NumberFormat(undefined, { style: 'currency', currency: 'eur' }).format(2.5)} spent`);
     await page.evaluate(() => { window.parameterTest.S.tasks[0].params.paymentPolicy = { cardIds: ['c1'], budget: 750, currency: 'eur' }; });
@@ -116,7 +119,9 @@ const root = __dirname;
     await page.locator('.vault-grant-pick[value="v2"]').check();
     await page.locator('[data-vault-apply]').click();
     assert.equal(await vaultCount.textContent(), '2 selected');
-    assert.equal(await page.locator('#tp-auth-save').isDisabled(), false);
+    // The section marks itself dirty asynchronously; a slow runner sees the
+    // count before the Save button, so wait for it rather than sample once.
+    await page.waitForFunction(() => !document.querySelector('#tp-auth-save').disabled);
     await page.evaluate(() => window.parameterTest.refreshTask());
     assert.equal(await vaultCount.textContent(), '2 selected', 'unsaved vault grants survive a refresh');
     assert.equal(await stillPinned(), true);

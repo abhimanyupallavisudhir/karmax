@@ -1,5 +1,5 @@
 import * as __asyncCollections from '../util/async-collections.js';
-import { Store } from '../store/db.js';
+import type { Store } from '../store/db.js';
 import { Capability, CAPABILITIES, DEVELOPER_WORKSPACE_CAPABILITIES, allows, attenuate } from './capabilities.js';
 import { SHIPPED_BUILTIN_PROFILES } from './builtin-profile-history.js';
 import type { AuthorizationSelection, ProjectMembership } from '../domain/types.js';
@@ -33,9 +33,25 @@ export interface PrincipalGrant {
   grantedAt: number;
 }
 
+/** What a refused grant lacks and how to proceed: summon someone who can grant
+ * it, or cut it back to the caller's own authorization. Humans see it as the
+ * authorization dialog; agents read it from the refusal. */
+export interface AuthorizationGap {
+  /** "Project maintainer · Site" */
+  summary: string;
+  missingCapabilities: Capability[];
+  /** The lowest level audience (else owners, else anyone) that can grant it all. */
+  summon?: string;
+  /** The ways forward, as API calls. */
+  next: string;
+}
+
 export class AuthorizationGrantError extends Error {
   status = 403;
   code = 'authorization_grant_denied';
+  constructor(message: string, public gap?: AuthorizationGap) {
+    super(message);
+  }
 }
 
 const viewer = [
@@ -230,7 +246,7 @@ function sameCapabilities(a: Capability[], b: Capability[]): boolean {
 export const projectScope = (projectId: string): AuthorizationScope => `project:${projectId}`;
 export const organizationScope = (organizationId: string): AuthorizationScope => `organization:${organizationId}`;
 
-type CapabilityRead = { kind: 'organization' | 'grants' | 'profile' | 'projectMembers' | 'teamMember' | 'orgMember'; args: string[] };
+export type CapabilityRead = { kind: 'organization' | 'grants' | 'profile' | 'projectMembers' | 'teamMember' | 'orgMember'; args: string[] };
 function* capabilityRead<T>(kind: CapabilityRead['kind'], ...args: string[]): Generator<CapabilityRead, T, unknown> {
   return (yield { kind, args }) as T;
 }
@@ -241,6 +257,71 @@ function* capabilityProfile(id: string, projectId?: string, organizationId?: str
     const profile = yield* capabilityRead<AuthorizationProfile | undefined>('profile', scope, id);
     if (profile) return profile;
   }
+}
+
+export function* capabilityPolicy(principalId: string, projectId?: string, organizationId?: string): Generator<CapabilityRead, Capability[], unknown> {
+  // An absent subject is never the administrative “list all grants” query.
+  if (!principalId) return [];
+  const out = new Set<Capability>();
+  const resolvedOrganizationId = organizationId ?? (projectId ? (yield* capabilityRead<string | undefined>('organization', projectId)) : undefined);
+  const relevant = (yield* capabilityRead<PrincipalGrant[]>('grants', principalId)).filter((g) => g.scopeKey === 'global'
+    || (resolvedOrganizationId && g.scopeKey === organizationScope(resolvedOrganizationId))
+    || (projectId && g.scopeKey === projectScope(projectId)));
+  for (const grant of relevant) {
+    // A project overlay must not silently redefine an account's global grant.
+    const p = grant.scopeKey === 'global' ? yield* capabilityProfile(grant.profileId) : yield* capabilityProfile(grant.profileId, projectId, resolvedOrganizationId);
+    if (!p) continue;
+    let caps = grant.capabilities ? attenuate(p.capabilities, grant.capabilities) : p.capabilities;
+    if (grant.scopeKey.startsWith('project:')) caps = attenuate(caps, PROJECT_GRANT_CEILING);
+    else if (grant.scopeKey.startsWith('organization:')) caps = attenuate(caps, ORGANIZATION_GRANT_CEILING);
+    for (const cap of caps) out.add(cap);
+  }
+  // Team and @all project access are durable principals, not UI aliases.
+  // Their selected profile applies dynamically, including to people added to
+  // the team/organization later, so group authorization is never cosmetic.
+  if (projectId && principalId.startsWith('user:')) {
+    const userId = principalId.slice(5);
+    const projectOrganization = yield* capabilityRead<string | undefined>('organization', projectId);
+    for (const membership of yield* capabilityRead<ProjectMembership[]>('projectMembers', projectId)) {
+      const applies = membership.principal.kind === 'user' ? membership.principal.userId === userId
+        : membership.principal.kind === 'team' ? yield* capabilityRead<boolean>('teamMember', membership.principal.teamId, userId)
+        : membership.principal.kind === 'organization' ? membership.principal.organizationId === projectOrganization
+          && Boolean(projectOrganization && (yield* capabilityRead<boolean>('orgMember', projectOrganization, userId))) : false;
+      if (!applies) continue;
+      const profileId = ['owner', 'admin', 'administrator', 'operator'].includes(membership.role)
+        ? 'maintainer'
+        : (yield* capabilityProfile(membership.role, projectId)) ? membership.role : 'developer';
+      const profile = yield* capabilityProfile(profileId, projectId);
+      if (profile) for (const cap of attenuate(profile.capabilities, PROJECT_GRANT_CEILING)) out.add(cap);
+    }
+  }
+  return [...out];
+}
+
+/** Project-relative audiences that name everyone at a level or above in the
+ * task's project, lowest first: the order "summon" walks to find the lowest
+ * level that can grant something. */
+export const LEVEL_AUDIENCES = [
+  { selector: '@maintainers', level: 'maintainer', description: 'Everyone who is at least a Project maintainer in this project.' },
+  { selector: '@admins', level: 'administrator', description: 'Everyone who is at least an Administrator of this organization.' },
+  { selector: '@superadmins', level: 'superadmin', description: 'Everyone who is a Super-administrator of this organization.' },
+] as const;
+
+/** What a holder of `level` has in a project: the level's profile within the
+ * ceiling of the scope it is granted for. */
+function* levelCapabilities(level: string, projectId: string): Generator<CapabilityRead, Capability[], unknown> {
+  const profile = yield* capabilityProfile(level, projectId);
+  if (!profile) return [];
+  return attenuate(profile.capabilities, ORGANIZATION_LEVELS[level] ? ORGANIZATION_GRANT_CEILING : PROJECT_GRANT_CEILING);
+}
+
+/** A principal "is" a level in a project when its effective capabilities there
+ * cover everything that level has, however they were granted. */
+export function* holdsLevel(principalId: string, projectId: string, level: string): Generator<CapabilityRead, boolean, unknown> {
+  const required = yield* levelCapabilities(level, projectId);
+  if (!required.length) return false;
+  const held = yield* capabilityPolicy(principalId, projectId);
+  return required.every((capability) => allows(held, capability));
 }
 
 export class AuthorizationService {
@@ -428,26 +509,21 @@ export class AuthorizationService {
   }
 
   async capabilities(principalId: string, projectId?: string, organizationId?: string): Promise<Capability[]> {
-    const policy = this.capabilityPolicy(principalId, projectId, organizationId);
-    const cache = new Map<string, unknown>();
-    let step = policy.next();
-    while (!step.done) {
-      const request = step.value, key = JSON.stringify(request);
-      if (!cache.has(key)) cache.set(key, (await this.readCapability(request)));
-      step = policy.next(cache.get(key));
-    }
-    return step.value;
+    return this.drive(capabilityPolicy(principalId, projectId, organizationId), (request) => this.readCapability(request));
   }
 
   async capabilitiesAsync(principalId: string, projectId?: string, organizationId?: string): Promise<Capability[]> {
-    const policy = this.capabilityPolicy(principalId, projectId, organizationId);
+    return this.drive(capabilityPolicy(principalId, projectId, organizationId), (request) => this.readCapabilityAsync(request));
+  }
+
+  private async drive<T>(policy: Generator<CapabilityRead, T, unknown>, read: (request: CapabilityRead) => Promise<unknown>): Promise<T> {
     // Request-local only: grants and memberships must be re-read on the next
     // request, including revocations after an identity token was cached.
     const cache = new Map<string, unknown>();
     let step = policy.next();
     while (!step.done) {
       const request = step.value, key = JSON.stringify(request);
-      if (!cache.has(key)) cache.set(key, await this.readCapabilityAsync(request));
+      if (!cache.has(key)) cache.set(key, await read(request));
       step = policy.next(cache.get(key));
     }
     return step.value;
@@ -473,45 +549,6 @@ export class AuthorizationService {
       case 'teamMember': return this.store.hasTeamMembershipAsync(a!, b!);
       case 'orgMember': return this.store.hasOrganizationMembershipAsync(a!, b!);
     }
-  }
-
-  private *capabilityPolicy(principalId: string, projectId?: string, organizationId?: string): Generator<CapabilityRead, Capability[], unknown> {
-    // An absent subject is never the administrative “list all grants” query.
-    if (!principalId) return [];
-    const out = new Set<Capability>();
-    const resolvedOrganizationId = organizationId ?? (projectId ? (yield* capabilityRead<string | undefined>('organization', projectId)) : undefined);
-    const relevant = (yield* capabilityRead<PrincipalGrant[]>('grants', principalId)).filter((g) => g.scopeKey === 'global'
-      || (resolvedOrganizationId && g.scopeKey === organizationScope(resolvedOrganizationId))
-      || (projectId && g.scopeKey === projectScope(projectId)));
-    for (const grant of relevant) {
-      // A project overlay must not silently redefine an account's global grant.
-      const p = grant.scopeKey === 'global' ? yield* capabilityProfile(grant.profileId) : yield* capabilityProfile(grant.profileId, projectId, resolvedOrganizationId);
-      if (!p) continue;
-      let caps = grant.capabilities ? attenuate(p.capabilities, grant.capabilities) : p.capabilities;
-      if (grant.scopeKey.startsWith('project:')) caps = attenuate(caps, PROJECT_GRANT_CEILING);
-      else if (grant.scopeKey.startsWith('organization:')) caps = attenuate(caps, ORGANIZATION_GRANT_CEILING);
-      for (const cap of caps) out.add(cap);
-    }
-    // Team and @all project access are durable principals, not UI aliases.
-    // Their selected profile applies dynamically, including to people added to
-    // the team/organization later, so group authorization is never cosmetic.
-    if (projectId && principalId.startsWith('user:')) {
-      const userId = principalId.slice(5);
-      const projectOrganization = yield* capabilityRead<string | undefined>('organization', projectId);
-      for (const membership of yield* capabilityRead<ProjectMembership[]>('projectMembers', projectId)) {
-        const applies = membership.principal.kind === 'user' ? membership.principal.userId === userId
-          : membership.principal.kind === 'team' ? yield* capabilityRead<boolean>('teamMember', membership.principal.teamId, userId)
-          : membership.principal.kind === 'organization' ? membership.principal.organizationId === projectOrganization
-            && Boolean(projectOrganization && (yield* capabilityRead<boolean>('orgMember', projectOrganization, userId))) : false;
-        if (!applies) continue;
-        const profileId = ['owner', 'admin', 'administrator', 'operator'].includes(membership.role)
-          ? 'maintainer'
-          : (yield* capabilityProfile(membership.role, projectId)) ? membership.role : 'developer';
-        const profile = yield* capabilityProfile(profileId, projectId);
-        if (profile) for (const cap of attenuate(profile.capabilities, PROJECT_GRANT_CEILING)) out.add(cap);
-      }
-    }
-    return [...out];
   }
 
   /** Workflow grant = selected task profile capped by the creator's effective set. */

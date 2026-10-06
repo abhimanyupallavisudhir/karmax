@@ -4,7 +4,6 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -17,6 +16,8 @@ class Rendered:
     text: str
     warnings: list[dict[str, str]]
     suffix: str
+    format: str = ""
+    mode: str = ""
 
     def __post_init__(self) -> None:
         self.text = self.text.encode("utf-8", errors="backslashreplace").decode("utf-8")
@@ -75,7 +76,10 @@ def _blocks_to_markdown(blocks: list[dict[str, Any]]) -> list[str]:
             lines.extend(["[Image: embedded data]" if isinstance(source, dict) or str(source).startswith("data:")
                           else f"![{block.get('alt') or 'Imported image'}]({source})", ""])
         elif kind == "attachment":
-            lines.extend([f"[Attachment: {block.get('name') or block.get('uri') or 'unavailable'}]", ""])
+            lines.append(f"[Attachment: {block.get('name') or block.get('uri') or 'unavailable'}]")
+            if block.get("text"):
+                lines.extend(["", "```text", str(block["text"]), "```"])
+            lines.append("")
     while lines and not lines[-1]:
         lines.pop()
     return lines
@@ -126,9 +130,24 @@ def _blocks_to_plain_context(blocks: list[dict[str, Any]]) -> list[str]:
             result.append("[Image: embedded data]")
         elif kind == "image" and isinstance(block.get("source"), str) and block["source"].startswith("data:"):
             result.append("[Image: embedded data]")
+        elif kind == "attachment" and block.get("text"):
+            result.append(f"[Attachment: {block.get('name') or 'unnamed'}]\n{block['text']}")
         elif kind in {"image", "attachment"}:
             result.append(f"[{kind.title()}: {block.get('source') or block.get('uri') or block.get('name') or 'unavailable'}]")
     return result
+
+
+def _context_messages(conv: dict[str, Any], warnings: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """The whole conversation as one guarded user message (context mode)."""
+    warnings.append(_target_warning("context_mode_flattened", "Native tool/message chronology was flattened into one guarded context message."))
+    return [{
+        "id": str(uuid4()),
+        "role": "user",
+        "created_at": conv.get("updated_at") or conv.get("created_at"),
+        "content": [{"type": "text", "text": _context_handoff(conv)}],
+        "provenance": {"source_format": conv["source"].get("format")},
+        "metadata": {},
+    }]
 
 
 def _session_id(value: Any) -> str:
@@ -163,19 +182,7 @@ def write_claude_code(
         )
     session_id = _session_id(session_id or conv.get("id"))
     native_cwd = cwd or "."
-    messages = conv["messages"]
-    if mode == "context":
-        messages = [
-            {
-                "id": str(uuid4()),
-                "role": "user",
-                "created_at": conv.get("updated_at") or conv.get("created_at"),
-                "content": [{"type": "text", "text": _context_handoff(conv)}],
-                "provenance": {"source_format": conv["source"].get("format")},
-                "metadata": {},
-            }
-        ]
-        warnings.append(_target_warning("context_mode_flattened", "Native tool/message chronology was flattened into one guarded context message."))
+    messages = _context_messages(conv, warnings) if mode == "context" else conv["messages"]
     records: list[dict[str, Any]] = []
     parent_uuid: str | None = None
     for item in messages:
@@ -282,6 +289,8 @@ def _to_claude_blocks(blocks: list[dict[str, Any]], role: str) -> tuple[list[dic
             result.append({"type": "tool_result", "tool_use_id": str(block.get("tool_call_id") or "unknown"), "content": content, "is_error": bool(block.get("is_error", False))})
         elif kind == "image" and isinstance(block.get("source"), (dict, str)):
             result.append(_claude_image(block, warnings))
+        elif kind == "attachment" and block.get("text"):
+            result.append({"type": "text", "text": _blocks_to_plain_context([block])[0]})
         elif kind in {"image", "attachment"}:
             result.append({"type": "text", "text": f"[{kind.title()} unavailable: {block.get('source') or block.get('uri') or block.get('name') or 'no reference'}]"})
             warnings.append(_target_warning("claude_binary_reference_flattened", "Image or attachment references were converted to labelled text."))
@@ -329,19 +338,7 @@ def write_codex(
             },
         }
     ]
-    messages = conv["messages"]
-    if mode == "context":
-        messages = [
-            {
-                "id": str(uuid4()),
-                "role": "user",
-                "created_at": conv.get("updated_at") or conv.get("created_at"),
-                "content": [{"type": "text", "text": _context_handoff(conv)}],
-                "provenance": {"source_format": conv["source"].get("format")},
-                "metadata": {},
-            }
-        ]
-        warnings.append(_target_warning("context_mode_flattened", "Native tool/message chronology was flattened into one guarded context message."))
+    messages = _context_messages(conv, warnings) if mode == "context" else conv["messages"]
     active_turn_id: str | None = None
     turn_started_at = 0
     last_turn_timestamp = created
@@ -412,7 +409,7 @@ def write_codex(
                     event_text.append("[Imported image]")
                     continue
             if kind in {"text", "code", "reasoning", "image", "attachment"}:
-                rendered = _blocks_to_plain_context([block])[0] if _blocks_to_plain_context([block]) else ""
+                rendered = "".join(_blocks_to_plain_context([block])[:1])
                 if rendered:
                     event_text.append(rendered)
                 message_role = role
@@ -434,7 +431,7 @@ def write_codex(
                 )
                 if kind == "reasoning":
                     warnings.append(_target_warning("codex_reasoning_flattened", "Reasoning summaries were converted to labelled message text."))
-                if kind in {"image", "attachment"}:
+                if kind == "image" or kind == "attachment" and not block.get("text"):
                     warnings.append(_target_warning("codex_binary_reference_flattened", "Image or attachment references were converted to labelled text."))
             elif kind == "tool_call":
                 arguments = block.get("arguments", {})
