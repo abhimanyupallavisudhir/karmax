@@ -776,7 +776,7 @@ export class Store {
         taskId TEXT NOT NULL, cardId TEXT, amount INTEGER NOT NULL, currency TEXT NOT NULL,
         merchant TEXT, why TEXT, status TEXT NOT NULL, reason TEXT, shortfall INTEGER,
         providerAuthorizationId TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
-        expiresAt INTEGER NOT NULL, resolvedBy TEXT
+        expiresAt INTEGER NOT NULL, resolvedBy TEXT, participant TEXT
       );
       CREATE TABLE IF NOT EXISTS payment_transactions (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT,
@@ -1003,6 +1003,9 @@ export class Store {
     if (!cardCols.some((c) => c.name === 'status')) (await this.db.exec("ALTER TABLE cards ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"));
     if (!cardCols.some((c) => c.name === 'cardholderId')) (await this.db.exec('ALTER TABLE cards ADD COLUMN cardholderId TEXT'));
     if (!cardCols.some((c) => c.name === 'last4')) (await this.db.exec('ALTER TABLE cards ADD COLUMN last4 TEXT'));
+    // Which of the task's agents asked: an agent's own budget counts only its spend.
+    const spendCols = (await this.db.prepare('PRAGMA table_info(payment_spend_requests)').all()) as { name: string }[];
+    if (!spendCols.some((c) => c.name === 'participant')) (await this.db.exec('ALTER TABLE payment_spend_requests ADD COLUMN participant TEXT'));
     (await this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_provider_external ON cards(provider, externalId) WHERE externalId IS NOT NULL'));
     // One inbox row per (user, task, kind): a notification is a LIVE ask, not a
     // copy of the event log. Older builds keyed rows by EVENT, so a task sitting
@@ -6026,6 +6029,14 @@ export class Store {
             : key === 'reveal' ? !['auto', 'ask', 'never'].includes(value as string) : true))))
         throw new Error('Invalid vault credential default policies');
     }
+    // Task defaults: the authorization level a task gets when it names none.
+    if (workflow === 'authorization' && Object.keys(values).length) {
+      const { level, scope, projectIds } = values as { level?: unknown; scope?: unknown; projectIds?: unknown };
+      if (typeof level !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/i.test(level)
+        || !['projects', 'organization', 'global'].includes(scope as string)
+        || (projectIds !== undefined && (!Array.isArray(projectIds) || projectIds.some((id) => typeof id !== 'string'))))
+        throw new Error('Default authorization must be {level, scope, projectIds?}');
+    }
     // A fresh epoch prevents an in-flight span crossing a rapid off/on cycle.
     if (scopeKey === 'global' && workflow === 'timing') values = { ...values, revision: crypto.randomUUID() };
     if (workflow === 'payments') {
@@ -7931,7 +7942,7 @@ export class Store {
 
   async createPaymentSpendRequest(input: { organizationId: string; projectId: string; taskId: string;
     cardId?: string; amount: number; currency?: string; merchant?: string; why?: string;
-    status: string; reason?: string; shortfall?: number; expiresAt?: number }): Promise<any> {
+    status: string; reason?: string; shortfall?: number; expiresAt?: number; participant?: string }): Promise<any> {
     return this.db.transaction(async () => {
 
     await this.assertProjectOrganization(input.projectId, input.organizationId);
@@ -7939,11 +7950,12 @@ export class Store {
     const id = newId('spend');
     (await this.db.prepare(`INSERT INTO payment_spend_requests
       (id, organizationId, projectId, taskId, cardId, amount, currency, merchant, why,
-       status, reason, shortfall, providerAuthorizationId, createdAt, updatedAt, expiresAt, resolvedBy)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)`)
+       status, reason, shortfall, providerAuthorizationId, createdAt, updatedAt, expiresAt, resolvedBy, participant)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?)`)
       .run(id, input.organizationId, input.projectId, input.taskId, input.cardId ?? null, input.amount,
         input.currency ?? 'usd', input.merchant ?? null, input.why ?? null, input.status,
-        input.reason ?? null, input.shortfall ?? null, now, now, input.expiresAt ?? now + 30 * 60_000));
+        input.reason ?? null, input.shortfall ?? null, now, now, input.expiresAt ?? now + 30 * 60_000,
+        input.participant ?? null));
     // The `spent:<taskId>` kv mirror below is DEAD in production: nothing reads
     // it — `paymentSpent` recomputes the sum from `payment_spend_requests` on
     // every call, as it must (authorizations expire on a clock). It is retained
@@ -8031,15 +8043,17 @@ export class Store {
   }
 
   /** Minor units spent or reserved; pass `currency` to count one currency only (AU-36). */
-  async paymentSpent(taskId: string, family = false, currency?: string): Promise<number> {
+  /** `participant`: only what that agent of the task spent (unattributed rows
+   * are the main agent's), for an agent's own budget. */
+  async paymentSpent(taskId: string, family = false, currency?: string, participant?: string): Promise<number> {
     return this.db.transaction(async () => {
 
     (await this.expirePaymentSpendRequests());
     const ids = family ? (await this.paymentBudgetFamily(taskId)).taskIds : [taskId];
     const row = (await this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
       WHERE taskId IN (${ids.map(() => '?').join(',')}) AND (status IN ('authorizing','consumed','settled')
-        OR (status='authorized' AND expiresAt>?))${currency ? ' AND LOWER(currency)=?' : ''}`)
-      .get(...ids, Date.now(), ...(currency ? [currency] : []))) as any;
+        OR (status='authorized' AND expiresAt>?))${currency ? ' AND LOWER(currency)=?' : ''}${participant ? " AND COALESCE(participant, 'do')=?" : ''}`)
+      .get(...ids, Date.now(), ...(currency ? [currency] : []), ...(participant ? [participant] : []))) as any;
     return Number(row?.amount ?? 0);
   
     });

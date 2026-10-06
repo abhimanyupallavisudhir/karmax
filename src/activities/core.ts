@@ -84,6 +84,7 @@ import {
 import { isGithubWorkflowPermissionRejection, type GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService, paymentPromptContext } from '../autonomy/payments.js';
+import { defaultParticipant, participantAuthorization } from '../platform/agent-authority.js';
 import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
@@ -444,6 +445,10 @@ export interface RunAgentTurnArgs {
   agentSlotGranted?: boolean;
   /** Current workflow versions own admission, including the remote-rail exemption. */
   agentAdmissionManaged?: boolean;
+  /** Which of the task's agents takes this turn (`do`, `responder`, `confirm`,
+   * `confirm-2`, `agent-3`; default: the role's own agent). Its own authority
+   * (`params._agentAuthorization[participant]`), cards and budget apply. */
+  participant?: string;
 }
 
 export interface PrepareChildArgs {
@@ -1937,13 +1942,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Approved credential escalations recorded after creation
       // (wiki plans/PLAN-passwords §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
-      const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
+      const participant = args.participant ?? defaultParticipant(args.role);
+      const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId, participant);
       const approvedPermissions = (await new PermissionRequests(store, organizationId).extensionCaps(args.taskId, args.role));
       // Requesting human input is a non-removable safety valve for every task
       // agent. The API restricts task-scoped callers to their own task, so this
       // cannot be used to interrupt peer work or widen the agent's authority.
       const preparationTask = await store.getTask(args.taskId);
-      const storedAuthorization = preparationTask?.params?._authorization as {
+      // An agent other than the main one acts with its own authority when it has
+      // one (wiki planned/collaboration-model); otherwise with the task's.
+      const agentAuthorization = participantAuthorization(preparationTask?.params, participant);
+      const storedAuthorization = (agentAuthorization ?? preparationTask?.params?._authorization) as {
         capabilities?: string[];
         principal?: string;
         scope?: 'projects' | 'organization' | 'global';
@@ -1988,8 +1997,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           taskId: args.taskId,
           profileId: profile.id,
           role: args.role,
+          participant,
           principal: avatar ? avatarPrincipal(avatar.id)
-            : args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
+            : args.task.parentTaskId ? `task:${args.task.parentTaskId}`
+              : (agentAuthorization?.principal ?? args.task.grantPrincipal ?? 'system:legacy-task'),
           projectId: avatar ? (delegatedScope ? undefined : args.task.projectId)
             : authorizationScope ? undefined : args.task.projectId,
           projectIds: avatar
@@ -2004,7 +2015,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           executionAttempt: activityAttempt,
           executionRunId: workflowRunId,
           worldGeneration: args.worldHandle.generation,
-          delegationId: avatar ? undefined : (storedAuthorization?.delegationId ?? args.task.delegationId),
+          delegationId: avatar ? undefined : agentAuthorization ? agentAuthorization.delegationId
+            : (storedAuthorization?.delegationId ?? args.task.delegationId),
           externalIdentities: avatar?.githubAccountId ? { githubAccountId: avatar.githubAccountId } : undefined,
           ceiling,
           grantorCaps: grant,
@@ -2012,6 +2024,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         token = minted.token;
         (await record(args.taskId, 'token.minted', { tokenId: minted.record.id, profile: profile.id, caps: effective,
           audience: minted.record.audience, executionId: minted.record.executionId, expiresAt: minted.record.expiresAt,
+          participant,
           ...(avatar ? { avatarId: avatar.id, avatarOwnerUserId: avatar.ownerUserId, promptVersion: avatar.promptVersion } : {}) }));
       }
 
@@ -2396,10 +2409,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : 'If other attempts are kept, integrate against the latest target and assess combined behavior, redundant changes, and incompatible assumptions, as well as textual conflicts. Validate the combined result.')
         : '';
       const paymentService = deps.payments ? new BudgetService(store, deps.paymentRegistry ?? deps.payments) : undefined;
-      const paymentCards = (await paymentService?.cards({ projectId: args.task.projectId, taskId: args.taskId, capabilities: args.task.grant })) ?? [];
-      const paymentPolicy = (await paymentService?.policy(args.task.projectId, args.taskId));
+      const paymentParticipant = args.participant ?? defaultParticipant(args.role);
+      const paymentCards = (await paymentService?.cards({ projectId: args.task.projectId, taskId: args.taskId,
+        capabilities: args.task.grant, participant: paymentParticipant })) ?? [];
+      // This agent's own cards and budget: the task's, narrowed by its authority.
+      const paymentPolicy = (await paymentService?.participantPolicy(args.task.projectId, args.taskId, paymentParticipant));
       const paymentContext = paymentPromptContext(paymentCards, paymentPolicy,
-        paymentCards.length ? (await store.paymentSpent(args.taskId, false, paymentPolicy?.currency)) : 0);
+        paymentCards.length && paymentPolicy ? paymentPolicy.spent : 0, paymentPolicy?.own ? 'Your budget' : 'Task budget');
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
@@ -2828,6 +2844,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   taskId: args.taskId,
                   organizationId: (await store.getProject(args.task.projectId))?.organizationId,
                   capabilities: effective,
+                  participant,
                 },
                 onSpend: async (req: any, outcome: any) => { await record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }); },
                 fillPaymentCard: async (fill: {
@@ -2840,12 +2857,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   // before a fill attempt is counted against the reservation.
                   const cdpUrl = isRemoteAgentWorld(world) ? WORLD_CDP_URL : localTaskBrowserUrl(args.taskId);
                   const { request, domain } = await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).claimFill({
-                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective, participant,
                   }, fill.requestId);
                   const card = request.cardId ? (await store.getCard(request.cardId)) : undefined;
                   if (!card) throw new Error('secure fill requires a reserved card');
                   if (!(await new BudgetService(store, deps.paymentRegistry ?? deps.payments!).cards({
-                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective,
+                    projectId: args.task.projectId, taskId: args.taskId, capabilities: effective, participant,
                   })).some(c => c.id === card.id)) throw new Error('card is no longer selected for this task');
                   // Any rail that can resolve a card's secret half is fillable; the
                   // mock rail deliberately cannot, because it moves no real money.

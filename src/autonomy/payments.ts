@@ -1,4 +1,6 @@
 import { getDomain } from 'tldts';
+import { participantAuthorization } from '../platform/agent-authority.js';
+import { MAIN_AGENT, participantLabel } from '../domain/participants.js';
 import { allows, attenuate } from '../platform/capabilities.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -950,6 +952,10 @@ export interface SpendCtx {
   /** Optional explicit card attenuation. No use-card capability means all cards
    * visible to the project; once present, only matching cards are eligible. */
   capabilities?: string[];
+  /** Which of the task's agents spends (from its token; absent ⇒ the main
+   * agent). An agent with its own authority spends only from the cards it was
+   * given, and within its own budget as well as the task's. */
+  participant?: string;
 }
 export interface SpendArgs {
   amount: number;
@@ -996,6 +1002,46 @@ export class BudgetService {
     return (await this.store.paymentSpent(taskId, true, currency));
   }
 
+  /** An agent's own payment policy, when its authority sets one. */
+  private async ownPolicy(taskId: string, participant: string | undefined) {
+    if (!participant) return undefined;
+    return participantAuthorization((await this.store.getTask(taskId))?.params, participant)?.paymentPolicy;
+  }
+
+  /**
+   * What one agent may spend: the task's cards narrowed to the agent's own, and
+   * a budget that is the smaller of what is left of the task's and what is left
+   * of the agent's own (which counts only that agent's payments). `budget` and
+   * `spent` are the agent's, so `budget - spent` is exactly what it has left.
+   */
+  async participantPolicy(projectId: string, taskId: string, participant?: string): Promise<PaymentPolicy & { spent: number; own?: true }> {
+    const task = (await this.policy(projectId, taskId));
+    const taskSpent = (await this.spent(taskId, task.currency));
+    const own = (await this.ownPolicy(taskId, participant));
+    if (!own) return { ...task, spent: taskSpent };
+    const cardIds = own.cardIds ? task.cardIds.filter((id) => own.cardIds!.includes(id)) : task.cardIds;
+    if (own.budget === undefined || own.budget === null) return { ...task, cardIds, spent: taskSpent };
+    const spent = (await this.store.paymentSpent(taskId, false, task.currency, participant));
+    // Budgets in two currencies cannot be compared: every spend asks.
+    if (own.currency && own.currency !== task.currency) return { cardIds, budget: spent, currency: task.currency, spent, own: true };
+    const remaining = Math.max(0, Math.min(own.budget - spent, task.budget === null ? Number.MAX_SAFE_INTEGER : task.budget - taskSpent));
+    return { cardIds, budget: spent + remaining, currency: task.currency, spent, own: true };
+  }
+
+  /** An agent's own budget, checked after the task's: over it asks approval. */
+  private async ownBudgetDecision(ctx: SpendCtx, amount: number, currency: string): Promise<SpendDecision | undefined> {
+    const own = (await this.ownPolicy(ctx.taskId, ctx.participant));
+    if (!own || own.budget === undefined || own.budget === null) return undefined;
+    const label = participantLabel(ctx.participant!);
+    if (own.currency && own.currency !== currency)
+      return { status: 'needs_approval', reason: `the ${label}'s ${own.currency.toUpperCase()} budget cannot count this ${currency.toUpperCase()} payment` };
+    const spent = (await this.store.paymentSpent(ctx.taskId, false, currency, ctx.participant));
+    if (spent + amount <= own.budget) return undefined;
+    const code = currency.toUpperCase();
+    const money = (minor: number) => `${formatMinorUnits(minor, code)} ${code}`;
+    return { status: 'needs_approval', reason: `over the ${label}'s budget (${money(spent)} spent + ${money(amount)} > ${money(own.budget)})` };
+  }
+
   /**
    * What is left of the card's ceiling: its cap minus everything already reserved
    * or charged on it. The cap is CUMULATIVE, so this has to be recounted at every
@@ -1014,7 +1060,9 @@ export class BudgetService {
   async cards(ctx: SpendCtx): Promise<Card[]> {
     const visible = (await this.store.listCards(ctx.projectId, ctx.organizationId))
       .filter((card) => card.status !== 'canceled' && card.status !== 'inactive') as Card[];
-    const storedCaps = ((await this.store.getTask(ctx.taskId))?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
+    const params = (await this.store.getTask(ctx.taskId))?.params;
+    const agent = participantAuthorization(params, ctx.participant);
+    const storedCaps = (agent ?? params?._authorization as { capabilities?: string[] } | undefined)?.capabilities;
     const permissions = new PermissionRequests(this.store,
       ctx.organizationId ?? (await this.store.getProject(ctx.projectId))?.organizationId ?? 'org_personal');
     const approved = await permissions.extensionCaps(ctx.taskId);
@@ -1027,7 +1075,8 @@ export class BudgetService {
         ...await permissions.extensionCaps(ancestorId),
       ]);
     }
-    const selected = (await this.policy(ctx.projectId, ctx.taskId)).cardIds;
+    const taskCards = (await this.policy(ctx.projectId, ctx.taskId)).cardIds;
+    const selected = agent?.paymentPolicy?.cardIds ? taskCards?.filter((id) => agent.paymentPolicy!.cardIds!.includes(id)) : taskCards;
     return visible.filter(card => (!selected || selected.includes(card.id))
       && allows(scoped, `use-card:${card.id}`));
   }
@@ -1037,7 +1086,8 @@ export class BudgetService {
       const request = await this.store.getPaymentSpendRequest(requestId);
       if (!request || request.taskId !== ctx.taskId || request.projectId !== ctx.projectId
         || !['authorized', 'settled'].includes(request.status)
-        || request.expiresAt <= Date.now() || request.createdAt + 30 * 60_000 <= Date.now())
+        || request.expiresAt <= Date.now() || request.createdAt + 30 * 60_000 <= Date.now()
+        || (request.participant ?? MAIN_AGENT) !== (ctx.participant ?? MAIN_AGENT))
         throw new Error('payment request is not an active reservation for this task');
       if (!(await this.cards(ctx)).some(card => card.id === request.cardId))
         throw new Error('card is no longer selected for this task');
@@ -1062,6 +1112,7 @@ export class BudgetService {
       ['authorizing', 'pending_approval', 'needs_funding', 'authorized', 'consumed', 'settled'].includes(request.status)
       && (['authorizing', 'pending_approval', 'needs_funding'].includes(request.status) || request.expiresAt > Date.now())
       && request.amount === args.amount
+      && (request.participant ?? MAIN_AGENT) === (ctx.participant ?? MAIN_AGENT)
       && (!args.cardId || request.cardId === args.cardId)
       && (request.merchant ?? undefined) === args.merchant
       && (request.why ?? undefined) === args.why);
@@ -1106,7 +1157,7 @@ export class BudgetService {
       const reason = 'choose a card for this task';
       const pending = (await this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
         taskId: ctx.taskId, amount: args.amount, currency, merchant: args.merchant, why: args.why,
-        status: 'needs_funding', reason, shortfall: args.amount }));
+        status: 'needs_funding', reason, shortfall: args.amount, participant: ctx.participant }));
       return this.result(pending);
     }
     const provider = this.provider(card);
@@ -1124,14 +1175,17 @@ export class BudgetService {
         spent: (await this.spent(ctx.taskId, currency)), available: refreshed.available,
         hardCap: (await this.remainingCap(provider, refreshed)), merchant: args.merchant,
         merchantLock: refreshed.merchantLock });
-      const decision: SpendDecision = comparable || evaluated.status === 'denied' ? evaluated : { status: 'needs_approval',
+      const taskDecision: SpendDecision = comparable || evaluated.status === 'denied' ? evaluated : { status: 'needs_approval',
         reason: `a ${cardCurrency(refreshed).toUpperCase()} card cannot be counted against this ${currency.toUpperCase()} budget` };
+      const decision: SpendDecision = taskDecision.status === 'granted' || taskDecision.status === 'needs_funding'
+        ? (await this.ownBudgetDecision(ctx, args.amount, cardCurrency(refreshed))) ?? taskDecision : taskDecision;
       const status = decision.status === 'granted'
         ? provider.authorizationMode === 'webhook' ? 'authorized' : 'authorizing'
         : decision.status === 'needs_approval' ? 'pending_approval' : decision.status;
       const request = (await this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
         taskId: ctx.taskId, cardId: card.id, amount: args.amount, currency: card.currency,
-        merchant: args.merchant, why: args.why, status, reason: decision.reason, shortfall: decision.shortfall }));
+        merchant: args.merchant, why: args.why, status, reason: decision.reason, shortfall: decision.shortfall,
+        participant: ctx.participant }));
       return { request, created: true };
     }));
     const pending = reserved.request;
@@ -1182,7 +1236,9 @@ export class BudgetService {
     for (const request of pending) {
       const policy = (await this.policy(ctx.projectId, ctx.taskId));
       if (!withinBudget(policy, request, await this.spent(ctx.taskId, policy.currency))) break;
-      if (!(await this.cards(ctx)).some(card => card.id === request.cardId)) break;
+      const requester = { ...ctx, participant: request.participant ?? undefined };
+      if (await this.ownBudgetDecision(requester, request.amount, cardCurrency(request))) break;
+      if (!(await this.cards(requester)).some(card => card.id === request.cardId)) break;
       const result = await this.approve(request.id, 'system:task-budget', true);
       results.push(result);
       if (result.status !== 'granted') break;
@@ -1217,6 +1273,7 @@ export class BudgetService {
         projectId: request.projectId,
         taskId: request.taskId,
         organizationId: request.organizationId,
+        participant: request.participant ?? undefined,
       })).find(candidate => cardCurrency(candidate) === cardCurrency(request));
     if (!card && !request.cardId) {
       const reason = `choose a ${cardCurrency(request).toUpperCase()} card for this task`;
@@ -1226,7 +1283,8 @@ export class BudgetService {
           ? this.store.updatePaymentSpendRequest(request.id, { reason }) : current;
       }));
     }
-    if (card && !(await this.cards({ projectId: request.projectId, taskId: request.taskId, organizationId: request.organizationId })).some(c => c.id === card.id))
+    if (card && !(await this.cards({ projectId: request.projectId, taskId: request.taskId, organizationId: request.organizationId,
+      participant: request.participant ?? undefined })).some(c => c.id === card.id))
       return { status: 'denied', reason: 'card is no longer selected for this task', requestId };
     if (!card) return this.result(await refuse('card no longer exists'));
     if (!request.cardId) (await this.store.setPaymentSpendRequestCard(request.id, card.id, cardCurrency(card)));
@@ -1240,7 +1298,9 @@ export class BudgetService {
         return (await this.store.updatePaymentSpendRequest(request.id, { status: 'denied', reason: 'the task has ended', resolvedBy }));
       const policy = (await this.policy(request.projectId, request.taskId));
       if (onlyWithinBudget && !withinBudget(policy, current, await this.spent(request.taskId, policy.currency))) return current;
-      if (!(await this.cards({ projectId: request.projectId, taskId: request.taskId })).some(c => c.id === card.id)) return current;
+      const requester = { projectId: request.projectId, taskId: request.taskId, participant: request.participant ?? undefined };
+      if (onlyWithinBudget && (await this.ownBudgetDecision(requester, request.amount, cardCurrency(request)))) return current;
+      if (!(await this.cards(requester)).some(c => c.id === card.id)) return current;
       if (refreshed.status === 'canceled' || refreshed.status === 'inactive')
         return (await this.store.updatePaymentSpendRequest(request.id,
           { status: 'denied', reason: 'card is not active', resolvedBy }));
@@ -1308,14 +1368,14 @@ const cardCurrency = (card: { currency?: string | null }) => (card.currency ?? '
  * too large.
  */
 export function paymentPromptContext(cards: Array<{ label: string; id: string; currency?: string | null }>,
-  policy: PaymentPolicy | undefined, spent: number): string {
+  policy: PaymentPolicy | undefined, spent: number, budgetLabel = 'Task budget'): string {
   if (!cards.length) return '';
   const currency = (policy?.currency ?? 'usd').toUpperCase();
   const amount = (minor: number) => `${formatMinorUnits(minor, currency)} ${currency} (amount ${minor})`;
   const scales = [...new Set([currency, ...cards.map(card => cardCurrency(card).toUpperCase())])]
     .map(code => `1 ${code} = ${10 ** minorUnitDigits(code)}`).join('; ');
   return `\n\nPayment cards available to this task: ${JSON.stringify(cards.map(c => ({ name: c.label, id: c.id, currency: cardCurrency(c).toUpperCase() })))}. `
-    + `Task budget: ${policy?.budget == null ? 'unlimited' : amount(policy.budget)}. Spent/reserved: ${amount(spent)}. `
+    + `${budgetLabel}: ${policy?.budget == null ? 'unlimited' : amount(policy.budget)}. Spent/reserved: ${amount(spent)}. `
     + `request_spend amounts are in the card currency's smallest unit (${scales}). `
     + 'Use request_spend with card_name to choose a card. Follow the user’s restrictions on each card. Over-budget payments require approval.';
 }

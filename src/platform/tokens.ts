@@ -58,6 +58,9 @@ export interface ScopedToken {
   profileId: string;
   /** Workflow role running with this token; authorization comes from the task grant. */
   role?: string;
+  /** Which of the task's agents holds it (`do`, `responder`, `confirm-2`,
+   * `agent-3`): its own authority, vault policies, cards and budget apply. */
+  participant?: string;
   principal: string; // the granting user/principal id
   projectId?: string;
   /** A task may be delegated the same level across an explicit project list. */
@@ -89,6 +92,7 @@ export interface MintArgs {
   taskId: string;
   profileId: string;
   role?: string;
+  participant?: string;
   principal: string;
   projectId?: string;
   projectIds?: string[];
@@ -273,6 +277,7 @@ export class TokenAuthority {
       taskId: args.taskId,
       profileId: args.profileId,
       role: args.role,
+      ...(args.participant ? { participant: args.participant } : {}),
       principal: args.principal,
       projectId: args.projectId,
       projectIds: args.projectIds?.length ? [...new Set(args.projectIds)] : undefined,
