@@ -87,6 +87,23 @@ describe('task messages, mentions, notify and escalation (real Temporal + git, m
       .toMatchObject({ role: 'agent', author: 'do', to: ['user:b'] });
   });
 
+  it("a helper agent's escalate_to_human asks people in the thread instead of holding the task", async () => {
+    const p = await project('messages-helper-ask');
+    const task = await h.api.createTask(human, { projectId: p.id, workflow: 'software-dev', prompt: 'Do.\n@write a.txt :: x' });
+    const handle = h.client.workflow.getHandle(task.id);
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    const runId = (await handle.describe()).runId;
+    const helper = (await h.tokens.mint({ taskId: task.id, profileId: 'agent', role: 'agent', participant: 'agent-1', principal: 'user:a',
+      projectId: p.id, ceiling: ['*'], grantorCaps: ['*'] })).token;
+    const asked = await h.api.escalateToHuman(helper, { audience: ['user:b'], message: 'Which region should I test?' }) as any;
+    expect(asked.note).toMatch(/End your turn/);
+    await expect.poll(() => inbox('b', task.id), { timeout: 10_000 }).toContainEqual({ kind: 'mentioned', actionable: true });
+    await expect.poll(async () => (await view(handle)).messages.find((m: any) => m.text === 'Which region should I test?'), { timeout: 10_000 })
+      .toMatchObject({ role: 'agent', author: 'agent-1', to: ['user:b'] });
+    expect((await view(handle)).stage).toBe('review');
+    expect((await handle.describe()).runId).toBe(runId);
+  });
+
   it('escalating a request the task waits on redirects it, without replacing the run', async () => {
     const p = await project('messages-escalate');
     const task = await h.api.createTask(human, { projectId: p.id, workflow: 'software-dev', prompt: 'Which colour?\n@incomplete' });

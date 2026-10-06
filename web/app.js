@@ -1627,7 +1627,9 @@ function cfLayerHtml(f, layer, agentDefault) {
         <button type="button" class="btn sm cf-del" title="Remove this step" aria-label="Remove this step">✕</button>
       </span>
     </div>
-    <div class="cf-agent" ${isAgent ? '' : 'hidden'}>${routeAgentBlock(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}</div>
+    <div class="cf-agent" ${isAgent ? '' : 'hidden'}>${routeAgentBlock(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
+      <label class="cf-max-revisions" title="How many times in a row this Reviewer may send the work back before the Review goes to people. Empty: no limit.">Revise limit
+        <input type="number" min="0" step="1" class="cf-max-revisions-input" placeholder="∞" value="${isAgent && Number.isInteger(layer.maxRevisions) ? layer.maxRevisions : ''}"></label></div>
   </div>`;
 }
 function cfListHtml(f, layers, agentDefault) {
@@ -1664,7 +1666,7 @@ function normAuthority(a) {
 const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
-      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: agentInstructions(l.prompt), resume: l.resumeFrom || null, mcpConnections: l.mcpConnections, authority: l.avatarId ? null : normAuthority(l.authority) }
+      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: agentInstructions(l.prompt), resume: l.resumeFrom || null, mcpConnections: l.mcpConnections, authority: l.avatarId ? null : normAuthority(l.authority), maxRevisions: l.maxRevisions ?? null }
       : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
@@ -1675,7 +1677,9 @@ function readConfirmerLayers(box) {
       const audience = (row.querySelector('.cf-audience')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
       return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
     }
-    return { kind: 'agent', ...readAgentBlock(row.querySelector('.agent-field')) };
+    const limit = row.querySelector('.cf-max-revisions-input')?.value.trim();
+    return { kind: 'agent', ...readAgentBlock(row.querySelector('.agent-field')),
+      ...(limit && Number.isInteger(Number(limit)) && Number(limit) >= 0 ? { maxRevisions: Number(limit) } : {}) };
   });
 }
 
@@ -9834,7 +9838,7 @@ function conversationPane(v, t) {
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="${t.shared ? 'Message the agent · @ to call an agent or person · [[ for wiki' : `Send a follow-up to ${agentName} (drop files here, type [[ for wiki context)`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <textarea class="followup-input" placeholder="${t.shared ? `${defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${participantLabelOf(defaultRecipientFor(v).slice(6), v)}`} · @ to call an agent or person · [[ for wiki` : `Send a follow-up to ${agentName} (drop files here, type [[ for wiki context)`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
@@ -11994,13 +11998,24 @@ function participantListHtml(v) {
     </button>`).join('')}`;
 }
 
+// Whom unaddressed text goes to: the agent that last asked you something (a
+// helper that asked you, say) until you have spoken since — you are replying —
+// else the main agent.
+function defaultRecipientFor(v) {
+  const me = S.user?.id && `user:${S.user.id}`;
+  for (const m of [...(v?.messages || [])].reverse()) {
+    if (m.role === 'user' && (!m.author || m.author === me)) break;
+    if (m.role === 'agent' && m.author && m.author !== 'do' && me && (m.to || []).includes(me)) return `agent:${m.author}`;
+  }
+  return 'agent:do';
+}
 // Recipients of a composed message: text before the first mention also reaches
-// the main agent (first); a message starting with a mention reaches only those.
-function composeRecipients(text, mentions) {
+// the default recipient (first); a message starting with a mention reaches only those.
+function composeRecipients(text, mentions, defaultRecipient = 'agent:do') {
   const ordered = [...mentions].sort((a, b) => a.index - b.index);
   const first = ordered.length ? ordered[0].index : text.length;
   const out = [];
-  if (!ordered.length || text.slice(0, first).trim()) out.push('agent:do');
+  if (!ordered.length || text.slice(0, first).trim()) out.push(defaultRecipient);
   for (const mention of ordered) if (!out.includes(mention.selector)) out.push(mention.selector);
   return out;
 }
@@ -12242,7 +12257,7 @@ function wireFollowups(v) {
         const mentions = shared ? followupMentions(key).map((m) => ({ ...m, index: text.indexOf(m.token) })).filter((m) => m.index >= 0) : [];
         const newAgents = shared ? Object.fromEntries(Object.entries(followupNewAgents(key))
           .filter(([agentKey]) => mentions.some((m) => m.selector === `agent:${agentKey}`))) : {};
-        const to = shared ? composeRecipients(text, mentions) : undefined;
+        const to = shared ? composeRecipients(text, mentions, defaultRecipientFor(v)) : undefined;
         const result = shared
           ? await api(`/api/tasks/${v.taskId}/messages`, { method: 'POST', body: JSON.stringify({ text, to,
               ...(Object.keys(newAgents).length ? { agents: newAgents } : {}),

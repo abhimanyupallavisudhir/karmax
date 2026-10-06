@@ -40,7 +40,8 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     const review = v.messages.find((m: any) => m.author === 'confirm');
     expect(answer.to).toEqual(['agent:do']);
     // Each agent read the others as labelled input, not a template.
-    expect(answer.text).toContain('heard: user: Start. | user: Agent: wrote a.txt');
+    // ... with a digest of what the Agent did on the way.
+    expect(answer.text).toContain('heard: user: Start. | user: Agent: (Wrote a.txt)');
     expect(review.text).toContain('user: Responder: heard:');
     expect(review.text).not.toContain('Recap: the task');
     expect(v.participants.map((p: any) => [p.key, p.label, p.messages])).toEqual([
@@ -60,9 +61,10 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.signal('followUp', { id: 'u-call', role: 'user', author: 'user:ann', authorLabel: 'Ann', ts: Date.now(),
       text: 'Please look.\n@heard', to: ['agent:agent-1'] });
     await expect.poll(async () => authored(await view(handle)), { timeout: 20_000 }).toContain('agent-1');
+    // Its reply lands before the Review wait is restored and republished.
+    await expect.poll(async () => (await view(handle)).status, { timeout: 10_000 }).toBe('waiting');
     const v = await view(handle);
     expect(v.stage).toBe('review');
-    expect(v.status).toBe('waiting');
     expect(v.waitingFor).toMatchObject({ kind: 'human' });
     const reply = v.messages.find((m: any) => m.author === 'agent-1');
     expect(reply.text).toContain('user: Ann: Please look.');
@@ -111,22 +113,40 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.result();
   });
 
-  it('a Reviewer and the Agent do not pass a proposal back and forth forever', async () => {
+  it("a Reviewer's revise limit hands the Review to people after that many rounds in a row", async () => {
     const repo = await h.makeRepo('revise-loop');
     const taskId = newId('task');
     const handle = await start(taskId, {
       ...input({ taskId, repo, title: 'ReviseLoop', prompt: 'Do.\n@write a.txt :: x\n@run git add -A && git commit -qm x' }),
-      confirm: { layers: [{ kind: 'agent', provider: 'mock', prompt: '@confirm revise :: not yet' }] },
+      confirm: { layers: [{ kind: 'agent', provider: 'mock', prompt: '@confirm revise :: not yet', maxRevisions: 3 }] },
     });
     await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 90_000 })
-      .toMatch(/asked for changes 5 times/);
+      .toMatch(/Reviewer asked for changes 3 times/);
     const v = await view(handle);
     expect(v.stage).toBe('review');
     expect(v.waitingFor).toMatchObject({ kind: 'human', audience: ['@creator'] });
-    expect(v.messages.filter((m: any) => m.author === 'confirm')).toHaveLength(5);
+    expect(v.messages.filter((m: any) => m.author === 'confirm')).toHaveLength(3);
     await handle.signal('cancel');
     await handle.result();
   }, 120_000);
+
+  it('an agent called while the Agent is paused runs at once, and the pause goes on', async () => {
+    const repo = await h.makeRepo('paused');
+    const taskId = newId('task');
+    const handle = await start(taskId, input({ taskId, repo, title: 'Paused', prompt: 'Wait for it.\n@pause 6', waitMinuteMs: 2_000 }));
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
+    const until = (await view(handle)).waitingFor.until;
+    await handle.executeUpdate('updateParams', { args: [{ 'agent:agent-1': { provider: 'mock' } }] });
+    await handle.signal('followUp', { id: 'u-paused', role: 'user', ts: Date.now(), text: 'Quick check.\n@heard', to: ['agent:agent-1'] });
+    await expect.poll(async () => authored(await view(handle)), { timeout: 10_000 }).toContain('agent-1');
+    // Still the same pause: the Agent was not resumed early.
+    await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 10_000 }).toMatchObject({ kind: 'timer', until });
+    expect(authored(await view(handle)).filter((a: string) => a === 'do')).toHaveLength(1);
+    // When it ends, the Agent resumes as it would have.
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => /6-minute pause is over/.test(m.text)), { timeout: 30_000 }).toBe(true);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 60_000);
 
   it('escalating a pending request redirects it to other people without interrupting the task', async () => {
     const repo = await h.makeRepo('redirect');

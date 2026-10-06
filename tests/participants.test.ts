@@ -77,3 +77,20 @@ describe('task participants', () => {
     expect(enqueueAgents(['agent-2'], ['confirm', 'agent-2', 'do'], 'do')).toEqual(['agent-2', 'confirm']);
   });
 });
+
+describe('what agents see of each other', () => {
+  it('a digest of another agent\'s work precedes its message', async () => {
+    const { workDigest } = await import('../src/domain/participants.js');
+    expect(workDigest([
+      { kind: 'command', title: 'npm test', phase: 'completed' },
+      { kind: 'file', title: 'Edited src/a.ts', phase: 'completed' },
+      { kind: 'command', title: 'npm run lint', phase: 'failed' },
+      { kind: 'reasoning', title: 'thinking', phase: 'completed' },
+      { kind: 'command', title: 'still going', phase: 'started' },
+    ])).toBe('(ran `npm test`; Edited src/a.ts; ran `npm run lint` ✗)');
+    expect(workDigest([])).toBeUndefined();
+    const thread: Message[] = [msg({ role: 'agent', author: 'confirm', text: 'Looks good.', sourceActivity: { turnId: 't', id: 'x', attempt: 1 } }, 0)];
+    expect(conversationFor(thread, 'do', undefined, () => '(ran `npm test`)')[0]!.text).toBe('Reviewer: (ran `npm test`)\nLooks good.');
+    expect(conversationFor(thread, 'confirm', undefined, () => '(ran `npm test`)')[0]!.text).toBe('Looks good.');
+  });
+});

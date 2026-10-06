@@ -124,13 +124,17 @@ export function composeRecipients(text: string, mentions: Array<{ selector: stri
  * (delivered counts, live-delivery cursors) mean the same in both arrays.
  */
 export function conversationFor(messages: readonly Message[], key: string,
-  labelOf: (participant: string) => string = participantLabel): Message[] {
+  labelOf: (participant: string) => string = participantLabel,
+  workOf?: (m: Message) => string | undefined): Message[] {
   return messages.map((m) => {
     if (m.role === 'system') return m;
     const author = messageAuthor(m);
     if (m.role === 'agent') {
       if (author === key) return m;
-      return { ...m, role: 'user', text: `${labelOf(author!)}: ${m.text}` };
+      // What it did on the way, compactly (commands, edits, tools), so the
+      // thread reads like the one people see, without its full output.
+      const work = workOf?.(m);
+      return { ...m, role: 'user', text: `${labelOf(author!)}: ${work ? `${work}\n` : ''}${m.text}` };
     }
     const speaker = m.authorLabel?.trim();
     const label = speaker && m.author ? `${speaker}: ` : '';
@@ -144,4 +148,19 @@ export function enqueueAgents(queue: readonly string[], keys: readonly string[],
   const out = [...queue];
   for (const key of keys) if (key !== running && !out.includes(key)) out.push(key);
   return out;
+}
+
+/** One line summarising an agent turn's work items for the other agents:
+ * `(ran \`npm test\` ✓; edited src/a.ts; used browser ✗ …)`. */
+export function workDigest(items: ReadonlyArray<{ kind?: string; title?: string; phase?: string }>, max = 30): string | undefined {
+  const done = items.filter((item) => item.title && ['command', 'file', 'tool', 'search', 'subagent'].includes(item.kind ?? '')
+    && (item.phase === 'completed' || item.phase === 'failed'));
+  if (!done.length) return undefined;
+  const clip = (text: string) => (text.length > 120 ? `${text.slice(0, 119)}…` : text);
+  const shown = done.slice(-max).map((item) => {
+    const mark = item.phase === 'failed' ? ' ✗' : '';
+    const title = clip(item.title!.replace(/\s+/g, ' ').trim());
+    return item.kind === 'command' ? `ran \`${title}\`${mark}` : `${title}${mark}`;
+  });
+  return `(${done.length > max ? `… ${done.length - max} earlier steps; ` : ''}${shown.join('; ')})`;
 }

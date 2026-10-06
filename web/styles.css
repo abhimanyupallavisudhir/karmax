@@ -3206,3 +3206,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .resource-defaults { display: grid; gap: 8px; }
 .resource-defaults .resource-reset { justify-self: start; }
 @media (max-width: 700px) { .parameter-fields .agent-controls:has(.pf-maxturns) { grid-template-columns: 1fr; } }
+
+.cf-max-revisions { display: inline-flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
+.cf-max-revisions input { width: 72px; }

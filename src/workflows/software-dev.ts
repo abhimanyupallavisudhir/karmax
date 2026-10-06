@@ -902,10 +902,10 @@ async function softwareDevImpl(
   /** Who last called each agent, so its reply goes back to them. */
   const calledBy: Record<string, string> = { ...continued?.participants?.calledBy };
   let runningParticipant: string | undefined;
-  /** Reviewer "revise" rounds since a person last spoke: two agents must not
-   * pass a proposal back and forth forever without anyone deciding. */
-  let automatedRevisions = 0;
-  const MAX_AUTOMATED_REVISIONS = 5;
+  /** Reviewer "revise" rounds in a row since a person last spoke, per
+   * Reviewer: a layer's `maxRevisions` stops two agents passing a proposal
+   * back and forth without anyone deciding. */
+  let automatedRevisions: Record<string, number> = { ...continued?.participants?.revisions };
   /** A redirect of the request a Responder agent is answering (v1.27 `reroute`). */
   let pendingReroute: { audience: string[]; detail?: string } | undefined;
   /** Whether anything after `from` calls the main agent. Before 1.27 every
@@ -1455,12 +1455,13 @@ async function softwareDevImpl(
         if (layerIndex >= gates.length) break;
         const layer = gates[layerIndex]!;
         const gateDetail = gates.length > 1 ? `confirm layer ${layerIndex + 1}/${gates.length}` : undefined;
-        const revisionBound = multiAgent && layer.kind === 'agent' && automatedRevisions >= MAX_AUTOMATED_REVISIONS;
+        const reviewer = reviewerKey(gates.slice(0, layerIndex).filter((candidate) => candidate.kind === 'agent').length);
+        const revisionBound = multiAgent && layer.kind === 'agent' && layer.maxRevisions !== undefined
+          && (automatedRevisions[reviewer] ?? 0) >= layer.maxRevisions;
         if (layer.kind === 'agent' && !revisionBound) {
           waitingFor = { kind: 'confirm', ...(gateDetail ? { detail: gateDetail } : {}) };
           await publish();
-          const decision = await confirmTurn(layer,
-            reviewerKey(gates.slice(0, layerIndex).filter((candidate) => candidate.kind === 'agent').length));
+          const decision = await confirmTurn(layer, reviewer);
           waitingFor = undefined;
           if (cancelled) return 'cancelled';
           if (confirmEpoch !== epoch) { layerIndex = 0; continue; }
@@ -1474,7 +1475,7 @@ async function softwareDevImpl(
             return 'cancelled';
           }
           if (decision?.action === 'revise') {
-            automatedRevisions++;
+            automatedRevisions = { ...automatedRevisions, [reviewer]: (automatedRevisions[reviewer] ?? 0) + 1 };
             if (!multiAgent) msgs.push({
               id: `cv-${msgs.length}`, role: 'user',
               text: decision.text || 'Please revise the work per the reviewer feedback.', ts: msgs.length,
@@ -1485,7 +1486,7 @@ async function softwareDevImpl(
         if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
         waitingFor = {
           kind: 'human',
-          ...(revisionBound ? { detail: `The Reviewer asked for changes ${automatedRevisions} times in a row. Confirm, or send guidance.` }
+          ...(revisionBound ? { detail: `${participantLabel(reviewer)} asked for changes ${automatedRevisions[reviewer]} times in a row. Confirm, or send guidance.` }
             : gateDetail ? { detail: gateDetail } : {}),
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'],
         };
@@ -1603,7 +1604,7 @@ async function softwareDevImpl(
         responderRounds = 0;
         subtaskNags = 0;
       }
-      if (message.role === 'user') automatedRevisions = 0;
+      if (message.role === 'user') automatedRevisions = {};
       whenLoaded(() => {
         if (msgs.some((candidate) => candidate.id === message.id)) return;
         msgs.push({ ...message, ts: message.ts || msgs.length });
@@ -1661,7 +1662,7 @@ async function softwareDevImpl(
     await landingWatcher?.signal('providerChanged').catch(() => undefined);
   });
   setHandler(confirmSignal, () => {
-    automatedRevisions = 0;
+    automatedRevisions = {};
     if (awaitingResourceDecision) return;
     if (stage === 'escalated' && escalationAction) {
       if (escalationAction === 'confirm') manualEscalationRequested = true;
@@ -3209,7 +3210,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         ...(escalationAction ? { escalationAction } : {}),
         ...(error ? { error } : {}),
         counters: { responderRounds, subtaskNags, subagentNudges, shellNudges, landingWatchSequence, resourceReviewSequence },
-        ...(multiAgent ? { participants: { sessions: participantSessions, queue: agentQueue, calledBy } } : {}),
+        ...(multiAgent ? { participants: { sessions: participantSessions, queue: agentQueue, calledBy, revisions: automatedRevisions } } : {}),
       },
     } };
   }
@@ -3571,8 +3572,10 @@ Inspect the complete current diff and specifically compare its delta from the re
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
         // A Needs input hold offers Open PR, like any input hold in Do (and a parent may send it).
         interrupted: () => cancelled || mainUnread() || raises.length > 0 || settled.length > 0
-          || (multiAgent && agentQueue.length > 0)
           || (!!needsInput && prRequested),
+        // Agents called while the main agent is paused run now; its pause goes
+        // on unless what they say is for it.
+        ...(multiAgent ? { serveable: () => agentQueue.length > 0 && !cancelled, serve: runCalledAgents } : {}),
       });
       if (cancelled) return await abort();
       if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });

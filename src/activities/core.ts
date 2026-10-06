@@ -1,5 +1,5 @@
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
-import { conversationFor } from '../domain/participants.js';
+import { conversationFor, workDigest } from '../domain/participants.js';
 import { createHash } from 'node:crypto';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
@@ -497,6 +497,18 @@ export async function ownSubTaskResponses(store: Pick<Store, 'getTask'>, taskId:
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
+  /** For a Reviewer choosing between attempts: the other attempts, and how to
+   * compare them without leaving its own conversation. */
+  const siblingAttemptsContext = async (taskId: string): Promise<string> => {
+    const group = await store.attemptGroup(taskId);
+    const others = (group?.attempts ?? []).filter((attempt) => attempt.id !== taskId);
+    if (!others.length) return '';
+    const lines = others.map((attempt) => {
+      const view = attempt.lastView;
+      return `- ${attempt.num ? `#${attempt.num} ` : ''}${attempt.id}: ${view ? `${view.stage}/${view.status}` : 'not started'}${view?.branch ? `, branch ${view.branch}` : ''}`;
+    });
+    return `\nThe other attempts:\n${lines.join('\n')}\nCompare them before choosing: get_conversation(task_id) shows an attempt's conversation, and import_task_branch(task_id) fetches its branch so you can diff it against this one.`;
+  };
   const turnProfile = async (task: TaskInput, role: AgentRole, explicitProfileId?: string) => {
     const base = (await profiles.resolve(role, task.profiles, explicitProfileId, task.projectId));
     const avatar = (await avatarForRole(store, task, role));
@@ -1869,7 +1881,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // One conversation, read as this agent hears it: its own replies stay its
       // own, everyone else's are labelled input (participants.ts). Historical
       // roles keep their own transcripts (and the shared confirmer transcript).
-      const ownView = sharedConversation ? conversationFor(args.messages, speaker) : args.messages;
+      // Each other agent's message carries a digest of what it did on the way,
+      // read for just the turns this agent is about to be handed.
+      let workOf: ((m: Message) => string | undefined) | undefined;
+      if (sharedConversation) {
+        const handed = args.session ? args.messages.slice(args.deliveredMessages ?? 0) : args.messages;
+        const turns = new Set(handed.filter((m) => m.role === 'agent' && (m.author ?? 'do') !== speaker && m.sourceActivity)
+          .map((m) => m.sourceActivity!.turnId));
+        if (turns.size) {
+          const byTurn = new Map<string, Map<string, { kind?: string; title?: string; phase?: string }>>();
+          for (const event of (await store.eventsOfType(args.taskId, 'agent.activity'))) {
+            const item = event.payload as { turnId?: string; id?: string; kind?: string; title?: string; phase?: string };
+            if (!item.turnId || !turns.has(item.turnId) || !item.id) continue;
+            const items = byTurn.get(item.turnId) ?? new Map();
+            items.set(item.id, item);
+            byTurn.set(item.turnId, items);
+          }
+          workOf = (m) => m.sourceActivity ? workDigest([...(byTurn.get(m.sourceActivity.turnId)?.values() ?? [])]) : undefined;
+        }
+      }
+      const ownView = sharedConversation ? conversationFor(args.messages, speaker, undefined, workOf) : args.messages;
       let messages = ownView;
       let deliveredMessages = args.deliveredMessages;
       let fork = false; // true → the adapter branches a NEW session id from `session`
@@ -2419,6 +2450,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? `\n\nThis task has ${attemptGroup.attempts} attempts. Other attempts: ${attemptGroup.otherAttempts ?? (await store.otherAttemptsDefault(args.taskId))}. `
           + (args.role === 'confirm' && !attemptGroup.committedAttemptId
             ? 'When accepting, set otherAttempts in confirm_decision to keep or cancel. Keep allows complementary proposals to continue and merge; cancel stops the alternatives. Follow an explicit project default; otherwise decide based on the value of the alternatives.'
+              + (sharedConversation ? await siblingAttemptsContext(args.taskId) : '')
             : 'If other attempts are kept, integrate against the latest target and assess combined behavior, redundant changes, and incompatible assumptions, as well as textual conflicts. Validate the combined result.')
         : '';
       const paymentService = deps.payments ? new BudgetService(store, deps.paymentRegistry ?? deps.payments) : undefined;
@@ -2471,7 +2503,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Confirm turns for sibling attempts share one durable transcript and run
       // serially. Fresh provider sessions replay that canonical transcript, which
       // also works across account/config-home rotation (native sessions are home-bound).
-      const releaseConfirm = args.role === 'confirm' && !sharedConversation ? await acquireConfirmLock(conversationTaskId, signal) : () => {};
+      // Reviews of an intent's attempts run one at a time, so their keep/cancel
+      // choices cannot race (each attempt's Reviewer now reads its own thread).
+      const releaseConfirm = args.role === 'confirm'
+        ? await acquireConfirmLock(sharedConversation ? (args.task.intentId ?? args.taskId) : conversationTaskId, signal) : () => {};
       let confirmTranscript: Message[] | undefined;
       if (args.role === 'confirm' && !sharedConversation) {
         let shared: Message[];

@@ -192,6 +192,7 @@ export function assembleTaskInput(
                   ...(l.mcpConnections !== undefined ? { mcpConnections: l.mcpConnections } : {}),
                   ...(l.resumeFrom ? { resumeFrom: l.resumeFrom } : {}),
                   ...(l.prompt?.trim() ? { prompt: l.prompt } : {}),
+                  ...(Number.isInteger(l.maxRevisions) && l.maxRevisions! >= 0 ? { maxRevisions: l.maxRevisions } : {}),
                   ...agentIdentity(l),
                 }
               : { kind: l.kind, audience: l.audience?.length ? [...l.audience] : ['@creator'] },

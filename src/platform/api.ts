@@ -3586,6 +3586,17 @@ export class KarmaxApi {
     const taskId = args.taskId ?? (caller.taskId !== '*' ? caller.taskId : undefined);
     if (!taskId) throw new Error('taskId is required for a non-task caller');
     const task = (await this.deps.store.getTask(taskId));
+    // Another of the task's agents (a helper called in with @, the Responder, a
+    // Reviewer) asking people does not hold the task the main agent is driving:
+    // it asks them in the conversation, and their reply calls it back.
+    if (task && caller.taskId === taskId && caller.participant && caller.participant !== MAIN_AGENT && this.sharedConversation(task)
+      && task.lastView?.waitingFor?.kind !== 'responder') {
+      const audience = args.audience?.length ? args.audience : ['@creator'];
+      const posted = await this.postTaskMessage(token, taskId, { text: args.message, to: audience,
+        ...(args.urgency ? { urgency: args.urgency } : {}) });
+      return { ...(task.lastView as TaskView), asked: posted.notified,
+        note: `Asked ${posted.notified.join(', ')} in the conversation. End your turn; their reply calls you back.` } as TaskView;
+    }
     // A task agent escalates its own task's requests, and those its sub-tasks
     // routed to it (it is their default audience).
     if (caller.taskId !== '*' && caller.taskId !== taskId && task?.parentTaskId !== caller.taskId)

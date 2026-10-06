@@ -40,7 +40,7 @@ global.S = {
     { seq: 3, ts: 1710000003000, type: 'agent.activity', payload: { role: 'confirm', participant: 'confirm', turnId: 't3', id: 'diff', kind: 'command', phase: 'completed', title: 'git diff' } },
   ],
 };
-for (const fn of ['sharedConversation', 'participantLabelOf', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'composeRecipients',
+for (const fn of ['defaultRecipientFor', 'sharedConversation', 'participantLabelOf', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'composeRecipients',
   'nextAgentKeyFor', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'renderConversationEntry']) eval(extractFn(fn));
 
 const view = {
@@ -91,5 +91,13 @@ assert.strictEqual(participantLabelOf('agent-3', view), 'Agent 3');
 // Historical tasks keep their per-role transcripts.
 const legacy = { taskId: 't', messages: [], transcripts: [{ role: 'do', label: 'Do agent', messages: [] }, { role: 'confirm', label: 'Confirm agent', messages: [] }] };
 assert.deepStrictEqual(taskTranscripts(legacy).map((t) => t.role), ['do', 'confirm']);
+
+// Unaddressed text replies to the helper that asked you, until you have spoken.
+const asked = { participants: view.participants, messages: [
+  { id: 'q', role: 'agent', author: 'agent-3', to: ['user:user-1'], text: 'Which region?', ts: 1 }] };
+assert.strictEqual(defaultRecipientFor(asked), 'agent:agent-3');
+asked.messages.push({ id: 'r', role: 'user', author: 'user:user-1', text: 'EU', ts: 2 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
+assert.deepStrictEqual(composeRecipients('EU', [], 'agent:agent-3'), ['agent:agent-3']);
 
 console.log('shared-conversation: ok');

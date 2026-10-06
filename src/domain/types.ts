@@ -1539,6 +1539,10 @@ export interface ConfirmLayer extends Partial<AgentSpec> {
    * @project, @team:<slug>, user:<id>, and legacy team:<id>. Multiple selectors mean any matching
    * person may satisfy this layer; use sequential layers for sequential gates. */
   audience?: HumanAudience;
+  /** Agent layers: how many times in a row this Reviewer may send the work
+   * back ("revise") with no person speaking before the Review goes to the
+   * task's people instead. Absent ⇒ no limit. */
+  maxRevisions?: number;
   /** Agent layers: the review-request message template sent each time the task
    *  reaches Review — optional instructions/guidance ("ensure X, Y and Z"), with
    *  {{prompt}} / {{response}} placeholders for the task prompt and the Do agent's
@@ -1914,6 +1918,8 @@ export interface TaskContinuation {
     sessions: Record<string, { session?: string; home?: string; seen: number }>;
     queue: string[];
     calledBy?: Record<string, string>;
+    /** Reviewer "revise" rounds in a row since a person last spoke. */
+    revisions?: Record<string, number>;
   };
 }
 
