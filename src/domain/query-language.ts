@@ -11,6 +11,8 @@
  *   is:draft  is:open  has:pr    facets (boolean-ish predicates)
  *   conversation:"merge conflict"   quotes keep a multi-word clause value together
  *   label:frontend               'label' is an alias for 'tag' (parent matches children)
+ *   for:me  for:"Ana Lima"       what waits on a person (live asks + their drafts)
+ *   project:website-redesign     project id, slug or name (the organization list)
  *   sort:priority-desc  sort:-created   sort directive
  *   group:status                 grouping directive
  *   "multi word"  free text      anything not a known field becomes full-text

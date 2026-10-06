@@ -37,6 +37,7 @@ const S = {
   organizationId: 'org_acme',
   projectId: 'P1',
   search: '',
+  searchScope: 'P1',
   tasks: [{ id: 'T9', projectId: 'P1', num: 42 }],
   // The field registry the query parser consults (a trimmed copy of the server's).
   fields: [
@@ -50,6 +51,7 @@ const S = {
 global.S = S;
 
 eval(extractConst('TASK_TABS'));
+eval(extractConst('DEFAULT_LIST_QUERY'));
 eval(extractConst('ORG_VIEWS'));
 eval(extractConst('PROJECT_SCOPED_TABS'));
 eval(extractConst('BUILTIN_VIEWS'));
@@ -63,6 +65,9 @@ eval(extractFn('orgBase'));
 eval(extractFn('parseRoute'));
 eval(extractFn('projectBase'));
 eval(extractFn('projectRoute'));
+eval(extractFn('listRoute'));
+eval(extractFn('homeRoute'));
+eval(extractFn('isTaskListTab'));
 eval(extractFn('globalRoute'));
 eval(extractFn('encodeQuery'));
 eval(extractFn('taskRecord'));
@@ -71,6 +76,7 @@ eval(extractFn('stringifyQuery'));
 eval(extractFn('parseQueryClient'));
 eval(extractFn('normalizeQuery'));
 eval(extractConst('ALL_VIEW'));
+eval(extractConst('FOR_ME_VIEW'));
 eval(extractFn('viewIdForQuery'));
 global.location = { pathname: '/', search: '' };
 
@@ -82,7 +88,8 @@ const eq = (actual, expected, msg) => {
 };
 
 // ── the query is in the URL ──────────────────────────────────────────────────
-eq(parseRoute('/acme/website-redesign').q, '', 'a bare list URL carries no query');
+eq(parseRoute('/acme/website-redesign').q, 'for:me', 'a bare list URL is the default view: what waits on you');
+eq(parseRoute('/acme/website-redesign?q=').q, '', 'an empty ?q= is "All"');
 eq(parseRoute('/acme/website-redesign?q=status:active+tag:bug').q, 'status:active tag:bug',
   'the ?q= param is the working query ("+" decodes back to a space)');
 eq(parseRoute('/acme/website-redesign?q=group%3Atag-type').q, 'group:tag-type', 'percent-encoded queries decode too');
@@ -93,7 +100,8 @@ eq(parseRoute('/acme/website-redesign/tasks/42?q=x').taskKey, '42', 'nor a task 
 // ── URL builders carry it ────────────────────────────────────────────────────
 eq(projectRoute('P1', 'tasks', 'status:active tag:bug'), '/acme/website-redesign?q=status:active+tag:bug',
   'an explicit query is appended, readably');
-eq(projectRoute('P1', 'tasks', ''), '/acme/website-redesign', 'an empty query adds no param');
+eq(projectRoute('P1', 'tasks', 'for:me'), '/acme/website-redesign', 'the default query adds no param');
+eq(projectRoute('P1', 'tasks', ''), '/acme/website-redesign?q=', '"All" is a bookmarkable, empty ?q=');
 eq(projectRoute('P1', 'queue', 'status:active'), '/acme/website-redesign/queue',
   'only the tasks list is query-driven; other tabs stay clean');
 S.search = 'group:tag-type';
@@ -116,6 +124,7 @@ for (const q of [
 // ── the selected view chip is derived from the query ─────────────────────────
 eq(viewIdForQuery(''), '__all__', 'the empty query is the “All” view');
 eq(viewIdForQuery('   '), '__all__', 'whitespace only is still “All”');
+eq(viewIdForQuery('for:me'), '__for_me__', 'for:me is the “For me” view');
 eq(viewIdForQuery('group:tag-type'), 'builtin:sectioned-type', 'a built-in view is recognised from its query');
 eq(viewIdForQuery('sort:nextRun-asc is:scheduled'), 'builtin:scheduled', 'token order does not matter');
 eq(viewIdForQuery('tag:bug'), 'V1', 'a saved view is recognised from its stringified query');
@@ -140,6 +149,8 @@ const activeChips = (q) => {
 eq(activeChips('tag:bug'), ['V1'], 'a URL naming a saved view’s query lights that chip');
 eq(activeChips('sort:nextRun-asc is:scheduled'), ['builtin:scheduled'], 'and a built-in view’s, whatever the token order');
 eq(activeChips(''), ['__all__'], 'an empty query lights “All”');
+eq(activeChips('for:me'), ['__for_me__'], 'the default query lights “For me”');
+ok(viewsBar().indexOf('__for_me__') < viewsBar().indexOf('__all__'), '“For me” comes first, then “All”');
 eq(activeChips('tag:bug priority:>=2'), [], 'an ad-hoc query lights nothing');
 S.search = '';
 
@@ -190,7 +201,18 @@ eval(extractFn('setQuery'));
   eq(nav.length, before, 'an unchanged query writes no new history entry');
 
   await setQuery('');
-  eq(currentPath(), '/acme/website-redesign', 'clearing the search clears the param — no dangling ?q=');
+  eq(currentPath(), '/acme/website-redesign?q=', 'clearing the search is "All" — kept in the URL so it survives a reload');
+  await setQuery('for:me');
+  eq(currentPath(), '/acme/website-redesign', 'the default view needs no param');
+
+  // The organization home owns its own query in the same way.
+  Object.assign(S, { tab: 'home', searchScope: 'org:org_acme' });
+  await setQuery('project:website-redesign');
+  eq(currentPath(), '/acme?q=project:website-redesign', 'a home search is the home URL');
+  eq(projectRoute('P1'), '/acme/website-redesign', 'and does not leak into the project\'s links');
+  await setQuery('for:me');
+  eq(currentPath(), '/acme', 'the home\'s default view is the bare organization path');
+  Object.assign(S, { tab: 'tasks', searchScope: 'P1' });
 
   // Only the tasks list is query-driven: nothing else may hijack the URL.
   S.search = 'tag:bug';

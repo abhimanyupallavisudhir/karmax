@@ -51,7 +51,6 @@ describe('default organization browser behavior', () => {
     const organizations = extractFunction('loadOrganizations');
     const profile = extractFunction('profileView');
     const wiring = extractFunction('wireProfileView');
-    const routing = extractFunction('applyRoute');
     const tabSwitch = extractFunction('switchTab');
 
     expect(organizations).toContain("api('/api/user/default-organization')");
@@ -62,9 +61,23 @@ describe('default organization browser behavior', () => {
     expect(profile).toContain('S.defaultOrganizationId');
     expect(wiring).toContain("method: 'PUT'");
     expect(wiring).toContain("toast('Default organization updated')");
-    expect(routing).toContain('firstProjectForOrganization(S.organizationId)');
-    expect(routing).not.toContain('S.projects[0]?.id');
     expect(tabSwitch).toContain('firstProjectForOrganization(S.organizationId)');
+  });
+
+  it('lands the root URL on the default organization\'s home, not on the first project anywhere', async () => {
+    const state: any = {
+      organizationId: 'personal', defaultOrganizationId: 'personal', projectId: null,
+      organizations: [{ id: 'new-team', slug: 'team' }, { id: 'personal', slug: 'mine' }],
+      projects: [{ id: 'other-project', organizationId: 'new-team', name: 'Other' }],
+    };
+    const went: string[] = [];
+    const helpers = ['slugify', 'orgSlug', 'organizationById', 'projectById', 'currentOrg', 'orgBase', 'encodeQuery',
+      'listRoute', 'homeRoute', 'globalRoute', 'applyRoute'].map(extractFunction).join('\n');
+    const applyRoute = Function('S', 'go', 'parseRoute', 'currentPath', 'location', 'DEFAULT_LIST_QUERY',
+      `${helpers}; return applyRoute;`)(state, (to: string) => { went.push(to); }, () => ({ name: 'home' }), () => '/',
+      { pathname: '/' }, 'for:me');
+    await applyRoute();
+    expect(went).toEqual(['/mine']);
   });
 });
 
