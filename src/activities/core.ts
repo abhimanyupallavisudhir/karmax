@@ -67,7 +67,9 @@ import {
   GithubApiError,
   GithubPrApi,
   githubSlug,
+  upstreamPullRequestUrl,
   type GithubPrApiOptions,
+  type GithubPullRequest,
   type GithubPullRequestReadiness,
 } from '../integrations/github-pr.js';
 import {
@@ -113,7 +115,7 @@ import { assembleTaskInput } from '../platform/params.js';
 import { subTaskParams } from '../platform/agent-params.js';
 import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type SubTaskRequest, type SubTaskResponse, type WorldHandleRef } from '../domain/types.js';
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type WorldHandleRef } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -315,6 +317,21 @@ function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoN
     bounded += suffix;
   }
   return bounded + provenance;
+}
+
+/** A proposal to someone else's repository carries only what its maintainers
+ * need: the change's description, without this deployment's task references. */
+function upstreamPrBody(details: OpenPrDetails, title: string): string {
+  const summary = details.summary?.trim() || title;
+  return summary.length > 60_000 ? `${summary.slice(0, 60_000)}\n… (summary truncated)` : summary;
+}
+
+function upstreamRef(repo: string, slug: string, headRepository: string, pr: GithubPullRequest): TaskPullRequest {
+  return {
+    repo, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged, headRepository,
+    ...(pr.headSha ? { headSha: pr.headSha } : {}),
+    ...(pr.nodeId ? { nodeId: pr.nodeId } : {}),
+  };
 }
 
 export interface CreateWorldArgs {
@@ -843,6 +860,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const candidate = await enrolledRepositoryForCheckout(handle, checkout);
       if (`${candidate?.owner}/${candidate?.name}`.toLowerCase() === slug.toLowerCase()) repository = candidate;
     }
+    if (!repository && (await enrolledForkOf(projectId, slug))) return (await upstreamPrApi(handle, slug)).api;
     // Connected development uses the SAME deployment App in two distinct
     // capacities: its installation owns repository transport, while this
     // per-user OAuth grant makes the PR attributable to the task creator.
@@ -877,11 +895,39 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     );
   }
 
+  /** The fork enrolled in this project whose upstream is `slug`. */
+  async function enrolledForkOf(projectId: string | undefined, slug: string): Promise<Repository | undefined> {
+    if (!projectId) return undefined;
+    return (await store.listProjectRepositories(projectId)).map((entry) => entry.repository)
+      .find((candidate) => candidate.upstream
+        && `${candidate.upstream.owner}/${candidate.upstream.name}`.toLowerCase() === slug.toLowerCase());
+  }
+
+  /** Pull-request access to the upstream of an enrolled fork. The App is not
+   * installed there, so no App token can write to it: opening or editing the
+   * pull request needs the person's own GitHub token (a Git profile token, or
+   * the host login for organization automation). Without one their App
+   * authorization still reads it, which GitHub allows for public repositories. */
+  async function upstreamPrApi(handle: WorldHandle, slug: string): Promise<{ api: GithubPrApi; canWrite: boolean }> {
+    const personal = await githubTokenFor(handle, slug);
+    if (personal) return { api: new GithubPrApi(personal, deps.githubPr ?? {}), canWrite: true };
+    const userId = (await store.taskCreatorUserId(handle.id));
+    const accountId = (await taskGithubAccountId(handle.id)) ?? (userId ? (await activeGithubAccountId(userId)) : undefined);
+    if (userId && (await deps.githubApp?.status(userId))?.userAuthorized) {
+      return { api: new GithubPrApi(
+        (options) => deps.githubApp!.userAccessToken(userId, { ...options, ...(accountId ? { accountId } : {}) }),
+        deps.githubPr ?? {},
+      ), canWrite: false };
+    }
+    throw new Error(`GitHub identity is not connected for ${slug}. Connect GitHub on your profile so ${BRAND} can follow the pull request, then retry.`);
+  }
+
   /** Each world repo that a pull request can be opened against. A repo without
    *  a GitHub origin is recorded and skipped — a project may legitimately mix a
-   *  GitHub repo with a local-only one. */
+   *  GitHub repo with a local-only one. A fork's pull request belongs to its
+   *  upstream, with the head in the fork (`headRepository`). */
   async function githubPrTargets(world: World, handle: WorldHandle):
-  Promise<{ repo: ReturnType<typeof worldRepos>[number]; slug: string; api: GithubPrApi }[]> {
+  Promise<{ repo: ReturnType<typeof worldRepos>[number]; slug: string; api: GithubPrApi; headRepository?: string; canWrite?: boolean }[]> {
     const targets = [];
     for (const repo of worldRepos(world.handle)) {
       // The *configured* origin URL, not `remote get-url`: that one applies the
@@ -891,6 +937,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const slug = githubSlug(worldRepoSource(repo)) ?? (origin.code === 0 ? githubSlug(origin.stdout.trim()) : undefined);
       if (!slug) {
         (await record(handle.id, 'pr.skipped', { repo: repo.name, reason: 'no GitHub origin remote' }));
+        continue;
+      }
+      const fork = await enrolledRepositoryForCheckout(handle, repo);
+      if (fork?.upstream) {
+        const upstream = `${fork.upstream.owner}/${fork.upstream.name}`;
+        targets.push({ repo, slug: upstream, headRepository: `${fork.owner}/${fork.name}`,
+          ...(await upstreamPrApi(handle, upstream)) });
         continue;
       }
       targets.push({ repo, slug, api: await prApiFor(handle, slug, repo) });
@@ -1512,6 +1565,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (sourceResolutions[index]?.localPath) return;
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
             return;
+          }
+          // A fork starts from its upstream's current state, not from whenever
+          // it was last synced. Best effort: a diverged fork keeps its branch.
+          if (repository.upstream && typeof deps.githubApp?.syncFork === 'function') {
+            const branch = repositoryBranches[source]?.base ?? args.base;
+            const synced = await deps.githubApp.syncFork(repository, branch)
+              .catch((error) => ({ synced: false, detail: error instanceof Error ? error.message : String(error) }));
+            (await record(args.taskId, 'repository.fork-synced', {
+              repository: `${repository.owner}/${repository.name}`,
+              upstream: `${repository.upstream.owner}/${repository.upstream.name}`, branch, ...synced,
+            }));
           }
           if (deps.githubApp) httpsTokens[source] = await deps.githubApp.repositoryCloneToken(repository);
         });
@@ -3747,7 +3811,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const changed: Array<(typeof targets)[number] & { base: string }> = [];
-      for (const { repo, slug, api } of targets) {
+      for (const candidate of targets) {
+        const { repo } = candidate;
         // A checkout whose base is a SIBLING's branch is a stacked pull request:
         // open it against that branch so GitHub renders the stack and its diff
         // shows only this branch's own change, not the base's as well.
@@ -3766,7 +3831,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           (await record(handle.id, 'pr.skipped', { repo: repo.name, reason: `no commits ahead of ${base}` }));
           continue;
         }
-        changed.push({ repo, slug, api, base });
+        changed.push({ ...candidate, base });
       }
       // No committed proposal is a successful PR no-op, even when EVERY checkout
       // is unchanged. Historical workflow pins (notably softwareDev@1.10.0) can
@@ -3778,7 +3843,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // the protected-target merge invariant.
       const pushed = await pushTaskBranches(world, handle, (await gitEnvFor(handle, handle.id)), changed.map(({ repo }) => repo));
       const opened: TaskPullRequest[] = [];
-      for (const { repo, slug, api, base } of changed) {
+      for (const { repo, slug, api, base, headRepository, canWrite } of changed) {
         if (!pushed.pushed.includes(repo.name)) {
           const pushError = pushed.errors?.[repo.name] ?? '';
           if (isGithubWorkflowPermissionRejection(pushError)) {
@@ -3804,6 +3869,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
           throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to origin`
             + `${pushError ? `: ${pushError}` : ''}`);
+        }
+        if (headRepository) {
+          // The branch is in the fork now. A pull request to someone else's
+          // repository is opened only after Review (proposeUpstream); one that
+          // already exists follows the branch and is adopted here.
+          const title = details.title?.trim() || `${BRAND}: ${repo.branch}`;
+          const existing = await api.findByHead(slug, repo.branch, headRepository.split('/')[0]);
+          if (!existing || existing.merged) {
+            (await record(handle.id, 'pr.upstream-pending', { repo: repo.name, slug, headRepository, base }));
+            continue;
+          }
+          const live = canWrite && existing.state === 'open'
+            ? await api.update(slug, existing.number, { title, body: upstreamPrBody(details, title) }).catch(() => existing)
+            : existing;
+          const ref = upstreamRef(repo.name, slug, headRepository, live);
+          (await record(handle.id, 'pr.updated', { ...ref, base }));
+          opened.push(ref);
+          continue;
         }
         let opening: Awaited<ReturnType<typeof api.openOrUpdate>>;
         try {
@@ -3835,6 +3918,59 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         opened.push(ref);
       }
       return opened;
+    },
+
+    /**
+     * Propose a reviewed fork branch to its upstream (software-dev 1.28): the
+     * step between Review and Landing for repositories someone else owns. It
+     * adopts a pull request that already exists, opens one when the person's
+     * own GitHub token allows it, and otherwise returns GitHub's prefilled
+     * "Open a pull request" page for them. Idempotent, like openPr.
+     */
+    async proposeUpstream(ref: WorldHandleRef, target: string, details: OpenPrDetails = {}): Promise<UpstreamProposal> {
+      const handle = ref as WorldHandle;
+      const world = await openWorld(handle);
+      const targets = (await githubPrTargets(world, handle)).filter((candidate) => candidate.headRepository);
+      const changed: Array<(typeof targets)[number] & { base: string }> = [];
+      for (const candidate of targets) {
+        const base = worldRepoTarget(candidate.repo, target);
+        const ahead = await commitsAheadOfPrBase(world, candidate.repo, base);
+        if (ahead.code !== 0) {
+          throw new Error(`could not compare branch "${candidate.repo.branch}" of repo "${candidate.repo.name}" with "${base}":`
+            + ` ${ahead.stderr || ahead.stdout || 'git rev-list failed'}`);
+        }
+        if (ahead.stdout.trim() !== '0') changed.push({ ...candidate, base });
+      }
+      if (!changed.length) return { prs: [], pending: [] };
+      const pushed = await pushTaskBranches(world, handle, (await gitEnvFor(handle, handle.id)), changed.map(({ repo }) => repo));
+      const result: UpstreamProposal = { prs: [], pending: [] };
+      for (const { repo, slug, api, base, headRepository, canWrite } of changed) {
+        if (!pushed.pushed.includes(repo.name)) {
+          throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to its fork ${headRepository}`
+            + `${pushed.errors?.[repo.name] ? `: ${pushed.errors[repo.name]}` : ''}`);
+        }
+        const title = changed.length > 1
+          ? `${details.title?.trim() || BRAND} (${repo.name})`
+          : details.title?.trim() || `${BRAND}: ${repo.branch}`;
+        const body = upstreamPrBody(details, title);
+        const headOwner = headRepository!.split('/')[0]!;
+        let pr = await api.findByHead(slug, repo.branch, headOwner);
+        if (pr?.merged) pr = undefined;
+        if (!pr && canWrite) {
+          const opening = await api.openOrUpdate(slug, { head: repo.branch, base, title, body, headOwner });
+          pr = opening.pr;
+          (await record(handle.id, opening.created ? 'pr.opened' : 'pr.updated',
+            { ...upstreamRef(repo.name, slug, headRepository!, pr), base }));
+        }
+        if (pr) {
+          result.prs.push(upstreamRef(repo.name, slug, headRepository!, pr));
+          continue;
+        }
+        const url = upstreamPullRequestUrl(slug, { base, headRepository: headRepository!, head: repo.branch, title, body });
+        (await record(handle.id, 'pr.upstream-pending', { repo: repo.name, slug, headRepository, base, url }));
+        result.pending.push({ repo: repo.name, slug, url });
+      }
+      return result;
     },
 
     /**
@@ -3927,13 +4063,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // integration. Karmax only needs an account able to read the PR it
         // already opened; requiring that person to have merge rights would
         // defeat external ownership before observation even began.
-        if (fairLanding && landingAuthority === 'external') {
+        // A proposal to someone else's repository is landed by its maintainers.
+        if (fairLanding && (landingAuthority === 'external'
+          || prs.every((candidate) => candidate.merged || candidate.headRepository))) {
           actorUserId = userId;
           break;
         }
         let eligible = true;
         const permissions = new Map<string, GitHubRepositoryPermission>();
-        for (const ref of prs.filter((candidate) => !candidate.merged)) {
+        for (const ref of prs.filter((candidate) => !candidate.merged && !candidate.headRepository)) {
           const permission = await deps.githubApp.repositoryPermission(userId, ref.slug, accountId).catch(() => undefined);
           if (!permission?.canMerge) { eligible = false; break; }
           permissions.set(ref.slug, permission);
@@ -4360,6 +4498,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? ((await store.currentWorld(task.parentTaskId)) as WorldHandle | undefined)?.branch
         : undefined;
       for (let ref of prs) {
+        // Upstream maintainers, not this project, own landing a proposal from
+        // a fork; it is observed like any external landing authority.
+        const refAuthority: LandingAuthority = ref.headRepository ? 'external' : landingAuthority;
         let live;
         try {
           live = await api.get(ref.slug, ref.number);
@@ -4397,7 +4538,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               detail: `GitHub reports pull request ${ref.slug}#${ref.number} merged but did not report its target branch; local coherence cannot be established yet.`,
             };
           }
-          const localSync = await syncGithubTargetToLocal(handle, ref, live.base, live.mergeCommitSha);
+          const localSync = ref.headRepository ? {} as { sha?: string }
+            : await syncGithubTargetToLocal(handle, ref, live.base, live.mergeCommitSha);
           lastSha = live.mergeCommitSha ?? localSync.sha ?? lastSha;
           const landedParticipant = participant('merged', 'merged');
           if (landedParticipant) participants.push(landedParticipant);
@@ -4623,7 +4765,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (fairLanding) {
             queued = true;
             queuedOwner = readiness.mergeQueueEntryId ? 'provider'
-              : landingAuthority === 'external' ? 'external' : 'provider';
+              : refAuthority === 'external' ? 'external' : 'provider';
             pendingDetail = readiness.mergeQueueEntryId
               ? 'GitHub is validating the pull requests in its merge queue.'
               : 'GitHub auto-merge is waiting for repository requirements.';
@@ -4638,7 +4780,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               ? 'GitHub is validating this pull request in its merge queue.'
               : 'GitHub auto-merge is waiting for repository requirements.',
             providerQueue: { state: 'validating', ...(entryIds.length ? { entryIds } : {}) },
-            landingOwner: readiness.mergeQueueEntryId ? 'provider' : landingAuthority === 'external' ? 'external' : 'provider',
+            landingOwner: readiness.mergeQueueEntryId ? 'provider' : refAuthority === 'external' ? 'external' : 'provider',
           };
         }
         const reviewEvents = events;
@@ -4664,7 +4806,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const mayMirrorApproval = exactHeadConfirmed
           || (!intentAuthorizedLanding && voters.includes(actorUserId))
           || (intentAuthorizedLanding && mirroredReviews.length === 0 && voters.includes(actorUserId));
-        if (mayMirrorApproval && !alreadyMirrored) {
+        // An author's approval of their own upstream proposal means nothing there.
+        if (mayMirrorApproval && !alreadyMirrored && !ref.headRepository) {
           await api.approve(ref.slug, ref.number, ref.headSha,
             `Approved in ${BRAND} after reviewing this exact pull-request head.`)
             .then(async () => (await record(handle.id, 'github.pr.review-approved', { ...ref, actorUserId })))
@@ -4675,7 +4818,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // A mirrored approval may have satisfied GitHub's own required-review
         // rule. Re-read only when that rule was previously blocking; if it still
         // is, this is a real external-human wait rather than an opaque merge poll.
-        if (readiness?.reviewDecision === 'REVIEW_REQUIRED') {
+        // Upstream maintainers' review is part of their landing, observed below.
+        if (readiness?.reviewDecision === 'REVIEW_REQUIRED' && !ref.headRepository) {
           try {
             readiness = await readinessOf();
           } catch (error) {
@@ -4721,9 +4865,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           };
           observations.push(createHash('sha256').update(JSON.stringify([ref.slug, ref.number, readiness])).digest('hex'));
           const planned = participant(
-            landingAuthority === 'external' ? 'external'
-              : landingAuthority === 'karmax' ? 'karmax' : 'unowned',
-            landingAuthority === 'external' ? 'queued' : 'ready',
+            refAuthority === 'external' ? 'external'
+              : refAuthority === 'karmax' ? 'karmax' : 'unowned',
+            refAuthority === 'external' ? 'queued' : 'ready',
           );
           if (planned) participants.push(planned);
           settled.push(next);
@@ -4820,7 +4964,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             repair: { kind: 'ci', preserveAuthorization: true },
           };
         }
-        if (fairLanding && observeOnly && landingAuthority !== 'external') {
+        if (fairLanding && observeOnly && refAuthority !== 'external') {
           // The provider previously owned this PR but no queue/auto-merge entry
           // is visible now. Observation must not mutate a stale branch without
           // admission. Hand control back to the workflow; its next iteration
@@ -4836,10 +4980,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // repository/PR itself. Karmax observes terminal checks, conflicts and
           // merge completion above, but never creates a competing order or
           // mutates the branch merely because it is behind.
-          if (landingAuthority === 'external') {
+          if (refAuthority === 'external') {
             queued = true;
             queuedOwner = 'external';
-            pendingDetail = `The configured external landing authority owns landing; ${BRAND} is observing the PRs and will act only on a terminal failure or merge.`;
+            pendingDetail = ref.headRepository
+              ? `Proposed to ${ref.slug}: waiting for its maintainers to review and merge it.`
+              : `The configured external landing authority owns landing; ${BRAND} is observing the PRs and will act only on a terminal failure or merge.`;
             const externalParticipant = participant('external', 'queued');
             if (externalParticipant) participants.push(externalParticipant);
             settled.push(next);
@@ -4848,7 +4994,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
           // Prefer a real provider queue. It can accept an out-of-date PR and
           // construct speculative candidates without rewriting the PR branch.
-          if (landingAuthority !== 'karmax' && live.nodeId) {
+          if (refAuthority !== 'karmax' && live.nodeId) {
             let queueResult;
             let queueError: unknown;
             try { queueResult = await api.enqueue(live.nodeId, ref.headSha); }
@@ -4873,7 +5019,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // Auto-merge is also provider ownership, but enabling it for an
             // already-behind branch does not make the provider update that
             // branch.  Such a participant belongs to guarded fallback instead.
-            if (landingAuthority !== 'karmax' && live.nodeId
+            if (refAuthority !== 'karmax' && live.nodeId
               && readiness?.mergeStateStatus !== 'BEHIND') {
               const mergeMethod = actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge';
               let autoMerge;
@@ -4931,7 +5077,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Karmax admission while current; if strict freshness later reports
           // BEHIND, reconciliation enters fallback admission and updates only
           // that one candidate instead of waking every stale task.
-          if (landingAuthority !== 'karmax' && live.nodeId) {
+          if (refAuthority !== 'karmax' && live.nodeId) {
             const mergeMethod = actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge';
             let autoMerge;
             try { autoMerge = await api.enableAutoMerge(live.nodeId, ref.headSha, mergeMethod); }

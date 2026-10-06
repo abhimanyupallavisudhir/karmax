@@ -135,6 +135,21 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     });
   });
 
+  it('keeps a connected account\'s own GitHub token with its identity, and removes it on request', async () => {
+    const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
+    (await user.saveGithubIdentity({ id: '7', login: 'jane' }));
+    (await user.saveGithubCustomIdentity('7', { userName: 'Jane D', signingKey: 'SIGN' }));
+    expect((await user.saveGithubToken('7', 'ghp_personal'))).toMatchObject({
+      name: 'github', github: { id: '7', login: 'jane' }, userName: 'Jane D', githubToken: true, signingKey: true,
+      customIdentity: { userName: 'Jane D' } });
+    expect((await user.env((await user.githubProfile('7'))!, {})).GH_TOKEN).toBe('ghp_personal');
+    const removed = await user.saveGithubToken('7', undefined);
+    expect(removed.githubToken).toBeUndefined();
+    expect(removed).toMatchObject({ signingKey: true, userName: 'Jane D' });
+    expect(broker.hasHandle(gitHandle('github', 'token', userGitScope('user_jane')))).toBe(false);
+    await expect(user.saveGithubToken('99', 'ghp_x')).rejects.toThrow(/Connect GitHub/);
+  });
+
   it('keeps per-account custom identities separate and supports an organization automation identity', async () => {
     const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
     (await user.saveGithubIdentity({ id: '1', login: 'first', name: 'First Person' }));

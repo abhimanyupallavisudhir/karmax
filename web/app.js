@@ -15239,6 +15239,66 @@ async function connectOrganizationGithub(organizationId, onConnected) {
   document.body.append(dialog);
   dialog.showModal();
 }
+// A fork names the repository its pull requests go to.
+function repositoryLabel(repository) {
+  const name = `${repository.owner}/${repository.name}`;
+  return repository.upstream ? `${name} → ${repository.upstream.owner}/${repository.upstream.name}` : name;
+}
+
+// `owner/name` from a GitHub URL or slug.
+function githubRepositorySlug(text) {
+  const match = String(text || '').trim().match(/^(?:(?:https?:\/\/)?(?:www\.)?github\.com[/:]|git@github\.com:)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/);
+  return match ? `${match[1]}/${match[2]}` : '';
+}
+
+// Work on someone else's repository: fork it on GitHub (where the App can reach
+// it), then attach the fork. Its pull requests open on the original.
+function openForkRepositoryDialog(proj, opener) {
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="fork-repository-title">
+    <div class="new-repository-head"><b id="fork-repository-title">Fork a repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row"><span>Repository</span><input id="project-fork-source" placeholder="https://github.com/owner/repo" required autocomplete="off"></label>
+    <div class="new-repository-actions"><button class="btn new-repository-cancel" type="button">Cancel</button><a class="btn" id="project-fork-github" target="_blank" rel="noopener" aria-disabled="true">Fork on GitHub ↗</a><button class="btn primary" type="submit" title="After forking">Attach fork</button></div>
+  </form></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); host.remove(); opener?.focus?.(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  const source = host.querySelector('#project-fork-source');
+  const forkLink = host.querySelector('#project-fork-github');
+  const sync = () => {
+    const slug = githubRepositorySlug(source.value);
+    if (slug) { forkLink.href = `https://github.com/${slug}/fork`; forkLink.removeAttribute('aria-disabled'); }
+    else { forkLink.removeAttribute('href'); forkLink.setAttribute('aria-disabled', 'true'); }
+  };
+  source.addEventListener('input', sync);
+  host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
+  host.querySelector('.new-repository-close').addEventListener('click', close);
+  host.querySelector('.new-repository-cancel').addEventListener('click', close);
+  host.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const slug = githubRepositorySlug(source.value).toLowerCase();
+    if (!slug) return toast('Enter a GitHub repository', true);
+    const button = event.submitter;
+    if (button) button.disabled = true;
+    try {
+      const { repositories } = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' });
+      const fork = (repositories || []).find((repository) => repository.upstream
+        && `${repository.upstream.owner}/${repository.upstream.name}`.toLowerCase() === slug);
+      if (!fork) {
+        toast('No fork found yet. Fork it on GitHub and give the GitHub App access to the fork.', true);
+        return;
+      }
+      await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: fork.id }) });
+      close(); toast('Fork attached'); await loadProjects(); await hydrateProjectAccess(projectById(proj.id) || proj);
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      if (button?.isConnected) button.disabled = false;
+    }
+  });
+  $('#modal-root').appendChild(host); document.addEventListener('keydown', keydown);
+  source.focus();
+}
+
 function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="new-repository-title">
@@ -15307,14 +15367,14 @@ async function hydrateProjectAccess(proj) {
       ${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span>${esc(principalName(member.principal))}</span>${member.protectedOwner ? '<span class="chip">project creator</span>' : ''}<span class="chip">${esc(member.profileId || 'developer')}</span><button class="btn sm project-member-remove">Remove</button></div>`; }).join('') || '<p class="task-sub">No project access overrides.</p>'}
       <a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-people">Manage people and authorization</a>`;
     repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Local repo, GitHub, or Git URL</p>
-      <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
+      <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repositoryLabel(repository))}</option>`).join('')}</datalist>
       <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button>${githubApp.configured && gitConnections.length && githubApp.userAuthorized ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository...</button>' : ''}</div>
       ${githubLoadError ? '<div id="project-github-error"></div>' : !githubApp.configured ? `<div class="inline-form">${S.installationAccess
         ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
         : '<span class="task-sub">The installation operator must set up the shared GitHub App before repositories can be connected.</span>'}</div>`
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
-        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>`}`;
+        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button><button class="btn sm" id="project-fork-open" type="button" aria-haspopup="dialog" title="Work on a repository you don't own. Pull requests go to it after Review.">Fork a repository...</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>`}`;
     accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
       if (!confirm('Remove this member’s access to the project?')) return;
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
@@ -15326,6 +15386,7 @@ async function hydrateProjectAccess(proj) {
     $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
     $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
     $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
+    $('#project-fork-open')?.addEventListener('click', (event) => openForkRepositoryDialog(proj, event.currentTarget));
     $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, () => hydrateProjectAccess(proj)); } catch (error) { toast(error.message, true); } });
     $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
@@ -18455,6 +18516,38 @@ function openGitIdentityDialog({ title, profile, endpoint, onSaved }) {
   overlay.querySelector('.git-identity-name').focus();
 }
 
+// The person's own GitHub token: the App acts only where it is installed, so
+// opening pull requests on repositories they forked needs a token of theirs.
+function openGithubTokenDialog(account, onSaved) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  const saved = Boolean(account.profile?.githubToken);
+  overlay.innerHTML = `<form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-label="GitHub token">
+    <div class="new-repository-head"><b>GitHub token</b><button class="icon-btn git-identity-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row"><span>Classic token · <a href="https://github.com/settings/tokens/new?scopes=public_repo&description=tavya" target="_blank" rel="noopener" title="Scope: public_repo">create ↗</a></span><input class="github-token-value" type="password" autocomplete="off" spellcheck="false" placeholder="${saved ? 'Saved — paste a new token to replace it' : 'ghp_…'}" /></label>
+    <div class="new-repository-actions">${saved ? '<button class="btn github-token-remove" type="button">Remove</button>' : ''}<button class="btn git-identity-cancel" type="button">Cancel</button><button class="btn primary github-token-save" type="submit">Save</button></div>
+  </form>`;
+  const endpoint = `/api/user/github-accounts/${encodeURIComponent(account.id)}/token`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  const run = async (button, request, message) => {
+    button.disabled = true;
+    try { await api(endpoint, request); close(); toast(message); await onSaved?.(); }
+    catch (error) { toast(error.message, true); button.disabled = false; }
+  };
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.git-identity-close').addEventListener('click', close);
+  overlay.querySelector('.git-identity-cancel').addEventListener('click', close);
+  overlay.querySelector('.github-token-remove')?.addEventListener('click', (event) => run(event.currentTarget, { method: 'DELETE' }, 'Token removed'));
+  overlay.querySelector('form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const token = overlay.querySelector('.github-token-value').value.trim();
+    if (!token) return toast('Paste a token', true);
+    run(overlay.querySelector('.github-token-save'), { method: 'PUT', body: JSON.stringify({ token }) }, 'Token saved');
+  });
+  document.body.appendChild(overlay); document.addEventListener('keydown', keydown);
+  overlay.querySelector('.github-token-value').focus();
+}
+
 async function hydrateProfileGithub() {
   const box = $('#profile-github'); if (!box) return;
   const renderIsCurrent = beginAsyncElementRender(box);
@@ -18471,7 +18564,7 @@ async function hydrateProfileGithub() {
   </div>` : '';
   box.innerHTML = `${failureDetail}<div class="github-account-list">${accounts.map((account) => `<div class="github-account-row" data-account="${esc(account.id)}">
     <span class="github-account-label">${githubMark()}<b>${esc(account.login)}</b>${account.active ? '<span class="chip">Active</span>' : ''}</span>
-    <span class="github-account-actions">${account.active ? '' : '<button class="btn sm github-use" type="button">Use</button>'}<button class="btn sm github-reconnect" type="button">Reconnect</button><button class="btn sm github-custom" type="button">Custom identity</button><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub account">${trashIcon()}</button></span>
+    <span class="github-account-actions">${account.active ? '' : '<button class="btn sm github-use" type="button">Use</button>'}<button class="btn sm github-reconnect" type="button">Reconnect</button><button class="btn sm github-custom" type="button">Custom identity</button><button class="btn sm github-token" type="button" title="Lets tavya open pull requests on repositories you forked">${account.profile?.githubToken ? 'Token ✓' : 'Token'}</button><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub account">${trashIcon()}</button></span>
   </div>`).join('')}</div>
   <button class="btn ${accounts.length ? '' : 'primary'} github-add" type="button">${githubMark()}${accounts.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>`;
   box.querySelector('.github-add')?.addEventListener('click', () => startUserGithubConnection(data.githubApp, 'add').catch((error) => toast(error.message, true)));
@@ -18481,6 +18574,7 @@ async function hydrateProfileGithub() {
     row.querySelector('.github-use')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}/active`, { method: 'POST', body: '{}' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
     row.querySelector('.github-custom')?.addEventListener('click', () => openGitIdentityDialog({ title: 'Custom identity', profile: account.profile,
       endpoint: `/api/user/github-accounts/${account.id}/identity`, onSaved: hydrateProfileGithub }));
+    row.querySelector('.github-token')?.addEventListener('click', () => openGithubTokenDialog(account, hydrateProfileGithub));
     row.querySelector('.github-remove')?.addEventListener('click', async () => {
       if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return; try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
   });

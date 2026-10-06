@@ -32,6 +32,23 @@ describe('personal Git development settings', () => {
     await returning.close();
   });
 
+  it('saves an account\'s own GitHub token behind its Token button, for pull requests on forked repositories', async () => {
+    const ui = await open('/profile', ({ method, path }) => path === '/api/user/github-accounts' ? githubAccounts
+      : method === 'PUT' && path === '/api/user/github-accounts/a1/token' ? { profile: { githubToken: true } } : undefined, '.github-account-row');
+    const button = ui.page.locator('#profile-github .github-token');
+    expect(await button.innerText()).toBe('Token');
+    expect(await button.getAttribute('title')).toMatch(/pull requests on repositories you forked/);
+    await button.click();
+    const dialog = ui.page.getByRole('dialog', { name: 'GitHub token' });
+    expect(await dialog.locator('a', { hasText: 'create' }).getAttribute('href')).toContain('scopes=public_repo');
+    await dialog.locator('.github-token-value').fill('ghp_personal');
+    await dialog.getByRole('button', { name: 'Save' }).click();
+    await expect.poll(() => ui.calls.filter((call) => call.method === 'PUT').map((call) => [call.path, call.body]))
+      .toEqual([['/api/user/github-accounts/a1/token', { token: 'ghp_personal' }]]);
+    await expect.poll(() => dialog.count()).toBe(0);
+    await ui.close();
+  });
+
   it('puts connected GitHub accounts and custom identity controls inside the main profile card', async () => {
     const ui = await open('/profile', ({ method, path }) => path === '/api/user/github-accounts' ? githubAccounts
       : method === 'PUT' && path === '/api/user/github-accounts/a1/identity' ? {} : undefined, '.github-account-row');

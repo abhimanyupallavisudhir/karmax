@@ -241,6 +241,29 @@ describe('Project settings', () => {
     await ui.close();
   });
 
+  it('forks someone else\'s repository on GitHub, then attaches the fork whose upstream it is', async () => {
+    const fork = { id: 'repo_fork', owner: 'octo', name: 'widgets', sshUrl: 'git@github.com:octo/widgets.git',
+      upstream: { owner: 'acme', name: 'widgets', defaultBranch: 'main', private: false } };
+    const ui = await settings({ api: ({ method, path: route }) => route.endsWith('/github/app') ? { configured: true, userAuthorized: true }
+      : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }]
+        : method === 'GET' && route.endsWith('/repositories') ? [fork]
+          : method === 'POST' && route.endsWith('/github/refresh') ? { repositories: [fork], count: 1 }
+            : method === 'POST' && route.endsWith('/repositories') ? { ok: true } : undefined });
+    const open = ui.page.getByRole('button', { name: 'Fork a repository...' });
+    await open.waitFor();
+    expect(await open.getAttribute('title')).toMatch(/repository you don't own/);
+    expect(await ui.page.locator('#project-repository-options option').first().innerText()).toBe('octo/widgets → acme/widgets');
+    await open.click();
+    const dialog = ui.page.getByRole('dialog', { name: 'Fork a repository' });
+    await dialog.getByLabel('Repository').fill('https://github.com/Acme/widgets');
+    expect(await dialog.getByRole('link', { name: /Fork on GitHub/ }).getAttribute('href')).toBe('https://github.com/Acme/widgets/fork');
+    await dialog.getByRole('button', { name: 'Attach fork' }).click();
+    await expect.poll(() => ui.calls.filter((call) => call.method === 'POST').map((call) => [call.path, call.body ?? null]))
+      .toContainEqual([expect.stringMatching(/\/api\/projects\/[^/]+\/repositories$/), { repositoryId: 'repo_fork' }]);
+    await dialog.waitFor({ state: 'detached' });
+    await ui.close();
+  });
+
   it('resets the actual scroll container when switching settings panes', async () => {
     const ui = await settings();
     const scroller = ui.page.locator('.main').first();

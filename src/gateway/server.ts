@@ -7627,7 +7627,7 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
-      const githubAccountsResource = p.match(/^\/api\/user\/github-accounts(?:\/([^/]+)(?:\/(active|identity))?)?$/);
+      const githubAccountsResource = p.match(/^\/api\/user\/github-accounts(?:\/([^/]+)(?:\/(active|identity|token))?)?$/);
       if (githubAccountsResource) {
         const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp || !this.deps.broker)
@@ -7660,6 +7660,18 @@ export class Gateway {
               signingKey: b.signingKey ? String(b.signingKey) : undefined,
               removeSigningKey: b.removeSigningKey === true,
             })) });
+          }
+          if (method === 'PUT' && accountId && action === 'token') {
+            const b = await this.body(req);
+            const personal = String(b.token ?? '').trim();
+            if (!personal) return this.json(res, 400, { error: 'token required' });
+            await this.deps.githubApp.assertUserAccount(subject.userId, accountId);
+            await this.deps.githubApp.verifyPersonalToken(accountId, personal);
+            return this.json(res, 200, { profile: (await gp.saveGithubToken(accountId, personal)) });
+          }
+          if (method === 'DELETE' && accountId && action === 'token') {
+            await this.deps.githubApp.assertUserAccount(subject.userId, accountId);
+            return this.json(res, 200, { profile: (await gp.saveGithubToken(accountId, undefined)) });
           }
           if (method === 'DELETE' && accountId && !action) {
             const active = await this.deps.githubApp.removeUserAccount(subject.userId, accountId);

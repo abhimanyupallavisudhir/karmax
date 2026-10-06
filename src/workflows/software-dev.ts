@@ -495,13 +495,18 @@ export async function softwareDevV1_27(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.27.0');
 }
 
+/** Work on a fork is proposed to its upstream after Review. */
+export async function softwareDevV1_28(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.28.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0' | '1.28.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -640,6 +645,9 @@ async function softwareDevImpl(
   // task-wide scalar owner cannot represent a native queue in one repository
   // and guarded fallback in another.
   const participantLanding = !repositoryless && minor >= 21;
+  // v1.28 proposes a reviewed fork branch to the repository it was forked from:
+  // a pull request there opens only after Review, and its maintainers land it.
+  const upstreamProposals = !repositoryless && minor >= 28;
   const restoresStagePrerequisites = minor >= 22;
   const preservesHumanHoldContext = minor >= 22;
   const interlocksLandingTransitions = minor >= 22;
@@ -4254,6 +4262,50 @@ Inspect the complete current diff and specifically compare its delta from the re
     await condition(() => mergeGranted || cancelled || changed);
     if (!changed) scope.cancel();
   }
+  // ── Proposal to upstream ──
+  // The fork branch was pushed before Review; the pull request on someone
+  // else's repository opens now. Without a GitHub token of the person's own,
+  // only they can open it there: ask them, and check GitHub until it exists.
+  if (upstreamProposals && githubAuthoritativeMerge) {
+    for (let checks = 0; ; checks++) {
+      if (cancelled) return await abort();
+      const proposal = await withResolve('pr', () => core.proposeUpstream(world!, target, {
+        title: input.title,
+        summary: pullRequestSummary(reviewInfo?.summary, msgs, false),
+      }));
+      const known = new Set(prs.map(prKey));
+      const added = proposal.prs.filter((candidate) => !known.has(prKey(candidate)));
+      prs = [...mergePrSnapshots(prs, proposal.prs), ...added];
+      pr = prs[0];
+      if (intentAuthorizedLanding && added.length)
+        landing = { ...landing, authorizedHeads: { ...landing.authorizedHeads, ...prHeadMap(added) } };
+      if (!proposal.pending.length) break;
+      stage = 'merge';
+      status = 'waiting';
+      const waitSeen = msgs.length;
+      waitingFor = {
+        kind: 'human', audience: ['@creator'], reason: 'merge',
+        summary: 'Open the pull request on GitHub',
+        detail: proposal.pending.map((candidate) => `[Open the pull request on ${candidate.slug}](${candidate.url})`).join('\n'),
+      };
+      // Cleared before the wait is shown, so a Confirm sent the moment it
+      // appears ("I opened it") wakes the check instead of being dropped.
+      confirmed = false;
+      await publish();
+      await condition(() => confirmed || cancelled || msgs.length > waitSeen, Math.min(60_000 * 2 ** checks, 600_000));
+      waitingFor = undefined;
+      confirmed = false;
+      if (cancelled) return await abort();
+      if (msgs.length > waitSeen) {
+        if (recoveryStage === 'pr' || recoveryStage === 'merge') recoveredLandingNeedsDo = true;
+        prRequested = false;
+        branchPreparedForPr = false;
+        stage = 'do';
+        status = 'active';
+        continue proposalCycle;
+      }
+    }
+  }
   for (;;) {
     stage = 'merge';
     status = 'active';
@@ -4345,9 +4397,12 @@ Inspect the complete current diff and specifically compare its delta from the re
               detail: 'Every multi-repository landing participant has merged.',
             };
           } else if (!fallbackPrs.length) {
+            const upstream = prs.filter((candidate) => !candidate.merged && candidate.headRepository);
             githubResult = {
               status: 'queued', prs, participants: plannedParticipants,
-              detail: 'Repository landing authorities own every outstanding pull request.',
+              detail: upstreamProposals && upstream.length === prs.filter((candidate) => !candidate.merged).length
+                ? `Proposed to ${[...new Set(upstream.map((candidate) => candidate.slug))].join(', ')}: waiting for its maintainers to review and merge it.`
+                : 'Repository landing authorities own every outstanding pull request.',
               providerQueue: { state: 'queued' },
             };
           }
