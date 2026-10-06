@@ -4764,6 +4764,13 @@ export class Store {
     return runAudienceAsync(humanAudience(taskId, requested), async (sql, params) => (await this.db.prepare(sql).all(...params)));
   }
 
+  /** Resolve project-relative selectors (`@maintainers`, `@admins`, `@team:…`)
+   * where there is no task yet, such as a task being created. */
+  async projectAudience(projectId: string, requested: string[]): Promise<string[]> {
+    return runAudienceAsync(humanAudience({ id: '', projectId, createdBy: undefined, lastView: undefined }, requested),
+      async (sql, params) => (await this.db.prepare(sql).all(...params)));
+  }
+
   async humanMayAct(taskId: string, userId: string): Promise<boolean> {
     return (await this.humanAudience(taskId)).includes(userId);
   }

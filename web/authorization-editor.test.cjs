@@ -81,22 +81,18 @@ ok(authorizationScopePlaceholder(['@organization']) === '' && authorizationScope
 ok(source.includes('input.placeholder = authorizationScopePlaceholder('),
   'the live editor keeps the placeholder in step with the chips');
 
-ok(source.includes('function chooseAuthorizationGrant('), 'task and Avatar flows share one authorization-gap prompt');
-ok(source.includes('Ask someone who can grant it') && source.includes('Limit it to my capabilities'),
-  'the prompt presents both secure outcomes in plain language');
+// The summon dialog itself is exercised in a browser: tests/authorization-summon-ui.test.ts.
 ok(source.includes('api(`/api/authorization/escalation-targets?projectId=${encodeURIComponent(projectId)}`'),
   'recipient choices come from the server-filtered eligibility endpoint, scoped to the project in the URL');
 // The gateway scopes a session to the project in the URL, never the body: a
 // body-only project made it check the owner's global grants and refuse them.
 ok(!/api\('\/api\/authorization-requests', \{ method: 'POST'/.test(source)
-  && (source.match(/api\(`\/api\/authorization-requests\?projectId=/g) || []).length === 2,
+  && (source.match(/api\(`\/api\/authorization-requests\?projectId=/g) || []).length === 3,
   'authorization requests name their project in the URL');
 ok(source.includes("target: { kind: 'task'") && source.includes("target: { kind: 'avatar'"),
   'both task and Avatar creation can route approval to the target resource');
 ok(source.includes('Awaiting a routed approver') && source.includes('request.recipients.includes(signedInUserId)'),
   'only a routed human sees controls for deciding an authorization request');
-ok(css.includes('.authorization-gap-card') && css.includes('.authorization-gap-recipient'),
-  'the shared decision prompt and recipient picker have dedicated responsive styling');
 
 // Stacked, and styled from inside .authz-editor: the generic `.form-row input`
 // rules are more specific than a bare `.authz-scope-input`, so without the

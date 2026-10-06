@@ -51,7 +51,7 @@ export interface PlatformOps {
   signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
   messageAgent(taskId: string, text: string, role?: string): Promise<void>;
   escalateToHuman(a: { audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
-  requestPermission(a: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
+  requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
@@ -459,7 +459,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         'Pause your current task at its exact stage and request input from selected people, teams, or Avatars. ' +
-        'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+        'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
         'Calling this stops the current turn; the task resumes when a selected principal responds. ' +
         'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
@@ -477,15 +477,16 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         'Request exact capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in the task Approval Requests tab ' +
-        'and is routed to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, ' +
-        '@project, or @all. Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
+        'and is routed to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, ' +
+        '@superadmins, @owners, @project, or @all; omit audience to summon the lowest level that can grant it (@maintainers, @admins or @superadmins). ' +
+        'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
         'Only a selected principal that already holds the requested capabilities and can grant the full task authorization across the expanded scope can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
         'pass urgency to raise or lower how loudly the human is alerted.',
       inputSchema: {
         capabilities: z.array(z.string().trim().min(1)).max(32),
         projectIds: z.array(z.string().trim().min(1)).max(32).optional(),
-        audience: z.array(z.string().trim().min(1)).min(1).max(32),
+        audience: z.array(z.string().trim().min(1)).min(1).max(32).optional(),
         reason: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },

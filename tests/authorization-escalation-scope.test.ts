@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Gateway } from '../src/gateway/server.js';
 import { KarmaxApi } from '../src/platform/api.js';
-import { AuthorizationService, organizationScope } from '../src/platform/authorization.js';
+import { AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { Store } from '../src/store/db.js';
 import { Overlays } from '../src/store/overlays.js';
@@ -46,7 +46,9 @@ async function signedIn(userId: string) {
   cleanups.push(async () => { await server.close(); await store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   const post = (route: string, body: unknown) => fetch(`${server.url}${route}`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  return { store, authorization, organization, project, post };
+  const put = (route: string, body: unknown) => fetch(`${server.url}${route}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  return { store, authorization, organization, project, post, put };
 }
 
 describe('asking for more authorization than you have', () => {
@@ -83,5 +85,29 @@ describe('asking for more authorization than you have', () => {
     expect((await refused.json() as any).error).toBe(
       `missing capability task:create in project "Website" (${project.id}) of organization "Mal'ta parivar" (${organization.id}). `
       + 'Your authorization there is Viewer; Developer and above have it.');
+  });
+
+  it('refuses a grant beyond the caller with whom to summon and how to proceed', async () => {
+    const { store, authorization, organization, project, post } = await signedIn('dev');
+    await authorization.bootstrapOrganizationOwner('system:test', 'owner', organization.id);
+    for (const userId of ['dev', 'maint']) await store.setOrganizationMembership(organization.id, userId, 'member');
+    await authorization.grant('test', { principalId: 'user:dev', scopeKey: projectScope(project.id), profileId: 'developer' });
+    await authorization.grant('test', { principalId: 'user:maint', scopeKey: projectScope(project.id), profileId: 'maintainer' });
+    const maintainer = { level: 'maintainer', scope: 'projects', projectIds: [project.id] };
+
+    const refused = await post(`/api/projects/${project.id}/tasks`, { workflow: 'just-do', params: { prompt: 'hi' }, authorization: maintainer });
+    expect(refused.status).toBe(403);
+    const body = await refused.json() as any;
+    expect(body).toMatchObject({ code: 'authorization_grant_denied', summon: '@maintainers', summary: 'Project maintainer · Website',
+      missingCapabilities: expect.arrayContaining(['project:edit']) });
+    expect(body.next).toMatch(/acceptAttenuation: true/);
+
+    // The same answer for an Avatar.
+    await store.kvSet(`avatars:project:${project.id}`, 'enabled');
+    const avatar = await post(`/api/projects/${project.id}/avatars`, { name: 'Atlas', prompt: 'Help.', authorityMode: 'restricted',
+      authorization: maintainer, runtime: { provider: 'mock' } });
+    expect(avatar.status).toBe(403);
+    expect(await avatar.json()).toMatchObject({ code: 'authorization_grant_denied', summon: '@maintainers',
+      next: expect.stringMatching(/limitAuthorization: true/) });
   });
 });
