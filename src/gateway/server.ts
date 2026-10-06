@@ -90,7 +90,7 @@ import { credentialResource, resourceDriverCatalog, resourceSecretHandle, snapsh
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/repository.js';
-import { worldRepos, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
+import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, weakensProtection } from '../autonomy/vault-items.js';
@@ -318,11 +318,12 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   // The tavya CLI (wiki planned/tavya-cli). Grants to read a resource are a
   // read, whatever the method; saving one is a settings write (or a task edit).
-  if (/^\/api\/projects\/[^/]+\/workspace$/.test(p)) return 'repository:read';
+  if (/^\/api\/projects\/[^/]+\/workspace$/.test(p) || /^\/api\/projects\/[^/]+\/git-credential$/.test(p)) return 'repository:read';
+  if (/^\/api\/organizations\/[^/]+\/cli-git-credentials$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/secrets\/values$/.test(p)) return 'project:secret:use';
   if (/^\/api\/projects\/[^/]+\/resources\/[^/]+\/read-grant$/.test(p)) return 'project:settings:read';
   if (/^\/api\/tasks\/[^/]+\/workspace$/.test(p) || /^\/api\/tasks\/[^/]+\/resources\/[^/]+\/read-grant$/.test(p)) return 'task:read';
-  if (/^\/api\/tasks\/[^/]+\/resources\/[^/]+\/append-grant$/.test(p) || /^\/api\/tasks\/[^/]+\/import-local$/.test(p)) return 'task:edit';
+  if (/^\/api\/tasks\/[^/]+\/resources\/[^/]+\/append-grant$/.test(p) || /^\/api\/tasks\/[^/]+\/(?:import-local|exec)$/.test(p)) return 'task:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources|checkout)(?:\/|$)/.test(p))
     return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/github-merge-eligibility$/.test(p)) return 'project:read';
@@ -4664,6 +4665,44 @@ export class Gateway {
           }
         }
       }
+      // `tavya git-credential`: the organization lends its GitHub App to members'
+      // Git (opt-in, off by default). One repository of the project, contents
+      // only, write when the caller may write to repositories, else read.
+      const gitCredential = p.match(/^\/api\/projects\/([^/]+)\/git-credential$/);
+      if (gitCredential && method === 'POST') {
+        const project = await store.getProject(gitCredential[1]!);
+        if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
+        if ((await store.kvGet(cliGitCredentialsKey(project.organizationId))) !== 'enabled')
+          return this.json(res, 403, { error: `${(await store.getOrganization(project.organizationId))?.name ?? 'This organization'} does not lend its GitHub access to the CLI; `
+            + 'use your own GitHub credentials, or ask an administrator to allow it (Organization settings → GitHub)' });
+        if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub is not connected' });
+        const body = await this.body(req);
+        const wanted = typeof body.repository === 'string' ? body.repository : '';
+        const wiki = (await store.projectWiki(project.id))?.repository;
+        const repository = [...(await store.listProjectRepositories(project.id)).map((entry) => entry.repository), ...(wiki ? [wiki] : [])]
+          .find((candidate) => { try { return sameRepository(candidate.sshUrl, wanted); } catch { return false; } });
+        if (!repository) return this.json(res, 404, { error: 'repository is not part of this project' });
+        const access = (await this.deps.tokens.check(token, 'repository:write', { projectId: project.id })).ok ? 'write' : 'read';
+        try {
+          const credential = await this.deps.githubApp.repositoryCredential(repository, access);
+          (await store.appendAudit({ principalId: actorPrincipal(callerIdentity.actor), action: 'github:cli-credential',
+            scopeKey: `project:${project.id}`, detail: { repositoryId: repository.id, access } }));
+          res.setHeader('cache-control', 'no-store');
+          return this.json(res, 200, { username: 'x-access-token', password: credential.token, expiresAt: credential.expiresAt, access });
+        } catch (error) { return this.json(res, 502, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const cliGitCredentials = p.match(/^\/api\/organizations\/([^/]+)\/cli-git-credentials$/);
+      if (cliGitCredentials && ['GET', 'PUT'].includes(method)) {
+        const organizationId = cliGitCredentials[1]!;
+        if (!(await store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          if (typeof body.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled must be true or false' });
+          if (body.enabled) (await store.kvSet(cliGitCredentialsKey(organizationId), 'enabled'));
+          else (await store.kvDelete(cliGitCredentialsKey(organizationId)));
+        }
+        return this.json(res, 200, { enabled: (await store.kvGet(cliGitCredentialsKey(organizationId))) === 'enabled' });
+      }
       const projectWorkspace = p.match(/^\/api\/projects\/([^/]+)\/workspace$/);
       if (projectWorkspace && method === 'GET') {
         try { return this.json(res, 200, await this.workspaces().project(projectWorkspace[1]!)); }
@@ -5251,6 +5290,36 @@ export class Gateway {
         // A path into this install's checkout only means something to the machine it lives on.
         const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/tavya.js', import.meta.url))] : [BRAND];
         return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
+      }
+      // `tavya exec`: one command in the task's world, its output streamed as
+      // NDJSON ({type: output|exit}). It runs as a review action does (same lease,
+      // execution record and stored, scrubbed output), with the terminal's authority.
+      const execMatch = p.match(/^\/api\/tasks\/([^/]+)\/exec$/);
+      if (execMatch && method === 'POST') {
+        const taskId = execMatch[1]!;
+        const task = await store.getTask(taskId);
+        const body = await this.body(req);
+        const command = typeof body.command === 'string' ? body.command : '';
+        if (!command.trim()) return this.json(res, 400, { error: 'command is required' });
+        const handle = worldHandleForView(task?.lastView, taskId, task ? await store.effectiveProjectConfig(task.projectId) : undefined);
+        if (!task || !handle) return this.json(res, 404, { error: 'this task has no world yet' });
+        const workdir = worldWorkingDirectory(handle);
+        const cwd = typeof body.cwd === 'string' && body.cwd ? path.posix.resolve(workdir, body.cwd) : workdir;
+        if (cwd !== handle.root && !cwd.startsWith(`${handle.root.replace(/\/+$/, '')}/`)) return this.json(res, 400, { error: 'cwd is outside the task world' });
+        let rec;
+        try { rec = await this.reviewActions.start({ taskId, world: handle, label: 'tavya exec', command, kind: 'command', cwd }); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+        res.writeHead(200, { 'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'no-store' });
+        if (rec.output) res.write(`${JSON.stringify({ type: 'output', data: rec.output })}\n`);
+        let off: (() => void) | undefined;
+        const end = (code: number | null) => { if (!res.writableEnded) res.end(`${JSON.stringify({ type: 'exit', code })}\n`); off?.(); };
+        off = await this.reviewActions.attach(rec.procId, (chunk, done, code) => {
+          if (chunk && !res.writableEnded) res.write(`${JSON.stringify({ type: 'output', data: chunk })}\n`);
+          if (done) end(code);
+        });
+        if (!rec.running) end(rec.exitCode);
+        res.on('close', () => { if (!res.writableEnded) void this.reviewActions.stop(rec.procId); off?.(); });
+        return;
       }
       const taskWorkspace = p.match(/^\/api\/tasks\/([^/]+)\/workspace$/);
       if (taskWorkspace && method === 'GET') {
@@ -9874,6 +9943,8 @@ function withoutVaultProjection(source: Record<string, unknown>): Record<string,
   const { vaultItemId: _item, vaultField: _field, vaultItemLabel: _label, vaultItemType: _type, ...rest } = source;
   return rest;
 }
+
+const cliGitCredentialsKey = (organizationId: string) => `cli-git-credentials:${organizationId}`;
 
 function stagedResourceCandidate(resource: ResourceAttachment): boolean {
   return resource.enabled === false && resource.source.candidate === true;

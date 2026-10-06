@@ -9964,54 +9964,86 @@ async function localHandoffDialog({ loading, load, title = () => 'Work locally',
   catch (error) { host.remove(); toast(error.message, true); return null; }
   if (!host.isConnected) return null;
   show(title(data), render(data));
-  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
-    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
-  })));
-  host.querySelectorAll('.native-conversation-download').forEach((button) =>
-    button.addEventListener('click', () => downloadNativeConversation(button)));
+  // Delegated, so what a fold loads later is wired too.
+  host.addEventListener('click', (event) => {
+    const copy = event.target.closest?.('.local-copy');
+    if (copy) return void copyToClipboard(copy.dataset.value || '').then(() => {
+      const label = copy.textContent; copy.textContent = '✓ copied'; setTimeout(() => { copy.textContent = label; }, 1200);
+    });
+    const download = event.target.closest?.('.native-conversation-download');
+    if (download) downloadNativeConversation(download);
+  });
   return { host, data };
+}
+
+// What `tavya clone` takes for a project or task: the short form on tavya.io,
+// else the console URL, which names its own server.
+function cliTarget(project, taskNumber) {
+  const org = organizationById(project?.organizationId);
+  if (location.origin === 'https://tavya.io' && org) return `${orgSlug(org)}/${projectSlug(project)}${taskNumber != null ? `#${taskNumber}` : ''}`;
+  return `${location.origin}${projectBase(project?.id)}${taskNumber != null ? `/tasks/${taskNumber}` : ''}`;
+}
+
+// Work locally is one CLI command; the Git-only steps (and their slower
+// server-side plan) load only when that fold is opened.
+async function cliHandoffDialog({ command, note, gitOnly }) {
+  const opened = await localHandoffDialog({ loading: '', load: async () => null, render: () => `
+    <div class="inline-form"><pre class="raw" style="flex:1;margin:0">${esc(command)}</pre><button class="btn sm primary local-copy" data-value="${esc(command)}">Copy</button></div>
+    ${note ? `<p class="task-sub">${note}</p>` : ''}
+    <details class="local-git-only"><summary class="task-sub">Git only</summary><div class="local-git-only-body"><div class="tf-loading" role="status"><span class="global-search-loading">Loading…</span></div></div></details>` });
+  if (!opened) return null;
+  let loaded = false;
+  opened.host.querySelector('.local-git-only')?.addEventListener('toggle', async (event) => {
+    if (!event.currentTarget.open || loaded) return;
+    loaded = true;
+    const body = opened.host.querySelector('.local-git-only-body');
+    try { await gitOnly(body); }
+    catch (error) { loaded = false; body.innerHTML = `<p class="task-sub" role="alert">${esc(error.message)}</p>`; }
+  });
+  return opened;
 }
 
 async function openLocalCheckout(v) {
   if (hostLocal()) return materializeLocalCheckout(v);
-  const opened = await localHandoffDialog({
-    loading: 'Preparing checkout instructions…',
-    load: () => Promise.all([
-      api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`),
-      api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`),
-    ]),
-    render: ([plan, preparedSessions]) => {
+  const rec = taskRecord(v.taskId);
+  const project = projectById(rec?.projectId || S.projectId);
+  return cliHandoffDialog({
+    command: `npx tavya clone ${cliTarget(project, rec?.num)}`,
+    note: `Code, data and secrets, as this task's world has them. <span class="mono">tavya push</span> brings your work back here; <span class="mono">tavya resume --fork</span> continues its agent on your machine.`,
+    gitOnly: async (body) => {
+      const [plan, preparedSessions] = await Promise.all([
+        api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`),
+        api(`/api/tasks/${encodeURIComponent(v.taskId)}/sessions`),
+      ]);
       const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
-      return `<p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
-    <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
+      body.innerHTML = `<div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
     ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true, preparedSessions)}
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
-    <p class="task-sub">${siteNameMarkup()} accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
     <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>`;
+      $('#local-refresh', body)?.addEventListener('click', async (event) => {
+        const button = event.currentTarget; const result = $('#local-refresh-result', body); button.disabled = true; result.textContent = 'Importing the pushed branch…';
+        try {
+          const refreshed = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/refresh-from-github`, { method: 'POST', body: '{}' });
+          result.textContent = `${refreshed.updated.length} repositor${refreshed.updated.length === 1 ? 'y' : 'ies'} refreshed${refreshed.parked ? ' and world parked' : ''}.${refreshed.warning ? ` ${refreshed.warning}` : ''}`;
+          await refreshTask();
+        } catch (error) { result.textContent = error.message; button.disabled = false; }
+      });
     },
-  });
-  if (!opened) return;
-  const { host } = opened;
-  $('#local-refresh', host)?.addEventListener('click', async (event) => {
-    const button = event.currentTarget; const result = $('#local-refresh-result', host); button.disabled = true; result.textContent = 'Importing the pushed branch…';
-    try {
-      const refreshed = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/refresh-from-github`, { method: 'POST', body: '{}' });
-      result.textContent = `${refreshed.updated.length} repositor${refreshed.updated.length === 1 ? 'y' : 'ies'} refreshed${refreshed.parked ? ' and world parked' : ''}.${refreshed.warning ? ` ${refreshed.warning}` : ''}`;
-      await refreshTask();
-    } catch (error) { result.textContent = error.message; button.disabled = false; }
   });
 }
 
 async function openProjectCheckout(project) {
   if (!project?.id) return;
-  await localHandoffDialog({
-    loading: 'Preparing checkout instructions…',
-    load: () => api(`/api/projects/${encodeURIComponent(project.id)}/checkout`),
-    render: (plan) => `<p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to ${siteNameMarkup()}.</p>
-    <div class="section-h">First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
-    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>`,
+  return cliHandoffDialog({
+    command: `npx tavya clone ${cliTarget(project)}`,
+    note: `Code, data and secrets, as a task's world has them. <span class="mono">tavya pull</span> and <span class="mono">tavya push</span> keep them in step.`,
+    gitOnly: async (body) => {
+      const plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`);
+      body.innerHTML = `<div class="section-h">First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
+    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>`;
+    },
   });
 }
 
@@ -18619,10 +18651,11 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
     },
     async github() {
       let githubLoadError = null;
-      const [gitConnections, githubApp, githubIdentity] = await Promise.all([
+      const [gitConnections, githubApp, githubIdentity, cliGit] = await Promise.all([
         read('git-connections').catch(error => { githubLoadError = error; return []; }),
         read('github/app').catch(error => { githubLoadError = error; return { configured: false }; }),
         read('github/identity').catch(() => ({ profile: null })),
+        read('cli-git-credentials').catch(() => null),
       ]);
       if (!live('github')) return;
       const githubManageUrl = (connection) => connection.accountType === 'Organization'
@@ -18644,7 +18677,15 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
         <span class="github-account-label">${githubMark()}<b>${esc(connection.accountLogin)}</b>${permission?.ready ? '' : '<span class="chip" style="color:var(--warn)">GitHub access update required</span>'}</span>
         <span class="github-account-actions">${permissionAction}<a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
       </div>`; }).join('')}</div>
-      <div class="github-org-actions">${githubSetup}</div>`;
+      <div class="github-org-actions">${githubSetup}</div>
+      ${gitConnections.length && cliGit ? `<div class="switch" style="margin-top:12px"><input type="checkbox" id="org-cli-git" ${cliGit.enabled ? 'checked' : ''} /><label for="org-cli-git">Members without GitHub access can use the CLI</label>${policyTip('Lets members clone, pull and push this organization’s repositories with `tavya clone --git-via-tavya`, through the GitHub App, without their own GitHub access. Each token covers one repository for an hour, with write access only for people who may change repositories. Their pushes appear as the GitHub App.')}</div>` : ''}`;
+      setEventHandler($('#org-cli-git'), 'change', async (event) => {
+        const box = event.currentTarget;
+        box.disabled = true;
+        try { await api(`/api/organizations/${organizationId}/cli-git-credentials`, { method: 'PUT', body: JSON.stringify({ enabled: box.checked }) }); }
+        catch (error) { box.checked = !box.checked; toast(error.message, true); }
+        finally { box.disabled = false; }
+      });
       if (githubLoadError) paneError($('#org-github'), githubLoadError, () => refresh('github'));
       setEventHandler($('#connect-github'), 'click', async () => {
         try {

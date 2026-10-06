@@ -61,7 +61,7 @@ async function fixture() {
     source: {}, credentialHandles: [], publish: 'review' });
   const corpus = Array.from({ length: 20 }, (_, i) => ({ path: `pages/${i}.txt`, data: crypto.randomBytes(500 + i) }));
   const first = await resources.importFiles(data.id, corpus);
-  const post = async (pathname: string, token: string, body: unknown = {}) => fetch(`${server.url}${pathname}`,
+  const post = async (pathname: string, token: string, body: unknown = {}): Promise<{ status: number; headers: Headers; json(): Promise<any> }> => fetch(`${server.url}${pathname}`,
     { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
   const get = async (pathname: string, token: string) => fetch(`${server.url}${pathname}`, { headers: { authorization: `Bearer ${token}` } });
   const tokenFor = async (level: string) => (await tokens.mintPrincipal('user:alice', capsOf(level), project.id)).token;
@@ -83,7 +83,7 @@ it('describes a project as the world tasks get: layout, repositories with the wi
     install: [{ repository: 'site', commands: ['npm ci'] }] });
   expect(JSON.stringify(manifest)).not.toContain('s3cret');
   // /api/meta tells the CLI the oldest version it still speaks to.
-  expect((await (await fetch(`${f.server.url}/api/meta`)).json()).cli).toEqual({ minVersion: '1.0.0' });
+  expect(((await (await fetch(`${f.server.url}/api/meta`)).json()) as any).cli).toEqual({ minVersion: '1.0.0' });
 });
 
 it('pulls a version with a read grant and pushes a new one with an append grant, refusing a stale base', async () => {

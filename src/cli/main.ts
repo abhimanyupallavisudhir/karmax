@@ -3,7 +3,7 @@ import { parseArgs } from 'node:util';
 import { Api, resolveServer } from './api.js';
 import { Credentials } from './config.js';
 import { parseRef } from './refs.js';
-import { CliError, EXIT, output, readStdin, type Output } from './util.js';
+import { CliError, EXIT, interactive, output, readStdin, type Output } from './util.js';
 import { Workspace } from './workspace.js';
 import { login, logout, token, whoami } from './commands/auth.js';
 import { clone, diff, pull, push, status } from './commands/sync.js';
@@ -81,43 +81,52 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // A pasted console URL names its server; a workspace remembers its own.
   const refServer = args[0] && /^https?:\/\//.test(args[0]) ? parseRef(args[0]).server : undefined;
   const server = resolveServer(flags.url ?? refServer ?? (workspace && !process.env.TAVYA_URL ? workspace.server : undefined));
-  const api = () => new Api(server, new Credentials(), flags.token ?? process.env.TAVYA_TOKEN ?? process.env.KARMAX_TOKEN);
+  const token = flags.token ?? (process.env.TAVYA_TOKEN || process.env.KARMAX_TOKEN || undefined);
+  const plainApi = () => new Api(server, new Credentials(), token);
+  // The first command on a terminal signs in, instead of failing with "run tavya login".
+  const api = async () => {
+    const client = plainApi();
+    if (client.signedIn || !interactive()) return client;
+    process.stderr.write(`Sign in to ${server} first.\n`);
+    await login(server, output(true), { browser: flags.browser !== false });
+    return plainApi();
+  };
 
   switch (command) {
     case 'login': await login(server, out, { ...(flags.name ? { name: flags.name } : {}), browser: flags.browser !== false }); return 0;
     case 'logout': await logout(server, out); return 0;
-    case 'whoami': await whoami(api(), out); return 0;
-    case 'token': case 'tokens': await token(api(), args, out, flags); return 0;
+    case 'whoami': await whoami(await api(), out); return 0;
+    case 'token': case 'tokens': await token(await api(), args, out, flags); return 0;
     case 'clone':
       if (!args[0]) throw new CliError('usage: tavya clone <organization>/<project>[#<task>] [directory]', EXIT.usage);
-      await clone(api(), args[0], args[1], out, { resources: flags.resources !== false, secrets: flags.secrets !== false,
+      await clone(await api(), args[0], args[1], out, { resources: flags.resources !== false, secrets: flags.secrets !== false,
         gitViaTavya: Boolean(flags['git-via-tavya']) });
       return 0;
-    case 'pull': await pull(api(), Workspace.require(), out, { force: Boolean(flags.force), resources: flags.resources !== false, secrets: flags.secrets !== false }); return 0;
-    case 'push': await push(api(), Workspace.require(), out, { overwrite: Boolean(flags.overwrite), git: flags.git !== false, resources: flags.resources !== false }); return 0;
+    case 'pull': await pull(await api(), Workspace.require(), out, { force: Boolean(flags.force), resources: flags.resources !== false, secrets: flags.secrets !== false }); return 0;
+    case 'push': await push(await api(), Workspace.require(), out, { overwrite: Boolean(flags.overwrite), git: flags.git !== false, resources: flags.resources !== false }); return 0;
     case 'status': case 'st': {
       const local = Workspace.require();
-      const client = api();
+      const client = plainApi();
       await status(client.signedIn ? client : undefined, local, out);
       return 0;
     }
     case 'diff': await diff(Workspace.require(), out, args[0]); return 0;
     case 'run': {
       const local = Workspace.require();
-      return run(api(), local, passthrough.length ? passthrough : args, out);
+      return run(await api(), local, passthrough.length ? passthrough : args, out);
     }
-    case 'env': await env(api(), Workspace.require(), out, flags.format ?? 'dotenv'); return 0;
+    case 'env': await env(await api(), Workspace.require(), out, flags.format ?? 'dotenv'); return 0;
     case 'setup': return setup(Workspace.require(), out);
     case 'secrets': case 'secret': {
-      const client = api();
+      const client = await api();
       const projectId = flags.project?.[0] ? (await resolveTarget(client, flags.project[0])).project.id : Workspace.require().manifest.project.id;
       await secrets(client, projectId, args, out, flags);
       return 0;
     }
-    case 'import': await importProject(api(), args[0] ?? '.', out, flags); return 0;
-    case 'task': case 'tasks': return task(api(), args, out, { ...flags, project: flags.project?.[0] }, workspace);
+    case 'import': await importProject(await api(), args[0] ?? '.', out, flags); return 0;
+    case 'task': case 'tasks': return task(await api(), args, out, { ...flags, project: flags.project?.[0] }, workspace);
     case 'attach': {
-      const client = api();
+      const client = await api();
       if (flags.ticket) {
         if (!args[0]) throw new CliError('usage: tavya attach <task-id> --ticket <ticket>', EXIT.usage);
         return attach(server, args[0], { ticket: flags.ticket });
@@ -126,24 +135,24 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return attach(server, taskId, { token: await client.token() });
     }
     case 'exec': {
-      const client = api();
+      const client = await api();
       const target = await resolveTask(client, args[0], workspace);
       return exec(client, target.taskId, passthrough, out, flags.cwd);
     }
     case 'preview': {
-      const client = api();
+      const client = await api();
       const target = await resolveTask(client, args[0], workspace);
       await preview(client, target.taskId, out, flags.port);
       return 0;
     }
     case 'resume': {
-      const client = api();
+      const client = await api();
       const target = await resolveTask(client, args[0], workspace);
       return resume(client, target, workspace?.manifest.task?.id === target.taskId ? workspace.workdir : process.cwd(), out,
         { ...(flags.role ? { role: flags.role } : {}), fork: Boolean(flags.fork), print: Boolean(flags.print) });
     }
-    case 'api': return apiCommand(api(), args, flags, out);
-    case 'git-credential': return gitCredential(api, args[0] ?? 'get');
+    case 'api': return apiCommand(await api(), args, flags, out);
+    case 'git-credential': return gitCredential(plainApi, args[0] ?? 'get');
     default: throw new CliError(`unknown command "${command}"\nRun \`tavya --help\`.`, EXIT.usage);
   }
 }

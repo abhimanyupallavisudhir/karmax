@@ -54,7 +54,8 @@ export async function importProject(api: Api, dir: string, out: Output, flags: R
   const root = await gitOk(requested, ['rev-parse', '--show-toplevel'], `${requested} is not a Git checkout`).catch(() => {
     throw new CliError(`${requested} is not a Git checkout; import one repository at a time`, EXIT.usage);
   });
-  const remote = await gitOk(root, ['remote', 'get-url', 'origin'], 'this checkout has no origin remote');
+  // The configured URL: `remote get-url` would apply the user's insteadOf rewrites.
+  const remote = await gitOk(root, ['config', '--get', 'remote.origin.url'], 'this checkout has no origin remote');
   const github = githubRepository(remote);
   if (!github) throw new CliError(`origin (${remote}) is not a GitHub repository; tavya projects use GitHub repositories`, EXIT.usage);
 
