@@ -6460,7 +6460,7 @@ export class Gateway {
             // A person answering a task request may reuse their own connected account.
             if (!callerTaskId && ownerId && taskId) for (const c of listed as Array<typeof listed[number] & { reusable?: unknown }>)
               if (c.status === 'requested' && (!c.ownerId || c.ownerId === ownerId))
-                c.reusable = (await service.reusable(org, ownerId, c)).map(({ id, label }) => ({ id, label }));
+                c.reusable = (await service.reusable(org, ownerId, c)).map(({ id, label, createdAt }) => ({ id, label, createdAt }));
             return this.json(res, 200, listed);
           }
           if (p === '/api/connections/request' && method === 'POST') {

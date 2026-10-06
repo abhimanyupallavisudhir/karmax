@@ -1093,6 +1093,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .approval-request-actions .vreq-pick { gap: 8px; max-width: 260px; }
 .approval-request-actions .vreq-pick .tf-vault-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .approval-request-actions .vreq-add { font-size: 12px; white-space: nowrap; }
+.approval-request-actions .connection-account { max-width: 200px; padding: 4px 8px; font-size: 13px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); }
 .approval-request-help { margin-top: 7px; color: var(--ink-2); font-size: 12px; }
 .approval-request-warn { margin-top: 7px; color: var(--danger); font-size: 12px; }
 .approval-request-warn.caution { color: var(--ink-2); }
