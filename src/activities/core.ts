@@ -1962,7 +1962,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // cannot be used to interrupt peer work or widen the agent's authority.
       const preparationTask = await store.getTask(args.taskId);
       // An agent other than the main one acts with its own authority when it has
-      // one (wiki planned/collaboration-model); otherwise with the task's.
+      // one (wiki features/collaboration-model); otherwise with the task's.
       const agentAuthorization = participantAuthorization(preparationTask?.params, participant);
       const storedAuthorization = (agentAuthorization ?? preparationTask?.params?._authorization) as {
         capabilities?: string[];

@@ -5,7 +5,7 @@ import { closeConsoleBrowser, consolePage, emptySettings } from './helpers/conso
 afterAll(closeConsoleBrowser);
 
 /**
- * Task defaults mirror the task form (wiki planned/collaboration-model): the
+ * Task defaults mirror the task form (wiki features/collaboration-model): the
  * default Agent — whose collapsed Authorization row holds the authorization,
  * vault and payment defaults — then the Responder, the Review route, and where
  * tasks run, saved together without disturbing what the card does not own.

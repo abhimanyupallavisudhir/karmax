@@ -2227,7 +2227,7 @@ export class KarmaxApi {
     return `${level} · ${scope}`;
   }
 
-  // ── Per-agent authority (wiki planned/collaboration-model) ──────────────────
+  // ── Per-agent authority (wiki features/collaboration-model) ──────────────────
   // The main agent acts with the task's `_authorization`. Every other agent's
   // spec may carry `authority`; it is attenuated against whoever set it exactly
   // like the task's own and stored per participant in `_agentAuthorization`.

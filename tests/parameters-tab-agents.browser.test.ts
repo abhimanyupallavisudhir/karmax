@@ -5,7 +5,7 @@ import { MANIFESTS } from '../src/contrib/manifests.js';
 afterAll(closeConsoleBrowser);
 
 /**
- * The Parameters tab mirrors the task form (wiki planned/collaboration-model):
+ * The Parameters tab mirrors the task form (wiki features/collaboration-model):
  * one Agent block per agent — the main agent, the Responder, each Reviewer, and
  * every agent called in with `@` — then where the task runs. Editable agents
  * save their own authority with their spec; frozen ones stay visible.

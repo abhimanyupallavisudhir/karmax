@@ -9,7 +9,7 @@ import { agentSpecsByParticipant, normalizeAgentAuthority, participantAuthorizat
 import type { AuthorizationSelection } from '../src/domain/types.js';
 
 /**
- * Per-agent authority (wiki planned/collaboration-model): every agent other than
+ * Per-agent authority (wiki features/collaboration-model): every agent other than
  * the main one may carry `authority` in its spec. The platform attenuates it
  * against whoever set it — exactly like the task's own authorization — and stores
  * it as `params._agentAuthorization[<participant>]`.

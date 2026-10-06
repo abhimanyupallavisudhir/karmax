@@ -1154,7 +1154,7 @@ function renderAgentField(f, spec, inherited, opts) {
   return agentBlockHtml(opts?.prefix, spec, { role: f.role || f.name, inherited, ...opts });
 }
 
-// ── The Agent block (wiki planned/collaboration-model) ───────────────────────
+// ── The Agent block (wiki features/collaboration-model) ───────────────────────
 // One control for everything an agent can be given, used wherever an agent is
 // configured: the task form (Agent, Responder, Reviewers), Task defaults, the
 // Parameters tab, and "New agent…" in the follow-up composer. Free of form

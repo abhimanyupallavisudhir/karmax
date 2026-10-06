@@ -4,7 +4,7 @@ import { MAIN_AGENT, isParticipantKey, reviewerKey } from '../domain/participant
 import { ValidationError } from './errors.js';
 
 /**
- * Per-agent authority (wiki planned/collaboration-model, SPEC §8.2).
+ * Per-agent authority (wiki features/collaboration-model, SPEC §8.2).
  *
  * The main agent's authority is the task's own (`params._authorization`, the
  * task's vault grants and `paymentPolicy`). Every other agent — the Responder,
