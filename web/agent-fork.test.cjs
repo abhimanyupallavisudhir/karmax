@@ -25,6 +25,8 @@ global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? 
 global.S = { tasks: [], meta: { hostLocal: true }, projects: [{ id: 'p1', name: 'Website' }, { id: 'p2', name: 'Billing' }] };
 global.document = { querySelectorAll: () => [] };
 global.hostLocal = () => S.meta?.hostLocal !== false;
+eval(extractFn('siteName'));
+eval(extractFn('siteNameMarkup'));
 global.projectById = (id) => S.projects.find((p) => p.id === id);
 global.taskUrl = (id, rec) => `/acme/${rec?.projectId || 'p1'}/tasks/${rec?.num ?? id}`;
 if (typeof global.CustomEvent !== 'function') {
@@ -94,12 +96,12 @@ const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { p
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
 ok(!closed.includes('<details class="af-resume') && closed.includes('af-resume-enabled'), 'fork choice uses its explicit toggle');
-ok(closed.includes('provider conversation ID or public ChatGPT/Claude share link'), 'a local console advertises provider ids and public share links');
+ok(closed.includes('provider conversation ID or a ChatGPT, Claude or tavya share link'), 'a local console advertises provider ids and share links');
 ok(closed.includes('Upload conversation'), 'conversation upload is offered without another panel');
 
 S.meta.hostLocal = false;
 const hosted = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { provider: 'claude' });
-ok(hosted.includes('paste a public ChatGPT/Claude share link'), 'a nonlocal console still advertises public share links');
+ok(hosted.includes('paste a ChatGPT, Claude or tavya share link'), 'a nonlocal console still advertises share links');
 ok(!hosted.includes('provider conversation ID'), 'a nonlocal console does not advertise inaccessible provider ids');
 S.meta.hostLocal = true;
 

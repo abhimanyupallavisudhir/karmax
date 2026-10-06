@@ -10,6 +10,11 @@ import {
   putConversationImport,
 } from '../src/store/conversation-imports.js';
 import { LocalObjectStore } from '../src/store/objects.js';
+import { publicConversationHtml, type ConversationShare } from '../src/gateway/conversation-sharing.js';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const VENDORED_PANAGENT = fileURLToPath(new URL('../vendor/panagent/src', import.meta.url));
 
 const SOURCE_SESSION = '11111111-1111-4111-8111-111111111111';
 const CLAUDE_JSONL = [
@@ -338,12 +343,50 @@ describe('Krmax panagent bridge', () => {
     }
   });
 
-  it('accepts only public ChatGPT and Claude share URLs', () => {
-    expect(publicConversationShare('https://chatgpt.com/share/abc')).toBe('https://chatgpt.com/share/abc');
-    expect(publicConversationShare('https://claude.ai/share/abc')).toBe('https://claude.ai/share/abc');
+  it('accepts only public ChatGPT, Claude and tavya share URLs', () => {
+    const tavya = `https://tavya.io/share/conversations/${'A'.repeat(43)}`;
+    expect(publicConversationShare('https://chatgpt.com/share/abc')).toEqual({ url: 'https://chatgpt.com/share/abc', format: 'chatgpt-share' });
+    expect(publicConversationShare('https://claude.ai/share/abc')).toEqual({ url: 'https://claude.ai/share/abc', format: 'claude-share' });
+    expect(publicConversationShare(tavya)).toEqual({ url: tavya, format: 'tavya-share', id: 'A'.repeat(43) });
+    // Any karmax installation serves shares at the same path.
+    expect(publicConversationShare(tavya.replace('tavya.io', 'karmax.example.org'))?.format).toBe('tavya-share');
+    expect(publicConversationShare('https://tavya.io/share/conversations/short')).toBeUndefined();
+    expect(publicConversationShare(tavya.replace('https:', 'http:'))).toBeUndefined();
     expect(publicConversationShare('https://chatgpt.com/c/private')).toBeUndefined();
     expect(publicConversationShare('http://chatgpt.com/share/abc')).toBeUndefined();
     expect(publicConversationShare('https://example.com/share/abc')).toBeUndefined();
     expect(publicConversationShare('not a url')).toBeUndefined();
+  });
+
+  it('reads its own share page exactly as tavya serves it', async () => {
+    const share: ConversationShare = {
+      id: 'B'.repeat(43), taskId: 'task', projectId: 'project', role: 'do', title: 'Port <it> & "test"', createdAt: Date.UTC(2026, 9, 5),
+      messages: [
+        { role: 'user', text: 'Fix `a < b` & "c".\n\n```py\nif x:\n    y()\n```' },
+        { role: 'agent', text: 'Done: $a<b$ and </div></article> stay text ✓' },
+      ],
+    };
+    const html = publicConversationHtml(share, { siteName: 'tavya' });
+    const converted = spawnSync('python3', ['-m', 'panagent', 'convert', '-', '--to', 'ir', '--quiet'],
+      { input: html, encoding: 'utf8', env: { PATH: process.env.PATH, PYTHONPATH: VENDORED_PANAGENT } });
+    expect(converted.status, converted.stderr).toBe(0);
+    const ir = JSON.parse(converted.stdout);
+    expect(ir.title).toBe(share.title);
+    expect(ir.source).toMatchObject({ format: 'tavya-share-html', provider: 'tavya', kind: 'public-share-snapshot' });
+    expect(ir.messages.map((m: any) => [m.role, m.content[0].text]))
+      .toEqual(share.messages.map((m) => [m.role === 'user' ? 'user' : 'assistant', m.text]));
+
+    const home = temporary('karmax-panagent-tavya-');
+    try {
+      const result = await importWithPanagent({ source: { data: Buffer.from(html), name: 'share.html' }, provider: 'claude',
+        forkHome: home, worldPath: '/tmp/tavya-world', mode: 'context', native: true });
+      expect(result.kind).toBe('native');
+      if (result.kind !== 'native') return;
+      const records = fs.readFileSync(path.join(home, 'projects', '-tmp-tavya-world', `${result.sessionId}.jsonl`), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line));
+      expect(records).toHaveLength(1);
+      expect(records[0].message.content).toContain('    y()');
+      expect(records[0].message.content).toContain('untrusted context');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 });

@@ -919,10 +919,10 @@ export class KarmaxApi {
       const sessionId = (resumeFrom as Record<string, unknown>).sessionId;
       if (sessionId !== undefined && (typeof sessionId !== 'string' || !sessionId.trim()
         || (looksLikeConversationUrl(sessionId) && !publicConversationShare(sessionId))))
-        throw new ValidationError('use a public HTTPS ChatGPT/Claude share link or upload a conversation file');
+        throw new ValidationError(`use a public HTTPS ChatGPT, Claude or ${BRAND} share link or upload a conversation file`);
       if (typeof sessionId === 'string' && !publicConversationShare(sessionId)
         && !(this.deps.hostLocal ?? deploymentHostLocal()))
-        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link`);
+        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT, Claude or ${BRAND} share link`);
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = (await this.deps.store.getTask(sourceId));

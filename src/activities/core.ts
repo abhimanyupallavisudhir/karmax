@@ -91,6 +91,7 @@ import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { publicShare, publicConversationHtml } from '../gateway/conversation-sharing.js';
 import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
@@ -2155,14 +2156,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const allowProviderId = deps.hostLocal ?? deploymentHostLocal();
         if (spec.resumeFrom.sessionId && !share && looksLikeConversationUrl(spec.resumeFrom.sessionId)) {
           throw ApplicationFailure.create({
-            message: 'Use a public HTTPS ChatGPT or Claude share link, or upload a conversation file.',
+            message: `Use a public HTTPS ChatGPT, Claude or ${BRAND} share link, or upload a conversation file.`,
             type: 'agent-error',
             nonRetryable: true,
           });
         }
         if (spec.resumeFrom.sessionId && !share && !allowProviderId) {
           throw ApplicationFailure.create({
-            message: `Provider conversation IDs are available only on a host-local ${BRAND}. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.`,
+            message: `Provider conversation IDs are available only on a host-local ${BRAND}. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT, Claude or ${BRAND} share link.`,
             type: 'agent-error',
             nonRetryable: true,
           });
@@ -2175,7 +2176,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const kind = await applyPanagent({ data, name: upload.name }, 'transcript', `upload:${upload.id}`);
           (await record(args.taskId, 'session.imported', { source: 'upload', format: upload.format, provider: profile.provider, kind }));
         } else if (share) {
-          const kind = await applyPanagent({ url: share }, 'context', `share:${share}`);
+          // A share of this installation is read from the store (exactly what
+          // its public page shows) rather than fetched back over the internet.
+          const local = share.id ? await publicShare(store, share.id) : undefined;
+          const source: PanagentSource = local
+            ? { data: Buffer.from(publicConversationHtml(local)), name: 'share.html' } : { url: share.url };
+          const kind = await applyPanagent(source, 'context', `share:${share.url}`);
           (await record(args.taskId, 'session.imported', { source: 'share', provider: profile.provider, kind }));
         } else if (spec.resumeFrom.sessionId) {
           // A raw id is meaningful only on a host-local install, where the UI and
