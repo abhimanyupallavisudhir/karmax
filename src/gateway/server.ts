@@ -192,6 +192,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
   if (p === '/api/organization-directory' && read) return 'none';
   if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
+  // The organization task list spans its projects; like global search, each
+  // project is authorized in searchableProjects / searchOrganizationTasks.
+  if (/^\/api\/organizations\/[^/]+\/search$/.test(p) && read) return 'none';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -4794,6 +4797,11 @@ export class Gateway {
         return this.json(res, 200, await this.searchProjects(req, res, session, query));
       }
       if (p === '/api/search/fields' && method === 'GET') return this.json(res, 200, (await api.searchFields(token)));
+      const organizationSearch = p.match(/^\/api\/organizations\/([^/]+)\/search$/);
+      if (organizationSearch && method === 'GET') {
+        if ((url.searchParams.get('q') ?? '').length > 2000) return this.json(res, 400, { error: 'Search is too long' });
+        return await this.searchOrganization(res, session, decodeURIComponent(organizationSearch[1]!), url);
+      }
 
       // Evaluate a query against a project: `?q=<query string>` (Linear-style token
       // syntax) → { tasks, groups, total }. Every list surface — the default list
@@ -9205,36 +9213,70 @@ export class Gateway {
   private async searchProjects(_req: http.IncomingMessage, res: http.ServerResponse, session: Session, query: string) {
     const results: { projectId: string; tasks: EvalResult['tasks']; total: number }[] = [];
     if (query.length < 2) return results;
-    const { authorization, identity, store, tokens, api } = this.deps;
-    const member = session.userId && identity && authorization ? session.userId : undefined;
+    const { api } = this.deps;
+    const member = this.searchMember(session);
+    for (const project of await this.searchableProjects(res, session)) {
+      if (res.destroyed) break;
+      const result = member ? await api.searchAuthorizedTasks(project.id, query, `user:${member}`)
+        : await api.searchTasks(session.apiToken, project.id, query);
+      results.push({ projectId: project.id, tasks: result.tasks.slice(0, 100), total: result.total });
+    }
+    return results;
+  }
+
+  /** The organization task list: one query over every project of the
+   *  organization the caller can read, sorted together and paged. */
+  private async searchOrganization(res: http.ServerResponse, session: Session, organizationId: string, url: URL) {
+    const query = url.searchParams.get('q') ?? '';
+    const page = { limit: Number(url.searchParams.get('limit') ?? 200), offset: Number(url.searchParams.get('offset') ?? 0) };
+    if (!(await this.deps.store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+    const member = this.searchMember(session);
+    if (!member) return this.json(res, 200, await this.deps.api.searchOrganizationTasks(session.apiToken, organizationId, query, page));
+    const projects = await this.searchableProjects(res, session, organizationId);
+    // An empty list is an answer only to a member; anyone else is refused, like
+    // every other route that names a foreign organization.
+    if (!projects.length && !(await this.deps.store.organizationMembership(organizationId, member)))
+      return this.json(res, 403, { error: 'You are not a member of this organization' });
+    return this.json(res, 200, await this.deps.api.searchAuthorizedOrganization(projects, query, `user:${member}`, page));
+  }
+
+  /** A browser session searches as its signed-in person; a bearer by its token. */
+  private searchMember(session: Session): string | undefined {
+    const { authorization, identity } = this.deps;
+    return session.userId && identity && authorization ? session.userId : undefined;
+  }
+
+  /** The projects a search may visit, optionally within one organization. */
+  private async searchableProjects(res: http.ServerResponse, session: Session, organizationId?: string): Promise<Project[]> {
+    const { authorization, store, tokens } = this.deps;
+    const member = this.searchMember(session);
     let projects: Project[];
     if (member) projects = await store.listProjectsReachableBy(member);
     else {
       const record = await tokens.verify(session.apiToken);
-      if (!record || !allows(record.caps, 'project:read') || !allows(record.caps, 'task:read')) return results;
+      if (!record || !allows(record.caps, 'project:read') || !allows(record.caps, 'task:read')) return [];
       const ids = record.projectId ? [record.projectId] : record.projectIds;
       projects = ids?.length ? (await Promise.all(ids.map(id => store.getProject(id)))).filter((p): p is Project => !!p)
         : record.organizationId ? await store.listOrganizationProjects(record.organizationId)
         : await store.listProjects(); // installation-wide authority
     }
+    const out: Project[] = [];
     for (const project of projects) {
       if (res.destroyed) break;
-      let result: EvalResult;
+      const projectOrganization = project.organizationId ?? 'org_personal';
+      if (organizationId && projectOrganization !== organizationId) continue;
       if (member) {
-        const organizationId = project.organizationId ?? 'org_personal';
-        const caps = await authorization!.capabilitiesAsync(`user:${member}`, project.id, organizationId);
+        const caps = await authorization!.capabilitiesAsync(`user:${member}`, project.id, projectOrganization);
         if (!allows(caps, 'project:read') || !allows(caps, 'task:read')
-          || !(await this.ssoAdmits(member, session.email, organizationId))) continue;
-        result = await api.searchAuthorizedTasks(project.id, query, `user:${member}`);
+          || !(await this.ssoAdmits(member, session.email, projectOrganization))) continue;
       } else {
-        const scope = { projectId: project.id };
+        const scope = { projectId: project.id, organizationId: projectOrganization };
         if (!(await tokens.check(session.apiToken, 'project:read', scope)).ok
           || !(await tokens.check(session.apiToken, 'task:read', scope)).ok) continue;
-        result = await api.searchTasks(session.apiToken, project.id, query);
       }
-      results.push({ projectId: project.id, tasks: result.tasks.slice(0, 100), total: result.total });
+      out.push(project);
     }
-    return results;
+    return out;
   }
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {

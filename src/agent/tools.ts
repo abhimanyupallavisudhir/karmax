@@ -9,7 +9,7 @@ import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME }
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
-  compactSearch, compactTags, normalizeRequestBody, platformRequestPathError,
+  compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
 import { URGENCY_LEVELS, type AgentWait, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
@@ -545,8 +545,10 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       + 'Fields: status, stage, priority, tag (a/b path matches descendants), workflow, created, updated, num, '
       + 'is:<facet> (open/draft/archived/pr/untagged/armed/scheduled/recurring/blocked-on-deps/series/run/…), '
       + 'trigger, schedule, nextRun, dependsOn:#N / blocks:#N, and any workflow param via `param.<key>`. '
-      + 'Add `sort:priority-desc` and `group:tag`. An empty query returns everything.',
-    parameters: { type: 'object', properties: { project_id: { type: 'string' }, query: { type: 'string' } }, required: ['project_id'] },
+      + '`for:me` / `for:<name|email>` = tasks waiting on that person plus their drafts; `project:<id|slug|name>`. '
+      + 'Add `sort:priority-desc` and `group:tag`. An empty query returns everything. '
+      + 'Pass organization_id instead of project_id to search every project of the organization you can read.',
+    parameters: { type: 'object', properties: { project_id: { type: 'string' }, organization_id: { type: 'string' }, query: { type: 'string' } } },
   },
   {
     name: 'list_tags',
@@ -1361,6 +1363,11 @@ export function platformToolHandlers(
       return JSON.stringify((listed ?? []).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })));
     },
     async search_tasks(args) {
+      if (!args?.project_id === !args?.organization_id) return 'pass exactly one of project_id or organization_id';
+      if (args?.organization_id) {
+        return JSON.stringify(compactOrganizationSearch(await platformRequest('GET',
+          `/api/organizations/${encodeURIComponent(String(args.organization_id))}/search?q=${encodeURIComponent(String(args?.query ?? ''))}`) as { tags?: unknown[] }));
+      }
       const projectId = encodeURIComponent(String(args?.project_id ?? ''));
       const [result, tags] = await Promise.all([
         platformRequest('GET', `/api/projects/${projectId}/search?q=${encodeURIComponent(String(args?.query ?? ''))}`),

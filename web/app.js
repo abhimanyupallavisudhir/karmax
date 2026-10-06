@@ -295,10 +295,10 @@ function taskRecord(id) {
 // slug; the user-owned profile does not. Projects are addressed by a slug of their
 // name; tasks are numbered per project.
 // Scheme:
-//   /                                    → home (redirects into the current org)
+//   /                                    → home (redirects into the current org's home)
 //   /profile                             → the current user's profile
 //   /installation                        → global operator-only installation controls
-//   /<org>                               → org home (redirects to a project or insights)
+//   /<org>                               → org home: every project's tasks, for:me by default
 //   /<org>/insights                      → organization insights (/<org>/dashboard redirects here)
 //   /<org>/settings                      → organization settings
 //   /<org>/inbox                         → inbox
@@ -306,6 +306,8 @@ function taskRecord(id) {
 //   /<org>/<project>                     → task list (also /queue, /activity, /wiki, /settings)
 //   /<org>/<project>/tasks/:num          → the task's own page (permalink)
 //   /<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
+// A task list's query rides in ?q=; no ?q means the default `for:me`, and an
+// empty ?q= is "All".
 // Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
 // parsed and then canonicalised to the org form.
 function slugify(s) {
@@ -371,6 +373,8 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
  *  the rail highlights the project, the main pane shows its tab bar). One list
  *  so they never drift apart again. */
 const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
+// The query a task list opens with: what needs the signed-in person.
+const DEFAULT_LIST_QUERY = 'for:me';
 // Second-segment words that name an organization-level view rather than a project.
 const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
 
@@ -387,7 +391,7 @@ function parseRoute(url) {
   let [pathname, search = ''] = String(url).split('?');
   try { pathname = decodeURI(pathname); } catch {}
   const query = new URLSearchParams(search);
-  const q = query.get('q') || '';
+  const q = query.has('q') ? query.get('q') : DEFAULT_LIST_QUERY;
   const seg = pathname.replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
@@ -406,7 +410,7 @@ function parseRoute(url) {
   }
   // New scheme: /<org>/… — everything is namespaced under the organization slug.
   const org = seg[0];
-  if (!seg[1]) return { name: 'global', org, tab: null };            // /<org> → org home
+  if (!seg[1]) return { name: 'global', org, tab: 'home', q };       // /<org> → org home
   // Profile used to be organization-prefixed. It never belonged to that tenant,
   // so recognize old bookmarks without carrying their org into application state.
   if (seg[1] === 'profile') return { name: 'profile', legacy: true };
@@ -465,11 +469,24 @@ function projectBase(pid) {
 // form of a search — and so moving between tabs (or back from a task) restores
 // the exact filtered/grouped/sorted view. It defaults to the query in hand,
 // which belongs to the project currently on screen and to no other.
-function projectRoute(pid, tab = 'tasks', q = pid === S.projectId ? S.search : '') {
+function projectRoute(pid, tab = 'tasks', q = pid === S.searchScope ? S.search : DEFAULT_LIST_QUERY) {
   const base = projectBase(pid);
   if (!base) return globalRoute('insights');
   if (tab !== 'tasks') return `${base}/${tab}`;
-  return q ? `${base}?q=${encodeQuery(q)}` : base;
+  return listRoute(base, q);
+}
+
+// A task list's URL: the default query (`for:me`) is the bare path, anything
+// else — "All" (the empty query) included — is spelled out in ?q=.
+function listRoute(base, q) {
+  return q === DEFAULT_LIST_QUERY ? base : `${base}?q=${encodeQuery(q || '')}`;
+}
+
+// The organization home — every project's tasks in one list — at /<org>.
+function homeRoute(org = currentOrg(), q) {
+  const query = q ?? (S.searchScope === 'org:' + org?.id ? S.search : DEFAULT_LIST_QUERY);
+  const base = orgBase(org);
+  return base ? listRoute(base, query) : '/';
 }
 
 // Query strings are meant to be read and hand-edited in the address bar, so we
@@ -491,9 +508,7 @@ function globalRoute(tab, org = currentOrg()) {
 // the context switch from the URL as the single source of truth.
 function organizationLandingRoute(organizationId) {
   const organization = organizationById(organizationId);
-  if (!organization) return null;
-  const project = firstProjectForOrganization(organization.id);
-  return project ? projectRoute(project.id) : globalRoute('organization', organization);
+  return organization ? homeRoute(organization, DEFAULT_LIST_QUERY) : null;
 }
 
 function installationRoute() { return '/installation'; }
@@ -563,8 +578,8 @@ async function applyRoute() {
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
   const r = parseRoute(currentPath());
   if (r.name === 'home') {
-    const pid = S.projectId || firstProjectForOrganization(S.organizationId)?.id;
-    return go(pid ? projectRoute(pid) : globalRoute('insights'), { replace: true });
+    const org = currentOrg();
+    return go(org ? homeRoute(org, DEFAULT_LIST_QUERY) : globalRoute('insights'), { replace: true });
   }
   if (r.name === 'profile') {
     if (r.legacy) return go(`${profileRoute()}${location.hash || ''}`, { replace: true });
@@ -607,16 +622,12 @@ async function applyRoute() {
     }
     await loadOrganizationRuntimeCatalog();
     if (!routeIsCurrent()) return;
-    // Bare /<org> → that org's default project (or its insights); pre-org URLs
-    // (/dashboard, /organization, …) → rewrite to the org-prefixed form. Only
-    // redirect when the canonical path actually differs, so an unresolvable slug
-    // (or a workspace with no organizations yet) renders instead of looping.
-    if (!r.tab) {
-      const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id;
-      const dest = pid ? projectRoute(pid) : globalRoute('insights');
-      if (dest !== currentPath()) return go(dest, { replace: true });
-      r.tab = 'insights'; // fall through to a real page
-    }
+    // Bare /<org> is the organization home: one task list over all its projects.
+    if (r.tab === 'home' && S.organizationId) return applyHomeRoute(r, routeIsCurrent);
+    if (r.tab === 'home') r.tab = 'insights'; // a workspace with no organization yet
+    // Pre-org URLs (/dashboard, /organization, …) → rewrite to the org-prefixed
+    // form below. Only redirect when the canonical path actually differs, so an
+    // unresolvable slug renders instead of looping.
     if (r.tab === 'inbox') {
       S.inboxFilter = INBOX_TABS.some((tab) => tab.key === r.sub) ? r.sub : 'all';
     }
@@ -682,12 +693,17 @@ async function applyRoute() {
     // below, so a link into another project's search still lands filtered.
     S.projectId = pid;
     syncLiveWatch();
-    S.search = '';
-    S.searchResult = null;
-    S.searchPending = false;
     S.cursorId = null;
   }
-  const incomingListQuery = r.q || '';
+  // The list query belongs to one list (a project, or the organization home);
+  // arriving from another drops it, so it cannot leak into this one's links.
+  if (S.searchScope !== pid) {
+    S.search = DEFAULT_LIST_QUERY;
+    S.searchScope = pid;
+    S.searchResult = null;
+    S.searchPending = false;
+  }
+  const incomingListQuery = r.q ?? DEFAULT_LIST_QUERY;
   const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
   const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
   // A project with nothing in memory to paint reads everything its page needs
@@ -771,6 +787,32 @@ async function applyRoute() {
   renderMain();
   if (tab === 'activity') seedActivity();
   if (tab === 'queue') seedQueue();
+}
+
+// The organization home: the task list over every project of the organization,
+// with the same query language, views and toolbar as a project list. The URL
+// owns its query exactly as it owns a project list's.
+async function applyHomeRoute(r, routeIsCurrent) {
+  closeTaskDom();
+  S.tab = 'home';
+  const scope = `org:${S.organizationId}`;
+  const query = r.q ?? DEFAULT_LIST_QUERY;
+  if (S.searchScope !== scope || S.search !== query) {
+    S.search = query;
+    S.searchScope = scope;
+    S.searchResult = null;
+    S.searchFailed = false;
+    S.searchPending = true;
+    S.cursorId = null;
+  }
+  renderRail();
+  renderMain();
+  const readable = firstProjectForOrganization(S.organizationId);
+  const fields = S.fields.length || !readable ? null
+    : api(`/api/search/fields?projectId=${encodeURIComponent(readable.id)}`).then((value) => { S.fields = value || []; }).catch(() => {});
+  await Promise.all([runSearch().catch(() => {}), fields]);
+  if (!routeIsCurrent() || S.tab !== 'home') return;
+  renderMain();
 }
 
 // The permalink for a task (/<org>/<project>/tasks/:num) — used for in-place
@@ -2870,6 +2912,7 @@ function resumeVisibleUpdates() {
     loadInbox().catch(() => {});
     if (S.selected) { S.liveOutput = {}; refreshTask(); refreshTaskHistory(S.selected); }
     else if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
+    else if (S.tab === 'home') scheduleHomeRefresh();
     else if (S.tab === 'activity') seedActivity();
   }
   checkConsoleRevision();
@@ -3310,15 +3353,24 @@ function markTaskCancelling(taskId) {
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
 async function runSearch() {
+  // The organization home searches every project of the organization; a project
+  // list (and a task page in it) searches that project.
+  const home = S.tab === 'home';
+  const organizationId = S.organizationId;
   const projectId = S.projectId;
-  if (!projectId) return false;
+  if (home ? !organizationId : !projectId) return false;
+  const scope = home ? `org:${organizationId}` : projectId;
+  const isCurrent = () => (S.tab === 'home' ? `org:${S.organizationId}` : S.projectId) === scope;
   const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
   S.searchPending = true;
   try {
-    const r = await api(`/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`);
-    if (S.searchEpoch !== epoch || S.projectId !== projectId) return false;
-    const live = new Map(S.tasks.map((t) => [t.id, t]));
+    const r = await api(home
+      ? `/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent(q)}`
+      : `/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`);
+    if (S.searchEpoch !== epoch || !isCurrent()) return false;
+    // Rows of other projects have no live copy in S.tasks (the open project's).
+    const live = new Map(home ? [] : S.tasks.map((t) => [t.id, t]));
     const overlay = (t) => pendingCancellationTask({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
     r.tasks = (r.tasks || []).map(overlay);
     const overlayGroups = (groups) => (groups || []).map((g) => ({
@@ -3338,7 +3390,7 @@ async function runSearch() {
     // Without the flag the view falls back to a client-side filter and shows
     // "No matching tasks", so a server outage reads as a bad query and the user
     // edits a perfectly good one.
-    if (S.searchEpoch === epoch && S.projectId === projectId) {
+    if (S.searchEpoch === epoch && isCurrent()) {
       S.searchResult = null; S.searchFailed = true; S.searchPending = false;
     }
     return false;
@@ -3351,10 +3403,14 @@ async function runSearch() {
 // opening a new page, so a typed search doesn't bury the previous page under a
 // history entry per keystroke.
 function syncQueryUrl() {
-  if (S.tab !== 'tasks' || S.selected || !S.projectId) return; // only the list is query-driven
-  const path = projectRoute(S.projectId);
+  if (!isTaskListTab() || S.selected) return; // only the list is query-driven
+  if (S.tab === 'tasks' && !S.projectId) return;
+  const path = S.tab === 'home' ? homeRoute() : projectRoute(S.projectId);
   if (path !== currentPath()) history.replaceState({ kx: 1 }, '', path);
 }
+
+// The query-driven task lists: a project's, and the organization home.
+function isTaskListTab(tab = S.tab) { return tab === 'tasks' || tab === 'home'; }
 
 let searchDebounce = null;
 function scheduleSearch(background = false) {
@@ -3362,9 +3418,9 @@ function scheduleSearch(background = false) {
   searchDebounce = setTimeout(async () => {
     syncQueryUrl();
     const search = runSearch();
-    if (S.tab === 'tasks' && !background) renderMain();
+    if (isTaskListTab() && !background) renderMain();
     await search;
-    if (S.tab === 'tasks' && !S.selected) bgRenderMain();
+    if (isTaskListTab() && !S.selected) bgRenderMain();
   }, 180);
 }
 
@@ -3377,9 +3433,9 @@ async function setQuery(q) {
   if (box) box.value = S.search;
   syncQueryUrl();
   const search = runSearch();
-  if (S.tab === 'tasks') renderMain();
+  if (isTaskListTab()) renderMain();
   await search;
-  if (S.tab === 'tasks') renderMain();
+  if (isTaskListTab()) renderMain();
 }
 
 // Leave any detail surface, restore the canonical tag-grouped list, and place
@@ -3528,6 +3584,28 @@ function patchTaskListFromEvent(ev) {
   return !!task && patchLifecycleView(task, ev);
 }
 
+// The organization home re-runs its query when a task of the organization
+// changes. A busy organization publishes many events a second, so they are
+// coalesced: at most one search per interval, and always one after the last.
+const HOME_REFRESH_MS = 800;
+let homeRefreshTimer = null;
+function homeEventChangesList(ev) {
+  if (!ev.taskId || ev.siblingAttempt || liveOnlyEvent(ev.type)) return false;
+  if (!(ev.type === 'view.updated' || ev.type === 'task.stage' || ev.type === 'task.mentioned'
+    || ev.type === 'task.created' || ev.type === 'task.deleted' || LIST_RELOAD_EVENTS.has(ev.type))) return false;
+  const project = projectById(ev.projectId || ev.payload?.projectId);
+  return !project || project.organizationId === S.organizationId;
+}
+function scheduleHomeRefresh() {
+  if (homeRefreshTimer) return;
+  homeRefreshTimer = setTimeout(async () => {
+    homeRefreshTimer = null;
+    if (S.tab !== 'home' || S.selected) return;
+    await runSearch();
+    if (S.tab === 'home' && !S.selected) bgRenderMain();
+  }, HOME_REFRESH_MS);
+}
+
 function scheduleTaskListReload() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
@@ -3619,6 +3697,7 @@ function connectWs() {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
+    if (S.tab === 'home' && !S.selected && homeEventChangesList(ev)) scheduleHomeRefresh();
     if (inboxEventChanges(ev)) scheduleInboxReload();
     if (ev.type.startsWith('credential.approval-') && refreshVaultRequests) refreshVaultRequests().catch?.(() => {});
   };
@@ -3716,6 +3795,8 @@ async function refreshTasks() {
     do {
       taskRefreshQueued = false;
       try {
+        // The home's rows come from its organization search alone.
+        if (S.tab === 'home') { if (!S.selected) { await runSearch(); bgRenderMain(); } continue; }
         await loadTasks();
         if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
         if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
@@ -3974,8 +4055,8 @@ function renderShell() {
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
-      <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
-      <div class="brand">${brandMark()} ${siteNameMarkup()}</div>
+      <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">☰</button>
+      <a class="brand" id="brand-home" data-spa href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
       ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
@@ -4003,14 +4084,19 @@ function renderShell() {
   const closeMobileNav = () => {
     $('#rail')?.classList.remove('mobile-open');
     $('#rail-scrim')?.classList.remove('visible');
-    $('#mobile-menu')?.setAttribute('aria-expanded', 'false');
+    syncRailToggle();
   };
+  // ☰ slides the rail over the page on a phone, and folds it away on a wider
+  // screen (remembered per browser, like the theme).
   $('#mobile-menu')?.addEventListener('click', () => {
+    if (!narrowViewport()) return setRailCollapsed(!railCollapsed());
     const open = !$('#rail')?.classList.contains('mobile-open');
     $('#rail')?.classList.toggle('mobile-open', open);
     $('#rail-scrim')?.classList.toggle('visible', open);
     $('#mobile-menu')?.setAttribute('aria-expanded', String(open));
   });
+  NARROW_VIEWPORT.addEventListener?.('change', () => { closeMobileNav(); syncRailToggle(); });
+  syncRailToggle();
   $('#rail-scrim')?.addEventListener('click', closeMobileNav);
   $('#rail')?.addEventListener('click', (event) => {
     if (event.target.closest('.folder-toggle, .rail-edit-action, .rail-inline-edit')) return;
@@ -4028,6 +4114,26 @@ function renderShell() {
   renderOnboarding();
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
+}
+
+// The rail is folded away on a wider screen by the ☰ button; a phone slides it
+// over the page instead (.mobile-open), so the folded state never applies there.
+const NARROW_VIEWPORT = window.matchMedia?.('(max-width: 720px)') || { matches: false };
+function narrowViewport() { return NARROW_VIEWPORT.matches; }
+function railCollapsed() { return renderFlag('karmax-rail-collapsed', false); }
+function setRailCollapsed(collapsed) {
+  try { localStorage.setItem('karmax-rail-collapsed', collapsed ? '1' : '0'); } catch {}
+  syncRailToggle();
+}
+function syncRailToggle() {
+  const collapsed = railCollapsed();
+  document.documentElement.classList.toggle('rail-collapsed', collapsed);
+  const toggle = $('#mobile-menu');
+  if (!toggle) return;
+  const open = narrowViewport() ? !!$('#rail')?.classList.contains('mobile-open') : !collapsed;
+  toggle.setAttribute('aria-expanded', String(open));
+  toggle.title = open ? 'Hide sidebar' : 'Show sidebar';
+  $('#rail')?.toggleAttribute('inert', !narrowViewport() && collapsed);
 }
 
 // Move project `id` so it sits immediately before `beforeId`, or last among its own
@@ -4276,6 +4382,7 @@ function renderRail() {
     rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
     $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
   } else rail.innerHTML = `
+    <a class="nav-item rail-home ${S.tab === 'home' ? 'active' : ''}" data-spa href="${esc(homeRoute())}" id="rail-home" tabindex="0" title="${esc(commandHint('Home — every project, what needs you first', 'nav.home'))}">⌂ Home</a>
     <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
     <label class="rail-search-box">
       <svg class="rail-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
@@ -4331,6 +4438,8 @@ function renderRail() {
   wireProjectDrag(rail);
   if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
   rail.scrollTop = scrollTop;
+  // The logo is the way home; its organization follows the route.
+  $('#brand-home')?.setAttribute('href', homeRoute(currentOrg(), DEFAULT_LIST_QUERY));
 }
 
 // HTML5 drag-and-drop reordering of the rail's project links. The rail holds more
@@ -4515,7 +4624,7 @@ function renderMain() {
   if (!main) return;
   // A preload begun on the task list must not survive a trip through settings,
   // where the defaults it captured may have just been edited.
-  if (S.tab !== 'tasks') taskFormDefaultRequests.clear();
+  if (!isTaskListTab()) taskFormDefaultRequests.clear();
   // A task page owns #main while a task is open. Background list refreshes land
   // here (WS-driven refreshTasks) — repaint the page from the freshest state
   // instead of the list. S.view is null for a repeatable series (its config page
@@ -4544,7 +4653,7 @@ function renderMain() {
     : '';
 
   let content = '';
-  if (S.tab === 'tasks') content = tasksView();
+  if (isTaskListTab()) content = tasksView();
   else if (S.tab === 'queue') content = queuesView();
   else if (S.tab === 'activity') content = activityView();
   else if (S.tab === 'insights') content = insightsView();
@@ -4566,7 +4675,7 @@ function renderMain() {
   main.innerHTML = tabbar + content;
   // Project tabs are real <a> links; installLinkRouter() handles the plain click.
   $('#project-local-checkout')?.addEventListener('click', () => openProjectCheckout(proj));
-  if (S.tab === 'tasks') wireTasksView();
+  if (isTaskListTab()) wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'wiki') wireWikiView(proj);
   if (S.tab === 'avatars') wireAvatarsView(proj);
@@ -4604,9 +4713,14 @@ function taskMatches(t, q) {
 // carries the defaults. If the query already mentions a facet, we leave it.
 // The task-picker overlay passes its own facet list (e.g. the fork search keeps archived).
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
+// A `for:` query asks what waits on a person, wherever it sits: a sub-task or a
+// run that needs a human routes to them, so those facets are not hidden.
+function queryNamesPerson(q) { return /(^|\s)for:\S/i.test(q || ''); }
+function listShowsNested(q, facet) { return queryMentionsFacet(q, facet) || queryNamesPerson(q); }
 function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
   let s = (q || '').trim();
-  for (const facet of facets) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
+  for (const facet of facets)
+    if (!queryMentionsFacet(s, facet) && !(facet !== 'archived' && queryNamesPerson(s))) s = `${s} -is:${facet}`.trim();
   return s;
 }
 
@@ -4629,31 +4743,36 @@ const BUILTIN_VIEWS = [
 // that matches no view lights nothing — "no filter" and "a filter I haven't saved"
 // are different states, and only the first of them is All.
 const ALL_VIEW = '__all__'; // the chip standing for the empty (unfiltered) query
+const FOR_ME_VIEW = '__for_me__'; // the default chip: what waits on you
 function viewIdForQuery(q) {
   const s = normalizeQuery(q);
   if (!s) return ALL_VIEW;
+  if (s === normalizeQuery(DEFAULT_LIST_QUERY)) return FOR_ME_VIEW;
   return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
     || (S.views || []).find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
     || null;
 }
 
-// The saved-views switcher — every chip is a query. "All" is the default; then the
-// built-in starter views, then the user's saved views (each with a ✕ to delete).
+// The saved-views switcher — every chip is a query. "For me" is the default, then
+// "All", the built-in starter views, and the project's saved views (each with a ✕
+// to delete). Saved views belong to a project, so the organization home has none.
 function viewsBar() {
   const active = viewIdForQuery(S.search);
+  const home = S.tab === 'home';
   const builtins = BUILTIN_VIEWS
     .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
     .join('');
-  const saved = S.views
+  const saved = (home ? [] : S.views)
     .map(
       (v) => `<div class="view-chip ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
     )
     .join('');
   return `<div class="views-bar">
+    <div class="view-chip ${active === FOR_ME_VIEW ? 'active' : ''}" data-view="${FOR_ME_VIEW}" role="button" tabindex="0" title="Waiting on you: reviews, questions, approvals, mentions — and your drafts">◉ For me</div>
     <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" role="button" tabindex="0">≡ All</div>
     ${builtins}
     ${saved}
-    <div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">＋ Save view</div>
+    ${home ? '' : '<div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">＋ Save view</div>'}
   </div>`;
 }
 
@@ -4745,6 +4864,9 @@ function wireQueryToolbar(root, prefix, { get, set }) {
 
 function tasksView() {
   const r = S.searchResult;
+  // The organization home lists every project's tasks: rows name their project,
+  // and new tasks are created inside a project, so it has no composer.
+  const home = S.tab === 'home';
   // Runs (spawned from a repeatable series) are grouped under their series row,
   // not shown at the top level. Build the lookup once for taskRow/seriesRow, and
   // hide runs from every list surface (flat + grouped) below.
@@ -4755,39 +4877,46 @@ function tasksView() {
   // (the -is:run/-is:subtask defaults from effectiveQuery); this is the client-side fallback,
   // and it opts back in when the query explicitly asks for that facet (the Sub-tasks view's
   // `is:subtask`, or a hand-typed `is:run`) so those views aren't stripped to empty.
-  const keepRun = queryMentionsFacet(S.search, 'run');
-  const keepSub = queryMentionsFacet(S.search, 'subtask');
+  const keepRun = listShowsNested(S.search, 'run');
+  const keepSub = listShowsNested(S.search, 'subtask');
   const topLevel = (t) => (keepRun || !t.params?.runOf) && (keepSub || !t.parentTaskId);
   // The server already applied the query (incl. the default -is:archived from effectiveQuery).
   // Fallback (before the first result lands) filters client-side and drops archived to match.
+  // Before the first result the open project's rows are a fair preview of a text
+  // search, but not of a structured one (for:, status:…) nor of the home's.
+  const preview = !home && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
   const flat = (r
     ? r.tasks
-    : S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)) : []
   ).filter(topLevel);
+  const row = (t, opts = {}) => taskRow(t, { ...opts, ...(home ? { showTags: false, project: true } : {}) });
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
   let body;
   if (groups) {
     body = r.hierarchical
       ? [
-        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).filter(topLevel).map((t) => taskRow(t, { showTags: false })),
+        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).filter(topLevel).map((t) => row(t, { showTags: false })),
         ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g, topLevel)),
       ].join('')
       : groups.map((g) => {
         const gt = g.tasks.filter(topLevel);
-        return `<h2 class="task-group-heading">${esc(g.label)} <span class="task-group-count">${gt.length} task${gt.length === 1 ? '' : 's'}</span></h2>${gt.map((t) => taskRow(t)).join('')}`;
+        return `<h2 class="task-group-heading">${esc(g.label)} <span class="task-group-count">${gt.length} task${gt.length === 1 ? '' : 's'}</span></h2>${gt.map((t) => row(t)).join('')}`;
       }).join('');
   } else {
-    body = flat.map((t) => taskRow(t)).join('');
+    body = flat.map((t) => row(t)).join('');
   }
   const empty = S.searchFailed
     ? `<div class="empty"><div class="big">Search didn’t run</div>Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button></div>`
+    : !r && S.searchPending ? ''
+    : viewIdForQuery(S.search) === FOR_ME_VIEW
+      ? `<div class="empty for-me-empty"><div class="big">All clear</div>Nothing is waiting on you.</div>`
     : S.search
       ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
       // Done and cancelled tasks archive themselves, so an empty default list
       // does not mean the project has never had a task.
-      : `<div class="empty"><div class="big">No open tasks</div>Describe one above. Finished tasks move to 🗄 Archived.</div>`;
-  return `
+      : `<div class="empty"><div class="big">No open tasks</div>${home ? '' : 'Describe one above. '}Finished tasks move to 🗄 Archived.</div>`;
+  const composer = home ? '' : `
     <div class="composer">
       <div class="quick-task-field">
         <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
@@ -4797,7 +4926,10 @@ function tasksView() {
       <button class="btn icon-only" id="expand-task" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
       <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
-    <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>
+    <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>`;
+  const trailing = home ? projectFilterHtml()
+    : `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`;
+  return `${composer}
     <div class="organizer">
       <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
@@ -4807,12 +4939,61 @@ function tasksView() {
         ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : ''}
       </div>
       ${viewsBar()}
-      ${queryToolbarHtml(S.search || '', 'q', `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`)}
+      ${queryToolbarHtml(S.search || '', 'q', trailing)}
     </div>
     <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
       <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
     </div>
     ${body || empty}`;
+}
+
+// The organization home's project filter: a `project:` clause in the query, so
+// it is a link like any other filter. Choosing "All projects" removes it.
+function projectFilterHtml() {
+  const projects = (S.projects || []).filter((p) => p.organizationId === S.organizationId);
+  if (projects.length < 2) return '';
+  const current = queryProjectSlug(S.search);
+  const opt = (value, label) => `<option value="${esc(value)}" ${value === current ? 'selected' : ''}>${esc(label)}</option>`;
+  return `<select id="q-project" class="q-sel" title="Project" aria-label="Project">${opt('', 'All projects')}${projects
+    .map((p) => opt(projectSlug(p), projectPath(p))).join('')}</select>`;
+}
+function queryProjectSlug(q) {
+  const value = (q || '').match(/(?:^|\s)project:("[^"]*"|\S+)/)?.[1]?.replace(/^"|"$/g, '') || '';
+  const project = (S.projects || []).find((p) => p.organizationId === S.organizationId
+    && [p.id.toLowerCase(), projectSlug(p), p.name.toLowerCase()].includes(value.toLowerCase()));
+  return project ? projectSlug(project) : value;
+}
+function setProjectClause(q, slug) {
+  const rest = (q || '').replace(/(?:^|\s)project:("[^"]*"|\S+)/g, '').replace(/\s+/g, ' ').trim();
+  return slug ? addClause(rest, 'project', slug) : rest;
+}
+
+// Why a row is in a `for:` list, from the inbox kind of the ask, most pressing first.
+// A short label on the row; the explanation is its tooltip.
+const ATTENTION_REASONS = {
+  'approval-requested': ['Approval', 'Waiting for your approval'],
+  'review-requested': ['Review', 'Waiting for your review'],
+  escalated: ['Input', 'Waiting for your answer'],
+  assigned: ['Assigned', 'Assigned to you'],
+  mentioned: ['Mentioned', 'You were mentioned'],
+};
+// A hold on a person says what it is waiting for (waitingFor.reason).
+const HOLD_REASONS = {
+  error: ['Failed', 'Stopped on an error — needs you'],
+  authorization: ['Access', 'Needs an authorization you can grant'],
+  merge: ['Merge', 'Waiting for you to merge'],
+};
+function attentionChip(t) {
+  const reasons = S.searchResult?.reasons?.[t.id] || [];
+  // An ask outranks a mention; the order of ATTENTION_REASONS is the rank.
+  const kind = Object.keys(ATTENTION_REASONS).find((reason) => reasons.includes(reason));
+  if (!kind) return '';
+  const [label, title] = (kind === 'escalated' && HOLD_REASONS[t.lastView?.waitingFor?.reason]) || ATTENTION_REASONS[kind];
+  return `<span class="chip attention ${esc(kind)}" title="${esc(title)}">${esc(label)}</span>`;
+}
+function projectChip(t) {
+  const project = projectById(t.projectId);
+  return project ? `<span class="chip task-project" title="Project">${esc(projectPath(project))}</span>` : '';
 }
 
 function tagGroupHtml(group, keep, depth = 0) {
@@ -4935,9 +5116,10 @@ function runSubRow(r) {
     </div>`;
 }
 
-function taskRow(t, { showTags = true } = {}) {
+function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
+  const where = project ? projectChip(t) : '';
   if (t.params?.repeatable && !archived) return seriesRow(t);
   if (t.params?.triggerState === 'armed' && !archived) {
     return `
@@ -4963,7 +5145,7 @@ function taskRow(t, { showTags = true } = {}) {
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub">${where}<span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-queue="${t.id}">Run task</button>
@@ -4974,6 +5156,9 @@ function taskRow(t, { showTags = true } = {}) {
   const v = t.lastView || {};
   const status = v.status || 'active';
   const stage = v.stage || 'setup';
+  // In a for: list the reason says what the task waits for; a waiting stage
+  // chip ("Needs input") would only repeat it.
+  const why = attentionChip(t);
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
@@ -4985,9 +5170,10 @@ function taskRow(t, { showTags = true } = {}) {
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
+          ${where}${why}
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          <span class="chip ${status}">${esc(stageLabel(v))}</span>
-          ${v.approvalRequests ? '<span class="chip approval-needed">approval needed</span>' : ''}
+          ${why && status === 'waiting' ? '' : `<span class="chip ${status}">${esc(stageLabel(v))}</span>`}
+          ${v.approvalRequests && !why ? '<span class="chip approval-needed">approval needed</span>' : ''}
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
@@ -5121,6 +5307,7 @@ function wireOrgControls() {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
       if (id === ALL_VIEW) { setQuery(''); return; }
+      if (id === FOR_ME_VIEW) { setQuery(DEFAULT_LIST_QUERY); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
       if (builtin) { setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
@@ -5593,8 +5780,12 @@ function wireTasksView() {
       openTagsManager(button.dataset.editTag);
     }),
   );
+  const home = S.tab === 'home';
   $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => wireTaskNav(e, () => e.dataset.id));
-  $('#main').querySelectorAll('[data-draft]').forEach((e) =>
+  // On the organization home a draft or armed row may belong to any project: it
+  // opens on its own project's page rather than in a form bound to this one.
+  if (home) $('#main').querySelectorAll('[data-draft], [data-armed]').forEach((e) => wireTaskNav(e, () => e.dataset.draft || e.dataset.armed));
+  else $('#main').querySelectorAll('[data-draft]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, taskRecord(e.dataset.draft)); }),
   );
   $('#main').querySelectorAll('[data-queue]').forEach((b) =>
@@ -5624,7 +5815,7 @@ function wireTasksView() {
     }),
   );
   // Clicking a waiting task's body opens the same form as a draft — fully editable, triggers included.
-  $('#main').querySelectorAll('[data-armed]').forEach((e) =>
+  if (!home) $('#main').querySelectorAll('[data-armed]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.runnow && !ev.target.dataset.canceltrig) openTaskForm(undefined, taskRecord(e.dataset.armed)); }),
   );
   // Repeatable series: run again, expand/collapse its runs, edit (body click), delete.
@@ -5655,6 +5846,16 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-unarchive]').forEach((b) =>
     b.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(b.dataset.unarchive, false); }),
   );
+  $('#retry-search')?.addEventListener('click', async () => { await runSearch(); renderMain(); });
+  $('#q-project')?.addEventListener('change', (e) => setQuery(setProjectClause(S.search, e.target.value)));
+  if (!home) wireQuickComposer();
+  // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
+  applyCursor();
+  $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
+}
+
+// The quick composer above a project's list.
+function wireQuickComposer() {
   const add = async (draft = false) => {
     const input = $('#new-task');
     const title = input.value.trim();
@@ -5670,7 +5871,7 @@ function wireTasksView() {
     };
     setBusy(true);
     try {
-      await api(`/api/projects/${S.projectId}/tasks`, {
+      const created = await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
         body: JSON.stringify(quickTaskPayload(title, images, draft, files)),
       });
@@ -5678,7 +5879,10 @@ function wireTasksView() {
       S.newTaskImages = [];
       S.newTaskFiles = [];
       renderAttachmentChips($('#new-task-chips'), S.newTaskImages, S.newTaskFiles);
-      toast(draft ? 'Draft saved' : 'Task created');
+      // A started task works on its own, so "For me" does not list it: the
+      // toast is the way to it.
+      const url = !draft && created?.id ? taskUrl(created.id, { ...created, projectId: created.projectId || S.projectId }) : '';
+      toast(draft ? 'Draft saved' : 'Task created', false, url ? { label: 'Open', fn: () => spaNavigate(url) } : undefined);
       await refreshTasks();
     } catch (e) {
       toast(e.message, true);
@@ -5686,7 +5890,6 @@ function wireTasksView() {
       if (composer?.isConnected) setBusy(false);
     }
   };
-  $('#retry-search')?.addEventListener('click', async () => { await runSearch(); renderMain(); });
   $('#draft-task')?.addEventListener('click', () => add(true));
   $('#add-task')?.addEventListener('click', () => add(false));
   // Enter opens the FULL form (carrying the typed text into its prompt field) so
@@ -5717,9 +5920,6 @@ function wireTasksView() {
   // Hide the defaultBranch/settings round-trip behind the time the user spends
   // reading or typing in the quick composer.
   requestTaskFormDefaults(S.projectId, QUICK_TASK_WORKFLOW);
-  // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
-  applyCursor();
-  $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
 const QUICK_TASK_WORKFLOW = 'software-dev';
@@ -19362,7 +19562,8 @@ const HOST_COMMANDS = [
   { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
   { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
   { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task')?.value.trim()); } },
-  { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (S.tab !== 'tasks') switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
+  { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
+  { id: 'nav.home', title: 'Go home', key: 'g h', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
   { id: 'nav.insights', title: 'Go to insights', key: 'g i', run: () => switchTab('insights') },
@@ -19390,7 +19591,7 @@ function allCommands() {
   const rail = inRail();
   add({ id: 'rail.newProject', title: 'New project', keybinding: 'n', group: 'Projects', available: rail, run: () => newProject() });
   add({ id: 'rail.search', title: 'Search projects', keybinding: '/', group: 'Projects', available: rail, run: () => $('#project-search')?.focus() });
-  const listy = ['tasks', 'queue'].includes(S.tab) && !rail;
+  const listy = ['tasks', 'home', 'queue'].includes(S.tab) && !rail;
   add({ id: 'list.quickAdd', title: 'Add quick task', keybinding: 'meta+Enter', group: 'List', palette: false, available: !!$('#add-task'), run: () => $('#add-task')?.click() });
   add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
   add({ id: 'list.prev', title: 'Previous task / row', keybinding: 'k', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(-1) : moveCursor(-1)) });
@@ -19553,10 +19754,15 @@ function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId)
 function openListRow(row) { if (row) (row.querySelector('a.row-link') || row).click(); }
 function openCursorRow() { openListRow(cursorRow()); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
-// With a task page open, j/k walk the same task order the list shows.
+// With a task page open, j/k walk the same task order the list shows — when the
+// open task is in that list; otherwise (a permalink, a task the query does not
+// match) they walk every task of the project, newest first.
 function taskOrder() {
+  const listed = S.searchScope === S.projectId ? (S.searchResult?.tasks || [])
+    .filter((t) => !t.params?.draft && t.projectId === S.projectId).map((t) => t.id) : [];
+  if (listed.includes(S.taskWalkTarget || S.selected)) return listed;
   return S.tasks
-    .filter((t) => !t.params?.draft && (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())))
+    .filter((t) => !t.params?.draft)
     .slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
     .map((t) => t.id);
 }

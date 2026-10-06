@@ -59,6 +59,8 @@ function constant(name) {
       window.stageLabel = () => 'Review';
       window.priorityFlag = () => '';
       window.pipeline = () => '';
+      window.attentionChip = () => '';
+      window.projectChip = () => '';
       window.renderMain = () => { $('#main').innerHTML = inboxView(); wireInboxView(); };
     });
     await page.addScriptTag({ content: [

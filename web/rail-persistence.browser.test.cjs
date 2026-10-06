@@ -36,6 +36,9 @@ function fn(name) {
         window.projectPath = p => [p.folder, p.name].filter(Boolean).join('/');
         window.projectRoute = id => `/projects/${id}`;
         window.globalRoute = tab => `/${tab}`;
+        window.homeRoute = () => '/o1';
+        window.currentOrg = () => ({ id: 'o1' });
+        window.DEFAULT_LIST_QUERY = 'for:me';
         window.commandHint = s => s;
         window.wireProjectDrag = () => {};
       });

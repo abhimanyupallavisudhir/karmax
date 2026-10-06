@@ -8,7 +8,7 @@ import { recordHumanConfirmation } from './review-confirmation.js';
 import { notifyChildSettlement } from './child-settlement.js';
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client, type WorkflowExecutionDescription } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
-import { Store, type CollaborationRequest } from '../store/db.js';
+import { Store, slugify, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
 import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
@@ -35,7 +35,7 @@ import {
 } from '../coordinators/names.js';
 import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
-import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
+import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, repositoryBranchDefaults } from './branch-defaults.js';
@@ -4180,9 +4180,66 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    *  `projectId`. Global console search authorizes a browser session's projects
    *  directly rather than minting a token for each (UI-18/RQ-14). */
   async searchAuthorizedTasks(projectId: string, query: string | TaskQuery, principalId: string, now = Date.now()): Promise<EvalResult> {
+    const project = (await this.deps.store.getProject(projectId)) ?? { id: projectId, name: projectId } as Project;
+    return (await this.evaluateProjects([project], query, principalId, now)).result;
+  }
+
+  /**
+   * Search every project of an organization the token can read (the agent and
+   * MCP path; a browser session's projects are authorized by the gateway and
+   * passed to `searchAuthorizedOrganization`). Projects the caller cannot read
+   * are skipped, exactly as global search skips them.
+   */
+  async searchOrganizationTasks(token: string, organizationId: string, query: string | TaskQuery,
+    page: { limit?: number; offset?: number } = {}, now = Date.now()) {
+    if (!(await this.deps.store.getOrganization(organizationId))) throw new NotFoundError(`no such organization ${organizationId}`);
+    const caller = await this.deps.tokens.verify(token);
+    if (!caller) throw new CapabilityError('unauthorized');
+    const all = await this.deps.store.listOrganizationProjects(organizationId);
+    const readable: Project[] = [];
+    for (const project of all) {
+      const scope = { projectId: project.id, organizationId };
+      if ((await this.deps.tokens.check(token, 'project:read', scope)).ok && (await this.deps.tokens.check(token, 'task:read', scope)).ok)
+        readable.push(project);
+    }
+    // An empty list is an answer only inside the caller's own organization.
+    if (!readable.length && !(caller.organizationId === organizationId && allows(caller.caps, 'task:read')))
+      throw new CapabilityError(`denied: task:read in no project of organization ${organizationId}`);
+    return this.searchAuthorizedOrganization(readable, query, caller.principal, page, now);
+  }
+
+  /** Evaluate one query across already-authorized projects of an organization:
+   *  one sort and grouping over all of them, then a page of the result. */
+  async searchAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string,
+    page: { limit?: number; offset?: number } = {}, now = Date.now()) {
+    const { result, tags } = await this.evaluateProjects(projects, query, principalId, now);
+    const limit = Math.max(1, Math.min(Number(page.limit) || 200, 500));
+    const offset = Math.max(0, Math.floor(Number(page.offset) || 0));
+    const tasks = result.tasks.slice(offset, offset + limit);
+    const ids = new Set(tasks.map((task) => task.id));
+    const prune = (groups: TaskGroup[]): TaskGroup[] => groups.map((group) => {
+      const children = group.children ? prune(group.children) : undefined;
+      const own = group.tasks.filter((task) => ids.has(task.id));
+      return { ...group, tasks: own, count: own.length + (children ?? []).reduce((n, child) => n + child.count, 0), ...(children ? { children } : {}) };
+    }).filter((group) => group.count > 0);
+    return {
+      ...result, tasks, total: result.total, offset, limit,
+      ...(result.groups ? { groups: prune(result.groups) } : {}),
+      ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
+      projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name) })),
+      tags,
+    };
+  }
+
+  /**
+   * The evaluator over one or more projects. `for:` clauses are resolved here,
+   * once per query: `me` is the caller, names and emails the organization's
+   * members, and each person's live asks come from the inbox — then they narrow
+   * the read to those tasks and drafts. Conversation search is intentionally
+   * explicit; every other query uses the compact projection.
+   */
+  private async evaluateProjects(projects: Project[], query: string | TaskQuery, principalId: string, now: number): Promise<{ result: EvalResult; tags: Tag[] }> {
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
-    // Conversation search is intentionally explicit. Every other query uses the
-    // compact projection so routine list filtering never parses all transcripts.
     const needsConversation = q.filters?.some((clause) =>
       clause.field === 'conversation' || clause.field === 'says') ?? false;
     // Preserve the evaluator's relational semantics: dependency fields need the
@@ -4191,13 +4248,42 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const fields = [...(q.filters ?? []).map(c => c.field), ...(q.sort ?? []).map(c => c.field), q.group];
     const activeOnly = !fields.some(field => field === 'dependsOn' || field === 'blocks')
       && q.filters?.some(c => c.field === 'is' && c.negate && c.values.length === 1 && c.values[0] === 'archived');
-    const tasks: TaskRecord[] = [];
-    for await (const page of this.deps.store.taskReadPages(projectId, {
-      includeArchived: !activeOnly, includeConversation: needsConversation,
-    })) tasks.push(...page);
-    const tags = await this.deps.store.listTagsAsync(projectId);
     const principal = principalRefOf(principalId);
-    return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });
+    const ctx: EvalContext = {
+      now, userId: principal?.kind === 'user' ? principal.userId : undefined,
+      projects: new Map(projects.map((project) => [project.id, { name: project.name, slug: slugify(project.name) }])),
+    };
+    const forValues = forClauseValues(q);
+    if (forValues.length) {
+      const organizations = [...new Set(projects.map((project) => project.organizationId ?? 'org_personal'))];
+      if (forValues.some((value) => value.toLowerCase() !== 'me' && !/^user:/i.test(value))) {
+        ctx.people = new Map();
+        for (const organizationId of organizations) for (const person of await this.deps.store.organizationPeople(organizationId)) {
+          ctx.people.set(person.name.trim().toLowerCase(), person.id);
+          if (person.email) ctx.people.set(person.email.trim().toLowerCase(), person.id);
+        }
+      }
+      const users = new Set(forValues.map((value) => value.toLowerCase() === 'me' ? ctx.userId
+        : /^user:/i.test(value) ? value.slice(5) : ctx.people?.get(value.trim().toLowerCase())).filter((id): id is string => !!id));
+      ctx.attention = new Map();
+      for (const userId of users) {
+        const asks = new Map<string, string[]>();
+        for (const organizationId of organizations)
+          for (const [taskId, kinds] of await this.deps.store.attentionAsks(userId, organizationId)) asks.set(taskId, kinds);
+        ctx.attention.set(userId, asks);
+      }
+    }
+    const candidates = attentionCandidates(q, ctx);
+    const tasks: TaskRecord[] = [];
+    const tags: Tag[] = [];
+    for (const project of projects) {
+      for await (const page of this.deps.store.taskReadPages(project.id, {
+        includeArchived: !activeOnly, includeConversation: needsConversation,
+        ...(candidates ? { candidateIds: [...candidates] } : {}),
+      })) tasks.push(...page);
+      tags.push(...(await this.deps.store.listTagsAsync(project.id)));
+    }
+    return { result: evaluateQuery(tasks, q, { ...ctx, tags }), tags };
   }
 
   /** The searchable-field registry the UI reads to build its filter/sort/group menus. */
