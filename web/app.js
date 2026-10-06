@@ -2936,7 +2936,7 @@ async function boot() {
     // The public root explains the product before asking for an account. Auth
     // callbacks, invitations and explicit auth routes still land directly on
     // the form they need, so a person following a link never has to hunt.
-    if (S.pendingInvite || S.justVerified || S.signInError || location.pathname === '/login' || location.pathname === '/mcp-callback') return renderLogin();
+    if (S.pendingInvite || S.justVerified || S.signInError || ['/login', '/mcp-callback', '/device', '/oauth/consent'].includes(location.pathname)) return renderLogin();
     if (location.pathname === '/signup') return renderSignup();
     return renderLanding();
   }
@@ -2947,6 +2947,8 @@ async function boot() {
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
   if (location.pathname === '/mcp-callback') return finishMcpCallback();
+  if (location.pathname === '/device') return renderDeviceApproval();
+  if (location.pathname === '/oauth/consent') return renderOAuthConsent();
   const route = parseRoute(location.pathname);
   if (route.name === 'invite') {
     const invitationToken = new URLSearchParams(location.search).get('token');
@@ -17563,6 +17565,7 @@ function profileView() {
       <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">Per-browser display choices.</p>
     </div>
     ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><p class="task-sub">Paid-plan subscriptions started through your account. Organization owners can change or cancel them in Plans &amp; billing.</p><div id="profile-paid-subscriptions" aria-live="polite">Loading subscriptions…</div></div>' : ''}
+    ${u ? appGrantsCard() : ''}
     <div class="card data-export-card">
       <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
       <div class="data-export-copy">
@@ -17722,6 +17725,7 @@ function wireProfileView() {
   if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
   void hydrateProfilePaidSubscriptions();
+  void hydrateAppGrants();
   hydrateProfileGithub();
   wireOrganizationCombo($('#default-organization'), () => S.defaultOrganizationId, async (organizationId) => {
     const preference = await api('/api/user/default-organization', {
@@ -20746,5 +20750,210 @@ function wireTiming(v) {
     const blob = new Blob([JSON.stringify(timingReports.get(v.taskId), null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a');
     a.href = url; a.download = `${v.taskId}-timing.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+}
+
+// ─── App sign-ins: /device, OAuth consent, Account → Apps and tokens ────────
+// The gateway side is src/gateway/oauth-routes.ts. A limit only ever narrows
+// the person's own access (level and/or projects); the default is all of it.
+const GRANT_KIND_LABEL = { cli: 'CLI', mcp: 'App', token: 'Token' };
+
+async function grantLimitOptions() {
+  const [projects, organizations] = await Promise.all([
+    api('/api/projects').catch(() => []), api('/api/organizations').catch(() => []),
+  ]);
+  const orgName = new Map((organizations || []).map((org) => [org.id, org.name]));
+  const several = new Set((projects || []).map((project) => project.organizationId)).size > 1;
+  return (projects || []).map((project) => ({ id: project.id,
+    name: several && orgName.get(project.organizationId) ? `${orgName.get(project.organizationId)} · ${project.name}` : project.name }));
+}
+
+function grantLimitSummary(levels, projects, limit) {
+  const level = levels.find((item) => item.id === limit.level)?.name;
+  const names = (limit.projectIds || []).map((id) => projects.find((project) => project.id === id)?.name || id);
+  if (!level && !names.length) return 'Your access';
+  return [level, names.length > 2 ? `${names.length} projects` : names.join(', ')].filter(Boolean).join(' · ');
+}
+
+function grantLimitMarkup(levels, projects, requested = {}) {
+  const chosen = new Set(requested.projectIds || []);
+  return `<details class="grant-limit">
+    <summary><span class="grant-limit-label">Access ${policyTip('It never gets more than you have. Limit it to a level, or to some projects.')}</span>
+      <b class="grant-limit-value">${esc(grantLimitSummary(levels, projects, requested))}</b></summary>
+    <div class="grant-limit-body">
+      <label class="grant-limit-row"><span>Level</span><select data-grant-level>
+        <option value="">Your access</option>
+        ${levels.map((level) => `<option value="${esc(level.id)}" title="${esc(level.description || '')}"${level.id === requested.level ? ' selected' : ''}>${esc(level.name)}</option>`).join('')}
+      </select></label>
+      ${projects.length ? `<fieldset class="grant-limit-projects"><legend>Projects ${policyTip('None selected: every project you can open.')}</legend>
+        ${projects.map((project) => `<label><input type="checkbox" value="${esc(project.id)}"${chosen.has(project.id) ? ' checked' : ''}> ${esc(project.name)}</label>`).join('')}
+      </fieldset>` : ''}
+    </div></details>`;
+}
+
+function readGrantLimit(root) {
+  const level = root.querySelector('[data-grant-level]')?.value || undefined;
+  const projectIds = [...root.querySelectorAll('.grant-limit-projects input:checked')].map((input) => input.value);
+  return { ...(level ? { level } : {}), ...(projectIds.length ? { projectIds } : {}) };
+}
+
+function wireGrantLimit(root, levels, projects) {
+  const update = () => { const value = root.querySelector('.grant-limit-value'); if (value) value.textContent = grantLimitSummary(levels, projects, readGrantLimit(root)); };
+  root.querySelector('.grant-limit')?.addEventListener('change', update);
+}
+
+function grantClientChip(client) {
+  if (!client) return '';
+  if (client.kind === 'first-party') return '';
+  return client.verified
+    ? `<span class="chip" title="${esc(`Identified by ${client.host}`)}">${esc(client.host || '')}</span>`
+    : `<span class="chip waiting">Unverified app ${policyTip('This app named itself; its name is not checked. Continue only if you just started this sign-in from an app you trust.')}</span>`;
+}
+
+function grantFrame(inner) {
+  document.body.classList.remove('landing-active');
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card grant-card">
+    <div class="brand grant-brand">${brandMark()} ${siteNameMarkup()}</div>${inner}</div></div>`;
+}
+
+function grantDone(title, text) {
+  $('.grant-card').innerHTML = `<div class="brand grant-brand">${brandMark()} ${siteNameMarkup()}</div>
+    <h1 class="grant-title">${esc(title)}</h1><p class="task-sub">${esc(text)}</p><a class="btn" href="/">Open ${siteNameMarkup()}</a>`;
+}
+
+async function renderDeviceApproval() {
+  document.title = `Approve sign-in · ${siteName()}`;
+  const initial = new URLSearchParams(location.search).get('code') || '';
+  grantFrame(`<h1 class="grant-title">Approve a sign-in ${policyTip('Approve only a code you started yourself, on a device you trust.')}</h1>
+    <input id="device-code" class="grant-code" value="${esc(initial.toUpperCase())}" maxlength="9" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Code shown on your device" placeholder="XXXX-XXXX">
+    <div id="device-detail"></div>
+    <div class="grant-actions" hidden><button class="btn primary" id="device-approve">Approve</button><button class="btn" id="device-deny">Deny</button></div>
+    <button class="btn primary grant-continue" id="device-continue">Continue</button>
+    <p class="grant-msg" id="grant-msg" role="alert"></p>`);
+  const input = $('#device-code'), message = $('#grant-msg');
+  let levels = [], projects = [], code = '';
+  const lookup = async () => {
+    message.textContent = '';
+    code = input.value.trim();
+    if (!code) { input.focus(); return; }
+    try {
+      const [request, options] = await Promise.all([api(`/api/oauth/device?code=${encodeURIComponent(code)}`), grantLimitOptions()]);
+      levels = request.levels || []; projects = options;
+      input.value = request.userCode; input.readOnly = true;
+      history.replaceState({ kx: 1 }, '', `/device?code=${encodeURIComponent(request.userCode)}`);
+      $('#device-detail').innerHTML = `<p class="grant-who"><b>${esc(request.deviceName || request.client?.name || 'A device')}</b>
+        <span class="task-sub">${esc(request.client?.name || '')}</span> ${grantClientChip(request.client)}</p>
+        ${grantLimitMarkup(levels, projects, request.requested || {})}`;
+      wireGrantLimit($('#device-detail'), levels, projects);
+      $('#device-continue').hidden = true;
+      $('.grant-actions').hidden = false;
+      $('#device-approve').focus();
+    } catch (error) { message.textContent = error.message; input.readOnly = false; input.select(); }
+  };
+  const decide = async (decision) => {
+    $('#device-approve').disabled = $('#device-deny').disabled = true;
+    try {
+      await api(`/api/oauth/device/${decision}`, { method: 'POST', body: JSON.stringify({ code, ...(decision === 'approve' ? readGrantLimit($('#device-detail')) : {}) }) });
+      if (decision === 'approve') grantDone('Signed in', 'Return to your device. You can close this tab.');
+      else grantDone('Sign-in denied', 'The device was not signed in.');
+    } catch (error) { message.textContent = error.message; $('#device-approve').disabled = $('#device-deny').disabled = false; }
+  };
+  input.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !input.readOnly) lookup(); });
+  $('#device-continue').addEventListener('click', lookup);
+  $('#device-approve').addEventListener('click', () => decide('approve'));
+  $('#device-deny').addEventListener('click', () => decide('deny'));
+  if (initial) await lookup(); else input.focus();
+}
+
+async function renderOAuthConsent() {
+  document.title = `Allow access · ${siteName()}`;
+  const id = new URLSearchParams(location.search).get('request') || '';
+  grantFrame('<p class="task-sub">Loading…</p>');
+  let request, projects;
+  try { [request, projects] = await Promise.all([api(`/api/oauth/authorizations/${encodeURIComponent(id)}`), grantLimitOptions()]); }
+  catch (error) { return grantDone('Sign-in expired', error.message); }
+  const client = request.client || {};
+  grantFrame(`<h1 class="grant-title">${esc(client.name || 'An app')}</h1>
+    <p class="grant-who">${grantClientChip(client)} <span class="task-sub" title="${esc(`Returns to ${request.redirectHost || ''}`)}">will act as you${client.kind === 'metadata' ? '' : ` · ${esc(request.redirectHost || '')}`}</span></p>
+    <div id="consent-limit">${grantLimitMarkup(request.levels || [], projects, request.requested || {})}</div>
+    <div class="grant-actions"><button class="btn primary" id="consent-allow">Allow</button><button class="btn" id="consent-deny">Deny</button></div>
+    <p class="grant-msg" id="grant-msg" role="alert"></p>`);
+  wireGrantLimit($('#consent-limit'), request.levels || [], projects);
+  const decide = async (decision) => {
+    $('#consent-allow').disabled = $('#consent-deny').disabled = true;
+    try {
+      const result = await api(`/api/oauth/authorizations/${encodeURIComponent(id)}/${decision}`, { method: 'POST',
+        body: JSON.stringify(decision === 'approve' ? readGrantLimit($('#consent-limit')) : {}) });
+      location.assign(result.redirectUri);
+    } catch (error) { $('#grant-msg').textContent = error.message; $('#consent-allow').disabled = $('#consent-deny').disabled = false; }
+  };
+  $('#consent-allow').addEventListener('click', () => decide('approve'));
+  $('#consent-deny').addEventListener('click', () => decide('deny'));
+  $('#consent-allow').focus();
+}
+
+function appGrantsCard() {
+  return `<div class="card" id="app-grants-card">
+    <div class="section-h">Apps and tokens ${policyTip('Devices, apps and tokens that act as you. Revoking one signs it out everywhere at once.')}</div>
+    <div id="profile-app-grants" aria-live="polite"><p class="task-sub">Loading…</p></div>
+    <div class="app-token-new" id="app-token-new"></div>
+    <button class="btn sm" type="button" id="app-token-open">New token</button>
+  </div>`;
+}
+
+async function hydrateAppGrants() {
+  const box = $('#profile-app-grants');
+  if (!box) return;
+  let result, projects;
+  try { [result, projects] = await Promise.all([api('/api/user/app-grants'), grantLimitOptions()]); }
+  catch (error) { box.innerHTML = `<p class="task-sub" role="alert">${esc(error.message)}</p>`; return; }
+  if ($('#profile-app-grants') !== box) return;
+  const levels = result.levels || [];
+  const day = (epoch) => new Date(epoch).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+  box.innerHTML = result.grants.length ? result.grants.map((grant) => `<div class="member-row app-grant-row" data-grant="${esc(grant.id)}">
+      <div><b>${esc(grant.name)}</b> <span class="chip">${GRANT_KIND_LABEL[grant.kind] || esc(grant.kind)}</span>${grant.current ? ' <span class="chip active">This one</span>' : ''}
+        <p class="task-sub">${esc(grantLimitSummary(levels, projects, grant.ceiling || {}))}${grant.limitedByCreator ? ` ${policyTip('Created by an agent: also limited to what that agent could do.')}` : ''}
+          · ${grant.lastUsedAt ? `used ${esc(fmtAgo(grant.lastUsedAt))}` : 'never used'}
+          · <span title="${esc(`Created ${new Date(grant.createdAt).toLocaleString()}`)}">${grant.kind === 'token' ? 'expires' : 'expires if unused by'} ${esc(day(grant.expiresAt))}</span></p></div>
+      <button class="btn sm danger" type="button" data-revoke-grant="${esc(grant.id)}">Revoke</button></div>`).join('')
+    : '<p class="task-sub">Nothing signed in. <code>npx tavya login</code> signs in a terminal.</p>';
+  box.querySelectorAll('[data-revoke-grant]').forEach((button) => button.addEventListener('click', async () => {
+    const name = button.closest('.app-grant-row')?.querySelector('b')?.textContent || 'this';
+    if (!confirm(`Revoke ${name}? It is signed out at once.`)) return;
+    button.disabled = true;
+    try { await api(`/api/user/app-grants/${encodeURIComponent(button.dataset.revokeGrant)}`, { method: 'DELETE' }); toast('Revoked'); await hydrateAppGrants(); }
+    catch (error) { button.disabled = false; toast(error.message, true); }
+  }));
+  const open = $('#app-token-open'), panel = $('#app-token-new');
+  if (!open || !panel) return;
+  open.onclick = () => {
+    open.hidden = true;
+    panel.innerHTML = `<form class="app-token-form">
+      <label class="form-row"><span>Name</span><input name="name" required maxlength="100" placeholder="CI deploys" autocomplete="off"></label>
+      ${grantLimitMarkup(levels, projects)}
+      <label class="grant-limit-row"><span>Expires in</span><select name="days">
+        ${[[7, '7 days'], [30, '30 days'], [90, '90 days'], [365, '1 year']].map(([days, label]) => `<option value="${days}"${days === 30 ? ' selected' : ''}>${label}</option>`).join('')}
+      </select></label>
+      <div class="profile-edit-actions"><button class="btn primary" type="submit">Create token</button><button class="btn" type="button" data-cancel>Cancel</button></div>
+    </form>`;
+    wireGrantLimit(panel, levels, projects);
+    const form = panel.querySelector('form');
+    form.name.focus();
+    form.querySelector('[data-cancel]').onclick = () => { panel.innerHTML = ''; open.hidden = false; };
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const submit = form.querySelector('[type=submit]'); submit.disabled = true;
+      try {
+        const created = await api('/api/user/tokens', { method: 'POST', body: JSON.stringify({ name: form.name.value.trim(),
+          expiresInDays: Number(form.days.value), ...readGrantLimit(panel) }) });
+        panel.innerHTML = `<div class="app-token-once"><label class="form-row"><span>New token ${policyTip('Shown only now. Store it where it is used, e.g. TAVYA_TOKEN in CI.')}</span>
+          <span class="app-token-value"><input readonly value="${esc(created.token)}" aria-label="New token"><button class="btn sm" type="button" data-copy>Copy</button></span></label>
+          <button class="btn sm" type="button" data-done>Done</button></div>`;
+        panel.querySelector('input').select();
+        panel.querySelector('[data-copy]').onclick = async () => { try { await copyToClipboard(created.token); toast('Token copied'); } catch { toast('Copy failed; select the token and copy it.', true); } };
+        panel.querySelector('[data-done]').onclick = () => { panel.innerHTML = ''; open.hidden = false; };
+        await hydrateAppGrants();
+      } catch (error) { submit.disabled = false; toast(error.message, true); }
+    };
   };
 }
