@@ -3080,3 +3080,20 @@ html[data-theme="dark"] .github-signin-btn:active,
 .storage-project { padding: 6px 0; border-top: 1px solid var(--line); }
 .storage-project .storage-item { padding-left: 14px; font-size: .92em; color: var(--ink-2); }
 .storage-project .storage-item > span:first-child { flex: 1; }
+
+/* ── One conversation, several agents (software-dev ≥1.27) ───────────────── */
+.msg.agent.other-agent { background: color-mix(in srgb, var(--accent) 6%, var(--surface-2)); border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); }
+.msg-to { font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }
+.activity-speaker { flex: none; font: 10px/1.6 var(--font-mono); text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-right: 6px; }
+.ck-participant { width: 100%; border: 0; background: none; text-align: left; font: inherit; }
+.ck-participant .ck-num { flex: none; width: 16px; font: 11px var(--font-mono); color: var(--ink-3); }
+.ck-participant .ck-queued { margin-left: auto; color: var(--ink-3); font-weight: 700; letter-spacing: .1em; }
+.ck-participant .ck-live { margin-left: auto; }
+.agent-mention-menu { min-width: 240px; }
+.agent-mention-menu .am-key { flex: none; width: 26px; font: 11px var(--font-mono); color: var(--ink-3); }
+.agent-mention-menu .am-sep { height: 1px; margin: 4px 6px; background: var(--line); }
+.followup-new-agent { margin-top: 8px; padding: 8px 10px; border: 1px dashed color-mix(in srgb, var(--accent) 40%, var(--line)); border-radius: 8px; background: var(--surface); }
+.followup-new-agent .fna-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12.5px; }
+.followup-new-agent .fna-fields { display: flex; flex-wrap: wrap; gap: 6px; }
+.followup-new-agent .fna-fields select, .followup-new-agent .fna-fields input { flex: 1 1 120px; min-width: 0; }
+.escalate-form { display: flex; flex-direction: column; gap: 10px; width: min(440px, 92vw); }

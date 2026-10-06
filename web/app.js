@@ -9070,6 +9070,10 @@ function overviewTab(v) {
 // Merge, SPEC §5.5/§5.6) plus the ephemeral terminal, behind a small sidebar.
 // Falls back to `messages` (Do) for workflows that predate per-role transcripts.
 function taskTranscripts(v) {
+  // One conversation with several speakers (software-dev ≥1.27): the agents are
+  // listed beside it, not as separate transcripts.
+  if (sharedConversation(v)) return [{ role: 'do', label: 'Conversation', messages: v.messages || [], shared: true },
+    ...(S.meta?.resolveAgentEnabled ? (v.transcripts || []).filter((t) => t.role === 'resolve') : [])];
   return (v.transcripts && v.transcripts.length)
     ? v.transcripts
         .filter((t) => S.meta?.resolveAgentEnabled || t.role !== 'resolve')
@@ -9129,10 +9133,10 @@ function checkinTab(v) {
   const items = transcripts
     .map((t) => `<div class="ck-item ${sel === t.role ? 'sel' : ''}" data-checkin="${esc(t.role)}">
         <span class="ck-name">${esc(t.label || t.role)}</span>
-        ${t.role === liveRole && v.status === 'active' ? '<span class="ck-live" title="agent working"></span>' : ''}
+        ${!t.shared && t.role === liveRole && v.status === 'active' ? '<span class="ck-live" title="agent working"></span>' : ''}
         <span class="ck-count">${conversationEntries(t).length}</span>
       </div>`)
-    .join('');
+    .join('') + (sharedConversation(v) ? participantListHtml(v) : '');
   const hasWorld = !!(v.worldAvailable || v.worldPath);
   return `<div class="ck-layout">
     <div class="ck-side">
@@ -9229,7 +9233,8 @@ function conversationPane(v, t) {
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName} (drop files here, type [[ for wiki context)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <textarea class="followup-input" placeholder="${t.shared ? 'Message the agent · @ to call an agent or person · [[ for wiki' : `Send a follow-up to ${agentName} (drop files here, type [[ for wiki context)`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         </div>
@@ -9301,7 +9306,8 @@ function conversationEntries(t) {
       return (Number(a.event.ts || 0) - Number(b.event.ts || 0)) || (a.index - b.index);
     })
     .map(({ event }) => event);
-  const updates = orderedEvents.filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
+  const updates = orderedEvents.filter((event) => event.type === 'agent.activity'
+    && (t.shared ? (event.payload?.participant ? true : event.payload?.role === 'do') : event.payload?.role === t.role));
   const activities = new Map();
   const activityRefsBySource = new Map();
   // A Temporal activity retry continues the same logical turn, so provider item
@@ -9346,6 +9352,7 @@ function conversationEntries(t) {
       activityRef: key,
       conversationRole: t.role,
       activityGroup: `${turn}/${attempt}`,
+      ...(t.shared ? { speaker: activity.participant || 'do' } : {}),
     });
   }
 
@@ -9639,21 +9646,26 @@ function renderConversationEntry(entry, v = S.view) {
   const math = mathjaxEnabled();
   const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'input-request') {
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
+      ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
-    const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
+    const shared = sharedConversation(v);
+    const role = shared ? messageSpeaker(m, v) : m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
     const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math) : renderMessageBody(m.text, math);
-    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
+    const otherAgent = shared && m.role === 'agent' && m.author && m.author !== 'do' ? ' other-agent' : '';
+    return `<div class="msg ${m.role}${otherAgent}"><div class="msg-meta"><span class="role">${esc(role)}</span>${shared ? recipientsHtml(m, v) : ''}${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
   }
   if (entry.type === 'explanation') {
     const e = entry.explanation;
     return `<div class="msg explanation"><div class="msg-meta"><span class="role">Explanation</span><span class="explanation-model">${esc(explanationModelLabel(e.model))}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(e.text)}</div><div class="msg-text${md}">${renderMessageBody(e.text, math)}</div></div>`;
   }
   const a = entry.activity;
+  const speaker = entry.speaker ? participantLabelOf(entry.speaker, v) : 'Agent';
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math)}</div>${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent${entry.speaker && entry.speaker !== 'do' ? ' other-agent' : ''}"><div class="msg-meta"><span class="role">${esc(speaker)}</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v, math)}</div>${explainMessageAffordance(entry, v)}</div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -9661,7 +9673,7 @@ function renderConversationEntry(entry, v = S.view) {
     : '';
   return `<div class="agent-activity ${esc(a.kind)} ${esc(a.phase)}">
     <span class="activity-icon" aria-hidden="true">${icons[a.kind] || '·'}</span>
-    <div class="activity-body"><div class="activity-head"><span class="activity-title">${esc(a.title)}</span><span class="activity-state">${esc(a.phase)}</span>${conversationTimeHtml(entry.ts)}</div>${detail}</div>
+    <div class="activity-body"><div class="activity-head">${entry.speaker && entry.speaker !== 'do' ? `<span class="activity-speaker">${esc(speaker)}</span>` : ''}<span class="activity-title">${esc(a.title)}</span><span class="activity-state">${esc(a.phase)}</span>${conversationTimeHtml(entry.ts)}</div>${detail}</div>
   </div>`;
 }
 
@@ -9730,6 +9742,10 @@ function wireExplainMessages(v) {
 }
 
 function conversationPresence(v, t) {
+  if (t.shared) {
+    const running = v.participants.find((p) => p.state === 'running');
+    if (running) return { label: v.agentTurn?.state === 'running' || running.key !== 'do' ? `${running.label} working` : 'Starting agent', tone: 'working' };
+  }
   if (v.agentTurn?.role === t.role) {
     return v.agentTurn.state === 'running'
       ? { label: 'Working now', tone: 'working' }
@@ -9838,6 +9854,22 @@ function wireCheckinSidebar(v) {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
+  // An agent in the list starts a message to it.
+  $('#main').querySelectorAll('[data-call-agent]').forEach((el) => el.addEventListener('click', () => {
+    const ta = $('#main').querySelector('.followup-box[data-role="do"] .followup-input');
+    if (!ta || ta.disabled) return;
+    const key = `${v.taskId}/do`;
+    const label = participantLabelOf(el.dataset.callAgent, v);
+    const token = `@${label}`;
+    if (!ta.value.includes(token)) {
+      ta.value = `${token} ${ta.value}`;
+      followupMentions(key).push({ token, selector: `agent:${el.dataset.callAgent}` });
+      S.followupDrafts[key] = ta.value;
+    }
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  }));
+  $('#main').querySelectorAll('.escalate-request').forEach((el) => el.addEventListener('click', () => openEscalateDialog(v)));
   $('#conversation-fullscreen')?.addEventListener('click', () => setConversationFullscreen(!S.conversationFullscreen));
   $('#share-task-conversation')?.addEventListener('click', event => openConversationShare(v, event.currentTarget.dataset.role));
   $('#fork-task-agent')?.addEventListener('click', (event) => {
@@ -11239,6 +11271,263 @@ function wireFollowupSizing(ta, key) {
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
 // agent role it addresses, so a follow-up is delivered to the right agent.
+// ── One conversation, several agents (software-dev ≥1.27) ────────────────────
+// A task's agents (the main one, its Responder and Reviewers, and agents called
+// in with @) speak in one thread. Mirrors src/domain/participants.ts.
+function sharedConversation(v) { return Array.isArray(v?.participants); }
+function participantLabelOf(key, v = S.view) {
+  const listed = v?.participants?.find((p) => p.key === key);
+  if (listed) return listed.label;
+  if (!key || key === 'do') return 'Agent';
+  if (key === 'responder') return 'Responder';
+  if (key === 'confirm') return 'Reviewer';
+  const review = /^confirm-(\d+)$/.exec(key);
+  if (review) return `Reviewer ${review[1]}`;
+  const agent = /^agent-(\d+)$/.exec(key);
+  return agent ? `Agent ${agent[1]}` : key;
+}
+function messageSpeaker(m, v) {
+  if (m.role === 'agent') return participantLabelOf(m.author || 'do', v);
+  if (m.role === 'system') return 'System';
+  if (!m.author || (S.user?.id && m.author === `user:${S.user.id}`)) return 'You';
+  if (m.authorLabel) return m.authorLabel;
+  if (m.author.startsWith('user:')) return principalLabel({ kind: 'user', userId: m.author.slice(5) });
+  return m.author;
+}
+function recipientLabel(selector, v) {
+  if (selector.startsWith('agent:')) return participantLabelOf(selector.slice(6), v);
+  if (selector.startsWith('user:')) return principalLabel({ kind: 'user', userId: selector.slice(5) });
+  if (selector.startsWith('avatar:')) return principalLabel({ kind: 'avatar', avatarId: selector.slice(7) });
+  if (selector.startsWith('@team:')) return S.teams.find((t) => t.slug === selector.slice(6))?.name || selector;
+  return selector;
+}
+// "→ Reviewer, Ann" — only when a message is addressed beyond the main agent.
+function recipientsHtml(m, v) {
+  const to = m.to || [];
+  if (!to.length || (m.role === 'user' && to.length === 1 && to[0] === 'agent:do')) return '';
+  return `<span class="msg-to" title="Addressed to">→ ${to.map((selector) => esc(recipientLabel(selector, v))).join(', ')}</span>`;
+}
+// The task's agents beside the conversation. Clicking one starts a message to it.
+function participantListHtml(v) {
+  return `<div class="ck-side-h">Agents</div>${v.participants.map((p, index) => `
+    <button type="button" class="ck-item ck-participant" data-call-agent="${esc(p.key)}" title="${p.state === 'running' ? 'Working now' : p.state === 'queued' ? 'Called — runs when the current turn ends' : 'Message this agent'}">
+      <span class="ck-num">${index}</span><span class="ck-name">${esc(p.label)}</span>
+      ${p.state === 'running' ? '<span class="ck-live"></span>' : p.state === 'queued' ? '<span class="ck-queued" aria-label="queued">⋯</span>' : ''}
+    </button>`).join('')}`;
+}
+
+// Recipients of a composed message: text before the first mention also reaches
+// the main agent (first); a message starting with a mention reaches only those.
+function composeRecipients(text, mentions) {
+  const ordered = [...mentions].sort((a, b) => a.index - b.index);
+  const first = ordered.length ? ordered[0].index : text.length;
+  const out = [];
+  if (!ordered.length || text.slice(0, first).trim()) out.push('agent:do');
+  for (const mention of ordered) if (!out.includes(mention.selector)) out.push(mention.selector);
+  return out;
+}
+function nextAgentKeyFor(existing) {
+  const used = new Set(existing);
+  for (let n = Math.max(1, existing.length); n < 1000; n++) if (!used.has(`agent-${n}`)) return `agent-${n}`;
+  return 'agent-999';
+}
+// People someone mentions most, per organization, so the @ menu offers them first.
+function mentionCounts() {
+  try { return JSON.parse(localStorage.getItem(`tavya.mentions.${S.organizationId}`) || '{}'); } catch { return {}; }
+}
+function countMentions(selectors) {
+  const counts = mentionCounts();
+  for (const selector of selectors) if (!selector.startsWith('agent:')) counts[selector] = (counts[selector] || 0) + 1;
+  try { localStorage.setItem(`tavya.mentions.${S.organizationId}`, JSON.stringify(counts)); } catch { /* private mode */ }
+}
+function mentionPeople() {
+  return [
+    ...humanAudienceOptions().map((o) => ({ selector: o.value, label: o.label.replace(/^(Person|Team) · /, ''),
+      kind: o.value.startsWith('user:') ? 'person' : o.value.startsWith('@team:') ? 'team' : 'group' })),
+    ...(S.avatars || []).filter((a) => a.enabled !== false).map((a) => ({ selector: `avatar:${a.id}`, label: a.name, kind: 'avatar' })),
+  ];
+}
+
+// Mentions typed into a box, by box key: [{ token, selector, newAgent? }].
+function followupMentions(key) { return ((S.followupMentions ||= {})[key] ||= []); }
+// Agents added for a message being written, by box key: { 'agent-3': spec }.
+function followupNewAgents(key) { return ((S.followupNewAgents ||= {})[key] ||= {}); }
+
+// The agent-configuration block for an agent called in with @: the shared Agent
+// block when available (harness, tools, fork, authority), else a compact form.
+function newAgentFormsHtml(v, key) {
+  const agents = followupNewAgents(key);
+  return Object.entries(agents).map(([agentKey, spec]) => `<div class="followup-new-agent" data-agent-key="${esc(agentKey)}">
+      <div class="fna-head"><b>${esc(participantLabelOf(agentKey, v))}</b><span class="pal-sub">new agent</span><span style="flex:1"></span>
+        <button type="button" class="icon-btn fna-remove" aria-label="Remove ${esc(participantLabelOf(agentKey, v))}" title="Remove">×</button></div>
+      ${typeof agentBlockHtml === 'function' ? agentBlockHtml(`fna-${agentKey}`, spec, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, compact: true })
+        : `<div class="fna-fields"><select class="fna-provider" aria-label="Harness">${['claude', 'codex', 'opencode', ...(S.meta?.mockAgent ? ['mock'] : [])]
+          .map((provider) => `<option value="${provider}" ${spec.provider === provider ? 'selected' : ''}>${esc({ claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', mock: 'Mock' }[provider] || provider)}</option>`).join('')}</select>
+          <input class="fna-model" placeholder="Model" value="${esc(spec.model || '')}" aria-label="Model">
+          <select class="fna-effort" aria-label="Reasoning effort"><option value="">Default effort</option>${['low', 'medium', 'high', 'xhigh', 'max']
+            .map((effort) => `<option ${spec.effort === effort ? 'selected' : ''}>${effort}</option>`).join('')}</select></div>`}
+    </div>`).join('');
+}
+function readNewAgentForm(el) {
+  if (typeof readAgentBlock === 'function' && el.querySelector('[data-agent-block]')) return readAgentBlock(el);
+  const spec = { provider: el.querySelector('.fna-provider')?.value || 'claude' };
+  const model = el.querySelector('.fna-model')?.value.trim();
+  const effort = el.querySelector('.fna-effort')?.value;
+  return { ...spec, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+}
+function wireNewAgentForms(box, v, key) {
+  const agents = followupNewAgents(key);
+  box.querySelectorAll('.followup-new-agent').forEach((el) => {
+    const agentKey = el.dataset.agentKey;
+    const save = () => { if (agents[agentKey]) agents[agentKey] = readNewAgentForm(el); };
+    if (typeof wireAgentBlock === 'function' && el.querySelector('[data-agent-block]')) wireAgentBlock(el, { onChange: save, projectId: taskRecord(v.taskId)?.projectId || S.projectId });
+    el.addEventListener('input', save);
+    el.addEventListener('change', save);
+    el.querySelector('.fna-remove')?.addEventListener('click', () => {
+      delete agents[agentKey];
+      const mentions = followupMentions(key);
+      const ta = box.querySelector('.followup-input');
+      for (const mention of mentions.filter((m) => m.selector === `agent:${agentKey}`)) {
+        if (ta) ta.value = ta.value.split(mention.token).join('');
+      }
+      S.followupMentions[key] = mentions.filter((m) => m.selector !== `agent:${agentKey}`);
+      if (ta) S.followupDrafts[key] = ta.value;
+      renderTaskPage();
+    });
+  });
+}
+
+// The @ menu: numbered agents, a new agent, frequently mentioned people, and a
+// searchable list of everyone. Digits pick an agent, + adds one, letters search.
+function wireAgentMention(ta, box, v, key) {
+  if (!ta || ta.dataset.amWired) return;
+  ta.dataset.amWired = '1';
+  let menu = null, items = [], active = 0, token = null, peopleMode = false;
+  const close = () => { menu?.remove(); menu = null; items = []; token = null; peopleMode = false; };
+  const tokenAt = () => {
+    const pos = ta.selectionStart;
+    if (pos == null || pos !== ta.selectionEnd) return null;
+    const m = /(^|[\s(])@([^\s@]*)$/.exec(ta.value.slice(0, pos));
+    return m ? { start: pos - m[2].length - 1, end: pos, query: m[2] } : null;
+  };
+  const agentItems = () => {
+    const pending = Object.keys(followupNewAgents(key));
+    const listed = [...(v.participants || []), ...pending.map((k) => ({ key: k, label: participantLabelOf(k, v), state: 'new' }))];
+    return listed.map((p, index) => ({ kind: 'agent', index, selector: `agent:${p.key}`, label: p.label, state: p.state }));
+  };
+  const build = () => {
+    const q = (token?.query || '').toLowerCase();
+    const agents = agentItems();
+    const people = mentionPeople();
+    const counts = mentionCounts();
+    if (peopleMode || (q && !/^\d+$/.test(q) && q !== '+')) {
+      const matches = people.filter((p) => !q || p.label.toLowerCase().includes(q) || p.selector.toLowerCase().includes(q))
+        .sort((a, b) => (counts[b.selector] || 0) - (counts[a.selector] || 0));
+      const agentMatches = q ? agents.filter((a) => a.label.toLowerCase().includes(q)) : [];
+      return [...agentMatches, ...matches.slice(0, 12)];
+    }
+    const frequent = people.filter((p) => counts[p.selector]).sort((a, b) => counts[b.selector] - counts[a.selector]).slice(0, 4);
+    return [...agents, { kind: 'new', label: 'New agent…' }, ...frequent, { kind: 'people', label: 'People' }];
+  };
+  const insert = (text, selector, extra = {}) => {
+    const value = `${text} `;
+    ta.value = ta.value.slice(0, token.start) + value + ta.value.slice(token.end);
+    const caret = token.start + value.length;
+    followupMentions(key).push({ token: text, selector, ...extra });
+    S.followupDrafts[key] = ta.value;
+    close();
+    ta.setSelectionRange(caret, caret);
+    ta.focus();
+  };
+  const choose = (item) => {
+    if (!item || !token) return close();
+    if (item.kind === 'people') { peopleMode = true; active = 0; items = build(); return render(); }
+    if (item.kind === 'new') {
+      const agentKey = nextAgentKeyFor([...(v.participants || []).map((p) => p.key), ...Object.keys(followupNewAgents(key))]);
+      const main = v.participants?.find((p) => p.key === 'do')?.spec || v.agents?.do || {};
+      followupNewAgents(key)[agentKey] = { provider: main.provider || 'claude', ...(main.model ? { model: main.model } : {}) };
+      insert(`@${participantLabelOf(agentKey, v)}`, `agent:${agentKey}`, { newAgent: true });
+      return renderTaskPage();
+    }
+    insert(`@${item.label}`, item.selector);
+  };
+  const render = () => {
+    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu agent-mention-menu'; menu.setAttribute('role', 'listbox'); document.body.appendChild(menu); }
+    let sawAgent = false;
+    menu.innerHTML = items.length ? items.map((item, i) => {
+      const sep = (item.kind !== 'agent' && item.kind !== 'new' && sawAgent) ? (sawAgent = false, '<div class="am-sep" role="separator"></div>') : '';
+      if (item.kind === 'agent' || item.kind === 'new') sawAgent = true;
+      const key = item.kind === 'agent' ? `[${item.index}]` : item.kind === 'new' ? '[+]' : '';
+      const hint = item.kind === 'agent' ? (item.state === 'running' ? 'working' : item.state === 'queued' ? 'queued' : item.state === 'new' ? 'new' : '')
+        : item.kind === 'people' ? '›' : item.kind === 'avatar' ? 'Avatar' : item.kind === 'team' ? 'Team' : item.kind === 'group' ? '' : '';
+      return `${sep}<div class="wm-opt am-opt ${i === active ? 'active' : ''}" data-i="${i}" role="option">
+        <span class="am-key">${key}</span><span class="wm-main"><span class="wm-ref">${esc(item.label)}</span></span><span class="wm-scope">${esc(hint)}</span></div>`;
+    }).join('') : '<div class="wm-empty">No one matches</div>';
+    menu.querySelectorAll('.am-opt').forEach((el) => {
+      el.addEventListener('mousedown', (ev) => { ev.preventDefault(); choose(items[+el.dataset.i]); });
+      el.addEventListener('mouseenter', () => { active = +el.dataset.i; menu.querySelectorAll('.am-opt').forEach((o, j) => o.classList.toggle('active', j === active)); });
+    });
+    const xy = textareaCaretXY(ta, token.start);
+    menu.style.left = `${Math.min(xy.left, window.innerWidth - 300)}px`;
+    menu.style.top = `${xy.top}px`;
+  };
+  const update = () => {
+    token = tokenAt();
+    if (!token) return close();
+    const q = token.query;
+    if (q === '+') return choose({ kind: 'new' });
+    if (/^\d+$/.test(q) && !peopleMode) {
+      const agent = agentItems().find((a) => a.index === Number(q));
+      if (agent && !agentItems().some((a) => String(a.index).startsWith(q) && a.index !== Number(q))) return choose(agent);
+    }
+    items = build();
+    active = Math.min(active, Math.max(0, items.length - 1));
+    render();
+  };
+  ta.addEventListener('input', update);
+  ta.addEventListener('keydown', (ev) => {
+    if (!menu) return;
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopImmediatePropagation(); close(); }
+    else if (!items.length) return;
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active + 1) % items.length; render(); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active - 1 + items.length) % items.length; render(); }
+    else if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopImmediatePropagation(); choose(items[active]); }
+  });
+  ta.addEventListener('blur', () => setTimeout(close, 150));
+}
+
+// Escalate: pass the request this task is waiting on to other people. The same
+// API an agent uses (escalate) — the wait stays, only who it asks changes.
+function openEscalateDialog(v) {
+  const root = $('#modal-root');
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card escalate-form" aria-labelledby="escalate-title">
+    <div class="section-h" id="escalate-title">Escalate</div>
+    ${audienceComboHtml('escalate-audience', '', 'Who should answer')}
+    <textarea class="escalate-note" rows="2" placeholder="Note (optional)"></textarea>
+    <div class="explanation-form-actions"><button type="button" class="btn escalate-cancel">Cancel</button><button class="btn primary">Send</button></div>
+  </form></div>`;
+  root.appendChild(host);
+  wireAudienceCombos(host);
+  const close = () => host.remove();
+  host.querySelector('.escalate-cancel').addEventListener('click', close);
+  host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
+  host.querySelector('.escalate-audience').focus();
+  host.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const audience = host.querySelector('.escalate-audience').value.split(',').map((x) => x.trim()).filter(Boolean);
+    if (!audience.length) return toast('Choose who should answer', true);
+    try {
+      await api(`/api/tasks/${encodeURIComponent(v.taskId)}/escalate`, { method: 'POST',
+        body: JSON.stringify({ audience, message: host.querySelector('.escalate-note').value.trim() || humanWaitDetail(v) || 'Please take this over.' }) });
+      countMentions(audience);
+      close();
+      toast('Escalated');
+      setTimeout(refreshTask, 250);
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
 function wireFollowups(v) {
   if (!S.followupImages) S.followupImages = {};
   if (!S.followupFiles) S.followupFiles = {};
@@ -11261,6 +11550,11 @@ function wireFollowups(v) {
     // Wiki references in follow-ups use the same picker and backend scanner as
     // the task prompt.
     wireWikiMention(ta, taskRecord(v.taskId)?.projectId || S.projectId);
+    const shared = sharedConversation(v) && role === 'do';
+    if (shared) {
+      wireAgentMention(ta, box, v, key);
+      wireNewAgentForms(box, v, key);
+    }
     wireFollowupSizing(ta, key);
     paint();
     const send = async () => {
@@ -11270,11 +11564,26 @@ function wireFollowups(v) {
       btn.disabled = true;
       box.setAttribute('aria-busy', 'true');
       try {
-        const result = await api(`/api/tasks/${v.taskId}/signal`, {
+        // A shared conversation addresses whoever was mentioned, in order;
+        // new agents travel with the message that calls them.
+        const mentions = shared ? followupMentions(key).map((m) => ({ ...m, index: text.indexOf(m.token) })).filter((m) => m.index >= 0) : [];
+        const newAgents = shared ? Object.fromEntries(Object.entries(followupNewAgents(key))
+          .filter(([agentKey]) => mentions.some((m) => m.selector === `agent:${agentKey}`))) : {};
+        const to = shared ? composeRecipients(text, mentions) : undefined;
+        const result = shared
+          ? await api(`/api/tasks/${v.taskId}/messages`, { method: 'POST', body: JSON.stringify({ text, to,
+              ...(Object.keys(newAgents).length ? { agents: newAgents } : {}),
+              ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) }) })
+          : await api(`/api/tasks/${v.taskId}/signal`, {
           method: 'POST',
           body: JSON.stringify({ signal: 'followUp', text, role,
             ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) }),
         });
+        if (shared) {
+          countMentions(to);
+          delete S.followupMentions[key];
+          delete S.followupNewAgents[key];
+        }
         // Render immediately even if this browser's event WebSocket is reconnecting.
         // The durable WS copy is de-duplicated by conversationEntries once it lands.
         if (result?.message && !S.taskEvents.some((event) => event.type === 'conversation.message' && event.payload?.message?.id === result.message.id)) {
@@ -11297,7 +11606,8 @@ function wireFollowups(v) {
         if (liveTa) liveTa.value = '';
         else if (ta) ta.value = '';
         paint();
-        toast('Follow-up sent');
+        toast(shared && to && (to.length > 1 || to[0] !== 'agent:do')
+          ? `Sent to ${to.map((selector) => recipientLabel(selector, v)).join(', ')}` : 'Follow-up sent');
         renderTaskPage();
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
