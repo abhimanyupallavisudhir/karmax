@@ -304,10 +304,10 @@ function taskRecord(id) {
 //   /<org>/inbox                         → inbox
 //   /<org>/wiki                          → organization wiki
 //   /<org>/<project>                     → task list (also /queue, /activity, /wiki, /settings)
-// A task list's query rides in ?q=; no ?q means the default `for:me`, and an
-// empty ?q= is "All".
 //   /<org>/<project>/tasks/:num          → the task's own page (permalink)
 //   /<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
+// A task list's query rides in ?q=; no ?q means the default `for:me`, and an
+// empty ?q= is "All".
 // Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
 // parsed and then canonicalised to the org form.
 function slugify(s) {
@@ -3715,7 +3715,6 @@ function connectWs() {
     else if (wsHadDropped) {
       loadInbox().catch(() => {});
       refreshTasks().catch(() => {});
-      if (S.tab === 'home') scheduleHomeRefresh();
       // Events were missed: live text is rebuilt from history, never kept stale.
       if (S.selected) { S.liveOutput = {}; refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
     }
@@ -3796,6 +3795,8 @@ async function refreshTasks() {
     do {
       taskRefreshQueued = false;
       try {
+        // The home's rows come from its organization search alone.
+        if (S.tab === 'home') { if (!S.selected) { await runSearch(); bgRenderMain(); } continue; }
         await loadTasks();
         if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
         if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
@@ -4914,7 +4915,7 @@ function tasksView() {
       ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
       // Done and cancelled tasks archive themselves, so an empty default list
       // does not mean the project has never had a task.
-      : `<div class="empty"><div class="big">No open tasks</div>Describe one above. Finished tasks move to 🗄 Archived.</div>`;
+      : `<div class="empty"><div class="big">No open tasks</div>${home ? '' : 'Describe one above. '}Finished tasks move to 🗄 Archived.</div>`;
   const composer = home ? '' : `
     <div class="composer">
       <div class="quick-task-field">

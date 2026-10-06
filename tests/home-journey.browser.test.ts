@@ -64,8 +64,8 @@ it('lands on the organization home, For me across projects, All one click away',
     await step('the other agent pauses', () => expect.poll(async () => (await consoleRequest(context, app!.url, 'GET', `/api/tasks/${paused.id}`))?.waitingFor?.kind,
       { timeout: 60_000 }).toBe('timer'));
 
-    const rows = async () => (await page.locator('#main .task-row').evaluateAll((els) =>
-      els.map((el) => (el as HTMLElement).dataset.id || (el as HTMLElement).dataset.draft))).sort();
+    const rows = async () => await page.evaluate<string[]>(
+      "[...document.querySelectorAll('#main .task-row')].map((el) => el.dataset.id || el.dataset.draft).sort()");
     await step('the root lands on the organization home, For me', async () => {
       await page.goto(app!.url);
       await page.waitForURL(/\/personal$/);
@@ -108,7 +108,7 @@ it('lands on the organization home, For me across projects, All one click away',
     const shots = process.env.HOME_SCREENSHOTS;
     if (shots) {
       await page.locator('#mobile-menu').click();
-      await page.waitForFunction(() => document.querySelector('#rail')!.getBoundingClientRect().width < 1);
+      await page.waitForFunction("document.querySelector('#rail').getBoundingClientRect().width < 1");
       await page.screenshot({ path: path.join(shots, 'app-home-collapsed.png') });
       await page.setViewportSize({ width: 390, height: 780 });
       await page.reload();

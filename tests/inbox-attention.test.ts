@@ -45,6 +45,26 @@ describe.each(storeBackends)('attention asks ($name)', ({ open }) => {
     expect((await store.attentionAsks('owner', organization.id)).size).toBe(0);
   });
 
+  it('narrows a task read to the candidates and every draft', async () => {
+    const store = await open();
+    const organization = await store.createOrganization({ name: 'Team', ownerUserId: 'owner' });
+    const project = await store.createProject('App', {}, organization.id);
+    const make = (title: string, params: Record<string, unknown> = {}) => store.createTask({ projectId: project.id, title,
+      workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: title, ...params }, createdBy: { kind: 'user', userId: 'owner' } });
+    const asked = await make('asked');
+    await make('busy');
+    const draft = await make('draft', { draft: true });
+    const read = async (candidateIds?: string[]) => {
+      const out: string[] = [];
+      for await (const page of store.taskReadPages(project.id, { candidateIds })) out.push(...page.map((task) => task.title));
+      return out.sort();
+    };
+    expect(await read([asked.id])).toEqual(['asked', 'draft']);
+    expect(await read([])).toEqual(['draft']);
+    expect(await read()).toEqual(['asked', 'busy', 'draft']);
+    expect(draft.params.draft).toBe(true);
+  });
+
   it('names the people of an organization by name and email', async () => {
     const store = await open();
     const organization = await store.createOrganization({ name: 'Team', ownerUserId: 'owner' });
