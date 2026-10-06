@@ -9495,7 +9495,7 @@ export class Gateway {
 
   /** The projects a search may visit, optionally within one organization. */
   private async searchableProjects(res: http.ServerResponse, session: Session, organizationId?: string): Promise<Project[]> {
-    const { authorization, store, tokens } = this.deps;
+    const { store, tokens } = this.deps;
     const member = this.searchMember(session);
     let projects: Project[];
     if (member) projects = await store.listProjectsReachableBy(member);
