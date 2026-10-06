@@ -47,6 +47,11 @@ export interface AgentWaitHooks {
   park(waitingFor: NonNullable<TaskView['waitingFor']>): Promise<void>;
   /** Something other than the wait itself needs the agent (or the task was cancelled). */
   interrupted(): boolean;
+  /** Work the task can do while the agent stays paused (software-dev ≥1.27:
+   * other agents called meanwhile). `serve` runs it and restores the wait's
+   * view; the wait then carries on unless that work interrupted it. */
+  serveable?(): boolean;
+  serve?(): Promise<void>;
 }
 
 /**
@@ -68,8 +73,14 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
     ? { kind: 'job', detail: `Waiting for ${list}`, ...(named ? { summary: named } : {}), jobs, until: untilMs }
     : { kind: 'timer', detail: `Waiting ${wait.minutes} min`, until: untilMs });
 
+  const serveable = () => !!hooks.serve && !!hooks.serveable?.();
   if (!jobs.length) {
-    const interrupted = await condition(hooks.interrupted, untilMs - Date.now());
+    let interrupted: boolean;
+    for (;;) {
+      interrupted = await condition(() => hooks.interrupted() || serveable(), Math.max(0, untilMs - Date.now()));
+      if (!interrupted || hooks.interrupted() || !serveable()) break;
+      await hooks.serve!();
+    }
     if (interrupted) return undefined;
     return hooks.ask
       ? `(Resumed: nobody answered within your ${wait.minutes}-minute limit. Carry on without the answer, or pause again to keep waiting.)`
@@ -86,7 +97,11 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
     (result) => { outcome = result; },
     (error) => { if (!isCancellation(error)) failure = error; },
   ).finally(() => { settled = true; });
-  await condition(() => settled || hooks.interrupted());
+  for (;;) {
+    await condition(() => settled || hooks.interrupted() || serveable());
+    if (settled || hooks.interrupted()) break;
+    await hooks.serve!();
+  }
   if (!settled) {
     scope.cancel();
     await watching;

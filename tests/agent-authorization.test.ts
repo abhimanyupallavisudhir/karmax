@@ -12,7 +12,7 @@ import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
-import { authorizationPromptContext, summarizeCapabilities } from '../src/platform/authorization-summary.js';
+import { summarizeCapabilities } from '../src/platform/authorization-summary.js';
 import { TOOL_SCHEMAS } from '../src/agent/tools.js';
 
 /**
@@ -55,22 +55,6 @@ describe('summarizeCapabilities', () => {
   });
 });
 
-describe('authorizationPromptContext', () => {
-  it('tells a maintainer agent it may change project settings itself', () => {
-    const text = authorizationPromptContext({
-      level: { id: 'maintainer', name: 'Project maintainer', description: 'Manage all tasks, reviews, settings, and automation inside assigned projects.' },
-      scope: { kind: 'projects', organization: { id: 'org_1', name: 'Acme' }, projects: [{ id: 'proj_1', name: 'Site' }] },
-      ...summarizeCapabilities(caps('maintainer')),
-    });
-    expect(text).toContain('Project maintainer');
-    expect(text).toContain('Site (proj_1)');
-    expect(text).toMatch(/project:settings:write/);
-    expect(text).toMatch(/do it yourself/i);
-    expect(text).toContain('request_permission');
-    expect(text).toContain('my_authorization');
-  });
-});
-
 describe('GET /api/authorization/me', () => {
   let home: string;
   let store: Store;
@@ -84,6 +68,7 @@ describe('GET /api/authorization/me', () => {
   let maintainerToken: string;
   let developerToken: string;
   let humanToken: string;
+  let calledAgentToken: string;
 
   const get = async (token: string, query = '') => {
     const res = await fetch(`${base}/api/authorization/me${query}`, { headers: { authorization: `Bearer ${token}` } });
@@ -122,6 +107,14 @@ describe('GET /api/authorization/me', () => {
       return (await tokens.mint({ taskId: task.id, profileId: 'claude', role: 'do', principal: 'user:a', projectIds: [site],
         organizationId: acme.id, ceiling: ['*'], grantorCaps: [...caps(level), 'task:escalate'] })).token;
     };
+    // An agent called in with `@` may hold its own, narrower authority.
+    const shared = await store.createTask({ projectId: site, title: 'shared', workflow: 'just-do', workflowVersion: '1.0.0',
+      params: { prompt: 'x',
+        _authorization: { level: 'maintainer', scope: 'projects', projectIds: [site], organizationId: acme.id, capabilities: caps('maintainer') },
+        _agentAuthorization: { 'agent-1': { level: 'developer', scope: 'projects', projectIds: [site], organizationId: acme.id, capabilities: caps('developer') } },
+      } as any });
+    calledAgentToken = (await tokens.mint({ taskId: shared.id, profileId: 'claude', role: 'do', participant: 'agent-1', principal: 'user:a',
+      projectIds: [site], organizationId: acme.id, ceiling: ['*'], grantorCaps: [...caps('developer'), 'task:escalate'] })).token;
     maintainerToken = await agent('maintainer');
     developerToken = await agent('developer');
     humanToken = (await tokens.mintPrincipal('user:a', caps('maintainer'), site, 60_000, acme.id)).token;
@@ -145,6 +138,12 @@ describe('GET /api/authorization/me', () => {
     expect(body.capabilities).toContain('project:settings:write');
     expect(body.missing).toContain('organization:edit');
     expect(body.missing).not.toContain('project:settings:write');
+  });
+
+  it('reports an @-called agent\'s own level, not the task\'s', async () => {
+    const { body } = await get(calledAgentToken);
+    expect(body.level).toMatchObject({ id: 'developer' });
+    expect(body.missing).toContain('project:settings:write');
   });
 
   it('answers whether a request would be allowed, without making it', async () => {

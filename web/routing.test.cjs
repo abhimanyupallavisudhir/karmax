@@ -51,6 +51,7 @@ global.S = S;
 
 // Bring the real declarations into scope.
 eval(extractConst('TASK_TABS'));
+eval(extractConst('DEFAULT_LIST_QUERY'));
 eval(extractConst('ORG_VIEWS'));
 eval(extractConst('PROJECT_SCOPED_TABS'));
 eval(extractFn('slugify'));
@@ -70,6 +71,8 @@ eval(extractFn('wikiViewFromQuery'));
 eval(extractFn('wikiRoute'));
 eval(extractFn('projectBase'));
 eval(extractFn('projectRoute'));
+eval(extractFn('listRoute'));
+eval(extractFn('homeRoute'));
 eval(extractFn('encodeQuery'));
 eval(extractFn('globalRoute'));
 eval(extractFn('organizationLandingRoute'));
@@ -100,7 +103,12 @@ eq(globalRoute('inbox'), '/acme/inbox', 'inbox route is org-prefixed');
 eq(installationRoute(), '/installation', 'installation route is global, not org-prefixed');
 eq(profileRoute(), '/profile', 'profile route is user-scoped, not org-prefixed');
 eq(globalRoute('organization', organizationById('org_globex')), '/globex/settings', 'globalRoute honours an explicit org');
-eq(organizationLandingRoute('org_globex'), '/globex/mobile-app', 'switching organizations navigates into the selected organization');
+eq(organizationLandingRoute('org_globex'), '/globex', 'switching organizations lands on the selected organization\'s home');
+eq(homeRoute(), '/acme', 'the organization home is the bare organization path (its default view is for:me)');
+eq(homeRoute(organizationById('org_globex'), ''), '/globex?q=', '"All" on the home is spelled out as an empty query');
+eq(homeRoute(organizationById('org_globex'), 'project:mobile-app'), '/globex?q=project:mobile-app', 'a home query rides in ?q=');
+eq(projectRoute('P1', 'tasks', ''), '/acme/website-redesign?q=', '"All" on a project list is bookmarkable');
+eq(projectRoute('P1', 'tasks', 'for:me'), '/acme/website-redesign', 'the default for:me list is the bare path');
 S.organizationId = 'org_globex';
 eq(profileRoute(), '/profile', 'profile route is stable when a different organization is selected');
 const organizationSwitcher = { value: 'org_acme', _sync() { this.value = currentOrg().id; } };
@@ -120,25 +128,27 @@ eq(parseRoute('/profile'), { name: 'profile' }, 'parse the global user profile')
 eq(parseRoute('/installation'), { name: 'installation' }, 'parse the operator-owned installation page');
 eq(parseRoute('/globex/profile'), { name: 'profile', legacy: true },
   'an old org-prefixed profile URL canonicalises without selecting that organization');
-eq(parseRoute('/acme'), { name: 'global', org: 'acme', tab: null }, 'parse bare /<org> as org home');
+eq(parseRoute('/acme'), { name: 'global', org: 'acme', tab: 'home', q: 'for:me' }, 'parse bare /<org> as the organization home, for:me by default');
+eq(parseRoute('/acme?q='), { name: 'global', org: 'acme', tab: 'home', q: '' }, 'an empty ?q= is the home\'s "All" view');
+eq(parseRoute('/acme?q=project:app+status:waiting').q, 'project:app status:waiting', 'the home carries its query');
 eq(parseRoute('/acme/website-redesign'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: null, taskTab: null, q: '' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: null, taskTab: null, q: 'for:me' },
   'parse /<org>/<project> as the tasks tab');
 eq(parseRoute('/acme/website-redesign/queue'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'queue', taskKey: null, taskTab: null, q: '' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'queue', taskKey: null, taskTab: null, q: 'for:me' },
   'parse a project tab');
 eq(parseRoute('/acme/website-redesign/activity'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'activity', taskKey: null, taskTab: null, q: '' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'activity', taskKey: null, taskTab: null, q: 'for:me' },
   'the hidden Activity debugger remains reachable by direct URL');
 eq(parseRoute('/acme/website-redesign/tasks/42'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me' },
   'parse a task permalink');
 eq(parseRoute('/acme/website-redesign/tasks/42/file?path=%2Fworkspace%2Fapp%2Fmain.ts&line=17'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '',
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me',
     taskFile: { path: '/workspace/app/main.ts', line: 17 } },
   'parse a task-scoped file handoff permalink');
 eq(parseRoute('/acme/website-redesign/tasks/42/checkin'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin', q: '' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin', q: 'for:me' },
   'parse a task permalink pinned to a tab');
 
 // ── Wiki routes (org-level bottom-left link + project tab) ────────────────────
@@ -154,7 +164,7 @@ eq(parseRoute('/acme/website-redesign/wiki?branch=feature%2Fx').wikiView, 'branc
 eq(parseRoute('/acme/website-redesign/wiki').wikiView, undefined, 'the default view carries no selector');
 eq(parseRoute('/acme/website-redesign/queue?task=367').wikiView, undefined, 'only the wiki reads a view');
 eq(parseRoute('/acme/website-redesign/wiki'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'wiki', taskKey: null, taskTab: null, q: '' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'wiki', taskKey: null, taskTab: null, q: 'for:me' },
   'parse a project wiki tab');
 
 // ── Round-trip: build → parse → resolve ───────────────────────────────────────
@@ -173,7 +183,7 @@ eq(parseRoute('/organization'), { name: 'global', tab: 'organization', legacy: t
 eq(parseRoute('/settings'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /settings alias');
 eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', sub: null, legacy: true }, 'legacy /inbox');
 eq(parseRoute('/projects/website-redesign/tasks/42'),
-  { name: 'project', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '', legacy: true },
+  { name: 'project', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me', legacy: true },
   'legacy /projects/:name/tasks/:num');
 eq(parseRoute('/invite'), { name: 'invite' }, 'invite stays a top-level route');
 eq(parseRoute('/'), { name: 'home' }, 'root is home');

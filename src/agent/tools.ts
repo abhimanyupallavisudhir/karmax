@@ -9,7 +9,7 @@ import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME }
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
-  compactSearch, compactTags, normalizeRequestBody, platformRequestPathError,
+  compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
 import { URGENCY_LEVELS, type AgentWait, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
@@ -187,7 +187,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'With needs_input: who to ask — user:<id>, @team:<slug>, @creator, @owners, @project, or @all (see escalate_to_human). Default: whoever answers this task\'s questions (for a sub-task, its parent).',
+          description: 'With needs_input: who to ask — user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all (see escalate_to_human). Default: whoever answers this task\'s questions (for a sub-task, its parent).',
         },
         urgency: URGENCY_PARAMETER,
       },
@@ -545,8 +545,10 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       + 'Fields: status, stage, priority, tag (a/b path matches descendants), workflow, created, updated, num, '
       + 'is:<facet> (open/draft/archived/pr/untagged/armed/scheduled/recurring/blocked-on-deps/series/run/…), '
       + 'trigger, schedule, nextRun, dependsOn:#N / blocks:#N, and any workflow param via `param.<key>`. '
-      + 'Add `sort:priority-desc` and `group:tag`. An empty query returns everything.',
-    parameters: { type: 'object', properties: { project_id: { type: 'string' }, query: { type: 'string' } }, required: ['project_id'] },
+      + '`for:me` / `for:<name|email>` = tasks waiting on that person plus their drafts; `project:<id|slug|name>`. '
+      + 'Add `sort:priority-desc` and `group:tag`. An empty query returns everything. '
+      + 'Pass organization_id instead of project_id to search every project of the organization you can read.',
+    parameters: { type: 'object', properties: { project_id: { type: 'string' }, organization_id: { type: 'string' }, query: { type: 'string' } } },
   },
   {
     name: 'list_tags',
@@ -728,7 +730,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'escalate_to_human',
     description:
       'Pause your current task at its exact stage and ask selected people, teams, or Avatars for input. ' +
-      'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+      'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
       'Discover valid choices with platform_request(GET, "/api/agent/escalation-targets"). ' +
       'Calling this stops your current turn; the task resumes when a selected principal responds.',
     parameters: {
@@ -739,7 +741,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'One or more person/team/Avatar routing selectors; any selected principal may respond.',
+          description: 'One or more person/team/Avatar routing selectors; any selected principal may respond. Default: the task\'s Responder (people), else its creator.',
         },
         message: {
           type: 'string',
@@ -749,7 +751,40 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         },
         urgency: URGENCY_PARAMETER,
       },
-      required: ['audience', 'message'],
+      required: ['message'],
+    },
+  },
+  {
+    name: 'notify',
+    description:
+      'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, @creator, ' +
+      '@owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now; agents of this task ' +
+      '(agent:do for the main agent, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends, in order. ' +
+      'The message is said in the task conversation.',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32 },
+        message: { type: 'string', minLength: 1, maxLength: 4_000 },
+        urgency: URGENCY_PARAMETER,
+      },
+      required: ['to', 'message'],
+    },
+  },
+  {
+    name: 'escalate',
+    description:
+      'Redirect a request you received but cannot answer yourself to people who can — the question you were asked as a ' +
+      'Responder, or a request a sub-task routed to you (pass its task_id). The request waits for them instead; your own ' +
+      'work is not interrupted. Audience selectors as for notify (people, teams, Avatars).',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32 },
+        note: { type: 'string', minLength: 1, maxLength: 4_000 },
+        task_id: { type: 'string' },
+      },
+      required: ['to', 'note'],
     },
   },
   {
@@ -767,8 +802,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'request_permission',
     description:
       `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
-      'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
-      'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
+      'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all; ' +
+      'omit audience to summon the lowest level that can grant it. Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
       'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task.',
     parameters: {
       type: 'object',
@@ -787,7 +822,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'One or more person/team/Avatar routing selectors; any selected capable principal may decide.',
+          description: 'Person/team/Avatar routing selectors; any selected capable principal may decide. Omit to summon @maintainers, @admins or @superadmins, whichever is the lowest level that can grant it.',
         },
         reason: {
           type: 'string',
@@ -797,7 +832,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         },
         urgency: URGENCY_PARAMETER,
       },
-      required: ['capabilities', 'audience', 'reason'],
+      required: ['capabilities', 'reason'],
     },
   },
   {
@@ -1339,6 +1374,11 @@ export function platformToolHandlers(
       return JSON.stringify((listed ?? []).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })));
     },
     async search_tasks(args) {
+      if (!args?.project_id === !args?.organization_id) return 'pass exactly one of project_id or organization_id';
+      if (args?.organization_id) {
+        return JSON.stringify(compactOrganizationSearch(await platformRequest('GET',
+          `/api/organizations/${encodeURIComponent(String(args.organization_id))}/search?q=${encodeURIComponent(String(args?.query ?? ''))}`) as { tags?: unknown[] }));
+      }
       const projectId = encodeURIComponent(String(args?.project_id ?? ''));
       const [result, tags] = await Promise.all([
         platformRequest('GET', `/api/projects/${projectId}/search?q=${encodeURIComponent(String(args?.query ?? ''))}`),
@@ -1487,6 +1527,20 @@ export function platformToolHandlers(
     async my_authorization(args) {
       const query = args?.path ? `?${new URLSearchParams({ method: String(args?.method ?? 'GET').toUpperCase(), path: String(args.path) })}` : '';
       return JSON.stringify(await platformRequest('GET', `/api/authorization/me${query}`));
+    },
+    async notify(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/notify', {
+        to: Array.isArray(args?.to) ? args.to.map(String) : [],
+        message: String(args?.message ?? ''),
+        ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
+      }));
+    },
+    async escalate(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/escalate', {
+        ...(args?.task_id ? { taskId: String(args.task_id) } : {}),
+        audience: Array.isArray(args?.to) ? args.to.map(String) : [],
+        message: String(args?.note ?? ''),
+      }));
     },
     async request_permission(args) {
       return JSON.stringify(await platformRequest('POST', '/api/agent/permission-requests', {

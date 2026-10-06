@@ -5,6 +5,7 @@ import { isAgentProvider } from '../agent/provider-registry.js';
 import { validateMcpSelection } from '../mcp/connections/store.js';
 import { avatarCallableBy, avatarEnabled } from './avatars.js';
 import { CapabilityError, ValidationError } from './errors.js';
+import { normalizeAgentAuthority } from './agent-authority.js';
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const set = (value: unknown) => value !== undefined && value !== null && value !== '';
@@ -40,7 +41,13 @@ export async function assertAgentSpec(store: Store, project: Project, spec: unkn
   callerUserId: string | undefined): Promise<Avatar | undefined> {
   if (spec === undefined || spec === null) return undefined;
   if (typeof spec !== 'object' || Array.isArray(spec)) throw new ValidationError(`"agent:${role}" must be an agent spec`);
-  const { provider, model, effort, mcpConnections } = spec as Record<string, unknown>;
+  const { provider, model, effort, mcpConnections, authority } = spec as Record<string, unknown>;
+  // The main agent acts with the task's own authorization, vault grants and
+  // payment policy; only the other agents carry an authority of their own.
+  if (authority !== undefined && authority !== null) {
+    if (role === 'do') throw new ValidationError('the main agent uses the task\'s authorization, vault credentials and payments; set those instead of its authority');
+    normalizeAgentAuthority(authority, role);
+  }
   if (set(provider) && !isAgentProvider(provider)) throw new ValidationError(`unknown agent provider "${String(provider)}"`);
   if (set(model) && typeof model !== 'string') throw new ValidationError(`the ${role} agent's model must be a model id`);
   if (set(effort) && !EFFORTS.includes(effort as string)) throw new ValidationError(`invalid reasoning effort "${String(effort)}"`);

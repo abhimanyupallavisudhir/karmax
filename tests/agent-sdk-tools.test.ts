@@ -87,8 +87,14 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
   it('advertises human escalation as a gateway-backed tool available to every agent', () => {
     const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'escalate_to_human')!;
     expect(schema).toBeDefined();
-    expect(schema.parameters.required).toEqual(['audience', 'message']);
+    // Without an audience it asks the task's Responder route.
+    expect(schema.parameters.required).toEqual(['message']);
     expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain('escalate_to_human');
+    // notify and escalate (redirect a received request) are gateway-backed too.
+    for (const name of ['notify', 'escalate']) {
+      expect(TOOL_SCHEMAS.find((tool) => tool.name === name)).toBeDefined();
+      expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain(name);
+    }
   });
 
   it('offers a dedicated inventory of credentials granted to the task', async () => {
@@ -122,7 +128,8 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
   it('advertises exact permission elevation as a routed approval request', () => {
     const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'request_permission')!;
     expect(schema).toBeDefined();
-    expect(schema.parameters.required).toEqual(['capabilities', 'audience', 'reason']);
+    // No audience summons the lowest level that can grant it.
+    expect(schema.parameters.required).toEqual(['capabilities', 'reason']);
     expect(schema.parameters.properties.capabilities).toMatchObject({
       type: 'array',
       minItems: 0,

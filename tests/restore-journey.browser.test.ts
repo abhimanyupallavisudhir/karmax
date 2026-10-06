@@ -79,7 +79,7 @@ it('restores a backup over lost state, and the console carries the restored task
     await page.locator('#login-btn').click();
     await page.locator('#new-project').waitFor();
   });
-  await step('open the restored project', () => page.goto(`${app!.url}/personal/restorable`));
+  await step('open the restored project', () => page.goto(`${app!.url}/personal/restorable?q=`));
   const row = page.locator('.task-row').filter({ hasText: '@write restored.txt' });
   await step('the restored task is listed', () => row.waitFor());
   await row.locator('.row-link').click();

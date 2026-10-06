@@ -5,9 +5,9 @@ import type { Store } from '../store/db.js';
 /**
  * What a caller may do, in the terms it acts and asks in (SPEC §8.1): its
  * level, its scope, the capabilities it holds and the exact ones it lacks.
- * The gateway serves it at `GET /api/authorization/me` and every agent turn's
- * prompt states it, so an agent neither asks a person to do what it may do
- * itself nor has to discover a refusal by trying.
+ * The gateway serves it at `GET /api/authorization/me` (the `my_authorization`
+ * tool), so an agent neither asks a person to do what it may do itself nor has
+ * to discover a refusal by trying.
  */
 export interface AuthorizationSummary {
   level?: { id: string; name: string; description?: string };
@@ -52,29 +52,6 @@ export function summarizeCapabilities(caps: Capability[]): Pick<AuthorizationSum
       held.push(capability);
   // `use-card:*`/`merge-into:*` are families, requested only as concrete members.
   return { held, missing: catalogue.filter((capability) => !allowed.has(capability) && !capability.includes('*')) };
-}
-
-const named = (entry: { id: string; name?: string }) => entry.name ? `${entry.name} (${entry.id})` : entry.id;
-
-export function describeScope(scope: AuthorizationSummary['scope']): string {
-  const organization = scope.organization ? named(scope.organization) : undefined;
-  if (scope.kind === 'global') return 'across the whole installation';
-  if (scope.kind === 'organization') return `across organization ${organization ?? '(unknown)'}`;
-  const projects = (scope.projects ?? []).map(named);
-  const list = `${projects.length === 1 ? 'project' : 'projects'} ${projects.join(', ') || '(none)'}`;
-  return organization ? `in ${list} of organization ${organization}` : `in ${list}`;
-}
-
-/** The prompt section every agent turn receives. */
-export function authorizationPromptContext(summary: AuthorizationSummary): string {
-  const who = summary.level ? `${summary.level.name}${summary.level.description ? ` (${summary.level.description.replace(/\.$/, '')})` : ''}` : 'a custom authorization';
-  return [
-    '# Authorization',
-    `You are authorized as ${who} ${describeScope(summary.scope)}. This is the same authority a person at that level has in the UI: when it covers something (a project setting, a secret, a review action…), do it yourself through the tools or platform_request — never ask a person to do it for you.`,
-    `You hold: ${summary.held.join(', ') || 'nothing beyond your own task'}.`,
-    ...(summary.missing.length ? [`You lack: ${summary.missing.join(', ')}.`] : []),
-    'For anything you lack — a capability or another project — ask with request_permission(capabilities, projectIds?) instead of asking a person to do the work. my_authorization(method?, path?) shows your current authorization (it grows when a request is approved) and whether a platform_request would be allowed, without making it.',
-  ].join('\n');
 }
 
 /** Resolve level and scope names for a capability set (a token's, or a turn's). */

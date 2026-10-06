@@ -170,7 +170,7 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     expect((await view(handle)).editableParams).toContain('responder');
 
     const applied = await h.api.updateParams(token, task.id, {
-      responder: { kind: 'agent', provider: 'mock', prompt: 'Answer this open question now.' },
+      responder: { kind: 'agent', provider: 'mock', prompt: 'Answer this open question now.\n@heard' },
     });
     expect(applied).toEqual({ applied: ['responder'] });
     expect((await h.store.getTask(task.id))?.params.responder).toMatchObject({ kind: 'agent', provider: 'mock' });
@@ -179,8 +179,11 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     // selected response agent answers it, and the Do conversation resumes.
     expect((await handle.result()).stage).toBe('done');
     const final = await view(handle);
-    const responder = final.transcripts.find((transcript: any) => transcript.role === 'responder');
-    expect(responder?.messages.some((message: any) => message.text.includes('Answer this open question now.'))).toBe(true);
+    // The Responder answered in the task's one conversation, following the
+    // instructions it was given (the mock acts on them: `@heard`).
+    const answer = final.messages.find((message: any) => message.author === 'responder');
+    expect(answer).toMatchObject({ role: 'agent', to: ['agent:do'] });
+    expect(answer.text).toContain('heard:');
     expect((await git(repo, ['show', 'main:answer.txt'])).stdout).toContain('rerouted');
   });
 

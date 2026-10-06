@@ -29,9 +29,14 @@ import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED, RELIST_ACCOUNT_GRANT } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
-import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
-import { renderRespondPrompt } from '../domain/respond-prompt.js';
+import { renderConfirmPrompt, CONFIRM_PROMPT_DEFAULT } from '../domain/confirm-prompt.js';
+import { renderRespondPrompt, RESPOND_PROMPT_DEFAULT } from '../domain/respond-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
+import { failureAudience, failureCause, type FailureCause } from '../domain/escalation.js';
+import {
+  MAIN_AGENT, addressedTo, agentSelector, calledAgents, enqueueAgents, isParticipantKey, messageAuthor,
+  participantLabel, participantRole, reviewerKey, selectorAgent,
+} from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
 import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS } from './failures.js';
 import {
@@ -57,6 +62,7 @@ import {
   TaskLandingState,
   TaskContinuation,
   TaskRecoveryCheckpoint,
+  TaskParticipant,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
@@ -148,6 +154,9 @@ const turnPreparation = proxyActivities<TurnPreparationActivities>({
 // `resolve`); omitted / unknown routes to the Do agent, so old single-arg signals
 // (and the other single-agent workflows) keep working unchanged.
 export const followUpSignal = defineSignal<[Message, string?]>('followUp');
+/** Escalate: redirect the request this task is waiting on to other people
+ * (v1.27). A Responder agent's own escalation takes effect when its turn ends. */
+export const rerouteSignal = defineSignal<[{ audience: string[]; detail?: string }]>('reroute');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
@@ -480,13 +489,19 @@ export async function softwareDevV1_26(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.26.0');
 }
 
+/** One conversation with several agents (main, Responder, Reviewers, agents
+ * called with @), an agent queue, and errors that hold in their stage. */
+export async function softwareDevV1_27(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.27.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -714,6 +729,8 @@ async function softwareDevImpl(
   let resourcesApplied = carried?.resourcesApplied ?? false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
+  /** v1.27: the stage a failure holds in (the view shows it instead of `escalated`). */
+  let escalatedFrom: Stage | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
   // A released sandbox is no longer addressable, but the branch and checkouts it
   // carried stay part of the finished task's record.
@@ -869,6 +886,63 @@ async function softwareDevImpl(
   // (e.g. a Do follow-up, a merge retry, or the next resolve attempt).
   const liveInput: SoftwareDevInput = { ...input, agents: { ...(input.agents ?? {}) } };
   if (patched('software-dev-omit-recovery-input-v1')) delete liveInput.recovery;
+
+  // ── One conversation, several agents (v1.27) ──
+  // Every agent — the main one, the Responder, each Reviewer, and agents called
+  // in with @ — speaks in `msgs` and works in this world with its own provider
+  // session. Each reads the conversation as it happened (participants.ts
+  // `conversationFor`, applied by the activity), not a templated digest. Only one
+  // agent works at a time: agents called while another is mid-turn wait in
+  // `agentQueue` and run, in call order, at the next turn boundary or at once
+  // while the task is parked. The main agent keeps `session`/`sessionHome`/`seen`.
+  const multiAgent = minor >= 27;
+  const participantSessions: Record<string, { session?: string; home?: string; seen: number }> =
+    Object.fromEntries(Object.entries(continued?.participants?.sessions ?? {}).map(([key, value]) => [key, { ...value }]));
+  let agentQueue: string[] = [...(continued?.participants?.queue ?? [])];
+  /** Who last called each agent, so its reply goes back to them. */
+  const calledBy: Record<string, string> = { ...continued?.participants?.calledBy };
+  let runningParticipant: string | undefined;
+  /** Reviewer "revise" rounds in a row since a person last spoke, per
+   * Reviewer: a layer's `maxRevisions` stops two agents passing a proposal
+   * back and forth without anyone deciding. */
+  let automatedRevisions: Record<string, number> = { ...continued?.participants?.revisions };
+  /** A redirect of the request a Responder agent is answering (v1.27 `reroute`). */
+  let pendingReroute: { audience: string[]; detail?: string } | undefined;
+  /** Whether anything after `from` calls the main agent. Before 1.27 every
+   * message did; now a message only for other agents is context it reads on
+   * its next turn, not a reason to run it. */
+  const mainUnreadSince = (from: number): boolean => multiAgent
+    ? msgs.slice(Math.max(0, from)).some((m) => addressedTo(m, MAIN_AGENT))
+    : msgs.length > from;
+  const mainUnread = (): boolean => mainUnreadSince(seen);
+  /** The agents this task lists right now, main agent first. */
+  const participantKeys = (): string[] => {
+    const keys = [MAIN_AGENT];
+    if (liveResponder?.kind === 'agent') keys.push('responder');
+    let reviewers = 0;
+    for (const layer of softwareDevConfirmLayers) if (layer.kind === 'agent') keys.push(reviewerKey(reviewers++));
+    for (const key of Object.keys(liveInput.agents ?? {})) if (/^agent-\d+$/.test(key) && isParticipantKey(key)) keys.push(key);
+    // An agent that spoke stays listed after the route that called it changed.
+    for (const m of msgs) {
+      const author = m.role === 'agent' ? messageAuthor(m) : undefined;
+      if (author && !keys.includes(author)) keys.push(author);
+    }
+    return keys;
+  };
+  /** The harness selection an agent runs with (its authority is the activity's). */
+  const participantSpec = (key: string): (Partial<AgentSpec> & { prompt?: string }) | undefined => {
+    if (key === 'responder') return liveResponder?.kind === 'agent' ? liveResponder : undefined;
+    if (key.startsWith('confirm')) {
+      const index = key === 'confirm' ? 0 : Number(key.slice('confirm-'.length)) - 1;
+      return softwareDevConfirmLayers.filter((layer) => layer.kind === 'agent')[index];
+    }
+    return liveInput.agents?.[key];
+  };
+  /** A message's sender as a recipient selector (for replies). */
+  const senderSelector = (m: Message): string | undefined => {
+    if (m.role === 'agent') return agentSelector(messageAuthor(m)!);
+    return m.author && !m.author.startsWith('task:') ? m.author : undefined;
+  };
   // Params the workflow has already consumed (value now load-bearing). `target` is
   // consumed once locked (PR open / merge enqueue); an auxiliary agent's IDENTITY
   // (provider/session) once its turn runs — its model/effort stay retunable after;
@@ -887,8 +961,13 @@ async function softwareDevImpl(
    *  The Do agent runs on a live resumable session from turn one, so its identity is
    *  frozen in-flight; auxiliary agents can be swapped until their own turn runs. Model
    *  and effort are NOT gated here — they retune whenever `paramEditable` allows. */
-  const agentIdentityEditable = (role: string): boolean =>
-    role !== 'do' && paramEditable(`agent:${role}`) && !isConsumed(`agent:${role}`);
+  /** An agent someone called in with @ (v1.27): it can be added, retuned or
+   * swapped until it first speaks, then retuned, up to the point of no return. */
+  const calledInAgent = (role: string): boolean => multiAgent && /^agent-\d+$/.test(role) && isParticipantKey(role);
+  const calledInEditable = (): boolean => !cancelled && !pointOfNoReturnPassed;
+  const agentIdentityEditable = (role: string): boolean => calledInAgent(role)
+    ? calledInEditable() && !participantSessions[role] && !msgs.some((m) => m.role === 'agent' && messageAuthor(m) === role)
+    : role !== 'do' && paramEditable(`agent:${role}`) && !isConsumed(`agent:${role}`);
   type AgentPlan = { ok: false; reason: string } | { ok: true; next: AgentSpec };
   /** Resolve an `agent:<role>` patch against live state (SPEC §5.5). While the role's
    *  identity is still editable, a full swap is accepted; once locked, only its model
@@ -899,7 +978,7 @@ async function softwareDevImpl(
     const spec = raw as AgentSpec;
     const cur = liveInput.agents?.[role];
     // A retune (like any edit) stops at cancel and the point of no return.
-    if (!paramEditable(`agent:${role}`))
+    if (!(calledInAgent(role) ? calledInEditable() : paramEditable(`agent:${role}`)))
       return { ok: false, reason: `the ${role} agent can't be changed now — the task is ${cancelled ? 'cancelled' : 'past the point of no return'}` };
     if (agentIdentityEditable(role)) {
       if (!spec.provider) return { ok: false, reason: `the ${role} agent override needs a provider` };
@@ -1066,8 +1145,36 @@ async function softwareDevImpl(
     }
   }
 
+  /** Every agent of the one conversation (v1.27), main agent first. */
+  function buildParticipants(): TaskParticipant[] {
+    const authored = new Map<string, number>();
+    for (const m of msgs) if (m.role === 'agent') {
+      const author = messageAuthor(m)!;
+      authored.set(author, (authored.get(author) ?? 0) + 1);
+    }
+    return participantKeys().map((key) => {
+      const spec = key === MAIN_AGENT ? liveInput.agents?.do : participantSpec(key);
+      const { kind: _kind, audience: _audience, prompt: _prompt, ...harness } = (spec ?? {}) as Partial<ConfirmLayer>;
+      const running = key === MAIN_AGENT
+        ? !runningParticipant && agentTurn?.role === 'do'
+        : runningParticipant === key;
+      return {
+        key, label: participantLabel(key), role: participantRole(key),
+        ...(Object.keys(harness).length ? { spec: harness } : {}),
+        state: running ? 'running' : agentQueue.includes(key) ? 'queued' : 'idle',
+        messages: authored.get(key) ?? 0,
+      };
+    });
+  }
+
   /** All per-role transcripts, omitting roles that haven't run a turn yet. */
   function buildTranscripts(): { role: string; label: string; messages: Message[] }[] {
+    // v1.27 speaks in one conversation; only historical roles keep their own.
+    if (multiAgent) {
+      const t = [{ role: 'do', label: 'Do agent', messages: msgs }];
+      if (resolveMsgs.length) t.push({ role: 'resolve', label: 'Resolve agent', messages: resolveMsgs });
+      return t;
+    }
     const t = [{ role: 'do', label: 'Do agent', messages: msgs }];
     if (!explicitPrCycle && mergeMsgs.length) t.push({ role: 'merge', label: 'Merge agent', messages: mergeMsgs });
     if (resolveMsgs.length) t.push({ role: 'resolve', label: 'Resolve agent', messages: resolveMsgs });
@@ -1103,10 +1210,11 @@ async function softwareDevImpl(
       ...(modeSwitching
         ? { workflowOptions: ['software-dev', 'goal'], workflowSwitchable }
         : {}),
-      stage,
+      stage: multiAgent && stage === 'escalated' && escalatedFrom ? escalatedFrom : stage,
       status,
       messages: msgs,
       transcripts: buildTranscripts(),
+      ...(multiAgent ? { participants: buildParticipants() } : {}),
       reviewInfo,
       actions: allowed(),
       state: {
@@ -1241,7 +1349,7 @@ async function softwareDevImpl(
       }
       const seenAtEscalation = msgs.length;
       await publish();
-      await condition(() => retryRequested || cancelled || (followUpWakesEscalation && msgs.length > seenAtEscalation));
+      await waitServing(() => retryRequested || cancelled || (followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
       waitingFor = undefined;
       error = undefined;
       stage = priorStage;
@@ -1321,7 +1429,7 @@ async function softwareDevImpl(
       waitingFor = { kind: 'parent' };
       await notifyParent(options.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
       await publish();
-      await condition(() => confirmed || cancelled || msgs.length > options.messagesSeen);
+      await waitServing(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen));
       waitingFor = undefined;
       if (cancelled) return 'cancelled';
       if (!confirmed) return 'do';
@@ -1347,10 +1455,13 @@ async function softwareDevImpl(
         if (layerIndex >= gates.length) break;
         const layer = gates[layerIndex]!;
         const gateDetail = gates.length > 1 ? `confirm layer ${layerIndex + 1}/${gates.length}` : undefined;
-        if (layer.kind === 'agent') {
+        const reviewer = reviewerKey(gates.slice(0, layerIndex).filter((candidate) => candidate.kind === 'agent').length);
+        const revisionBound = multiAgent && layer.kind === 'agent' && layer.maxRevisions !== undefined
+          && (automatedRevisions[reviewer] ?? 0) >= layer.maxRevisions;
+        if (layer.kind === 'agent' && !revisionBound) {
           waitingFor = { kind: 'confirm', ...(gateDetail ? { detail: gateDetail } : {}) };
           await publish();
-          const decision = await confirmTurn(layer);
+          const decision = await confirmTurn(layer, reviewer);
           waitingFor = undefined;
           if (cancelled) return 'cancelled';
           if (confirmEpoch !== epoch) { layerIndex = 0; continue; }
@@ -1364,7 +1475,8 @@ async function softwareDevImpl(
             return 'cancelled';
           }
           if (decision?.action === 'revise') {
-            msgs.push({
+            automatedRevisions = { ...automatedRevisions, [reviewer]: (automatedRevisions[reviewer] ?? 0) + 1 };
+            if (!multiAgent) msgs.push({
               id: `cv-${msgs.length}`, role: 'user',
               text: decision.text || 'Please revise the work per the reviewer feedback.', ts: msgs.length,
             });
@@ -1373,20 +1485,22 @@ async function softwareDevImpl(
         }
         if (patched('human-confirm-waiting-status-v1')) status = 'waiting';
         waitingFor = {
-          kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
+          kind: 'human',
+          ...(revisionBound ? { detail: `${participantLabel(reviewer)} asked for changes ${automatedRevisions[reviewer]} times in a row. Confirm, or send guidance.` }
+            : gateDetail ? { detail: gateDetail } : {}),
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'],
         };
         await publish();
         // No new commands are emitted for historical openPr signals (no payload),
         // so existing histories retain their original Review behavior.
-        if (manualConfirmer && confirmEpoch === epoch && msgs.length === options.messagesSeen && !cancelled) {
+        if (manualConfirmer && confirmEpoch === epoch && !mainUnreadSince(options.messagesSeen) && !cancelled) {
           const userId = manualConfirmer;
           manualConfirmer = undefined;
           const approved = await core.confirmManualPr(taskId, userId);
-          if (approved && confirmEpoch === epoch && msgs.length === options.messagesSeen && !cancelled)
+          if (approved && confirmEpoch === epoch && !mainUnreadSince(options.messagesSeen) && !cancelled)
             confirmed = true;
         }
-        await condition(() => confirmed || cancelled || msgs.length > options.messagesSeen || confirmEpoch !== epoch);
+        await waitServing(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen) || confirmEpoch !== epoch);
         waitingFor = undefined;
         if (cancelled) return 'cancelled';
         if (confirmEpoch !== epoch) { layerIndex = 0; confirmed = false; continue; }
@@ -1455,10 +1569,51 @@ async function softwareDevImpl(
   setHandler(pendingMessagesQuery, (role, fromIndex) => {
     // The raw slice from `fromIndex` (indices align with the array the activity is
     // tracking). A negative/over-range index clamps to a safe empty/whole slice.
+    if (multiAgent && isParticipantKey(role)) {
+      // `role` is the running agent. Deliver only what calls it, and stop at the
+      // first message that does not: that one waits for its own agent's turn and
+      // the running agent reads it as context next time, so delivered counts
+      // stay contiguous indices into `msgs`.
+      const pending = msgs.slice(Math.max(0, fromIndex));
+      const stop = pending.findIndex((m) => !addressedTo(m, role));
+      return stop < 0 ? pending : pending.slice(0, stop);
+    }
     const target = conversationFor(role);
     return target.slice(Math.max(0, fromIndex));
   });
+  /** Queue every agent `m` calls (except the main one, which `mainUnread`
+   * wakes) and remember who called it. */
+  const callAgents = (m: Message) => {
+    const listed = participantKeys();
+    for (const key of calledAgents(m)) {
+      if (key === MAIN_AGENT || !listed.includes(key)) continue;
+      const sender = senderSelector(m);
+      if (sender && sender !== agentSelector(key)) calledBy[key] = sender;
+      else delete calledBy[key];
+      agentQueue = enqueueAgents(agentQueue, [key], runningParticipant);
+    }
+  };
   setHandler(followUpSignal, (m, role) => {
+    if (multiAgent && role !== 'merge' && role !== 'resolve') {
+      // A follow-up addressed by role (the pre-1.27 API) calls that agent.
+      const message: Message = !m.to && role && role !== MAIN_AGENT && isParticipantKey(role)
+        ? { ...m, to: [agentSelector(role)] } : m;
+      const forMain = addressedTo(message, MAIN_AGENT);
+      if (forMain) {
+        manualPrConfirmer = undefined;
+        responderRounds = 0;
+        subtaskNags = 0;
+      }
+      if (message.role === 'user') automatedRevisions = {};
+      whenLoaded(() => {
+        if (msgs.some((candidate) => candidate.id === message.id)) return;
+        msgs.push({ ...message, ts: message.ts || msgs.length });
+        callAgents(message);
+      });
+      if (forMain && responsiveHumanHold && humanPauseActive)
+        humanPauseWake = { kind: 'followUp', role: MAIN_AGENT };
+      return;
+    }
     manualPrConfirmer = undefined;
     responderRounds = 0;
     subtaskNags = 0;
@@ -1473,6 +1628,13 @@ async function softwareDevImpl(
     });
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'followUp', role };
+  });
+  setHandler(rerouteSignal, async ({ audience, detail }) => {
+    if (!multiAgent || !Array.isArray(audience) || !audience.length) return;
+    if (runningParticipant === 'responder') { pendingReroute = { audience: [...audience], ...(detail ? { detail } : {}) }; return; }
+    if (waitingFor?.kind !== 'human' && waitingFor?.kind !== 'parent') return;
+    waitingFor = { ...waitingFor, kind: 'human', audience: [...audience], ...(detail ? { detail } : {}) };
+    await publish();
   });
   // The "requested" and "settled" signals are sent by two independent code paths
   // over two concurrent RPCs, so they can arrive in either order: a target that
@@ -1500,6 +1662,7 @@ async function softwareDevImpl(
     await landingWatcher?.signal('providerChanged').catch(() => undefined);
   });
   setHandler(confirmSignal, () => {
+    automatedRevisions = {};
     if (awaitingResourceDecision) return;
     if (stage === 'escalated' && escalationAction) {
       if (escalationAction === 'confirm') manualEscalationRequested = true;
@@ -1710,6 +1873,8 @@ async function softwareDevImpl(
     // public Review stage. Preserve the actual UI stage for a later human retry.
     const resumeStage = stage;
     let lastError = '';
+    // What the last failure says about who can fix it (v1.27 routing).
+    let cause: FailureCause = 'task';
     for (;;) {
       let attempt = 0;
       let infraRetries = 0;
@@ -1723,6 +1888,7 @@ async function softwareDevImpl(
           // This new failure type has no historical command sequence. A safety
           // decision is task-local: never rotate accounts or ask Resolve to retry.
           if (failureHasType(err, 'agent-policy')) {
+            cause = 'task';
             lastError = describeError(err);
             error = lastError;
             break;
@@ -1741,6 +1907,7 @@ async function softwareDevImpl(
               attempt--;
               continue;
             }
+            cause = 'task';
             lastError = `${describeError(err)} — the conversation is larger than the model's context window even in a fresh session; send a narrower follow-up or start a new task`;
             error = lastError;
             break;
@@ -1753,6 +1920,7 @@ async function softwareDevImpl(
           // this failure through the historical Resolve path.
           if (failureHasType(err, 'github-workflows-permission')
             && patched('software-dev-human-github-workflow-permission-v1')) {
+            cause = 'project';
             lastError = describeError(err);
             error = lastError;
             break;
@@ -1760,6 +1928,7 @@ async function softwareDevImpl(
           // A credential wall (all logins/keys need a human) won't fix on retry —
           // escalate straight to a human (#5).
           if (err instanceof CredentialDenied) {
+            cause = 'organization';
             lastError = describeError(err);
             error = lastError;
             break;
@@ -1793,6 +1962,7 @@ async function softwareDevImpl(
               error = undefined;
               continue;
             }
+            cause = 'infrastructure';
             lastError = `infrastructure: ${describeError(err)} (still failing after ${INFRA_BACKOFF_MS.length} waits)`;
             error = lastError;
             break; // → escalate to a human; Resolve can't fix infrastructure
@@ -1800,6 +1970,8 @@ async function softwareDevImpl(
           lastError = describeError(err);
           error = lastError;
           const providerLimit = limitFailureClassification(err);
+          cause = failureCause({ stage: stageName, hardLimit: !!providerLimit?.hard,
+            types: failureTypes(err) });
           const prevStage = stage;
           // v1 command order is recorded in existing histories: publish Resolve,
           // then invoke autoResolve. The improved no-flicker order belongs to the
@@ -1938,9 +2110,15 @@ async function softwareDevImpl(
       status = 'blocked';
       error = lastError;
       retryRequested = false;
+      // From 1.27 a failure is not a stage: the view keeps the stage that failed
+      // and asks whoever can fix its cause (domain/escalation.ts). A sub-task's
+      // parent still hears every failure first; it can escalate further.
+      escalatedFrom = multiAgent ? resumeStage : undefined;
       if (input.parentTaskId) {
         waitingFor = { kind: 'parent' };
         await notifyParent('blocked', lastError);
+      } else if (multiAgent) {
+        waitingFor = { kind: 'human', reason: 'error', audience: failureAudience(cause), detail: lastError };
       } else if (escalationAction) {
         waitingFor = { kind: 'human', audience: ['@creator'] };
       }
@@ -1953,15 +2131,16 @@ async function softwareDevImpl(
       const seenAtEscalation = msgs.length;
       await publish();
       for (;;) {
-        await condition(() =>
+        await waitServing(() =>
           retryRequested || cancelled || manualEscalationRequested
-          || (followUpWakesEscalation && msgs.length > seenAtEscalation));
+          || (followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
         if (!manualEscalationRequested || cancelled || !manual) break;
         manualEscalationRequested = false;
         try {
           const result = await manual.finish();
           escalationAction = undefined;
           waitingFor = undefined;
+          escalatedFrom = undefined;
           stage = resumeStage;
           status = 'active';
           error = undefined;
@@ -1974,6 +2153,7 @@ async function softwareDevImpl(
       }
       escalationAction = undefined;
       waitingFor = undefined;
+      escalatedFrom = undefined;
       if (cancelled) throw new Cancelled();
       // A human/parent retry resumes the stage that failed. Leaving this as
       // `escalated` made the live view claim the task was still escalated while
@@ -2336,6 +2516,7 @@ async function softwareDevImpl(
         return agentTurns.runAgentTurn({
           taskId,
           role: 'do',
+          ...(multiAgent ? { participant: MAIN_AGENT } : {}),
           worldHandle: world as any,
           ...turnMessages(msgs, 'do'),
           session: resume,
@@ -2454,7 +2635,22 @@ async function softwareDevImpl(
    *  human makes. Leased + resolve-wrapped like every other role. Returns the verdict,
    *  or undefined if the agent turn failed or declined to decide (caller falls back to
    *  the human gate so nothing is silently auto-confirmed). */
-  async function confirmTurn(layer: ConfirmLayer): Promise<import('./contract.js').ConfirmDecision | undefined> {
+  async function confirmTurn(layer: ConfirmLayer, reviewer?: string): Promise<import('./contract.js').ConfirmDecision | undefined> {
+    if (multiAgent && reviewer) {
+      // The Reviewer reads the conversation and says what it thinks; its verdict
+      // is the structured decision. "Revise" is its message to the main agent.
+      const turn = await participantTurn(reviewer);
+      const decision = turn?.confirmDecision;
+      let reply = turn?.reply;
+      if (decision?.action === 'revise' && !reply) {
+        reply = { id: `${reviewer}-${msgs.length}`, role: 'agent', author: reviewer, ts: msgs.length,
+          text: decision.text || 'Please revise the work.' };
+        msgs.push(reply);
+        participantSessions[reviewer] = { ...participantSessions[reviewer]!, seen: msgs.length };
+      }
+      await deliverReply(reply, decision?.action === 'revise' ? [agentSelector(MAIN_AGENT)] : []);
+      return decision;
+    }
     // The layer's own agent spec drives this turn (each agent layer can run a
     // different reviewer): land it on liveInput.agents.confirm so the shared
     // machinery (provider lease + runAgentTurn's per-role override) picks it up;
@@ -2537,6 +2733,16 @@ async function softwareDevImpl(
    * Do. Its prose is returned to the caller and inserted as a user message in the
    * working transcript; it never receives Review authority. */
   async function responderTurn(route: ResponderConfig, question: string): Promise<string | undefined> {
+    if (multiAgent) {
+      // The question is the main agent's last message; the Responder reads the
+      // conversation and answers it there. A Responder that redirected the
+      // request (escalate) leaves `pendingReroute` for the caller instead.
+      pendingReroute = undefined;
+      const turn = await participantTurn('responder');
+      if (pendingReroute) return undefined;
+      await deliverReply(turn?.reply, [agentSelector(MAIN_AGENT)]);
+      return turn?.reply?.text.trim() || undefined;
+    }
     const { kind: _kind, prompt: _prompt, audience: _audience, ...routeSpec } = route;
     const { responder: _previous, ...otherAgents } = liveInput.agents ?? {};
     liveInput.agents = routeSpec.provider
@@ -2580,6 +2786,150 @@ async function softwareDevImpl(
     if (output) responderMsgs.push({ id: `r-out-${responderMsgs.length}`, role: 'agent', text: output, ts: responderMsgs.length,
       ...(rt?.finalActivity ? { sourceActivity: rt.finalActivity } : {}) });
     return output || undefined;
+  }
+
+  type AgentTurnResult = Awaited<ReturnType<typeof agentTurns.runAgentTurn>>;
+
+  /** A Responder/Reviewer instruction field, minus the request templates it
+   * used to hold: 1.27 agents read the conversation, not a templated digest. */
+  const agentInstructions = (prompt: string | undefined): string => {
+    const text = prompt?.trim();
+    if (!text || text === RESPOND_PROMPT_DEFAULT.trim() || text === CONFIRM_PROMPT_DEFAULT.trim()) return '';
+    const instructions = text.replace(/\{\{\w+\}\}/g, '').trim();
+    return instructions ? `Instructions for you:\n${instructions}` : '';
+  };
+
+  /**
+   * One turn of agent `key` on the shared conversation (v1.27): it resumes its
+   * own provider session, reads everything said since its last turn (the
+   * activity labels each speaker), works in this world, and its reply joins
+   * `msgs` right after what it answered. Returns the turn, with `reply` set when
+   * it said something, or undefined when the turn failed.
+   */
+  async function participantTurn(key: string): Promise<(AgentTurnResult & { reply?: Message }) | undefined> {
+    const role = participantRole(key);
+    const spec = participantSpec(key) as Partial<ConfirmLayer> | undefined;
+    const { kind: _kind, audience: _audience, prompt, ...harness } = spec ?? {};
+    // The role's turn machinery (credential lease, profile, provider) reads the
+    // spec from `liveInput.agents[role]`, as for the historical auxiliary roles.
+    const { [role]: _previous, ...otherAgents } = liveInput.agents ?? {};
+    liveInput.agents = harness.provider ? { ...otherAgents, [role]: { ...harness, provider: harness.provider } as AgentSpec } : otherAgents;
+    const state = participantSessions[key] ?? { seen: 0 };
+    let home: string | undefined;
+    let deliveredNow = state.seen;
+    agentQueue = agentQueue.filter((queued) => queued !== key);
+    runningParticipant = key;
+    let turn: AgentTurnResult | undefined;
+    try {
+      turn = await withResolve(role, () => leasedTurn(role, (
+        accountConfigHome,
+        accountApiKeyHandle,
+        agentTurnId,
+        accountCredentialKind,
+        accountCredentialProvider,
+        admission,
+      ) => {
+        home = accountConfigHome ?? '(profile)';
+        const resume = state.session && state.home === home ? state.session : undefined;
+        deliveredNow = msgs.length;
+        return agentTurns.runAgentTurn({
+          taskId,
+          role,
+          participant: key,
+          worldHandle: world as any,
+          ...turnMessages(msgs, 'do'),
+          session: resume,
+          deliveredMessages: resume ? state.seen : 0,
+          task: liveInput,
+          bindings: {
+            participant: participantLabel(key),
+            agentInstructions: agentInstructions(prompt),
+            reviewInfo: reviewInfo?.summary ?? '',
+            changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
+          },
+          accountConfigHome,
+          accountApiKeyHandle,
+          accountCredentialKind,
+          accountCredentialProvider,
+          ...(agentTurnId ? { agentTurnId } : {}),
+          ...admission,
+        });
+      }));
+    } catch (e) {
+      if (isCancellation(e)) throw e;
+      log.warn('agent turn failed', { participant: key, e: String(e) });
+      return undefined;
+    } finally {
+      runningParticipant = undefined;
+    }
+    const delivered = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
+    let reply: Message | undefined;
+    if (turn.output?.trim()) {
+      reply = { id: `${key}-${msgs.length}`, role: 'agent', author: key, text: turn.output, ts: msgs.length, to: [],
+        ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) };
+      msgs.splice(delivered, 0, reply);
+    }
+    const session = turn.session ?? state.session;
+    participantSessions[key] = { ...(session ? { session } : {}), ...(home ? { home } : {}), seen: delivered + (reply ? 1 : 0) };
+    // Someone called it again after its last delivery: it answers that next.
+    if (msgs.slice(participantSessions[key]!.seen).some((m) => addressedTo(m, key)))
+      agentQueue = enqueueAgents(agentQueue, [key]);
+    if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
+    if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
+    return { ...turn, ...(reply ? { reply } : {}) };
+  }
+
+  /** Address `reply` and act on it: agents it names are called, people it names
+   * are notified now (an ask, in their inbox). */
+  async function deliverReply(reply: Message | undefined, to: string[]): Promise<void> {
+    if (!reply) return;
+    reply.to = [...new Set(to)];
+    callAgents(reply);
+    const people = reply.to.filter((selector) => !selectorAgent(selector));
+    if (people.length) await core.recordEvent(taskId, 'task.mentioned', {
+      recipients: people, by: agentSelector(messageAuthor(reply)!), messageId: reply.id, text: clip(reply.text, 500),
+    });
+  }
+
+  /** Run every called agent, one at a time in call order (v1.27). While one
+   * runs the task shows it working; the wait it interrupted is restored. */
+  async function runCalledAgents(): Promise<void> {
+    if (!multiAgent) return;
+    while (agentQueue.length && !cancelled && world) {
+      const key = agentQueue[0]!;
+      if (!participantKeys().includes(key)) { agentQueue.shift(); continue; }
+      const resume = { status, waitingFor };
+      status = 'active';
+      waitingFor = undefined;
+      await publish();
+      const turn = await participantTurn(key);
+      if (cancelled) return;
+      // A called agent answers whoever called it; an agent it calls with notify
+      // arrives as its own message. Reviewer and Responder replies are routed
+      // by the stage that called them, not here.
+      const caller = calledBy[key];
+      delete calledBy[key];
+      await deliverReply(turn?.reply, caller ? [caller] : []);
+      status = resume.status;
+      waitingFor = resume.waitingFor;
+      await publish();
+    }
+  }
+
+  /** Wait for `ready` while staying responsive to agents called meanwhile:
+   * each runs at once (the task is parked, so nothing else is working) and the
+   * wait resumes unless it is now ready. Before 1.27 it is a plain condition. */
+  async function waitServing(ready: () => boolean, timeoutMs?: number): Promise<boolean> {
+    if (!multiAgent) return timeoutMs === undefined ? (await condition(ready), true) : condition(ready, timeoutMs);
+    const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+    for (;;) {
+      const wake = () => ready() || (agentQueue.length > 0 && !cancelled);
+      const woke = deadline === undefined ? (await condition(wake), true)
+        : await condition(wake, Math.max(0, deadline - Date.now()));
+      if (ready()) return true;
+      if (!woke) return false;
+      await runCalledAgents();
+    }
   }
 
   /** Validate the exact integration candidate without replaying human Review.
@@ -2860,6 +3210,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         ...(escalationAction ? { escalationAction } : {}),
         ...(error ? { error } : {}),
         counters: { responderRounds, subtaskNags, subagentNudges, shellNudges, landingWatchSequence, resourceReviewSequence },
+        ...(multiAgent ? { participants: { sessions: participantSessions, queue: agentQueue, calledBy, revisions: automatedRevisions } } : {}),
       },
     } };
   }
@@ -2993,7 +3344,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     retryRequested = false;
     await publish();
     if (responsiveHumanHold)
-      await condition(() => !!humanPauseWake || cancelled);
+      await waitServing(() => !!humanPauseWake || cancelled);
     else
       await condition(() => retryRequested || cancelled);
     pauseWake = humanPauseWake;
@@ -3140,6 +3491,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     drainChildEvents();
     await publish();
     if (cancelled) return await abort();
+    // An agent called while the task was elsewhere (an interrupted pause, a
+    // review that returned here) speaks before the main agent's next turn.
+    await runCalledAgents();
+    if (cancelled) return await abort();
     if (continuesAsNew && historyGrown() && patched('software-dev-continue-as-new-v1')) {
       await continueRun();
       if (cancelled) return await abort();
@@ -3152,7 +3507,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     const turn: Awaited<ReturnType<typeof doTurn>> = mayReuseCompletedProposalForOpenPr(
       explicitPrCycle,
       prRequested,
-      msgs.length,
+      // Messages only for other agents are not unread by the main agent.
+      multiAgent && !mainUnread() ? seen : msgs.length,
       seen,
       preventsUnreadOpenPrSpin,
     )
@@ -3162,6 +3518,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     // down to the children they target (SPEC §5.3).
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
+    // Agents called while the main agent worked run now, in call order, before
+    // its turn is acted on: what they say may call it back (mainUnread below).
+    await runCalledAgents();
+    if (cancelled) return await abort();
 
     // The agent asked to be resumed later (`pause`): park here and resume it with
     // the outcome. A message, a child's event, or a cancellation ends it early.
@@ -3179,15 +3539,24 @@ Inspect the complete current diff and specifically compare its delta from the re
         responderRounds++;
         status = 'waiting';
         waitingFor = { kind: 'responder', detail: question };
+        // The Responder reads the conversation, so a question asked only through
+        // pause's `message` is said there as the main agent's own words.
+        if (multiAgent && needsInput.message && needsInput.message.trim() !== turn.output?.trim()) {
+          const caughtUp = !mainUnread();
+          msgs.push({ id: `ask-${msgs.length}`, role: 'agent', text: needsInput.message, ts: msgs.length });
+          if (caughtUp) seen = msgs.length;
+        }
         await publish();
         const answer = await responderTurn(route, question);
         waitingFor = undefined;
         if (cancelled) return await abort();
         if (answer) {
-          msgs.push({ id: `responder-${msgs.length}`, role: 'user', text: `Responder: ${answer}`, ts: msgs.length });
+          if (!multiAgent) msgs.push({ id: `responder-${msgs.length}`, role: 'user', text: `Responder: ${answer}`, ts: msgs.length });
           continue;
         }
       }
+      const rerouted = pendingReroute;
+      pendingReroute = undefined;
       const note = await waitForAgent(turn.wait, {
         world,
         ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
@@ -3195,14 +3564,18 @@ Inspect the complete current diff and specifically compare its delta from the re
           : needsInput ? { ask: {
             kind: 'human' as const,
             audience: needsInput.audience?.length ? needsInput.audience
+              : rerouted ? rerouted.audience
               : route?.kind === 'human' && route.audience?.length ? route.audience : ['@creator'],
             detail: question,
             ...(needsInput.urgency ? { urgency: needsInput.urgency } : {}),
           } } : {}),
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
         // A Needs input hold offers Open PR, like any input hold in Do (and a parent may send it).
-        interrupted: () => cancelled || msgs.length > seen || raises.length > 0 || settled.length > 0
+        interrupted: () => cancelled || mainUnread() || raises.length > 0 || settled.length > 0
           || (!!needsInput && prRequested),
+        // Agents called while the main agent is paused run now; its pause goes
+        // on unless what they say is for it.
+        ...(multiAgent ? { serveable: () => agentQueue.length > 0 && !cancelled, serve: runCalledAgents } : {}),
       });
       if (cancelled) return await abort();
       if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
@@ -3242,7 +3615,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           ? { kind: 'human', audience: ['@creator'], detail: 'The managing agent has not answered its children after three reminders. Send guidance to continue.' }
           : { kind: 'subtask' };
         await publish();
-        const wake = () => raises.length > 0 || settled.length > 0 || cancelled || msgs.length > seen;
+        const wake = () => raises.length > 0 || settled.length > 0 || cancelled || mainUnread();
         // If a child is still awaiting OUR reply (it raised a needs_confirmation /
         // needs_info / blocked that we drained but haven't answered), we must not
         // park forever: a child at Review neither re-raises nor settles, so `wake`
@@ -3255,7 +3628,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           chosen = true;
           if (awaitingResponse.size > 0 && !needsHuman) {
             if (boundedNags) subtaskNags++;
-            await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
+            await waitServing(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
           } else if (!needsHuman && [...outstanding].some((id) => !childHandles.has(id))
             && patched('software-dev-child-settlement-recheck-v1')) {
             // A child restored without its handle (after continue-as-new or a
@@ -3273,7 +3646,7 @@ Inspect the complete current diff and specifically compare its delta from the re
                 if (outstanding.has(child.taskId)) settled.push({ childTaskId: child.taskId, stage: child.stage });
             }
           } else {
-            await condition(() => wake() || droppedChildHandles > drops);
+            await waitServing(() => wake() || droppedChildHandles > drops);
             chosen = wake();
           }
         }
@@ -3294,7 +3667,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         detail: `Waiting for ${pendingCollaborations.size} background collaboration request(s)`,
       };
       await publish();
-      await condition(() => cancelled || pendingCollaborations.size === 0 || msgs.length > seen);
+      await waitServing(() => cancelled || pendingCollaborations.size === 0 || mainUnread());
       if (cancelled) return await abort();
       stage = 'do';
       status = 'active';
@@ -3302,21 +3675,21 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
 
     if (patched('service-connections-wait-v1')) {
-      while (await core.pendingServiceConnections(taskId) && !cancelled && msgs.length === seen) {
+      while (await core.pendingServiceConnections(taskId) && !cancelled && !mainUnread()) {
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
         await publish();
-        if (patched('service-connections-signal-wait-v1')) await condition(() => cancelled || msgs.length > seen);
+        if (patched('service-connections-signal-wait-v1')) await waitServing(() => cancelled || mainUnread());
         else await condition(() => cancelled || msgs.length > seen, '30 seconds');
       }
       if (cancelled) return await abort();
-      if (msgs.length > seen) { status = 'active'; waitingFor = undefined; continue; }
+      if (mainUnread()) { status = 'active'; waitingFor = undefined; continue; }
     }
 
     // A collaboration may settle after the provider's final live-message poll
     // but before its activity returns. Always deliver that queued result in a
     // fresh turn instead of advancing to Review with an unread notification.
-    if (msgs.length > seen) continue;
+    if (mainUnread()) continue;
 
     // The agent's OWN in-harness sub-agents (Claude Agent SDK Task tool) may still be
     // running when its turn returned — Claude Code auto-backgrounds long sub-agents, so
@@ -3331,11 +3704,11 @@ Inspect the complete current diff and specifically compare its delta from the re
       await publish();
       // Back off before re-prompting (avoids a hot loop of subprocess spawns), but stay
       // redirectable: a human follow-up or a cancel wakes us early.
-      await condition(() => cancelled || msgs.length > seen, input.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS);
+      await waitServing(() => cancelled || mainUnread(), input.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS);
       if (cancelled) return await abort();
       // Unless a human already redirected us this wait, nudge the agent to wait for its
       // sub-agents and fold in their results before signalling completion.
-      if (msgs.length === seen) {
+      if (!mainUnread()) {
         msgs.push({
           id: `sa-${msgs.length}`,
           role: 'user',
@@ -3368,9 +3741,9 @@ Inspect the complete current diff and specifically compare its delta from the re
       await publish();
       // Back off before re-prompting, but stay redirectable: a human follow-up or a
       // cancel wakes us early.
-      await condition(() => cancelled || msgs.length > seen, input.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS);
+      await waitServing(() => cancelled || mainUnread(), input.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS);
       if (cancelled) return await abort();
-      if (msgs.length === seen && turn.stoppedBackgroundShells?.length) {
+      if (!mainUnread() && turn.stoppedBackgroundShells?.length) {
         // The turn ended under them, and ending a turn stops them: say so.
         msgs.push({
           id: `sh-${msgs.length}`,
@@ -3378,7 +3751,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           text: `Your turn ended while background shells you started were still running, and ending a turn stops them, so their results are lost:\n${turn.stoppedBackgroundShells.map((d) => `- ${d}`).join('\n')}\nIf you need a result, run the command with start_job and then call pause. If it was deliberately temporary (e.g. a dev server), finish now and say so.`,
           ts: msgs.length,
         });
-      } else if (msgs.length === seen) {
+      } else if (!mainUnread()) {
         msgs.push({
           id: `sh-${msgs.length}`,
           role: 'user',
@@ -3486,13 +3859,13 @@ Inspect the complete current diff and specifically compare its delta from the re
               ?? `Its Do turn ended without opening a PR. Confirm to open the PR if the work is truly complete; otherwise comment.${turn.output?.trim()
                 ? `\n\nIts last message:\n${clip(turn.output.trim(), PARENT_RAISE_OUTPUT_CHARS)}` : ''}`);
             await publish();
-            await condition(() => prRequested || cancelled || msgs.length > seen);
+            await waitServing(() => prRequested || cancelled || mainUnread());
           } else {
             let answered = false;
             // An accepted Responder edit invalidates the route currently parked
             // on this question. Replay only this routing decision—not the Do turn—
             // so switching human ↔ agent (or changing audience) takes effect now.
-            while (!prRequested && !cancelled && msgs.length <= seen) {
+            while (!prRequested && !cancelled && !mainUnread()) {
               const routeEpoch = responderEpoch;
               const route = liveResponder;
               const boundedResponses = patched('software-dev-bounded-input-loops-v1');
@@ -3507,7 +3880,7 @@ Inspect the complete current diff and specifically compare its delta from the re
                 // Its stale answer must not win over the newly selected route.
                 if (mutableInputResponder && responderEpoch !== routeEpoch) continue;
                 if (answer) {
-                  msgs.push({
+                  if (!multiAgent) msgs.push({
                     id: `responder-${msgs.length}`,
                     role: 'user',
                     text: `Responder: ${answer}`,
@@ -3517,8 +3890,13 @@ Inspect the complete current diff and specifically compare its delta from the re
                   break;
                 }
                 // A responder outage must not strand the task in an invisible loop.
-                // Fall back to its creator, like a failed Confirm-agent turn.
-                waitingFor = { kind: 'human', audience: ['@creator'], detail: question };
+                // Fall back to its creator, like a failed Confirm-agent turn; a
+                // Responder that escalated the question hands it to whom it chose.
+                const rerouted = pendingReroute;
+                pendingReroute = undefined;
+                waitingFor = rerouted
+                  ? { kind: 'human', audience: rerouted.audience, detail: rerouted.detail ?? question }
+                  : { kind: 'human', audience: ['@creator'], detail: question };
               } else {
                 waitingFor = {
                   kind: 'human',
@@ -3530,7 +3908,7 @@ Inspect the complete current diff and specifically compare its delta from the re
                 };
               }
               await publish();
-              await condition(() => prRequested || cancelled || msgs.length > seen
+              await waitServing(() => prRequested || cancelled || mainUnread()
                 || (mutableInputResponder && responderEpoch !== routeEpoch));
               waitingFor = undefined;
               if (mutableInputResponder && responderEpoch !== routeEpoch) continue;
@@ -4699,6 +5077,17 @@ function describeError(err: any): string {
     e = e.cause;
   }
   return parts.join(' → ') || String(err);
+}
+
+/** Every typed classification along a failure's cause chain. */
+function failureTypes(err: unknown): string[] {
+  const types: string[] = [];
+  let value: any = err;
+  for (let depth = 0; value && depth < 8; depth++) {
+    if (typeof value.type === 'string') types.push(value.type);
+    value = value.cause;
+  }
+  return types;
 }
 
 function failureHasType(err: unknown, type: string): boolean {

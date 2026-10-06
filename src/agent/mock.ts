@@ -49,6 +49,12 @@ import { platformToolHandlers } from './tools.js';
  *   @incomplete                     do NOT signal completion this turn
  *   @profile                        echo this turn's model/effort (`profile: <model>/<effort>`)
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
+ *   @heard                          report the conversation this turn was handed, one
+ *                                   `role: first line` entry per message (shared conversations)
+ *
+ * A Responder, Reviewer or called-in agent in a shared conversation (software-dev
+ * ≥1.27) reads other agents' messages, not directive-bearing prompts, so it also
+ * acts on directives in its configured instructions ("Instructions for you:").
  */
 // @failonce ledger: activity retries land in the same world, so keying by world+message
 // makes the second attempt succeed. Module-level: survives across turn invocations.
@@ -359,6 +365,9 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`shells: ${rest.trim()}`);
           break;
         }
+        case 'heard':
+          outputs.push(`heard: ${input.messages.map((m) => `${m.role}: ${m.text.split('\n')[0]}`).join(' | ')}`);
+          break;
         case 'profile':
           // Echo the model/effort this turn actually ran with, so tests can assert
           // an in-flight retune (SPEC §5.5) reaches the agent on its next turn.
@@ -380,6 +389,10 @@ export class MockAdapter implements AgentAdapter {
     if (persistent) throw providerErrorFromMessage('mock', persistent);
     const recent = input.messages.filter((m) => m.role === 'user');
     const initialText = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
+    if (input.role !== 'do') {
+      const instructions = input.systemPrompt.match(/Instructions for you:\n([\s\S]*?)(?:\n\n|$)/)?.[1];
+      if (instructions && recent.length) await processText(instructions);
+    }
     await processText(initialText);
     // A competent agent answers a dirty-proposal/landing rejection by committing
     // (machinery never sweeps uncommitted work). In current software-dev this is

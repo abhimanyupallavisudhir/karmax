@@ -55,7 +55,9 @@ const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration 
 - platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by ${BRAND} for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, settings, review actions, and future UI operations.
 - open_pr(): Do agents only. Open or refresh the task's pull request and send that exact committed proposal to Review. Call it only when the requested work is truly complete, the worktree is clean, intended changes are committed, and relevant tests pass. This is the final action of a completed Do turn.
 - confirm_decision(action, text?): use only when the workflow explicitly asks this turn to review or verify an already-open exact candidate. A final Do-agent integration verification uses this tool instead of open_pr and must not edit the proposal in that verification turn.
-- my_authorization(method?, path?) and request_permission(capabilities, projectIds?, audience, reason): see what your authorization covers, or whether one platform_request would be allowed, and ask for exactly what you lack. Do what your authorization covers yourself; never ask a person to do it for you.
+- my_authorization(method?, path?): what your authorization covers, and whether one platform_request would be allowed without making it. Check it before attempting something you may lack or asking a person to do something for you: do what it covers yourself, and ask for what it lacks with request_permission(capabilities, projectIds?, reason).
+- notify(to, message, urgency?): tell or call people and this task's agents without ending your turn. People are notified now; agents (agent:do, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends. Messages from other people and agents in this task reach you labelled with who said them.
+- escalate(to, note, task_id?): pass a request you received but cannot answer (as Responder, or from a sub-task) to people who can.
 - escalate_to_human(audience, message, urgency?): pause for input without opening a PR. Choose a specific user/team/Avatar when appropriate; discover valid routes with platform_request(GET, "/api/agent/escalation-targets"). A normal turn ending also waits for input from the default audience.
 - signal_completion(summary?): optional structured completion summary. Provider-reported successful turn completion is authoritative; this tool is not required.
 Do real work directly in the working directory (create/edit files, run commands), verify it, and report the result in your final response. If you are the Do agent and the work is ready for review, call open_pr as your final action. If you need a human decision first, use escalate_to_human instead; waiting for input and opening a PR are separate decisions.`;
@@ -81,9 +83,6 @@ export interface AssembleArgs {
   world: WorldHandle;
   globalInstructions?: string;
   projectInstructions?: string;
-  /** What this agent's authorization covers (`authorizationPromptContext`). It
-   * follows the tools preamble even when a workflow overrides that preamble. */
-  authorization?: string;
   /** Extra bindings for non-do roles (error, stage, transcript, reviewInfo, skills). */
   bindings?: Record<string, string>;
 }
@@ -103,7 +102,6 @@ export function assemblePrompt(args: AssembleArgs): string {
 
 Input routing for this task: its ordinary Waiting-for-input Responder is an agent. When you need a decision or information that this Responder can supply, do not call escalate_to_human. End the turn without open_pr and make your final response the concrete question; ${BRAND} will send it to the Responder and return the answer to this same Do conversation. Use escalate_to_human only when the requested input is inherently human-only (for example an approval, secret, or irreversible personal decision).`;
   }
-  if (args.authorization) preamble += `\n\n${args.authorization}`;
   const target = args.task.target ?? args.world.target ?? args.world.base;
   if (args.role === 'do' && (target !== args.world.base || args.task.agents?.do?.resumeFrom)) {
     preamble += `
@@ -125,6 +123,8 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     error: '',
     transcript: '',
     skills: '',
+    participant: agentRoleDef(args.role)?.label ?? args.role,
+    agentInstructions: '',
     ...(args.bindings ?? {}),
   };
   // Bindings another agent authored — the Do agent's transcript, its review

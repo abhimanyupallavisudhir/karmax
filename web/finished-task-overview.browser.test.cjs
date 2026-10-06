@@ -90,9 +90,14 @@ const root = __dirname;
     assert.match(await page.locator('#ck-term-item').innerText(), /Workspace closed/, 'a finished task does not claim its workspace never started');
 
     await open('parameters');
+    // The task's authority is its agent's collapsed Authorization row.
+    await page.waitForSelector('#tp-auth-frozen', { state: 'attached' });
+    assert.match(await page.locator('#tp-auth-frozen').evaluate((el) => el.closest('.agent-authority').querySelector('.aa-summary').textContent),
+      /Developer · Shop · 1 credential/, 'the collapsed row names it');
+    await page.locator('#tp-params .agent-authority > summary').first().click();
     await page.waitForSelector('#tp-auth-frozen');
     await shot('finished-task-parameters.png', '#tp-auth-frozen');
-    assert.match(await page.locator('#tp-auth-frozen').innerText(), /Developer · Shop · 1 vault credential/, 'authorization stays as a read-only record');
+    assert.match(await page.locator('#tp-auth-frozen').innerText(), /Developer · Shop · 1 credential/, 'authorization stays as a read-only record');
     assert.equal(await page.locator('#tp-auth-save').count(), 0, 'and cannot be edited');
 
     assert.deepEqual(errors, []);

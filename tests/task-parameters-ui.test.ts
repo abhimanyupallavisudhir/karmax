@@ -3,7 +3,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const app = readFileSync(fileURLToPath(new URL('../web/app.js', import.meta.url)), 'utf8');
-const start = app.indexOf('function paramsSection(v)');
+// From the field list the section renders (agents called in with @ included).
+const start = app.indexOf('function paramFields(v)');
 const end = app.indexOf('function paramCurrentValue(', start);
 if (start < 0 || end < 0) throw new Error('Could not find the task parameter renderer');
 const source = app.slice(start, end);
@@ -19,6 +20,15 @@ const paramsSection = new Function(
   'esc',
   'S',
   'TERMINAL_STAGES',
+  'authorizationLiveKey',
+  'paymentsLiveKey',
+  'agentParticipantLabel',
+  'fieldLabel',
+  'renderConfirmerField',
+  'renderResponderField',
+  'triggerSummary',
+  'agentAuthorityHtml',
+  'mainAuthorityParams',
   `${source}; return paramsSection;`,
 )(
   () => ({ params: { prompt: 'Ship the retained configuration' } }),
@@ -30,6 +40,15 @@ const paramsSection = new Function(
   (value: unknown) => String(value),
   state,
   ['done', 'cancelled', 'failed'],
+  (taskId: string) => `authorization:${taskId}`,
+  (taskId: string) => `payments:${taskId}`,
+  (key: string) => key,
+  (field: { label: string }) => `<label>${field.label}</label>`,
+  () => '',
+  () => '',
+  () => '',
+  () => '',
+  () => ({ html: '', summary: '' }),
 ) as (view: Record<string, unknown>) => string;
 
 describe('completed task parameters', () => {
@@ -41,7 +60,8 @@ describe('completed task parameters', () => {
       editableParams: ['prompt'],
     });
 
-    expect(html).toContain('>Parameters<');
+    // The tab is the heading; the section itself has none.
+    expect(html).toContain('id="tp-params"');
     expect(html).toContain('Ship the retained configuration');
     expect(html).toContain('This task has finished. Parameters are read-only.');
     expect(html).not.toContain('id="params-save"');

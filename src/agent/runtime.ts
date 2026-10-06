@@ -70,7 +70,7 @@ export interface RunTurnDeps {
       fundingUrl?: string;
     }>;
   };
-  spendCtx?: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] };
+  spendCtx?: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[]; participant?: string };
   onSpend?: (req: any, outcome: any) => void | Promise<void>;
   /** Cancellation propagated from the workflow (SPEC §5.6 mid-turn cancel). */
   signal?: AbortSignal;
