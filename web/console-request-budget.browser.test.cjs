@@ -52,6 +52,10 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       else if (p.endsWith('/defaults') || p.startsWith('/api/defaults/')) data = { effective: {}, inherited: {} };
       else if ((m = p.match(/^\/api\/projects\/(\w+)\/tasks$/))) data = tasks[m[1]] || [];
       else if ((m = p.match(/^\/api\/projects\/(\w+)\/search$/))) data = { tasks: tasks[m[1]] || [], total: (tasks[m[1]] || []).length };
+      else if ((m = p.match(/^\/api\/organizations\/(\w+)\/search$/))) {
+        const listed = projects.filter(project => project.organizationId === m[1]).flatMap(project => tasks[project.id] || []);
+        data = { tasks: listed, total: listed.length, offset: 0, limit: 200, projects: [], tags: [] };
+      }
       else if ((m = p.match(/^\/api\/organizations\/\w+\/roles$/))) data = { canCreate: true, profiles: [], capabilityGroups: [], creatableCapabilities: [] };
       else if (p.endsWith('/payments/providers')) data = { providers: [], active: null };
       else if ((m = p.match(/^\/api\/organizations\/\w+\/(entitlements|usage|usage-policy|identity-policy)$/))) data = null;
@@ -156,6 +160,13 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       await deep.goto('http://console.test/second/other');
       await deep.locator('[data-id="t7"]').waitFor();
     }));
+    // The organization home (every project's tasks) boots on the same budget.
+    const homePage = await context.newPage();
+    homePage.on('pageerror', error => { errors.push(error.message); console.error('page:', error.stack); });
+    record(await measure('boot (home)', async () => {
+      await homePage.goto('http://console.test/org');
+      await homePage.locator('[data-id="t1"]').waitFor();
+    }));
     // Public pages need no session; reading one has side effects (it provisions a
     // personal workspace and consumes the one-time onboarding flag).
     const publicPage = await context.newPage();
@@ -174,6 +185,8 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       };
       budget('boot', 24, 5);
       budget('boot (other organization)', 24, 5);
+      budget('boot (home)', 24, 5);
+      assert.equal(results['boot (home)'].counts['GET /api/organizations/o/search'], 1, 'the home searches its organization once');
       budget('organization action (create team)', 6);
       // The route that switches organization and the settings page it paints share one read.
       for (const key of ['GET /api/organizations/o2/members', 'GET /api/organizations/o2/teams', 'GET /api/organizations/o2/roles'])

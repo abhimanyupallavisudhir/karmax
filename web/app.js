@@ -4083,7 +4083,7 @@ function renderShell() {
   const closeMobileNav = () => {
     $('#rail')?.classList.remove('mobile-open');
     $('#rail-scrim')?.classList.remove('visible');
-    $('#mobile-menu')?.setAttribute('aria-expanded', 'false');
+    syncRailToggle();
   };
   // ☰ slides the rail over the page on a phone, and folds it away on a wider
   // screen (remembered per browser, like the theme).
@@ -4928,7 +4928,7 @@ function tasksView() {
     <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>`;
   const trailing = home ? projectFilterHtml()
     : `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`;
-  return `${home ? `<h1 class="page-title home-title">${esc(currentOrg()?.name || 'Home')}</h1>` : ''}${composer}
+  return `${composer}
     <div class="organizer">
       <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
@@ -5155,6 +5155,9 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   const v = t.lastView || {};
   const status = v.status || 'active';
   const stage = v.stage || 'setup';
+  // In a for: list the reason says what the task waits for; a waiting stage
+  // chip ("Needs input") would only repeat it.
+  const why = attentionChip(t);
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
@@ -5166,10 +5169,10 @@ function taskRow(t, { showTags = true, project = false } = {}) {
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
-          ${where}${attentionChip(t)}
+          ${where}${why}
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          <span class="chip ${status}">${esc(stageLabel(v))}</span>
-          ${v.approvalRequests ? '<span class="chip approval-needed">approval needed</span>' : ''}
+          ${why && status === 'waiting' ? '' : `<span class="chip ${status}">${esc(stageLabel(v))}</span>`}
+          ${v.approvalRequests && !why ? '<span class="chip approval-needed">approval needed</span>' : ''}
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
@@ -5867,7 +5870,7 @@ function wireQuickComposer() {
     };
     setBusy(true);
     try {
-      await api(`/api/projects/${S.projectId}/tasks`, {
+      const created = await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
         body: JSON.stringify(quickTaskPayload(title, images, draft, files)),
       });
@@ -5875,7 +5878,10 @@ function wireQuickComposer() {
       S.newTaskImages = [];
       S.newTaskFiles = [];
       renderAttachmentChips($('#new-task-chips'), S.newTaskImages, S.newTaskFiles);
-      toast(draft ? 'Draft saved' : 'Task created');
+      // A started task works on its own, so "For me" does not list it: the
+      // toast is the way to it.
+      const url = !draft && created?.id ? taskUrl(created.id, { ...created, projectId: created.projectId || S.projectId }) : '';
+      toast(draft ? 'Draft saved' : 'Task created', false, url ? { label: 'Open', fn: () => spaNavigate(url) } : undefined);
       await refreshTasks();
     } catch (e) {
       toast(e.message, true);
@@ -19433,10 +19439,15 @@ function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId)
 function openListRow(row) { if (row) (row.querySelector('a.row-link') || row).click(); }
 function openCursorRow() { openListRow(cursorRow()); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
-// With a task page open, j/k walk the same task order the list shows.
+// With a task page open, j/k walk the same task order the list shows — when the
+// open task is in that list; otherwise (a permalink, a task the query does not
+// match) they walk every task of the project, newest first.
 function taskOrder() {
+  const listed = S.searchScope === S.projectId ? (S.searchResult?.tasks || [])
+    .filter((t) => !t.params?.draft && t.projectId === S.projectId).map((t) => t.id) : [];
+  if (listed.includes(S.taskWalkTarget || S.selected)) return listed;
   return S.tasks
-    .filter((t) => !t.params?.draft && (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())))
+    .filter((t) => !t.params?.draft)
     .slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
     .map((t) => t.id);
 }

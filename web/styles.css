@@ -241,7 +241,8 @@ a { color: var(--accent); text-decoration: none; }
   .body { transition: grid-template-columns .18s ease; }
   .rail { transition: visibility 0s; }
   html.rail-collapsed .body { grid-template-columns: 0 1fr; }
-  html.rail-collapsed .rail { visibility: hidden; overflow: hidden; border-right-color: transparent; transition: visibility 0s .18s; }
+  html.rail-collapsed .rail { visibility: hidden; overflow: hidden; min-width: 0; padding-left: 0; padding-right: 0; border-right-width: 0;
+    transition: visibility 0s .18s, padding 0s .18s, border-width 0s .18s; }
   html.rail-collapsed .task-form-page { left: 0; }
 }
 @media (prefers-reduced-motion: reduce) { .body, html.rail-collapsed .rail { transition: none; } }
@@ -403,7 +404,10 @@ a { color: var(--accent); text-decoration: none; }
 .task-title { font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* Human-facing sequential task id (SPEC §10.6): a quiet monospace tag before the title. */
 .task-num { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); font-weight: 500; }
-.task-sub { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-3); margin-top: 3px; }
+.task-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 12px; color: var(--ink-3); margin-top: 3px; }
+.task-sub > .chip { white-space: nowrap; }
+/* A phone gives the title the row: the dot and stage chip already say where it is. */
+@media (max-width: 700px) { .task-row > .task-right > .pipeline { display: none; } }
 /* The flex row above is for a strip of metadata (a div of chips). A <p> is prose:
    as a flex container every inline <a>/<span> in the sentence became its own item,
    gapped and wrapped away from the words around it. Prose flows as prose. */
@@ -622,8 +626,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .chip.attention { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
 .chip.attention.escalated { background: var(--working-weak); color: var(--working); }
 /* The organization home names each row's project. */
-.chip.task-project { color: var(--ink-2); background: var(--surface-2); max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.home-title { margin-bottom: 10px; }
+.chip.task-project { display: inline-block; color: var(--ink-2); background: var(--surface-2); max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* GitHub pull request, in the task byline: link + live state. */
 .pr-link {
