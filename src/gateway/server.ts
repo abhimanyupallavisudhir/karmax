@@ -38,6 +38,9 @@ import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } fro
 import { ConversationImportError, MAX_CONVERSATION_IMPORT_BYTES, putConversationImport } from '../store/conversation-imports.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority, type ScopedToken } from '../platform/tokens.js';
+import { resolveAuthorizationSummary } from '../platform/authorization-summary.js';
+import { participantAuthorization } from '../platform/agent-authority.js';
+import { platformRequestPathError } from '../platform/platform-request.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
@@ -249,6 +252,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // Requesting an explanation spends the organization's model credit and
   // appends to the timeline, so it is a conversation write, not a read.
   if (/^\/api\/tasks\/[^/]+\/explanations$/.test(p)) return read ? 'task:conversation:read' : 'task:conversation:message';
+  // Every caller may learn its own authority; the answer never widens it.
+  if (p === '/api/authorization/me') return read ? 'none' : undefined;
   if (p === '/api/authorization/profiles' && read) return 'task:create';
   if (p === '/api/authorization/escalation-targets' || p === '/api/authorization-requests')
     return read ? 'task:read' : 'task:create';
@@ -607,6 +612,25 @@ const PREVIEW_REQUEST_HEADERS = new Set([
   'accept', 'accept-language', 'content-type', 'if-match', 'if-modified-since',
   'if-none-match', 'if-unmodified-since', 'range', 'user-agent',
 ]);
+
+/** See `Gateway.routeDecision`. `required` is absent for routes that need no capability. */
+type RouteDecision =
+  | { required?: undefined; allowed: true; scope: { projectId?: string; taskId?: string; organizationId?: string } }
+  | { required: string; allowed: boolean; scope: { projectId?: string; taskId?: string; organizationId?: string };
+    checked: Awaited<ReturnType<TokenAuthority['check']>> };
+
+/** What a task agent would ask for with `request_permission` to get past a
+ * refusal: the missing capability, or the project its scope lacks. People
+ * have no task to extend, and other organizations cannot be requested. */
+function permissionRequestFor(checked: { ok: boolean; missing?: string; reason?: string },
+  record: ScopedToken | undefined, target?: { projectId?: string; organizationId?: string }): { capabilities: string[]; projectIds?: string[] } | undefined {
+  if (checked.ok || !record || record.kind !== 'agent' || record.taskId === '*') return undefined;
+  if (checked.missing) return checked.missing.includes('*') ? undefined : { capabilities: [checked.missing] };
+  if (target?.projectId && record.projectIds?.length && !record.projectIds.includes(target.projectId)
+    && target.organizationId && target.organizationId === record.organizationId)
+    return { capabilities: [], projectIds: [target.projectId] };
+  return undefined;
+}
 
 interface Session {
   user: string;
@@ -2193,43 +2217,17 @@ export class Gateway {
 
     // Authorization is independent of actor type. Personal self-service routes
     // below require the same verified account subject for browsers and delegates.
-    const required = capabilityForRequest(method, p, url);
-    if (required) {
-      // These endpoints operate on the authenticated calling task. Collaboration
-      // additionally authorizes its target in the service after parsing the body.
-      const callingTaskRoute = p === '/api/agent/git/publish'
-        || p === '/api/agent/resource-candidates' || p === '/api/agent/collaboration/request'
-        || /^\/api\/agent\/collaboration\/[^/]+\/cancel$/.test(p);
-      const scope = callingTaskRoute && authRecord.taskId && authRecord.taskId !== '*'
-        ? { ...requestedScope, taskId: authRecord.taskId } : requestedScope;
-      const checked = (await this.deps.tokens.check(token, required, scope));
-      // The project collection has no single scope. A project-only human may
-      // enter it when at least one project grant permits discovery; the response
-      // below is filtered project-by-project. No other unscoped route gets this
-      // exception.
-      const collectionAllowed = !checked.ok && p === '/api/projects' && method === 'GET' && !!session.userId && (
-        // A member of any organization may enter (even before any project exists)
-        // — the response is filtered project-by-project, so an empty org just
-        // yields an empty list and the app lands on that org's dashboard rather
-        // than the "no access" waiting room.
-        (await this.deps.store.listOrganizations(session.userId)).length > 0 ||
-        (await __asyncCollections.some((await this.deps.store.listProjects()), async (project) => allows((await this.deps.authorization?.capabilities(`user:${session.userId}`, project.id)) ?? [], required))));
-      const organizationCollectionAllowed = !checked.ok && p === '/api/organizations' && !!session.userId && (
-        method === 'POST' || (await __asyncCollections.some((await this.deps.store.listOrganizations(session.userId)), async (organization) =>
-          allows((await this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, organization.id)) ?? [], required)))
-      );
+    const decision = await this.routeDecision(token, authRecord, session, method, p, url, requestedScope);
+    const required = decision.required;
+    if (decision.required) {
+      const { checked } = decision;
       const auditedIdentity = resolveCallerIdentity(checked.record ?? authRecord, session.userId);
       const principal = actorPrincipal(auditedIdentity.actor);
-      if (!checked.ok && !collectionAllowed && !organizationCollectionAllowed) {
+      if (!decision.allowed) {
         (await this.deps.authorization?.audit(principal, `http.denied.${required}`, auditScope,
           { path: p, method, reason: checked.reason ?? `missing capability ${required}`,
             ...identityAuditDetail(auditedIdentity) }));
-        const error = ['settings:read', 'settings:write'].includes(required)
-          && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length)
-          ? 'This endpoint configures the shared installation and requires global authority (God). Use /api/organizations/:id/settings/:workflow or /api/settings/project/:id/:workflow for your authorized scope.'
-          : required === 'organization:wiki:write' && checked.missing === required ? ORGANIZATION_WIKI_WRITE_DENIED
-          : `${checked.reason ?? `missing capability ${required}`}${checked.missing ? (await this.capabilityHint(checked.missing, checked.record ?? authRecord, scope)) : ''}`;
-        return this.json(res, 403, { error });
+        return this.json(res, 403, { error: await this.routeRefusal(decision, authRecord) });
       }
       if (checked.ok && checked.record) {
         authRecord = checked.record;
@@ -2451,6 +2449,26 @@ export class Gateway {
         const label = String(identityData.profile.email ?? identityData.profile.name ?? 'user')
           .split('@')[0]!.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'user';
         return this.downloadJson(res, `${BRAND}-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
+      }
+      if (p === '/api/authorization/me' && method === 'GET') {
+        const target = url.searchParams.get('path');
+        const targetMethod = (url.searchParams.get('method') ?? 'GET').toUpperCase();
+        if (target !== null && (!target.startsWith('/api/') || !['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(targetMethod)))
+          return this.json(res, 400, { error: 'path must be a /api/ path and method one of GET, POST, PUT, PATCH, DELETE' });
+        const organizationId = authRecord.organizationId ?? requestedScope.organizationId
+          ?? (authRecord.projectId ? await store.projectOrganizationAsync(authRecord.projectId) : undefined);
+        const summary = await resolveAuthorizationSummary(store, this.deps.authorization, {
+          caps: authRecord.caps, level: await this.callerLevel(authRecord, organizationId),
+          projectId: authRecord.projectId, projectIds: authRecord.projectIds, organizationId,
+        });
+        return this.json(res, 200, {
+          actor: authRecord.kind === 'agent' ? 'agent' : authRecord.kind,
+          ...(summary.level ? { level: summary.level } : {}),
+          scope: summary.scope,
+          capabilities: summary.held,
+          missing: summary.missing,
+          ...(target !== null ? { check: await this.routeCheck(req, authRecord, targetMethod, target) } : {}),
+        });
       }
       if (p === '/api/settings/access' && method === 'GET') {
         if (!requestedScope.projectId && !requestedScope.organizationId)
@@ -9533,16 +9551,95 @@ export class Gateway {
     }
     const holders = !lowest ? '' : lowest === 'god' ? 'only God has it' : `${await name(lowest)} and above have it`;
     let current = '';
-    if (record?.kind === 'human' && record.principal.startsWith('user:') && organizationId) {
-      const selection = await authorization.selectionForPrincipal(record.principal, organizationId);
-      current = selection ? `your authorization there is ${await name(selection.level)}` : 'you have no authorization there';
-    } else if (record && record.taskId !== '*') {
-      const stored = (await this.deps.store.getTask(record.taskId))?.params?._authorization as { level?: string; profileId?: string } | undefined;
-      const level = [stored?.level, stored?.profileId, record.profileId].find((candidate) => candidate && levels.includes(candidate));
-      if (level) current = `this task is authorized as ${await name(level)}`;
-    }
+    const level = record ? await this.callerLevel(record, organizationId) : undefined;
+    if (record?.kind === 'human' && record.principal.startsWith('user:') && organizationId)
+      current = level ? `your authorization there is ${await name(level)}` : 'you have no authorization there';
+    else if (level) current = `this task is authorized as ${await name(level)}`;
     const parts = [current, holders].filter(Boolean);
     return parts.length ? `. ${parts.join('; ').replace(/^./, (first) => first.toUpperCase())}.` : '';
+  }
+
+  /**
+   * The gateway's authorization decision for one request: the capability its
+   * route needs, the scope it is checked in, and whether the caller holds it.
+   * The gate enforces it; `GET /api/authorization/me` reports it without
+   * making the request, so the two cannot disagree.
+   */
+  private async routeDecision(token: string, authRecord: ScopedToken, session: Session, method: string, p: string, url: URL,
+    requestedScope: { projectId?: string; taskId?: string; organizationId?: string }): Promise<RouteDecision> {
+    const required = capabilityForRequest(method, p, url);
+    if (!required) return { allowed: true, scope: requestedScope };
+    // These endpoints operate on the authenticated calling task. Collaboration
+    // additionally authorizes its target in the service after parsing the body.
+    const callingTaskRoute = p === '/api/agent/git/publish'
+      || p === '/api/agent/resource-candidates' || p === '/api/agent/collaboration/request'
+      || /^\/api\/agent\/collaboration\/[^/]+\/cancel$/.test(p);
+    const scope = callingTaskRoute && authRecord.taskId && authRecord.taskId !== '*'
+      ? { ...requestedScope, taskId: authRecord.taskId } : requestedScope;
+    const checked = (await this.deps.tokens.check(token, required, scope));
+    // The project collection has no single scope. A project-only human may
+    // enter it when at least one project grant permits discovery; the response
+    // below is filtered project-by-project. No other unscoped route gets this
+    // exception.
+    const collectionAllowed = !checked.ok && p === '/api/projects' && method === 'GET' && !!session.userId && (
+      // A member of any organization may enter (even before any project exists)
+      // — the response is filtered project-by-project, so an empty org just
+      // yields an empty list and the app lands on that org's dashboard rather
+      // than the "no access" waiting room.
+      (await this.deps.store.listOrganizations(session.userId)).length > 0 ||
+      (await __asyncCollections.some((await this.deps.store.listProjects()), async (project) => allows((await this.deps.authorization?.capabilities(`user:${session.userId}`, project.id)) ?? [], required))));
+    const organizationCollectionAllowed = !checked.ok && p === '/api/organizations' && !!session.userId && (
+      method === 'POST' || (await __asyncCollections.some((await this.deps.store.listOrganizations(session.userId)), async (organization) =>
+        allows((await this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, organization.id)) ?? [], required)))
+    );
+    return { required, scope, checked, allowed: checked.ok || collectionAllowed || organizationCollectionAllowed };
+  }
+
+  /** The 403 message for a refused `routeDecision`. */
+  private async routeRefusal(decision: RouteDecision & { required: string }, authRecord: ScopedToken): Promise<string> {
+    const { required, checked, scope } = decision;
+    if (['settings:read', 'settings:write'].includes(required)
+      && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length))
+      return 'This endpoint configures the shared installation and requires global authority (God). Use /api/organizations/:id/settings/:workflow or /api/settings/project/:id/:workflow for your authorized scope.';
+    if (required === 'organization:wiki:write' && checked.missing === required) return ORGANIZATION_WIKI_WRITE_DENIED;
+    const record = checked.record ?? authRecord;
+    const request = permissionRequestFor(checked, record);
+    return `${checked.reason ?? `missing capability ${required}`}${checked.missing ? (await this.capabilityHint(checked.missing, record, scope)) : ''}`
+      + (request?.capabilities.length ? ` Ask for it with request_permission (capabilities: ${JSON.stringify(request.capabilities)}).` : '');
+  }
+
+  /** The authorization level a caller holds: a person's selection in the
+   * organization, or the level its task was authorized at. */
+  private async callerLevel(record: ScopedToken, organizationId: string | undefined): Promise<string | undefined> {
+    if (record.kind === 'human' && record.principal.startsWith('user:'))
+      return organizationId ? (await this.deps.authorization?.selectionForPrincipal?.(record.principal, organizationId))?.level : undefined;
+    if (record.taskId === '*') return undefined;
+    const levels = ['viewer', 'developer', 'maintainer', 'administrator', 'superadmin', 'god'];
+    // An agent other than the main one may act with its own authority.
+    const params = (await this.deps.store.getTask(record.taskId))?.params;
+    const stored = (participantAuthorization(params, record.participant) ?? params?._authorization) as { level?: string; profileId?: string } | undefined;
+    return [stored?.level, stored?.profileId, record.profileId].find((candidate) => candidate && levels.includes(candidate));
+  }
+
+  /** Whether the caller could make `method target`, decided exactly as the
+   * gate decides it, without making the request. */
+  private async routeCheck(req: http.IncomingMessage, authRecord: ScopedToken, method: string, target: string) {
+    const url = new URL(target, 'http://gateway.invalid');
+    const p = url.pathname;
+    const result = (allowed: boolean, extra: Record<string, unknown> = {}) =>
+      ({ method, path: target, capability: capabilityForRequest(method, p, url) ?? null, allowed, ...extra });
+    const excluded = platformRequestPathError(target);
+    if (excluded) return result(false, { reason: excluded });
+    const scope = await this.requestScope(p, url);
+    if (scope.conflict) return result(false, { reason: scope.conflict });
+    const session = await this.auth(req, scope.projectId, scope.organizationId);
+    if (!session) return result(false, { reason: 'unauthorized' });
+    const record = (await this.deps.tokens.verify(session.apiToken)) ?? authRecord;
+    const decision = await this.routeDecision(session.apiToken, record, session, method, p, url, scope);
+    if (decision.allowed || !decision.required) return result(true);
+    const organizationId = scope.organizationId ?? (scope.projectId ? await this.deps.store.projectOrganizationAsync(scope.projectId) : undefined);
+    const request = permissionRequestFor(decision.checked, decision.checked.record ?? record, { projectId: scope.projectId, organizationId });
+    return result(false, { reason: await this.routeRefusal(decision, record), ...(request ? { request } : {}) });
   }
 
   /** The 403 message when the caller lacks `capability`, or undefined when it holds it. */

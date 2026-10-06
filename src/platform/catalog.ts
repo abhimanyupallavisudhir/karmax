@@ -158,6 +158,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/agent/resource-candidates (calling task inferred from its token)',
     'POST /api/agent/escalate (calling task inferred from its token, or taskId of a sub-task whose request you redirect; body {taskId?, audience?, message, urgency?: low|normal|high|critical}; on a task already waiting it redirects the request; no audience asks the task\'s Responder route)',
     'POST /api/agent/notify (calling task inferred from its token; body {to: [agent:<key> | person/team/Avatar selector], message, urgency?}; people are notified now, the task\'s agents are called when your turn ends)',
+    'GET /api/authorization/me?method=&path= (your level, scope, held and missing capabilities; with method and path, whether that request would be allowed and what to request if not, decided as the gateway decides without making it; people add projectId= or organizationId=)',
     'POST /api/agent/permission-requests (body {capabilities, projectIds?, audience?, reason, urgency?}; exact task elevation and additive project scope (capabilities: [] for scope only) routed to people, teams, or Avatars; no audience summons the lowest of @maintainers, @admins, @superadmins that can grant it; high urgency by default)',
     'GET /api/agent/escalation-targets (people, teams, Avatars, and special audience selectors — @creator, @maintainers, @admins, @superadmins, @owners, @project, @all — available to the calling task)',
     'GET /api/permission-requests?taskId=&organizationId=',
