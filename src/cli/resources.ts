@@ -97,7 +97,7 @@ export async function saveResource(api: Api, workspace: Workspace, resource: Res
   if (!fs.existsSync(target)) throw new CliError(`${resource.name}: ${resource.path} does not exist`);
   const state = workspace.resource(resource.id);
   const grant = await api.post<Grant>(`${workspace.apiBase}/resources/${encodeURIComponent(resource.id)}/append-grant`,
-    { ...(state.revisionId ? { baseRevisionId: state.revisionId } : {}) });
+    state.revisionId ? { baseRevisionId: state.revisionId } : {});
   const file = resource.shape === 'file' ? fs.realpathSync(target) : undefined;
   const label = `Pushing ${resource.name}`;
   out.info(`${label}…`);

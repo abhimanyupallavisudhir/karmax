@@ -131,7 +131,7 @@ export async function attach(server: string, taskId: string, credential: { token
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('taskId', taskId);
   if (credential.ticket) url.searchParams.set('ticket', credential.ticket);
-  const ws = new WebSocket(url, credential.ticket ? undefined : { headers: { authorization: `Bearer ${credential.token}` } } as any);
+  const ws = new WebSocket(url, credential.ticket ? undefined : { headers: { authorization: `Bearer ${credential.token}` } });
   let raw = false;
   const restore = () => { if (raw && process.stdin.isTTY) process.stdin.setRawMode(false); raw = false; };
   const resize = () => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols: process.stdout.columns ?? 80, rows: process.stdout.rows ?? 24 })); };

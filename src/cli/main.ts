@@ -1,4 +1,5 @@
 import process from 'node:process';
+import pkg from '../../cli/package.json' with { type: 'json' };
 import { parseArgs } from 'node:util';
 import { Api, resolveServer } from './api.js';
 import { Credentials } from './config.js';
@@ -13,7 +14,7 @@ import { importProject } from './commands/import.js';
 import { exec, preview } from './commands/world.js';
 import { gitCredential } from './commands/git-credential.js';
 
-export const VERSION = '1.0.0';
+export const VERSION: string = pkg.version;
 
 const HELP = `tavya — work on tavya projects and tasks from your own machine
 
@@ -81,8 +82,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // A pasted console URL names its server; a workspace remembers its own.
   const refServer = args[0] && /^https?:\/\//.test(args[0]) ? parseRef(args[0]).server : undefined;
   const server = resolveServer(flags.url ?? refServer ?? (workspace && !process.env.TAVYA_URL ? workspace.server : undefined));
-  const token = flags.token ?? (process.env.TAVYA_TOKEN || process.env.KARMAX_TOKEN || undefined);
-  const plainApi = () => new Api(server, new Credentials(), token);
+  const bearer = flags.token ?? (process.env.TAVYA_TOKEN || process.env.KARMAX_TOKEN || undefined);
+  const plainApi = () => new Api(server, new Credentials(), bearer);
   // The first command on a terminal signs in, instead of failing with "run tavya login".
   const api = async () => {
     const client = plainApi();

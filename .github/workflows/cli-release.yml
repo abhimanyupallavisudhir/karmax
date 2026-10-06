@@ -1,0 +1,123 @@
+name: CLI release
+
+# Publishes the tavya CLI (src/cli) when a `cli-v<version>` tag is pushed:
+# the bundled npm package `tavya`, and single executables for each platform on
+# the GitHub release (installed by https://tavya.io/cli/install.sh).
+# The tag must equal cli/package.json's version. npm needs the NPM_TOKEN secret.
+on:
+  push:
+    tags: ['cli-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing cli-v<version> tag to (re)publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ env.TAG }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.16.0' }
+      - name: Tag matches cli/package.json
+        run: test "cli-v$(node -p "require('./cli/package.json').version")" = "$TAG"
+      # The CLI needs only esbuild to build: it has no runtime dependencies.
+      - run: npm install --no-save --ignore-scripts --no-package-lock esbuild@0.28.1
+      - run: node scripts/build-cli.mjs
+      - run: node cli/dist/tavya.mjs --version
+      - uses: actions/upload-artifact@v4
+        with: { name: tavya-mjs, path: cli/dist/tavya.mjs }
+
+  executable:
+    needs: bundle
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: linux-x64 }
+          - { os: ubuntu-24.04-arm, target: linux-arm64 }
+          - { os: macos-14, target: darwin-arm64 }
+          - { os: macos-13, target: darwin-x64 }
+          - { os: windows-latest, target: windows-x64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ env.TAG }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.16.0' }
+      - run: npm install --no-save --ignore-scripts --no-package-lock esbuild@0.28.1 postject@1.0.0-alpha.6
+      - run: node scripts/build-cli.mjs --sea
+      - name: Inject into a copy of node (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cp "$(command -v node)" tavya-${{ matrix.target }}
+          npx postject tavya-${{ matrix.target }} NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+      - name: Inject into a copy of node (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cp "$(command -v node)" tavya-${{ matrix.target }}
+          codesign --remove-signature tavya-${{ matrix.target }}
+          npx postject tavya-${{ matrix.target }} NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --macho-segment-name NODE_SEA
+          codesign --sign - tavya-${{ matrix.target }}
+      - name: Inject into a copy of node (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cp "$(command -v node)" tavya-${{ matrix.target }}.exe
+          npx postject tavya-${{ matrix.target }}.exe NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+      - name: Smoke test
+        shell: bash
+        run: ./tavya-${{ matrix.target }}$([ "$RUNNER_OS" = Windows ] && echo .exe) --version
+      - uses: actions/upload-artifact@v4
+        with: { name: 'tavya-${{ matrix.target }}', path: 'tavya-${{ matrix.target }}*' }
+
+  release:
+    needs: executable
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: assets, merge-multiple: true }
+      - name: Checksums
+        working-directory: assets
+        run: sha256sum tavya-* tavya.mjs > SHA256SUMS && cat SHA256SUMS
+      - name: GitHub release
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "tavya CLI ${TAG#cli-v}" \
+                 --notes "Install: \`curl -fsSL https://tavya.io/cli/install.sh | sh\` or \`npm install -g tavya\`."
+          gh release upload "$TAG" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  npm:
+    needs: bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ env.TAG }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.16.0', registry-url: 'https://registry.npmjs.org' }
+      - uses: actions/download-artifact@v4
+        with: { name: tavya-mjs, path: cli/dist }
+      - name: Publish
+        env: { NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}' }
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "::warning::NPM_TOKEN is not set; skipping npm publish"; exit 0; fi
+          chmod +x cli/dist/tavya.mjs
+          cd cli && npm publish --access public --provenance

@@ -4,5 +4,4 @@
 import { register } from 'tsx/esm/api';
 
 register();
-const { cli } = await import('../src/cli/main.ts');
-await cli();
+await import('../src/cli/bin.ts');
