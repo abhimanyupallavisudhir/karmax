@@ -48,9 +48,9 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     const bodies: Array<{ method: string; url: string; body: any }> = [];
-    page.on('request', (request) => {
+    context.on('request', (request) => {
       if (/\/api\/(projects\/[^/]+\/tasks|tasks\/[^/]+\/params)$/.test(new URL(request.url()).pathname) && request.method() !== 'GET')
-        bodies.push({ method: request.method(), url: request.url(), body: request.postDataJSON() });
+        bodies.push({ method: request.method(), url: request.url(), body: JSON.parse(request.postData() || 'null') });
     });
     await page.goto(`${running.url}/personal/agents`);
     await page.locator('#expand-task').click();
@@ -104,8 +104,10 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
       },
     });
     // The main agent's authority still rides on the task's own fields.
+    // Request events reach the test after the gateway has already stored them.
     const saved = bodies.filter((request) => request.body?.params?.prompt === 'Ship it');
-    expect(saved.length).toBeGreaterThan(0);
+    await expect.poll(() => bodies.filter((request) => request.body?.params?.prompt === 'Ship it').length).toBeGreaterThan(0);
+    saved.splice(0, saved.length, ...bodies.filter((request) => request.body?.params?.prompt === 'Ship it'));
     expect(saved.at(-1)!.body.params).not.toHaveProperty('_agentAuthorization');
     expect(saved.find((request) => request.method === 'POST')?.body).toMatchObject({
       authorization: { level: 'developer' }, credentialGrants: [], draft: true, allowAttenuation: true });

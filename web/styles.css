@@ -3143,3 +3143,34 @@ html[data-theme="dark"] .github-signin-btn:active,
 .agent-authority .payment-budget { height: 36px; }
 /* A Reviewer's block sits inside its layer card; one frame is enough. */
 .parameter-fields .cf-layer .agent-field { border: 0; padding: 0; background: none; }
+
+/* Parameters tab: the task form's shape, frozen parts read-only in place. */
+.tp-section { padding: 12px 0 2px; border-top: 1px solid var(--line); }
+.tp-section:first-child { border-top: 0; padding-top: 4px; }
+.tp-section > .form-row, .tp-section > .pf-edit-row { margin-bottom: 8px; }
+.pf-lock { color: var(--ink-3); font-size: 11px; }
+.pf-agent-state { font-size: 10px; text-transform: lowercase; }
+.pf-ro { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ab-frozen, .pf-fieldset { border: 0; padding: 0; margin: 0; min-inline-size: auto; display: grid; gap: 8px; }
+.ab-frozen > *, .pf-fieldset > * { opacity: .7; }
+.tp-creds-head { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
+.tp-creds-head label, .tp-workflow > label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.tp-workflow { margin-bottom: 10px; }
+.agent-authority #tp-auth { display: grid; gap: 8px; }
+.agent-authority #tp-auth .params-save-bar { position: static; margin-top: 0; padding-top: 4px; background: none; }
+/* The main agent's cards and budget save with its authorization. */
+.agent-authority .payment-save { display: none; }
+.agent-authority .aa-resources > .task-payments > .payment-spent { white-space: nowrap; }
+
+/* Task defaults (organization and project): the task form's shape. */
+.task-defaults { display: grid; gap: 0; }
+.task-defaults > .td-section { padding: 14px 0 6px; border-top: 1px solid var(--line); }
+.task-defaults > .td-section:first-child { border-top: 0; padding-top: 2px; }
+.task-defaults .td-profile { margin-bottom: 8px; }
+.task-defaults .td-actions { display: flex; align-items: center; gap: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.task-defaults .td-actions .resource-error { color: var(--danger); font-size: 12px; }
+.parameter-fields .agent-controls:has(.pf-maxturns) { grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr) 90px; }
+.parameter-fields .agent-field .agent-controls .pf-maxturns { width: 100%; }
+.resource-defaults { display: grid; gap: 8px; }
+.resource-defaults .resource-reset { justify-self: start; }
+@media (max-width: 700px) { .parameter-fields .agent-controls:has(.pf-maxturns) { grid-template-columns: 1fr; } }

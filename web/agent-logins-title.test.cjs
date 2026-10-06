@@ -34,6 +34,7 @@ function ok(condition, message) {
 global.paramsSection = () => '';
 global.workflowSection = () => '';
 global.authorizationSection = () => '';
+global.policyTip = (text) => `<button class="info-dot" title="${text}">ⓘ</button>`;
 // Isolate the account-control title from the task/payment sections, including
 // the read-only payment section shown once a task has finished.
 global.taskRecord = () => ({ params: {} });
@@ -44,8 +45,8 @@ global.esc = String;
 eval(extractFn('parametersTab'));
 for (const view of [{ stage: 'do' }, { stage: 'done' }, { stage: 'merge', pointOfNoReturnPassed: true }]) {
   const tab = parametersTab(view);
-  ok(/<div class="section-h">Codex\/Claude<\/div>/.test(tab), 'Parameters tab titles the section "Codex/Claude"');
-  ok(!/<div class="section-h">Credentials<\/div>/.test(tab), 'Parameters tab no longer titles it "Credentials"');
+  ok(/<label>Codex\/Claude<\/label>/.test(tab), 'Parameters tab titles the section "Codex/Claude"');
+  ok(!/>Credentials</.test(tab), 'Parameters tab no longer titles it "Credentials"');
 }
 
 // New-task form (openTaskForm) label.

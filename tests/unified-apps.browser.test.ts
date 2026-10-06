@@ -44,18 +44,22 @@ it('unified app search and resource defaults work in the real gateway UI', async
   await page.screenshot({path:`${out}/${name}.png`});console.log(name);
  }
  await page.goto(base+'/personal/settings#settings-defaults');
+ // The defaults live in the default Agent's collapsed Authorization row.
+ await page.locator('#task-defaults-global .td-agent .agent-authority > summary').click();
  const org=page.locator('[data-resource-defaults="global"]');await org.locator('.resource-vault:not([disabled])').waitFor();
  assert.match(await org.locator('.tf-vault-count').innerText(),/1 selected/);
  await org.scrollIntoViewIfNeeded();await shot('01-organization-defaults');
  await page.goto(base+'/personal/connection-demo/settings#project-defaults');
- const projectBox=page.locator('[data-resource-defaults="project"]');await projectBox.locator('.resource-save:not([disabled])').waitFor();
+ await page.locator('#task-defaults-project .td-agent .agent-authority > summary').click();
+ const projectBox=page.locator('[data-resource-defaults="project"]');await projectBox.locator('.resource-reset:not([disabled])').waitFor();
+ const saveDefaults=page.locator('#task-defaults-project [data-save-task-defaults]');
  assert.match(await projectBox.locator('.tf-vault-count').innerText(),/1 selected/);
  assert.equal(await projectBox.locator('.payment-budget').inputValue(),'25.00');
  await projectBox.locator('.payment-search').fill('Demo');
- await projectBox.locator('.resource-save').click();
+ await saveDefaults.click();
  assert.equal((await store.getSettings(project.id,'payments')),undefined);
  assert.equal((await store.getSettings(project.id,'vault')),undefined);
- await projectBox.locator('.payment-budget').fill('10');await projectBox.locator('.resource-save').click();
+ await projectBox.locator('.payment-budget').fill('10');await saveDefaults.click();
  // Poll the store: Playwright's waitForFunction does not await an async
  // predicate, so a fetch-based wait there returns before the save lands.
  await expect.poll(async()=>(await store.getSettings(project.id,'payments'))?.budget,{timeout:10_000}).toBe(1000);
@@ -63,7 +67,7 @@ it('unified app search and resource defaults work in the real gateway UI', async
 
  await projectBox.locator('.resource-vault').click();await page.locator('.vault-grant-all').uncheck();await page.locator('[data-vault-apply]').click();
  await projectBox.locator('[data-remove="card_demo"]').click();await projectBox.locator('.payment-budget').fill('0');
- await projectBox.locator('.resource-save').click();
+ await saveDefaults.click();
  await expect.poll(async()=>(await store.getSettings(project.id,'vault'))?.credentialGrants,{timeout:10_000}).toEqual([]);
  await expect.poll(async()=>await store.getSettings(project.id,'payments'),{timeout:10_000}).toMatchObject({budget:0,cardIds:[]});
  await projectBox.scrollIntoViewIfNeeded();await shot('02-project-empty-overrides');
@@ -71,8 +75,10 @@ it('unified app search and resource defaults work in the real gateway UI', async
  await page.waitForFunction(()=>(globalThis as any).document.querySelector('[data-resource-defaults="project"] .tf-vault-count')?.textContent==='1 selected');
  assert.deepEqual((await store.getSettings(project.id,'vault')),{});
  await page.goto(base+'/personal/connection-demo');await page.locator('#expand-task').click();
+ // A new task's vault credentials are its Agent's collapsed Authorization row.
+ await page.locator('#tf-body .tf-agent .agent-authority > summary').click();
  await page.locator('#tf-vault-open:not([disabled])').waitFor();assert.equal(await page.locator('#tf-vault-count').innerText(),'1 selected');
- await page.locator('#tf-payments').scrollIntoViewIfNeeded();await shot('03-task-inherits');
+ await page.locator('#tf-body .tf-agent').scrollIntoViewIfNeeded();await shot('03-task-inherits');
  await page.goto(base+'/personal/settings#settings-payments');
  const search=page.locator('#native-connections .mcp-filter');await search.fill('Example');
  await page.locator('#native-connections [data-connector-app]').waitFor();

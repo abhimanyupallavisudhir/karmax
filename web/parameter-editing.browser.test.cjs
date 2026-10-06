@@ -95,7 +95,8 @@ const root = __dirname;
     view.stage = 'done'; view.editableParams = [];
     await page.evaluate(() => window.parameterTest.refreshTask());
     assert.equal(await page.locator('#params-save').count(), 0, 'terminal transition freezes controls');
-    assert.equal(await textarea.count(), 0);
+    // The route stays visible, read-only, in the task form's shape.
+    assert.equal(await textarea.isDisabled(), true);
     assert.deepEqual(errors, []);
     console.log('PASS: live refresh preserves textarea, focus, selection, resize and scroll; failed save, retry, persistence, and lifecycle locking');
   } finally { await browser.close(); }

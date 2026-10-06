@@ -19,21 +19,24 @@ const context = vm.createContext({
   esc: (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
   authorizationLevels: () => [{ id: 'developer', name: 'Developer', scope: 'selectable' }],
   authorizationEditorHtml: () => '<div class="authz-editor"></div>',
+  taskPaymentsHtml: (id) => `<div class="task-payments" id="${id}"></div>`,
+  paymentsLiveKey: () => 'payments',
+  fromMinorUnits: (minor) => String(minor),
 });
-vm.runInContext(['normalizedAuthorization', 'authorizationSummary', 'authorizationLiveKey', 'authorizationSection'].map(fn).join('\n'), context);
+vm.runInContext(['normalizedAuthorization', 'authorizationSummary', 'authorizationLiveKey', 'agentAuthoritySummary', 'mainAuthorityParams'].map(fn).join('\n'), context);
 
-const done = context.authorizationSection({ taskId: 'task', stage: 'done', status: 'done' });
-assert.match(done, /Authorization/, 'a finished task still shows its authorization');
-assert.match(done, /Developer · Shop · 2 vault credentials/, 'it names the role, scope and credential grants');
-assert.match(done, /Frozen — this task has finished/, 'it says why it cannot be edited');
-assert.doesNotMatch(done, /tp-auth-save|authz-editor/, 'it offers no editor or save');
+// The main agent's Authorization row on the Parameters tab.
+const done = context.mainAuthorityParams({ taskId: 'task', stage: 'done', status: 'done' });
+assert.equal(done.summary, 'Developer · Shop · 2 credentials', 'it names the role, scope and credential grants');
+assert.match(done.html, /Developer · Shop · 2 credentials/, 'a finished task still shows its authorization');
+assert.match(done.html, /Frozen — this task has finished/, 'it says why it cannot be edited');
+assert.doesNotMatch(done.html, /tp-auth-save|authz-editor/, 'it offers no editor or save');
+assert.match(done.html, /tp-payments/, 'spending stays visible');
 
-const landing = context.authorizationSection({ taskId: 'task', stage: 'merge', status: 'active', pointOfNoReturnPassed: true });
-assert.match(landing, /Frozen — this task is landing/);
+const landing = context.mainAuthorityParams({ taskId: 'task', stage: 'merge', status: 'active', pointOfNoReturnPassed: true });
+assert.match(landing.html, /Frozen — this task is landing/);
 
-const live = context.authorizationSection({ taskId: 'task', stage: 'do', status: 'active' });
-assert.match(live, /tp-auth-save/, 'a running task keeps the editor');
-
-record.params.draft = true;
-assert.equal(context.authorizationSection({ taskId: 'task', stage: 'done', status: 'done' }), '', 'drafts edit in the full form');
+const live = context.mainAuthorityParams({ taskId: 'task', stage: 'do', status: 'active' });
+assert.match(live.html, /tp-auth-save/, 'a running task keeps the editor');
+assert.match(live.html, /tp-payments/, 'its cards and budget save with it');
 console.log('authorization-frozen: ok');
