@@ -220,10 +220,11 @@ export class ServiceConnections {
   private sameApp(a: ServiceConnection, b: ServiceConnection) { return a.mcp ? a.mcp.url === b.mcp?.url : !b.mcp && a.toolkit === b.toolkit; }
   /** An account the person connected themselves, rather than a grant of one. */
   private isAccount(c: ServiceConnection) { return !c.grantedConnectionId && c.status === 'active' && (c.mcp ? true : !!c.accountId); }
-  /** The person's own connected accounts that a task request can use without another sign-in. */
+  /** The person's own connected accounts that a task request can use without another sign-in, newest first. */
   async reusable(org: string, ownerId: string, app: string | ServiceConnection) {
     const wanted = typeof app === 'string' ? { toolkit: app } as ServiceConnection : app;
-    return (await this.all()).filter(c => c.organizationId === org && c.ownerId === ownerId && this.sameApp(wanted, c) && this.isAccount(c)).map(c => this.view(c));
+    return (await this.all()).filter(c => c.organizationId === org && c.ownerId === ownerId && this.sameApp(wanted, c) && this.isAccount(c))
+      .sort((a, b) => b.createdAt - a.createdAt).map(c => this.view(c));
   }
   async connect(org: string, ownerId: string, input: { id?: string; toolkit?: string; label?: string; restart?: boolean; useConnectionId?: string; redirect?: string }) {
     return this.locked(input.id ?? `${org}:${ownerId}:${input.toolkit}`, async () => {
