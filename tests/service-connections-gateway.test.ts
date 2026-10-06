@@ -158,7 +158,7 @@ describe('connection gateway flow', () => {
     const pending: any = await (await request('/api/connections/request', { token, method: 'POST', body: { toolkit: 'gmail', why: 'Mail' } })).json();
     expect(pending.status).toBe('needs_connection');
     const rows = await (await request(`/api/connections?taskId=${task}&organizationId=${org}`)).json() as any[];
-    expect(rows).toEqual([expect.objectContaining({ id: pending.connection.id, reusable: [{ id: account, label: 'gmail' }] })]);
+    expect(rows).toEqual([expect.objectContaining({ id: pending.connection.id, reusable: [{ id: account, label: 'gmail', createdAt: expect.any(Number) }] })]);
     expect((await (await request(`/api/connections?taskId=${task}&organizationId=${org}`, { user: 'bob' })).json() as any[])[0]?.reusable ?? []).toEqual([]);
     const allowed = await request(`/api/connections/connect?organizationId=${org}`, { method: 'POST', body: { id: pending.connection.id, useConnectionId: account } });
     expect(await allowed.json()).toEqual({ connection: expect.objectContaining({ status: 'active' }) });

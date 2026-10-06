@@ -111,13 +111,24 @@ export async function exportConversationWithPanagent(opts: {
   }
 }
 
-export function publicConversationShare(value: string): string | undefined {
+export type ShareFormat = 'chatgpt-share' | 'claude-share' | 'tavya-share';
+export interface ConversationShareLink { url: string; format: ShareFormat; /** A tavya share's id. */ id?: string }
+
+/** tavya (any karmax install) serves shares at an unguessable id below this path. */
+const TAVYA_SHARE_PATH = /^\/share\/conversations\/([A-Za-z0-9_-]{43})$/;
+
+/** A public HTTPS ChatGPT, Claude or tavya share link panagent can import. */
+export function publicConversationShare(value: string): ConversationShareLink | undefined {
   let url: URL;
   try { url = publicUrl(value); } catch { return undefined; }
+  if (url.protocol !== 'https:') return undefined;
   const host = url.hostname.toLowerCase();
-  const supported = (host === 'chatgpt.com' || host === 'www.chatgpt.com' || host === 'claude.ai' || host === 'www.claude.ai')
-    && url.pathname.startsWith('/share/');
-  return supported && url.protocol === 'https:' ? url.toString() : undefined;
+  const tavya = url.pathname.match(TAVYA_SHARE_PATH);
+  if (tavya) return { url: url.toString(), format: 'tavya-share', id: tavya[1] };
+  if (!url.pathname.startsWith('/share/')) return undefined;
+  if (host === 'chatgpt.com' || host === 'www.chatgpt.com') return { url: url.toString(), format: 'chatgpt-share' };
+  if (host === 'claude.ai' || host === 'www.claude.ai') return { url: url.toString(), format: 'claude-share' };
+  return undefined;
 }
 
 export function looksLikeConversationUrl(value: string): boolean {
@@ -150,13 +161,15 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
         : path.join(temporary, safeSourceName(opts.source.name));
     const format: string[] = [];
     if ('url' in opts.source) {
-      const url = publicConversationShare(opts.source.url);
-      if (!url) throw new PanagentError('Use a public HTTPS ChatGPT or Claude share URL');
-      const response = await publicFetch(url);
+      const share = publicConversationShare(opts.source.url);
+      if (!share) throw new PanagentError(`Use a public HTTPS ChatGPT, Claude or ${BRAND} share URL`);
+      const response = await publicFetch(share.url);
+      if (response.status === 404 || response.status === 410)
+        throw new PanagentError('Share link not found; it may have been deleted or unshared');
       if (!response.ok) throw new PanagentError(`Share request returned HTTP ${response.status}`);
       source = path.join(temporary, 'share.html');
       fs.writeFileSync(source, Buffer.from(await response.arrayBuffer()), { mode: 0o600 });
-      format.push('--from', new URL(url).hostname.endsWith('claude.ai') ? 'claude-share' : 'chatgpt-share');
+      format.push('--from', share.format);
     }
     if ('data' in opts.source) fs.writeFileSync(source, opts.source.data, { mode: 0o600 });
     if (!('url' in opts.source)) {

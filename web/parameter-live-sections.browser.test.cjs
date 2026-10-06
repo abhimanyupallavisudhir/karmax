@@ -119,7 +119,9 @@ const root = __dirname;
     await page.locator('.vault-grant-pick[value="v2"]').check();
     await page.locator('[data-vault-apply]').click();
     assert.equal(await vaultCount.textContent(), '2 selected');
-    assert.equal(await page.locator('#tp-auth-save').isDisabled(), false);
+    // The section marks itself dirty asynchronously; a slow runner sees the
+    // count before the Save button, so wait for it rather than sample once.
+    await page.waitForFunction(() => !document.querySelector('#tp-auth-save').disabled);
     await page.evaluate(() => window.parameterTest.refreshTask());
     assert.equal(await vaultCount.textContent(), '2 selected', 'unsaved vault grants survive a refresh');
     assert.equal(await stillPinned(), true);

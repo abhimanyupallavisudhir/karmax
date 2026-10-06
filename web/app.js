@@ -1225,7 +1225,7 @@ function agentBlockHtml(prefix, spec, opts) {
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a provider conversation ID or public ChatGPT/Claude share link' : '...or paste a public ChatGPT/Claude share link'}" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+      <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a provider conversation ID or a ChatGPT, Claude or ' : '...or paste a ChatGPT, Claude or '}${siteNameMarkup()} share link" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
       <div class="af-resume-import-row">
         <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
         <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
@@ -16912,6 +16912,9 @@ function connectionRows(connections, inTask = false) {
   return connections.map(c => {
     const own = c.ownerId === userId;
     const canConnect = !c.ownerId || own;
+    // The person's own connected accounts, newest first; Allow uses the one picked.
+    const reusable = canConnect && c.status === 'requested' ? c.reusable || [] : [];
+    const accountNames = connectionAccountNames(reusable);
     const status = { requested: c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
     const projects = S.projects.filter(p => p.organizationId === c.organizationId);
     return `<div class="approval-request" data-connection="${esc(c.id)}">
@@ -16923,13 +16926,21 @@ function connectionRows(connections, inTask = false) {
           <button type="button" class="btn sm" data-connection-action="access">Save access</button></details>` : ''}
         <span data-connection-result role="status"></span>
       </div><div class="approval-request-actions">
-        ${canConnect && c.status === 'requested' ? (c.reusable || []).map(account => `<button type="button" class="btn sm primary" data-connection-action="allow" data-use-connection="${esc(account.id)}" title="Use your connected ${esc(account.label)} account — no new sign-in">${c.reusable.length > 1 ? `Use ${esc(account.label)}` : 'Allow'}</button>`).join('') : ''}
+        ${reusable.length > 1 ? `<select class="connection-account" data-connection-account aria-label="Account" title="Your connected accounts, newest first">${reusable.map((account, i) => `<option value="${esc(account.id)}">${esc(accountNames[i])}</option>`).join('')}</select>` : ''}
+        ${reusable.length ? `<button type="button" class="btn sm primary" data-connection-action="allow" data-use-connection="${esc(reusable[0].id)}" title="Use your connected account — no new sign-in">Allow</button>` : ''}
         ${canConnect && ['requested', 'connecting', 'expired', 'disconnected'].includes(c.status) ? `<button type="button" class="btn sm${c.status === 'requested' && c.reusable?.length ? '' : ' primary'}" data-connection-action="connect">${c.status === 'expired' ? 'Reconnect' : c.status === 'requested' && c.reusable?.length ? 'Other account' : `Connect${inTask ? ' for this task' : ''}`}</button>` : ''}
         ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
         ${own && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
         ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
       </div></div>`;
   }).join('');
+}
+
+/** Distinct names for a person's accounts of one app: its name, then when each was connected. */
+function connectionAccountNames(accounts) {
+  const when = (a, time) => new Date(a.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', ...(time ? { hour: 'numeric', minute: '2-digit' } : {}) });
+  const named = accounts.map(a => accounts.some(b => b !== a && b.label === a.label) ? `${a.label} · ${when(a, false)}` : a.label);
+  return named.map((name, i) => named.indexOf(name) === named.lastIndexOf(name) ? name : `${accounts[i].label} · ${when(accounts[i], true)}`);
 }
 
 function wireConnectionActions(root, organizationId, refresh) {
@@ -16943,7 +16954,8 @@ function wireConnectionActions(root, organizationId, refresh) {
     button.disabled = true;
     try {
       if (action === 'allow') {
-        await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, useConnectionId: button.dataset.useConnection }) });
+        const useConnectionId = row.querySelector('[data-connection-account]')?.value || button.dataset.useConnection;
+        await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, useConnectionId }) });
         await refresh();
       } else if (action === 'connect' || action === 'restart') {
         const result = await api(`/api/connections/connect${oq}`, { method: 'POST', body: JSON.stringify({ id, restart: action === 'restart' }) });

@@ -8,8 +8,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from .detect import url_format
 from . import __version__
+from .detect import url_format
 from .errors import AcquisitionError, BrowserRequired, FormatError
 from .model import message, new_conversation, normalize_timestamp, text_block, validate_conversation, warning
 
@@ -17,17 +17,23 @@ USER_AGENT = f"panagent/{__version__} (+https://github.com/abhimanyupallavisudhi
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
 
-def _require_share_url(url: str) -> None:
+def _require_share_url(url: str) -> str:
     try:
-        if not url.startswith("https://") or not url_format(url):
-            raise AcquisitionError("only HTTPS public share URLs are supported")
-    except FormatError as exc:
-        raise AcquisitionError("only HTTPS public share URLs are supported") from exc
+        found = url_format(url) if url.startswith("https://") else None
+    except FormatError:
+        found = None
+    if not found:
+        raise AcquisitionError("only HTTPS public share URLs are supported")
+    return found
 
 
 class _ShareRedirectHandler(HTTPRedirectHandler):
+    """Follow a redirect only to a share of the same kind (chat.openai.com → chatgpt.com)."""
+
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Request | None:
-        _require_share_url(newurl)
+        found = _require_share_url(newurl)
+        if req is not None and found != _require_share_url(req.full_url):
+            raise AcquisitionError("share redirected to a different kind of URL")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -134,36 +140,55 @@ def fetch_share(url: str, *, timeout: float = 30.0) -> str:
             charset = response.headers.get_content_charset() or "utf-8"
             return data.decode(charset, errors="replace")
     except HTTPError as exc:
-        raise AcquisitionError(f"share request returned HTTP {exc.code}: {url}") from exc
+        if exc.code in {404, 410}:
+            raise AcquisitionError(f"share not found; it may have been deleted or unshared: {url}", status=exc.code) from exc
+        raise AcquisitionError(f"share request returned HTTP {exc.code}: {url}", status=exc.code) from exc
     except URLError as exc:
         raise AcquisitionError(f"could not fetch share URL: {exc.reason}") from exc
 
 
-def read_chatgpt_share(text: str, *, source_uri: str | None = None, **_: Any) -> dict[str, Any]:
+def read_chatgpt_share(
+    text: str, *, source_uri: str | None = None, conversation: str | None = None, **_: Any
+) -> dict[str, Any]:
+    """A ChatGPT share page, or one conversation of a ChatGPT data export (conversations.json)."""
+    if text.lstrip("\ufeff \t\r\n").startswith(("{", "[")):
+        try:
+            data = json.loads(text.lstrip("\ufeff"))
+        except json.JSONDecodeError as exc:
+            raise FormatError(f"invalid ChatGPT export JSON: {exc}") from exc
+        payload = _select_conversation(
+            [item for item in (data if isinstance(data, list) else [data])
+             if isinstance(item, dict) and isinstance(item.get("mapping"), dict)],
+            conversation, provider="ChatGPT")
+        return _chatgpt_conversation(payload, "chatgpt-export-json", "account-export", source_uri)
     collector = _parse_html(text)
     payload = _chatgpt_payload(collector)
     if payload is None:
         if collector.messages:
             conv = _dom_conversation(collector.messages, "chatgpt-share-html", "openai", source_uri)
-            _add_share_warnings(conv, provider="ChatGPT")
+            _add_snapshot_warnings(conv, "ChatGPT")
             warning(conv, "dom_fallback", "Structured ChatGPT payload was unavailable; imported rendered DOM text.")
             return validate_conversation(conv)
         raise FormatError("ChatGPT share HTML did not contain a structured conversation or rendered messages")
-    conversation_id = payload.get("conversation_id")
+    return _chatgpt_conversation(payload, "chatgpt-share-html", "public-share-snapshot", source_uri)
+
+
+def _chatgpt_conversation(payload: dict[str, Any], source_format: str, kind: str, source_uri: str | None) -> dict[str, Any]:
+    conversation_id = payload.get("conversation_id") or payload.get("id")
     conv = new_conversation(
-        source_format="chatgpt-share-html",
+        source_format=source_format,
         provider="openai",
-        kind="public-share-snapshot",
+        kind=kind,
         source_uri=source_uri,
         conversation_id=str(conversation_id) if conversation_id else None,
         title=payload.get("title"),
     )
     conv["created_at"] = normalize_timestamp(payload.get("create_time"))
     conv["updated_at"] = normalize_timestamp(payload.get("update_time"))
-    conv["environment"]["model"] = payload.get("default_model_slug")
-    mapping = payload.get("mapping")
-    if not isinstance(mapping, dict):
-        raise FormatError("ChatGPT share payload has no message mapping")
+    if payload.get("default_model_slug"):
+        conv["environment"]["model"] = payload["default_model_slug"]
+    if not isinstance(payload.get("mapping"), dict):
+        raise FormatError("ChatGPT conversation has no message mapping")
     for index, node in enumerate(_chatgpt_active_chain(payload)):
         native = node.get("message") if isinstance(node, dict) else None
         if not isinstance(native, dict):
@@ -172,19 +197,21 @@ def read_chatgpt_share(text: str, *, source_uri: str | None = None, **_: Any) ->
         role = author.get("role")
         if role not in {"system", "developer", "user", "assistant", "tool"}:
             continue
+        if not _chatgpt_visible(native):
+            continue
         blocks = _chatgpt_content(native.get("content"), conv, index)
         if not blocks:
             continue
         if role == "tool":
-            # Share snapshots generally flatten the tool invocation; retain output without inventing a pairing.
-            rendered = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+            # ChatGPT records tool output without a structured call; keep it without inventing a pairing.
+            rendered = "\n".join(block.get("text", "") for block in blocks if block.get("type") in {"text", "code"})
             blocks = [{"type": "tool_result", "tool_call_id": str(native.get("id") or "unavailable"), "content": rendered, "is_error": False}]
-            warning(conv, "chatgpt_tool_call_pairing_unavailable", "ChatGPT share tool output was present but its structured call pairing was unavailable.")
+            warning(conv, "chatgpt_tool_call_pairing_unavailable", "ChatGPT tool output was present but its structured call pairing was unavailable.")
         conv["messages"].append(
             message(
                 role=role,
                 content=blocks,
-                source_format="chatgpt-share-html",
+                source_format=source_format,
                 source_id=native.get("id"),
                 source_index=index,
                 created_at=native.get("create_time"),
@@ -195,8 +222,16 @@ def read_chatgpt_share(text: str, *, source_uri: str | None = None, **_: Any) ->
                 },
             )
         )
-    _add_share_warnings(conv, provider="ChatGPT")
+    _add_snapshot_warnings(conv, "ChatGPT")
     return validate_conversation(conv)
+
+
+_CHATGPT_CONTEXT_KINDS = {"model_editable_context", "user_editable_context"}
+
+
+def _chatgpt_visible(native: Any) -> bool:
+    """Not hidden scaffolding (an empty system message, for instance)."""
+    return isinstance(native, dict) and not (native.get("metadata") or {}).get("is_visually_hidden_from_conversation")
 
 
 def is_challenge_page(html: str, url: str = "") -> bool:
@@ -340,7 +375,21 @@ def _chatgpt_content(value: Any, conv: dict[str, Any], index: int) -> list[dict[
         return []
     kind = value.get("content_type")
     if kind == "text":
-        return [text_block(part) for part in value.get("parts", []) if isinstance(part, (str, int, float))]
+        return [text_block(part) for part in value.get("parts", []) if isinstance(part, (str, int, float)) and str(part)]
+    if kind == "multimodal_text":
+        blocks: list[dict[str, Any]] = []
+        for part in value.get("parts", []):
+            if isinstance(part, (str, int, float)):
+                if str(part):
+                    blocks.append(text_block(part))
+            elif isinstance(part, dict) and part.get("content_type") == "image_asset_pointer":
+                # Asset pointers name files inside ChatGPT; the bytes are not part of the export.
+                blocks.append({"type": "attachment", "name": str(part.get("asset_pointer") or "image"), "media_type": "image"})
+                warning(conv, "chatgpt_image_unavailable", "ChatGPT images are referenced by asset pointers whose contents are not exported.")
+        return blocks
+    if kind in {"execution_output", "system_error", "tether_quote", "tether_browsing_display"}:
+        body = value.get("text") or value.get("result") or ""
+        return [text_block(body)] if body else []
     if kind == "code":
         return [{"type": "code", "language": value.get("language"), "text": str(value.get("text", ""))}]
     if kind == "thoughts":
@@ -352,15 +401,18 @@ def _chatgpt_content(value: Any, conv: dict[str, Any], index: int) -> list[dict[
         return results
     if kind == "reasoning_recap":
         return [{"type": "reasoning", "text": str(value.get("content", "")), "visibility": "recap"}]
-    if kind == "model_editable_context":
-        warning(conv, "chatgpt_model_context_not_message", "ChatGPT model-editable context was omitted from message history.", path=f"messages[{index}]")
+    if kind in _CHATGPT_CONTEXT_KINDS:
+        warning(conv, "chatgpt_model_context_not_message", "ChatGPT memory and custom-instruction context was omitted from message history.")
         return []
     warning(conv, "chatgpt_content_not_represented", f"ChatGPT content type {kind!r} was not represented.", path=f"messages[{index}]")
     return []
 
 
-def read_claude_share(text: str, *, source_uri: str | None = None, **_: Any) -> dict[str, Any]:
-    stripped = text.lstrip()
+def read_claude_share(
+    text: str, *, source_uri: str | None = None, conversation: str | None = None, **_: Any
+) -> dict[str, Any]:
+    """A Claude share (page, rendered DOM or captured JSON), or one conversation of a Claude data export."""
+    stripped = text.lstrip("\ufeff \t\r\n")
     data: Any = None
     if stripped.startswith(("{", "[")):
         try:
@@ -381,35 +433,44 @@ def read_claude_share(text: str, *, source_uri: str | None = None, **_: Any) -> 
                 break
         if data is None and collector.messages:
             conv = _dom_conversation(collector.messages, "claude-share-html", "anthropic", source_uri)
-            _add_share_warnings(conv, provider="Claude")
+            _add_snapshot_warnings(conv, "Claude")
             warning(conv, "dom_fallback", "Structured Claude payload was unavailable; imported rendered browser DOM text.")
             return validate_conversation(conv)
         if data is None and collector.challenge:
             raise BrowserRequired(
                 "Claude returned an anti-bot challenge, not a conversation. Open the share URL in your browser, "
-                "complete the challenge, then use the browser/export fallback documented in docs/browser-export.md."
+                "complete the challenge, then use the browser/export fallback at https://github.com/abhimanyupallavisudhir/panagent/blob/master/docs/browser-export.md"
             )
         if data is None:
             raise BrowserRequired(
                 "Claude share HTML contained no conversation; it renders only in a browser. Retry with "
-                "--browser headed or --cdp-url, or use the browser/export fallback documented in docs/browser-export.md."
+                "--browser headed or --cdp-url, or use the browser/export fallback at https://github.com/abhimanyupallavisudhir/panagent/blob/master/docs/browser-export.md"
             )
-    conversation = _select_claude_conversation(data)
-    if conversation is None:
+    account_export = isinstance(data, list)
+    if account_export:
+        selected = _select_conversation(
+            [item for item in data if isinstance(item, dict) and _find_chat_messages(item) is not None],
+            conversation, provider="Claude")
+    else:
+        selected = _claude_conversation_object(data)
+    if selected is None:
         raise FormatError(
-            "Claude input contained no chat_messages. Use the browser export recipe in docs/browser-export.md."
+            "Claude input contained no chat_messages. Use the browser export recipe at https://github.com/abhimanyupallavisudhir/panagent/blob/master/docs/browser-export.md"
         )
-    source_url = source_uri or conversation.get("source_url") or conversation.get("url")
-    conversation_id = conversation.get("uuid") or conversation.get("id")
+    source_url = source_uri or selected.get("source_url") or selected.get("url")
+    conversation_id = selected.get("uuid") or selected.get("id")
+    kind = "account-export" if account_export else (
+        "public-share-snapshot" if source_url and "/share/" in source_url else "browser-export")
     conv = new_conversation(
         source_format="claude-share-export",
         provider="anthropic",
-        kind="public-share-snapshot" if source_url and "/share/" in source_url else "browser-export",
+        kind=kind,
         source_uri=source_url,
         conversation_id=str(conversation_id) if conversation_id else None,
-        title=conversation.get("name") or conversation.get("title"),
+        title=selected.get("name") or selected.get("title"),
     )
-    items = conversation.get("chat_messages") or conversation.get("messages") or []
+    pending: list[str] = []
+    items = selected.get("chat_messages") or selected.get("messages") or []
     for index, native in enumerate(items):
         if not isinstance(native, dict):
             continue
@@ -417,43 +478,87 @@ def read_claude_share(text: str, *, source_uri: str | None = None, **_: Any) -> 
         role = {"human": "user", "ai": "assistant"}.get(sender, sender)
         if role not in {"system", "developer", "user", "assistant", "tool"}:
             continue
-        blocks = _claude_export_content(native)
-        if not blocks:
-            continue
-        conv["messages"].append(
-            message(
-                role=role,
-                content=blocks,
-                source_format="claude-share-export",
-                source_id=native.get("uuid") or native.get("id"),
-                source_index=index,
-                created_at=native.get("created_at") or native.get("timestamp"),
-                metadata={key: native[key] for key in ("updated_at", "index") if native.get(key) is not None},
+        native_id = native.get("uuid") or native.get("id")
+        for part, (part_role, blocks) in enumerate(_split_tool_results(role, _claude_export_content(native, conv, index, pending))):
+            conv["messages"].append(
+                message(
+                    role=part_role,
+                    content=blocks,
+                    source_format="claude-share-export",
+                    source_id=native_id,
+                    message_id=f"{native_id}:{part}" if native_id and part else None,
+                    source_index=index,
+                    created_at=native.get("created_at") or native.get("timestamp"),
+                    metadata={key: native[key] for key in ("updated_at", "index") if native.get(key) is not None},
+                )
             )
-        )
-    conv["created_at"] = normalize_timestamp(conversation.get("created_at")) or (
+    conv["created_at"] = normalize_timestamp(selected.get("created_at")) or (
         conv["messages"][0]["created_at"] if conv["messages"] else None
     )
-    conv["updated_at"] = normalize_timestamp(conversation.get("updated_at"))
-    _add_share_warnings(conv, provider="Claude")
+    conv["updated_at"] = normalize_timestamp(selected.get("updated_at"))
+    _add_snapshot_warnings(conv, "Claude")
     return validate_conversation(conv)
 
 
-def _select_claude_conversation(data: Any) -> dict[str, Any] | None:
-    if isinstance(data, list):
-        candidates = [item for item in data if isinstance(item, dict) and _find_chat_messages(item) is not None]
-        if len(candidates) > 1:
-            raise FormatError("Claude export contains multiple conversations; provide one conversation object")
-        return candidates[0] if candidates else None
-    if isinstance(data, dict):
-        if isinstance(data.get("conversation"), dict):
-            return data["conversation"]
-        if isinstance(data.get("chat_messages"), list) or isinstance(data.get("messages"), list):
-            return data
-        found = _find_chat_messages(data)
-        if found is not None:
-            return found
-    return None
+def _claude_conversation_object(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    if isinstance(data.get("conversation"), dict):
+        return data["conversation"]
+    if isinstance(data.get("chat_messages"), list) or isinstance(data.get("messages"), list):
+        return data
+    return _find_chat_messages(data)
+
+
+def _select_conversation(candidates: list[dict[str, Any]], wanted: str | None, *, provider: str) -> dict[str, Any]:
+    """One conversation of an export, chosen by id or exact title when there are several."""
+    if not candidates:
+        raise FormatError(f"{provider} export contains no conversations")
+    if wanted is None:
+        if len(candidates) == 1:
+            return candidates[0]
+        raise FormatError(
+            f"{provider} export contains {len(candidates)} conversations; choose one with --conversation ID "
+            "(list them with `panagent list FILE`)"
+        )
+    matches = [item for item in candidates if wanted in _conversation_ids(item)]
+    matches = matches or [item for item in candidates if (item.get("title") or item.get("name")) == wanted]
+    if not matches:
+        raise FormatError(f"no conversation with id or title {wanted!r} in this {provider} export")
+    if len(matches) > 1:
+        raise FormatError(f"{len(matches)} conversations are titled {wanted!r}; choose one by id")
+    return matches[0]
+
+
+def _conversation_ids(item: dict[str, Any]) -> set[str]:
+    return {str(item[key]) for key in ("conversation_id", "id", "uuid") if item.get(key)}
+
+
+def list_conversations(text: str, source_format: str) -> list[dict[str, Any]]:
+    """The conversations of a ChatGPT or Claude data export: id, title, update time and message count."""
+    try:
+        data = json.loads(text.lstrip("\ufeff"))
+    except json.JSONDecodeError as exc:
+        raise FormatError(f"invalid export JSON: {exc}") from exc
+    items = data if isinstance(data, list) else [data]
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if source_format == "chatgpt-share" and isinstance(item.get("mapping"), dict):
+            count = sum(1 for node in _chatgpt_active_chain(item) if _chatgpt_visible(node.get("message"))
+                        and (node["message"].get("content") or {}).get("content_type") not in _CHATGPT_CONTEXT_KINDS)
+        elif source_format == "claude-share" and isinstance(item.get("chat_messages"), list):
+            count = len(item["chat_messages"])
+        else:
+            continue
+        result.append({
+            "id": item.get("conversation_id") or item.get("id") or item.get("uuid"),
+            "title": item.get("title") or item.get("name") or "",
+            "updated_at": normalize_timestamp(item.get("update_time") or item.get("updated_at")),
+            "messages": count,
+        })
+    return result
 
 
 def _find_chat_messages(value: Any, seen: set[int] | None = None) -> dict[str, Any] | None:
@@ -481,18 +586,65 @@ def _find_chat_messages(value: Any, seen: set[int] | None = None) -> dict[str, A
     return None
 
 
-def _claude_export_content(native: dict[str, Any]) -> list[dict[str, Any]]:
+def _claude_export_content(
+    native: dict[str, Any], conv: dict[str, Any], index: int, pending: list[str]
+) -> list[dict[str, Any]]:
     content = native.get("content")
     blocks: list[dict[str, Any]] = []
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                blocks.append(text_block(item.get("text", "")))
-    if not blocks and native.get("text") is not None:
+    for part_index, item in enumerate(content if isinstance(content, list) else []):
+        kind = item.get("type") if isinstance(item, dict) else None
+        if kind == "text":
+            if item.get("text"):
+                blocks.append(text_block(item["text"]))
+        elif kind == "thinking":
+            if item.get("thinking"):
+                blocks.append({"type": "reasoning", "text": str(item["thinking"]), "visibility": "source-visible"})
+        elif kind == "tool_use":
+            call_id = str(item.get("id") or f"claude-tool-{index}-{part_index}")
+            pending.append(call_id)
+            blocks.append({"type": "tool_call", "id": call_id, "name": str(item.get("name") or "unknown"),
+                           "arguments": item.get("input", {})})
+        elif kind == "tool_result":
+            call_id = str(item.get("tool_use_id") or (pending[0] if pending else "unavailable"))
+            if call_id in pending:
+                pending.remove(call_id)
+            output = item.get("content", "")
+            if isinstance(output, list):
+                output = "\n".join(str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in output)
+            blocks.append({"type": "tool_result", "tool_call_id": call_id, "content": str(output),
+                           "is_error": bool(item.get("is_error", False))})
+        else:
+            warning(conv, "claude_block_not_represented", f"Claude content block type {kind!r} was not represented.",
+                    path=f"chat_messages[{index}].content[{part_index}]")
+    if not blocks and native.get("text"):
         blocks.append(text_block(native["text"]))
-    if not blocks and isinstance(content, str):
+    if not blocks and isinstance(content, str) and content:
         blocks.append(text_block(content))
+    for attachment in native.get("attachments") or []:
+        if isinstance(attachment, dict):
+            block = {"type": "attachment", "name": str(attachment.get("file_name") or "attachment")}
+            if attachment.get("file_type"):
+                block["media_type"] = str(attachment["file_type"])
+            if attachment.get("extracted_content"):
+                block["text"] = str(attachment["extracted_content"])
+            blocks.append(block)
+    for file in native.get("files") or []:
+        if isinstance(file, dict) and file.get("file_name"):
+            blocks.append({"type": "attachment", "name": str(file["file_name"])})
     return blocks
+
+
+def _split_tool_results(role: str, blocks: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Web chats keep a tool's call and result in one assistant message; native histories
+    put results in a message of their own, so split each run of results out."""
+    parts: list[tuple[str, list[dict[str, Any]]]] = []
+    for block in blocks:
+        part_role = "tool" if block["type"] == "tool_result" else role
+        if parts and parts[-1][0] == part_role:
+            parts[-1][1].append(block)
+        else:
+            parts.append((part_role, [block]))
+    return parts
 
 
 def _dom_conversation(
@@ -517,22 +669,106 @@ def _dom_conversation(
     return conv
 
 
-def _add_share_warnings(conv: dict[str, Any], *, provider: str) -> None:
+def _add_snapshot_warnings(conv: dict[str, Any], provider: str) -> None:
     conv["capabilities"]["source"] = ["visible_messages", "visible_text", "snapshot_provenance"]
-    unavailable = [
+    conv["capabilities"]["unavailable"].extend([
         "hidden_system_instructions",
         "original_tool_call_structure",
         "uploaded_file_contents",
         "alternative_branches",
         "continuation_state",
-    ]
-    conv["capabilities"]["unavailable"].extend(unavailable)
+    ])
+    what = "exports" if conv["source"]["kind"] == "account-export" else "public shares"
     warning(
         conv,
         "share_snapshot_limitations",
-        f"{provider} public shares are visible snapshots; hidden instructions, uploads, branches, and resumable provider state may be absent.",
+        f"{provider} {what} are visible snapshots; hidden instructions, uploads, branches, and resumable provider state may be absent.",
         severity="info",
     )
 
 
-WEB_READERS = {"chatgpt-share": read_chatgpt_share, "claude-share": read_claude_share}
+class _TavyaShareParser(HTMLParser):
+    """tavya's share page: an <h1> title, a snapshot <time>, and one
+    <article data-share-message class="msg user|agent"> per message whose
+    <div class="msg-text"> holds the message's escaped source text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title: str | None = None
+        self.shared_at: str | None = None
+        self.unavailable = False
+        self.messages: list[tuple[str, str]] = []
+        self._role: str | None = None
+        self._title: list[str] | None = None
+        self._text: list[str] | None = None
+        self._div_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        classes = set((values.get("class") or "").split())
+        if self._text is not None:
+            self._div_depth += tag == "div"
+        elif tag == "article" and "data-share-message" in values:
+            self._role = "user" if "user" in classes else "assistant"
+        elif tag == "div" and "msg-text" in classes and self._role:
+            self._text, self._div_depth = [], 1
+        elif tag == "h1" and self.title is None:
+            self._title = []
+        elif tag == "time" and self.shared_at is None:
+            self.shared_at = values.get("datetime")
+        elif tag == "section" and "shared-unavailable" in classes:
+            self.unavailable = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._text is not None and tag == "div":
+            self._div_depth -= 1
+            if self._div_depth == 0:
+                self.messages.append((self._role or "assistant", "".join(self._text)))
+                self._text = None
+        elif tag == "article":
+            self._role = None
+        elif tag == "h1" and self._title is not None:
+            self.title = " ".join("".join(self._title).split())
+            self._title = None
+
+    def handle_data(self, data: str) -> None:
+        if self._text is not None:
+            self._text.append(data)
+        elif self._title is not None:
+            self._title.append(data)
+
+
+def read_tavya_share(text: str, *, source_uri: str | None = None, **_: Any) -> dict[str, Any]:
+    """A tavya (karmax) shared conversation page."""
+    parser = _TavyaShareParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except Exception as exc:
+        raise FormatError(f"invalid tavya share HTML: {exc}") from exc
+    if parser.unavailable:
+        raise FormatError("this tavya share is unavailable; the link was revoked or sharing is disabled")
+    if not parser.messages:
+        raise FormatError("tavya share HTML contained no messages")
+    share_id = source_uri.rstrip("/").rsplit("/", 1)[-1] if source_uri and "://" in source_uri else None
+    conv = new_conversation(
+        source_format="tavya-share-html",
+        provider="tavya",
+        kind="public-share-snapshot",
+        source_uri=source_uri,
+        conversation_id=share_id,
+        title=parser.title,
+    )
+    conv["updated_at"] = normalize_timestamp(parser.shared_at)
+    for index, (role, body) in enumerate(parser.messages):
+        conv["messages"].append(message(role=role, content=[text_block(body)], source_format="tavya-share-html",
+                                        source_index=index, message_id=f"message-{index + 1}"))
+    conv["capabilities"]["source"] = ["visible_messages", "visible_text", "snapshot_provenance"]
+    conv["capabilities"]["unavailable"].extend(["timestamps", "attachments", "tool_activity", "continuation_state"])
+    warning(conv, "share_snapshot_limitations",
+            "tavya shares keep message text only; attachments, tool activity and the agent's resumable state are absent.",
+            severity="info")
+    return validate_conversation(conv)
+
+
+WEB_READERS = {"chatgpt-share": read_chatgpt_share, "claude-share": read_claude_share, "tavya-share": read_tavya_share}
