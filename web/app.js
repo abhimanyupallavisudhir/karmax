@@ -1364,6 +1364,8 @@ function cfLayersOf(v) {
 function humanAudienceOptions() {
   return [
     { value: '@creator', label: 'Task creator' }, { value: '@all', label: 'Everyone in the organization' },
+    { value: '@maintainers', label: 'Project maintainers' }, { value: '@admins', label: 'Administrators' },
+    { value: '@superadmins', label: 'Super-administrators' },
     { value: '@owners', label: 'Organization owners' }, { value: '@project', label: 'Everyone with project access' },
     ...S.organizationMembers.map((m) => ({ value: `user:${m.userId}`, label: `Person · ${principalLabel({ kind: 'user', userId: m.userId })}` })),
     ...S.teams.map((t) => ({ value: `@team:${t.slug}`, label: `Team · ${t.name}` })),
@@ -1761,81 +1763,206 @@ function isAuthorizationGrantGap(error) {
     || /more authorization than you have|authorization level you do not hold/i.test(error?.message || '');
 }
 
-/** One deliberate decision point shared by task and Avatar creation. Recipient
- * choices come from the server already intersected with principals that can
- * grant the complete requested package; selectors are still re-checked when the
- * request is created and when it is approved. */
+/** Group audiences people can be summoned by, in the words the UI uses. */
+const SUMMON_GROUP_LABELS = {
+  '@maintainers': 'Project maintainers', '@admins': 'Administrators', '@superadmins': 'Super-administrators',
+  '@owners': 'Organization owners', '@all': 'Everyone',
+};
+
+/**
+ * The one dialog for "you can't do this yourself": granting authorization you
+ * lack, merging without GitHub access. Three ways on — alert the people who
+ * can (primary), pick someone else, or go ahead within your own authority —
+ * and every explanation in a tooltip. Resolves to { action: 'ask', audience }
+ * | { action: 'limit' } | null (closed).
+ */
+function summonDialog({ title, tip, missing = [], summon, recipients = [], limit }) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay summon-overlay';
+    overlay.innerHTML = `<div class="modal-card summon-card" role="dialog" aria-modal="true" aria-labelledby="summon-title">
+      <div class="summon-head"><h2 id="summon-title">${esc(title)}</h2>${tip ? policyTip(tip) : ''}
+        <button type="button" class="icon-btn summon-close" aria-label="Cancel">×</button></div>
+      ${missing.length ? `<button type="button" class="summon-missing-toggle" aria-expanded="false">${missing.length} missing</button>
+        <div class="summon-missing" hidden>${missing.map((item) => `<span class="chip mono">${esc(item)}</span>`).join(' ')}</div>` : ''}
+      <div class="summon-actions">
+        ${summon ? `<button type="button" class="btn primary summon-alert" title="${esc(summon.tip || '')}">${esc(summon.label)}</button>` : ''}
+        ${recipients.length ? `<div class="summon-someone">
+          <div class="summon-field"><span class="summon-picked"></span><input class="summon-input" role="combobox" aria-label="Someone else…" placeholder="Someone else…"
+            aria-expanded="false" aria-controls="summon-menu" autocomplete="off" spellcheck="false"></div>
+          <div class="summon-menu" id="summon-menu" role="listbox" hidden></div>
+          <button type="button" class="btn summon-send" hidden>Send</button></div>` : ''}
+        ${limit ? `<button type="button" class="btn soft summon-limit" title="${esc(limit.tip || '')}">${esc(limit.label)}</button>` : ''}
+      </div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const finish = (value) => { overlay.remove(); resolve(value); };
+    const picked = [];
+    const input = overlay.querySelector('.summon-input');
+    const menu = overlay.querySelector('.summon-menu');
+    const send = overlay.querySelector('.summon-send');
+    const toggle = overlay.querySelector('.summon-missing-toggle');
+    toggle?.addEventListener('click', () => {
+      const list = overlay.querySelector('.summon-missing');
+      list.hidden = !list.hidden;
+      toggle.setAttribute('aria-expanded', String(!list.hidden));
+    });
+    const matches = () => {
+      const q = input.value.trim().toLowerCase();
+      return recipients.filter((option) => !picked.includes(option.value)
+        && (!q || `${option.label} ${option.detail || ''} ${option.value}`.toLowerCase().includes(q)));
+    };
+    const drawPicked = () => {
+      overlay.querySelector('.summon-picked').innerHTML = picked.map((value) => {
+        const option = recipients.find((candidate) => candidate.value === value);
+        return `<span class="summon-chip" data-value="${esc(value)}">${esc(option?.label || value)}<button type="button" aria-label="Remove ${esc(option?.label || value)}">×</button></span>`;
+      }).join('');
+      overlay.querySelectorAll('.summon-chip button').forEach((button) => button.addEventListener('click', () => {
+        picked.splice(picked.indexOf(button.parentElement.dataset.value), 1);
+        drawPicked(); input.focus();
+      }));
+      send.hidden = !picked.length;
+      input.placeholder = picked.length ? '' : 'Someone else…';
+    };
+    const drawMenu = () => {
+      const options = matches();
+      menu.innerHTML = options.length ? options.map((option, index) => `<div class="summon-option${index ? '' : ' active'}" role="option" data-value="${esc(option.value)}" aria-selected="${index ? 'false' : 'true'}">
+          <span class="summon-kind ${esc(option.kind || 'person')}" aria-hidden="true">${option.kind === 'avatar' ? 'A' : option.kind === 'person' ? '•' : '@'}</span>
+          <span><b>${esc(option.label)}</b>${option.detail ? `<small>${esc(option.detail)}</small>` : ''}</span></div>`).join('')
+        : '<div class="summon-empty">No one else can</div>';
+      menu.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+      menu.querySelectorAll('[role="option"]').forEach((element) => element.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+        pick(element.dataset.value);
+      }));
+    };
+    const hideMenu = () => { if (menu) { menu.hidden = true; input.setAttribute('aria-expanded', 'false'); } };
+    const pick = (value) => { picked.push(value); input.value = ''; drawPicked(); hideMenu(); input.focus(); };
+    input?.addEventListener('focus', drawMenu);
+    input?.addEventListener('input', drawMenu);
+    input?.addEventListener('blur', () => setTimeout(hideMenu, 120));
+    input?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        const first = matches()[0];
+        if (first && !menu.hidden && input.value.trim()) pick(first.value);
+        else if (picked.length) send.click();
+      } else if (event.key === 'Backspace' && !input.value && picked.length) { picked.pop(); drawPicked(); }
+    });
+    overlay.querySelector('.summon-alert')?.addEventListener('click', () => finish({ action: 'ask', audience: summon.audience }));
+    send?.addEventListener('click', () => finish({ action: 'ask', audience: [...picked] }));
+    overlay.querySelector('.summon-limit')?.addEventListener('click', () => finish({ action: 'limit' }));
+    overlay.querySelector('.summon-close').addEventListener('click', () => finish(null));
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) finish(null); });
+    overlay.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      event.stopPropagation();
+      if (menu && !menu.hidden) hideMenu();
+      else finish(null);
+    });
+    (overlay.querySelector('.summon-alert') || input || overlay.querySelector('.summon-limit') || overlay.querySelector('.summon-close')).focus();
+  });
+}
+
+/** "Project maintainer · Site", "Developer · 3 projects", "Administrator · @organization". */
+function authorizationShortSummary(value, projects) {
+  const selected = normalizedAuthorization(value);
+  const level = authorizationLevels().find((candidate) => candidate.id === selected.level)?.name || selected.level;
+  if (selected.scope === 'global') return level;
+  if (selected.scope === 'organization') return `${level} · @organization`;
+  const ids = selected.projectIds || [];
+  return `${level} · ${ids.length === 1 ? (projects || []).find((project) => project.id === ids[0])?.name || ids[0] : `${ids.length} projects`}`;
+}
+
+/** The authorization gap, shared by task creation, task authorization edits
+ * and Avatars. Recipients come from the server already intersected with who
+ * can grant the complete package, and are re-checked when the request is made
+ * and when it is approved. Resolves to { action: 'ask', audience, reason } |
+ * { action: 'limit' } | null. */
 async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 'agent') {
   const targets = await api(`/api/authorization/escalation-targets?projectId=${encodeURIComponent(projectId)}`, {
     method: 'POST', body: JSON.stringify({ projectId, authorization }),
   });
-  return new Promise((resolve) => {
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay authorization-gap-overlay';
-    const recipientRows = [
-      ...targets.special.map((item) => ({ selector: item.selector,
-        label: item.selector === '@all' ? 'Everyone who can grant it' : 'Organization owners who can grant it',
-        detail: `${item.eligibleUserIds.length} eligible ${item.eligibleUserIds.length === 1 ? 'person' : 'people'}`, kind: 'group' })),
-      ...targets.teams.map((team) => ({ selector: team.selector, label: team.name,
-        detail: `${team.eligibleUserIds.length} eligible ${team.eligibleUserIds.length === 1 ? 'member' : 'members'}`, kind: 'team' })),
-      ...targets.users.map((user) => ({ selector: user.selector, label: user.name || user.email || user.id,
-        detail: user.name && user.email ? user.email : 'Person', kind: 'person' })),
-      ...targets.avatars.map((avatar) => ({ selector: avatar.selector, label: avatar.name,
-        detail: avatar.purpose || 'Authorization Avatar', kind: 'avatar' })),
-    ];
-    overlay.innerHTML = `<div class="modal-card authorization-gap-card" role="dialog" aria-modal="true" aria-labelledby="authorization-gap-title">
-      <div class="authorization-gap-head"><span class="authorization-gap-mark" aria-hidden="true">↗</span><div>
-        <div class="section-h">Delegation boundary</div>
-        <h2 id="authorization-gap-title">You are trying to grant this ${esc(targetLabel)} more authorization than you have.</h2>
-        <p>Choose who should approve the requested ${esc(authorizationSummary(authorization,
-          S.projects.filter((project) => project.organizationId === projectById(projectId)?.organizationId)))} authorization, or continue with only your capabilities.</p>
-      </div></div>
-      <div class="authorization-gap-paths">
-        <section class="authorization-gap-path ask-path">
-          <div class="authorization-gap-number">1</div><div class="authorization-gap-path-copy"><b>Ask someone who can grant it</b>
-          <span>The request goes only to eligible recipients. Any one of them can decide.</span></div>
-          <button type="button" class="btn authorization-gap-show">Choose recipients</button>
-        </section>
-        <div class="authorization-gap-recipients" hidden>
-          ${recipientRows.length ? `<div class="authorization-gap-list">${recipientRows.map((row) =>
-            `<label class="authorization-gap-recipient"><input type="checkbox" value="${esc(row.selector)}">
-              <span class="authorization-gap-recipient-icon ${esc(row.kind)}">${row.kind === 'avatar' ? 'A' : row.kind === 'team' || row.kind === 'group' ? '@' : '•'}</span>
-              <span><b>${esc(row.label)}</b><small>${esc(row.detail)}</small></span></label>`).join('')}</div>
-            <label class="authorization-gap-reason"><span>Note for approvers</span><textarea rows="2">Please approve the requested authorization for this ${esc(targetLabel)}.</textarea></label>
-            <button type="button" class="btn primary authorization-gap-send" disabled>Send authorization request</button>`
-            : '<div class="authorization-gap-empty">No person or Avatar currently holds the complete requested authorization.</div>'}
-        </div>
-        <section class="authorization-gap-path limit-path">
-          <div class="authorization-gap-number">2</div><div class="authorization-gap-path-copy"><b>Limit it to my capabilities</b>
-          <span>The ${esc(targetLabel)} continues now without the ${targets.missingCapabilities.length} missing ${targets.missingCapabilities.length === 1 ? 'capability' : 'capabilities'}.</span></div>
-          <button type="button" class="btn authorization-gap-limit">Use my authorization</button>
-        </section>
-      </div>
-      <details class="authorization-gap-details"><summary>${targets.missingCapabilities.length} capabilities need approval</summary>
-        <div>${targets.missingCapabilities.map((capability) => `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div></details>
-      <button type="button" class="icon-btn authorization-gap-close" aria-label="Cancel">×</button>
-    </div>`;
-    document.body.appendChild(overlay);
-    const finish = (value) => { overlay.remove(); resolve(value); };
-    const recipients = overlay.querySelector('.authorization-gap-recipients');
-    const send = overlay.querySelector('.authorization-gap-send');
-    const sync = () => { if (send) send.disabled = !overlay.querySelector('.authorization-gap-recipient input:checked'); };
-    overlay.querySelector('.authorization-gap-show').addEventListener('click', () => {
-      recipients.hidden = false;
-      overlay.querySelector('.authorization-gap-show').hidden = true;
-      recipients.querySelector('input')?.focus();
-    });
-    overlay.querySelectorAll('.authorization-gap-recipient input').forEach((input) => input.addEventListener('change', sync));
-    send?.addEventListener('click', () => finish({ action: 'ask',
-      audience: [...overlay.querySelectorAll('.authorization-gap-recipient input:checked')].map((input) => input.value),
-      reason: overlay.querySelector('.authorization-gap-reason textarea').value.trim(),
-    }));
-    overlay.querySelector('.authorization-gap-limit').addEventListener('click', () => finish({ action: 'limit' }));
-    overlay.querySelector('.authorization-gap-close').addEventListener('click', () => finish(null));
-    overlay.addEventListener('click', (event) => { if (event.target === overlay) finish(null); });
-    overlay.addEventListener('keydown', (event) => { if (event.key === 'Escape') finish(null); });
-    overlay.querySelector('.authorization-gap-show').focus();
+  const summary = authorizationShortSummary(authorization,
+    S.projects.filter((project) => project.organizationId === projectById(projectId)?.organizationId));
+  const count = (ids) => `${ids.length} ${ids.length === 1 ? 'person' : 'people'}`;
+  const summoned = targets.special.find((item) => item.selector === targets.summon);
+  const recipients = [
+    ...targets.users.map((user) => ({ value: user.selector, label: user.name || user.email || user.id,
+      detail: user.name && user.email ? user.email : '', kind: 'person' })),
+    ...targets.teams.map((team) => ({ value: team.selector, label: team.name, detail: `Team · ${count(team.eligibleUserIds)}`, kind: 'team' })),
+    ...targets.avatars.map((avatar) => ({ value: avatar.selector, label: avatar.name, detail: avatar.purpose || 'Avatar', kind: 'avatar' })),
+    ...targets.special.filter((item) => item.selector !== targets.summon).map((item) => ({ value: item.selector,
+      label: SUMMON_GROUP_LABELS[item.selector] || item.selector, detail: `${item.selector} · ${count(item.eligibleUserIds)}`, kind: 'group' })),
+  ];
+  const decision = await summonDialog({
+    title: `You can't grant ${summary}`,
+    tip: `Only someone who holds this authorization can grant it. Alert asks them to approve — the ${targetLabel} waits until one does. Use my authorization goes ahead with only what you have.`,
+    missing: targets.missingCapabilities,
+    summon: summoned ? { label: `Alert ${summoned.selector}`, audience: [summoned.selector],
+      tip: `Ask the ${count(summoned.eligibleUserIds)} in ${SUMMON_GROUP_LABELS[summoned.selector] || summoned.selector} who can grant it` } : null,
+    recipients,
+    limit: { label: 'Use my authorization', tip: `Go ahead without the ${targets.missingCapabilities.length} capabilities you lack` },
   });
+  return decision?.action === 'ask'
+    ? { ...decision, reason: `Please grant ${summary} to this ${targetLabel}.` }
+    : decision;
+}
+
+/** Save a task's authorization; if it is more than you can grant, ask the
+ * summon dialog. Resolves to the updated task, or null when nothing was saved
+ * (asked someone, or closed). */
+async function saveTaskAuthorization(taskId, projectId, values) {
+  try {
+    return await api(`/api/tasks/${taskId}/authorization`, { method: 'PATCH', body: JSON.stringify(values) });
+  } catch (error) {
+    if (!isAuthorizationGrantGap(error)) throw error;
+    const decision = await chooseAuthorizationGrant(projectId, values.authorization, 'agent');
+    if (decision?.action === 'limit')
+      return api(`/api/tasks/${taskId}/authorization`, { method: 'PATCH', body: JSON.stringify({ ...values, acceptAttenuation: true }) });
+    if (decision?.action === 'ask') {
+      await api(`/api/authorization-requests?projectId=${encodeURIComponent(projectId)}`, { method: 'POST', body: JSON.stringify({
+        projectId, target: { kind: 'task', taskId }, authorization: values.authorization, audience: decision.audience, reason: decision.reason,
+      }) });
+      toast('Authorization request sent');
+    }
+    return null;
+  }
+}
+
+/** Before a confirmation that merges on GitHub: when neither you nor the task's
+ * creator can merge its pull requests, offer to send the Review to people who
+ * can (redirecting the request, POST /api/tasks/:id/escalate). Resolves true to
+ * go ahead with the confirmation. */
+async function confirmMergeRights(action, v) {
+  const authorizingMerge = v?.stage === 'merge' && v.waitingFor?.kind === 'human';
+  if (action !== 'confirm' || !v?.taskId || !(hasOpenPullRequest(v) || authorizingMerge)) return true;
+  let answer;
+  try { answer = await api(`/api/tasks/${v.taskId}/merge-eligibility`); } catch { return true; }
+  if (!answer?.blocked) return true;
+  const prs = answer.pullRequests || [];
+  const people = answer.people || [];
+  const names = people.map((person) => person.name || person.email || person.id);
+  const decision = await summonDialog({
+    title: `You can't merge ${prs.length === 1 ? `${prs[0].slug}#${prs[0].number}` : `${prs.length || 'these'} pull requests`} on GitHub`,
+    tip: 'Merging needs a connected GitHub account with merge access to every repository. Alert sends this Review to people who have it.',
+    summon: people.length ? { label: `Alert ${people.length === 1 ? names[0] : `${people.length} people`}`, audience: answer.audience, tip: names.join(', ') } : null,
+    recipients: humanAudienceOptions().filter((option) => !(answer.audience || []).includes(option.value))
+      .map((option) => ({ value: option.value, label: option.label.replace(/^(Person|Team) · /, ''),
+        kind: option.value.startsWith('user:') ? 'person' : 'group' })),
+    limit: authorizingMerge ? null : { label: 'Confirm anyway', tip: 'Approve the Review now; the merge waits for someone with GitHub access' },
+  });
+  if (decision?.action === 'limit') return true;
+  if (decision?.action === 'ask') {
+    try {
+      await api(`/api/tasks/${v.taskId}/escalate`, { method: 'POST', body: JSON.stringify({ audience: decision.audience,
+        message: "Please review and merge this — I can't merge it on GitHub." }) });
+      toast(`Sent to ${decision.audience === answer.audience && names.length === 1 ? names[0] : 'them'}`);
+      setTimeout(refreshTask, 250);
+    } catch (error) { toast(error.message, true); }
+  }
+  return false;
 }
 
 function wireAuthorizationEditor(root, projects, onChange) {
@@ -10411,7 +10538,8 @@ async function wireTaskAuthorization(v) {
     const submitted = structuredClone(draft.values);
     draft.saving = true; draft.sync();
     try {
-      const updated = await api(`/api/tasks/${v.taskId}/authorization`, { method: 'PATCH', body: JSON.stringify(submitted) });
+      const updated = await saveTaskAuthorization(v.taskId, projectId, submitted);
+      if (!updated) return;
       const currentRecord = taskRecord(v.taskId);
       if (currentRecord && updated?.params) currentRecord.params = updated.params;
       // The section already shows what was saved; don't repaint it for that.
@@ -11417,6 +11545,7 @@ function wireActions(v) {
       btn.disabled = true;
       btn.textContent = cancelling ? 'Cancelling…' : 'Sending…';
       try {
+        if (!(await confirmMergeRights(act, v))) return;
         const choice = await otherAttemptsConfirmation(act, v.taskId);
         if (choice === null) return;
         if (act === 'confirm' || act === 'openPr') await waitResourceChoices(v.taskId);
@@ -19664,6 +19793,7 @@ async function runDeclaredAction(a) {
   if (!confirmTaskAction(a.name, S.view)) return;
   const taskId = S.selected;
   try {
+    if (!(await confirmMergeRights(a.name, S.view))) return;
     const choice = await otherAttemptsConfirmation(a.name, taskId);
     if (choice === null) return;
     if (a.name === 'confirm' || a.name === 'openPr') await waitResourceChoices(taskId);

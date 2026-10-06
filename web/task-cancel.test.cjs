@@ -34,7 +34,7 @@ for (const entry of ['footer', 'command', 'form', 'scheduled']) {
         renderAttachmentChips() {}, requestTaskFormDefaults() {}, applyCursor() {}, wireQuickComposer() {},
         esc: text => text,
       });
-      vm.runInContext(['confirmTaskAction', 'otherAttemptsConfirmation', 'actionToast',
+      vm.runInContext(['confirmTaskAction', 'hasOpenPullRequest', 'confirmMergeRights', 'otherAttemptsConfirmation', 'actionToast',
         'wireActions', 'runDeclaredAction', 'openActionForm', 'wireTasksView'].map(fn).join('\n'), context);
       if (entry === 'footer') {
         context.wireActions(context.S.view);

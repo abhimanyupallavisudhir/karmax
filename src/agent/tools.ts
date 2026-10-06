@@ -187,7 +187,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'With needs_input: who to ask — user:<id>, @team:<slug>, @creator, @owners, @project, or @all (see escalate_to_human). Default: whoever answers this task\'s questions (for a sub-task, its parent).',
+          description: 'With needs_input: who to ask — user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all (see escalate_to_human). Default: whoever answers this task\'s questions (for a sub-task, its parent).',
         },
         urgency: URGENCY_PARAMETER,
       },
@@ -730,7 +730,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'escalate_to_human',
     description:
       'Pause your current task at its exact stage and ask selected people, teams, or Avatars for input. ' +
-      'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+      'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
       'Discover valid choices with platform_request(GET, "/api/agent/escalation-targets"). ' +
       'Calling this stops your current turn; the task resumes when a selected principal responds.',
     parameters: {
@@ -791,8 +791,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'request_permission',
     description:
       `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
-      'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
-      'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
+      'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all; ' +
+      'omit audience to summon the lowest level that can grant it. Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
       'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task.',
     parameters: {
       type: 'object',
@@ -811,7 +811,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'One or more person/team/Avatar routing selectors; any selected capable principal may decide.',
+          description: 'Person/team/Avatar routing selectors; any selected capable principal may decide. Omit to summon @maintainers, @admins or @superadmins, whichever is the lowest level that can grant it.',
         },
         reason: {
           type: 'string',
@@ -821,7 +821,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         },
         urgency: URGENCY_PARAMETER,
       },
-      required: ['capabilities', 'audience', 'reason'],
+      required: ['capabilities', 'reason'],
     },
   },
   {
