@@ -232,7 +232,9 @@ function assertInMergeDomain(task: TaskRecord, domain: string): void {
 const RETRY_ACTION = (): TaskView['actions'][number] =>
   ({ name: 'retry', kind: 'signal', label: 'Retry', enabled: true });
 
-const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
+/** Past the point of no return a failed task keeps Retry and follow-ups, but
+ * not Cancel: part of its proposal already landed. */
+const FAILED_RECOVERY_ACTIONS = (pointOfNoReturnPassed?: boolean): TaskView['actions'] => [
   RETRY_ACTION(),
   {
     name: 'followUp',
@@ -241,7 +243,7 @@ const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
     enabled: true,
     args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
   },
-  { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true },
+  ...(pointOfNoReturnPassed ? [] : [{ name: 'cancel', kind: 'signal' as const, label: 'Cancel', enabled: true, danger: true }]),
 ];
 
 const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
@@ -2761,8 +2763,8 @@ export class KarmaxApi {
         notes: task?.notes,
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
-        ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow) && !view.pointOfNoReturnPassed
-          ? { actions: FAILED_RECOVERY_ACTIONS() }
+        ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow)
+          ? { actions: FAILED_RECOVERY_ACTIONS(view.pointOfNoReturnPassed) }
           : { actions: this.lifecycleActions(view) }),
         ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
           ? { actions: [], stageTransitions: [] } : {}),
@@ -3093,7 +3095,9 @@ export class KarmaxApi {
       return result;
     }
     if (view.status === 'failed') {
-      if (resumable && !view.pointOfNoReturnPassed)
+      // Past the point of no return, Retry is how the rest of a partly landed
+      // proposal still lands; only discarding it is unsafe.
+      if (resumable)
         add({ target: 'do', label: 'Retry', description: 'Recover the preserved work and retry the task.' });
       if (!jayadratha && !view.pointOfNoReturnPassed)
         add({ target: 'draft', label: 'Draft', description: 'Discard failed progress and start over later.', danger: true });
@@ -3208,6 +3212,7 @@ export class KarmaxApi {
       // refs so a recovered Review/Merge can authorize the exact opened heads.
       prs: (view.prs ?? source.prs)?.map((pr) => ({ ...pr })),
       ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
+      ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
       resumeStage,
       // A deliberate Landing → Do move is an integration repair, not a fresh
       // proposal. Keep intent authorization but require automated review of the
@@ -3303,7 +3308,16 @@ export class KarmaxApi {
       if (attempt === 3)
         throw new Error(`${task.title} kept continuing as new while it was being stopped; try again.`);
     }
+    await this.withdrawCoordinatorClaims(task, view);
+    return attempted;
+  }
 
+  /** Withdraw what a stopped run still holds in the coordinators: queued or
+   * granted agent turns, account leases and merge-queue places. A run that
+   * ended without running its own cleanup (terminated, failed) leaves them
+   * behind, and the merge queue's dead-holder check cannot tell that run from
+   * its replacement, which shares the task id. */
+  private async withdrawCoordinatorClaims(task: TaskRecord, view: TaskView): Promise<void> {
     // Do not trust only the projected turn: pre-1.7 account waits did not expose
     // their turnId, and a stale snapshot can lag a just-enqueued agent request.
     // Query both coordinators and withdraw every request owned by this task.
@@ -3329,13 +3343,18 @@ export class KarmaxApi {
     }
     const world = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
     const rememberedDomain = typeof view.state?.mergeDomain === 'string' ? view.state.mergeDomain : undefined;
-    const domains = world
-      ? mergeQueueDomains(world, view.targetBranch ?? world.target ?? 'main', task.projectId)
+    // A GitHub landing leases one domain per participant repository, which the
+    // world alone does not name; the run publishes every domain it holds.
+    const publishedDomains = Array.isArray(view.state?.mergeDomains)
+      ? view.state.mergeDomains.filter((domain): domain is string => typeof domain === 'string')
+      : [];
+    const domains = [...publishedDomains, ...(world
+      ? [...mergeQueueDomains(world, view.targetBranch ?? world.target ?? 'main', task.projectId), ...(rememberedDomain ? [rememberedDomain] : [])]
       : view.stage === 'merge'
         ? [rememberedDomain ?? mergeQueueDomains(undefined, view.targetBranch ?? 'main', task.projectId)[0]!]
         : rememberedDomain
           ? [rememberedDomain]
-          : [];
+          : [])];
     for (const domain of [...new Set(domains)]) {
       signals.push(this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
         workflowId: mergeQueueId(domain),
@@ -3346,7 +3365,6 @@ export class KarmaxApi {
       }));
     }
     await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
-    return attempted;
   }
 
   /** Setup can be terminated before a WorldHandle containing `worldLeaseId` is
@@ -3565,6 +3583,11 @@ export class KarmaxApi {
     if (view.state?.humanPauseOrigin === target) {
       await (await this.workflowHandle(taskId)).signal(SIG.retry);
       return (await this.getTaskView(token, taskId, { live: true }))!;
+    }
+
+    if (view.status === 'failed' && target === 'do') {
+      await this.recoverFailedTask(taskId);
+      return (await this.getTaskView(token, taskId))!;
     }
 
     if (!['done', 'cancelled', 'failed'].includes(view.status))
@@ -4901,7 +4924,6 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!task || !view) throw new Error(`no failed task ${taskId}`);
     if (!RECOVERABLE_WORKFLOWS.has(task.workflow) || view.status !== 'failed')
       throw new Error(`only a failed ${[...RECOVERABLE_WORKFLOWS].join(' or ')} task can be recovered`);
-    if (view.pointOfNoReturnPassed) throw new Error('cannot recover a task after its merge point of no return');
 
     // Recovery is an explicit migration boundary. Replaying a replacement with
     // the same obsolete implementation can reproduce the exact incompatibility
@@ -4937,33 +4959,22 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       };
     }
     if (world.kind === 'worktree' && !fs.existsSync(world.root)) throw new Error(`preserved worktree no longer exists: ${world.root}`);
+    await this.withdrawCoordinatorClaims(task, view);
 
-    const messages = view.messages.map((m) => ({ ...m }));
-    const seen = typeof view.state?.turnsSeen === 'number' ? view.state.turnsSeen : messages.length;
-    messages.push({
+    // Resume in Do whatever stage failed: a run that died mid-Landing may have
+    // been stopped inside a merge whose outcome only the provider knows, so the
+    // agent and the landing both re-read the live PRs rather than trusting the
+    // checkpoint. The PR set, landing and point of no return carry over, so an
+    // authorized landing that failed resumes as an integration repair.
+    const failedFrom = view.state?.failedFrom as Stage | undefined;
+    const checkpoint = (await this.transitionCheckpoint({ ...view, stage: failedFrom ?? view.stage }, 'do'));
+    const messages = [...checkpoint.messages, {
       id: `recovery-${Date.now()}`,
-      role: 'user',
+      role: 'user' as const,
       text: `${BRAND} recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
-      ts: messages.length,
-    });
-    const session = (await this.deps.store.kvGet(`session:${taskId}:do`)) || undefined;
-    let sessionHome: string | undefined;
-    try {
-      const meta = JSON.parse((await this.deps.store.kvGet(`sessionmeta:${taskId}:do`)) ?? '{}');
-      sessionHome = typeof meta.home === 'string' ? meta.home || '(profile)' : undefined;
-    } catch {
-      /* malformed legacy metadata: conversation still recovers without session resume */
-    }
-    input.recovery = {
-      world,
-      messages,
-      transcripts: view.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) })),
-      reviewInfo: view.reviewInfo,
-      session,
-      sessionHome,
-      seen,
-      target: view.targetBranch,
-    };
+      ts: checkpoint.messages.length,
+    }];
+    input.recovery = { ...checkpoint, world, messages };
 
     const execution = await withTimeout(
       this.deps.client.workflow.start(startType, {
@@ -4996,6 +5007,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (started) (await this.saveAgentSnapshot(taskId, started.manifest, input));
     // Close the short acceptance→first-publish window so the UI cannot offer a
     // second recovery while the replacement run is already starting.
+    const { failedFrom: _failedFrom, ...recoveredState } = view.state;
     (await this.deps.store.saveView(taskId, {
       ...view,
       stage: 'do',
@@ -5003,8 +5015,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       messages,
       error: undefined,
       waitingFor: undefined,
-      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
-      state: { ...view.state, recoveryWorld: world },
+      actions: view.pointOfNoReturnPassed ? [] : [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
+      state: { ...recoveredState, recoveryWorld: world },
     }));
   }
 
@@ -5306,7 +5318,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     }
 
     const terminal = (await this.deps.store.getTask(taskId))?.lastView;
-    if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow) && !terminal.pointOfNoReturnPassed) {
+    if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow)) {
       if (signal === SIG.retry) {
         await this.recoverFailedTask(taskId);
         return;
@@ -5318,11 +5330,12 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
         (target ?? messages).push(msg);
-        (await this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() }));
+        (await this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS(terminal.pointOfNoReturnPassed) }));
         (await this.publishConversationMessage(taskId, role, msg));
         return msg;
       }
       if (signal === SIG.cancel) {
+        if (terminal.pointOfNoReturnPassed) throw new Error('cannot cancel a task after its merge point of no return');
         (await this.saveSettledView(taskId, {
           ...terminal,
           stage: 'cancelled',
