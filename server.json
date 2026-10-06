@@ -1,0 +1,14 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.tavya/tavya",
+  "title": "tavya",
+  "description": "Run and manage AI agent tasks on tavya: create, search and steer tasks, read wikis, call the API.",
+  "websiteUrl": "https://tavya.io",
+  "version": "1.0.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://tavya.io/mcp"
+    }
+  ]
+}

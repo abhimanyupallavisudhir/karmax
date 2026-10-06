@@ -165,7 +165,8 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
  * re-acquire one — the gateway holds sessions in memory, so a gateway restart
  * would otherwise 401 every subsequent call for the life of the agent.
  */
-export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>)): PlatformOps {
+export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>),
+  extraHeaders: Record<string, string> = {}): PlatformOps {
   const resolve = typeof token === 'string' ? async () => token : token;
   let cached: string | undefined = typeof token === 'string' ? token : undefined;
   const req = async (rawPath: string, init: RequestInit = {}, reauth = true): Promise<unknown> => {
@@ -177,7 +178,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     if (cached === undefined) cached = await resolve();
     const res = await fetch(`${baseUrl}${path}`, {
       ...init,
-      headers: { 'content-type': 'application/json', ...(cached ? { authorization: `Bearer ${cached}` } : {}), ...(init.headers ?? {}) },
+      headers: { 'content-type': 'application/json', ...extraHeaders, ...(cached ? { authorization: `Bearer ${cached}` } : {}), ...(init.headers ?? {}) },
     });
     // Session expired or the gateway restarted since we last authed — drop the
     // stale token, re-acquire once, and retry before surfacing an error.
@@ -280,8 +281,15 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
   };
 }
 
-export function createPlatformMcpServer(ops: PlatformOps): McpServer {
-  const server = new McpServer({ name: 'karmax-platform', version: '1.0.0' });
+/** `tools` registers only that subset of the definitions below (the remote
+ * `/mcp` server leaves out tools bound to a calling task). */
+export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: ReadonlySet<string>; name?: string } = {}): McpServer {
+  const server = new McpServer({ name: options.name ?? 'karmax-platform', version: '1.0.0' });
+  if (options.tools) {
+    const register = server.registerTool.bind(server), tools = options.tools;
+    server.registerTool = ((name: string, ...rest: unknown[]) => tools.has(name)
+      ? (register as (...args: unknown[]) => unknown)(name, ...rest) : undefined) as typeof server.registerTool;
+  }
   const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] });
   const wrap = async (fn: () => Promise<any>) => {
     try {
