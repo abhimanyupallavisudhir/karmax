@@ -54,7 +54,7 @@ const view = {
     { id: 'm0', role: 'user', text: 'Build X', ts: 1710000000000 },
     { id: 'm1', role: 'agent', text: 'Should X use Y?', ts: 1 },
     { id: 'm2', role: 'agent', author: 'responder', to: ['agent:do'], text: 'Yes, Y.', ts: 2 },
-    { id: 'm3', role: 'user', author: 'user-2' && 'user:user-2', to: ['agent:confirm', 'user:user-1'], text: '@Reviewer also check Z', ts: 1710000002500 },
+    { id: 'm3', role: 'user', author: 'user:user-2', to: ['agent:confirm', 'user:user-1'], text: '@Reviewer also check Z', ts: 1710000002500 },
   ],
   transcripts: [{ role: 'do', label: 'Do agent', messages: [] }, { role: 'responder', label: 'Responder agent', messages: [] }],
 };

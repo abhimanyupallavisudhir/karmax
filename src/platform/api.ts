@@ -71,7 +71,7 @@ import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from 
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
-import { assertAgentSpec, selectableAvatar } from './agent-params.js';
+import { assertAgentSpec } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
 import { AGENT_SELECTOR, MAIN_AGENT, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
@@ -2185,7 +2185,7 @@ export class KarmaxApi {
     token: string,
     projectId: string,
     authorization: AuthorizationSelection,
-    target: { kind: 'new-task' } | { kind: 'task'; taskId: string; queue?: boolean } | { kind: 'avatar'; avatarId?: string },
+    target: { kind: 'new-task' } | { kind: 'task'; taskId: string; queue?: boolean; participant?: string } | { kind: 'avatar'; avatarId?: string },
     options: { canLimit?: boolean } = {},
   ): Promise<AuthorizationGrantError> {
     const targets = await this.authorizationEscalationTargets(token, { projectId, authorization }).catch(() => undefined);
@@ -2196,20 +2196,21 @@ export class KarmaxApi {
       + `{"target":${taskOrAvatar},"authorization":${JSON.stringify(authorization)},"audience":["${summon}"]}`;
     const limit = options.canLimit === false ? undefined
       : target.kind === 'avatar' ? 'save it with limitAuthorization: true'
+        : target.kind === 'task' && target.participant ? `retry with acceptAttenuation: ["${target.participant}"]`
         : target.kind === 'task' ? `PATCH /api/tasks/${target.taskId}/authorization with acceptAttenuation: true`
           : 'retry with acceptAttenuation: true';
     const ask = !summon ? 'nobody in this organization can grant all of it'
       : target.kind === 'new-task'
         ? `summon ${summon}: create it with draft: true and allowAttenuation: true, then ${request('{"kind":"task","taskId":"<its id>","queueAfterApproval":true}')}; it starts once approved`
         : target.kind === 'task'
-          ? `summon ${summon}: ${request(`{"kind":"task","taskId":"${target.taskId}"${target.queue ? ',"queueAfterApproval":true' : ''}}`)}`
+          ? `summon ${summon}: ${request(`{"kind":"task","taskId":"${target.taskId}"${target.participant ? `,"participant":"${target.participant}"` : ''}${target.queue ? ',"queueAfterApproval":true' : ''}}`)}`
           : target.avatarId ? `summon ${summon}: ${request(`{"kind":"avatar","avatarId":"${target.avatarId}"}`)}`
             : `summon ${summon}: save it with limitAuthorization: true and enabled: false, then `
               + `${request('{"kind":"avatar","avatarId":"<its id>","enableAfterApproval":true}')}`;
     const next = limit ? `To proceed, ${limit} to use only your own authorization, or ${ask}.` : `To proceed, ${ask}.`;
     const shown = missingCapabilities.slice(0, 4).join(', ') + (missingCapabilities.length > 4 ? ` and ${missingCapabilities.length - 4} more` : '');
     return new AuthorizationGrantError(
-      `you cannot grant the ${target.kind === 'avatar' ? 'Avatar' : 'agent'} more authorization than you have: `
+      `you cannot grant the ${target.kind === 'avatar' ? 'Avatar' : target.kind === 'task' && target.participant ? participantLabel(target.participant) : 'agent'} more authorization than you have: `
       + `${summary}${shown ? ` needs ${shown}` : ''}. ${next}`,
       { summary, missingCapabilities, ...(summon ? { summon } : {}), next });
   }
@@ -2346,7 +2347,7 @@ export class KarmaxApi {
     // is refused unless a draft keeps it for later or the setter accepts the
     // limited package. Task defaults are snapshotted attenuated, never widened.
     if (requested.authorization && profileAttenuated && !options.mayAttenuate && !attenuationAccepted)
-      throw Object.assign(new AuthorizationGrantError(`you cannot grant the ${participantLabel(key)} more authorization than you have`),
+      throw Object.assign(await this.authorizationGap(token, task.projectId, selection, { kind: 'task', taskId: task.id, participant: key }),
         { participant: key, authorization: selection });
     const scoped = authorization as typeof authorization & { scope?: AuthorizationSelection['scope']; projectIds?: string[]; organizationId?: string };
     const pinnedGithubAccountId = typeof task.params?._githubAccountId === 'string' ? task.params._githubAccountId : undefined;

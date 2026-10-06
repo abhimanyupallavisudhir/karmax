@@ -900,7 +900,7 @@ async function softwareDevImpl(
     Object.fromEntries(Object.entries(continued?.participants?.sessions ?? {}).map(([key, value]) => [key, { ...value }]));
   let agentQueue: string[] = [...(continued?.participants?.queue ?? [])];
   /** Who last called each agent, so its reply goes back to them. */
-  const calledBy: Record<string, string> = { ...(continued?.participants?.calledBy ?? {}) };
+  const calledBy: Record<string, string> = { ...continued?.participants?.calledBy };
   let runningParticipant: string | undefined;
   /** A redirect of the request a Responder agent is answering (v1.27 `reroute`). */
   let pendingReroute: { audience: string[]; detail?: string } | undefined;
