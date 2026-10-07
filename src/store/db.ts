@@ -6402,6 +6402,12 @@ export class Store {
     });
   }
 
+  /** The version a world's copy now descends from, after newer published
+   * changes were merged into it. */
+  async rebaseResourceLease(id: string, revisionId: string): Promise<void> {
+    (await this.db.prepare('UPDATE resource_leases SET revisionId=? WHERE id=?').run(revisionId, id));
+  }
+
   // ─── Organization storage locations and physical snapshot accounting ─────
 
   async saveStorageLocation(input: Omit<StorageLocation, 'createdAt' | 'updatedAt'>
