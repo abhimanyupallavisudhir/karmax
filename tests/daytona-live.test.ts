@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DaytonaWorldProvider } from '../src/world/daytona.js';
 import { CodexAppServerClient } from '../src/agent/codex-app-server-client.js';
-import { ensureRemoteNode, spawnRemoteAgentProcess } from '../src/agent/remote-process.js';
+import { ensureRemoteNode, remoteAgentEnv, spawnRemoteAgentProcess } from '../src/agent/remote-process.js';
 import type { World } from '../src/world/types.js';
 import { liveEnabled } from './helpers/live-gate.js';
 
@@ -91,6 +91,63 @@ describe.skipIf(!live)('Daytona live lifecycle', () => {
     } finally { await world.destroy(); }
     expect(await provider.probe(world.handle)).toBe('missing');
   }, 600_000);
+
+  // Task #514: Daytona closes a PTY socket on any input frame over 64 KiB, and
+  // the Claude SDK sends its whole system prompt and tool manifests in one
+  // initialize line. No model call is made: the prompt stream never yields.
+  it('completes a real Claude SDK handshake whose initialize line exceeds 64 KiB', async () => {
+    const provider = new DaytonaWorldProvider();
+    const world = await provider.create({ taskId: `live-daytona-claude-${Date.now()}`, base: 'main', network: { unrestricted: true } });
+    try {
+      const runtimeBin = await ensureRemoteNode(world);
+      const home = `${world.handle.root}/.fixture/claude`;
+      await world.writeFile('.fixture/claude/.keep', '');
+      const { query } = await import('@anthropic-ai/claude-agent-sdk');
+      const appendSystemPrompt = 'Context for the Daytona PTY framing regression (task 514).\n'.repeat(3000);
+      expect(Buffer.byteLength(appendSystemPrompt)).toBeGreaterThan(128 * 1024);
+      let agent: ReturnType<typeof spawnRemoteAgentProcess> | undefined;
+      let release!: () => void;
+      const idle = new Promise<void>((resolve) => { release = resolve; });
+      const q = query({
+        prompt: { [Symbol.asyncIterator]: () => ({ next: async () => { await idle; return { done: true as const, value: undefined }; } }) },
+        options: {
+          systemPrompt: { type: 'preset', preset: 'claude_code', append: appendSystemPrompt },
+          spawnClaudeCodeProcess: (o) => {
+            const env = remoteAgentEnv('claude', home, o.env);
+            env.PATH = `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+            agent = spawnRemoteAgentProcess({ world, provider: 'claude', command: o.command, args: o.args,
+              cwd: world.handle.root, env, signal: o.signal });
+            agent.on('error', () => {});
+            return agent as any;
+          },
+        },
+      });
+      try {
+        const init = await deadline(q.initializationResult(), 240_000);
+        expect(init).toHaveProperty('commands');
+        expect(agent?.lost).toBeUndefined();
+      } finally {
+        release();
+        q.close();
+        await agent?.stop().catch(() => undefined);
+      }
+    } finally { await world.destroy(); }
+  }, 600_000);
+
+  it('carries one 140 KB PTY write to the process intact', async () => {
+    const provider = new DaytonaWorldProvider();
+    const world = await provider.create({ taskId: `live-daytona-pty-${Date.now()}`, base: 'main', network: { unrestricted: true } });
+    try {
+      const terminal = await world.openPty({ command: 'stty raw -echo; printf "%s\\n" "READY"; head -c 140000 > /tmp/karmax-in; printf "GOT=%s\\n" "$(wc -c < /tmp/karmax-in)"; exit 7' });
+      let out = '';
+      terminal.onData((chunk) => { out += chunk; });
+      const exited = new Promise<[number | null, unknown]>((resolve) => terminal.onExit((code, ending) => resolve([code, ending])));
+      for (let i = 0; i < 300 && !/READY\r?\n/.test(out); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+      await terminal.write('z'.repeat(140_000));
+      expect(await deadline(exited, 60_000)).toEqual([7, undefined]);
+      expect(out).toContain('GOT=140000');
+    } finally { await world.destroy(); }
+  }, 300_000);
 
   it('provisions a real Git checkout, removes clone credentials and adds a sibling branch', async () => {
     const repo = 'git@github.com:octocat/Hello-World.git';

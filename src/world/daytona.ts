@@ -17,6 +17,8 @@ const DEFAULT_IDLE_MS = 10 * 60_000;
  * 64 KiB, and the SDK then reports no exit status (task #514: the Claude SDK's
  * initialize line is larger). Half the limit leaves room for framing. */
 const PTY_INPUT_FRAME_BYTES = 32 * 1024;
+const PTY_REATTACH_LIMIT = 3;
+const PTY_REATTACH_WINDOW_MS = 10 * 60_000;
 
 /** Structural SDK boundary: production uses @daytona/sdk, tests use an in-memory
  * double. Provider SDK objects and sandbox IDs never cross this module. */
@@ -38,6 +40,8 @@ export interface DaytonaSandboxLike {
     deleteSession?(id: string): Promise<void>;
     createPty(options: { id: string; cwd?: string; envs?: Record<string, string>; cols?: number; rows?: number;
       onData: (data: Uint8Array) => void }): Promise<any>;
+    /** Follow an existing PTY session again after its socket dropped. */
+    connectPty?(id: string, options: { onData: (data: Uint8Array) => void }): Promise<any>;
   };
   fs: {
     downloadFile(remotePath: string): Promise<Buffer>;
@@ -448,24 +452,42 @@ class DaytonaWorld implements World {
     const pending: string[] = [];
     let attached = false;
     let exited = false;
+    let closed = false;
     let exitCode: number | null = null;
     let termination: WorldPtyTermination | undefined;
     const decoder = new TextDecoder();
-    const terminal = await this.sandbox.process.createPty({ id: `karmax-${crypto.randomBytes(8).toString('hex')}`,
-      cwd: this.cwd(spec.cwd), envs: remoteEnv(spec.env), cols: spec.cols ?? 80, rows: spec.rows ?? 24,
-      onData: (data: Uint8Array) => {
-        const chunk = decoder.decode(data, { stream: true });
-        if (!attached) pending.push(chunk);
-        for (const listener of output) listener(chunk);
-      } });
+    const onData = (data: Uint8Array) => {
+      const chunk = decoder.decode(data, { stream: true });
+      if (!chunk) return;
+      if (!attached) pending.push(chunk);
+      for (const listener of output) listener(chunk);
+    };
+    const id = `karmax-${crypto.randomBytes(8).toString('hex')}`;
+    let terminal = await this.sandbox.process.createPty({ id,
+      cwd: this.cwd(spec.cwd), envs: remoteEnv(spec.env), cols: spec.cols ?? 80, rows: spec.rows ?? 24, onData });
+    // Settles once a dropped socket has been reattached or given up on; input
+    // waits for it so no frame is sent into a dead socket.
+    let reattaching: Promise<void> | undefined;
     // One write may exceed a frame; queue writes so concurrent callers'
     // frames never interleave.
     let sending = Promise.resolve();
     const send = (data: string): Promise<void> => {
       const bytes = new TextEncoder().encode(data);
       const sent = sending.then(async () => {
-        for (let at = 0; at < bytes.byteLength; at += PTY_INPUT_FRAME_BYTES)
-          await terminal.sendInput(bytes.subarray(at, at + PTY_INPUT_FRAME_BYTES));
+        for (let at = 0; at < bytes.byteLength; at += PTY_INPUT_FRAME_BYTES) {
+          const frame = bytes.subarray(at, at + PTY_INPUT_FRAME_BYTES);
+          await reattaching;
+          const target = terminal;
+          try { await target.sendInput(frame); }
+          catch (error) {
+            // The socket may have closed a moment before wait() reports it:
+            // give the drop a turn to start reattaching, then resend once.
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            await reattaching;
+            if (terminal === target || exited) throw error;
+            await terminal.sendInput(frame);
+          }
+        }
       });
       sending = sent.catch(() => undefined);
       return sent;
@@ -481,8 +503,6 @@ class DaytonaWorld implements World {
       try { await terminal.disconnect?.(); } catch { /* preserve startup failure */ }
       throw error;
     }
-    // A socket that closed without an exit status lost the stream, not the
-    // process: the agent may still be running in the sandbox.
     const end = (code: number | null, ending?: WorldPtyTermination) => {
       stopKeepAlive();
       exited = true;
@@ -490,10 +510,29 @@ class DaytonaWorld implements World {
       termination = ending;
       for (const listener of exits) listener(exitCode, termination);
     };
-    void Promise.resolve(terminal.wait?.()).then((result) => {
-      if (typeof result?.exitCode === 'number') end(result.exitCode);
-      else end(null, { lost: new Error(`Daytona PTY connection closed without an exit status${result?.error ? ` (${String(result.error)})` : ''}`) });
-    }).catch((error) => end(null, { lost: error instanceof Error ? error : new Error(String(error)) }));
+    // A socket that closed without an exit status lost the stream, not the
+    // process: the session keeps running in the sandbox, so follow it again
+    // (at most three times in ten minutes, never after karmax closed it). Only
+    // when that fails is it reported as lost — the agent may still be running.
+    let reattached: number[] = [];
+    const lost = async (error: Error) => {
+      reattached = reattached.filter((at) => Date.now() - at < PTY_REATTACH_WINDOW_MS);
+      if (!closed && this.sandbox.process.connectPty && reattached.length < PTY_REATTACH_LIMIT) {
+        reattached.push(Date.now());
+        let done!: () => void;
+        reattaching = new Promise<void>((resolve) => { done = resolve; });
+        const again = await this.sandbox.process.connectPty(id, { onData }).catch(() => undefined);
+        if (again && !closed) { terminal = again; done(); follow(); return; }
+        if (again) void Promise.resolve(again.disconnect?.()).catch(() => undefined);
+        done();
+      }
+      end(null, { lost: error });
+    };
+    const follow = () => void Promise.resolve(terminal.wait?.()).then((result) => {
+      if (typeof result?.exitCode === 'number') return end(result.exitCode);
+      return lost(new Error(`Daytona PTY connection closed without an exit status${result?.error ? ` (${String(result.error)})` : ''}`));
+    }, (error) => lost(error instanceof Error ? error : new Error(String(error))));
+    follow();
     return {
       onData(listener) {
         output.add(listener);
@@ -506,8 +545,9 @@ class DaytonaWorld implements World {
         return () => exits.delete(listener);
       },
       async write(data) { await send(data); },
-      async resize(cols, rows) { await terminal.resize(cols, rows); },
+      async resize(cols, rows) { await reattaching; await terminal.resize(cols, rows); },
       async close() {
+        closed = true;
         stopKeepAlive();
         try { if (!exited) await terminal.kill?.(); } finally { await terminal.disconnect?.(); }
       },

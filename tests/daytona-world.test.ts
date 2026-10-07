@@ -480,6 +480,74 @@ describe('Daytona cloud world provider', () => {
     expect(termination.lost.message).toContain('without an exit status');
   });
 
+  it('reattaches a dropped PTY socket to the still-running session and keeps its output and input', async () => {
+    const sandbox = fakeSandbox();
+    const inputs: string[] = [];
+    let drop!: () => void;
+    let created: any;
+    sandbox.process.createPty = async (options: any) => {
+      created = options;
+      return { async waitForConnection() {}, async resize() {}, async kill() {},
+        async sendInput(value: Uint8Array) { inputs.push(`first:${new TextDecoder().decode(value)}`); },
+        wait: () => new Promise((resolve) => { drop = () => resolve({ exitCode: undefined }); }) };
+    };
+    const connects: string[] = [];
+    (sandbox.process as any).connectPty = async (id: string, options: any) => {
+      connects.push(id);
+      queueMicrotask(() => options.onData(new TextEncoder().encode('after')));
+      return { async waitForConnection() {}, async resize() {}, async kill() {},
+        async sendInput(value: Uint8Array) { inputs.push(`second:${new TextDecoder().decode(value)}`); },
+        wait: () => new Promise((resolve) => setTimeout(() => resolve({ exitCode: 5 }), 20)) };
+    };
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'reattach', base: 'main' });
+    const pty = await world.openPty({ command: 'exec agent' });
+    let output = '';
+    pty.onData((chunk) => { output += chunk; });
+    const exited = new Promise<[number | null, any]>((resolve) => pty.onExit((code, ending) => resolve([code, ending])));
+    created.onData(new TextEncoder().encode('before|'));
+    drop();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await pty.write('ping\n');
+    expect(await exited).toEqual([5, undefined]);
+    expect(connects).toEqual([created.id]);
+    expect(output).toBe('before|after');
+    expect(inputs).toEqual(['first:exec agent\n', 'second:ping\n']);
+  });
+
+  it('stops reattaching after three drops in ten minutes and reports the connection lost', async () => {
+    const sandbox = fakeSandbox();
+    const drops = () => ({ async waitForConnection() {}, async resize() {}, async kill() {}, async sendInput() {},
+      async wait() { return { exitCode: undefined, error: 'socket closed' }; } });
+    sandbox.process.createPty = async () => drops();
+    let connects = 0;
+    (sandbox.process as any).connectPty = async () => { connects++; return drops(); };
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'reattach-limit', base: 'main' });
+    const pty = await world.openPty();
+    const [code, ending] = await new Promise<[number | null, any]>((resolve) => pty.onExit((c, e) => resolve([c, e])));
+    expect(connects).toBe(3);
+    expect(code).toBeNull();
+    expect(ending.lost.message).toContain('socket closed');
+  });
+
+  it('never reattaches a PTY that karmax closed', async () => {
+    const sandbox = fakeSandbox();
+    let drop!: () => void;
+    sandbox.process.createPty = async () => ({ async waitForConnection() {}, async resize() {}, async sendInput() {},
+      async kill() { drop(); }, async disconnect() {},
+      wait: () => new Promise((resolve) => { drop = () => resolve({ exitCode: undefined }); }) });
+    const connectPty = vi.fn();
+    (sandbox.process as any).connectPty = connectPty;
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'closed', base: 'main' });
+    const pty = await world.openPty();
+    const exited = new Promise((resolve) => pty.onExit(resolve));
+    await pty.close();
+    await exited;
+    expect(connectPty).not.toHaveBeenCalled();
+  });
+
   it('keeps a real zero exit status as exit 0', async () => {
     const sandbox = fakeSandbox();
     sandbox.process.createPty = async () => ({
