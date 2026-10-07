@@ -1,12 +1,11 @@
 name: CLI release
 
-# Publishes the tavya CLI (src/cli): the bundled npm package `tavya`, and single
+# Publishes the tavya CLI (src/cli): the bundled npm package `@tavya/cli`, and single
 # executables for each platform on the GitHub release `cli-v<version>`
 # (installed by https://tavya.io/cli/install.sh). Runs when such a tag is
 # pushed, or by hand (workflow_dispatch) on a branch, which releases that
-# commit's cli/package.json version and creates its tag. npm publishing needs
-# the NPM_TOKEN secret and is skipped without it; the package can also be
-# published with `npm publish` from cli/ (wiki features/tavya-cli).
+# commit's cli/package.json version and creates its tag. npm publishes through
+# trusted publishing (no token; job `npm`).
 on:
   push:
     tags: ['cli-v*']
@@ -111,9 +110,12 @@ jobs:
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --title "tavya CLI ${TAG#cli-v}" \
-                 --notes "Install: \`curl -fsSL https://tavya.io/cli/install.sh | sh\` or \`npm install -g tavya\`."
+                 --notes "Install: \`curl -fsSL https://tavya.io/cli/install.sh | sh\` or \`npm install -g @tavya/cli\`."
           gh release upload "$TAG" assets/* --repo "$GITHUB_REPOSITORY" --clobber
 
+  # npm trusted publishing (configured 2026-10-07 for this repository and file):
+  # npm exchanges this job's GitHub OIDC token for a short-lived publish token,
+  # so no npm token is stored anywhere. Needs npm >= 11.5.1.
   npm:
     needs: bundle
     runs-on: ubuntu-latest
@@ -126,11 +128,12 @@ jobs:
         with: { ref: '${{ needs.bundle.outputs.sha }}' }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0', registry-url: 'https://registry.npmjs.org' }
+      - run: npm install -g npm@11
       - uses: actions/download-artifact@v4
         with: { name: tavya-mjs, path: cli/dist }
       - name: Publish
-        env: { NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}' }
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "::warning::NPM_TOKEN is not set; skipping npm publish"; exit 0; fi
+          version="$(node -p "require('./cli/package.json').version")"
+          if npm view "@tavya/cli@${version}" version >/dev/null 2>&1; then echo "@tavya/cli@${version} is already on npm"; exit 0; fi
           chmod +x cli/dist/tavya.mjs
           cd cli && npm publish --access public --provenance

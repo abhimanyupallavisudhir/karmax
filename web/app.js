@@ -10656,7 +10656,7 @@ async function openLocalCheckout(v) {
   const rec = taskRecord(v.taskId);
   const project = projectById(rec?.projectId || S.projectId);
   return cliHandoffDialog({
-    command: `npx tavya clone ${cliTarget(project, rec?.num)}`,
+    command: `npx @tavya/cli clone ${cliTarget(project, rec?.num)}`,
     note: `Code, data and secrets, as this task's world has them. <span class="mono nowrap">tavya push</span> brings your work back here; <span class="mono nowrap">tavya resume --fork</span> continues its agent on your machine.`,
     gitOnly: async (body) => {
       const [plan, preparedSessions] = await Promise.all([
@@ -10685,7 +10685,7 @@ async function openLocalCheckout(v) {
 async function openProjectCheckout(project) {
   if (!project?.id) return;
   return cliHandoffDialog({
-    command: `npx tavya clone ${cliTarget(project)}`,
+    command: `npx @tavya/cli clone ${cliTarget(project)}`,
     note: `Code, data and secrets, as a task's world has them. <span class="mono nowrap">tavya pull</span> and <span class="mono nowrap">tavya push</span> keep them in step.`,
     gitOnly: async (body) => {
       const plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`);
@@ -22020,7 +22020,7 @@ async function hydrateAppGrants() {
           · ${grant.lastUsedAt ? `used ${esc(fmtAgo(grant.lastUsedAt))}` : 'never used'}
           · <span title="${esc(`Created ${new Date(grant.createdAt).toLocaleString()}`)}">${grant.kind === 'token' ? 'expires' : 'expires if unused by'} ${esc(day(grant.expiresAt))}</span></p></div>
       <button class="btn sm danger" type="button" data-revoke-grant="${esc(grant.id)}">Revoke</button></div>`).join('')
-    : '<p class="task-sub">Nothing signed in. <code>npx tavya login</code> signs in a terminal.</p>';
+    : '<p class="task-sub">Nothing signed in. <code>npx @tavya/cli login</code> signs in a terminal.</p>';
   box.querySelectorAll('[data-revoke-grant]').forEach((button) => button.addEventListener('click', async () => {
     const name = button.closest('.app-grant-row')?.querySelector('b')?.textContent || 'this';
     if (!confirm(`Revoke ${name}? It is signed out at once.`)) return;

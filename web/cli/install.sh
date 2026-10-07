@@ -1,13 +1,13 @@
 #!/bin/sh
 # Installs the tavya CLI:  curl -fsSL https://tavya.io/cli/install.sh | sh
 # A single executable from the CLI's GitHub release, checked against that
-# release's SHA256SUMS. With Node 22 you can instead run `npm install -g tavya`.
+# release's SHA256SUMS. With Node 22 you can instead run `npm install -g @tavya/cli`.
 # TAVYA_VERSION=1.2.3 pins a version; TAVYA_INSTALL_DIR overrides ~/.local/bin.
 set -eu
 repo=abhimanyupallavisudhir/karmax
 os=$(uname -s); arch=$(uname -m)
-case "$os" in Linux) os=linux ;; Darwin) os=darwin ;; *) echo "tavya: no build for $os; use: npm install -g tavya" >&2; exit 1 ;; esac
-case "$arch" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) echo "tavya: no build for $arch; use: npm install -g tavya" >&2; exit 1 ;; esac
+case "$os" in Linux) os=linux ;; Darwin) os=darwin ;; *) echo "tavya: no build for $os; use: npm install -g @tavya/cli" >&2; exit 1 ;; esac
+case "$arch" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) echo "tavya: no build for $arch; use: npm install -g @tavya/cli" >&2; exit 1 ;; esac
 version=${TAVYA_VERSION:-}
 if [ -z "$version" ]; then
   version=$(curl -fsSL "https://api.github.com/repos/$repo/releases?per_page=100" | grep -o '"tag_name": *"cli-v[^"]*"' | head -n 1 | sed 's/.*cli-v//; s/"$//')

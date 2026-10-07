@@ -27,7 +27,7 @@ it('Work locally is one tavya command; the Git-only steps load only when asked f
     openLocalCheckout({ taskId: 'task-1', status: 'waiting', waitingFor: { kind: 'human' } })`);
   const dialog = ui.page.locator('.local-handoff-scrim');
   // On another origin than tavya.io the command names its server through the task's URL.
-  await expect.poll(() => dialog.locator('pre').first().textContent()).toBe('npx tavya clone http://console.test/acme/site-builder/tasks/12');
+  await expect.poll(() => dialog.locator('pre').first().textContent()).toBe('npx @tavya/cli clone http://console.test/acme/site-builder/tasks/12');
   expect(ui.calls.filter((call) => call.path.startsWith('/api/tasks/'))).toEqual([]);
   await shot(ui.page, 'work-locally-task');
   await dialog.getByText('Git only').click();
@@ -37,7 +37,7 @@ it('Work locally is one tavya command; the Git-only steps load only when asked f
   await dialog.getByRole('button', { name: 'Close' }).click();
 
   await ui.run(`openProjectCheckout(S.projects[0])`);
-  await expect.poll(() => ui.page.locator('.local-handoff-scrim pre').first().textContent()).toBe('npx tavya clone http://console.test/acme/site-builder');
+  await expect.poll(() => ui.page.locator('.local-handoff-scrim pre').first().textContent()).toBe('npx @tavya/cli clone http://console.test/acme/site-builder');
   await shot(ui.page, 'work-locally-project');
   expect(ui.errors).toEqual([]);
   await ui.close();

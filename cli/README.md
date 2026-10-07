@@ -3,7 +3,7 @@
 Work on [tavya](https://tavya.io) projects and tasks from your own machine.
 
 ```sh
-curl -fsSL https://tavya.io/cli/install.sh | sh     # or: npm install -g tavya  (Node 22)
+curl -fsSL https://tavya.io/cli/install.sh | sh     # or: npm install -g @tavya/cli  (Node 22)
 tavya clone acme/site                                # repositories, data and secret files
 tavya clone acme/site#123                            # a task, as its cloud world has it
 ```

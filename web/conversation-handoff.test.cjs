@@ -35,7 +35,7 @@ for (const local of [false, true]) test(`${local ? 'local' : 'hosted'} checkout 
   await vm.runInContext(`${local ? 'materializeLocalCheckout' : 'openLocalCheckout'}({ taskId: 'task-1', status: 'done' })`, context);
   if (!local) {
     // Hosted: the dialog is the CLI command; nothing is fetched until the Git-only fold opens.
-    assert.match(host.innerHTML, /npx tavya clone acme\/site#3/);
+    assert.match(host.innerHTML, /npx @tavya\/cli clone acme\/site#3/);
     assert.equal(calls.length, 0);
     await listeners.toggle({ currentTarget: { open: true } });
   }
