@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { DaytonaWorldProvider, type DaytonaFactory, type DaytonaSandboxLike } from '../src/world/daytona.js';
+import { spawnSync } from 'node:child_process';
+import { DaytonaWorldProvider, daytonaSize, provisionTarget, type DaytonaFactory, type DaytonaSandboxLike } from '../src/world/daytona.js';
 
 describe('Daytona cloud world provider', () => {
   it('rejects an unauthenticated legacy sandbox ID before any provider operation (WD-30)', async () => {
@@ -548,6 +549,90 @@ describe('Daytona cloud world provider', () => {
     expect(connectPty).not.toHaveBeenCalled();
   });
 
+  // Daytona's execute API returns stdout and stderr merged into one `result`.
+  it('returns stdout and stderr separately although Daytona merges them', async () => {
+    const sandbox = fakeSandbox();
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'stderr', base: 'main' });
+    sandbox.process.executeCommand = async (command: string) => mergedShell(command);
+    expect(await world.exec('sh', ['-c', 'printf abc; printf XYZ >&2; printf def; exit 4']))
+      .toEqual({ stdout: 'abcdef', stderr: 'XYZ', code: 4 });
+    expect(await world.exec('printf', ['%s', 'only-out'])).toEqual({ stdout: 'only-out', stderr: '', code: 0 });
+    expect(await world.exec('sh', ['-c', 'printf "a\\nKARMAX_ERR"; printf "e\\0f" >&2'])).toEqual({ stdout: 'a\nKARMAX_ERR', stderr: 'e\0f', code: 0 });
+  });
+
+  it('separates stderr from stdout during trusted provisioning', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.executeCommand = async (command: string) => mergedShell(command);
+    expect(await provisionTarget(sandbox).run("echo 'warning: x' >&2; echo out; exit 2", 10_000))
+      .toEqual({ stdout: 'out\n', stderr: 'warning: x\n', code: 2 });
+  });
+
+  it('sizes a world from Daytona\'s general snapshots, defaulting to E2B\'s 2 vCPU / 2 GB', async () => {
+    expect(daytonaSize(undefined)).toMatchObject({ snapshot: 'daytona-medium', cpu: 2, memory: 4 });
+    expect(daytonaSize({ cpu: 1, memoryMb: 1024 })).toMatchObject({ snapshot: 'daytona-small', cpu: 1, memory: 1 });
+    expect(daytonaSize({ cpu: 2, memoryMb: 2048 })).toMatchObject({ snapshot: 'daytona-medium' });
+    expect(daytonaSize({ cpu: 1, memoryMb: 6144 })).toMatchObject({ snapshot: 'daytona-large', cpu: 4, memory: 8 });
+    expect(daytonaSize({ cpu: 16, memoryMb: 65536 })).toMatchObject({ snapshot: 'daytona-large' });
+    const created: any[] = [];
+    const sandbox = fakeSandbox();
+    Object.assign(sandbox, { cpu: 2, memory: 4 });
+    const provider = new DaytonaWorldProvider({ create: async (options) => { created.push(options); return sandbox; }, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'sized', base: 'main', resources: { cpu: 2, memoryMb: 2048 } });
+    expect(created[0]).toMatchObject({ snapshot: 'daytona-medium' });
+    expect(world.handle.warnings ?? []).toEqual([]);
+    await provider.create({ taskId: 'sized-default', base: 'main' });
+    expect(created[1]).toMatchObject({ snapshot: 'daytona-medium' });
+  });
+
+  it('keeps an explicitly configured snapshot and warns only when it is smaller than requested', async () => {
+    const created: any[] = [];
+    const sandbox = fakeSandbox();
+    Object.assign(sandbox, { cpu: 1, memory: 1 });
+    const provider = new DaytonaWorldProvider({ create: async (options) => { created.push(options); return sandbox; }, get: async () => sandbox },
+      undefined, 'custom-snapshot');
+    const small = await provider.create({ taskId: 'custom', base: 'main', resources: { cpu: 2, memoryMb: 2048 } });
+    expect(created[0]).toMatchObject({ snapshot: 'custom-snapshot' });
+    expect(small.handle.warnings?.[0]).toContain('1 CPUs, 1 GiB RAM');
+    Object.assign(sandbox, { cpu: 4, memory: 8 });
+    const large = await provider.create({ taskId: 'custom-large', base: 'main', resources: { cpu: 2, memoryMb: 2048 } });
+    expect(large.handle.warnings ?? []).toEqual([]);
+  });
+
+  it('falls back to Daytona\'s default when a general size snapshot is unavailable', async () => {
+    const created: any[] = [];
+    const sandbox = fakeSandbox();
+    const provider = new DaytonaWorldProvider({ create: async (options) => {
+      created.push(options);
+      if (options.snapshot) throw Object.assign(new Error('Snapshot daytona-medium not found'), { statusCode: 404 });
+      return sandbox;
+    }, get: async () => sandbox });
+    await provider.create({ taskId: 'fallback', base: 'main' });
+    expect(created.map((options) => options.snapshot)).toEqual(['daytona-medium', undefined]);
+  });
+
+  it('explains a failure from Daytona\'s minute-granular memory metrics without crying stall', async () => {
+    const sandbox = fakeSandbox();
+    const now = Date.parse('2026-10-07T08:12:00Z');
+    let samples: Array<{ timestamp: Date; memUsed: number; memTotal: number }> = [];
+    (sandbox as any).getMetrics = async (start: Date, end: Date) => {
+      expect(end.getTime()).toBe(now);
+      expect(start.getTime()).toBeLessThan(now);
+      return samples;
+    };
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'diagnose', base: 'main' });
+    const gib = 2 ** 30;
+    samples = [{ timestamp: new Date('2026-10-07T08:09:00Z'), memUsed: 0.5 * gib, memTotal: 4 * gib },
+      { timestamp: new Date('2026-10-07T08:10:00Z'), memUsed: 0.6 * gib, memTotal: 4 * gib }];
+    expect(await world.diagnose!({ since: now - 10 * 60_000, now })).toBeUndefined();
+    samples = [...samples, { timestamp: new Date('2026-10-07T08:11:00Z'), memUsed: 3.95 * gib, memTotal: 4 * gib }];
+    expect(await world.diagnose!({ since: now - 10 * 60_000, now })).toMatchObject({ memoryExhausted: true,
+      summary: expect.stringContaining('of 4096 MB') });
+    (sandbox as any).getMetrics = async () => { throw new Error('telemetry down'); };
+    expect(await world.diagnose!({ since: now - 10 * 60_000, now })).toBeUndefined();
+  });
+
   it('keeps a real zero exit status as exit 0', async () => {
     const sandbox = fakeSandbox();
     sandbox.process.createPty = async () => ({
@@ -573,4 +658,10 @@ function fakeSandbox(): DaytonaSandboxLike {
     getUserHomeDir: async () => '/home/daytona', getSignedPreviewUrl: async () => ({ url: 'https://invalid/' }),
     start: async () => {}, stop: async () => {}, archive: async () => {}, delete: async () => {},
   };
+}
+
+/** Daytona's execute API: run through a shell, stdout and stderr merged. */
+function mergedShell(command: string) {
+  const run = spawnSync('sh', ['-c', `exec 2>&1; ${command}`], { encoding: 'utf8' });
+  return { exitCode: run.status ?? -1, result: run.stdout };
 }

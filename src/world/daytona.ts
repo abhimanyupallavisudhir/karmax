@@ -1,9 +1,11 @@
 import type { WorldReferenceKeys } from './reference-keys.js';
 import { isMissingSandbox } from './provider-errors.js';
+import { diagnoseMetrics } from './health.js';
+import { withTimeout } from '../util/timeout.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import type { ExecOptions, ExecResult, ProviderSandboxRef, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
-  WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldProvider, WorldPty, WorldPtySpec, WorldPtyTermination, WorldSpec } from './types.js';
+  WorldDiagnosis, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldProvider, WorldPty, WorldPtySpec, WorldPtyTermination, WorldSpec } from './types.js';
 import { worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
 import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
@@ -18,6 +20,26 @@ const DEFAULT_IDLE_MS = 10 * 60_000;
  * initialize line is larger). Half the limit leaves room for framing. */
 const PTY_INPUT_FRAME_BYTES = 32 * 1024;
 const PTY_REATTACH_LIMIT = 3;
+const DIAGNOSIS_WINDOW_MS = 30 * 60_000;
+const METRICS_SILENT_MS = 5 * 60_000;
+/** Daytona's general Linux snapshots, smallest first (cpu, GiB RAM, GB disk).
+ * Without a configured snapshot Daytona uses a 1 vCPU / 1 GiB default, too
+ * small for an agent, its browser and a dependency install (task #514). */
+const DAYTONA_SIZES = [
+  { snapshot: 'daytona-small', cpu: 1, memory: 1, disk: 3 },
+  { snapshot: 'daytona-medium', cpu: 2, memory: 4, disk: 8 },
+  { snapshot: 'daytona-large', cpu: 4, memory: 8, disk: 10 },
+] as const;
+/** What an unconfigured world needs: the same 2 vCPU / 2 GB as E2B's template. */
+const DEFAULT_WORLD_RESOURCES = { cpu: 2, memoryMb: 2048 };
+
+/** The smallest general Daytona size that covers the requested CPU and memory
+ * (the largest when none does). Task worlds and setup snapshots share it. */
+export function daytonaSize(resources?: { cpu?: number; memoryMb?: number }): (typeof DAYTONA_SIZES)[number] {
+  const cpu = resources?.cpu ?? DEFAULT_WORLD_RESOURCES.cpu;
+  const memoryMb = resources?.memoryMb ?? DEFAULT_WORLD_RESOURCES.memoryMb;
+  return DAYTONA_SIZES.find((size) => size.cpu >= cpu && size.memory * 1024 >= memoryMb) ?? DAYTONA_SIZES.at(-1)!;
+}
 const PTY_REATTACH_WINDOW_MS = 10 * 60_000;
 
 /** Structural SDK boundary: production uses @daytona/sdk, tests use an in-memory
@@ -56,6 +78,8 @@ export interface DaytonaSandboxLike {
   /** Re-arm the auto-stop countdown. Present in current SDKs; when absent the
    * keep-alive falls back to a no-op command (which is sandbox activity). */
   refreshActivity?(): Promise<void>;
+  /** Minute-granular history from Daytona's telemetry, in bytes. */
+  getMetrics?(start?: Date, end?: Date): Promise<Array<{ timestamp: Date | string; memUsed: number; memTotal: number }>>;
   setAutostopInterval?(minutes: number): Promise<unknown>;
   start(timeoutSeconds?: number): Promise<void>;
   stop(timeoutSeconds?: number, force?: boolean): Promise<void>;
@@ -113,13 +137,16 @@ export class DaytonaWorldProvider implements WorldProvider {
     const selectedImage = selectedSnapshot ? undefined : environment.image ?? (flavor === 'desktop'
       ? connection?.config.desktopImage ?? this.desktopImage
       : connection?.config.image ?? this.image);
+    // Nothing configured: pick the general snapshot sized for the request. If
+    // this Daytona has no such snapshot, fall back to its own default.
+    const sized = !selectedSnapshot && !selectedImage && flavor === 'headless' ? daytonaSize(spec.resources).snapshot : undefined;
     const network = daytonaNetwork(spec);
     const labels = { karmaxTaskId: spec.taskId, karmaxHome: serviceHomeLabel(), karmaxGeneration: String(spec.generation ?? 1) };
     const trustedSsh = Boolean(spec.gitCredentials?.sshKey || Object.keys(spec.gitCredentials?.repositories ?? {}).length);
     let sandbox = await findProvisioningSandbox(factory, labels);
     let adopted = Boolean(sandbox);
-    if (!sandbox) sandbox = await factory.create({
-      ...(selectedSnapshot ? { snapshot: selectedSnapshot } : {}),
+    const createOptions = (snapshot: string | undefined) => ({
+      ...(snapshot ? { snapshot } : {}),
       ...(selectedImage ? { image: selectedImage } : {}),
       // `karmaxHome` scopes orphan reaping to sandboxes THIS deployment
       // created: several karmax instances can share one Daytona account, and
@@ -133,6 +160,10 @@ export class DaytonaWorldProvider implements WorldProvider {
       autoDeleteInterval: -1, ...(trustedSsh ? { networkBlockAll: false } : network),
       ...(selectedImage && spec.resources ? { resources: { cpu: spec.resources.cpu,
         memory: spec.resources.memoryMb ? Math.ceil(spec.resources.memoryMb / 1024) : undefined, gpu: spec.resources.gpu } } : {}),
+    });
+    if (!sandbox) sandbox = await factory.create(createOptions(selectedSnapshot ?? sized)).catch(async (error) => {
+      if (sized && isMissingSnapshot(error)) return factory.create(createOptions(undefined));
+      throw error;
     }).catch(async (error) => {
       const recovered = await findProvisioningSandbox(factory, labels).catch(() => undefined);
       if (!recovered) throw explainDaytonaError(error);
@@ -351,11 +382,9 @@ class DaytonaWorld implements World {
         const quoted = quote(stdinPath);
         command = `chmod 600 ${quoted} 2>/dev/null; ${line} < ${quoted}; __karmax_code=$?; rm -f ${quoted}; exit $__karmax_code`;
       }
-      const result = await this.sandbox.process.executeCommand(command,
-        this.cwd(opts.cwd), remoteEnv(opts.env), seconds);
+      const result = await executeSeparated(this.sandbox, command, this.cwd(opts.cwd), remoteEnv(opts.env), seconds);
       stdinPath = undefined; // the command's own `rm -f` already removed it
-      return { stdout: String(result?.result ?? result?.stdout ?? result?.artifacts?.stdout ?? ''),
-        stderr: String(result?.stderr ?? ''), code: Number(result?.exitCode ?? 0) };
+      return result;
     } catch (error: any) {
       if (!Number.isInteger(error?.exitCode)) throw error;
       return { stdout: String(error?.stdout ?? ''), stderr: String(error?.stderr ?? error?.message ?? error),
@@ -593,6 +622,20 @@ class DaytonaWorld implements World {
 
   async destroy(): Promise<void> { await deleteSandbox(this.sandbox); this.onDestroy(); }
 
+  /** Reads the sandbox's memory history from Daytona's telemetry, which the
+   * control plane serves whatever state the sandbox is in. Samples are a
+   * minute apart and lag by up to two, so only a longer silence is a stall. */
+  async diagnose({ since, now = Date.now() }: { since: number; now?: number }): Promise<WorldDiagnosis | undefined> {
+    if (!this.sandbox.getMetrics) return undefined;
+    try {
+      const samples = await withTimeout(this.sandbox.getMetrics(new Date(now - DIAGNOSIS_WINDOW_MS), new Date(now)), 10_000);
+      return diagnoseMetrics(samples.map((s) => ({ at: new Date(s.timestamp).getTime(), memUsed: s.memUsed, memTotal: s.memTotal })),
+        { since, now, silentMs: METRICS_SILENT_MS });
+    } catch {
+      return undefined; // diagnosis must never replace the failure it explains
+    }
+  }
+
   /** Open processes need control-plane activity even when producing no output. */
   private async keepAlive(): Promise<() => void> {
     let stopped = false;
@@ -633,18 +676,41 @@ function applyPreviewPath(target: URL, requestPath: string): void {
   target.hash = requested.hash;
 }
 
+/** Daytona's execute API returns stdout and stderr merged into one `result`,
+ * so a warning on stderr would corrupt output a caller parses (a SHA, base64).
+ * Run the command in a subshell with stderr sent to a private file, then print
+ * a random marker and that file base64-encoded after stdout. A command killed
+ * by the timeout never prints the marker; its whole output is then stdout. */
+async function executeSeparated(sandbox: DaytonaSandboxLike, command: string, cwd: string | undefined,
+  env: Record<string, string> | undefined, seconds: number, shell: 'sh' | 'bash' = 'sh'): Promise<ExecResult> {
+  const id = crypto.randomBytes(12).toString('hex');
+  const marker = `KARMAX_STDERR_${id}:`;
+  const file = quote(`/tmp/karmax-stderr-${id}`);
+  const wrapped = `(umask 077; : > ${file}); ( ${command}\n) 2>>${file}; __karmax_code=$?; printf '%s' ${quote(marker)}; `
+    + `base64 < ${file} 2>/dev/null | tr -d '\\n'; rm -f ${file}; exit $__karmax_code`;
+  // An explicit shell: the image's default may be zsh.
+  const result = await sandbox.process.executeCommand(`${shell} -c ${quote(wrapped)}`, cwd, env, seconds);
+  const output = String(result?.result ?? result?.stdout ?? result?.artifacts?.stdout ?? '');
+  const code = Number(result?.exitCode ?? 0);
+  const at = output.lastIndexOf(marker);
+  if (at < 0) return { stdout: output, stderr: String(result?.stderr ?? ''), code };
+  return { stdout: output.slice(0, at), stderr: Buffer.from(output.slice(at + marker.length).trim(), 'base64').toString('utf8'), code };
+}
+
 /** Trusted-provisioning adapter over the sandbox SDK. Never catches: real SDK
  * errors must reach the caller unchanged. */
-function provisionTarget(sandbox: DaytonaSandboxLike, signal?: AbortSignal): ProvisionTarget {
+export function provisionTarget(sandbox: DaytonaSandboxLike, signal?: AbortSignal): ProvisionTarget {
   return {
     async run(command, timeoutMs) {
       signal?.throwIfAborted();
-      const result = await sandbox.process.executeCommand(`bash -c ${quote(command)}`, undefined, undefined, Math.max(1, Math.ceil(timeoutMs / 1000)));
-      return { stdout: String(result?.result ?? result?.stdout ?? ''), stderr: String(result?.stderr ?? ''),
-        code: Number(result?.exitCode ?? 0) };
+      return executeSeparated(sandbox, command, undefined, undefined, Math.max(1, Math.ceil(timeoutMs / 1000)), 'bash');
     },
     async writeFile(remotePath, content) { signal?.throwIfAborted(); await sandbox.fs.uploadFile(Buffer.from(content), remotePath); },
   };
+}
+
+function isMissingSnapshot(error: unknown): boolean {
+  return /snapshot/i.test(String((error as Error)?.message ?? error)) && /not found|does not exist|404/i.test(String((error as Error)?.message ?? error));
 }
 
 function explainDaytonaError(error: unknown): unknown {
@@ -707,8 +773,8 @@ function snapshotResourceWarnings(sandbox: DaytonaSandboxLike, spec: WorldSpec):
   if (!requested) return [];
   if (requested.gpu && requested.gpu > (sandbox.gpu ?? 0))
     throw new Error('The Daytona snapshot has insufficient GPUs. Select a GPU snapshot or an image with the requested resources.');
-  if ((requested.cpu !== undefined && sandbox.cpu !== undefined && requested.cpu !== sandbox.cpu)
-    || (requested.memoryMb !== undefined && sandbox.memory !== undefined && requested.memoryMb !== sandbox.memory * 1024))
+  if ((requested.cpu !== undefined && sandbox.cpu !== undefined && sandbox.cpu < requested.cpu)
+    || (requested.memoryMb !== undefined && sandbox.memory !== undefined && sandbox.memory * 1024 < requested.memoryMb))
     return [`Daytona snapshot allocation: ${sandbox.cpu ?? '?'} CPUs, ${sandbox.memory ?? '?'} GiB RAM. CPU and memory settings apply to image builds; choose an image or a differently sized snapshot to change them.`];
   return [];
 }

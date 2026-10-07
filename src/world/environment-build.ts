@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import type { ProjectEnvironmentSpec } from '../domain/types.js';
 import { environmentArtifactName } from '../util/environment-artifact.js';
 import { e2bTemplate } from './e2b-template.js';
+import { daytonaSize } from './daytona.js';
 export { environmentArtifactName } from '../util/environment-artifact.js';
 
 const pexec = promisify(execFile);
@@ -24,6 +25,8 @@ export interface EnvironmentBuildInput {
   onBuilderCreated?: (id: string) => void | Promise<void>;
   assertActive?: () => void | Promise<void>;
   spec: ProjectEnvironmentSpec;
+  /** The project's world size; Daytona bakes it into the setup snapshot. */
+  resources?: { cpu?: number; memoryMb?: number };
   connection?: { apiKey?: string; apiUrl?: string; target?: string; template?: string };
   createBuilderSandbox?: (base: string, options: { apiKey?: string }) => Promise<BuilderSandbox>;
 }
@@ -113,7 +116,8 @@ async function buildDaytona(input: EnvironmentBuildInput): Promise<EnvironmentBu
     if (commands.length) image = image.runCommands(...commands);
     const name = environmentArtifactName(input.projectId, input.digest, input.buildId);
     await input.assertActive?.();
-    await daytona.snapshot.create({ name, image }, { timeout: 45 * 60 });
+    const { cpu, memory, disk } = daytonaSize(input.resources);
+    await daytona.snapshot.create({ name, image, resources: { cpu, memory, disk } }, { timeout: 45 * 60 });
     return { ref: name };
   } catch (error) {
     if (error instanceof DaytonaAuthorizationError)

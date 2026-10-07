@@ -7,17 +7,33 @@ import { liveEnabled } from './helpers/live-gate.js';
 
 const live = liveEnabled() && !!process.env.DAYTONA_API_KEY;
 describe.skipIf(!live)('Daytona live environments', () => {
-  it.skipIf(process.env.KARMAX_DAYTONA_LIVE_BUILD !== '1')('builds a setup snapshot and launches it without resource overrides', async () => {
+  it('sizes an unconfigured world for an agent and keeps stderr out of stdout', async () => {
+    const world = await new DaytonaWorldProvider().create({ taskId: `live-sized-${Date.now()}`, base: 'main',
+      network: { unrestricted: true }, resources: { cpu: 2, memoryMb: 2048 } });
+    try {
+      expect(world.handle.warnings ?? []).toEqual([]);
+      const cpus = await world.exec('nproc', []);
+      expect(cpus.code).toBe(0);
+      const limit = await world.exec('cat', ['/sys/fs/cgroup/memory.max']);
+      expect(Number(limit.stdout.trim())).toBeGreaterThanOrEqual(2 * 1024 ** 3);
+      expect(await world.exec('sh', ['-c', 'printf abc; printf XYZ >&2; printf def; exit 4']))
+        .toEqual({ stdout: 'abcdef', stderr: 'XYZ', code: 4 });
+      expect(await world.exec('cat', [], { input: 'stdin-ok' })).toEqual({ stdout: 'stdin-ok', stderr: '', code: 0 });
+    } finally { await world.destroy(); }
+  }, 300_000);
+
+  it.skipIf(process.env.KARMAX_DAYTONA_LIVE_BUILD !== '1')('builds a setup snapshot at the requested world size and launches it', async () => {
     const client = new Daytona();
     const projectId = `live-${Date.now()}`;
     const name = environmentArtifactName(projectId, 'fixture');
     let world: World | undefined;
     try {
-      const built = await buildEnvironment({ provider: 'daytona', projectId, digest: 'fixture',
+      const built = await buildEnvironment({ provider: 'daytona', projectId, digest: 'fixture', resources: { cpu: 2, memoryMb: 2048 },
         spec: { image: 'node:22-slim', setup: ['echo snapshot-ready > /tmp/karmax-built'] } });
       expect(built.ref).toBe(name);
       world = await new DaytonaWorldProvider().create({ taskId: projectId, base: 'main',
         network: { unrestricted: true }, environment: { snapshot: built.ref }, resources: { cpu: 2, memoryMb: 2048 } });
+      expect(world.handle.warnings ?? []).toEqual([]);
       expect(await world.exec('cat', ['/tmp/karmax-built'])).toMatchObject({ code: 0, stdout: 'snapshot-ready\n' });
       expect(await world.exec('node', ['--version'])).toMatchObject({ code: 0, stdout: expect.stringMatching(/^v22\./) });
     } finally {

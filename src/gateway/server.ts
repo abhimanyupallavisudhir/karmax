@@ -4201,13 +4201,15 @@ export class Gateway {
             const spec = (await environments.spec(project.id));
             if (!spec) return this.json(res, 400, { error: 'accept or configure an environment proposal first' });
             const body = await this.body(req);
-            const provider = String(body.provider ?? (await store.effectiveProjectConfig(project)).worldProvider ?? 'worktree');
+            const executionConfig = (await store.effectiveProjectConfig(project));
+            const provider = String(body.provider ?? executionConfig.worldProvider ?? 'worktree');
             const digest = environments.digest(spec);
             const connection = ['e2b', 'daytona'].includes(provider)
               ? (await this.deps.providerConnections?.resolve(project.organizationId, provider)) : undefined;
             const { buildEnvironment } = await import('../world/environment-build.js');
             const attempt = await beginEnvironmentBuild(store, project.id, buildScope, provider, digest);
             void buildEnvironment({ provider, projectId: project.id, digest, spec, buildId: attempt.buildId,
+              ...(executionConfig.resources ? { resources: executionConfig.resources } : {}),
               onBuilderCreated: id => recordEnvironmentBuilder(store, attempt, id),
               assertActive: async () => { if (!await environmentBuildIsActive(store, attempt)) throw new Error('Environment build was invalidated.'); },
               ...(connection ? { connection: { apiKey: connection.apiKey,
