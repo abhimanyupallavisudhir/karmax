@@ -466,13 +466,19 @@ function projectPrincipalFromBody(value: unknown, organizationId: string): Proje
 
 /** What a refused grant tells the client: which agent, so the console can ask
  * about exactly that one (`chooseAuthorizationGrant`). */
-function grantRefusal(e: unknown): { code?: string; participant?: string; authorization?: AuthorizationSelection } {
-  const error = e as { code?: unknown; participant?: unknown; authorization?: AuthorizationSelection } | undefined;
+function grantRefusal(e: unknown): { code?: string; participant?: string; authorization?: AuthorizationSelection; credentialGrants?: string[] } {
+  const error = e as { code?: unknown; participant?: unknown; authorization?: AuthorizationSelection; credentialGrants?: unknown } | undefined;
   return {
     ...(error?.code ? { code: String(error.code) } : {}),
     ...(typeof error?.participant === 'string' ? { participant: error.participant,
       ...(error.authorization ? { authorization: error.authorization } : {}) } : {}),
+    ...(Array.isArray(error?.credentialGrants) ? { credentialGrants: error.credentialGrants.map(String) } : {}),
   };
+}
+
+/** `credentialGrants` of a gap or request body: vault grants, else absent. */
+function credentialGrantsFromBody(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.length ? value.map(String) : undefined;
 }
 
 /** `acceptAttenuation`: `true` for every agent, or the participant keys. */
@@ -5449,7 +5455,7 @@ export class Gateway {
         if (!projectId) return this.json(res, 400, { error: unscopedProject });
         try {
           const result = (await api.authorizationEscalationTargets(token, {
-            projectId, authorization,
+            projectId, authorization, credentialGrants: credentialGrantsFromBody(b.credentialGrants),
           }));
           const names = new Map(((await this.deps.identity?.listUsers()) ?? []).map((user) =>
             [user.id, { name: user.name, email: user.email }]));
@@ -5472,6 +5478,7 @@ export class Gateway {
           try {
             return this.json(res, 200, await api.requestAuthorization(token, {
               projectId, target: b.target as any, authorization,
+              credentialGrants: credentialGrantsFromBody(b.credentialGrants),
               audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
               reason: b.reason == null ? undefined : String(b.reason),
             }));

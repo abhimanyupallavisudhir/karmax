@@ -44,6 +44,9 @@ export interface AuthorizationGap {
   summon?: string;
   /** The ways forward, as API calls. */
   next: string;
+  /** Vault credentials asked for that the caller cannot grant; an
+   * authorization request names them so approving adds them. */
+  credentialGrants?: Capability[];
 }
 
 export class AuthorizationGrantError extends Error {
