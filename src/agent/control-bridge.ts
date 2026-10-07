@@ -184,7 +184,10 @@ export async function startControlBridge(
       while ((index = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, index);
         buffer = buffer.slice(index + 1);
-        void handleLine(line, socket, handlers, available, token);
+        void handleLine(line, {
+          reply: (body) => { try { socket.write(`${JSON.stringify(body)}\n`); } catch { /* the child went away mid-turn */ } },
+          hangUp: () => socket.end(),
+        }, handlers, available, token);
       }
     });
   });
@@ -231,9 +234,15 @@ function tokenMatches(presented: unknown, expected: string): boolean {
   return crypto.timingSafeEqual(a, b);
 }
 
+/** One connection's way back: a reply frame, or hanging up on the peer. */
+interface ControlPeer {
+  reply(body: Record<string, unknown>): void;
+  hangUp(): void;
+}
+
 async function handleLine(
   line: string,
-  socket: net.Socket,
+  peer: ControlPeer,
   handlers: Record<string, (args: any) => Promise<string>>,
   schemas: ToolSchema[],
   token: string,
@@ -246,17 +255,14 @@ async function handleLine(
   } catch {
     return; // a malformed frame must never take down a turn
   }
-  const reply = (body: Record<string, unknown>) => {
-    try { socket.write(`${JSON.stringify({ id: request?.id, ...body })}\n`); }
-    catch { /* the child went away mid-turn */ }
-  };
+  const reply = (body: Record<string, unknown>) => peer.reply({ id: request?.id, ...body });
   // Authenticate BEFORE looking at `op`: an unauthorized peer must not be able to
   // enumerate the tool surface with `list` either. The error names no expected
   // value and does not distinguish "absent" from "wrong", and the connection is
   // dropped so a peer cannot sit on the socket grinding guesses.
   if (!tokenMatches(request?.token, token)) {
     reply({ ok: false, error: 'unauthorized: this control socket is private to one turn' });
-    socket.end();
+    peer.hangUp();
     return;
   }
   if (request?.op === 'list') {
@@ -281,4 +287,55 @@ async function handleLine(
   } catch (error) {
     reply({ ok: false, error: error instanceof Error ? error.message : String(error) });
   }
+}
+
+/** A control frame between the activity and the sandbox relay
+ *  (`acp-relay.mjs`): `m` is one NDJSON line of the socket protocol above,
+ *  `c` the relay's connection it belongs to. */
+export interface ControlFrame {
+  c: number;
+  m?: string;
+  closed?: boolean;
+  close?: boolean;
+}
+
+export interface RemoteControlBridge {
+  /** Per-turn secret the sandbox MCP child must put on every frame. */
+  token: string;
+  tools: ToolSchema[];
+  /** Serve one frame from the sandbox; `send` writes frames back to it. */
+  serve(frame: ControlFrame, send: (frame: ControlFrame) => void): void;
+  close(): void;
+}
+
+/**
+ * The same bridge for a harness that runs in a cloud sandbox. A unix socket on
+ * this host cannot reach into the sandbox, so the sandbox's ACP relay owns the
+ * socket and carries each line over the agent's PTY (`remote-acp.ts`); this
+ * side applies exactly the checks `startControlBridge` applies: the token on
+ * every frame, only the advertised tools, and nothing after `close()`.
+ */
+export function remoteControlBridge(
+  handlers: Record<string, (args: any) => Promise<string>>,
+  schemas: ToolSchema[] = SDK_CONTROL_TOOL_SCHEMAS,
+): RemoteControlBridge | undefined {
+  const available = controlBridgeTools(handlers, schemas);
+  if (!available.length) return undefined;
+  const token = crypto.randomBytes(32).toString('hex');
+  const refused = new Set<number>();
+  let closed = false;
+  return {
+    token,
+    tools: available,
+    serve(frame, send) {
+      if (closed || !Number.isSafeInteger(frame?.c) || typeof frame.m !== 'string') return;
+      if (refused.has(frame.c)) return;
+      const peer: ControlPeer = {
+        reply: (body) => { if (!closed) send({ c: frame.c, m: JSON.stringify(body) }); },
+        hangUp: () => { refused.add(frame.c); send({ c: frame.c, close: true }); },
+      };
+      void handleLine(frame.m, peer, handlers, available, token);
+    },
+    close() { closed = true; },
+  };
 }
