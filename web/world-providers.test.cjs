@@ -11,22 +11,18 @@ function ok(condition, message) {
   else { fail++; console.error('FAIL:', message); }
 }
 
-const start = src.indexOf('const providerInfo = {');
-// The object closes at the indentation it opened with.
-const indent = start >= 0 ? src.slice(src.lastIndexOf('\n', start) + 1, start) : '';
-const end = src.indexOf(`\n${indent}};`, start);
-ok(start >= 0 && end > start, 'Organization settings declare providerInfo');
-const providerInfo = start >= 0 && end > start ? new Function(`${src.slice(start, end + indent.length + 3)} return providerInfo;`)() : {};
+const start = src.indexOf('const COMPUTER_PROVIDERS = {');
+const end = src.indexOf('\n};', start);
+ok(start >= 0 && end > start, 'Computers settings declare COMPUTER_PROVIDERS');
+const providers = start >= 0 && end > start ? new Function(`${src.slice(start, end + 3)} return COMPUTER_PROVIDERS;`)() : {};
 
-const note = providerInfo.daytona?.note || '';
-ok(/Tiers? 1.2/.test(note), 'Daytona note names Tiers 1–2');
-ok(note.includes('E2B') && /Tier 3/.test(note), 'Daytona note points to E2B or a higher Daytona tier');
-ok(note.includes('https://www.daytona.io/docs/en/network-limits/'), 'Daytona note links Daytona network limits');
-ok(!providerInfo.e2b?.note, 'E2B has no network note');
+const tip = providers.daytona?.tip || '';
+ok(/Tiers? 1.2/.test(tip), 'Daytona tip names Tiers 1–2');
+ok(tip.includes('E2B') && /Tier 3/.test(tip), 'Daytona tip points to E2B or a higher Daytona tier');
+ok(!providers.e2b?.tip, 'E2B has no network tip');
 
-const card = src.slice(src.indexOf("$('#org-providers').innerHTML"), src.indexOf("$('#org-runners').innerHTML"));
-ok(/info\.note \? `<p class="provider-note"/.test(card), 'Provider card renders its note');
-ok(/\.provider-note\s*\{/.test(fs.readFileSync(path.join(__dirname, 'styles.css'), 'utf8')), 'Provider note is styled');
+const dialog = src.slice(src.indexOf('function openComputerDialog('), src.indexOf('function organizationView()'));
+ok(/info\.tip \? policyTip\(info\.tip\)/.test(dialog), 'The provider dialog shows its tip beside the provider name');
 
 console.log(`${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

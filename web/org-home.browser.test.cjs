@@ -1,6 +1,7 @@
 // The organization home: `/` lands on `/<org>`, one task list over every
 // project that opens on "For me" (what waits on you, each row saying why), with
 // "All" one click away and bookmarkable, a project filter, project permalinks,
+// a composer that creates the task in a project you pick,
 // the logo as the way home, and a ☰ that folds the sidebar on a wide screen.
 // Run: node web/org-home.browser.test.cjs   (HOME_SCREENSHOTS=<dir> also saves screenshots)
 const assert = require('node:assert/strict');
@@ -70,12 +71,12 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     const chips = await page.locator('.view-chip[data-view]').evaluateAll((els) => els.map((el) => el.dataset.view));
     assert.deepEqual(chips.slice(0, 2), ['__for_me__', '__all__'], 'For me, then All');
     assert.equal(await page.locator('#save-view').count(), 0, 'saved views belong to projects');
-    assert.equal(await page.locator('#new-task').count(), 0, 'tasks are created in a project');
+    assert.equal(await page.locator('#new-task-project').innerText(), 'website', 'new tasks start in a project you pick');
     const review = page.locator('[data-id="t1"] .chip.attention');
     assert.equal(await review.innerText(), 'Review');
     assert.equal(await review.getAttribute('title'), 'Waiting for your review', 'the reason is explained in a tooltip');
     assert.equal(await page.locator('[data-id="t6"] .chip.attention').innerText(), 'Approval', 'an ask outranks a mention');
-    assert.equal(await page.locator('[data-id="t4"] .chip.task-project').innerText(), 'Mobile App', 'rows name their project');
+    assert.equal(await page.locator('[data-id="t4"] .task-project').innerText(), 'mobile-app', 'rows name their project by slug');
     assert.equal(await page.locator('[data-id="t1"] .row-link').getAttribute('href'), '/org/website/tasks/1', 'rows link to their project permalink');
     assert.equal(await page.locator('#brand-home').getAttribute('href'), '/org', 'the logo links home');
     if (shots) await page.screenshot({ path: path.join(shots, 'home-desktop.png') });

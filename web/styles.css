@@ -161,6 +161,7 @@ button.action-pending::after, [role="button"].action-pending::after, a.action-pe
 @keyframes action-error { 40% { box-shadow: 0 0 0 2px var(--danger); } }
 a { color: var(--accent); text-decoration: none; }
 .mono { font-family: var(--font-mono); font-feature-settings: "ss01"; }
+.nowrap { white-space: nowrap; }
 
 /* ── layout shell ───────────────────────────────────────────── */
 #app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
@@ -204,15 +205,6 @@ a { color: var(--accent); text-decoration: none; }
 }
 .topbar .search input { border: 0; background: transparent; outline: none; width: 100%; }
 .topbar .spacer { flex: 1; }
-.global-search-trigger {
-  min-width: 230px; max-width: 320px; height: 34px;
-  display: flex; align-items: center; gap: 8px;
-  padding: 0 8px 0 11px; border: 1px solid var(--line); border-radius: 8px;
-  background: var(--surface-2); color: var(--ink-3); cursor: pointer; text-align: left;
-}
-.global-search-trigger:hover { border-color: var(--line-strong); color: var(--ink-2); background: var(--surface); }
-.global-search-trigger .global-search-label { flex: 1; }
-.global-search-trigger .kbd { margin-left: auto; background: var(--surface); }
 .icon-btn {
   width: 34px; height: 34px; border-radius: 8px; border: 1px solid transparent;
   background: transparent; color: var(--ink-2); cursor: pointer;
@@ -415,8 +407,6 @@ p.task-sub { display: block; line-height: 1.55; }
 p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
-.provider-note { font-size: 12px; margin: 6px 0; padding: 6px 9px; border-radius: var(--r-sm); color: var(--ink); background: var(--working-weak); border-left: 3px solid var(--working); }
-.provider-note a { color: inherit; text-decoration: underline; }
 .task-right { display: flex; align-items: center; gap: 12px; }
 
 /* ── real-link rows ─────────────────────────────────────────────
@@ -466,17 +456,13 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .pipeline .ponr.passed { background: var(--merged); }
 .pipeline .ponr.current { background: var(--accent); }
 
-.inbox-toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; color:var(--ink-2); }
-.inbox-controls { display:flex; align-items:center; gap:14px; }
-.inbox-controls .switch { gap:7px; font-size:13px; }
-.inbox-controls .switch input { width:30px; height:18px; }
-/* The kind sub-tabs sit under the page title, so they are not the sticky bar. */
-.inbox-tabs { position:static; }
-/* Row border, padding, and hover/focus treatments come from .task-row. */
+/* A notice on the bell's page (an ask that is not a task's) is a task row;
+   row border, padding, and hover/focus treatments come from .task-row. */
+.inbox-row { cursor: pointer; }
 .inbox-row .task-sub { flex-wrap:wrap; }
-.inbox-project { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
-.inbox-row time { font-size:12px; color:var(--ink-3); white-space:nowrap; }
-.inbox-read[aria-pressed="true"] { color:var(--merged); }
+/* An ask you have not opened yet: an accent edge, like an unread message. */
+.task-row.unread { box-shadow: inset 3px 0 0 var(--accent); }
+.task-row.unread .task-title { font-weight: 650; color: var(--ink); }
 @media (max-width: 700px) {
   .inbox-row { grid-template-columns:auto minmax(0, 1fr); }
   .inbox-row .task-right { grid-column:2; justify-content:flex-end; gap:10px; }
@@ -626,7 +612,43 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .chip.attention { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
 .chip.attention.escalated { background: var(--working-weak); color: var(--working); }
 /* The organization home names each row's project. */
-.chip.task-project { display: inline-block; color: var(--ink-2); background: var(--surface-2); max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A row's project: a plain monospace slug, not a chip — it says where a task
+   lives, not how it is going, so it never looks like a status. */
+.task-project {
+  display: inline-block; max-width: 32ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+  font-family: var(--font-mono); font-size: 11.5px; font-weight: 500; color: var(--ink-2);
+}
+.task-project-org { color: var(--ink-3); font-weight: 400; }
+
+/* The project a new task goes to: its slug, with a menu of the organization's
+   projects (Home's composer, the task form's "← New task" bar). */
+.project-pick-wrap { position: relative; display: inline-flex; flex: none; min-width: 0; }
+.project-pick {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0; height: 28px; padding: 0 7px;
+  border: 0; border-radius: 6px; background: transparent; color: var(--ink-3); cursor: pointer;
+}
+.project-pick:hover, .project-pick[aria-expanded="true"] { background: var(--surface-2); color: var(--ink-2); }
+.project-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.project-pick .task-project { font-size: 12.5px; color: var(--ink); }
+.project-pick.static { display: inline-flex; align-items: center; height: 28px; padding: 0 7px; cursor: default; }
+.project-pick-caret { flex: none; }
+.project-pick-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 40; min-width: 200px; max-width: 320px; max-height: 300px;
+  overflow-y: auto; display: grid; gap: 1px; padding: 4px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 9px; box-shadow: var(--shadow);
+}
+.project-pick-menu[hidden] { display: none; }
+.project-pick-filter { margin: 0 0 4px; padding: 6px 8px; font-size: 13px; }
+.project-pick-opt {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%;
+  padding: 7px 9px; border: 0; border-radius: 6px; background: none; text-align: left; cursor: pointer;
+}
+.project-pick-opt[hidden] { display: none; }
+.project-pick-opt:hover, .project-pick-opt:focus-visible { background: var(--accent-weak); outline: none; }
+.project-pick-opt .task-project { max-width: none; font-size: 12.5px; }
+.project-pick-opt[aria-selected="true"]::after { content: '✓'; color: var(--accent); font-size: 12px; }
+.quick-task-field .project-pick-wrap, .quick-task-field > .project-pick.static { margin-left: 6px; }
+.quick-task-field .project-pick-wrap + .title-in, .quick-task-field > .project-pick.static + .title-in { padding-left: 6px; }
 
 /* GitHub pull request, in the task byline: link + live state. */
 .pr-link {
@@ -1580,32 +1602,15 @@ a.ins-task-title:hover { color: var(--accent); }
 
 /* Global search is a finder, not a command surface. It reuses the palette shell
    but gives results a two-line identity with their project/status context. */
-.global-search { width: min(680px, 92vw); }
-.global-search-head { display: flex; align-items: center; gap: 4px; padding-left: 16px; border-bottom: 1px solid var(--line); }
-.global-search-head > span { color: var(--ink-3); font-size: 17px; }
-.global-search-head input { border: 0; min-width: 0; }
-.global-search-head .icon-btn { flex: none; margin-right: 7px; }
-.global-search-context, .global-search-foot { padding: 8px 16px; color: var(--ink-3); background: var(--surface-2); font-size: 11px; }
-.global-search-context { border-bottom: 1px solid var(--line); }
-.global-search-foot { border-top: 1px solid var(--line); }
-.global-search-foot code { color: var(--ink-2); }
 #gs-list { min-height: 180px; max-height: 52vh; overflow: auto; padding-bottom: 6px; }
-.global-search-result { align-items: flex-start !important; }
-.global-search-kind { width: 22px; color: var(--ink-3); text-align: center; font-size: 16px; line-height: 20px; flex: none; }
-.global-search-kind svg { vertical-align: -3px; }
-.global-search-copy { display: grid; gap: 2px; min-width: 0; }
-.global-search-copy b { color: var(--ink); font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.global-search-copy span { color: var(--ink-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.global-search-empty { min-height: 180px; display: grid; place-content: center; justify-items: center; gap: 6px; padding: 24px; color: var(--ink-3); text-align: center; }
-.global-search-empty b { color: var(--ink-2); font-size: 14px; }
 .global-search-loading::before { content: ''; display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: var(--accent); animation: pulse-dot 1s ease-in-out infinite alternate; }
-.global-search-summary { padding: 8px 16px 3px; color: var(--ink-3); font-size: 11px; text-align: center; }
 /* Distinct name: redeclaring the breathing-dot keyframe above would silently
    override it and freeze every "agent is working" indicator. */
 @keyframes pulse-dot { to { opacity: .3; transform: scale(.75); } }
 
 /* keyboard navigation: list cursor, digit hints on action buttons, "?" help */
 .task-row.cursor, .queue-item.cursor { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.task-row.unread.cursor { box-shadow: inset 3px 0 0 var(--accent), 0 0 0 3px var(--accent-weak); }
 .task-row:focus-visible, .queue-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .kbd { margin-left: 7px; font-family: var(--font-mono); font-size: 10px; line-height: 1.5; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
 .btn.primary .kbd, .btn.danger .kbd { color: inherit; border-color: currentColor; opacity: .7; }
@@ -2116,11 +2121,6 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tp-foot { padding: 10px 0; }
   .tp-foot-inner { padding: 0 16px; }
   .ck-layout { grid-template-columns: 148px 1fr; }
-  .global-search-trigger { min-width: 34px; width: 34px; padding: 0; justify-content: center; }
-  .global-search-trigger .global-search-label, .global-search-trigger .kbd { display: none; }
-}
-@media (min-width: 721px) and (max-width: 900px) {
-  .global-search-trigger { min-width: 170px; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
@@ -2921,7 +2921,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   .avatar-role-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
 
-#bell-badge, .inbox-tabs .pill { background:#c62828; color:#fff; font-weight:800; }
+#bell-badge { background:#c62828; color:#fff; font-weight:800; }
 #bell-badge { min-width:20px; height:20px; font-size:12px; top:-4px; right:-6px; border:2px solid var(--surface); }
 .notify-sound-options { display:flex; flex-wrap:wrap; align-items:end; gap:16px; margin:16px 0; }
 .notify-sound-options label { display:grid; gap:6px; }
@@ -3096,6 +3096,45 @@ html[data-theme="dark"] .github-signin-btn:active,
 .storage-project .storage-item { padding-left: 14px; font-size: .92em; color: var(--ink-2); }
 .storage-project .storage-item > span:first-child { flex: 1; }
 
+/* app sign-ins: /device, OAuth consent, Profile → Apps and tokens */
+.grant-card { width: 360px; max-width: calc(100vw - 32px); }
+.grant-brand { margin-bottom: 16px; }
+.grant-title { display: flex; align-items: center; gap: 6px; margin: 0 0 14px; font-size: 17px; font-weight: 600; }
+.grant-code { width: 100%; box-sizing: border-box; padding: 12px 8px; border: 1px dashed var(--line-strong); border-radius: var(--r);
+  background: var(--surface-2); color: var(--ink); font-family: var(--font-mono); font-size: 26px; letter-spacing: .22em;
+  text-align: center; text-transform: uppercase; }
+.grant-code[readonly] { border-style: solid; border-color: var(--accent); background: var(--accent-weak); }
+.grant-who { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 12px 0 8px; }
+.grant-who .task-sub { margin: 0; }
+.grant-limit { margin: 8px 0 14px; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.grant-limit summary { display: flex; align-items: center; gap: 8px; padding: 8px 10px; font-size: 13px; cursor: pointer; list-style: none; }
+.grant-limit summary::-webkit-details-marker { display: none; }
+.grant-limit summary::after { content: '▾'; color: var(--ink-3); }
+.grant-limit[open] summary::after { content: '▴'; }
+.grant-limit-label { display: inline-flex; align-items: center; gap: 4px; color: var(--ink-2); }
+.grant-limit-value { margin-left: auto; font-weight: 500; text-align: right; }
+.grant-limit-body { display: grid; gap: 8px; padding: 0 10px 10px; }
+.grant-limit-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ink-2); font-size: 13px; }
+.grant-limit-projects { display: grid; gap: 4px; max-height: 160px; margin: 0; padding: 0; overflow: auto; border: 0; font-size: 13px; }
+.grant-limit-projects legend { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; padding: 0; color: var(--ink-2); }
+.grant-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.grant-actions[hidden] { display: none; }
+.grant-continue { width: 100%; margin-top: 12px; }
+.grant-continue[hidden] { display: none; }
+.grant-msg { min-height: 16px; margin: 8px 0 0; color: var(--danger); font-size: 12px; }
+.app-grant-row .task-sub { margin: 2px 0 0; }
+.app-token-new:empty { display: none; }
+.app-token-form, .app-token-once { display: grid; gap: 8px; margin: 10px 0; }
+.app-token-value { display: flex; gap: 6px; }
+.app-token-value input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 12px; }
+#app-token-open { margin-top: 10px; }
+#app-token-open[hidden] { display: none; }
+.grant-limit-row select, .app-token-form input[name=name] { padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); font-size: 13px; }
+.grant-actions .btn, .grant-continue { justify-content: center; }
+.grant-msg:empty { display: none; }
+.app-token-form .grant-limit, .app-token-form .form-row { margin: 0; }
+.app-token-once > .btn { justify-self: start; }
+
 /* ── One conversation, several agents (software-dev ≥1.27) ───────────────── */
 .msg.agent.other-agent { background: color-mix(in srgb, var(--accent) 6%, var(--surface-2)); border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); }
 .msg-to { font-size: 11px; color: currentColor; opacity: .72; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }
@@ -3210,3 +3249,48 @@ html[data-theme="dark"] .github-signin-btn:active,
 
 .cf-max-revisions { display: inline-flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
 .cf-max-revisions input { width: 72px; }
+
+/* ── The Computer block (task form, Task defaults, Parameters) ── */
+.parameter-fields .computer-field { padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); display: grid; gap: 8px; }
+.computer-controls { display: grid; grid-template-columns: minmax(120px, 1.1fr) repeat(3, minmax(92px, .8fr)); gap: 8px; }
+.computer-controls > select, .computer-size input, .computer-more input, .computer-more select {
+  width: 100%; min-width: 0; height: 40px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface); outline: none; font-size: 13px;
+}
+.computer-controls > select:focus, .computer-size input:focus, .computer-more input:focus, .computer-more select:focus { border-color: var(--accent); }
+.computer-size { position: relative; display: block; min-width: 0; margin: 0; }
+.computer-size input { padding-right: 58px; font-variant-numeric: tabular-nums; }
+.computer-size input::-webkit-inner-spin-button { opacity: .5; }
+.computer-size > span { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); color: var(--ink-3); font-size: 11.5px; pointer-events: none; white-space: nowrap; }
+.computer-more { border-top: 1px dashed var(--line); padding-top: 6px; min-width: 0; }
+.computer-more > summary { display: flex; align-items: baseline; gap: 10px; cursor: pointer; list-style: none; font-size: 12px; color: var(--ink-2); font-weight: 600; user-select: none; padding: 2px 0; }
+.computer-more > summary::-webkit-details-marker { display: none; }
+.computer-more > summary::before { content: '▸'; color: var(--ink-3); font-size: 10px; width: 8px; transition: transform .12s; }
+.computer-more[open] > summary::before { transform: rotate(90deg); }
+.computer-more-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 10px; padding: 8px 0 2px 18px; }
+.computer-more-grid > .form-row { margin: 0; gap: 4px; }
+.computer-more-grid > .form-row > span { display: flex; align-items: center; gap: 5px; color: var(--ink-2); font-size: 12px; }
+.computer-more .cf-allowlist { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.computer-more .cf-allowlist[hidden] { display: none; }
+.computer-field fieldset.ab-frozen { display: grid; gap: 8px; }
+@media (max-width: 700px) {
+  .computer-controls { grid-template-columns: 1fr 1fr; }
+  .computer-more-grid, .computer-more .cf-allowlist { grid-template-columns: 1fr; padding-left: 0; }
+}
+
+/* ── Computers (Settings → Projects, Project → Computers) ── */
+.computer-providers { display: grid; gap: 8px; }
+.computer-provider { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.computer-provider > b { min-width: 72px; }
+.computer-provider .chip[title] { cursor: help; }
+.computer-dialog { width: min(520px, calc(100vw - 28px)); display: grid; gap: 12px; }
+.computer-dialog .modal-head { display: flex; align-items: center; gap: 8px; }
+.computer-dialog .form-row { margin: 0; }
+.computer-dialog .form-row > span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--ink-2); font-size: 12px; font-weight: 600; }
+.computer-key-link { font-weight: 400; font-size: 12px; }
+.computer-advanced > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.computer-advanced .settings-grid { margin-top: 10px; }
+.computer-dialog .modal-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.computer-dialog .modal-actions .label-row-fill { flex: 1; }
+.computer-size input { -moz-appearance: textfield; appearance: textfield; }
+.computer-size input::-webkit-inner-spin-button, .computer-size input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }

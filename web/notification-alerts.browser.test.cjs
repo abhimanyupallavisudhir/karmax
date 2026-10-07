@@ -29,7 +29,7 @@ function statement(prefix) {
 }
 const code = [
   statement('const URGENCY_LEVELS = '), statement('const NOTIFY_DEFAULTS = '), statement('const systemNotifications = '), statement('const liveInboxItem = '),
-  ...['urgencyRank', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxRowLabel', 'notifyPrefs', 'inboxArrivals',
+  ...['urgencyRank', 'inboxUnreadCount', 'inboxRowLabel', 'notifyPrefs', 'inboxArrivals',
     'announceInbox', 'inboxTitle', 'showVisualNotification', 'showSystemNotification', 'syncNotificationAlerts', 'updateBell',
     'markInboxItemReadLocally', 'loadInbox'].map(fn),
 ].join('\n');
@@ -45,7 +45,7 @@ const code = [
     await page.evaluate((code) => {
       window.$ = (s) => document.querySelector(s);
       window.esc = (v) => String(v ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
-      window.S = { organizations: [{ id: 'org' }], inbox: [], inboxFilter: 'all', tab: 'tasks' };
+      window.S = { organizations: [{ id: 'org' }], inbox: [], tab: 'tasks' };
       window.bgRenderMain = () => {};
       window.playNotificationSound = () => {};
       // A system notification stand-in that records whether the page closed it.

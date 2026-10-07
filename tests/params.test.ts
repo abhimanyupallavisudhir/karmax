@@ -122,6 +122,19 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
     expect(input.agents?.do).toEqual({ provider: 'codex', model: 'gpt-4.1', effort: 'high' });
   });
 
+  it('layers the task\'s own Computer onto the project\'s effective execution config', () => {
+    const project = { worldProvider: 'e2b', resources: { cpu: 2, memoryMb: 2048 }, environment: { flavor: 'headless' as const },
+      network: { unrestricted: true }, hibernateAfterMs: 604_800_000 };
+    const input = assembleTaskInput(sd, { prompt: 'x', computer: { provider: 'daytona', diskGb: 60, hibernateAfterDays: 1 } },
+      { taskId: 't1', projectId: 'p1', title: 'X', project });
+    expect(input.project).toMatchObject({ worldProvider: 'daytona', resources: { cpu: 2, memoryMb: 2048, diskGb: 60 },
+      environment: { flavor: 'headless' }, hibernateAfterMs: 86_400_000 });
+    // A running task can resize its computer, so the field is editable in flight.
+    expect(input.paramWindows?.computer).toBe('always');
+    // No computer of its own: the project's computer, unchanged.
+    expect(assembleTaskInput(sd, { prompt: 'x' }, { taskId: 't1', projectId: 'p1', title: 'X', project }).project).toEqual(project);
+  });
+
   it('normalizes a legacy confirmer {mode} value into confirm layers', () => {
     const resolved = {
       prompt: 'build X',
@@ -293,12 +306,13 @@ describe('quick-task agent defaults (separate overlay for the quick-add box)', (
 
 describe('settingsToProjectConfig (mirror back to ProjectConfig)', () => {
   it('maps base/target to defaultBase/defaultTarget and binds workflow project fields', () => {
-    const cfg = settingsToProjectConfig(sd, { base: 'main', target: 'prod', repos: ['~/r'], worldProvider: 'container' });
+    const cfg = settingsToProjectConfig(sd, { base: 'main', target: 'prod', repos: ['~/r'], computer: { provider: 'container' } });
     expect(cfg.defaultBase).toBe('main');
     expect(cfg.defaultTarget).toBe('prod');
     expect(cfg.repos).toEqual([path.join(os.homedir(), 'r')]);
-    // "Agent environment" is now a task default (bind:'project'), so it mirrors back
-    // to ProjectConfig.worldProvider like the other project-bound fields.
-    expect(cfg.worldProvider).toBe('container');
+    // The Computer is stored in the execution policy by its own path, never
+    // copied wholesale into ProjectConfig.
+    expect(cfg).not.toHaveProperty('computer');
+    expect(cfg).not.toHaveProperty('worldProvider');
   });
 });

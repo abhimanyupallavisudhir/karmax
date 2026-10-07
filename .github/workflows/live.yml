@@ -137,7 +137,7 @@ jobs:
       - uses: ./.github/actions/install
       - uses: ./.github/actions/temporal-cli
       # The smoke checks, then a whole task: pause at Review, resume, teardown.
-      - run: npx vitest run tests/cloud-live.test.ts tests/e2b-workflow-live.test.ts
+      - run: npx vitest run tests/cloud-live.test.ts tests/e2b-workflow-live.test.ts tests/e2b-computer-live.test.ts
         env:
           KARMAX_RUN_LIVE: '1'
           E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}

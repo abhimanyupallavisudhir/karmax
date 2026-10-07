@@ -35,14 +35,14 @@ function browser() {
     WebSocket: function () {},
     api: async () => { if (response instanceof Error) throw response; return response; },
     announceInbox: (items) => alerts.push(...items),
-    updateBell() {}, bgRenderMain() {}, patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false,
+    updateBell() {}, bgRenderMain() {}, scheduleHomeRefresh() {}, homeEventChangesList: () => false, patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false,
     LIST_RELOAD_EVENTS: new Set(), setWsOnline() {}, checkConsoleRevision() {}, syncLiveWatch() {},
     refreshTasks: async () => {},
     setTimeout: (fn) => { timers.push(fn); return timers.length; },
   });
   // Module-level state connectWs reads: reconnect backoff and the vault-approvals repaint hook.
   vm.runInContext('let inboxRefreshTimer; let wsHadDropped = false; let wsRetryMs = 1500; let refreshVaultRequests = null;\n' +
-    ['urgencyRank', 'inboxArrivals', 'loadInbox', 'inboxEventChanges', 'scheduleInboxReload', 'connectWs']
+    ['urgencyRank', 'inboxArrivals', 'loadInbox', 'inboxEventChanges', 'scheduleInboxReload', 'connectWs', 'isCrossProjectList']
       .map(extractFn).join('\n'), ctx);
   return { ctx, state, alerts, timers, respond: (value) => { response = value; } };
 }
@@ -110,43 +110,21 @@ test('review checkpoint refreshes the selected task without clearing streaming o
   assert.equal(b.timers.length, 0);
 });
 
-for (const partialFailure of [false, true]) test(`mark all read updates rows and counts, partial failure=${partialFailure}`, async () => {
+test('opening a task reads its asks, winning over an in-flight inbox fetch without hiding later arrivals', async () => {
   const b = browser();
-  b.state.inbox = [ask('a'), ask('b'), { ...ask('read'), unread: false }];
-  b.ctx.inboxItems = () => b.state.inbox.filter((item) => item.unread);
-  let renders = 0;
-  b.ctx.renderMain = () => { renders++; };
-  b.ctx.renderRail = () => {};
-  b.ctx.api = async (url, options) => JSON.parse(options.body).ids
-    .filter(id => !partialFailure || id !== 'b').map(id => ({ id, unread: false }));
-  vm.runInContext(extractFn('markVisibleInboxRead'), b.ctx);
-  if (partialFailure) await assert.rejects(b.ctx.markVisibleInboxRead(), /1 notifications/);
-  else await b.ctx.markVisibleInboxRead();
-  assert.equal(b.state.inbox[0].unread, false);
-  assert.equal(b.state.inbox[1].unread, partialFailure);
-  assert.equal(renders, 1);
-  assert.equal(b.state.inboxLoadEpoch, 1);
-});
-
-test('bulk read wins over an in-flight inbox fetch without hiding later arrivals', async () => {
-  const b = browser();
-  b.state.inbox = [ask('a')];
-  b.ctx.inboxItems = () => b.state.inbox;
-  b.ctx.renderMain = b.ctx.renderRail = () => {};
+  b.state.inbox = [{ ...ask('a'), taskId: 't', organizationId: 'org' }];
   let finishFetch;
-  b.ctx.api = async (url, options) => options ? JSON.parse(options.body).ids.map(id => ({ id, unread: false }))
-    : new Promise((resolve) => { finishFetch = resolve; });
-  vm.runInContext(extractFn('markVisibleInboxRead'), b.ctx);
+  b.ctx.api = async (url, options) => options ? [] : new Promise((resolve) => { finishFetch = resolve; });
+  vm.runInContext(extractFn('markTaskAsksRead'), b.ctx);
   const pending = b.ctx.loadInbox();
-  await b.ctx.markVisibleInboxRead();
-  finishFetch([ask('a')]);
+  b.ctx.markTaskAsksRead('t');
+  finishFetch([{ ...ask('a'), taskId: 't' }]);
   await pending;
   assert.equal(b.state.inbox[0].unread, false);
-  b.ctx.api = async () => [{ ...ask('a'), unread: false }, ask('new')];
+  b.ctx.api = async () => [{ ...ask('a'), taskId: 't', unread: false }, ask('new')];
   await b.ctx.loadInbox();
   assert.equal(b.state.inbox[1].unread, true);
 });
-
 
 test('inbox and bell include every organization on all pages, even during navigation', async () => {
   const b = browser();
@@ -170,15 +148,14 @@ test('inbox and bell include every organization on all pages, even during naviga
   assert.equal(b.state.inbox.length, 2);
 });
 
-test('bulk read uses each notification organization and completes across navigation', async () => {
+test("reading a task's asks uses each notification's organization and completes across navigation", async () => {
   const b = browser();
-  b.state.inbox = [{ ...ask('a'), organizationId: 'personal' }, { ...ask('b'), organizationId: 'team' }];
-  b.ctx.inboxItems = () => b.state.inbox;
-  b.ctx.renderMain = b.ctx.renderRail = () => {};
+  b.state.inbox = [{ ...ask('a'), taskId: 't', organizationId: 'personal' }, { ...ask('b'), taskId: 't', organizationId: 'team' }];
   const requests = [];
-  b.ctx.api = async (url, options) => { requests.push(url); b.state.organizationId = 'elsewhere'; return JSON.parse(options.body).ids.map(id => ({ id, unread: false })); };
-  vm.runInContext(extractFn('markVisibleInboxRead'), b.ctx);
-  await b.ctx.markVisibleInboxRead();
+  b.ctx.api = async (url) => { requests.push(url); b.state.organizationId = 'elsewhere'; return []; };
+  vm.runInContext(extractFn('markTaskAsksRead'), b.ctx);
+  b.ctx.markTaskAsksRead('t');
+  await flush();
   assert.deepEqual(requests, ['/api/inbox?organizationId=personal', '/api/inbox?organizationId=team']);
   assert.ok(b.state.inbox.every(item => !item.unread));
 });

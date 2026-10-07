@@ -68,7 +68,7 @@ it('shows one Agent block per agent, in conversation order, and saves an agentâ€
     const params = page.locator('#tp-params');
     await params.waitFor();
     expect(await params.locator(':scope > .tp-section').evaluateAll((sections) => sections.map((section) =>
-      section.querySelector('[data-row]')?.getAttribute('data-row')))).toEqual(['prompt', 'agent:do', 'responder', 'confirm', 'agent:agent-2', 'base']);
+      section.querySelector('[data-row]')?.getAttribute('data-row')))).toEqual(['prompt', 'agent:do', 'responder', 'confirm', 'agent:agent-2', 'computer', 'base']);
     // The task's own authority is the main agent's collapsed Authorization row.
     const main = params.locator('[data-row="agent:do"] .agent-authority');
     expect(await main.evaluate((el) => (el as unknown as { open: boolean }).open)).toBe(false);

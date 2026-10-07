@@ -10,7 +10,7 @@ test('RQ-1: streaming output updates only its bubble and preserves activity hist
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
     patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, updateLiveBubble: () => bubbles++, scheduleTaskPageRender: () => renders++,
     LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false });
-  vm.runInContext([fn('connectWs'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
+  vm.runInContext([fn('connectWs'), fn('isCrossProjectList'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
   for (let i = 0; i < 500; i++) ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', type: 'agent.output', payload: { text: 'hello', source: 'assistant' } }) });
   assert.equal(bubbles, 500); assert.equal(renders, 0); assert.equal(ctx.S.taskEvents.length, 1);
 });
@@ -20,7 +20,7 @@ test('LT-5: the live bubble holds assistant text until its message completes or 
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
     patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, updateLiveBubble: () => bubbles++, scheduleTaskPageRender: () => {},
     LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false });
-  vm.runInContext([fn('connectWs'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
+  vm.runInContext([fn('connectWs'), fn('isCrossProjectList'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
   const send = (type, payload) => ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', type, payload }) });
   const live = (role = 'do') => ctx.S.liveOutput[role]?.text ?? '';
   send('agent.output', { role: 'do', text: 'Fixing the', source: 'assistant' });
@@ -41,7 +41,7 @@ test('LT-5: each agent keeps its own live text; another agent\'s events never cl
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
     patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, updateLiveBubble: () => {}, scheduleTaskPageRender: () => {}, refreshTask: () => {},
     LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false });
-  vm.runInContext([fn('connectWs'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
+  vm.runInContext([fn('connectWs'), fn('isCrossProjectList'), fn('noteLiveOutput'), fn('supersedesLiveOutput')].join('\n'), ctx); ctx.connectWs();
   const send = (type, payload) => ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', type, payload }) });
   send('agent.output', { role: 'do', text: 'Editing the parser', source: 'assistant' });
   send('agent.output', { role: 'responder', text: 'The agent is', source: 'assistant' });
@@ -63,7 +63,7 @@ test('LT-5: streamed chunks stay out of the Activity feed', () => {
   const ctx = vm.createContext({ S: { selected: null, tab: 'activity', projectId: 'p', tasks: [], taskEvents: [], activity: [], meta: {} },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
     patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, bgRenderMain: () => renders++, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false });
-  vm.runInContext([fn('connectWs'), fn('noteLiveOutput'), fn('supersedesLiveOutput'), fn('liveOnlyEvent')].join('\n'), ctx); ctx.connectWs();
+  vm.runInContext([fn('connectWs'), fn('isCrossProjectList'), fn('noteLiveOutput'), fn('supersedesLiveOutput'), fn('liveOnlyEvent')].join('\n'), ctx); ctx.connectWs();
   for (let i = 0; i < 50; i++) ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', projectId: 'p', type: 'agent.output', payload: { text: `x${i}`, source: 'assistant' } }) });
   // Save progress is shown on the task, not listed either.
   ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 't', projectId: 'p', type: 'staging.progress', payload: { bytes: 1, totalBytes: 2 } }) });

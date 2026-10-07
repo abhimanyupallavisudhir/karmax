@@ -328,6 +328,18 @@ export class WorldHandoffService {
 
   async refresh(taskId: string, view: TaskView): Promise<{ updated: Array<{ repo: string; branch: string; sha: string }>;
     parked: boolean; warning?: string }> {
+    const { resources: _resources, ...result } = await this.importLocal(taskId, view, { git: true });
+    return result;
+  }
+
+  /** Bring a laptop's work into the waiting cloud world: the pushed task
+   * branch (`git`), and resource snapshots the workspace saved into each
+   * resource's repository, which replace the world's private copies. Review
+   * then publishes them as it would the agent's own. */
+  async importLocal(taskId: string, view: TaskView, input: { git: boolean; resources?: Array<{ id: string; snapshot: string }> }):
+    Promise<{ updated: Array<{ repo: string; branch: string; sha: string }>; resources: string[]; parked: boolean; warning?: string }> {
+    const imports = input.resources ?? [];
+    if (imports.length && !this.resources) throw new Error('project resources are unavailable');
     const task = (await this.store.taskMetadata(taskId));
     const project = task ? (await this.store.getProject(task.projectId)) : undefined;
     if (!task || !project?.organizationId) throw new Error('task project is unavailable');
@@ -342,7 +354,7 @@ export class WorldHandoffService {
     if (!handle) throw new Error('task has no recoverable world');
     if (!this.worlds.get(handle.kind).capabilities?.remote) throw new Error('local projects already use their on-disk world directly');
     const linked = (await this.store.listProjectRepositories(project.id));
-    if (!linked.length) throw new Error('project has no GitHub repositories');
+    if (input.git && !linked.length) throw new Error('project has no GitHub repositories');
     const auth: GitBrokerAuth = async (repo) => {
       const repository = linked.find((entry) => sameRepository(entry.repository.sshUrl, worldRepoSource(repo)))?.repository;
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
@@ -385,7 +397,8 @@ export class WorldHandoffService {
         throw new Error('world admission changed; retry importing local changes');
       }
       let world: Awaited<ReturnType<WorldRegistry['open']>> | undefined;
-      let result: Awaited<ReturnType<typeof brokerRefreshBranch>> | undefined;
+      let result: Awaited<ReturnType<typeof brokerRefreshBranch>> = { updated: [] };
+      const imported: string[] = [];
       let parked = false;
       let warning: string | undefined;
       let operationError: unknown;
@@ -393,10 +406,15 @@ export class WorldHandoffService {
         world = await this.worlds.open(handle!);
         opened = true;
         await assertReview();
-        result = await brokerRefreshBranch(world, auth);
+        if (input.git) result = await brokerRefreshBranch(world, auth);
+        for (const resource of imports) {
+          await this.resources!.importWorkspaceSnapshot(taskId, world, resource.id, resource.snapshot);
+          imported.push(resource.id);
+        }
         (await this.store.appendEvent({ taskId, type: 'world.local-handoff-imported', ts: Date.now(), payload: {
           provider: handle.kind, generation: world.handle.generation ?? handle.generation ?? 1,
           repositories: result.updated.map((entry) => ({ repo: entry.repo, branch: entry.branch, sha: entry.sha })),
+          ...(imported.length ? { resources: imported } : {}),
         } }));
       } catch (error) {
         operationError = error;
@@ -427,7 +445,7 @@ export class WorldHandoffService {
         const primary = operationError instanceof Error ? operationError.message : String(operationError);
         throw new Error(warning ? `${primary}; additionally, ${warning}` : primary);
       }
-      return { ...result!, parked, ...(warning ? { warning } : {}) };
+      return { ...result, resources: imported, parked, ...(warning ? { warning } : {}) };
     }); } catch (error) {
       // Admission happens outside transition ownership to avoid capacity/park
       // deadlocks. If validation fails before opening, release that new lease.

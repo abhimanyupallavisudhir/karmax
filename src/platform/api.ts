@@ -36,6 +36,7 @@ import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, T
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
+import { assertInFlightComputerEdit, computerOf, machineShape, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
@@ -1003,6 +1004,35 @@ export class KarmaxApi {
     }
   }
 
+  /** A task's own Computer, validated: sizes in range, and a provider this
+   * deployment can run and the organization has connected. */
+  private async taskComputer(project: Project, overrides: ValueMap): Promise<ComputerSpec | undefined> {
+    let computer: ComputerSpec | undefined;
+    try {
+      computer = normalizeComputer(overrides.computer);
+      if (!computer?.provider && typeof overrides.worldProvider === 'string' && overrides.worldProvider)
+        computer = normalizeComputer({ ...computer, provider: overrides.worldProvider });
+    } catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+    const provider = computer?.provider;
+    if (provider) {
+      const local = ['worktree', 'container', 'memory'].includes(provider);
+      if (local && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B or Daytona)');
+      if (!local && this.deps.providerConnections
+        && !(await this.deps.providerConnections.available(project.organizationId ?? 'org_personal', provider)))
+        throw new ValidationError(`${provider} is not connected. Connect it under Settings → Computers first.`);
+    }
+    return computer;
+  }
+
+  /** Store a task's Computer in its one canonical, validated form. */
+  private async normalizeTaskComputer(project: Project, params: ValueMap): Promise<void> {
+    if (params.computer === undefined && params.worldProvider === undefined) return;
+    const computer = (await this.taskComputer(project, params));
+    delete params.worldProvider;
+    if (computer) params.computer = computer;
+    else delete params.computer;
+  }
+
   private async assertRepositoriesValid(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
     if (!needsRepo) return;
@@ -1196,6 +1226,7 @@ export class KarmaxApi {
     }
     taskOverrides.paymentPolicy ??= paymentDefaults;
     this.assertBranchParams(taskOverrides);
+    (await this.normalizeTaskComputer(project, taskOverrides));
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
     (await this.validateAndAuthorizeResumeSources(token, taskOverrides));
@@ -1529,6 +1560,12 @@ export class KarmaxApi {
       ? [taskOverrides, (await quickProjectSettingsFor(getSettings, project.id, manifest.name)), (await quickGlobalSettingsFor(getSettings, manifest.name, project.organizationId)), projectVals, globalVals]
       : [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
+    // The Computer's defaults are the execution policy (already in the project's
+    // effective config); only the task's own override is a param. A legacy
+    // `worldProvider` param (older drafts and API callers) is its provider.
+    const computer = (await this.taskComputer(project, taskOverrides));
+    if (computer) resolved.computer = computer;
+    else delete resolved.computer;
     // `none` means a completed merge may remain only in its local world. That is
     // a valid self-hosted choice, but never a valid outcome for a disposable
     // hosted GitHub world. Coerce legacy settings rows here so every newly
@@ -2625,6 +2662,7 @@ export class KarmaxApi {
     params = stripPlatformMetadata({ ...params });
     const project = (await this.deps.store.getProject(task.projectId));
     if (project) this.assertProfilesVisible(params.profiles, project);
+    if (project) (await this.normalizeTaskComputer(project, params));
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
     (await this.validateAndAuthorizeResumeSources(token, params));
@@ -4701,8 +4739,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return this.searchAuthorizedOrganization(readable, query, caller.principal, page, now);
   }
 
-  /** Evaluate one query across already-authorized projects of an organization:
-   *  one sort and grouping over all of them, then a page of the result. */
+  /** Evaluate one query across already-authorized projects — an organization's,
+   *  or every organization's: one sort and grouping over all of them, then a
+   *  page of the result. */
   async searchAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string,
     page: { limit?: number; offset?: number } = {}, now = Date.now()) {
     const { result, tags } = await this.evaluateProjects(projects, query, principalId, now);
@@ -4719,7 +4758,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       ...result, tasks, total: result.total, offset, limit,
       ...(result.groups ? { groups: prune(result.groups) } : {}),
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
-      projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name) })),
+      projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
       tags,
     };
   }
@@ -5708,6 +5747,15 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     if ('paymentPolicy' in patch) throw new Error('Use the task payments endpoint to change cards or budget');
     patch = stripPlatformMetadata({ ...patch });
     this.assertBranchParams(patch);
+    // A running task may resize its computer, not swap it for another one.
+    const project = (await this.deps.store.getProject(task.projectId));
+    const computerBefore = project && Object.prototype.hasOwnProperty.call(patch, 'computer')
+      ? (await this.deps.store.effectiveTaskConfig(project, taskId)) : undefined;
+    if (project && computerBefore) {
+      try { assertInFlightComputerEdit(computerOf(computerBefore), normalizeComputer(patch.computer) ?? {}); }
+      catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+      patch.computer = (await this.taskComputer(project, { computer: patch.computer })) ?? null;
+    }
     // An in-flight edit can introduce a `resumeFrom` pointer at another task —
     // the same source-side conversation check as createTask/updateArmedParams.
     (await this.validateAndAuthorizeResumeSources(token, patch));
@@ -5753,6 +5801,17 @@ Act according to your Avatar instructions. When ready, call platform_request POS
           else delete current[key];
         }
         (await this.deps.store.patchTaskParams(taskId, { _agentAuthorization: current }));
+      }
+      // The workflow accepted the edit window; the Computer itself is read from
+      // the task's params by whatever makes its next machine (runners.ts sweep,
+      // checkpoint restore, a retry's world). A world made before machines were
+      // recorded learns the size it was made at, so the sweep can see the change.
+      if (computerBefore) {
+        (await this.deps.store.patchTaskParams(taskId, { computer: patch.computer }));
+        const world = (await this.deps.store.currentWorld(taskId));
+        if (world && !world.meta?.computer && !['worktree', 'container', 'memory'].includes(world.kind))
+          (await this.deps.store.updateWorldMeta(world, { computer: machineShape(computerBefore) }).catch(() => undefined));
+        result.applied = [...new Set([...result.applied, 'computer'])];
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')

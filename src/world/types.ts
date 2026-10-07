@@ -183,7 +183,7 @@ export interface WorldSpec {
   sourceAuthority?: 'project' | 'origin';
   network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
   environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };
-  resources?: { cpu?: number; memoryMb?: number; gpu?: number };
+  resources?: { cpu?: number; memoryMb?: number; diskGb?: number; gpu?: number };
   /** Where the checkouts sit under the world root. `flat` (the default for a
    * lone repo) makes the world root itself the worktree; `nested` always gives
    * each checkout its own subdirectory — which is what leaves room for a

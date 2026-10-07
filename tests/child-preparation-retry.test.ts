@@ -65,3 +65,24 @@ it('stores the profiles a child inherits from its parent', async () => {
     expect((await store.getTask(child.taskId))!.params.profiles).toEqual(profiles);
   } finally { vi.restoreAllMocks(); await store.close(); }
 });
+
+// pramana#3: a sub-task starts from its parent's copies of the writable
+// resources, saved when it is created, as it starts from the parent's branch.
+it('records the parent\'s resource versions a child starts from', async () => {
+  const store = await Store.create(':memory:');
+  const project = await store.createProject('Corpus');
+  const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1', params: { prompt: 'fixture' } });
+  const handle = { id: parent.id, kind: 'worktree', root: '/tmp/world', branch: `karmax/${parent.id}`, base: 'main', meta: { projectId: project.id } };
+  await store.registerWorld(handle as any, project.id);
+  vi.spyOn(Context, 'current').mockImplementation(() => ({ info: { activityId: 'prepare',
+    workflowExecution: { workflowId: parent.id, runId: 'run-1' } } }) as any);
+  const snapshotForks = vi.fn(async () => ({ resource_raw: 'revision_parent_copy' }));
+  const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+    profiles: new ProfileResolver(store, 'mock'), resources: { snapshotForks } as any });
+  try {
+    const child = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work',
+      base: 'main', target: 'main', parentBranch: `karmax/${parent.id}`, project: {}, profiles: {} } as any);
+    expect(snapshotForks).toHaveBeenCalledWith(expect.objectContaining({ id: parent.id }));
+    expect((await store.getTask(child.taskId))?.params._parentResources).toEqual({ resource_raw: 'revision_parent_copy' });
+  } finally { vi.restoreAllMocks(); await store.close(); }
+});
