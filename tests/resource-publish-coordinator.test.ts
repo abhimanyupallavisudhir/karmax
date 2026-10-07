@@ -119,8 +119,9 @@ describe('resource publish coordinator', () => {
       const promoted = await firstPromotion;
       expect(promoted.revision.parentRevisionId).toBe(baseline.id);
       // Both forked the same baseline, so the database CAS still refuses the
-      // second one after the coordinator lets it through.
-      expect(await secondOutcome).toMatch(/baseline changed/);
+      // second one after the coordinator lets it through; merging the first's
+      // publication then finds both changed the same file.
+      expect(await secondOutcome).toMatch(/changed both by this task and in a newer published version \(weights\.bin\)/);
       expect(promoteRevision).toHaveBeenCalledTimes(2);
       expect((await h.store.getResourceAttachment(attachment.id))?.currentRevisionId).toBe(promoted.revision.id);
       await expect.poll(() => view(attachment.id), { timeout: 10_000 }).toMatchObject({ queue: [] });

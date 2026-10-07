@@ -4,6 +4,7 @@ import type { IdentityService } from '../auth/identity.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { userScope } from '../autonomy/vault-keys.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
+import { AppGrants } from '../auth/app-grants.js';
 
 export const closedAccountKey = (id: string) => `account-closed:${id}`;
 const caseKey = (id: string) => `account-erasure:${id}`;
@@ -225,6 +226,7 @@ export class AccountErasureService {
         if (row.key.startsWith(`hosted:onboarding:${userId}:`)) await this.store.kvDelete(row.key);
       await this.store.kvDelete(`git:profiles:user:${userId}`);
       await this.store.kvDelete(`git:default-profile:user:${userId}`);
+      await new AppGrants(this.store).revokeUser(userId); // CLI logins, MCP clients, personal tokens
     });
   }
 

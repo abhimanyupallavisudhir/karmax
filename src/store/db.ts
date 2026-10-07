@@ -6420,6 +6420,12 @@ export class Store {
     });
   }
 
+  /** The version a world's copy now descends from, after newer published
+   * changes were merged into it. */
+  async rebaseResourceLease(id: string, revisionId: string): Promise<void> {
+    (await this.db.prepare('UPDATE resource_leases SET revisionId=? WHERE id=?').run(revisionId, id));
+  }
+
   // ─── Organization storage locations and physical snapshot accounting ─────
 
   async saveStorageLocation(input: Omit<StorageLocation, 'createdAt' | 'updatedAt'>
@@ -8906,7 +8912,9 @@ async function uniqueSlug(value: string, used: (candidate: string) => boolean | 
 const RESERVED_ROUTE_SLUGS = new Set([
   'mcp-callback',
   // gateway-owned top-level prefixes
-  'api', 'ws',
+  'api', 'ws', 'mcp', 'oauth',
+  // app sign-in approval (web/app.js renderDeviceApproval)
+  'device',
   // top-level routes / legacy org paths (an org slug is the first URL segment)
   'invite', 'projects', 'organization', 'organizations', 'installation',
   // `for:me` is the signed-in person in every search (and /me is kept free)
