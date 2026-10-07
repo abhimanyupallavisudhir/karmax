@@ -68,6 +68,8 @@ eval(extractFn('projectRoute'));
 eval(extractFn('listRoute'));
 eval(extractFn('homeRoute'));
 eval(extractFn('isTaskListTab'));
+eval(extractFn('isCrossProjectList'));
+eval(extractFn('inboxRoute'));
 eval(extractFn('globalRoute'));
 eval(extractFn('encodeQuery'));
 eval(extractFn('taskRecord'));
@@ -212,6 +214,12 @@ eval(extractFn('setQuery'));
   eq(projectRoute('P1'), '/acme/website-redesign', 'and does not leak into the project\'s links');
   await setQuery('for:me');
   eq(currentPath(), '/acme', 'the home\'s default view is the bare organization path');
+  // So does the bell's page, above every organization.
+  Object.assign(S, { tab: 'inbox', searchScope: 'all' });
+  await setQuery('');
+  eq(currentPath(), '/inbox?q=', 'a search on the bell\'s page is its URL');
+  await setQuery('for:me');
+  eq(currentPath(), '/inbox', 'and its default view is the bare /inbox');
   Object.assign(S, { tab: 'tasks', searchScope: 'P1' });
 
   // Only the tasks list is query-driven: nothing else may hijack the URL.

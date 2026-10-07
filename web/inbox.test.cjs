@@ -1,4 +1,5 @@
-// The inbox panel: kind sub-tabs, and read items hidden until asked for.
+// The bell: its badge counts new asks in every organization, and its page (the
+// Home list over every organization) heads For me with asks that are not tasks.
 // Run: node web/inbox.test.cjs
 const fs = require('fs');
 const path = require('path');
@@ -31,130 +32,72 @@ function extractConst(name) {
 global.esc = (value) => String(value ?? '').replace(/[&<>"]/g, (char) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
 })[char]);
-global.localStorage = undefined; // the plain-node harness has no browser storage
-global.renderFlag = (key, dflt) => (global.FLAGS && key in global.FLAGS ? global.FLAGS[key] : dflt);
-global.inboxRoute = (filter) => `/personal/inbox${filter && filter !== 'all' ? `/${filter}` : ''}`;
-global.S = { inbox: [], inboxFilter: 'all', meta: { deliveryChannels: ['browser'] }, deliveryPreferences: null };
-
-global.globalRoute = (tab) => `/personal/${tab}`;
-global.profileRoute = () => '/profile';
+global.S = { inbox: [], tab: 'inbox', search: 'for:me', organizations: [{ id: 'o1', name: 'Acme & Co', slug: 'acme' }],
+  projects: [{ id: 'project_1', organizationId: 'o1', name: 'Karmax & tools' }] };
 global.syncNotificationAlerts = () => {}; // alert overlays: web/notification-alerts.browser.test.cjs
+global.FOR_ME_VIEW = '__for_me__';
+global.viewIdForQuery = (q) => (q === 'for:me' ? FOR_ME_VIEW : null);
+global.organizationById = (id) => S.organizations.find((o) => o.id === id);
+global.projectById = (id) => S.projects.find((p) => p.id === id);
+global.formatBytes = (n) => `${n} B`;
 
-// A `const` inside a direct eval stays in the eval's own scope; hoist it out.
-eval(extractConst('INBOX_TABS').replace('const INBOX_TABS =', 'global.INBOX_TABS ='));
 eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
-for (const name of ['urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxTimeLabel', 'inboxProjectLabel', 'inboxView', 'updateBell']) eval(extractFn(name));
+for (const name of ['urgencyRank', 'inboxUnreadCount', 'taskHasUnreadAsk', 'inboxRowLabel', 'inboxTitle', 'urgencyChip', 'updateBell',
+  'inboxNotices', 'inboxNoticesHtml', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
 const ok = (condition, message) => condition ? pass++ : (fail++, console.error('FAIL:', message));
 
-const item = (id, kind, unread, extra = {}) => ({ id, kind, unread, actionable: kind !== 'update', urgency: 'normal',
+const item = (id, kind, unread, extra = {}) => ({ id, kind, unread, actionable: kind !== 'update', urgency: 'normal', organizationId: 'o1',
   taskId: `task_${id}`, createdAt: 1_700_000_000_000, task: { id: `task_${id}`, num: Number(id), title: `Task ${id}`, projectId: 'project_1' }, ...extra });
 
 S.inbox = [
   item('1', 'approval-requested', true),
-  item('2', 'review-requested', true),
+  item('2', 'review-requested', true, { organizationId: 'o2' }),
   item('3', 'review-requested', false),
   item('4', 'update', true),
 ];
-
-// Show read is OFF by default: an answered notification stops taking up space.
-ok(inboxShowRead() === false, 'read items are hidden by default');
-ok(inboxItems().map((x) => x.id).join(',') === '1,2', 'All renders unread asks, not routine updates');
-global.FLAGS = { 'karmax-inbox-show-read': true };
-ok(inboxItems().map((x) => x.id).join(',') === '1,2,3', 'the toggle brings read asks back without adding updates to All');
-global.FLAGS = {};
-
-// Every known kind has a stable tab, including kinds with no current items.
-const tabs = inboxTabs();
-ok(tabs[0].key === 'all', 'All is the first sub-tab');
-ok(tabs.map((t) => t.key).join(',') === 'all,approval-requested,review-requested,escalated,assigned,mentioned,update',
-  `every kind gets a tab (got ${tabs.map((t) => t.key).join(',')})`);
-ok(tabs.find((t) => t.key === 'review-requested').unread === 1, 'a sub-tab counts its UNREAD items');
-ok(tabs.find((t) => t.key === 'escalated').unread === 0, 'an empty sub-tab has a zero count');
-ok(tabs.find((t) => t.key === 'update').unread === 1, 'Updates counts its unread items');
-ok(tabs.find((t) => t.key === 'all').unread === 2, 'All counts unread asks, not updates');
-
+// The badge: unread asks in every organization, never routine updates.
 const badge = { classList: { toggle() {} } };
 global.$ = (selector) => selector === '#bell-badge' ? badge : null;
-S.inboxFilter = 'update';
 updateBell();
-ok(badge.textContent === 2, 'bell matches All even while viewing Updates');
-
-S.inboxFilter = 'approval-requested';
-ok(inboxItems().map((x) => x.id).join(',') === '1', 'the selected sub-tab filters the list');
-S.inboxFilter = 'escalated'; // a filter whose items have all been answered
-ok(inboxItems().length === 0, 'an empty sub-tab simply renders empty');
-S.inboxFilter = 'update';
-ok(inboxItems().map((x) => x.id).join(',') === '4', 'routine updates remain available in their own sub-tab');
-S.inboxFilter = 'all';
+ok(badge.textContent === 2, `the bell counts unread asks across organizations (got ${badge.textContent})`);
+ok(taskHasUnreadAsk('task_1') && !taskHasUnreadAsk('task_3'), 'a row knows whether its ask is new');
+ok(!taskHasUnreadAsk('task_4'), 'an unread update does not mark its row');
 
 // An update's news is the outcome, not the word "update".
-ok(inboxRowLabel(item('9', 'update', true, { task: { status: 'cancelled' } })) === 'cancelled',
-  'an update row names the outcome it reports');
-ok(inboxRowLabel(item('9', 'update', true)) === 'update', 'and falls back when the status is unknown');
+ok(inboxRowLabel(item('9', 'update', true, { task: { status: 'cancelled' } })) === 'cancelled', 'an update row names the outcome it reports');
 ok(inboxRowLabel(item('9', 'review-requested', true)) === 'review requested', 'an ask names itself');
 
-// Urgency orders the list: the most urgent ask is at the top whatever its age,
-// and every level has an explicit priority label.
-S.inbox = [
-  item('11', 'escalated', true, { urgency: 'high', createdAt: 1 }),
-  item('12', 'review-requested', true, { urgency: 'normal', createdAt: 9 }),
-  item('13', 'escalated', true, { urgency: 'critical', createdAt: 5 }),
-  item('14', 'escalated', true, { urgency: 'high', createdAt: 0 }),
-];
-ok(inboxItems().map((x) => x.id).join(',') === '13,11,14,12',
-  `urgency outranks recency (got ${inboxItems().map((x) => x.id).join(',')})`);
+// Every priority is explicit and ranked.
 ok(urgencyRank('critical') > urgencyRank('high') && urgencyRank('high') > urgencyRank('normal')
   && urgencyRank('normal') > urgencyRank('low'), 'the levels rank in order');
 ok(urgencyRank('nonsense') === urgencyRank('normal'), 'an unknown level reads as normal, not as the floor');
-const urgentHtml = inboxView();
-ok(/urgency-chip critical/.test(urgentHtml) && /urgency-chip high/.test(urgentHtml), 'high and critical rows are chipped');
-ok(/urgency-chip normal/.test(urgentHtml), 'normal priority is labeled too');
 ok(urgencyChip('low').includes('low priority'), 'low priority has an accessible label');
 ok(urgencyChip('invalid').includes('normal priority'), 'unknown priority safely defaults to normal');
-ok(urgentHtml.indexOf('urgency-chip critical') < urgentHtml.indexOf('urgency-chip high'),
-  'the critical row is rendered first');
 
+// Asks that are not a task's head For me, most urgent first.
+const notice = (id, extra) => ({ id, kind: 'approval-requested', unread: true, actionable: true, urgency: 'normal', organizationId: 'o1', createdAt: 1, ...extra });
 S.inbox = [
-  item('1', 'approval-requested', true),
-  item('2', 'review-requested', true),
-  item('3', 'review-requested', false),
-  item('4', 'update', true),
+  item('1', 'review-requested', true),
+  notice('cred', { subject: { kind: 'credential', provider: 'claude', account: 'ops', reason: 'signed-out' } }),
+  notice('avatar', { urgency: 'critical', subject: { kind: 'avatar-authorization', projectId: 'project_1' }, resource: { name: 'Design <helper>', projectId: 'project_1' } }),
+  notice('old', { actionable: false, subject: { kind: 'credential', provider: 'x', account: 'y', reason: 'signed-out' } }),
 ];
-const html = inboxView();
-ok(html.includes('href="/personal/inbox/approval-requested"'), 'sub-tabs are real links (URL owns the view)');
-ok(html.includes('href="/personal/inbox/escalated"'), 'empty sub-tabs are still rendered as links');
-ok(html.includes('id="inbox-show-read"'), 'the panel offers the Show read toggle');
-ok(!/id="inbox-show-read"[^>]*checked/.test(html), 'Show read is unchecked by default');
-ok(html.includes('Task 1'), 'rows render the task title');
-ok(/class="task-row inbox-row/.test(html), 'notifications reuse task-row styling');
-ok(/class="task-title"><span class="task-num">#1<\/span> Task 1/.test(html), 'task number and title share the task title line');
-ok(/class="task-main"/.test(html) && /class="task-right"/.test(html), 'notification content and actions use task row columns');
-ok(/class="status-dot /.test(html), 'notifications use task status dots');
-ok(/data-inbox="1" tabindex="0"/.test(html), 'notification rows can receive keyboard focus');
-ok(/aria-label="Mark as read"/.test(html) && /data-inbox-toggle="1"/.test(html), 'checkmark has an accessible read action');
-ok(/class="task-right">[\s\S]*urgency-chip[\s\S]*<time[\s\S]*data-inbox-toggle/.test(html), 'urgency, time, and checkmark appear in order on the right');
-const now = new Date(2026, 8, 18, 14, 0).getTime();
-ok(inboxTimeLabel(now - 10 * 60000, now) === '10 minutes ago', 'minutes are relative');
-ok(inboxTimeLabel(now - 3600000, now) === '1 hour ago', 'singular hour is relative');
-ok(inboxTimeLabel(now - 10000, now) === 'just now', 'recent arrivals say just now');
-ok(inboxTimeLabel(new Date(2026, 8, 17, 23).getTime(), now) === 'yesterday', 'previous calendar day says yesterday');
-ok(!/ago|:/.test(inboxTimeLabel(new Date(2026, 8, 16).getTime(), now)), 'older notifications use only a date');
-S.projects = [{ id: 'project_1', name: 'Karmax & tools' }];
-ok(inboxProjectLabel(S.inbox[0]) === 'Karmax & tools', 'task project name is resolved');
-ok(inboxProjectLabel({ resource: { projectId: 'project_1' } }) === 'Karmax & tools', 'resource notifications resolve their project');
-ok(inboxView().includes('Karmax &amp; tools'), 'project label is escaped');
+ok(inboxNotices().map((x) => x.id).join(',') === 'avatar,cred', `only live asks without a task, urgency first (got ${inboxNotices().map((x) => x.id)})`);
+const html = inboxNoticesHtml();
+ok(/class="task-row inbox-row unread" data-inbox="avatar" tabindex="0"/.test(html), 'a notice is a focusable task row');
+ok(html.includes('Avatar authorization approval') && html.includes('Design &lt;helper&gt;'), 'it says what is asked, escaped');
+ok(html.includes('<span class="task-project-org">acme/</span>karmax-tools'), 'it names organization and project as a slug');
+ok(/<span class="task-project" title="Acme &amp; Co"><span class="task-project-org">acme<\/span><\/span>/.test(html), 'an organization-wide ask names just its organization');
+ok(html.indexOf('data-inbox="avatar"') < html.indexOf('data-inbox="cred"'), 'the critical notice comes first');
+S.search = '';
+ok(inboxNoticesHtml() === '', 'notices belong to For me');
+S.search = 'for:me'; S.tab = 'home';
+ok(inboxNoticesHtml() === '', 'and to the bell\'s page only');
+
 for (const name of ['taskRow', 'seriesRow']) ok(!extractFn(name).includes('workflowLabel('), name + ' omits workflow type');
-
-
-ok(!html.includes('Task 3'), 'a read row is not rendered while Show read is off');
-ok(!html.includes('Task 4'), 'All does not render an unread routine update');
-ok(html.includes('<span>2 unread</span>'), 'the All toolbar count excludes routine updates');
-// Behaviour lives in one place — the profile — not next to the list it affects.
-ok(html.includes(`href="/profile#notifications"`), 'the panel points at the user-scoped notification settings');
-ok(!html.includes('id="save-delivery"'), 'delivery preferences are no longer configured from the list');
 
 const openItem = extractFn('openInboxItem');
 ok(!openItem.includes('await loadTasks'), 'opening an inbox task does not preload its project before navigation');

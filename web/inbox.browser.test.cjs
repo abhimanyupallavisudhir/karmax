@@ -39,86 +39,72 @@ function constant(name) {
     await page.addStyleTag({ path: path.join(__dirname, 'styles.css') });
     await page.evaluate(() => {
       window.$ = s => document.querySelector(s);
-      window.S = { organizationId: 'org_fixture', projects: [{ id: 'karmax', name: 'Karmax' }, { id: 'site', name: 'Website' }], inboxFilter: 'all', inbox: [
-        { id: 'critical', kind: 'escalated', urgency: 'critical', unread: true, actionable: true, createdAt: Date.now() - 60000, task: { projectId: 'karmax', num: 284, title: 'Restore the deployment after a failed health check', status: 'blocked' } },
-        { id: 'review', kind: 'review-requested', urgency: 'high', unread: true, actionable: true, createdAt: Date.now() - 10 * 60000, task: { projectId: 'karmax', num: 283, title: 'Match notification rows to the task list', status: 'waiting' } },
-        { id: 'resource', kind: 'approval-requested', urgency: 'normal', unread: true, actionable: true, createdAt: Date.now() - 3600000, resource: { name: 'Design assistant', projectId: 'karmax' }, subject: { kind: 'avatar-authorization' } },
-        { id: 'read', kind: 'assigned', urgency: 'low', unread: false, actionable: true, createdAt: new Date(new Date().setDate(new Date().getDate() - 1)).getTime(), task: { projectId: 'site', num: 281, title: 'Polish the project settings page', status: 'active' } },
+      window.S = { tab: 'inbox', search: 'for:me', organizationId: 'org_fixture',
+        organizations: [{ id: 'org_fixture', name: 'Fixture', slug: 'fixture' }],
+        projects: [{ id: 'karmax', organizationId: 'org_fixture', name: 'Karmax' }, { id: 'site', organizationId: 'org_fixture', name: 'Website' }], inbox: [
+        { id: 'critical', organizationId: 'org_fixture', kind: 'escalated', urgency: 'critical', unread: true, actionable: true, createdAt: Date.now() - 60000, taskId: 'reference', task: { projectId: 'karmax', num: 284, title: 'Restore the deployment after a failed health check', status: 'blocked' } },
+        { id: 'resource', organizationId: 'org_fixture', kind: 'approval-requested', urgency: 'normal', unread: true, actionable: true, createdAt: Date.now() - 3600000, resource: { name: 'Design assistant with a long name that should truncate politely on a phone', projectId: 'karmax' }, subject: { kind: 'avatar-authorization', projectId: 'karmax' } },
+        { id: 'login', organizationId: 'org_fixture', kind: 'approval-requested', urgency: 'high', unread: false, actionable: true, createdAt: Date.now() - 7200000, subject: { kind: 'credential', provider: 'claude', account: 'ops', reason: 'signed-out' } },
       ] };
+      window.FOR_ME_VIEW = '__for_me__';
+      window.viewIdForQuery = q => (q === 'for:me' ? FOR_ME_VIEW : null);
       window.esc = v => String(v ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
-      window.renderFlag = (key, fallback) => localStorage.getItem(key) === null ? fallback : localStorage.getItem(key) === '1';
-      window.inboxRoute = filter => '/inbox/' + filter;
-      window.profileRoute = () => '/profile';
-      window.requests = []; window.opened = [];
-      window.api = async (url, options) => { requests.push({ url, ...options }); return {}; };
+      window.organizationById = id => S.organizations.find(o => o.id === id);
+      window.projectById = id => S.projects.find(p => p.id === id);
+      window.formatBytes = n => `${n} B`;
+      window.opened = [];
       window.openInboxItem = item => opened.push(item.id);
-      window.renderRail = () => {};
-      window.toast = message => { throw new Error(message); };
       window.workflowLabel = () => 'Software development';
       window.customBranch = () => false;
       window.stageLabel = () => 'Review';
       window.priorityFlag = () => '';
       window.pipeline = () => '';
-      window.attentionChip = () => '';
-      window.projectChip = () => '';
-      window.renderMain = () => { $('#main').innerHTML = inboxView(); wireInboxView(); };
+      window.attentionChip = () => '<span class="chip attention escalated">Input</span>';
+      window.renderMain = () => {
+        $('#main').innerHTML = `<div class="task-list">${inboxNoticesHtml()}${taskRow({ id: 'reference', projectId: 'karmax', num: 284, title: 'Restore the deployment after a failed health check', lastView: { status: 'waiting', stage: 'review' } }, { showTags: false, project: true })}</div>`;
+        wireInboxNotices();
+      };
     });
     await page.addScriptTag({ content: [
-      constant('INBOX_TABS'), constant('URGENCY_LEVELS'), 'const systemNotifications = new Map();',
-      ...['updateBell', 'syncNotificationAlerts', 'urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxTimeLabel', 'inboxProjectLabel', 'inboxView', 'wireInboxView', 'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'taskRow'].map(fn),
+      constant('URGENCY_LEVELS'), 'const systemNotifications = new Map();',
+      ...['updateBell', 'syncNotificationAlerts', 'urgencyRank', 'inboxUnreadCount', 'taskHasUnreadAsk', 'inboxRowLabel', 'inboxTitle', 'urgencyChip',
+        'inboxNotices', 'inboxNoticesHtml', 'wireInboxNotices', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel',
+        'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'taskRow'].map(fn),
       'renderMain();',
     ].join('\n') });
     await page.evaluate(() => document.fonts.ready);
-    assert.equal(await page.locator('.inbox-row').count(), 3);
-    // Compare actual task and notification renderers, not a second CSS fixture.
-    const styles = await page.evaluate(() => {
-      const reference = document.createElement('div');
-      reference.innerHTML = taskRow({ id: 'reference', num: 283, title: 'Match notification rows to the task list', lastView: { status: 'waiting', stage: 'review' } }, { showTags: false });
-      $('#main').append(reference);
-      const pick = el => {
-        const style = getComputedStyle(el);
-        return Object.fromEntries(['padding', 'gap', 'borderRadius', 'borderWidth', 'borderColor', 'borderStyle', 'boxShadow', 'backgroundColor', 'fontSize', 'fontWeight'].map(k => [k, style[k]]));
-      };
-      const actual = [pick($('.inbox-row')), pick($('.inbox-row .task-title'))];
-      const expected = [pick(reference.firstElementChild), pick(reference.querySelector('.task-title'))];
-      reference.remove();
-      return { actual, expected };
+    assert.equal(await page.locator('.inbox-row').count(), 2, 'asks that are not tasks are rows');
+    // Notices are task rows: compare the actual renderers, not a second CSS fixture.
+    const pick = selector => page.locator(selector).evaluate(el => {
+      const style = getComputedStyle(el);
+      return Object.fromEntries(['padding', 'gap', 'borderRadius', 'borderWidth', 'borderColor', 'borderStyle', 'backgroundColor', 'fontSize'].map(k => [k, style[k]]));
     });
-    assert.deepEqual(styles.actual, styles.expected);
-    await page.locator('[data-inbox-toggle="review"]').click();
-    assert.equal(await page.locator('[data-inbox="review"]').count(), 0);
-    assert.deepEqual(await page.evaluate(() => opened), []);
-    assert.equal(await page.evaluate(() => JSON.parse(requests[0].body).unread), false);
-    await page.locator('#inbox-show-read').check();
-    assert.equal(await page.locator('[data-inbox-toggle="review"]').getAttribute('aria-label'), 'Mark as unread');
-    await page.locator('[data-inbox-toggle="review"]').click();
-    assert.equal(await page.locator('[data-inbox-toggle="review"]').getAttribute('aria-label'), 'Mark as read');
+    const notification = '[data-inbox="login"]';
+    const reference = '.task-row[data-id="reference"]';
+    assert.deepEqual(await pick(notification), await pick(reference));
+    assert.deepEqual(await pick(`${notification} .task-title`).then(({ fontSize }) => fontSize), await pick(`${reference} .task-title`).then(({ fontSize }) => fontSize));
+    // A new ask has an accent edge; a project is a plain monospace slug, never a chip.
+    const shadow = selector => page.locator(selector).evaluate(el => getComputedStyle(el).boxShadow);
+    assert.notEqual(await shadow(reference), 'none', 'the unread task row has an accent edge');
+    assert.equal(await shadow(notification), 'none', 'a read notice does not');
+    const label = await page.locator(`${reference} .task-project`).evaluate(el => {
+      const s = getComputedStyle(el);
+      return { text: el.textContent, font: s.fontFamily, border: s.borderTopWidth, background: s.backgroundColor, radius: s.borderRadius };
+    });
+    assert.equal(label.text, 'fixture/karmax');
+    assert.match(label.font, /mono/i);
+    assert.deepEqual([label.border, label.background, label.radius], ['0px', 'rgba(0, 0, 0, 0)', '0px']);
     await page.locator('[data-inbox="resource"] .task-title').click();
     assert.deepEqual(await page.evaluate(() => opened), ['resource']);
-    await page.evaluate(() => { S.cursorId = undefined; moveCursor(1); moveCursor(1); openListRow(document.activeElement); });
-    assert.equal(await page.evaluate(() => opened.at(-1)), 'review');
-    await page.evaluate(() => { document.activeElement.blur(); S.cursorId = undefined; applyCursor(); });
-    assert.equal(await page.locator('[data-inbox="critical"] time').textContent(), '1 minute ago');
-    assert.ok(await page.locator('[data-inbox="critical"] time').getAttribute('title'));
-    assert.equal(await page.locator('[data-inbox="critical"] .inbox-project').textContent(), 'Karmax');
-    assert.ok(await page.evaluate(() => {
-      const right = document.querySelector('.inbox-row .task-right');
-      return right.children[0].classList.contains('urgency-chip') && right.children[1].tagName === 'TIME' && right.children[2].tagName === 'BUTTON';
-    }));
-    // Compare hover and keyboard-focus outlines against a real project task row.
-    await page.evaluate(() => {
-      const reference = document.createElement('section');
-      reference.id = 'task-reference';
-      reference.innerHTML = '<h1 class="page-title">Project task row</h1>' + taskRow({ id: 'reference', num: 283, title: 'Match notification rows to the task list', lastView: { status: 'waiting', stage: 'review' } }, { showTags: false });
-      $('#main').append(reference);
-    });
-    assert.equal(await page.locator('#task-reference .wf').count(), 0);
+    await page.locator('[data-inbox="login"]').focus();
+    await page.keyboard.press('Enter');
+    assert.deepEqual(await page.evaluate(() => opened), ['resource', 'login'], 'Enter opens a focused notice');
+    await page.evaluate(() => document.activeElement.blur());
+    // Hover and keyboard-focus outlines match a real task row in every theme.
     const outline = async selector => page.locator(selector).evaluate(el => {
       const s = getComputedStyle(el);
-      return [s.borderColor, s.borderWidth, s.borderRadius, s.boxShadow, s.outline];
+      return [s.borderColor, s.borderWidth, s.borderRadius, s.outline];
     });
-    const notification = '[data-inbox="critical"]';
-    const reference = '#task-reference .task-row';
     for (const theme of ['light', 'dark', 'system-dark']) {
       await page.emulateMedia({ colorScheme: theme === 'light' ? 'light' : 'dark' });
       await page.evaluate(theme => {
@@ -135,97 +121,49 @@ function constant(name) {
       await page.waitForTimeout(150);
       assert.deepEqual(notificationHover, await outline(reference), theme + ': hover outlines match');
       await page.mouse.move(0, 0);
-      await page.evaluate(() => {
-        document.querySelector('[data-inbox="critical"]').classList.add('cursor');
-        document.querySelector('#task-reference .task-row').classList.add('cursor');
-      });
-      await page.waitForTimeout(150);
-      assert.deepEqual(await outline(notification), await outline(reference), theme + ': cursor outlines match');
-      await page.evaluate(() => {
-        document.querySelector('[data-inbox="critical"]').classList.remove('cursor');
-        document.querySelector('#task-reference .task-row').classList.remove('cursor');
-      });
-      // Keyboard modality makes :focus-visible apply, unlike a mouse click.
       await page.keyboard.press('Tab');
+      // The list's focus handler (wireTasksView) moves the cursor to any focused row.
       await page.locator(notification).focus();
+      await page.locator(notification).evaluate(el => el.classList.add('cursor'));
       await page.waitForTimeout(150);
       const notificationFocus = await outline(notification);
+      await page.locator(notification).evaluate(el => el.classList.remove('cursor'));
       await page.locator(reference).focus();
       await page.locator(reference).evaluate(el => el.classList.add('cursor'));
       await page.waitForTimeout(150);
       assert.deepEqual(notificationFocus, await outline(reference), theme + ': keyboard focus outlines match');
-      await page.evaluate(() => {
-        document.activeElement.blur();
-        S.cursorId = undefined;
-        applyCursor();
-      });
-      await page.waitForTimeout(150);
+      await page.evaluate(() => { document.activeElement.blur(); S.cursorId = undefined; applyCursor(); });
     }
     await page.evaluate(() => document.documentElement.dataset.theme = 'light');
     await page.waitForTimeout(150);
     const dir = process.env.INBOX_SCREENSHOT_DIR;
     if (dir) {
       fs.mkdirSync(dir, { recursive: true });
-      await page.screenshot({ path: path.join(dir, 'notifications-comparison.png'), fullPage: true });
-      await page.evaluate(() => document.documentElement.dataset.theme = 'dark');
-      await page.waitForTimeout(150); // Let the shared border-color transition settle before capture.
-      await page.screenshot({ path: path.join(dir, 'notifications-comparison-dark.png'), fullPage: true });
-      await page.evaluate(() => document.documentElement.dataset.theme = 'light');
-      await page.waitForTimeout(150);
-    }
-    await page.locator('#task-reference').evaluate(el => el.remove());
-    if (dir) {
-      await page.screenshot({ path: path.join(dir, 'notifications-desktop.png'), fullPage: true });
-      await page.evaluate(() => document.documentElement.dataset.theme = 'dark');
-      await page.waitForTimeout(150); // Let the shared border-color transition settle before capture.
-      await page.screenshot({ path: path.join(dir, 'notifications-dark.png'), fullPage: true });
-      await page.evaluate(() => document.documentElement.dataset.theme = 'light');
-      await page.waitForTimeout(150);
+      await page.screenshot({ path: path.join(dir, 'notices-desktop.png'), fullPage: true });
     }
     await page.setViewportSize({ width: 390, height: 844 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no horizontal page overflow');
-    assert.ok(await page.evaluate(() => [...document.querySelectorAll('.inbox-row')].every(row => {
-      const title = row.querySelector('.task-title').getBoundingClientRect();
-      const button = row.querySelector('button').getBoundingClientRect();
-      return (title.right <= button.left || title.bottom <= button.top) && button.right <= innerWidth;
-    })), 'long titles leave room for Read on mobile');
-    if (dir) await page.screenshot({ path: path.join(dir, 'notifications-mobile.png'), fullPage: true });
+    if (dir) await page.screenshot({ path: path.join(dir, 'notices-mobile.png'), fullPage: true });
     await page.setViewportSize({ width: 320, height: 700 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no overflow on small phones');
-    // Exercise the real loader, badge and read handlers across organization routes.
-    await page.addScriptTag({ content: ['loadInbox', 'inboxArrivals', 'markVisibleInboxRead'].map(fn).join('\n') });
+    // The real loader: one badge over every organization, whichever page is open.
+    await page.addScriptTag({ content: ['loadInbox', 'inboxArrivals', 'scheduleHomeRefresh'].map(fn).join('\n') + '\nlet homeRefreshTimer = null; const HOME_REFRESH_MS = 10;' });
     await page.evaluate(() => {
       document.body.insertAdjacentHTML('afterbegin', '<a id="bell"><span id="bell-badge"></span></a>');
       S.organizations = [{ id: 'personal' }, { id: 'team' }];
-      S.tab = 'inbox';
-      S.inboxFilter = 'all';
       window.announceInbox = () => {};
-      window.bgRenderMain = renderMain;
-      window.requests = [];
-      window.api = async (url, options) => {
-        requests.push({ url, ...options });
+      window.isCrossProjectList = () => true;
+      window.runSearch = async () => {};
+      window.bgRenderMain = () => {};
+      window.api = async url => {
         const organizationId = new URL(url, location.origin).searchParams.get('organizationId');
-        if (options) return url.startsWith('/api/inbox?') ? JSON.parse(options.body).ids.map(id => ({ id, unread: false })) : { unread: false };
-        return [{ id: organizationId, organizationId, kind: 'escalated', actionable: true,
-          urgency: 'high', unread: true, createdAt: Date.now(), task: { title: organizationId } }];
+        return [{ id: organizationId, organizationId, kind: 'escalated', actionable: true, urgency: 'high', unread: true, createdAt: Date.now(), taskId: organizationId }];
       };
     });
     for (const org of ['personal', 'team', null]) {
-      await page.evaluate(async org => {
-        S.organizationId = org;
-        history.pushState({}, '', org ? `/${org}/inbox` : '/profile');
-        await loadInbox();
-      }, org);
+      await page.evaluate(async org => { S.organizationId = org; await loadInbox(); }, org);
       assert.equal(await page.locator('#bell-badge').textContent(), '2');
-      assert.equal(await page.locator('.inbox-row').count(), 2);
     }
-    await page.locator('[data-inbox-toggle="team"]').click();
-    assert.equal(await page.locator('#bell-badge').textContent(), '1');
-    assert.equal(await page.evaluate(() => requests.at(-1).url), '/api/inbox/team?organizationId=team');
-    await page.locator('#inbox-read-all').click();
-    assert.equal(await page.locator('#bell-badge').textContent(), '0');
-    assert.equal(await page.locator('#bell-badge').isHidden(), true);
-    assert.equal(await page.evaluate(() => requests.at(-1).url), '/api/inbox?organizationId=personal');
-    console.log('Inbox browser checks passed (desktop, dark, mobile, read/unread, navigation).');
+    console.log('Inbox browser checks passed (notices as task rows, slugs, unread edge, themes, mobile, badge).');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

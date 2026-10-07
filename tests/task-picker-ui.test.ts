@@ -109,7 +109,7 @@ describe('fork picker across projects', () => {
     await search.fill('');
     const elsewhere = ui.page.locator('#pk-list .pick-row').filter({ hasText: 'Elsewhere' });
     await elsewhere.waitFor();
-    expect(await elsewhere.locator('.task-project').innerText()).toBe('Website');
+    expect(await elsewhere.locator('.task-project').innerText()).toBe('website');
     expect(ui.errors).toEqual([]);
     await ui.close();
   });
