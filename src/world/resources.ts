@@ -331,12 +331,23 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
 /** Control-plane resource orchestrator. Workflows carry no credentials and no
  * snapshot refs: create/open activities resolve them immediately around the
  * live provider-owned World. */
+/** A workspace pushed onto a version that is no longer the current one. */
+export class WorkspaceConflict extends Error {
+  readonly status = 409;
+  readonly currentRevisionId: string | null;
+  constructor(attachment: ResourceAttachment) {
+    super(`resource "${attachment.name}" changed since you pulled it; pull first (or overwrite)`);
+    this.currentRevisionId = attachment.currentRevisionId ?? null;
+  }
+}
+
 export class ProjectResourceService {
   private publishLocks = new Map<string, Promise<void>>();
   /** The restic repositories resources are saved in, and the server restic reaches them at. */
   readonly restic: ResticResources;
   readonly repositoryServer: ResourceRepositoryServer;
   private loopback?: Promise<string>;
+  private edge?: () => string | undefined;
 
   /** `repositories.world` is where a remote sandbox reaches the repositories
    * (the public URL); this host's own restic uses a loopback port. */
@@ -360,6 +371,7 @@ export class ProjectResourceService {
       if (!fallback) throw new Error('resource storage is not configured');
       return fallback;
     };
+    this.edge = repositories.edge;
     const tokens = new RepositoryTokens(broker);
     this.repositoryServer = new ResourceRepositoryServer({ store, tokens, objects, edge: () => !!repositories.edge?.(),
       ...(repositories.proxyReads ? { proxyReads: true } : {}) });
@@ -1379,6 +1391,131 @@ export class ProjectResourceService {
       refs.push({ attachmentId: attachment.id, revisionId });
     }
     return refs;
+  }
+
+  // ── Workspaces: the tavya CLI on a laptop (wiki planned/tavya-cli) ──
+  // A laptop is treated like a remote world: it runs restic itself with the
+  // same short-lived grant, against the edge when one is deployed.
+
+  /** The version a workspace of `taskId` (else of the project) starts from:
+   * the task world's last park of its private copy, else the version the
+   * world started from, else the project's current one. */
+  async workspaceRevision(attachment: ResourceAttachment, taskId?: string): Promise<string | undefined> {
+    const handle = taskId ? (await this.store.currentWorld(taskId)) as WorldHandle | undefined : undefined;
+    if (!handle) return attachment.currentRevisionId;
+    const lease = (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))
+      .find((candidate) => candidate.attachmentId === attachment.id && candidate.state === 'active');
+    if (!lease) return attachment.currentRevisionId;
+    try {
+      const parked = JSON.parse((await this.store.kvGet(`resource-checkpoint:${handle.id}:${attachment.id}`)) ?? '{}');
+      if (parked.leaseId === lease.id && typeof parked.revisionId === 'string') return parked.revisionId;
+    } catch { /* none recorded */ }
+    return lease.revisionId;
+  }
+
+  /** restic's environment for reading one version (`read`), or for saving a
+   * new one into the resource's current repository (`append`, quota counted).
+   * `parent` is the snapshot a save should be incremental against. */
+  async workspaceGrant(attachmentId: string, options: { access: 'read' | 'append'; revisionId?: string; baseRevisionId?: string;
+    publicUrl: string }): Promise<{ env: Record<string, string>; expiresAt: number; snapshot?: string; revisionId?: string; parent?: string }> {
+    const attachment = await this.requiredAttachment(attachmentId);
+    if (!isSnapshotDriver(attachment.driver)) throw new Error(`resource "${attachment.name}" has no files to transfer`);
+    const base = this.edge?.() ?? options.publicUrl;
+    const expiresAt = Date.now() + 23 * 3_600_000;
+    if (options.access === 'read') {
+      const revisionId = options.revisionId ?? attachment.currentRevisionId;
+      const revision = revisionId ? await this.store.getResourceRevision(revisionId) : undefined;
+      if (!revision || revision.attachmentId !== attachment.id) throw new Error(`resource "${attachment.name}" has no such version`);
+      if (revision.engine !== RESTIC_ENGINE)
+        throw new Error(`resource "${attachment.name}" is still being converted to the current storage format; try again in an hour`);
+      const repository = this.restic.of(attachment, revision);
+      return { env: await this.restic.clientEnvironment(repository, base, 'read'), expiresAt,
+        snapshot: resticRef(revision).snapshot, revisionId: revision.id };
+    }
+    const repository = await this.restic.current(attachment);
+    await this.restic.prepare(repository);
+    const baseline = options.baseRevisionId ? await this.store.getResourceRevision(options.baseRevisionId) : undefined;
+    const parent = this.parentIn(repository, baseline?.attachmentId === attachment.id ? baseline : undefined);
+    return { env: await this.restic.clientEnvironment(repository, base, 'append'), expiresAt, ...(parent ? { parent } : {}) };
+  }
+
+  /** Make a snapshot a workspace saved the resource's current version. Refused
+   * (409) unless the current version is still `baseRevisionId`: there is no
+   * merge of files, as for agents. An unchanged snapshot makes no version. */
+  async adoptWorkspaceSnapshot(attachmentId: string, snapshot: string, baseRevisionId: string | null, principal: string):
+    Promise<{ revision?: ResourceRevision; unchanged: boolean }> {
+    const attachment = await this.requiredAttachment(attachmentId);
+    if (!isSnapshotDriver(attachment.driver)) throw new Error(`resource "${attachment.name}" has no files to save`);
+    if ((attachment.currentRevisionId ?? null) !== baseRevisionId) throw new WorkspaceConflict(attachment);
+    const repository = await this.restic.current(attachment);
+    if (!await this.restic.hasSnapshot(repository, snapshot)) throw new Error('snapshot not found in the resource repository; save it again');
+    const baseline = attachment.currentRevisionId ? await this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
+    const parent = this.parentIn(repository, baseline);
+    let added = 0;
+    if (parent) {
+      const changes = await this.restic.diff(repository, parent, snapshot);
+      if (changes.added + changes.modified + changes.deleted === 0) {
+        await this.restic.forget(repository, [snapshot]);
+        return { revision: baseline, unchanged: true };
+      }
+      added = changes.bytes;
+    }
+    const files = await this.restic.files(repository, snapshot);
+    const bytes = files.reduce((sum, file) => sum + file.bytes, 0);
+    if (!parent) added = bytes;
+    let revision: ResourceRevision;
+    try {
+      revision = await this.store.saveAndPromoteResourceRevision({ attachmentId, parentRevisionId: baseline?.id,
+        ...this.restic.revisionFields({ snapshot, files: files.length, bytes, added }, repository),
+        metadata: { workspace: true, savedBy: principal } }, baseline?.id);
+    } catch (error) {
+      if (/baseline changed/.test(message(error))) throw new WorkspaceConflict((await this.requiredAttachment(attachmentId)));
+      throw error;
+    }
+    (await this.store.appendAudit({ principalId: principal, action: 'resource:workspace-save',
+      scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, from: baseline?.id ?? null, to: revision.id,
+        bytes, files: files.length } }));
+    return { revision, unchanged: false };
+  }
+
+  /** Put a workspace's snapshot of a writable resource into the task's world,
+   * replacing its private copy exactly; the task publishes it at Confirm. */
+  async importWorkspaceSnapshot(taskId: string, world: World, attachmentId: string, snapshot: string): Promise<void> {
+    const attachment = await this.requiredAttachment(attachmentId);
+    const task = await this.store.getTask(taskId);
+    if (!task || task.projectId !== attachment.projectId) throw new Error('resource does not belong to task project');
+    if (!isSnapshotDriver(attachment.driver) || attachment.target.kind !== 'path')
+      throw new Error(`resource "${attachment.name}" has no files to import`);
+    if (attachment.access !== 'write') throw new Error(`resource "${attachment.name}" is read-only in tasks`);
+    const lease = (await this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1))
+      .find((candidate) => candidate.attachmentId === attachmentId && candidate.state === 'active');
+    if (!lease) throw new Error(`the task world has no copy of resource "${attachment.name}"`);
+    const repository = await this.restic.current(attachment);
+    if (!await this.restic.hasSnapshot(repository, snapshot)) throw new Error('snapshot not found in the resource repository; push again');
+    await this.restic.restore({ world, path: resourceAbsolutePath(world.handle, attachment), file: fileShaped(attachment) },
+      repository, snapshot, { key: `workspace:${lease.id}:${snapshot.slice(0, 16)}`, mirror: true });
+    (await this.store.appendEvent({ taskId, type: 'world.resource-imported', ts: Date.now(),
+      payload: { attachmentId, snapshot } }));
+  }
+
+  /** The project's secret values, for a person's own machine (`tavya run`).
+   * Every value read is audited by name. */
+  async workspaceSecretValues(projectId: string, principal: string, names?: string[]):
+    Promise<Array<{ id: string; name: string; variable?: string; file?: string; value: string }>> {
+    const wanted = names?.length ? new Set(names) : undefined;
+    const values: Array<{ id: string; name: string; variable?: string; file?: string; value: string }> = [];
+    for (const attachment of (await this.store.listResourceAttachments(projectId))) {
+      if (!attachment.enabled || !isSecretLike(attachment) || !attachment.credentialHandles[0]) continue;
+      const variable = attachment.target.kind === 'environment' || attachment.target.kind === 'service' ? attachment.target.name : undefined;
+      const file = attachment.target.kind === 'path' ? attachment.target.path : undefined;
+      if (wanted && !wanted.has(attachment.name) && !(variable && wanted.has(variable))) continue;
+      const handle = await this.ownedCredentialHandle(attachment);
+      const value = this.broker.resolve(handle, { taskId: `workspace:${principal}`, caps: [`use-credential:${handle}`] });
+      (await this.store.appendAudit({ principalId: principal, action: 'resource:secret-read', scopeKey: `project:${projectId}`,
+        detail: { attachmentId: attachment.id, name: attachment.name } }));
+      values.push({ id: attachment.id, name: attachment.name, ...(variable ? { variable } : {}), ...(file ? { file } : {}), value });
+    }
+    return values;
   }
 
   async promote(taskId: string, attachmentId: string): Promise<{ attachment: ResourceAttachment; revision: ResourceRevision; summary: ResourceChangeSummary }> {

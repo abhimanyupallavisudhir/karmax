@@ -143,6 +143,22 @@ describe('gateway route capability binding', () => {
     expect(cap('GET', '/api/user/github-accounts')).toBe('none');
     expect(cap('PUT', '/api/user/github-accounts/42/identity')).toBe('none');
   });
+
+  it('treats app grants, personal tokens and sign-in approvals as self-service of the verified subject', () => {
+    expect(cap('GET', '/api/user/me')).toBe('none');
+    expect(cap('GET', '/api/user/app-grants')).toBe('none');
+    expect(cap('DELETE', '/api/user/app-grants/grant_1')).toBe('none');
+    expect(cap('POST', '/api/user/tokens')).toBe('none');
+    expect(cap('GET', '/api/oauth/device')).toBe('none');
+    expect(cap('POST', '/api/oauth/device/approve')).toBe('none');
+    expect(cap('POST', '/api/oauth/device/deny')).toBe('none');
+    expect(cap('GET', '/api/oauth/authorizations/r1')).toBe('none');
+    expect(cap('POST', '/api/oauth/authorizations/r1/approve')).toBe('none');
+    // Lookalikes stay on their own bindings.
+    expect(cap('GET', '/api/users/u1')).toBe('user:read');
+    expect(PLATFORM_API_CATALOG.appGrants.some((entry) => entry.startsWith('POST /api/user/tokens '))).toBe(true);
+    expect(PLATFORM_API_CATALOG.identityRequirements.humanSubject).toContain('GET /api/user/me');
+  });
 });
 
 describe('gateway route capability catalog', () => {
@@ -216,8 +232,9 @@ describe('platform catalog covers the gateway route table', () => {
 
   it('documents every /api route the gateway serves', async () => {
     const fs = await import('node:fs');
-    const url = new URL('../src/gateway/server.ts', import.meta.url);
-    const source = fs.readFileSync(url, 'utf8');
+    // Routes split out of server.ts into their own modules count too.
+    const source = ['../src/gateway/server.ts', '../src/gateway/oauth-routes.ts']
+      .map((file) => fs.readFileSync(new URL(file, import.meta.url), 'utf8')).join('\n');
     // Both spellings the router uses: `p === '/api/x'` and `p.match(/^\/api\/x\/...$/)`.
     const found = new Set<string>();
     for (const m of source.matchAll(/p === '(\/api\/[^']*)'/g)) found.add(normalize(m[1]!));
