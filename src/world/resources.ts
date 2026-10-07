@@ -85,8 +85,8 @@ class UnstageableCandidate extends Error {}
 
 /** Files a task changed that a newer published version also changed, differently. */
 export class ResourceConflictError extends Error {
-  constructor(readonly resource: string, readonly paths: string[]) {
-    super(`${resource}: ${paths.length === 1 ? 'a file was' : `${paths.length} files were`} changed both by this task and in a newer published version`
+  constructor(readonly resource: string, readonly paths: string[], source = 'a newer published version') {
+    super(`${resource}: ${paths.length === 1 ? 'a file was' : `${paths.length} files were`} changed both by this task and in ${source}`
       + ` (${paths.slice(0, 5).join(', ')}${paths.length > 5 ? ', …' : ''}). Keep one version: rename or remove this task's copy.`);
     this.name = 'ResourceConflictError';
   }
@@ -96,8 +96,15 @@ export class ResourceConflictError extends Error {
 const PUBLISH_ATTEMPTS = 3;
 
 interface ChangeCount { added: number; modified: number; deleted: number }
-/** What refreshing a world's copy brought in, or the files that conflict. */
+/** What a sub-task's delivery brought into its parent's world, or the files that conflict. */
 export interface ResourceRefresh extends ChangeCount { attachmentId: string; name: string; path: string; revisionId: string; conflicts?: string[] }
+
+/** A sub-task's output waiting for its parent's world (kv `resource-delivery:<parent>:<attachment>:<sub-task>`):
+ * its changes to a fork, relative to `baseRevisionId`, or a proposed output. */
+interface Delivery { kind: 'fork' | 'candidate'; attachmentId: string; fromTaskId: string; revisionId?: string; baseRevisionId?: string; candidateId?: string }
+function parseDelivery(value: string | undefined): Delivery | undefined {
+  try { return value ? JSON.parse(value) as Delivery : undefined; } catch { return undefined; }
+}
 
 export interface RestoreOptions { signal?: AbortSignal }
 
@@ -1266,9 +1273,15 @@ export class ProjectResourceService {
   }
 
   async settleReview(taskId: string, work: ResourceWork = {}): Promise<void> {
+    // A parent publishes what its sub-tasks handed it too: anything still
+    // waiting for its world goes in first, and a conflict stops publication.
+    const conflicted = (await this.takeDeliveries(taskId, work)).find((delivery) => delivery.conflicts);
+    if (conflicted) throw new ResourceConflictError(conflicted.path, conflicted.conflicts!, 'a sub-task');
     const selection = await this.store.resourceReview(taskId, { freeze: true });
     const excluded = new Set(selection.excluded);
     const principal = `task:${taskId}:confirmation`;
+    // A sub-task's output goes to its parent, as its branch does (SPEC §11.4).
+    const parent = await this.parentWorld(taskId);
     const candidates = await this.store.listResourceCandidates(taskId);
     for (const candidate of candidates) {
       if (candidate.state === 'discarding' || (candidate.state === 'pending' && excluded.has(candidate.attachmentId)))
@@ -1279,6 +1292,7 @@ export class ProjectResourceService {
         // no bytes to adopt; failing the confirmed task over it helps no one.
         await this.discardCandidate(taskId, candidate.id, 'system:resource-stage-failed',
           'its snapshot never completed');
+      else if (candidate.state === 'pending' && parent) await this.handCandidate(taskId, candidate, parent);
       else if (candidate.state === 'pending') await this.adoptCandidate(taskId, candidate.id, principal);
     }
     const world = await this.store.currentWorld(taskId) as WorldHandle | undefined;
@@ -1299,10 +1313,125 @@ export class ProjectResourceService {
       const inspection = await this.inspect(taskId, resource.id, { ...work,
         onProgress: work.onProgress && ((progress) => work.onProgress!({ ...progress, index, count: forks.length })) });
       const { summary } = inspection;
-      if (!summary.promoted && summary.added + summary.modified + summary.deleted > 0)
+      if (summary.added + summary.modified + summary.deleted > 0 && parent?.forks.has(resource.id))
+        await this.deliver(taskId, resource, inspection, parent.taskId);
+      else if (!summary.promoted && summary.added + summary.modified + summary.deleted > 0)
         await this.promoteReviewed(taskId, resource.id, inspection);
       else await this.restic.forget(inspection.repository, [inspection.capture.snapshot]);
     }
+  }
+
+  /** The parent of a sub-task whose world is still to receive output, and
+   * the writable resources it forked (any generation). */
+  private async parentWorld(taskId: string): Promise<{ taskId: string; handle: WorldHandle; forks: Set<string> } | undefined> {
+    const parentTaskId = (await this.store.getTask(taskId))?.parentTaskId;
+    if (!parentTaskId) return undefined;
+    const handle = (await this.store.currentWorld(parentTaskId)) as WorldHandle | undefined;
+    if (!handle || (await this.store.worldState(handle.id)) === 'released') return undefined;
+    const forks = new Set((await this.store.listResourceLeases(handle.id))
+      .filter((lease) => lease.access === 'write').map((lease) => lease.attachmentId));
+    return { taskId: parentTaskId, handle, forks };
+  }
+
+  /** Record a sub-task's changes to a writable resource for its parent's
+   * world, which takes them in before the parent's next turn or at its
+   * Confirm ({@link takeDeliveries}). The saved snapshot is kept as a version
+   * that was never current. Delivering again (after a follow-up) replaces a
+   * delivery still waiting, and builds on one already taken in. */
+  private async deliver(taskId: string, attachment: ResourceAttachment, inspection: Inspection, parentTaskId: string): Promise<void> {
+    const { summary, repository, capture } = inspection;
+    const key = `resource-delivery:${parentTaskId}:${attachment.id}:${taskId}`;
+    const waiting = parseDelivery(await this.store.kvGet(key));
+    const delivered = await this.store.kvGet(`resource-delivered:${parentTaskId}:${attachment.id}:${taskId}`);
+    const { lease } = await this.worldResource(taskId, attachment.id);
+    const baseRevisionId = waiting?.baseRevisionId ?? delivered ?? await this.ownForkPoint(taskId, lease.revisionId);
+    const revision = await this.store.saveResourceRevision({ attachmentId: attachment.id, parentRevisionId: baseRevisionId,
+      ...this.restic.revisionFields(capture, repository), metadata: { summary, deliveredTo: parentTaskId }, createdByTaskId: taskId });
+    await this.store.kvSet(key, JSON.stringify({ kind: 'fork', attachmentId: attachment.id, revisionId: revision.id,
+      ...(baseRevisionId ? { baseRevisionId } : {}), fromTaskId: taskId } satisfies Delivery));
+    await this.store.kvSet(`resource-delivered:${parentTaskId}:${attachment.id}:${taskId}`, revision.id);
+    (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:deliver',
+      scopeKey: `project:${attachment.projectId}`, detail: { attachmentId: attachment.id, to: parentTaskId, revisionId: revision.id, summary } }));
+  }
+
+  /** A sub-task's proposed output becomes its parent's: the parent's Review
+   * adopts or excludes it, and its world receives the files. */
+  private async handCandidate(taskId: string, candidate: ResourceCandidate, parent: { taskId: string; handle: WorldHandle }): Promise<void> {
+    await this.store.reassignResourceCandidate(candidate.id, taskId,
+      { taskId: parent.taskId, worldId: parent.handle.id, worldGeneration: parent.handle.generation ?? 1 });
+    if (candidate.sourceKind === 'path') await this.store.kvSet(`resource-delivery:${parent.taskId}:${candidate.attachmentId}:${taskId}`,
+      JSON.stringify({ kind: 'candidate', attachmentId: candidate.attachmentId, candidateId: candidate.id, fromTaskId: taskId } satisfies Delivery));
+    (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-hand',
+      scopeKey: `project:${candidate.projectId}`, detail: { candidateId: candidate.id, attachmentId: candidate.attachmentId, to: parent.taskId } }));
+  }
+
+  /** Bring what sub-tasks handed this task into its world: their changes to
+   * the writable resources it forked, merged file by file with its own, and
+   * the output they proposed. One that conflicts stays waiting, reported. */
+  async takeDeliveries(taskId: string, work: { checkContinue?: () => Promise<void> } = {}): Promise<ResourceRefresh[]> {
+    const entries = await this.store.kvEntries(`resource-delivery:${taskId}:`);
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
+    if (!entries.length || !handle) return [];
+    const taken: ResourceRefresh[] = [];
+    for (const entry of entries) {
+      await work.checkContinue?.();
+      const delivery = parseDelivery(entry.value);
+      const attachment = delivery && await this.store.getResourceAttachment(delivery.attachmentId);
+      if (!delivery || !attachment) { await this.store.kvDelete(entry.key); continue; }
+      const report = { attachmentId: attachment.id, name: attachment.name, added: 0, modified: 0, deleted: 0 };
+      try {
+        if (delivery.kind === 'candidate') {
+          const candidate = await this.store.getResourceCandidate(delivery.candidateId!);
+          const revisionId = attachment.currentRevisionId;
+          if (candidate?.state === 'pending' && candidate.taskId === taskId && revisionId) {
+            Object.assign(report, { path: candidate.sourcePath!, revisionId });
+            const revision = (await this.store.getResourceRevision(revisionId))!;
+            const world = await this.worlds.open(handle);
+            const target = path.posix.resolve(worldWorkingDirectory(handle), candidate.sourcePath!);
+            const present = await world.exec('bash', ['-c', 'test -e "$1" && echo present || echo absent', 'probe', target], { cwd: handle.root });
+            if (present.stdout.trim() !== 'absent') throw new ResourceConflictError(candidate.sourcePath!, [candidate.sourcePath!], 'a sub-task');
+            await this.restic.restore({ world, path: target, file: fileShaped(attachment) }, this.restic.of(attachment, revision),
+              resticRef(revision).snapshot, { key: `deliver:${candidate.id}`, ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}) });
+            await this.store.reassignResourceCandidate(candidate.id, taskId, { taskId, worldId: handle.id, worldGeneration: handle.generation ?? 1 });
+            report.added = revision.files ?? 0;
+            taken.push(report as ResourceRefresh);
+          }
+        } else {
+          const { lease, world, target } = await this.worldResource(taskId, attachment.id);
+          Object.assign(report, { path: attachment.target.kind === 'path' ? attachment.target.path : attachment.name, revisionId: delivery.revisionId });
+          const repository = await this.restic.current(attachment);
+          const restoredFrom = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
+          const parent = this.parentIn(repository, restoredFrom);
+          const place = { world, path: target, file: fileShaped(attachment) };
+          // This world's copy as it is now; a park would save the same (counted, never refused).
+          const mine = await this.restic.backup(place, repository, { key: `deliver:${lease.id}:${delivery.revisionId}`, quota: false,
+            ...(parent ? { parent } : {}), ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}) });
+          await this.mergePublished(place, repository, delivery.baseRevisionId, delivery.revisionId, mine.snapshot,
+            { key: `deliver:${lease.id}:${delivery.revisionId}:merge`, quota: false, applied: report, source: 'a sub-task',
+              ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}) });
+          taken.push(report as ResourceRefresh);
+        }
+        await this.store.kvDelete(entry.key);
+        (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:take-delivery',
+          scopeKey: `project:${attachment.projectId}`, detail: { ...report, from: delivery.fromTaskId } }));
+      } catch (error) {
+        if (!(error instanceof ResourceConflictError)) throw error;
+        taken.push({ ...report, path: (report as Partial<ResourceRefresh>).path ?? attachment.name,
+          revisionId: (report as Partial<ResourceRefresh>).revisionId ?? '', conflicts: error.paths });
+      }
+    }
+    return taken;
+  }
+
+  /** Save the writable resources a world forked, for its sub-tasks to start
+   * from, as its branch is committed for them: attachment → version. */
+  async snapshotForks(handle: WorldHandle): Promise<Record<string, string>> {
+    const forks: Record<string, string> = {};
+    for (const ref of await this.checkpoint(handle)) {
+      const attachment = await this.store.getResourceAttachment(ref.attachmentId);
+      if (attachment?.access === 'write' && attachment.isolation === 'fork') forks[ref.attachmentId] = ref.revisionId;
+    }
+    return forks;
   }
 
   async summarize(taskId: string, attachmentId: string): Promise<ResourceChangeSummary> {
@@ -1314,9 +1443,9 @@ export class ProjectResourceService {
   private async inspect(taskId: string, attachmentId: string, work: { checkContinue?: () => Promise<void>;
     onProgress?: (progress: Omit<StagingProgress, 'index' | 'count'>) => void } = {}): Promise<Inspection> {
     const { attachment, world, lease, target } = await this.worldResource(taskId, attachmentId);
-    // What changed is relative to the published version the copy forked
-    // from, also when it was restored from a park's capture since.
-    const forkedId = await this.forkPoint(lease.revisionId);
+    // What changed is relative to the version the copy forked from (a
+    // sub-task's: its parent's copy), also once restored from a park's capture.
+    const forkedId = await this.ownForkPoint(taskId, lease.revisionId);
     const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
     const restoredFrom = lease.revisionId && lease.revisionId !== forkedId ? await this.store.getResourceRevision(lease.revisionId) : started;
     // Deduplicated against the version the world was restored from, so mostly a scan.
@@ -1550,7 +1679,7 @@ export class ProjectResourceService {
     // serialized operation is the tiny baseline pointer CAS, so a multi-GB
     // upload cannot block another publication merely while bytes are moving.
     const { summary, repository, capture } = inspection ?? await this.inspect(taskId, attachmentId);
-    const forkedId = await this.forkPoint(lease.revisionId);
+    const forkedId = await this.ownForkPoint(taskId, lease.revisionId);
     const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
     // Identical to what the world started from: there is nothing to publish.
     if (started?.attachmentId === attachment.id && summary.added + summary.modified + summary.deleted === 0) {
@@ -1558,7 +1687,7 @@ export class ProjectResourceService {
       return { attachment, revision: started, summary };
     }
     const place = { world, path: target, file: fileShaped(attachment) };
-    let base = await this.mergeBase(taskId, attachment.currentRevisionId, forkedId);
+    let base = await this.mergeBase(taskId, attachment.currentRevisionId, await this.forkPoint(lease.revisionId));
     let saved = capture;
     for (let attempt = 1; ; attempt++) {
       // Whatever other tasks (a sibling sub-task, say) published since this
@@ -1593,51 +1722,14 @@ export class ProjectResourceService {
     }
   }
 
-  /** Merge the newest published version of each writable resource this
-   * task's world forked into the world's copy, keeping the world's own
-   * changes: how a parent gets what its sub-tasks published. A resource with
-   * conflicting changes is left as it was and reported. */
-  async refreshForks(taskId: string, work: { checkContinue?: () => Promise<void> } = {}): Promise<ResourceRefresh[]> {
-    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
-    if (!handle) return [];
-    const refreshed: ResourceRefresh[] = [];
-    for (const lease of await this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
-      await work.checkContinue?.();
-      if (lease.state !== 'active' || lease.access !== 'write') continue;
-      const attachment = await this.store.getResourceAttachment(lease.attachmentId);
-      if (!attachment || !isSnapshotDriver(attachment.driver) || attachment.isolation !== 'fork' || attachment.target.kind !== 'path') continue;
-      const currentId = attachment.currentRevisionId;
-      const base = await this.mergeBase(taskId, currentId, await this.forkPoint(lease.revisionId));
-      if (!currentId || currentId === base) continue;
-      const { world, target } = await this.worldResource(taskId, attachment.id);
-      const place = { world, path: target, file: fileShaped(attachment) };
-      const repository = await this.restic.current(attachment);
-      const started = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
-      const parent = this.parentIn(repository, started);
-      try {
-        // The world's copy as it is now; a park would save the same (counted, never refused).
-        const mine = await this.restic.backup(place, repository, { key: `refresh:${lease.id}:${currentId}`, quota: false,
-          ...(parent ? { parent } : {}), ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}) });
-        const applied: ChangeCount = { added: 0, modified: 0, deleted: 0 };
-        await this.mergePublished(place, repository, base, currentId, mine.snapshot,
-          { key: `refresh:${lease.id}:${currentId}:merge`, quota: false, applied, ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}) });
-        await this.store.rebaseResourceLease(lease.id, currentId);
-        refreshed.push({ attachmentId: attachment.id, name: attachment.name, path: attachment.target.path, revisionId: currentId, ...applied });
-      } catch (error) {
-        if (!(error instanceof ResourceConflictError)) throw error;
-        refreshed.push({ attachmentId: attachment.id, name: attachment.name, path: attachment.target.path, revisionId: currentId,
-          added: 0, modified: 0, deleted: 0, conflicts: error.paths });
-      }
-    }
-    return refreshed;
-  }
-
-  /** Bring into the world's copy (whose snapshot is `mine`) what was
-   * published between `baseId` and `currentId`, file by file. A file both
-   * sides changed differently is a conflict, and nothing is touched. The new
-   * snapshot of the merged copy; undefined when it already held everything. */
+  /** Bring into the world's copy (whose snapshot is `mine`) what changed
+   * between versions `baseId` and `currentId` (a newer published version, or
+   * a sub-task's output), file by file. A file both sides changed
+   * differently is a conflict, and nothing is touched. The new snapshot of
+   * the merged copy; undefined when it already held everything. */
   private async mergePublished(place: ResticPlace, repository: Repository, baseId: string | undefined, currentId: string | undefined,
     mine: string, options: { key: string; quota: boolean; checkContinue?: () => Promise<void>; applied?: ChangeCount;
+      /** Who made the changes brought in, for a conflict's message. */ source?: string;
       /** Merge nothing into a copy without changes of its own: answer `none`. */ ownChangesOnly?: boolean }): Promise<ResticCapture | 'none' | undefined> {
     const label = path.posix.basename(place.path);
     const [base, current] = await Promise.all([baseId ? this.store.getResourceRevision(baseId) : undefined,
@@ -1656,7 +1748,7 @@ export class ProjectResourceService {
     if (both.length) {
       const differing = (await restic.changeSet(repository, currentSnapshot, mine)).files;
       const conflicts = both.filter((file) => differing.has(file));
-      if (conflicts.length) throw new ResourceConflictError(label, conflicts);
+      if (conflicts.length) throw new ResourceConflictError(label, conflicts, options.source);
     }
     const paths: string[] = []; const deletions: string[] = [];
     for (const [file, change] of theirs.files) {
@@ -1688,6 +1780,21 @@ export class ProjectResourceService {
       visited.add(id);
       const revision = await this.store.getResourceRevision(id);
       if (!revision?.metadata?.checkpoint) return id;
+      id = revision.parentRevisionId;
+    }
+    return id;
+  }
+
+  /** The version a world's copy started from as this task saw it: through
+   * its own park captures to the version it forked (published, or the
+   * parent's copy for a sub-task). What its Review shows is relative to it. */
+  private async ownForkPoint(taskId: string, revisionId: string | undefined): Promise<string | undefined> {
+    const visited = new Set<string>();
+    let id = revisionId;
+    while (id && !visited.has(id)) {
+      visited.add(id);
+      const revision = await this.store.getResourceRevision(id);
+      if (!revision?.metadata?.checkpoint || revision.createdByTaskId !== taskId) return id;
       id = revision.parentRevisionId;
     }
     return id;

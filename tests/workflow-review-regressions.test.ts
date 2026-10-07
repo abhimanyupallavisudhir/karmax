@@ -851,7 +851,7 @@ describe('resource publication by sub-tasks', () => {
     await expect(softwareDevV1_27(child)).rejects.toThrow(conflict);
   });
 
-  it('brings what a landed sub-task published into the parent\'s world before its next turn', async () => {
+  it('brings a landed sub-task\'s data into the parent\'s world before its next turn', async () => {
     wf.activities.accountPoolSize.mockResolvedValue(0);
     wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child' }));
     let finish!: (value: { stage: string }) => void;
@@ -876,8 +876,8 @@ describe('resource publication by sub-tasks', () => {
     const texts = wf.handlers.get('view')!().messages.map((m: any) => m.text);
     const landed = texts.findIndex((text: string) => text.startsWith('Sub-task child finished: done'));
     expect(texts.slice(landed + 1, landed + 3)).toEqual([
-      'resources/raw_data now includes what sub-tasks published: 12 new, 1 changed, 0 removed files.',
-      'resources/index was not updated with what sub-tasks published: a file you changed differs from the published version (a.txt). Keep one version; publishing yours fails until you do.',
+      'resources/raw_data now includes a sub-task\'s data: 12 new, 1 changed, 0 removed files.',
+      'resources/index was not updated with a sub-task\'s data: a file you changed differs from the sub-task\'s (a.txt). Keep one version (rename or remove yours); it comes in when the next sub-task finishes, and your publication fails until it does.',
     ]);
     expect(prompts).toHaveLength(3);
   });
