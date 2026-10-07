@@ -87,3 +87,25 @@ describe('MCP Registry entry', () => {
     expect(entry.remotes).toEqual([{ type: 'streamable-http', url: 'https://tavya.io/mcp' }]);
   });
 });
+
+describe('MCP Registry domain proof', () => {
+  it('serves tavya.io\'s registry key on tavya.io only, or an installation\'s own', async () => {
+    const { mcpRegistryAuth } = await import('../src/gateway/oauth-routes.js');
+    expect(mcpRegistryAuth('https://tavya.io', {})).toBe('v=MCPv1; k=ed25519; p=6oEDCCfsbXqtZvKsztgRTtzV7iOM9O5GHzuICOW1Fm0=');
+    expect(mcpRegistryAuth('https://other.example', {})).toBeUndefined();
+    expect(mcpRegistryAuth(undefined, {})).toBeUndefined();
+    expect(mcpRegistryAuth('https://other.example', { KARMAX_MCP_REGISTRY_AUTH: 'v=MCPv1; k=ed25519; p=own' })).toBe('v=MCPv1; k=ed25519; p=own');
+    // This fixture's issuer is its own loopback origin: no proof for tavya's key.
+    const local = await fetch(`${f.g.url}/.well-known/mcp-registry-auth`);
+    expect(local.status).toBe(404);
+    const previous = process.env.KARMAX_MCP_REGISTRY_AUTH;
+    process.env.KARMAX_MCP_REGISTRY_AUTH = 'v=MCPv1; k=ed25519; p=own';
+    try {
+      const own = await fetch(`${f.g.url}/.well-known/mcp-registry-auth`);
+      expect(own.status).toBe(200);
+      expect(await own.text()).toBe('v=MCPv1; k=ed25519; p=own');
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_MCP_REGISTRY_AUTH; else process.env.KARMAX_MCP_REGISTRY_AUTH = previous;
+    }
+  });
+});

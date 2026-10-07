@@ -47,6 +47,19 @@ export function appGrantRouteCapability(p: string): 'none' | undefined {
 
 const PERSONAL_TOKEN_CLIENT = 'personal-token';
 const HIDDEN_LEVELS = new Set(['god', 'operator']);
+/** The MCP Registry's HTTP proof of a domain (`mcp-publisher login http`):
+ * the public half of the key kept in the vault as "MCP Registry signing key"
+ * (wiki ops/mcp-registry). Answered for tavya.io only, so a self-hosted
+ * install never vouches for tavya's key on its own domain; a self-host
+ * publishing under its own name sets KARMAX_MCP_REGISTRY_AUTH instead. */
+export const MCP_REGISTRY_AUTH_PATH = '/.well-known/mcp-registry-auth';
+const TAVYA_MCP_REGISTRY_KEY = '6oEDCCfsbXqtZvKsztgRTtzV7iOM9O5GHzuICOW1Fm0=';
+export function mcpRegistryAuth(issuer: string | undefined, env = process.env): string | undefined {
+  const own = env.KARMAX_MCP_REGISTRY_AUTH?.trim();
+  if (own) return own;
+  return issuer === 'https://tavya.io' ? `v=MCPv1; k=ed25519; p=${TAVYA_MCP_REGISTRY_KEY}` : undefined;
+}
+
 const CORS_PATHS = new Set(['/oauth/token', '/oauth/device', '/oauth/register', '/oauth/revoke', '/mcp']);
 
 export class OAuthRoutes {
@@ -67,6 +80,12 @@ export class OAuthRoutes {
   /** Answers the unauthenticated routes; false for anything else. */
   async handlePublic(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<boolean> {
     const p = url.pathname, method = req.method ?? 'GET';
+    if (p === MCP_REGISTRY_AUTH_PATH && method === 'GET') {
+      const proof = mcpRegistryAuth(this.issuer(req));
+      res.writeHead(proof ? 200 : 404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache' });
+      res.end(proof ?? 'not found');
+      return true;
+    }
     const metadata = p === '/.well-known/oauth-authorization-server';
     const resourceMetadata = p === '/.well-known/oauth-protected-resource' || p === '/.well-known/oauth-protected-resource/mcp';
     if (!metadata && !resourceMetadata && !CORS_PATHS.has(p) && p !== '/oauth/authorize') return false;

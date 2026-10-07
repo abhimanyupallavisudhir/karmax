@@ -1,36 +1,46 @@
 name: CLI release
 
-# Publishes the tavya CLI (src/cli) when a `cli-v<version>` tag is pushed:
-# the bundled npm package `tavya`, and single executables for each platform on
-# the GitHub release (installed by https://tavya.io/cli/install.sh).
-# The tag must equal cli/package.json's version. npm needs the NPM_TOKEN secret.
+# Publishes the tavya CLI (src/cli): the bundled npm package `tavya`, and single
+# executables for each platform on the GitHub release `cli-v<version>`
+# (installed by https://tavya.io/cli/install.sh). Runs when such a tag is
+# pushed, or by hand (workflow_dispatch) on a branch, which releases that
+# commit's cli/package.json version and creates its tag. npm publishing needs
+# the NPM_TOKEN secret and is skipped without it; the package can also be
+# published with `npm publish` from cli/ (wiki features/tavya-cli).
 on:
   push:
     tags: ['cli-v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing cli-v<version> tag to (re)publish
-        required: true
+        description: An existing cli-v<version> tag to republish; empty releases this branch's version
+        required: false
         type: string
 
 permissions:
   contents: read
 
-env:
-  TAG: ${{ inputs.tag || github.ref_name }}
-
 jobs:
   bundle:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
-        with: { ref: '${{ env.TAG }}' }
+        with: { ref: "${{ inputs.tag || github.sha }}" }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0' }
-      - name: Tag matches cli/package.json
-        run: test "cli-v$(node -p "require('./cli/package.json').version")" = "$TAG"
+      - name: Version
+        id: version
+        env:
+          REQUESTED: "${{ inputs.tag || (github.event_name == 'push' && github.ref_name) || '' }}"
+        run: |
+          tag="cli-v$(node -p "require('./cli/package.json').version")"
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$tag" ]; then echo "::error::$REQUESTED does not match cli/package.json ($tag)"; exit 1; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       # The CLI needs only esbuild to build: it has no runtime dependencies.
       - run: npm install --no-save --ignore-scripts --no-package-lock esbuild@0.28.1
       - run: node scripts/build-cli.mjs
@@ -52,7 +62,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with: { ref: '${{ env.TAG }}' }
+        with: { ref: '${{ needs.bundle.outputs.sha }}' }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0' }
       - run: npm install --no-save --ignore-scripts --no-package-lock esbuild@0.28.1 postject@1.0.0-alpha.6
@@ -85,7 +95,7 @@ jobs:
         with: { name: 'tavya-${{ matrix.target }}', path: 'tavya-${{ matrix.target }}*' }
 
   release:
-    needs: executable
+    needs: [bundle, executable]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -97,10 +107,10 @@ jobs:
         working-directory: assets
         run: sha256sum tavya-* tavya.mjs > SHA256SUMS && cat SHA256SUMS
       - name: GitHub release
-        env: { GH_TOKEN: '${{ github.token }}' }
+        env: { GH_TOKEN: '${{ github.token }}', TAG: '${{ needs.bundle.outputs.tag }}', SHA: '${{ needs.bundle.outputs.sha }}' }
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "tavya CLI ${TAG#cli-v}" \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --title "tavya CLI ${TAG#cli-v}" \
                  --notes "Install: \`curl -fsSL https://tavya.io/cli/install.sh | sh\` or \`npm install -g tavya\`."
           gh release upload "$TAG" assets/* --repo "$GITHUB_REPOSITORY" --clobber
 
@@ -113,7 +123,7 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-        with: { ref: '${{ env.TAG }}' }
+        with: { ref: '${{ needs.bundle.outputs.sha }}' }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0', registry-url: 'https://registry.npmjs.org' }
       - uses: actions/download-artifact@v4
