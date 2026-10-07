@@ -25,3 +25,14 @@ describe('Do-agent input routing instructions', () => {
     expect(prompt).not.toContain('ordinary Waiting-for-input Responder is an agent');
   });
 });
+
+describe('the computer in the World section', () => {
+  it('names a cloud world\'s machine and how the agent can make it bigger', () => {
+    const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }),
+      world: { ...world, meta: { computer: { cpu: 2, memoryMb: 2048, diskGb: 20 } } } as any });
+    expect(prompt).toContain('Computer: 2 CPU · 2 GB · 20 GB disk.');
+    expect(prompt).toMatch(/platform_request\(PATCH, "\/api\/tasks\/[^/]+\/params", \{"params": \{"computer": \{"diskGb": 50\}\}\}\)/);
+    // A local world has no machine of its own to resize.
+    expect(assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world })).not.toContain('Computer:');
+  });
+});

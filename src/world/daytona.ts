@@ -21,7 +21,10 @@ export interface DaytonaSandboxLike {
   state?: string;
   cpu?: number;
   memory?: number;
+  disk?: number;
   gpu?: number;
+  /** CPU/memory increases apply to a running sandbox; anything else needs it stopped. */
+  resize?(resources: { cpu?: number; memory?: number; disk?: number }, timeout?: number): Promise<void>;
   waitUntilStarted?(timeout?: number): Promise<void>;
   waitUntilStopped?(timeout?: number): Promise<void>;
   process: {
@@ -124,7 +127,8 @@ export class DaytonaWorldProvider implements WorldProvider {
       autoStopInterval: Math.max(1, Math.ceil(this.idleMs / 60_000)), autoArchiveInterval: 24 * 60,
       autoDeleteInterval: -1, ...(trustedSsh ? { networkBlockAll: false } : network),
       ...(selectedImage && spec.resources ? { resources: { cpu: spec.resources.cpu,
-        memory: spec.resources.memoryMb ? Math.ceil(spec.resources.memoryMb / 1024) : undefined, gpu: spec.resources.gpu } } : {}),
+        memory: spec.resources.memoryMb ? Math.ceil(spec.resources.memoryMb / 1024) : undefined,
+        ...(spec.resources.diskGb ? { disk: spec.resources.diskGb } : {}), gpu: spec.resources.gpu } } : {}),
     }).catch(async (error) => {
       const recovered = await findProvisioningSandbox(factory, labels).catch(() => undefined);
       if (!recovered) throw explainDaytonaError(error);
@@ -136,7 +140,9 @@ export class DaytonaWorldProvider implements WorldProvider {
     try {
       spec.signal?.throwIfAborted();
       if (adopted) { await sandbox.refreshData?.(); await startSandbox(sandbox); }
-      const resourceWarnings = selectedImage ? [] : snapshotResourceWarnings(sandbox, spec);
+      // An image is created at the requested size; a snapshot boots at its own
+      // and is resized to the Computer before anything is provisioned on it.
+      const resourceWarnings = selectedImage ? [] : await sizeSnapshotSandbox(sandbox, spec);
       if (flavor === 'desktop') {
         if (!sandbox.computerUse) throw new Error('the selected Daytona environment does not support Computer Use');
         await sandbox.computerUse.start();
@@ -640,18 +646,40 @@ async function startSandbox(sandbox: DaytonaSandboxLike): Promise<void> {
   else if (sandbox.state !== 'started') await sandbox.start(120);
 }
 
-/** Snapshot sizing is fixed by its author, including Daytona's default. Only
- * image builds accept resource overrides; do not rely on the SDK's resize API,
- * which is not implemented by every deployed Daytona control plane. */
-function snapshotResourceWarnings(sandbox: DaytonaSandboxLike, spec: WorldSpec): string[] {
+/** A snapshot (Daytona's default included) boots at the size its author chose.
+ * Resize it to the Computer: CPU and memory increases apply live, anything else
+ * with the fresh sandbox briefly stopped. Not every deployed Daytona control
+ * plane implements resize, so a refusal leaves the snapshot's size and says so. */
+async function sizeSnapshotSandbox(sandbox: DaytonaSandboxLike, spec: WorldSpec): Promise<string[]> {
   const requested = spec.resources;
   if (!requested) return [];
   if (requested.gpu && requested.gpu > (sandbox.gpu ?? 0))
     throw new Error('The Daytona snapshot has insufficient GPUs. Select a GPU snapshot or an image with the requested resources.');
-  if ((requested.cpu !== undefined && sandbox.cpu !== undefined && requested.cpu !== sandbox.cpu)
-    || (requested.memoryMb !== undefined && sandbox.memory !== undefined && requested.memoryMb !== sandbox.memory * 1024))
-    return [`Daytona snapshot allocation: ${sandbox.cpu ?? '?'} CPUs, ${sandbox.memory ?? '?'} GiB RAM. CPU and memory settings apply to image builds; choose an image or a differently sized snapshot to change them.`];
-  return [];
+  const want = { cpu: requested.cpu, memory: requested.memoryMb ? Math.ceil(requested.memoryMb / 1024) : undefined, disk: requested.diskGb };
+  const have = { cpu: sandbox.cpu, memory: sandbox.memory, disk: sandbox.disk };
+  const warnings: string[] = [];
+  const change: { cpu?: number; memory?: number; disk?: number } = {};
+  for (const key of ['cpu', 'memory', 'disk'] as const)
+    if (want[key] !== undefined && have[key] !== undefined && want[key] !== have[key]) change[key] = want[key];
+  if (change.disk !== undefined && change.disk < have.disk!) {
+    warnings.push(`Daytona cannot shrink a disk: this computer keeps the snapshot's ${have.disk} GB.`);
+    delete change.disk;
+  }
+  if (!Object.keys(change).length) return warnings;
+  const live = change.disk === undefined && (change.cpu ?? Infinity) >= (have.cpu ?? 0) && (change.memory ?? Infinity) >= (have.memory ?? 0);
+  try {
+    if (!sandbox.resize) throw new Error('this Daytona client cannot resize');
+    if (live) await sandbox.resize(change, 120);
+    else {
+      await sandbox.stop(90);
+      try { await sandbox.resize(change, 120); }
+      finally { await sandbox.start(120); }
+    }
+    return warnings;
+  } catch (error) {
+    return [...warnings, `This computer runs at the Daytona snapshot's size (${have.cpu ?? '?'} CPU · ${have.memory ?? '?'} GB${
+      have.disk ? ` · ${have.disk} GB disk` : ''}): ${error instanceof Error ? error.message : String(error)}`.slice(0, 500)];
+  }
 }
 
 function daytonaNetwork(spec: WorldSpec): Record<string, unknown> {

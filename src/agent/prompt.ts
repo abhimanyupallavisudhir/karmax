@@ -1,3 +1,4 @@
+import { describeMachine, type MachineShape } from '../domain/computer.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
@@ -113,7 +114,7 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: worldWorkingDirectory(args.world),
-    worldRepos: [describeRepos(args.world), describeEnvironment(args.world)].filter(Boolean).join('\n'),
+    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId)].filter(Boolean).join('\n'),
     branch: args.world.branch,
     base: args.world.base,
     target,
@@ -150,6 +151,16 @@ function describeEnvironment(world: WorldHandle): string {
     + 'When something is missing (a dependency, browser or CLI), first check whether a command above covers it and you skipped or '
     + 'shortened it; if so, run it. Only a step that every task needs and these commands lack belongs in your final response, '
     + 'as the exact command to add to Project Settings → Environment.';
+}
+
+/** A cloud world's machine, and how the agent can get a bigger one itself. */
+function describeComputer(world: WorldHandle, taskId: string): string {
+  const shape = world.meta?.computer as MachineShape | undefined;
+  if (!shape) return '';
+  return `Computer: ${describeMachine(shape)}. If it is too small (out of disk or memory), resize it yourself with `
+    + `platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": 50}}}) (or cpu, memoryMb) and then pause(3): the move happens while the task is paused. `
+    + 'You resume on the new machine with every tracked file and uncommitted change, but Git-ignored files (dependencies, build output) '
+    + 'and running processes do not carry over.';
 }
 
 /**

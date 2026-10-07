@@ -1,5 +1,6 @@
 import { TextDecoder } from 'node:util';
-import { e2bTemplate } from './e2b-template.js';
+import { buildSizedTemplate, e2bTemplate, needsSizedTemplate, sizedTemplateName } from './e2b-template.js';
+import { describeMachine, E2B_MAX_DISK_GB, machineShape, type MachineShape } from '../domain/computer.js';
 import type { WorldReferenceKeys } from './reference-keys.js';
 import { isMissingSandbox } from './provider-errors.js';
 import { timed } from '../timing/index.js';
@@ -114,6 +115,8 @@ export interface E2BFactory {
   kill?(id: string, options: { apiKey?: string }): Promise<unknown>;
   /** Completed lifecycle executions from E2B's seven-day event feed. */
   events?(options: { apiKey?: string; since?: number; offset?: number }): Promise<{ events: unknown[]; resumeAt?: number }>;
+  /** Make template `name` exist: `base` built at `shape`'s CPU, memory and disk. */
+  ensureTemplate?(base: string, name: string, shape: MachineShape, options: { apiKey?: string }): Promise<void>;
 }
 
 /** E2B cloud worlds: one isolated sandbox per task attempt, automatically paused
@@ -147,9 +150,27 @@ export class E2BWorldProvider implements WorldProvider {
   async create(spec: WorldSpec): Promise<World> {
     const connection = (await this.connection(spec.organizationId));
     const flavor = spec.environment?.flavor ?? 'headless';
-    const selectedTemplate = flavor === 'desktop'
+    const baseTemplate = flavor === 'desktop'
       ? spec.environment?.template ?? spec.environment?.snapshot ?? connection?.config.desktopTemplate ?? this.desktopTemplate
       : spec.environment?.template ?? spec.environment?.snapshot ?? spec.environment?.image ?? connection?.config.template ?? this.template;
+    // CPU, memory and disk are template properties on E2B. A project
+    // environment snapshot was already built at its project's size
+    // (environment-build.ts); any other base gets a template of the task's size.
+    const shape = machineShape({ resources: spec.resources });
+    const sizeWarnings: string[] = [];
+    let selectedTemplate = baseTemplate;
+    if (baseTemplate && !spec.environment?.snapshot && needsSizedTemplate(shape)) {
+      try {
+        selectedTemplate = await this.sizedTemplate(baseTemplate, shape, connection?.apiKey);
+        if ((shape.diskGb ?? 0) > E2B_MAX_DISK_GB)
+          sizeWarnings.push(`E2B gives a computer at most ${E2B_MAX_DISK_GB} GB of free disk; this one has ${E2B_MAX_DISK_GB} GB, not ${shape.diskGb} GB.`);
+      } catch (error) {
+        if (spec.signal?.aborted) throw error;
+        // Never fail a task over its size: it runs, at the template's own size, and says so.
+        sizeWarnings.push(`This computer could not be prepared as ${describeMachine(shape)}, so it runs at its template's default size: ${
+          error instanceof Error ? error.message : String(error)}`.slice(0, 600));
+      }
+    }
     const taskNetwork = e2bNetwork(spec);
     const requestTimeoutMs = envPositiveInt('KARMAX_E2B_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS);
     const generation = String(spec.generation ?? 1);
@@ -240,7 +261,7 @@ export class E2BWorldProvider implements WorldProvider {
         meta: { releaseOnCompletion: true, environmentFlavor: flavor,
           ...(ephemeralPaths.length ? { ephemeralPaths } : {}),
           ...(selectedTemplate ? { environmentArtifact: selectedTemplate } : {}) },
-        ...(warnings.length ? { warnings } : {}),
+        ...(warnings.length || sizeWarnings.length ? { warnings: [...warnings, ...sizeWarnings] } : {}),
       };
       return new E2BWorld(handle, sandbox, this.idleMs, () => {
         this.sandboxes.delete(sandbox.sandboxId);
@@ -253,6 +274,23 @@ export class E2BWorldProvider implements WorldProvider {
       this.states.delete(sandbox.sandboxId);
       throw error;
     }
+  }
+
+  /** The template of `base` at `shape`'s size, built on first use and then
+   * reused (deterministic name; one in-flight build per name and key). */
+  private sizing = new Map<string, Promise<void>>();
+  private async sizedTemplate(base: string, shape: MachineShape, apiKey?: string): Promise<string> {
+    const name = sizedTemplateName(base, shape);
+    if (!this.factory.ensureTemplate) throw new Error('this E2B client cannot build templates');
+    const key = `${crypto.createHash('sha256').update(apiKey ?? '').digest('hex')}:${name}`;
+    let pending = this.sizing.get(key);
+    if (!pending) {
+      pending = timed('e2b.size-template', () => this.factory.ensureTemplate!(base, name, shape, apiKey ? { apiKey } : {}));
+      this.sizing.set(key, pending);
+      pending.catch(() => this.sizing.delete(key));
+    }
+    await pending;
+    return name;
   }
 
   async open(handle: WorldHandle): Promise<World> {
@@ -943,6 +981,7 @@ function defaultE2BFactory(): E2BFactory {
     }
   };
   return {
+    ensureTemplate: buildSizedTemplate,
     async create(options) {
       const { template, desktop, ...opts } = options;
       if (desktop) {

@@ -115,24 +115,24 @@ const multiPrField = (): FieldSpec => ({
   scopes: ALL,
   bind: 'project',
 });
-// "Agent environment" (SPEC §11) — the world backend a task's agent runs in: a
-// local git worktree/container or a remote sandbox (E2B/Daytona). Canonical
-// storage remains the execution policy (ProjectConfig.worldProvider / the
-// organization policy); this field exposes it as an ordinary task default AND a
-// per-task override, so a single task can pick a different environment without a
-// project-wide change. `bind:'project'` lands the resolved value on
-// `input.project.worldProvider`, which every world-creating workflow already
-// reads. Options are filled in by the client from the organization's connected
-// providers; an empty value ⇒ inherit the project / organization default. It is
-// frozen once the task starts (default `queue`): the world is provisioned at
-// setup and can't be swapped mid-flight.
-const agentEnvironmentField = (): FieldSpec => ({
-  name: 'worldProvider',
-  type: 'select',
-  label: 'Agent environment',
-  options: [''],
+// The Computer (SPEC §11) — where a task's agent runs and how big that machine
+// is: the provider (a remote sandbox on E2B/Daytona, or a local worktree or
+// container when self-hosted), CPU, memory, disk, the experience (headless or
+// desktop), how long it sleeps before hibernating, and outbound network. One
+// block, like the Agent. Organization and project defaults live in the
+// execution policy (the API's /defaults projects them into this field); a
+// task's own value is a sparse override that `assembleTaskInput` layers onto
+// `input.project`, which every world-creating workflow already reads. Its size
+// and hibernation stay editable while the task runs: the platform applies a
+// resize when the world next parks (src/world/runners.ts).
+const computerField = (): FieldSpec => ({
+  name: 'computer',
+  type: 'computer',
+  label: 'Computer',
+  help: 'Where the agent works, and how big that machine is. Disk is space for the task\'s files (E2B gives up to 50 GB). A new size takes a minute to prepare the first time; a running task can grow its computer, and moves to it when it next pauses.',
   scopes: ALL,
-  bind: 'project',
+  bind: 'computer',
+  mutable: 'always',
 });
 
 export interface EventSchemaDecl {
@@ -472,7 +472,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       agentField('do', 'Agent', 'always'),
       baseField(),
       targetField(),
-      agentEnvironmentField(),
+      computerField(),
       reposField(),
       multiPrField(),
       copyGlobsField(),
@@ -512,7 +512,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { key: 'review', label: 'Review' },
       { key: 'done', label: 'End' },
     ],
-    params: [promptField(), agentField('do', 'Agent'), baseField(), agentEnvironmentField(), reposField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), computerField(), reposField(), confirmerField()],
   },
   {
     name: 'script-exec',
@@ -533,7 +533,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     ],
     params: [
       { name: 'command', type: 'text', label: 'Command', required: true, scopes: ['task'], bind: 'top', placeholder: 'npm test' },
-      agentEnvironmentField(),
+      computerField(),
       reposField(),
     ],
   },
@@ -549,7 +549,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Review machinery.
     roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), RESPONDER_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), computerField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
   },
   {
     name: 'merge-only',
@@ -573,7 +573,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     params: [
       { name: 'branch', type: 'branch', label: 'Branch to merge', required: true, scopes: ['task'], bind: 'top' },
       targetField(),
-      agentEnvironmentField(),
+      computerField(),
       reposField(),
       agentField('do', 'Agent'),
       confirmerField(),

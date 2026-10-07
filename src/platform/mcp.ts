@@ -375,7 +375,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       organizationId: z.string(), projectId: z.string().optional(),
       worldProvider: z.string().nullish(), runnerPoolId: z.string().nullish(),
       environmentFlavor: z.enum(['headless', 'desktop']).optional(),
-      cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), gpu: z.number().nonnegative().optional(),
+      cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), diskGb: z.number().int().min(1).optional(), gpu: z.number().nonnegative().optional(),
       unrestrictedInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
       monthlyBudgetUsd: z.number().nonnegative().nullish(), hibernateAfterDays: z.number().nonnegative().nullish(),
     } },
@@ -393,7 +393,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       // the policy currently in force: otherwise `{allowDomains}` alone silently
       // set `unrestricted:false` and dropped `allowCidrs`, and `{memoryMb}` alone
       // erased `cpu`/`gpu`. Only keys the caller actually supplied are assigned.
-      const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.gpu !== undefined;
+      const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.diskGb !== undefined || a.gpu !== undefined;
       const wantsNetwork = a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined;
       if (wantsResources || wantsNetwork) {
         // Either `{organization, override?, effective?}` or a bare policy — see below.
@@ -414,6 +414,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
           const resources: Record<string, unknown> = { ...(base.resources ?? {}) };
           if (a.cpu !== undefined) resources.cpu = a.cpu;
           if (a.memoryMb !== undefined) resources.memoryMb = a.memoryMb;
+          if (a.diskGb !== undefined) resources.diskGb = a.diskGb;
           if (a.gpu !== undefined) resources.gpu = a.gpu;
           policy.resources = resources;
         }

@@ -147,7 +147,7 @@ const S = {
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
   agentQueue: { capacity: 3, queue: [], current: [] }, // workflow-owned host admission queue
   modelCatalog: null, // provider-native model metadata loaded from the gateway
-  worldProviderConnections: [], // org's connected remote sandbox providers → Agent-environment options
+  worldProviderConnections: [], // org's connected cloud computers → the Computer block's provider choices
   inviteNotice: null,
   installationAccess: false, // proven by an installation-scoped endpoint, never inferred from an org role
   installationInfo: null,
@@ -1038,7 +1038,6 @@ function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
   el.outerHTML = effortSelectHtml(effortCls, provider, model, el.value || '');
 }
 
-// The "Agent environment" (worldProvider) choices depend on the deployment and
 // Whether the browser and the karmax host are the same computer. Host-machine
 // affordances — typing a filesystem path on the host, materializing a checkout to
 // `cd` into, importing the host's `pass` store — are noise to anyone reaching
@@ -1049,21 +1048,109 @@ const hostLocal = () => S.meta?.hostLocal !== false;
 // into it. Elsewhere the world is still reachable — over `karmax attach`, not a path.
 const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 
-// which remote sandbox providers the organization has connected — so the manifest
-// ships an empty option list and the client fills it in. An empty first option ⇒
-// inherit the project / organization default.
-function agentEnvOptions() {
+// ── The Computer block (wiki features/computers) ─────────────────────────────
+// Where a task's agent runs and how big that machine is, edited as one block
+// wherever an agent is configured: the task form, Task defaults and the
+// Parameters tab. The value is sparse ({provider, cpu, memoryMb, diskGb, flavor,
+// hibernateAfterDays, network}); the block shows the effective machine and a
+// form stores only what differs from what it inherits.
+const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', worktree: 'This machine', container: 'Docker container' };
+const E2B_MAX_DISK_GB = 50;
+// The providers a task can run on here: the organization's connected cloud
+// computers, plus this machine when self-hosted.
+function computerProviderOptions(current) {
   const local = S.meta?.hosted ? [] : ['worktree', 'container'];
   const connected = (S.worldProviderConnections || [])
     .filter((c) => c.enabled && c.credentialConfigured)
     .map((c) => c.provider);
-  return ['', ...new Set([...local, ...connected])];
+  return [...new Set([...connected, ...local, ...(current ? [current] : [])])];
+}
+const gbOf = (mb) => (mb == null ? '' : String(Math.round((mb / 1024) * 100) / 100));
+function computerBlockHtml(name, value, inherited, opts = {}) {
+  const inh = inherited || {};
+  const v = { ...inh, ...value };
+  const provider = v.provider || '';
+  const restricted = v.network?.unrestricted === false;
+  // In flight, a task may only resize: another provider, experience or network is another computer.
+  const fixed = opts.inFlight ? 'disabled' : '';
+  const body = `<div class="computer-controls">
+      <select class="cf-provider" aria-label="Provider" ${fixed}>${computerProviderOptions(provider).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
+      <label class="computer-size"><input class="cf-cpu" type="number" min="1" max="64" step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" placeholder="2" aria-label="CPU"><span>CPU</span></label>
+      <label class="computer-size"><input class="cf-memory" type="number" min="0.5" max="256" step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" placeholder="2" aria-label="Memory in GB"><span>GB RAM</span></label>
+      <label class="computer-size"><input class="cf-disk" type="number" min="1" ${provider === 'e2b' ? `max="${E2B_MAX_DISK_GB}"` : 'max="2048"'} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" placeholder="Default" aria-label="Disk in GB"><span>GB disk</span></label>
+    </div>
+    <details class="computer-more"${opts.open ? ' open' : ''}><summary>More</summary><div class="computer-more-grid">
+      <label class="form-row"><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
+        <option value="headless" ${v.flavor !== 'desktop' ? 'selected' : ''}>Headless</option><option value="desktop" ${v.flavor === 'desktop' ? 'selected' : ''}>Desktop</option></select></label>
+      <label class="form-row"><span>Hibernate after (days) ${policyTip('How long a paused task keeps its computer before packing it away. Waking it afterwards takes a little longer.')}</span>
+        <input class="cf-hibernate" type="number" min="0" max="365" step="1" value="${esc(v.hibernateAfterDays ?? '')}" placeholder="7"></label>
+      <label class="form-row"><span>Outbound network ${policyTip('Agents normally need package registries, documentation, search and APIs. Allowlist only is for organizations that maintain an egress policy.')}</span><select class="cf-network" ${fixed}>
+        <option value="unrestricted" ${restricted ? '' : 'selected'}>Normal internet</option><option value="restricted" ${restricted ? 'selected' : ''}>Allowlist only</option></select></label>
+      <div class="cf-allowlist" ${restricted ? '' : 'hidden'}>
+        <input class="cf-domains" ${fixed} value="${esc((v.network?.allowDomains || []).join(', '))}" placeholder="Allowed domains: registry.npmjs.org, pypi.org" aria-label="Allowed domains">
+        <input class="cf-cidrs" ${fixed} value="${esc((v.network?.allowCidrs || []).join(', '))}" placeholder="Allowed CIDRs: 10.20.0.0/16" aria-label="Allowed CIDRs">
+      </div>
+    </div></details>`;
+  return `<div class="computer-field computer-block" data-computer="${esc(name)}" ${inhAttr(inh)}>
+    ${opts.frozen ? `<fieldset class="ab-frozen" disabled>${body}</fieldset>` : body}</div>`;
+}
+function readComputerBlock(box) {
+  const value = (selector) => box.querySelector(selector)?.value.trim() ?? '';
+  const number = (selector) => { const raw = value(selector); return raw === '' || !Number.isFinite(Number(raw)) ? undefined : Number(raw); };
+  const list = (selector) => value(selector).split(',').map((item) => item.trim()).filter(Boolean);
+  const memory = number('.cf-memory');
+  const out = {
+    provider: value('.cf-provider') || undefined,
+    cpu: number('.cf-cpu'),
+    memoryMb: memory === undefined ? undefined : Math.round(memory * 1024),
+    diskGb: number('.cf-disk'),
+    flavor: value('.cf-flavor') || undefined,
+    hibernateAfterDays: number('.cf-hibernate'),
+    network: value('.cf-network') === 'restricted'
+      ? { unrestricted: false, allowDomains: list('.cf-domains'), allowCidrs: list('.cf-cidrs') } : { unrestricted: true },
+  };
+  return Object.fromEntries(Object.entries(out).filter(([, item]) => item !== undefined));
+}
+// What a block holds beyond what it inherits — the sparse value a form stores.
+function computerOverride(box, attr = 'data-inherit') {
+  const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
+  const read = readComputerBlock(box);
+  const network = (n) => JSON.stringify(n?.unrestricted === false ? n : { unrestricted: true });
+  return Object.fromEntries(Object.entries(read).filter(([key, item]) => key === 'network'
+    ? network(item) !== network(inh.network) : !sameJson(item, inh[key])));
+}
+function resetComputerBlock(box, attr = 'data-inherit') {
+  const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
+  const set = (selector, item) => { const el = box.querySelector(selector); if (el) el.value = item ?? ''; };
+  set('.cf-provider', inh.provider);
+  set('.cf-cpu', inh.cpu); set('.cf-memory', gbOf(inh.memoryMb)); set('.cf-disk', inh.diskGb);
+  set('.cf-flavor', inh.flavor || 'headless'); set('.cf-hibernate', inh.hibernateAfterDays);
+  set('.cf-network', inh.network?.unrestricted === false ? 'restricted' : 'unrestricted');
+  set('.cf-domains', (inh.network?.allowDomains || []).join(', ')); set('.cf-cidrs', (inh.network?.allowCidrs || []).join(', '));
+  syncComputerBlock(box);
+  box.dispatchEvent(new Event('change', { bubbles: true }));
+}
+function syncComputerBlock(box) {
+  const provider = box.querySelector('.cf-provider')?.value;
+  const disk = box.querySelector('.cf-disk');
+  if (disk) disk.max = provider === 'e2b' ? String(E2B_MAX_DISK_GB) : '2048';
+  const allowlist = box.querySelector('.cf-allowlist');
+  if (allowlist) allowlist.hidden = box.querySelector('.cf-network')?.value !== 'restricted';
+}
+// One delegated listener keeps every Computer block's dependent controls in step.
+document.addEventListener('change', (event) => {
+  const box = event.target?.closest?.('.computer-field');
+  if (box) syncComputerBlock(box);
+});
+// "E2B · 4 CPU · 8 GB · 50 GB disk" — a frozen or summarized Computer.
+function computerSummary(value) {
+  const v = value || {};
+  return [COMPUTER_PROVIDER_LABELS[v.provider] || v.provider, v.cpu != null ? `${v.cpu} CPU` : '', v.memoryMb != null ? `${gbOf(v.memoryMb)} GB` : '',
+    v.diskGb != null ? `${v.diskGb} GB disk` : '', v.flavor === 'desktop' ? 'desktop' : ''].filter(Boolean).join(' · ') || '(default)';
 }
 
 function schemaFor(workflow) {
-  const params = S.schema.find((s) => s.name === workflow)?.params || [];
-  // Fill the Agent-environment select's options from the live provider catalog.
-  return params.map((f) => (f.name === 'worldProvider' ? { ...f, options: agentEnvOptions() } : f));
+  return S.schema.find((s) => s.name === workflow)?.params || [];
 }
 
 // ── generic field renderer (SPEC §10.4 / §10.5) ──────────────────────────────
@@ -1096,6 +1183,7 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
   const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}${altAttr}`;
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited, agentOpts)}</div>`;
+  if (f.type === 'computer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${computerBlockHtml(f.name, own, inherited, agentOpts)}</div>`;
   if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited, alt)}</div>`;
   if (f.type === 'responder') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderResponderField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
@@ -1131,9 +1219,9 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
 }
 
 function renderFields(fields, own = {}, inherited = {}, withPromptChips = false, altFor) {
-  // Base, target, and the Agent environment share one row (rendered at the first
-  // of them present, in this order); the rest are skipped where they'd fall.
-  const inlineRow = ['base', 'target', 'worldProvider'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
+  // Base and target share one row (rendered at the first of them present, in
+  // this order); the rest are skipped where they'd fall.
+  const inlineRow = ['base', 'target'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
   const inlineNames = new Set(inlineRow.map((f) => f.name));
   let inlineDrawn = false;
   const html = [];
@@ -1141,7 +1229,7 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
     if (inlineNames.has(f.name) && inlineRow.length > 1) {
       if (!inlineDrawn) {
         inlineDrawn = true;
-        html.push(`<div class="branch-pair${inlineRow.length === 3 ? ' cols-3' : ''}">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`);
+        html.push(`<div class="branch-pair">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`);
       }
       continue;
     }
@@ -1732,6 +1820,14 @@ function collectForm(root, fields) {
       const resumeFrom = spec.resumeFrom;
       // include only if the agent differs from inherited OR a resume was chosen
       if (resumeFrom || !sameJson(normSpec(spec, inh), normSpec(inh))) out[f.name] = spec;
+      continue;
+    }
+    if (f.type === 'computer') {
+      const box = root.querySelector(`.computer-field[data-computer="${CSS.escape(f.name)}"]`);
+      if (!box) continue;
+      // Sparse: only what differs from the inherited computer.
+      const own = computerOverride(box);
+      if (Object.keys(own).length) out[f.name] = own;
       continue;
     }
     if (f.type === 'confirmer') {
@@ -2705,6 +2801,7 @@ function wireFieldResets(root, fields) {
     let box = null;
     let el = null;
     if (f.type === 'agent') box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
+    else if (f.type === 'computer') box = root.querySelector(`.computer-field[data-computer="${CSS.escape(f.name)}"]`);
     else if (f.type === 'confirmer') box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
     else if (f.type === 'responder') box = root.querySelector(`.responder-field[data-responder="${CSS.escape(f.role || f.name)}"]`);
     else el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -2718,6 +2815,7 @@ function wireFieldResets(root, fields) {
       const attr = attrFor(btn);
       btn.addEventListener('click', () => {
         if (f.type === 'agent') resetAgentField(box, attr);
+        else if (f.type === 'computer') resetComputerBlock(box, attr);
         else if (f.type === 'confirmer') resetConfirmerField(box, attr);
         else if (f.type === 'responder') resetResponderField(box, attr);
         else resetPlainField(el, f, attr);
@@ -2737,6 +2835,10 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
     const spec = readAgentSpec(box);
     return !sameJson(normSpec(spec, inh), normSpec(inh));
+  }
+  if (f.type === 'computer') {
+    const box = root.querySelector(`.computer-field[data-computer="${CSS.escape(f.name)}"]`);
+    return !!box && Object.keys(computerOverride(box, attr)).length > 0;
   }
   if (f.type === 'confirmer') {
     const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
@@ -4378,7 +4480,7 @@ function renderOnboarding() {
     <ol class="onboarding-list">
       ${onboardingStep(1, 'github', 'Connect GitHub', `Import repositories and let ${siteNameMarkup()} work through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
       ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
-      ${onboardingStep(3, 'e2b', 'Add an E2B or Daytona API key', 'Enable secure cloud worlds where hosted agents do their work.', `<a class="btn sm" data-spa href="${settings}#settings-compute">${state.steps.e2b.complete ? 'Manage E2B/Daytona' : 'Set up E2B/Daytona'}</a>`)}
+      ${onboardingStep(3, 'e2b', 'Add an E2B or Daytona API key', 'Enable secure cloud worlds where hosted agents do their work.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage E2B/Daytona' : 'Set up E2B/Daytona'}</a>`)}
       ${onboardingStep(4, 'optional', 'Connect apps and payment cards', 'Connect services and give agents approved access to passwords and purchases. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault || optional.card ? 'Manage apps &amp; cards' : 'Set up apps &amp; cards'}</a>`)}
       ${onboardingStep(5, 'paidPlan', 'Buy paid plan', 'Choose a paid subscription for this workspace, or keep using Free. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-plan">${state.steps.paidPlan?.complete ? 'Manage paid plan' : 'View plans &amp; billing'}</a>`)}
       ${onboardingStep(6, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
@@ -6783,9 +6885,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // Everything stays inside #tf-body so collect/auto-save wiring sees one form.
   const restFields = promptField ? fields.filter((f) => f.name !== promptField.name) : fields;
   // The main column reads like the task it describes: the prompt, the agent
-  // that does it, who answers its questions, who reviews it, then where it runs
-  // and when it starts.
-  const agentRank = (f) => (f.type === 'agent' ? 0 : f.type === 'responder' ? 1 : f.type === 'confirmer' ? 2 : 3);
+  // that does it, who answers its questions, who reviews it, the computer it
+  // runs on, then its branches and when it starts.
+  const agentRank = (f) => (f.type === 'agent' ? 0 : f.type === 'responder' ? 1 : f.type === 'confirmer' ? 2 : f.type === 'computer' ? 2.5 : 3);
   const agentFields = restFields.filter((f) => agentRank(f) < 3).sort((a, b) => agentRank(a) - agentRank(b));
   const otherFields = restFields.filter((f) => agentRank(f) === 3);
   const mainAgentField = agentFields.find((f) => f.type === 'agent' && (f.role || f.name) === 'do') || agentFields.find((f) => f.type === 'agent');
@@ -11516,6 +11618,12 @@ function paramsSection(v) {
       return isEditable ? `<div class="pf-edit-row" data-row="${esc(f.name)}">${row}</div>`
         : `<div class="pf-frozen" data-row="${esc(f.name)}">${row}</div>`;
     }
+    // The Computer, like an agent, is one block. In flight only its size and
+    // hibernation change; the provider, experience and network stay.
+    if (f.type === 'computer') {
+      const block = computerBlockHtml(f.name, own || undefined, inherited, { inFlight: true, frozen: !isEditable });
+      return `<div class="${isEditable ? 'pf-edit-row' : 'pf-frozen'}" data-row="${esc(f.name)}"><div class="form-row">${isEditable ? fieldLabel(f) : frozenLabel(f)}${block}</div></div>`;
+    }
     if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
     // A frozen route keeps its shape (who, in order, and each agent's block).
     if (f.type === 'confirmer' || f.type === 'responder') {
@@ -11529,13 +11637,13 @@ function paramsSection(v) {
   };
   // The task form's order: the prompt, its agents, then where it runs.
   const rank = (f) => (f.bind === 'prompt' ? -1 : f.type === 'agent' && !f.calledAgent ? 0 : f.type === 'responder' ? 1
-    : f.type === 'confirmer' ? 2 : f.calledAgent ? 3 : 4);
+    : f.type === 'confirmer' ? 2 : f.calledAgent ? 3 : f.type === 'computer' ? 3.5 : 4);
   const agentFields = fields.filter((f) => rank(f) < 4).sort((a, b) => rank(a) - rank(b));
   const whereFields = fields.filter((f) => rank(f) === 4);
-  // Base, target and environment share one row, as in the task form.
-  const pair = ['base', 'target', 'worldProvider'].map((name) => whereFields.find((f) => f.name === name)).filter(Boolean);
+  // Base and target share one row, as in the task form.
+  const pair = ['base', 'target'].map((name) => whereFields.find((f) => f.name === name)).filter(Boolean);
   const where = [
-    pair.length > 1 ? `<div class="branch-pair${pair.length === 3 ? ' cols-3' : ''}">${pair.map(rowFor).join('')}</div>` : '',
+    pair.length > 1 ? `<div class="branch-pair">${pair.map(rowFor).join('')}</div>` : '',
     ...whereFields.filter((f) => pair.length < 2 || !pair.includes(f)).map(rowFor),
   ].join('');
   const triggers = Array.isArray(rec?.params?.triggers) && rec.params.triggers.length
@@ -11602,6 +11710,7 @@ function paramCurrentValue(f, v, rec) {
 function displayParam(f, val) {
   if (val === undefined || val === null || val === '') return '(default)';
   if (f.type === 'agent') return [val.provider, val.model].filter(Boolean).join(' · ') || '(default)';
+  if (f.type === 'computer') return computerSummary(val);
   if (f.type === 'confirmer') {
     const layers = cfLayersOf(val);
     if (!layers.length) return 'auto-confirm';
@@ -11628,6 +11737,12 @@ function collectParamEdits(root, fields) {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
       out[f.name] = readAgentBlock(box);
+      continue;
+    }
+    if (f.type === 'computer') {
+      // A running task's computer is sent whole: the machine it should be now.
+      const box = root.querySelector(`.computer-field[data-computer="${CSS.escape(f.name)}"]`);
+      if (box) out[f.name] = readComputerBlock(box);
       continue;
     }
     if (f.type === 'confirmer') {
@@ -13524,12 +13639,15 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'multiPr', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'computer', 'multiPr', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // Review route and Responder stay shared/common values on the wire, but their
 // controls live in the Agent card.
 const agentRouteSettingsFields = (scope) => ['responder', 'confirm']
   .map((name) => settingsFields('software-dev', scope).find((field) => field.name === name)).filter(Boolean);
-const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && !['confirm', 'responder'].includes(field.name));
+const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name)
+  && !['confirm', 'responder'].includes(field.name) && field.type !== 'computer');
+// The Computer has its own section of the card, like the Agent.
+const computerSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => field.type === 'computer');
 // The stored `__common__` row is shared by several forms (task defaults here; the
 // agent routes and Git profile elsewhere) and a settings PUT replaces the whole
 // row — so every save read-merge-writes: fetch the raw row, drop exactly the keys
@@ -13553,11 +13671,14 @@ function settingsForms(scope, projectId) {
     .filter((s) => s.name !== 'agent-queue' && WORKFLOWS.some((w) => w.id === s.name));
   // Task defaults mirror the task form: the Agent (its harness, tools and
   // collapsed Authorization row with the authorization, vault and payment
-  // defaults), the Responder, the Review route, then where tasks run — saved
-  // together.
+  // defaults), the Responder, the Review route, the Computer, then branches —
+  // saved together.
   const common = `<div class="card task-defaults parameter-fields" id="task-defaults-${scope}">
       <section class="td-section td-agent"><div id="profiles-list-${scope}">Loading…</div></section>
       <section class="td-section td-routes"><div id="review-route-${scope}">Loading…</div></section>
+      <section class="td-section td-computer" data-wf="__common__" data-schema-wf="software-dev" data-part="computer">
+        <div class="wf-form parameter-fields">${renderFields(computerSettingsFields(scope))}</div>
+      </section>
       <section class="td-section td-where" data-wf="__common__" data-schema-wf="software-dev">
         <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
       </section>
@@ -13603,10 +13724,15 @@ function wireTaskDefaultsSave(scope, projectId, organizationId) {
     try {
       for (const save of Object.values(card._savers || {})) await save();
       const routes = card.querySelector(`#review-route-${scope} .wf-form`);
-      const where = card.querySelector('[data-wf="__common__"] .wf-form');
+      const where = card.querySelector('[data-wf="__common__"]:not([data-part]) .wf-form');
+      const computer = card.querySelector('[data-part="computer"] .wf-form');
       const owned = [...(routes ? agentRouteSettingsFields(scope) : []), ...(where ? commonSettingsFields(scope) : [])];
       const values = { ...(routes ? collectForm(routes, agentRouteSettingsFields(scope)) : {}),
         ...(where ? collectForm(where, commonSettingsFields(scope)) : {}) };
+      // Always sent: the Computer is stored as the execution policy, and null
+      // (nothing changed from what it inherits) resets this scope to inherit.
+      if (computer?.querySelector('.computer-field'))
+        for (const field of computerSettingsFields(scope)) values[field.name] = collectForm(computer, [field])[field.name] ?? null;
       await saveCommonSettings(scope, projectId, organizationId, owned.map((field) => field.name), values);
       if (scope === 'project') await loadProjects();
       flashSaved(button);
@@ -13781,7 +13907,7 @@ async function hydrateSettingsForms(scope, projectId, organizationId) {
       own = d[scope].own;
       inherited = d[scope].inherited;
     } catch {}
-    const fields = wf === '__common__' ? commonSettingsFields(scope)
+    const fields = wf === '__common__' ? (sec.dataset.part === 'computer' ? computerSettingsFields(scope) : commonSettingsFields(scope))
       : settingsFields(wf, scope).filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
     sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
     sec.dataset.mcpScope = mcpScope(projectId || null, organizationId);
@@ -14791,7 +14917,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-agents">Agents</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -14799,6 +14925,7 @@ function settingsView(proj) {
       <button type="button" data-project-jump="project-data"><b>Data</b><span>Files ${siteNameMarkup()} versions</span></button>
       <button type="button" data-project-jump="project-services"><b>Service</b><span>A live system tasks call</span></button>
       <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools tasks run with</span></button>
+      <button type="button" data-project-jump="project-computers"><b>Computers</b><span>Where tasks run</span></button>
     </div>
     <div class="project-config-section" id="project-git"><div class="project-config-number">01</div><div><h2>Git &amp; GitHub</h2></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${profileRoute()}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
@@ -14810,9 +14937,10 @@ function settingsView(proj) {
     <div class="card"><div id="project-services-box">Loading…</div></div>
     <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
-    <div class="settings-section-title" id="project-compute"><div>Where tasks run</div></div>${cloudEnvironmentCard(proj)}
-    <div class="settings-section-title" id="project-agents"><div>Codex/Claude</div></div>
-    <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
+    <div class="project-config-section" id="project-computers"><div class="project-config-number">06</div><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
+    <div class="card"><div id="project-computers-box">Loading…</div></div>
+    <div class="settings-section-title" id="project-agents"><div>Agents</div></div>
+    <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Organization agent accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
     <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
@@ -14831,12 +14959,6 @@ function settingsView(proj) {
     <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
     <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;
-}
-function cloudEnvironmentCard(proj) {
-  return `<div class="card">
-    <p class="task-sub">Available providers and limits come from <a class="organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-compute">organization settings</a>.</p>
-    <div id="project-execution">Loading organization execution policy…</div>
-  </div>`;
 }
 // A settings pane that fails to load used to dead-end on bare server text. Say
 // plainly what happened, keep the raw detail on hover, and offer the one useful
@@ -15375,7 +15497,7 @@ function wireSettingsView(proj) {
     go(link.getAttribute('href'));
   }));
   hydrateProjectAccess(proj);
-  hydrateExecutionProviders(proj);
+  hydrateComputers($('#project-computers-box'), proj.organizationId);
   hydrateConversationSharing('project', proj.id);
   hydrateAvatarAvailability('project', proj.id);
   hydrateProjectSecrets(proj);
@@ -15573,59 +15695,6 @@ async function hydrateSettingsAccess(scope) {
   layout.querySelectorAll('[data-settings-advanced]').forEach((element) => { element.hidden = !advanced; });
   wireSettingsNavigation();
 }
-async function hydrateExecutionProviders(proj) {
-  const box = $('#project-execution'); if (!box) return;
-  const renderIsCurrent = beginAsyncElementRender(box);
-  try {
-    const [policy, connections, pools] = await Promise.all([
-      api(`/api/projects/${encodeURIComponent(proj.id)}/execution-policy`),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/world-providers`),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/runner-pools`),
-    ]);
-    if (!renderIsCurrent()) return;
-    S.worldProviderConnections = connections;
-    // The Agent environment (worktree / container / E2B / Daytona) now lives in
-    // Task defaults — and can be overridden per task. Compute keeps the runner
-    // pool, network policy, world flavor, and budget, so the pool list is filtered
-    // by the effective environment (shown read-only here).
-    const environment = policy.effective.worldProvider || 'worktree';
-    const networkOverride = policy.override.network;
-    const networkMode = networkOverride ? (networkOverride.unrestricted ? 'unrestricted' : 'restricted') : '';
-    box.innerHTML = `<div class="settings-grid">
-      <label class="form-row">Runner pool<select id="project-execution-pool"></select></label>
-      <label class="form-row">World experience<select id="project-execution-flavor"><option value="">Organization default — ${esc(policy.organization.environment?.flavor || 'headless')}</option><option value="headless" ${policy.override.environment?.flavor === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${policy.override.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
-      <label class="form-row">Outbound network<select id="project-execution-network"><option value="" ${networkMode === '' ? 'selected' : ''}>Organization default — ${policy.organization.network?.unrestricted !== false ? 'normal internet' : 'restricted'}</option><option value="unrestricted" ${networkMode === 'unrestricted' ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${networkMode === 'restricted' ? 'selected' : ''}>Restricted allowlist</option></select></label>
-      <label class="form-row">Optional tighter project budget (USD/month)<input id="project-execution-budget" type="number" min="0" step="0.01" value="${policy.override.monthlyBudgetMicros == null ? '' : esc(policy.override.monthlyBudgetMicros / 1e6)}" placeholder="Use organization budget" /></label>
-    </div>
-    <details id="project-network-restrictions" ${networkMode === 'restricted' ? 'open' : ''}><summary class="task-sub">Project restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="project-execution-domains" value="${esc((networkOverride?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="project-execution-cidrs" value="${esc((networkOverride?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
-    <div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${esc(policy.effective.environment?.flavor || 'headless')} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
-    <button class="btn sm primary" id="project-execution-save">Save</button>`;
-    const matching = pools.filter((pool) => pool.provider === environment && pool.enabled);
-    $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Organization BYOK default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-    $('#project-execution-network')?.addEventListener('change', (event) => {
-      $('#project-network-restrictions').open = event.target.value === 'restricted';
-    });
-    $('#project-execution-save')?.addEventListener('click', async () => {
-      const pool = $('#project-execution-pool').value;
-      const budget = $('#project-execution-budget').value.trim();
-      const selectedNetwork = $('#project-execution-network').value;
-      const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
-      try {
-        await api(`/api/projects/${proj.id}/execution-policy`, { method: 'PUT', body: JSON.stringify({ override: {
-          runnerPoolId: pool || null,
-          environment: $('#project-execution-flavor').value ? { flavor: $('#project-execution-flavor').value } : null,
-          network: selectedNetwork === '' ? null : selectedNetwork === 'unrestricted' ? { unrestricted: true }
-            : { unrestricted: false, allowDomains: split('#project-execution-domains'), allowCidrs: split('#project-execution-cidrs') },
-          monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
-        } }) });
-        await loadProjects(); toast('Saved'); await hydrateExecutionProviders(proj);
-      } catch (error) { toast(error.message, true); }
-    });
-  } catch (error) {
-    if (renderIsCurrent()) toast(`Could not load where tasks run: ${error.message}`, true);
-  }
-}
-
 // ── organization defaults (legacy APIs still call this global scope) ─────────
 /** The brand icon is instance-wide, like host capacity: it is the same mark for
  * everyone, including on the sign-in screen before any organization is known. */
@@ -15710,7 +15779,7 @@ function globalSettingsView(embedded = false) {
     ${vaultRequestsCard()}
     ${agentMailCard()}
     ${paymentsCard('global')}
-    <div class="settings-section-title" id="settings-agents"><div>Codex/Claude</div></div>
+    <div class="settings-section-title" id="settings-agents"><div>Agents</div></div>
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
       <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
@@ -18952,13 +19021,15 @@ function wireSettingsNavigation() {
   const panes = [...content.querySelectorAll('.settings-pane')];
   const activate = (id) => {
     const visibleLinks = links.filter((link) => !link.hidden);
-    const nestedPane = id && [...content.querySelectorAll('[id]')]
-      .find((node) => node.id === id)?.closest('.settings-pane')?.dataset.pane;
+    const nested = id ? [...content.querySelectorAll('[id]')].find((node) => node.id === id) : undefined;
+    const nestedPane = nested?.closest('.settings-pane')?.dataset.pane;
     const requestedPane = nestedPane || id;
     const target = visibleLinks.some((link) => link.getAttribute('href') === `#${requestedPane}`)
       ? requestedPane : visibleLinks[0]?.getAttribute('href').slice(1);
     panes.forEach((pane) => pane.classList.toggle('active', pane.dataset.pane === target));
     links.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${target}`));
+    // A link to a card inside a pane (#settings-computers) lands on that card.
+    if (nested && nestedPane === target && nestedPane !== id) requestAnimationFrame(() => nested.scrollIntoView?.({ block: 'start' }));
   };
   links.forEach((link) => {
     // onclick assignment (not addEventListener) keeps re-wiring idempotent —
@@ -19369,6 +19440,105 @@ function wireInstallationSettings() {
   if (hostLocal()) hydratePhoneAccess();
 }
 
+// ── Computers (Organization → Projects, Project → Computers) ─────────────────
+// The cloud computers an organization's tasks can run on: one row per provider
+// with its state, an edit dialog (API key and the rarely needed provider
+// templates) and a connection test. What a task's computer is — provider, size,
+// experience, hibernation, network — lives in the Computer block of the task
+// form and Task defaults, not here.
+const COMPUTER_PROVIDERS = {
+  e2b: { name: 'E2B', keys: 'https://e2b.dev/dashboard?tab=keys',
+    advanced: [['template', 'Headless template', 'Default'], ['desktopTemplate', 'Desktop template', 'E2B desktop']] },
+  daytona: { name: 'Daytona', keys: 'https://app.daytona.io',
+    tip: 'Daytona Tiers 1–2 reach only package registries, Git hosts and AI APIs, not the open internet. Use E2B or Daytona Tier 3+ for general web access.',
+    advanced: [['snapshot', 'Headless snapshot', 'Daytona default'], ['image', 'Headless image', 'used when no snapshot'],
+      ['desktopSnapshot', 'Desktop snapshot', 'Daytona default'], ['desktopImage', 'Desktop image', 'used when no desktop snapshot'],
+      ['apiUrl', 'API URL', 'https://app.daytona.io/api'], ['target', 'Target', 'provider default']] },
+};
+function computerConnectionState(connection) {
+  if (!connection) return { label: 'not connected', tone: '' };
+  if (!connection.enabled) return { label: 'disabled', tone: '' };
+  if (connection.status === 'ready') return { label: 'connected', tone: 'done' };
+  return { label: connection.status === 'error' ? 'failing' : String(connection.status || 'unverified'), tone: 'failed' };
+}
+function computersMarkup(connections) {
+  return `<div class="computer-providers">${Object.entries(COMPUTER_PROVIDERS).map(([id, info]) => {
+    const connection = connections.find((candidate) => candidate.provider === id);
+    const state = computerConnectionState(connection);
+    return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
+      <span class="chip ${state.tone}"${connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
+      <span class="label-row-fill"></span>
+      ${connection ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button>
+        <button class="btn sm computer-test" type="button">Test</button>`
+      : `<button class="btn sm computer-connect" type="button">Connect</button>`}</div>`;
+  }).join('')}</div>`;
+}
+async function hydrateComputers(box, organizationId) {
+  if (!box) return;
+  const current = beginAsyncElementRender(box);
+  let connections;
+  try { connections = await api(`/api/organizations/${encodeURIComponent(organizationId)}/world-providers`); }
+  catch (error) { if (current()) paneError(box, error, () => hydrateComputers(box, organizationId)); return; }
+  if (!current()) return;
+  if (organizationId === S.organizationId) S.worldProviderConnections = connections;
+  box.innerHTML = computersMarkup(connections);
+  const reload = () => hydrateComputers(box, organizationId);
+  box.querySelectorAll('.computer-provider').forEach((row) => {
+    const provider = row.dataset.provider;
+    const connection = connections.find((candidate) => candidate.provider === provider);
+    const open = () => openComputerDialog(provider, connection, organizationId, reload);
+    row.querySelector('.computer-edit')?.addEventListener('click', open);
+    row.querySelector('.computer-connect')?.addEventListener('click', open);
+    row.querySelector('.computer-test')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget; button.disabled = true;
+      try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${COMPUTER_PROVIDERS[provider].name} works`); }
+      catch (error) { toast(error.message, true); }
+      await reload();
+    });
+  });
+}
+function openComputerDialog(provider, connection, organizationId, onSaved) {
+  const info = COMPUTER_PROVIDERS[provider];
+  const config = connection?.config || {};
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="${esc(info.name)}">
+    <div class="modal-head"><b>${esc(info.name)}</b>${info.tip ? policyTip(info.tip) : ''}<span class="label-row-fill"></span><button class="icon-btn computer-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row"><span>API key <a class="computer-key-link" href="${esc(info.keys)}" target="_blank" rel="noopener noreferrer">Get a key</a></span>
+      <input class="computer-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Blank to leave unchanged' : 'Required'}"></label>
+    <details class="computer-advanced"><summary>Advanced</summary><div class="settings-grid">
+      ${info.advanced.map(([key, label, placeholder]) => `<label class="form-row">${esc(label)}<input data-config="${esc(key)}" value="${esc(config[key] || '')}" placeholder="${esc(placeholder)}"></label>`).join('')}
+    </div></details>
+    <div class="modal-actions">${connection ? '<button class="btn danger computer-disconnect" type="button">Disconnect</button><span class="label-row-fill"></span>' : ''}
+      <button class="btn computer-cancel" type="button">Cancel</button><button class="btn primary computer-save" type="button">${connection ? 'Save' : 'Connect'}</button></div>
+  </div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  const base = `/api/organizations/${encodeURIComponent(organizationId)}/world-providers/${provider}`;
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.computer-close').addEventListener('click', close);
+  overlay.querySelector('.computer-cancel').addEventListener('click', close);
+  overlay.querySelector('.computer-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    const body = { apiKey: overlay.querySelector('.computer-key').value.trim() || undefined,
+      config: Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])) };
+    // A refused save changed nothing: keep what was typed. A saved one is
+    // verified at once, and its state (or error) shows on the row.
+    try { await api(base, { method: 'PUT', body: JSON.stringify(body) }); }
+    catch (error) { toast(error.message, true); button.disabled = false; return; }
+    close();
+    try { await api(`${base}/test`, { method: 'POST', body: '{}' }); toast(`${info.name} connected`); }
+    catch (error) { toast(error.message, true); }
+    await onSaved?.();
+  });
+  overlay.querySelector('.computer-disconnect')?.addEventListener('click', async () => {
+    if (!confirm(`Disconnect ${info.name}? Tasks running on it must finish or be removed first.`)) return;
+    try { await api(base, { method: 'DELETE' }); close(); await onSaved?.(); }
+    catch (error) { toast(error.message, true); }
+  });
+  document.body.appendChild(overlay); document.addEventListener('keydown', keydown);
+  overlay.querySelector('.computer-key').focus();
+}
+
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
   const authorizationProjects = S.projects.filter((project) => project.organizationId === S.organizationId);
@@ -19376,11 +19546,11 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-agents">Agents</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
-    <div class="card" id="org-plan">Loading…</div>
+    <div class="card"><div id="org-plan">Loading…</div><div id="org-usage"></div></div>
     <div class="settings-section-title" id="settings-billing"><div>Subscription billing<small>Hosted subscription and active-user seats—not cards used by agents</small></div></div>
     <div class="card" id="org-subscription"><p class="task-sub">Loading verified subscription status…</p></div>
 
@@ -19395,12 +19565,10 @@ function organizationView() {
       </select></label><p class="task-sub">Controls whether your organization’s name appears in organization search. Access to projects and settings still requires authorization. The operator can always find every organization.</p></div>
     <div class="card" id="organization-roles">Loading roles…</div>
     <div class="card"><div id="organization-conversation-sharing">Loading…</div></div>
-    <div class="settings-section-title" id="settings-code"><div>Projects<small>Repository access and storage shared by this organization’s projects</small></div></div>
+    <div class="settings-section-title" id="settings-code"><div>Projects<small>Repositories, computers and storage shared by this organization’s projects</small></div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
+    <div class="card"><div class="section-h" id="settings-computers">Computers ${policyTip('The cloud computers tasks run on. Each task’s computer—its size, experience and network—is set in the task form and Task defaults.')}</div><div id="org-computers">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-storage">Data storage ${policyTip(`Managed storage is intentionally bounded. Connect your own bucket for large versioned datasets; for live or frequently changing data, add the bucket as a project Service instead of copying it into ${siteName()}.`)}</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
-
-    <div class="settings-section-title" id="settings-compute"><div>Where tasks run</div></div>
-    <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
 
     ${globalSettingsView(true)}
 
@@ -19536,8 +19704,8 @@ function setEventHandler(element, type, handler) {
 
 // Organization settings, pane by pane: opening the page paints every pane, each
 // as soon as its own reads arrive; an action refreshes only the panes it changed,
-// so adding a team re-reads people and teams, not GitHub, compute and usage too.
-const ORGANIZATION_PANES = ['people', 'github', 'compute', 'storage', 'usage', 'identity'];
+// so adding a team re-reads people and teams, not GitHub, computers and usage too.
+const ORGANIZATION_PANES = ['people', 'github', 'computers', 'storage', 'usage', 'identity'];
 async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
   if (!$('#org-members') || !S.organizationId) return;
   const organizationId = S.organizationId;
@@ -19721,90 +19889,8 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
         });
       });
     },
-    async compute() {
-      const [runners, providerConnections, executionPolicy, usagePolicy] = await Promise.all([
-        read('runner-pools').catch(() => []),
-        read('world-providers').catch(() => []),
-        read('execution-policy').catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
-        read('usage-policy').catch(() => null),
-      ]);
-      if (!live('compute')) return;
-      const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
-      S.worldProviderConnections = providerConnections;
-      // The default Agent environment moved to Task defaults (below) and can be
-      // overridden per project/task. Compute keeps the runner pool + budget; the pool
-      // list is scoped to the effective environment, shown read-only here.
-      const orgEnvironment = executionPolicy.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
-      $('#org-execution').innerHTML = `<div class="settings-grid">
-        <label class="form-row">Agent environment<input value="${esc(orgEnvironment)}" disabled title="Set the default in Task defaults; override it per project or task" /></label>
-        <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
-        <label class="form-row">World experience<select id="org-execution-flavor"><option value="headless" ${(executionPolicy.environment?.flavor || 'headless') === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${executionPolicy.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
-        <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
-        <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
-        <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
-        <label class="form-row">Hibernate parked worlds after (days)<input id="org-execution-hibernate" type="number" min="1" value="${esc(Math.round((executionPolicy.hibernateAfterMs || 604800000) / 86400000))}" /></label>
-        <label class="form-row"><span>Outbound network ${policyTip('Coding agents normally need arbitrary package registries, documentation, web search and APIs. Restricted mode is for organizations with a maintained egress policy.')}</span><select id="org-execution-network"><option value="unrestricted" ${executionPolicy.network?.unrestricted !== false ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${executionPolicy.network?.unrestricted === false ? 'selected' : ''}>Restricted allowlist</option></select></label>
-      </div>
-      <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
-      <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
-      const providerInfo = {
-        e2b: { name: 'E2B', site: 'https://e2b.dev', keys: 'https://e2b.dev/dashboard?tab=keys' },
-        daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io',
-          note: 'Note: <a href="https://www.daytona.io/docs/en/network-limits/" target="_blank" rel="noopener noreferrer">Daytona Tiers 1–2</a> only reach package registries, Git hosts and AI APIs, not the open internet. Use E2B or Daytona Tier 3+ instead.' },
-      };
-      $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
-        const connection = connectionFor(provider); const config = connection?.config || {};
-        const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
-        const info = providerInfo[provider];
-        return `<div class="team-block provider-connection" data-provider="${provider}">
-          <div class="member-row"><b>${info.name}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
-          <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
-          ${info.note ? `<p class="provider-note">${info.note}</p>` : ''}
-          ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
-          <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
-          ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
-            : `<details class="settings-disclosure compact"><summary><b>Advanced (optional)</b></summary><p class="task-sub">An API key is enough to use Daytona’s default environment. Snapshots set their own CPU and memory; choose an image to apply task resource settings.</p><div class="settings-grid"><label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="Daytona default" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label></div></details>`}
-          </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
-      }).join('');
-      $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
-        <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select>${hostLocal() ? '<input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds">' : ''}<button class="btn sm" id="runner-create">Add pool</button></div>`;
-      $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
-        const provider = row.dataset.provider;
-        row.querySelector('.provider-save')?.addEventListener('click', async () => {
-          const body = { apiKey: row.querySelector('.provider-key').value || undefined, config: provider === 'e2b'
-            ? { template: row.querySelector('.provider-template').value, desktopTemplate: row.querySelector('.provider-desktop-template').value }
-            : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
-                desktopSnapshot: row.querySelector('.provider-desktop-snapshot').value, desktopImage: row.querySelector('.provider-desktop-image').value,
-                apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
-          // A rejected save changed nothing: keep what was typed. Once saved, the
-          // redraw shows the stored connection and any verification error.
-          try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); }
-          catch (e) { toast(e.message, true); return; }
-          try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await refresh('compute'); }
-          catch (e) { toast(e.message, true); await refresh('compute'); }
-        });
-        row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await refresh('compute'); } catch (e) { toast(e.message, true); await refresh('compute'); } });
-        row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await refresh('compute'); } catch (e) { toast(e.message, true); } });
-      });
-      setEventHandler($('#runner-create'), 'click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await refresh('compute'); } catch (e) { toast(e.message, true); } });
-      const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
-      $('#org-execution-pool').innerHTML = `<option value="">Organization BYOK default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-      setEventHandler($('#org-execution-network'), 'change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
-      setEventHandler($('#org-execution-save'), 'click', async () => {
-        const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
-        const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
-        try {
-          await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
-            runnerPoolId: $('#org-execution-pool').value || undefined,
-            environment: { flavor: $('#org-execution-flavor').value },
-            resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
-            network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
-            monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
-            hibernateAfterMs: Math.round(Number($('#org-execution-hibernate').value) * 86400000),
-          } }) }); toast('Organization execution policy saved'); await refresh('compute');
-        } catch (error) { toast(error.message, true); }
-      });
-      $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await refresh('compute'); } catch (e) { toast(e.message, true); } }));
+    async computers() {
+      if (live('computers')) await hydrateComputers($('#org-computers'), organizationId);
     },
     async storage() {
       const [storageLocations, contents] = await Promise.all([read('storage').catch(() => []), read('storage-contents').catch(() => null)]);
@@ -19859,10 +19945,9 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       });
     },
     async usage() {
-      const [entitlements, usage, usagePolicy] = await Promise.all([
+      const [entitlements, usage] = await Promise.all([
         read('entitlements').catch(() => null),
         read('usage').catch(() => null),
-        read('usage-policy').catch(() => null),
       ]);
       if (!live('usage')) return;
       $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
@@ -19874,37 +19959,8 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
         : coverageFrom > Number(usage?.from || 0)
           ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
-      const usageFunding = usage?.byFundingSource || {};
-      $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Metered + estimated usage · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
-        <p class="task-sub">Incurred $${((usage.incurredCostMicros || 0) / 1e6).toFixed(2)} · estimated $${((usage.estimatedCostMicros || 0) / 1e6).toFixed(2)} · active managed reservations $${((usage.activeReservationsMicros || 0) / 1e6).toFixed(2)}</p>
-        <p class="task-sub">Managed $${((usageFunding.managed || 0) / 1e6).toFixed(2)} (${usage.requests?.managed || 0} model requests) · BYOK $${((usageFunding.byok || 0) / 1e6).toFixed(2)} (${usage.requests?.byok || 0} model requests) · active: ${usage.active?.agentTurns || 0} model turns, ${usage.active?.worlds || 0} worlds, ${usage.active?.executions || 0} commands</p>
-        ${usagePolicy ? `<details class="settings-disclosure compact"><summary><b>Usage guardrails</b> ${policyTip(`The plan admits ${entitlements?.maxActiveAgentRuns || usagePolicy.effectiveMaxActiveAgentTurns} shared active agent runs; an owner can only set a tighter cap here. Managed model use stays off until an owner sets a spend cap and enables a provider. BYOK usage is attributed separately, and remote sandboxes use the organization's own provider account.`)}</summary><div class="settings-grid">
-          <label class="form-row">Managed spend cap (USD/month)<input id="usage-managed-cap" type="number" min="0.01" step="0.01" value="${usagePolicy.managedSpendCapMicros == null ? '' : esc(usagePolicy.managedSpendCapMicros / 1e6)}" placeholder="Disabled" /></label>
-          <label class="form-row">Managed model providers<input id="usage-managed-providers" value="${esc((usagePolicy.managedModelProviders || []).join(', '))}" placeholder="Disabled" /></label>
-          <label class="form-row">Allowed model providers<input id="usage-allowed-providers" value="${esc((usagePolicy.allowedModelProviders || []).join(', '))}" placeholder="All connected BYOK providers" /></label>
-          <label class="form-row">Allowed models<input id="usage-allowed-models" value="${esc((usagePolicy.allowedModels || []).join(', '))}" placeholder="All models" /></label>
-          <label class="form-row">Model starts / minute<input id="usage-agent-rate" type="number" min="1" value="${esc(usagePolicy.maxAgentStartsPerMinute)}" /></label>
-          <label class="form-row">Sandbox starts / minute<input id="usage-world-rate" type="number" min="1" value="${esc(usagePolicy.maxRemoteStartsPerMinute)}" /></label>
-          <label class="form-row">Optional tighter model concurrency<input id="usage-agent-active" type="number" min="1" max="${esc(entitlements?.maxActiveAgentRuns || 1000000)}" value="${usagePolicy.maxActiveAgentTurns == null ? '' : esc(usagePolicy.maxActiveAgentTurns)}" placeholder="Plan limit: ${esc(usagePolicy.effectiveMaxActiveAgentTurns)}" /></label>
-          ${hostLocal() ? `<label class="form-row">Concurrent remote worlds<input id="usage-world-active" type="number" min="1" value="${esc(usagePolicy.maxActiveWorlds)}" /></label>`
-            : `<div class="form-row"><span>Concurrent remote worlds</span><b>Same as agent concurrency: ${esc(usagePolicy.maxActiveWorlds)}</b></div>`}
-        </div><button class="btn sm primary" id="usage-policy-save">Save usage guardrails</button></details>` : ''}` : 'Usage unavailable.';
-      setEventHandler($('#usage-policy-save'), 'click', async () => {
-        const list = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
-        const cap = $('#usage-managed-cap').value.trim();
-        const agentCap = $('#usage-agent-active').value.trim();
-        try {
-          const policy = {
-            managedSpendCapMicros: cap === '' ? null : Math.round(Number(cap) * 1e6),
-            managedModelProviders: list('#usage-managed-providers'), allowedModelProviders: list('#usage-allowed-providers'),
-            allowedModels: list('#usage-allowed-models'), maxAgentStartsPerMinute: Number($('#usage-agent-rate').value),
-            maxRemoteStartsPerMinute: Number($('#usage-world-rate').value),
-            maxActiveAgentTurns: agentCap === '' ? null : Number(agentCap),
-            ...(hostLocal() ? { maxActiveWorlds: Number($('#usage-world-active').value) } : {}),
-          };
-          await api(`/api/organizations/${S.organizationId}/usage-policy`, { method: 'PUT', body: JSON.stringify({ policy }) }); toast('Usage guardrails saved'); await refresh('usage', 'compute');
-        } catch (error) { toast(error.message, true); }
-      });
+      $('#org-usage').innerHTML = usage ? `<div class="settings-divider"></div><div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Metered + estimated usage · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
+        <p class="task-sub">Incurred $${((usage.incurredCostMicros || 0) / 1e6).toFixed(2)} · estimated $${((usage.estimatedCostMicros || 0) / 1e6).toFixed(2)} · active managed reservations $${((usage.activeReservationsMicros || 0) / 1e6).toFixed(2)}</p>` : '';
     },
     async identity() {
       const identityPolicy = await read('identity-policy').catch(() => null);

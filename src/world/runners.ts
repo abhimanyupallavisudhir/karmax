@@ -4,6 +4,7 @@ import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Store } from '../store/db.js';
 import type { Project, RunnerPool, WorldHandleRef } from '../domain/types.js';
 import type { ProviderSandboxRef } from './types.js';
+import { describeMachine, machineShape, sameMachine, type MachineShape } from '../domain/computer.js';
 import type { WorldRegistry } from './registry.js';
 import type { WorldCheckpointService } from './checkpoint.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -54,10 +55,13 @@ export class RunnerPoolService {
   }
 
   async acquire(input: { project: Project; taskId: string; worldId: string; provider: string; priority?: number;
+    /** The task's own machine size, when its Computer differs from the project's. */
+    resources?: Project['config']['resources'];
     heartbeat?: () => void; signal?: AbortSignal; pollMs?: number }): Promise<{ leaseId: string; runnerPoolId: string }> {
     if (input.signal?.aborted)
       throw input.signal.reason ?? new Error('runner lease cancelled');
-    const config = (await this.store.effectiveProjectConfig(input.project));
+    const projectConfig = (await this.store.effectiveProjectConfig(input.project));
+    const config = input.resources ? { ...projectConfig, resources: input.resources } : projectConfig;
     const pool = (await this.ensureDefaultPool(input.project, input.provider));
     const month = monthWindow(Date.now());
     const organizationPolicy = (await this.store.getOrganizationExecutionPolicy(input.project.organizationId!));
@@ -280,8 +284,16 @@ export class WorldLifecycleManager {
       try {
       const projectId = String(candidate.handle.meta?.projectId ?? '');
       const project = (await this.store.getProject(projectId));
-      const after = project ? (await this.store.effectiveProjectConfig(project)).hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
-      if (!project || candidate.updatedAt > now - after) continue;
+      const config = project ? (await this.store.effectiveTaskConfig(project, candidate.handle.id)) : undefined;
+      const after = config?.hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000;
+      // A task whose Computer now asks for another size moves to a machine of
+      // that size: hibernate now, and the next wake restores the checkpoint onto
+      // it (checkpoint.ts restore). Worlds made before sizes were recorded are
+      // left alone until their task's Computer is edited (api.ts updateParams).
+      const recorded = candidate.handle.meta?.computer as MachineShape | undefined;
+      const resize = recorded && config && !sameMachine(recorded, machineShape(config))
+        ? { from: recorded, to: machineShape(config) } : undefined;
+      if (!project || (!resize && candidate.updatedAt > now - after)) continue;
       // Selection is only a hint: a gateway or activity can resume this world
       // while the sweep awaits another provider. Own the complete destructive
       // transition, and recheck after every potentially slow preparation step.
@@ -324,12 +336,15 @@ export class WorldLifecycleManager {
             return;
           }
           await this.store.setWorldState(candidate.handle, 'hibernated');
-          await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id, providerEvicted: true });
+          await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id, providerEvicted: true,
+            ...(resize ? { resize } : {}) });
+          if (resize) await this.checkpoints.addNotice?.(candidate.handle.id, resizeNotice(resize.to));
           hibernated++;
           return;
         }
         await this.store.setWorldState(candidate.handle, 'hibernated');
-        await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id });
+        await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id, ...(resize ? { resize } : {}) });
+        if (resize) await this.checkpoints.addNotice?.(candidate.handle.id, resizeNotice(resize.to));
         hibernated++;
       }));
       } catch (error) {
@@ -482,6 +497,13 @@ export class WorldLifecycleManager {
 }
 
 /** First retry delay after a failed hibernation; doubles per failure up to the cap. */
+/** What the agent hears on its first turn on the resized computer. */
+function resizeNotice(shape: MachineShape): string {
+  return `This task's computer was resized to ${describeMachine(shape)}. You are on a new machine with the same files your `
+    + 'repositories track, and the same uncommitted changes. Git-ignored files (installed dependencies, build output, caches) and '
+    + 'running processes did not carry over: reinstall or restart what you need.';
+}
+
 const HIBERNATE_RETRY_MS = 5 * 60_000;
 const HIBERNATE_RETRY_MAX_MS = 6 * 60 * 60_000;
 

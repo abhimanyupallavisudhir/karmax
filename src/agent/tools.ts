@@ -662,7 +662,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         organization_id: { type: 'string' }, project_id: { type: 'string' },
         world_provider: { type: 'string' }, runner_pool_id: { type: 'string' },
         environment_flavor: { type: 'string', enum: ['headless', 'desktop'] },
-        cpu: { type: 'number' }, memory_mb: { type: 'number' }, gpu: { type: 'number' },
+        cpu: { type: 'number' }, memory_mb: { type: 'number' }, disk_gb: { type: 'number', description: 'Free disk for task files, in GB' }, gpu: { type: 'number' },
         unrestricted_internet: { type: 'boolean' },
         allow_domains: { type: 'array', items: { type: 'string' } },
         allow_cidrs: { type: 'array', items: { type: 'string' } },
@@ -1456,7 +1456,7 @@ export function platformToolHandlers(
       // Sparse by contract: `network` is replaced wholesale by the store, so a
       // partial change is merged against the policy currently in force rather
       // than silently clearing the fields the caller did not mention.
-      const wantsResources = args?.cpu !== undefined || args?.memory_mb !== undefined || args?.gpu !== undefined;
+      const wantsResources = args?.cpu !== undefined || args?.memory_mb !== undefined || args?.disk_gb !== undefined || args?.gpu !== undefined;
       const wantsNetwork = args?.unrestricted_internet !== undefined || args?.allow_domains !== undefined || args?.allow_cidrs !== undefined;
       if (wantsResources || wantsNetwork) {
         const current: any = await platformRequest('GET', url).catch(() => undefined);
@@ -1469,6 +1469,7 @@ export function platformToolHandlers(
           const resources: Record<string, unknown> = { ...(base.resources ?? {}) };
           if (args?.cpu !== undefined) resources.cpu = args.cpu;
           if (args?.memory_mb !== undefined) resources.memoryMb = args.memory_mb;
+          if (args?.disk_gb !== undefined) resources.diskGb = args.disk_gb;
           if (args?.gpu !== undefined) resources.gpu = args.gpu;
           policy.resources = resources;
         }
