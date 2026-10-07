@@ -218,7 +218,7 @@ export class ProjectTransfers {
       }
       const { _authorization, _githubAccountId, profiles, ...params } = task.params;
       if (task.params.draft) {
-        for (const key of Object.keys(params)) if (key.startsWith('agent:') || ['confirm', 'confirmer', 'responder', 'confirmation', 'gitProfile', 'runnerPoolId', 'environment', 'worldProvider', 'copyGlobs', 'paymentPolicy'].includes(key))
+        for (const key of Object.keys(params)) if (key.startsWith('agent:') || ['confirm', 'confirmer', 'responder', 'confirmation', 'gitProfile', 'runnerPoolId', 'environment', 'worldProvider', 'computer', 'copyGlobs', 'paymentPolicy'].includes(key))
           delete params[key];
         // Creator identity is historical provenance, not permission. If that
         // person is absent from the receiving org, route new draft decisions

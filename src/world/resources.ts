@@ -83,6 +83,22 @@ export interface ProposedResourceCandidate {
 /** A candidate that no retry can stage: its world or path is gone. */
 class UnstageableCandidate extends Error {}
 
+/** Files a task changed that a newer published version also changed, differently. */
+export class ResourceConflictError extends Error {
+  constructor(readonly resource: string, readonly paths: string[]) {
+    super(`${resource}: ${paths.length === 1 ? 'a file was' : `${paths.length} files were`} changed both by this task and in a newer published version`
+      + ` (${paths.slice(0, 5).join(', ')}${paths.length > 5 ? ', …' : ''}). Keep one version: rename or remove this task's copy.`);
+    this.name = 'ResourceConflictError';
+  }
+}
+
+/** A publication that keeps meeting newer ones gives up after this many merges. */
+const PUBLISH_ATTEMPTS = 3;
+
+interface ChangeCount { added: number; modified: number; deleted: number }
+/** What refreshing a world's copy brought in, or the files that conflict. */
+export interface ResourceRefresh extends ChangeCount { attachmentId: string; name: string; path: string; revisionId: string; conflicts?: string[] }
+
 export interface RestoreOptions { signal?: AbortSignal }
 
 /** A writable resource's world copy, saved, with what it changes. */
@@ -331,12 +347,23 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
 /** Control-plane resource orchestrator. Workflows carry no credentials and no
  * snapshot refs: create/open activities resolve them immediately around the
  * live provider-owned World. */
+/** A workspace pushed onto a version that is no longer the current one. */
+export class WorkspaceConflict extends Error {
+  readonly status = 409;
+  readonly currentRevisionId: string | null;
+  constructor(attachment: ResourceAttachment) {
+    super(`resource "${attachment.name}" changed since you pulled it; pull first (or overwrite)`);
+    this.currentRevisionId = attachment.currentRevisionId ?? null;
+  }
+}
+
 export class ProjectResourceService {
   private publishLocks = new Map<string, Promise<void>>();
   /** The restic repositories resources are saved in, and the server restic reaches them at. */
   readonly restic: ResticResources;
   readonly repositoryServer: ResourceRepositoryServer;
   private loopback?: Promise<string>;
+  private edge?: () => string | undefined;
 
   /** `repositories.world` is where a remote sandbox reaches the repositories
    * (the public URL); this host's own restic uses a loopback port. */
@@ -360,6 +387,7 @@ export class ProjectResourceService {
       if (!fallback) throw new Error('resource storage is not configured');
       return fallback;
     };
+    this.edge = repositories.edge;
     const tokens = new RepositoryTokens(broker);
     this.repositoryServer = new ResourceRepositoryServer({ store, tokens, objects, edge: () => !!repositories.edge?.(),
       ...(repositories.proxyReads ? { proxyReads: true } : {}) });
@@ -1286,22 +1314,26 @@ export class ProjectResourceService {
   private async inspect(taskId: string, attachmentId: string, work: { checkContinue?: () => Promise<void>;
     onProgress?: (progress: Omit<StagingProgress, 'index' | 'count'>) => void } = {}): Promise<Inspection> {
     const { attachment, world, lease, target } = await this.worldResource(taskId, attachmentId);
-    const started = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
-    // Deduplicated against the version it started from, so mostly a scan.
+    // What changed is relative to the published version the copy forked
+    // from, also when it was restored from a park's capture since.
+    const forkedId = await this.forkPoint(lease.revisionId);
+    const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
+    const restoredFrom = lease.revisionId && lease.revisionId !== forkedId ? await this.store.getResourceRevision(lease.revisionId) : started;
+    // Deduplicated against the version the world was restored from, so mostly a scan.
     const repository = await this.restic.current(attachment);
-    const parent = this.parentIn(repository, started);
+    const parent = this.parentIn(repository, restoredFrom);
     const label = attachment.target.kind === 'path' ? attachment.target.path : attachment.name;
     const capture = await this.restic.backup({ world, path: target, file: fileShaped(attachment) }, repository, {
       key: `inspect:${lease.id}`, quota: true, ...(parent ? { parent } : {}),
       ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}),
       ...(work.onProgress ? { onProgress: (progress) => work.onProgress!({ path: label, ...progress }) } : {}) });
-    const summary: ResourceChangeSummary = { attachmentId: attachment.id, baseRevisionId: lease.revisionId,
+    const summary: ResourceChangeSummary = { attachmentId: attachment.id, baseRevisionId: forkedId,
       ...await this.changes(repository, started, capture.snapshot) };
     // Keep the lease's original baseline (and its publication CAS fence), but
     // stop asking for a decision on bytes this task has already published.
     let publishedId = attachment.currentRevisionId;
     const visited = new Set<string>();
-    while (publishedId && publishedId !== lease.revisionId && !visited.has(publishedId)) {
+    while (publishedId && publishedId !== forkedId && !visited.has(publishedId)) {
       visited.add(publishedId);
       const published = await this.store.getResourceRevision(publishedId);
       if (!published) break;
@@ -1381,48 +1413,300 @@ export class ProjectResourceService {
     return refs;
   }
 
+  // ── Workspaces: the tavya CLI on a laptop (wiki planned/tavya-cli) ──
+  // A laptop is treated like a remote world: it runs restic itself with the
+  // same short-lived grant, against the edge when one is deployed.
+
+  /** The version a workspace of `taskId` (else of the project) starts from:
+   * the task world's last park of its private copy, else the version the
+   * world started from, else the project's current one. */
+  async workspaceRevision(attachment: ResourceAttachment, taskId?: string): Promise<string | undefined> {
+    const handle = taskId ? (await this.store.currentWorld(taskId)) as WorldHandle | undefined : undefined;
+    if (!handle) return attachment.currentRevisionId;
+    const lease = (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))
+      .find((candidate) => candidate.attachmentId === attachment.id && candidate.state === 'active');
+    if (!lease) return attachment.currentRevisionId;
+    try {
+      const parked = JSON.parse((await this.store.kvGet(`resource-checkpoint:${handle.id}:${attachment.id}`)) ?? '{}');
+      if (parked.leaseId === lease.id && typeof parked.revisionId === 'string') return parked.revisionId;
+    } catch { /* none recorded */ }
+    return lease.revisionId;
+  }
+
+  /** restic's environment for reading one version (`read`), or for saving a
+   * new one into the resource's current repository (`append`, quota counted).
+   * `parent` is the snapshot a save should be incremental against. */
+  async workspaceGrant(attachmentId: string, options: { access: 'read' | 'append'; revisionId?: string; baseRevisionId?: string;
+    publicUrl: string }): Promise<{ env: Record<string, string>; expiresAt: number; snapshot?: string; revisionId?: string; parent?: string }> {
+    const attachment = await this.requiredAttachment(attachmentId);
+    if (!isSnapshotDriver(attachment.driver)) throw new Error(`resource "${attachment.name}" has no files to transfer`);
+    const base = this.edge?.() ?? options.publicUrl;
+    const expiresAt = Date.now() + 23 * 3_600_000;
+    if (options.access === 'read') {
+      const revisionId = options.revisionId ?? attachment.currentRevisionId;
+      const revision = revisionId ? await this.store.getResourceRevision(revisionId) : undefined;
+      if (!revision || revision.attachmentId !== attachment.id) throw new Error(`resource "${attachment.name}" has no such version`);
+      if (revision.engine !== RESTIC_ENGINE)
+        throw new Error(`resource "${attachment.name}" is still being converted to the current storage format; try again in an hour`);
+      const repository = this.restic.of(attachment, revision);
+      return { env: await this.restic.clientEnvironment(repository, base, 'read'), expiresAt,
+        snapshot: resticRef(revision).snapshot, revisionId: revision.id };
+    }
+    const repository = await this.restic.current(attachment);
+    await this.restic.prepare(repository);
+    const baseline = options.baseRevisionId ? await this.store.getResourceRevision(options.baseRevisionId) : undefined;
+    const parent = this.parentIn(repository, baseline?.attachmentId === attachment.id ? baseline : undefined);
+    return { env: await this.restic.clientEnvironment(repository, base, 'append'), expiresAt, ...(parent ? { parent } : {}) };
+  }
+
+  /** Make a snapshot a workspace saved the resource's current version. Refused
+   * (409) unless the current version is still `baseRevisionId`: there is no
+   * merge of files, as for agents. An unchanged snapshot makes no version. */
+  async adoptWorkspaceSnapshot(attachmentId: string, snapshot: string, baseRevisionId: string | null, principal: string):
+    Promise<{ revision?: ResourceRevision; unchanged: boolean }> {
+    const attachment = await this.requiredAttachment(attachmentId);
+    if (!isSnapshotDriver(attachment.driver)) throw new Error(`resource "${attachment.name}" has no files to save`);
+    if ((attachment.currentRevisionId ?? null) !== baseRevisionId) throw new WorkspaceConflict(attachment);
+    const repository = await this.restic.current(attachment);
+    if (!await this.restic.hasSnapshot(repository, snapshot)) throw new Error('snapshot not found in the resource repository; save it again');
+    const baseline = attachment.currentRevisionId ? await this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
+    const parent = this.parentIn(repository, baseline);
+    let added = 0;
+    if (parent) {
+      const changes = await this.restic.diff(repository, parent, snapshot);
+      if (changes.added + changes.modified + changes.deleted === 0) {
+        await this.restic.forget(repository, [snapshot]);
+        return { revision: baseline, unchanged: true };
+      }
+      added = changes.bytes;
+    }
+    const files = await this.restic.files(repository, snapshot);
+    const bytes = files.reduce((sum, file) => sum + file.bytes, 0);
+    if (!parent) added = bytes;
+    let revision: ResourceRevision;
+    try {
+      revision = await this.store.saveAndPromoteResourceRevision({ attachmentId, parentRevisionId: baseline?.id,
+        ...this.restic.revisionFields({ snapshot, files: files.length, bytes, added }, repository),
+        metadata: { workspace: true, savedBy: principal } }, baseline?.id);
+    } catch (error) {
+      if (/baseline changed/.test(message(error))) throw new WorkspaceConflict((await this.requiredAttachment(attachmentId)));
+      throw error;
+    }
+    (await this.store.appendAudit({ principalId: principal, action: 'resource:workspace-save',
+      scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, from: baseline?.id ?? null, to: revision.id,
+        bytes, files: files.length } }));
+    return { revision, unchanged: false };
+  }
+
+  /** Put a workspace's snapshot of a writable resource into the task's world,
+   * replacing its private copy exactly; the task publishes it at Confirm. */
+  async importWorkspaceSnapshot(taskId: string, world: World, attachmentId: string, snapshot: string): Promise<void> {
+    const attachment = await this.requiredAttachment(attachmentId);
+    const task = await this.store.getTask(taskId);
+    if (!task || task.projectId !== attachment.projectId) throw new Error('resource does not belong to task project');
+    if (!isSnapshotDriver(attachment.driver) || attachment.target.kind !== 'path')
+      throw new Error(`resource "${attachment.name}" has no files to import`);
+    if (attachment.access !== 'write') throw new Error(`resource "${attachment.name}" is read-only in tasks`);
+    const lease = (await this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1))
+      .find((candidate) => candidate.attachmentId === attachmentId && candidate.state === 'active');
+    if (!lease) throw new Error(`the task world has no copy of resource "${attachment.name}"`);
+    const repository = await this.restic.current(attachment);
+    if (!await this.restic.hasSnapshot(repository, snapshot)) throw new Error('snapshot not found in the resource repository; push again');
+    await this.restic.restore({ world, path: resourceAbsolutePath(world.handle, attachment), file: fileShaped(attachment) },
+      repository, snapshot, { key: `workspace:${lease.id}:${snapshot.slice(0, 16)}`, mirror: true });
+    (await this.store.appendEvent({ taskId, type: 'world.resource-imported', ts: Date.now(),
+      payload: { attachmentId, snapshot } }));
+  }
+
+  /** The project's secret values, for a person's own machine (`tavya run`).
+   * Every value read is audited by name. */
+  async workspaceSecretValues(projectId: string, principal: string, names?: string[]):
+    Promise<Array<{ id: string; name: string; variable?: string; file?: string; value: string }>> {
+    const wanted = names?.length ? new Set(names) : undefined;
+    const values: Array<{ id: string; name: string; variable?: string; file?: string; value: string }> = [];
+    for (const attachment of (await this.store.listResourceAttachments(projectId))) {
+      if (!attachment.enabled || !isSecretLike(attachment) || !attachment.credentialHandles[0]) continue;
+      const variable = attachment.target.kind === 'environment' || attachment.target.kind === 'service' ? attachment.target.name : undefined;
+      const file = attachment.target.kind === 'path' ? attachment.target.path : undefined;
+      if (wanted && !wanted.has(attachment.name) && !(variable && wanted.has(variable))) continue;
+      const handle = await this.ownedCredentialHandle(attachment);
+      const value = this.broker.resolve(handle, { taskId: `workspace:${principal}`, caps: [`use-credential:${handle}`] });
+      (await this.store.appendAudit({ principalId: principal, action: 'resource:secret-read', scopeKey: `project:${projectId}`,
+        detail: { attachmentId: attachment.id, name: attachment.name } }));
+      values.push({ id: attachment.id, name: attachment.name, ...(variable ? { variable } : {}), ...(file ? { file } : {}), value });
+    }
+    return values;
+  }
+
   async promote(taskId: string, attachmentId: string): Promise<{ attachment: ResourceAttachment; revision: ResourceRevision; summary: ResourceChangeSummary }> {
     return this.promoteReviewed(taskId, attachmentId);
   }
 
   private async promoteReviewed(taskId: string, attachmentId: string, inspection?: Inspection): Promise<{ attachment: ResourceAttachment; revision: ResourceRevision; summary: ResourceChangeSummary }> {
-    const { attachment, lease } = await this.worldResource(taskId, attachmentId);
+    const { attachment, lease, world, target } = await this.worldResource(taskId, attachmentId);
     if (attachment.publish !== 'review' || attachment.access !== 'write' || attachment.isolation !== 'fork')
       throw new Error('resource is not configured for reviewed promotion');
     // The immutable candidate is saved before entering the singleton. The only
     // serialized operation is the tiny baseline pointer CAS, so a multi-GB
     // upload cannot block another publication merely while bytes are moving.
     const { summary, repository, capture } = inspection ?? await this.inspect(taskId, attachmentId);
-    const started = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
+    const forkedId = await this.forkPoint(lease.revisionId);
+    const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
     // Identical to what the world started from: there is nothing to publish.
     if (started?.attachmentId === attachment.id && summary.added + summary.modified + summary.deleted === 0) {
       await this.restic.forget(repository, [capture.snapshot]);
       return { attachment, revision: started, summary };
     }
-    const baseline = await this.publicationBaseline(taskId, attachment.currentRevisionId, lease.revisionId);
-    const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: baseline,
-      ...this.restic.revisionFields(capture, repository), metadata: { summary }, createdByTaskId: taskId }));
-    return this.serializePublish(attachmentId, taskId, async () => {
-      const promoted = (await this.store.promoteResourceRevision(attachmentId, revision.id, baseline));
-      (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:promote',
-        scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, from: baseline, to: revision.id, summary } }));
-      return { attachment: promoted, revision, summary };
-    });
+    const place = { world, path: target, file: fileShaped(attachment) };
+    let base = await this.mergeBase(taskId, attachment.currentRevisionId, forkedId);
+    let saved = capture;
+    for (let attempt = 1; ; attempt++) {
+      // Whatever other tasks (a sibling sub-task, say) published since this
+      // world forked is merged in, so publications combine instead of refusing.
+      const currentId = (await this.requiredAttachment(attachmentId)).currentRevisionId;
+      if (currentId !== base) {
+        const merged = await this.mergePublished(place, repository, base, currentId, saved.snapshot,
+          { key: `publish:${lease.id}:${attempt}`, quota: true, ownChangesOnly: true });
+        if (merged === 'none') {
+          // Everything here was published already (by this task, before others built on it).
+          await this.restic.forget(repository, [capture.snapshot]);
+          return { attachment: (await this.requiredAttachment(attachmentId)), revision: (await this.store.getResourceRevision(currentId!))!, summary };
+        }
+        if (merged) saved = merged;
+        base = currentId;
+      }
+      const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: base,
+        ...this.restic.revisionFields(saved, repository), metadata: { summary }, createdByTaskId: taskId }));
+      try {
+        return await this.serializePublish(attachmentId, taskId, async () => {
+          const promoted = (await this.store.promoteResourceRevision(attachmentId, revision.id, base));
+          (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:promote',
+            scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, from: base, to: revision.id, summary } }));
+          return { attachment: promoted, revision, summary };
+        });
+      } catch (error) {
+        // Not a version: its snapshot stays, to merge again from.
+        await this.store.deleteResourceRevisionIfUnreferenced(revision.id).catch(() => undefined);
+        // Another publication landed while this one merged: merge that too.
+        if (attempt >= PUBLISH_ATTEMPTS || !/baseline changed/.test(String((error as Error)?.message))) throw error;
+      }
+    }
   }
 
-  /** The revision a publication must replace. A task that already published
-   * since it forked fast-forwards over its own publications; anything another
-   * task published in between keeps the fork's revision, so the CAS fails. */
-  private async publicationBaseline(taskId: string, currentId: string | undefined, forkedId: string | undefined) {
+  /** Merge the newest published version of each writable resource this
+   * task's world forked into the world's copy, keeping the world's own
+   * changes: how a parent gets what its sub-tasks published. A resource with
+   * conflicting changes is left as it was and reported. */
+  async refreshForks(taskId: string, work: { checkContinue?: () => Promise<void> } = {}): Promise<ResourceRefresh[]> {
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
+    if (!handle) return [];
+    const refreshed: ResourceRefresh[] = [];
+    for (const lease of await this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
+      await work.checkContinue?.();
+      if (lease.state !== 'active' || lease.access !== 'write') continue;
+      const attachment = await this.store.getResourceAttachment(lease.attachmentId);
+      if (!attachment || !isSnapshotDriver(attachment.driver) || attachment.isolation !== 'fork' || attachment.target.kind !== 'path') continue;
+      const currentId = attachment.currentRevisionId;
+      const base = await this.mergeBase(taskId, currentId, await this.forkPoint(lease.revisionId));
+      if (!currentId || currentId === base) continue;
+      const { world, target } = await this.worldResource(taskId, attachment.id);
+      const place = { world, path: target, file: fileShaped(attachment) };
+      const repository = await this.restic.current(attachment);
+      const started = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
+      const parent = this.parentIn(repository, started);
+      try {
+        // The world's copy as it is now; a park would save the same (counted, never refused).
+        const mine = await this.restic.backup(place, repository, { key: `refresh:${lease.id}:${currentId}`, quota: false,
+          ...(parent ? { parent } : {}), ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}) });
+        const applied: ChangeCount = { added: 0, modified: 0, deleted: 0 };
+        await this.mergePublished(place, repository, base, currentId, mine.snapshot,
+          { key: `refresh:${lease.id}:${currentId}:merge`, quota: false, applied, ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}) });
+        await this.store.rebaseResourceLease(lease.id, currentId);
+        refreshed.push({ attachmentId: attachment.id, name: attachment.name, path: attachment.target.path, revisionId: currentId, ...applied });
+      } catch (error) {
+        if (!(error instanceof ResourceConflictError)) throw error;
+        refreshed.push({ attachmentId: attachment.id, name: attachment.name, path: attachment.target.path, revisionId: currentId,
+          added: 0, modified: 0, deleted: 0, conflicts: error.paths });
+      }
+    }
+    return refreshed;
+  }
+
+  /** Bring into the world's copy (whose snapshot is `mine`) what was
+   * published between `baseId` and `currentId`, file by file. A file both
+   * sides changed differently is a conflict, and nothing is touched. The new
+   * snapshot of the merged copy; undefined when it already held everything. */
+  private async mergePublished(place: ResticPlace, repository: Repository, baseId: string | undefined, currentId: string | undefined,
+    mine: string, options: { key: string; quota: boolean; checkContinue?: () => Promise<void>; applied?: ChangeCount;
+      /** Merge nothing into a copy without changes of its own: answer `none`. */ ownChangesOnly?: boolean }): Promise<ResticCapture | 'none' | undefined> {
+    const label = path.posix.basename(place.path);
+    const [base, current] = await Promise.all([baseId ? this.store.getResourceRevision(baseId) : undefined,
+      currentId ? this.store.getResourceRevision(currentId) : undefined]);
+    const baseSnapshot = this.parentIn(repository, base);
+    const currentSnapshot = this.parentIn(repository, current);
+    // restic compares snapshots of one repository only (a resource moved to
+    // another storage location starts a new one).
+    if (!currentSnapshot || (base && !baseSnapshot))
+      throw new Error('resource baseline changed before publish; review the newer revision and retry');
+    const restic = this.restic;
+    const [theirs, ours] = await Promise.all([restic.changeSet(repository, baseSnapshot, currentSnapshot),
+      restic.changeSet(repository, baseSnapshot, mine)]);
+    if (options.ownChangesOnly && !ours.files.size) return 'none';
+    const both = [...theirs.files.keys()].filter((file) => ours.files.has(file));
+    if (both.length) {
+      const differing = (await restic.changeSet(repository, currentSnapshot, mine)).files;
+      const conflicts = both.filter((file) => differing.has(file));
+      if (conflicts.length) throw new ResourceConflictError(label, conflicts);
+    }
+    const paths: string[] = []; const deletions: string[] = [];
+    for (const [file, change] of theirs.files) {
+      if (ours.files.has(file)) continue; // the same change is already here
+      (change === '-' ? deletions : paths).push(file);
+      if (options.applied) options.applied[change === '+' ? 'added' : change === 'M' ? 'modified' : 'deleted']++;
+    }
+    if (!paths.length && !deletions.length) return undefined;
+    await options.checkContinue?.();
+    if (place.file) await restic.restore(place, repository, currentSnapshot, options);
+    else await restic.applyPaths(place, repository, currentSnapshot,
+      { paths, deletions, removedDirectories: theirs.removedDirectories }, options);
+    const merged = await restic.backup(place, repository, { ...options, key: `${options.key}:save`, parent: mine });
+    // The merge is right only if it differs from the published version
+    // exactly where this world's own changes are.
+    const stray = [...(await restic.changeSet(repository, currentSnapshot, merged.snapshot)).files.keys()]
+      .filter((file) => !ours.files.has(file));
+    if (stray.length) throw new Error(`${label} changed while newer published changes were merged into it (${stray.slice(0, 3).join(', ')}); try again`);
+    return merged;
+  }
+
+  /** The published version a world's copy descends from: a copy restored
+   * from a park, or forked from another task's unpublished work, starts from
+   * a checkpoint capture, never published itself. */
+  private async forkPoint(revisionId: string | undefined): Promise<string | undefined> {
+    const visited = new Set<string>();
+    let id = revisionId;
+    while (id && !visited.has(id)) {
+      visited.add(id);
+      const revision = await this.store.getResourceRevision(id);
+      if (!revision?.metadata?.checkpoint) return id;
+      id = revision.parentRevisionId;
+    }
+    return id;
+  }
+
+  /** The newest published version the world's copy already contains: its
+   * fork point, or this task's own later publication, which merged
+   * everything before it. */
+  private async mergeBase(taskId: string, currentId: string | undefined, forkedId: string | undefined) {
     const visited = new Set<string>();
     let id = currentId;
     while (id && id !== forkedId && !visited.has(id)) {
       visited.add(id);
       const published = await this.store.getResourceRevision(id);
-      if (published?.createdByTaskId !== taskId) return forkedId;
+      if (!published) break;
+      if (published.createdByTaskId === taskId && !published.metadata?.checkpoint) return id;
       id = published.parentRevisionId;
     }
-    return id === forkedId ? currentId : forkedId;
+    return forkedId;
   }
 
   async discard(taskId: string, attachmentId: string): Promise<void> {

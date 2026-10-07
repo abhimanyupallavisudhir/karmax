@@ -1,3 +1,4 @@
+import { applyComputer, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -1400,9 +1401,9 @@ export class Store {
   /** One organization-level execution policy. Provider-specific template/image
    * details stay with the provider connection; this is the provider-neutral
    * policy every project inherits. */
-  async getOrganizationExecutionPolicy(organizationId: string): Promise<OrganizationExecutionPolicy> {
-    if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
-    const fallback: OrganizationExecutionPolicy = {
+  /** The execution policy an organization has before it changes anything. */
+  defaultOrganizationExecutionPolicy(): OrganizationExecutionPolicy {
+    return {
       worldProvider: process.env.KARMAX_DEPLOYMENT === 'hosted'
         ? process.env.KARMAX_CLOUD_WORLD_PROVIDER ?? 'e2b'
         : 'worktree',
@@ -1413,6 +1414,11 @@ export class Store {
       environment: { flavor: 'headless' },
       hibernateAfterMs: 7 * 24 * 60 * 60 * 1000,
     };
+  }
+
+  async getOrganizationExecutionPolicy(organizationId: string): Promise<OrganizationExecutionPolicy> {
+    if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
+    const fallback = this.defaultOrganizationExecutionPolicy();
     const raw = (await this.kvGet(`organization-execution:${organizationId}`));
     if (!raw) return fallback;
     const saved = JSON.parse(raw) as OrganizationExecutionPolicy;
@@ -1562,6 +1568,18 @@ export class Store {
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && (config.remote === undefined || config.remote === 'none'))
       config.remote = 'pr';
     return config;
+  }
+
+  /** A task's effective execution config: its project's, with the task's own
+   * Computer (`params.computer`) layered on. Every world creation, restore and
+   * lifecycle decision for the task reads this. */
+  async effectiveTaskConfig(project: Project | string, taskId: string): Promise<ProjectConfig> {
+    const config = (await this.effectiveProjectConfig(project));
+    const params = (await this.getTask(taskId))?.params;
+    let computer: ComputerSpec | undefined;
+    // Validated when stored; a value that predates validation is ignored, never fatal.
+    try { computer = normalizeComputer(params?.computer); } catch { computer = undefined; }
+    return applyComputer(config, computer);
   }
 
   async setProjectExecutionPolicy(id: string, override: Partial<Record<keyof OrganizationExecutionPolicy, unknown>>): Promise<Project> {
@@ -6402,6 +6420,12 @@ export class Store {
     });
   }
 
+  /** The version a world's copy now descends from, after newer published
+   * changes were merged into it. */
+  async rebaseResourceLease(id: string, revisionId: string): Promise<void> {
+    (await this.db.prepare('UPDATE resource_leases SET revisionId=? WHERE id=?').run(revisionId, id));
+  }
+
   // ─── Organization storage locations and physical snapshot accounting ─────
 
   async saveStorageLocation(input: Omit<StorageLocation, 'createdAt' | 'updatedAt'>
@@ -8888,7 +8912,9 @@ async function uniqueSlug(value: string, used: (candidate: string) => boolean | 
 const RESERVED_ROUTE_SLUGS = new Set([
   'mcp-callback',
   // gateway-owned top-level prefixes
-  'api', 'ws',
+  'api', 'ws', 'mcp', 'oauth',
+  // app sign-in approval (web/app.js renderDeviceApproval)
+  'device',
   // top-level routes / legacy org paths (an org slug is the first URL segment)
   'invite', 'projects', 'organization', 'organizations', 'installation',
   // `for:me` is the signed-in person in every search (and /me is kept free)
@@ -8916,6 +8942,7 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
   };
   positive(raw.resources?.cpu, 'CPU', 1);
   positive(raw.resources?.memoryMb, 'memory', 128);
+  positive(raw.resources?.diskGb, 'disk', 1);
   positive(raw.resources?.gpu, 'GPU', 0);
   positive(raw.monthlyBudgetMicros, 'monthly budget', 0);
   if (raw.environment?.flavor != null && !['headless', 'desktop'].includes(raw.environment.flavor))

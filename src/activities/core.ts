@@ -1,3 +1,4 @@
+import { machineShape } from '../domain/computer.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, workDigest } from '../domain/participants.js';
 import { createHash } from 'node:crypto';
@@ -11,7 +12,7 @@ import { turnPlatformRequest } from '../agent/platform-request.js';
 import { acquireConfirmLock } from './confirm-lock.js';
 import { scriptOutput, reviewFiles } from './result-bounds.js';
 import { mapBatches } from '../util/async-batch.js';
-import type { StagingProgress } from '../world/resources.js';
+import { ResourceConflictError, type ResourceRefresh, type StagingProgress } from '../world/resources.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
@@ -1410,7 +1411,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ...developmentSources,
         ...(developmentSources.length > 0 && wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
       ];
-      const executionConfig = project ? (await store.effectiveProjectConfig(project)) : undefined;
+      const executionConfig = project ? (await store.effectiveTaskConfig(project, args.taskId)) : undefined;
       const githubIsAuthority = remotePolicyOf(executionConfig) === 'pr';
       // Remote providers always need a network transport. Local PR worlds also
       // resolve one when available so GitHub-backed sources can fork from the
@@ -1520,12 +1521,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens };
       }
       const environmentSelection = projectId
-        ? (await selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment, forkCheckpoint?.environment))
+        ? (await selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment, forkCheckpoint?.environment, executionConfig?.resources))
         : { built: false, environment: executionConfig?.environment };
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
         try {
           acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
+            resources: executionConfig?.resources,
             priority: Number((await store.getTask(args.taskId))?.params.priority ?? 0), signal: activitySignal,
             heartbeat }));
         } catch (error) {
@@ -1645,6 +1647,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             repositoryIds: [...linkedRepositories.map((candidate) => candidate.repository.id),
               ...(wikiRepository ? [wikiRepository.id] : [])] };
           if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
+          // The machine this world was made as: the lifecycle sweep resizes it
+          // when the task's Computer later asks for another (src/world/runners.ts).
+          if (remote && executionConfig) world.handle.meta = { ...world.handle.meta, computer: machineShape(executionConfig) };
           activitySignal?.throwIfAborted();
           if (projectId) {
             world.handle = (await store.registerWorld(world.handle, projectId, {
@@ -3662,6 +3667,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             void record(taskId, 'staging.progress', { ...next }).catch(() => undefined);
           },
         });
+      } catch (error) {
+        // Saving again cannot resolve a conflict: the task's people must.
+        if (error instanceof ResourceConflictError)
+          throw ApplicationFailure.create({ message: error.message, type: 'resource-conflict', nonRetryable: true });
+        throw error;
+      } finally { clearInterval(pulse); }
+    },
+
+    /** Merge into a parent's world what its sub-tasks published to the
+     * writable resources it forked. */
+    async refreshResourceForks(taskId: string): Promise<ResourceRefresh[]> {
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct tests */ }
+      const pulse = setInterval(() => {
+        try { context?.heartbeat({ taskId, operation: 'refreshing-resources' }); }
+        catch { /* activity completion/cancellation */ }
+      }, 5_000);
+      try {
+        return (await deps.resources?.refreshForks(taskId, {
+          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
       } finally { clearInterval(pulse); }
     },
 

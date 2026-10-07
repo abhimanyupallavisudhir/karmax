@@ -172,7 +172,8 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
  * re-acquire one — the gateway holds sessions in memory, so a gateway restart
  * would otherwise 401 every subsequent call for the life of the agent.
  */
-export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>)): PlatformOps {
+export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>),
+  extraHeaders: Record<string, string> = {}): PlatformOps {
   const resolve = typeof token === 'string' ? async () => token : token;
   let cached: string | undefined = typeof token === 'string' ? token : undefined;
   const req = async (rawPath: string, init: RequestInit = {}, reauth = true): Promise<unknown> => {
@@ -184,7 +185,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     if (cached === undefined) cached = await resolve();
     const res = await fetch(`${baseUrl}${path}`, {
       ...init,
-      headers: { 'content-type': 'application/json', ...(cached ? { authorization: `Bearer ${cached}` } : {}), ...(init.headers ?? {}) },
+      headers: { 'content-type': 'application/json', ...extraHeaders, ...(cached ? { authorization: `Bearer ${cached}` } : {}), ...(init.headers ?? {}) },
     });
     // Session expired or the gateway restarted since we last authed — drop the
     // stale token, re-acquire once, and retry before surfacing an error.
@@ -291,8 +292,15 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
   };
 }
 
-export function createPlatformMcpServer(ops: PlatformOps): McpServer {
-  const server = new McpServer({ name: 'karmax-platform', version: '1.0.0' });
+/** `tools` registers only that subset of the definitions below (the remote
+ * `/mcp` server leaves out tools bound to a calling task). */
+export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: ReadonlySet<string>; name?: string } = {}): McpServer {
+  const server = new McpServer({ name: options.name ?? 'karmax-platform', version: '1.0.0' });
+  if (options.tools) {
+    const register = server.registerTool.bind(server), tools = options.tools;
+    server.registerTool = ((name: string, ...rest: unknown[]) => tools.has(name)
+      ? (register as (...args: unknown[]) => unknown)(name, ...rest) : undefined) as typeof server.registerTool;
+  }
   const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] });
   const wrap = async (fn: () => Promise<any>) => {
     try {
@@ -375,7 +383,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       organizationId: z.string(), projectId: z.string().optional(),
       worldProvider: z.string().nullish(), runnerPoolId: z.string().nullish(),
       environmentFlavor: z.enum(['headless', 'desktop']).optional(),
-      cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), gpu: z.number().nonnegative().optional(),
+      cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), diskGb: z.number().int().min(1).optional(), gpu: z.number().nonnegative().optional(),
       unrestrictedInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
       monthlyBudgetUsd: z.number().nonnegative().nullish(), hibernateAfterDays: z.number().nonnegative().nullish(),
     } },
@@ -393,7 +401,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       // the policy currently in force: otherwise `{allowDomains}` alone silently
       // set `unrestricted:false` and dropped `allowCidrs`, and `{memoryMb}` alone
       // erased `cpu`/`gpu`. Only keys the caller actually supplied are assigned.
-      const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.gpu !== undefined;
+      const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.diskGb !== undefined || a.gpu !== undefined;
       const wantsNetwork = a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined;
       if (wantsResources || wantsNetwork) {
         // Either `{organization, override?, effective?}` or a bare policy — see below.
@@ -414,6 +422,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
           const resources: Record<string, unknown> = { ...(base.resources ?? {}) };
           if (a.cpu !== undefined) resources.cpu = a.cpu;
           if (a.memoryMb !== undefined) resources.memoryMb = a.memoryMb;
+          if (a.diskGb !== undefined) resources.diskGb = a.diskGb;
           if (a.gpu !== undefined) resources.gpu = a.gpu;
           policy.resources = resources;
         }

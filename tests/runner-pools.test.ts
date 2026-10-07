@@ -559,6 +559,32 @@ describe('runner capacity and world lifecycle', () => {
     expect((await store.worldState(world.handle.id))).toBe('hibernated');
   });
 
+  it('moves a parked world to a machine of its task\'s new size at once', async () => {
+    const store = (await Store.create(':memory:'));
+    // Hibernation is a week away: only the resize can explain an early one.
+    const project = (await store.createProject('Resize', { resources: { cpu: 2, memoryMb: 2048 } }));
+    const worlds = new WorldRegistry();
+    const task = await store.createTask({ projectId: project.id, title: 'Out of disk', workflow: 'software-dev',
+      workflowVersion: '1.27.0', params: { prompt: 'x' } });
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    world.handle.meta = { projectId: project.id, computer: { cpu: 2, memoryMb: 2048 } };
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
+    (await store.saveWorldCheckpoint({ id: 'checkpoint-r', worldId: world.handle.id, generation: 1, projectId: project.id,
+      runnerPoolId: 'local', environmentDigest: 'test', repos: [], createdAt: Date.now() }));
+    (await store.setWorldState(world.handle, 'parked'));
+    const notices: string[] = [];
+    const lifecycle = new WorldLifecycleManager(store, worlds, { addNotice: async (_id: string, text: string) => { notices.push(text); } } as any, 1_000);
+    // Same size: nothing happens.
+    expect(await lifecycle.sweep(Date.now() + 1)).toBe(0);
+    expect((await store.worldState(world.handle.id))).toBe('parked');
+    await store.patchTaskParams(task.id, { computer: { diskGb: 50 } });
+    expect(await lifecycle.sweep(Date.now() + 1)).toBe(1);
+    expect((await store.worldState(world.handle.id))).toBe('hibernated');
+    expect(notices).toEqual([expect.stringContaining('resized to 2 CPU · 2 GB · 50 GB disk')]);
+    expect((await store.eventsOfType(task.id, 'world.hibernated')).at(-1)?.payload).toMatchObject({
+      resize: { from: { cpu: 2, memoryMb: 2048 }, to: { cpu: 2, memoryMb: 2048, diskGb: 50 } } });
+  });
+
   it('never hibernates a world holding proposed output that is not saved yet', async () => {
     const store = (await Store.create(':memory:'));
     const project = (await store.createProject('Unsaved', { hibernateAfterMs: 0 }));

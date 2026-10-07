@@ -144,7 +144,7 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       await page.evaluate(() => { history.pushState({ kx: 1 }, '', '/second/settings'); dispatchEvent(new PopStateEvent('popstate')); });
       await page.waitForFunction(() => document.querySelector('#org-members') && !document.querySelector('#org-members').textContent.startsWith('Loading'));
     }));
-    const panes = ['#org-plan .plan-summary, #org-plan *', '#org-github .github-org-actions', '#org-execution-pool', '#org-providers .provider-connection', '#org-runners #runner-create', '#org-storage #storage-connect', '#org-usage'];
+    const panes = ['#org-plan .plan-summary, #org-plan *', '#org-github .github-org-actions', '#org-computers .computer-provider', '#org-storage #storage-connect', '#org-usage'];
     assert.deepEqual(await page.evaluate(selectors => selectors.filter(selector => !document.querySelector(selector)), panes), [], 'every organization pane paints');
     record(await measure('organization switch (settings)', async () => {
       await page.evaluate(() => { history.pushState({ kx: 1 }, '', '/org/settings'); dispatchEvent(new PopStateEvent('popstate')); });

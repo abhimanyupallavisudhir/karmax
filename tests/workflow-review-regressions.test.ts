@@ -51,7 +51,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
-import { softwareDevV1_20, softwareDevV1_26 } from '../src/workflows/software-dev.js';
+import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27 } from '../src/workflows/software-dev.js';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
 
@@ -801,5 +801,84 @@ describe('WF-37: a failed merge-only or just-do run releases its world', () => {
     wf.activities.runAgentTurn.mockRejectedValue(new Error('agent refused the task'));
     await expect(justDoV1_7({ ...input, project: { repos: [], worldProvider: 'e2b' } })).rejects.toThrow();
     expect(wf.activities.destroyWorld).not.toHaveBeenCalled();
+  });
+});
+
+// pramana#3: a sub-task whose resource publication was refused failed its
+// workflow outright, leaving its output in a kept world and its parent with
+// only "finished: failed".
+describe('resource publication by sub-tasks', () => {
+  const child = { ...input, taskId: 'child', parentTaskId: 'parent' };
+  const conflict = 'raw_data: a file was changed both by this task and in a newer published version (index.txt). Keep one version: rename or remove this task\'s copy.';
+
+  function reviewAndConfirm() {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.runAgentTurn.mockResolvedValue({ openPrRequested: true, completed: true });
+    wf.activities.pendingResourceCandidates = vi.fn(async () => 0);
+    const views: any[] = [];
+    wf.activities.publishView.mockImplementation(async (_id: string, view: any) => {
+      views.push(view);
+      if (view.stage === 'review' && view.waitingFor?.kind === 'parent') wf.handlers.get('parentResponse')!({ action: 'confirm' });
+    });
+    return views;
+  }
+
+  it('escalates a refused publication to the parent, and Retry publishes again', async () => {
+    const views = reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('Activity task failed'), { cause: new Error(conflict) }))
+      .mockResolvedValue(undefined);
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage !== 'escalated' || escalated) return;
+      escalated = view;
+      wf.handlers.get('parentResponse')!({ action: 'retry' });
+    };
+    const result = await softwareDevV1_27(child);
+    expect(escalated).toMatchObject({ status: 'blocked', waitingFor: { kind: 'parent' },
+      error: `Could not publish resources: ${conflict} Nothing was lost; Retry publishes again.` });
+    expect(wf.childSignal).toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked', detail: escalated.error }));
+    expect(wf.activities.settleResourceReview).toHaveBeenCalledTimes(2);
+    expect(result.stage).toBe('done');
+    expect(views.at(-1).error).toBeUndefined();
+  });
+
+  it('keeps histories recorded before the escalation failing the task', async () => {
+    reviewAndConfirm();
+    wf.absentPatches = new Set(['resource-publish-escalates-v1']);
+    wf.activities.settleResourceReview = vi.fn(async () => { throw new Error(conflict); });
+    await expect(softwareDevV1_27(child)).rejects.toThrow(conflict);
+  });
+
+  it('brings what a landed sub-task published into the parent\'s world before its next turn', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child' }));
+    let finish!: (value: { stage: string }) => void;
+    wf.startChild = async () => ({ result: () => new Promise((resolve) => { finish = resolve; }) });
+    wf.activities.refreshResourceForks = vi.fn(async () => [
+      { attachmentId: 'r1', name: 'raw_data', path: 'resources/raw_data', revisionId: 'rev', added: 12, modified: 1, deleted: 0 },
+      { attachmentId: 'r2', name: 'index', path: 'resources/index', revisionId: 'rev2', added: 0, modified: 0, deleted: 0, conflicts: ['a.txt'] },
+    ]);
+    const prompts: string[] = [];
+    wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+      prompts.push(JSON.stringify(args.messages ?? args));
+      if (prompts.length === 1) return { subTasks: [{ title: 'child', prompt: 'work' }] };
+      if (prompts.length === 2) { finish({ stage: 'done' }); return { waitForSubtasks: true }; }
+      wf.handlers.get('cancel')!();
+      return {};
+    });
+    wf.wait = () => { if (prompts.length >= 3) wf.handlers.get('cancel')!(); };
+    await softwareDevV1_27(input);
+    expect(wf.activities.refreshResourceForks).toHaveBeenCalledOnce();
+    expect(wf.activities.refreshResourceForks).toHaveBeenCalledWith('task');
+    // The agent reads them at the top of the turn after the sub-task landed.
+    const texts = wf.handlers.get('view')!().messages.map((m: any) => m.text);
+    const landed = texts.findIndex((text: string) => text.startsWith('Sub-task child finished: done'));
+    expect(texts.slice(landed + 1, landed + 3)).toEqual([
+      'resources/raw_data now includes what sub-tasks published: 12 new, 1 changed, 0 removed files.',
+      'resources/index was not updated with what sub-tasks published: a file you changed differs from the published version (a.txt). Keep one version; publishing yours fails until you do.',
+    ]);
+    expect(prompts).toHaveLength(3);
   });
 });

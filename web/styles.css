@@ -161,6 +161,7 @@ button.action-pending::after, [role="button"].action-pending::after, a.action-pe
 @keyframes action-error { 40% { box-shadow: 0 0 0 2px var(--danger); } }
 a { color: var(--accent); text-decoration: none; }
 .mono { font-family: var(--font-mono); font-feature-settings: "ss01"; }
+.nowrap { white-space: nowrap; }
 
 /* ── layout shell ───────────────────────────────────────────── */
 #app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
@@ -406,8 +407,6 @@ p.task-sub { display: block; line-height: 1.55; }
 p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
-.provider-note { font-size: 12px; margin: 6px 0; padding: 6px 9px; border-radius: var(--r-sm); color: var(--ink); background: var(--working-weak); border-left: 3px solid var(--working); }
-.provider-note a { color: inherit; text-decoration: underline; }
 .task-right { display: flex; align-items: center; gap: 12px; }
 
 /* ── real-link rows ─────────────────────────────────────────────
@@ -3097,6 +3096,45 @@ html[data-theme="dark"] .github-signin-btn:active,
 .storage-project .storage-item { padding-left: 14px; font-size: .92em; color: var(--ink-2); }
 .storage-project .storage-item > span:first-child { flex: 1; }
 
+/* app sign-ins: /device, OAuth consent, Profile → Apps and tokens */
+.grant-card { width: 360px; max-width: calc(100vw - 32px); }
+.grant-brand { margin-bottom: 16px; }
+.grant-title { display: flex; align-items: center; gap: 6px; margin: 0 0 14px; font-size: 17px; font-weight: 600; }
+.grant-code { width: 100%; box-sizing: border-box; padding: 12px 8px; border: 1px dashed var(--line-strong); border-radius: var(--r);
+  background: var(--surface-2); color: var(--ink); font-family: var(--font-mono); font-size: 26px; letter-spacing: .22em;
+  text-align: center; text-transform: uppercase; }
+.grant-code[readonly] { border-style: solid; border-color: var(--accent); background: var(--accent-weak); }
+.grant-who { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 12px 0 8px; }
+.grant-who .task-sub { margin: 0; }
+.grant-limit { margin: 8px 0 14px; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.grant-limit summary { display: flex; align-items: center; gap: 8px; padding: 8px 10px; font-size: 13px; cursor: pointer; list-style: none; }
+.grant-limit summary::-webkit-details-marker { display: none; }
+.grant-limit summary::after { content: '▾'; color: var(--ink-3); }
+.grant-limit[open] summary::after { content: '▴'; }
+.grant-limit-label { display: inline-flex; align-items: center; gap: 4px; color: var(--ink-2); }
+.grant-limit-value { margin-left: auto; font-weight: 500; text-align: right; }
+.grant-limit-body { display: grid; gap: 8px; padding: 0 10px 10px; }
+.grant-limit-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ink-2); font-size: 13px; }
+.grant-limit-projects { display: grid; gap: 4px; max-height: 160px; margin: 0; padding: 0; overflow: auto; border: 0; font-size: 13px; }
+.grant-limit-projects legend { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; padding: 0; color: var(--ink-2); }
+.grant-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.grant-actions[hidden] { display: none; }
+.grant-continue { width: 100%; margin-top: 12px; }
+.grant-continue[hidden] { display: none; }
+.grant-msg { min-height: 16px; margin: 8px 0 0; color: var(--danger); font-size: 12px; }
+.app-grant-row .task-sub { margin: 2px 0 0; }
+.app-token-new:empty { display: none; }
+.app-token-form, .app-token-once { display: grid; gap: 8px; margin: 10px 0; }
+.app-token-value { display: flex; gap: 6px; }
+.app-token-value input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 12px; }
+#app-token-open { margin-top: 10px; }
+#app-token-open[hidden] { display: none; }
+.grant-limit-row select, .app-token-form input[name=name] { padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); font-size: 13px; }
+.grant-actions .btn, .grant-continue { justify-content: center; }
+.grant-msg:empty { display: none; }
+.app-token-form .grant-limit, .app-token-form .form-row { margin: 0; }
+.app-token-once > .btn { justify-self: start; }
+
 /* ── One conversation, several agents (software-dev ≥1.27) ───────────────── */
 .msg.agent.other-agent { background: color-mix(in srgb, var(--accent) 6%, var(--surface-2)); border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); }
 .msg-to { font-size: 11px; color: currentColor; opacity: .72; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }
@@ -3211,3 +3249,48 @@ html[data-theme="dark"] .github-signin-btn:active,
 
 .cf-max-revisions { display: inline-flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
 .cf-max-revisions input { width: 72px; }
+
+/* ── The Computer block (task form, Task defaults, Parameters) ── */
+.parameter-fields .computer-field { padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); display: grid; gap: 8px; }
+.computer-controls { display: grid; grid-template-columns: minmax(120px, 1.1fr) repeat(3, minmax(92px, .8fr)); gap: 8px; }
+.computer-controls > select, .computer-size input, .computer-more input, .computer-more select {
+  width: 100%; min-width: 0; height: 40px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface); outline: none; font-size: 13px;
+}
+.computer-controls > select:focus, .computer-size input:focus, .computer-more input:focus, .computer-more select:focus { border-color: var(--accent); }
+.computer-size { position: relative; display: block; min-width: 0; margin: 0; }
+.computer-size input { padding-right: 58px; font-variant-numeric: tabular-nums; }
+.computer-size input::-webkit-inner-spin-button { opacity: .5; }
+.computer-size > span { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); color: var(--ink-3); font-size: 11.5px; pointer-events: none; white-space: nowrap; }
+.computer-more { border-top: 1px dashed var(--line); padding-top: 6px; min-width: 0; }
+.computer-more > summary { display: flex; align-items: baseline; gap: 10px; cursor: pointer; list-style: none; font-size: 12px; color: var(--ink-2); font-weight: 600; user-select: none; padding: 2px 0; }
+.computer-more > summary::-webkit-details-marker { display: none; }
+.computer-more > summary::before { content: '▸'; color: var(--ink-3); font-size: 10px; width: 8px; transition: transform .12s; }
+.computer-more[open] > summary::before { transform: rotate(90deg); }
+.computer-more-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 10px; padding: 8px 0 2px 18px; }
+.computer-more-grid > .form-row { margin: 0; gap: 4px; }
+.computer-more-grid > .form-row > span { display: flex; align-items: center; gap: 5px; color: var(--ink-2); font-size: 12px; }
+.computer-more .cf-allowlist { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.computer-more .cf-allowlist[hidden] { display: none; }
+.computer-field fieldset.ab-frozen { display: grid; gap: 8px; }
+@media (max-width: 700px) {
+  .computer-controls { grid-template-columns: 1fr 1fr; }
+  .computer-more-grid, .computer-more .cf-allowlist { grid-template-columns: 1fr; padding-left: 0; }
+}
+
+/* ── Computers (Settings → Projects, Project → Computers) ── */
+.computer-providers { display: grid; gap: 8px; }
+.computer-provider { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.computer-provider > b { min-width: 72px; }
+.computer-provider .chip[title] { cursor: help; }
+.computer-dialog { width: min(520px, calc(100vw - 28px)); display: grid; gap: 12px; }
+.computer-dialog .modal-head { display: flex; align-items: center; gap: 8px; }
+.computer-dialog .form-row { margin: 0; }
+.computer-dialog .form-row > span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--ink-2); font-size: 12px; font-weight: 600; }
+.computer-key-link { font-weight: 400; font-size: 12px; }
+.computer-advanced > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.computer-advanced .settings-grid { margin-top: 10px; }
+.computer-dialog .modal-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.computer-dialog .modal-actions .label-row-fill { flex: 1; }
+.computer-size input { -moz-appearance: textfield; appearance: textfield; }
+.computer-size input::-webkit-inner-spin-button, .computer-size input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
