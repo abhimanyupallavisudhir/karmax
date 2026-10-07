@@ -196,13 +196,43 @@ describe('Daytona cloud world provider', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
-  it('reports the fixed snapshot allocation when requested sizing differs', async () => {
+  it('resizes a snapshot sandbox to the computer: live when it only grows, stopped when the disk changes', async () => {
+    const calls: string[] = [];
+    const sized = () => {
+      const sandbox = fakeSandbox();
+      Object.assign(sandbox, { cpu: 1, memory: 1, disk: 3, gpu: 0,
+        resize: vi.fn(async (resources: object) => { calls.push(`resize ${JSON.stringify(resources)}`); }),
+        stop: vi.fn(async () => { calls.push('stop'); }), start: vi.fn(async () => { calls.push('start'); }) });
+      return sandbox;
+    };
+    const live = sized();
+    let world = await new DaytonaWorldProvider({ create: async () => live, get: async () => live }).create({
+      taskId: 'grow', base: 'main', resources: { cpu: 2, memoryMb: 4096, gpu: 0 } });
+    expect(calls).toEqual(['resize {"cpu":2,"memory":4}']);
+    expect(world.handle.warnings).toBeUndefined();
+    calls.length = 0;
+    const disk = sized();
+    world = await new DaytonaWorldProvider({ create: async () => disk, get: async () => disk }).create({
+      taskId: 'disk', base: 'main', resources: { cpu: 1, memoryMb: 1024, diskGb: 40 } });
+    expect(calls).toEqual(['stop', 'resize {"disk":40}', 'start']);
+    // Daytona creates an image at the requested disk directly.
+    const created: Array<Record<string, unknown>> = [];
+    const create = async (options: Record<string, unknown>) => { created.push(options); return fakeSandbox(); };
+    await new DaytonaWorldProvider({ create, get: async () => fakeSandbox() })
+      .create({ taskId: 'image-disk', base: 'main', environment: { image: 'ubuntu:24.04' }, resources: { cpu: 2, memoryMb: 2048, diskGb: 40 } });
+    expect(created[0]).toMatchObject({ resources: { cpu: 2, memory: 2, disk: 40 } });
+  });
+
+  it('keeps the snapshot size and says so when this Daytona cannot resize', async () => {
     const sandbox = fakeSandbox();
-    Object.assign(sandbox, { cpu: 4, memory: 2, gpu: 0 });
+    Object.assign(sandbox, { cpu: 4, memory: 2, disk: 10, gpu: 0, resize: async () => { throw new Error('resize is not implemented'); } });
     const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox }).create({
-      taskId: 'size', base: 'main', resources: { cpu: 2, memoryMb: 4096, gpu: 0 },
+      taskId: 'size', base: 'main', resources: { cpu: 2, memoryMb: 4096, diskGb: 5, gpu: 0 },
     });
-    expect(world.handle.warnings).toEqual([expect.stringContaining('4 CPUs, 2 GiB RAM')]);
+    expect(world.handle.warnings).toEqual([
+      'Daytona cannot shrink a disk: this computer keeps the snapshot\'s 10 GB.',
+      expect.stringMatching(/runs at the Daytona snapshot's size \(4 CPU · 2 GB · 10 GB disk\): resize is not implemented/),
+    ]);
   });
 
   it('cleans up when snapshot GPU requirements cannot be satisfied', async () => {

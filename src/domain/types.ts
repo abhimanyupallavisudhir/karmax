@@ -584,9 +584,10 @@ export interface ProjectConfig {
   worldProvider?: string;
   /** Resume provider-backed worlds after a parked wait (§11.3). */
   resumeWorlds?: boolean;
-  /** Hosted execution pool and declared resources. */
+  /** Hosted execution pool and declared resources. `diskGb` is the free space
+   * the task's files get (E2B: template `minFreeDiskMb`; Daytona: disk size). */
   runnerPoolId?: string;
-  resources?: { cpu?: number; memoryMb?: number; gpu?: number };
+  resources?: { cpu?: number; memoryMb?: number; diskGb?: number; gpu?: number };
   /** Remote-world egress policy. Normal coding uses unrestricted internet;
    * allowlists are an explicit organization-level hardening mode. */
   network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
@@ -1395,11 +1396,11 @@ export interface ActionArg {
 
 // ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
 
-export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer' | 'responder';
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer' | 'responder' | 'computer';
 /** Which surfaces a field appears on. */
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
-export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm' | 'responder';
+export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm' | 'responder' | 'computer';
 /**
  * When a param may be edited after the task is queued (SPEC §4.5/§5.5). This is
  * the single declaration that drives in-flight edits: the workflow validator

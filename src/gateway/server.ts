@@ -1,3 +1,4 @@
+import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
@@ -4249,6 +4250,7 @@ export class Gateway {
             const { buildEnvironment } = await import('../world/environment-build.js');
             const attempt = await beginEnvironmentBuild(store, project.id, buildScope, provider, digest);
             void buildEnvironment({ provider, projectId: project.id, digest, spec, buildId: attempt.buildId,
+              resources: (await store.effectiveProjectConfig(project)).resources,
               onBuilderCreated: id => recordEnvironmentBuilder(store, attempt, id),
               assertActive: async () => { if (!await environmentBuildIsActive(store, attempt)) throw new Error('Environment build was invalidated.'); },
               ...(connection ? { connection: { apiKey: connection.apiKey,
@@ -8189,14 +8191,9 @@ export class Gateway {
             globalVals = { ...globalVals, remote: 'pr' };
           if (projectVals.remote === 'none') projectVals = { ...projectVals, remote: 'pr' };
         }
-        // "Agent environment" (worldProvider) is stored in the execution policy, not
-        // the settings rows — surface the real organization default + project override
-        // so the Task Defaults form shows and inherits the true selection (§11).
-        if (organizationId && globalVals.worldProvider === undefined) {
-          const orgProvider = (await store.getOrganizationExecutionPolicy(organizationId)).worldProvider;
-          if (orgProvider !== undefined) globalVals.worldProvider = orgProvider;
-        }
-        if (project?.config.worldProvider !== undefined) projectVals.worldProvider = project.config.worldProvider;
+        // The Computer is the execution policy, not a settings row: project the
+        // organization policy and the project override into each layer (§11).
+        const computer = (await computerDefaults(store, organizationId ?? undefined, project));
         // Detect the effective repository policy so placeholders agree with the
         // branch provisioning and pull requests will actually use.
         const repo0 = project
@@ -8216,10 +8213,15 @@ export class Gateway {
         // organization Quick agents into the regular project/organization agents.
         const globalQuickVals = (await quickGlobalSettingsFor(gs, wf, organizationId ?? undefined));
         const projectQuickVals = project ? (await quickProjectSettingsFor(gs, project.id, wf)) : {};
+        const hasComputer = m.params.some((field) => field.type === 'computer');
+        const withComputer = (values: Record<string, unknown>, value: unknown) => {
+          const { worldProvider: _legacy, computer: _stale, ...rest } = values;
+          return hasComputer ? { ...rest, computer: value } : rest;
+        };
         return this.json(res, 200, {
-          task: { own: {}, inherited: (await enrich(resolveParams(m, { project: projectVals, global: globalVals }), {})) },
-          project: { own: projectVals, inherited: (await enrich(resolveParams(m, { global: globalVals }), projectVals)) },
-          global: { own: globalVals, inherited: (await enrich(resolveParams(m, {}), { ...projectVals, ...globalVals })) },
+          task: { own: {}, inherited: withComputer((await enrich(resolveParams(m, { project: projectVals, global: globalVals }), {})), computer.task.inherited) },
+          project: { own: withComputer(projectVals, computer.project.own), inherited: withComputer((await enrich(resolveParams(m, { global: globalVals }), projectVals)), computer.project.inherited) },
+          global: { own: withComputer(globalVals, computer.global.own), inherited: withComputer((await enrich(resolveParams(m, {}), { ...projectVals, ...globalVals })), computer.global.inherited) },
           globalQuick: { own: globalQuickVals, inherited: (await enrich(resolveParams(m, { global: globalVals }), globalQuickVals)) },
           projectQuick: {
             own: projectQuickVals,
@@ -8235,14 +8237,14 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, (await globalSettingsFor(async (s, w) => (await store.getSettings(s, w)), wf!, organizationId)));
         if (method === 'PUT') {
           const b = await this.body(req);
-          const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
+          const { rest: values, computer } = splitComputerValues(hostedSettingsValues(b.values ?? {}, this.deps.hosted === true));
+          // The Computer is the organization's execution policy (§11). Save it
+          // first: a refused provider must not leave half the form saved.
+          const options = { hosted: this.deps.hosted === true, providerConnections: this.deps.providerConnections };
+          try {
+            if (computer) (await saveOrganizationComputer(store, organizationId!, computer.value, options));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           (await store.setSettings(`organization:${organizationId}`, wf!, values));
-          // The organization "Agent environment" default lives in the execution
-          // policy (so runner-pool compatibility and effectiveProjectConfig agree);
-          // mirror a non-empty selection there. Blank at organization scope means
-          // "unchanged" — the top-level default is always a concrete provider.
-          if (values.worldProvider)
-            (await store.setOrganizationExecutionPolicy(organizationId!, { worldProvider: values.worldProvider as string }));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -8293,16 +8295,18 @@ export class Gateway {
         }
         if (method === 'PUT') {
           const b = await this.body(req);
-          const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
+          const { rest: values, computer } = splitComputerValues(hostedSettingsValues(b.values ?? {}, this.deps.hosted === true));
+          const project = (await store.getProject(projectId));
+          if (!project) return this.json(res, 404, { error: 'no project' });
+          // The Computer is the project's execution-policy override (§11); empty inherits the organization's.
+          const options = { hosted: this.deps.hosted === true, providerConnections: this.deps.providerConnections };
+          try {
+            if (computer) (await saveProjectComputer(store, project, computer.value, options));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           (await store.setSettings(projectId, wf, values));
           // Mirror bound-project fields into ProjectConfig for back-compat.
           const m = manifest(wf);
           if (m) (await store.updateProjectConfig(projectId, settingsToProjectConfig(m, values)));
-          // "Agent environment" is canonically an execution-policy value; mirror it so
-          // effectiveProjectConfig, runner-pool compatibility, and the Compute section
-          // stay coherent (empty ⇒ clear the override and inherit the organization).
-          if (Object.prototype.hasOwnProperty.call(values, 'worldProvider'))
-            (await store.setProjectExecutionPolicy(projectId, { worldProvider: (values.worldProvider as string) || null }));
           return this.json(res, 200, { ok: true });
         }
       }

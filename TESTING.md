@@ -147,7 +147,7 @@ environment's branch rule is the control.
 | `models` | `LIVE_ANTHROPIC_API_KEY`, `LIVE_OPENAI_API_KEY` (either) | `live-providers` |
 | `agent` | `LIVE_OPENAI_API_KEY` | `live-agent` |
 | `claude` | `LIVE_CLAUDE_CODE_OAUTH_TOKEN` | `claude-permission` |
-| `e2b` | `LIVE_E2B_API_KEY` | `cloud-live`, `e2b-workflow-live` (a task that pauses at Review, resumes and tears down) |
+| `e2b` | `LIVE_E2B_API_KEY` | `cloud-live`, `e2b-workflow-live` (a task that pauses at Review, resumes and tears down), `e2b-computer-live` (a sized template really has its CPU, memory and disk) |
 | `daytona` | `LIVE_DAYTONA_API_KEY` | `daytona-live`, `daytona-environment-live`, `daytona-workflow-live` |
 | `github` | `LIVE_GITHUB_TOKEN`: a fine-grained token for the private `karmax-e2e-tests` repository only (Contents, Issues and Pull requests read and write; Commit statuses read). Clones and pushes go over HTTPS with it. | `github-live` |
 

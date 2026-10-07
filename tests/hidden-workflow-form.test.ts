@@ -24,7 +24,7 @@ describe('existing hidden workflow forms', () => {
         source.slice(source.indexOf('const WORKFLOWS ='), source.indexOf('const NODES =')),
         "const esc = (s) => String(s ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;');",
         source.slice(source.indexOf('const eff ='), source.indexOf('function renderField(')),
-        fn('schemaFor'), fn('agentEnvOptions'), fn('consumingField'), fn('renderField'),
+        fn('schemaFor'), fn('consumingField'), fn('renderField'),
       ].join('\n'), context);
       // The editor uses this exact schema → consuming field → renderer path.
       const html = vm.runInContext("renderField(consumingField(schemaFor('just-do')), 'Wake #219 after #232 succeeds.', undefined, true)", context);

@@ -19,7 +19,7 @@ const slice = (from, to) => {
 
 const installation = slice('function installationView()', 'function organizationView()');
 const organization = slice('function organizationView()', 'async function hydrateOrganizationView(');
-const project = slice('function settingsView(proj)', 'function cloudEnvironmentCard(proj)');
+const project = slice('function settingsView(proj)', 'function paneError(');
 
 for (const marker of [
   'installation-appearance', 'installation-health', 'installation-capacity', 'installation-github',
