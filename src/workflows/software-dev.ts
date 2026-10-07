@@ -857,6 +857,8 @@ async function softwareDevImpl(
   let responderEpoch = 0;
   let responderRounds = carriedCount?.responderRounds ?? 0;
   let subtaskNags = carriedCount?.subtaskNags ?? 0;
+  /** A sub-task landed since this world last took in what sub-tasks published. */
+  let childLandedSinceRefresh = false;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   type AccountGrant = {
     accountId: string;
@@ -1363,17 +1365,67 @@ async function softwareDevImpl(
     }
   }
 
-  /** False when a cancel stopped staging: nothing is adopted for a cancelled task. */
-  async function applyReviewedResources(stage = true): Promise<boolean> {
-    if (stage && await stageResources() && cancelled) return false;
-    applyingResources = true;
-    status = 'active';
-    await publish();
-    try {
-      await runLandingActivity(() => resourceActivities.settleResourceReview(taskId));
-      resourcesApplied = true;
-    } finally { applyingResources = false; }
-    return true;
+  /** `cancelled` when a cancel stopped it: nothing is adopted for a cancelled
+   * task. A publication that fails (a file another task changed differently,
+   * say) escalates with the reason instead of failing the task, whose world
+   * keeps the output: Retry publishes again, merging what was published
+   * meanwhile, and with `followUpReturnsToDo` a follow-up goes to the agent. */
+  async function applyReviewedResources(stageFirst = true, followUpReturnsToDo = false): Promise<'applied' | 'cancelled' | 'do'> {
+    if (stageFirst && await stageResources() && cancelled) return 'cancelled';
+    for (;;) {
+      applyingResources = true;
+      status = 'active';
+      await publish();
+      let failure: string;
+      try {
+        await runLandingActivity(() => resourceActivities.settleResourceReview(taskId));
+        resourcesApplied = true;
+        return 'applied';
+      } catch (err) {
+        if (isCancellation(err) || !patched('resource-publish-escalates-v1')) throw err;
+        failure = innermostMessage(err);
+      } finally { applyingResources = false; }
+      const priorStage = stage;
+      stage = 'escalated';
+      status = 'blocked';
+      retryRequested = false;
+      error = `Could not publish resources: ${failure} Nothing was lost; Retry publishes again.`;
+      if (input.parentTaskId) {
+        waitingFor = { kind: 'parent' };
+        await notifyParent('blocked', error);
+      }
+      const seenAtEscalation = msgs.length;
+      await publish();
+      await waitServing(() => retryRequested || cancelled
+        || (followUpReturnsToDo && followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
+      waitingFor = undefined;
+      error = undefined;
+      stage = priorStage;
+      status = 'active';
+      if (cancelled) return 'cancelled';
+      if (!retryRequested) return 'do';
+      retryRequested = false;
+    }
+  }
+
+  /** Once a sub-task has landed, the writable resources this world forked
+   * take in what it published (SPEC §11.4), before the agent's next turn,
+   * as its branch did. */
+  async function refreshResourcesFromChildren(): Promise<void> {
+    let refreshed: Awaited<ReturnType<coreActivities['refreshResourceForks']>>;
+    try { refreshed = await resourceStaging.refreshResourceForks(taskId); }
+    catch (err) {
+      if (isCancellation(err)) throw err;
+      msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length,
+        text: `Could not bring what sub-tasks published into your resources: ${innermostMessage(err)} It stays published, and your own changes merge with it when you publish.` });
+      return;
+    }
+    for (const r of refreshed) {
+      const text = r.conflicts
+        ? `${r.path} was not updated with what sub-tasks published: ${r.conflicts.length === 1 ? 'a file you changed differs' : `${r.conflicts.length} files you changed differ`} from the published version (${r.conflicts.slice(0, 5).join(', ')}${r.conflicts.length > 5 ? ', …' : ''}). Keep one version; publishing yours fails until you do.`
+        : `${r.path} now includes what sub-tasks published: ${r.added} new, ${r.modified} changed, ${r.deleted} removed file${r.deleted === 1 ? '' : 's'}.`;
+      msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length, text });
+    }
   }
 
   /** Play the one canonical Review route. Restored proposals call this after
@@ -1520,8 +1572,12 @@ async function softwareDevImpl(
       if (await stageResources() && cancelled) return 'cancelled';
       const saved = await ensureResourcesSaved();
       if (saved !== 'saved') return saved;
-      if (!(await applyReviewedResources(false))) return 'cancelled';
-    } else if (automaticResources && !(await applyReviewedResources())) return 'cancelled';
+      const applied = await applyReviewedResources(false, true);
+      if (applied !== 'applied') return applied;
+    } else if (automaticResources) {
+      const applied = await applyReviewedResources(true, true);
+      if (applied !== 'applied') return applied;
+    }
     confirmed = true;
     if (intentAuthorizedLanding) {
       landing = {
@@ -3162,6 +3218,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (((recovery && patched('software-dev-preserve-replacement-children-v1')) || durableChildSettlement)
         && !outstanding.has(s.childTaskId)) continue;
       subtaskNags = 0;
+      if (s.stage === 'done') childLandedSinceRefresh = true;
       outstanding.delete(s.childTaskId);
       awaitingResponse.delete(s.childTaskId);
       msgs.push({
@@ -3491,6 +3548,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     // sees their raises/results at the top of this turn — this is what lets us keep
     // working while they run, rather than blocking on them.
     drainChildEvents();
+    if (childLandedSinceRefresh) {
+      childLandedSinceRefresh = false;
+      if (resourceCandidateReview && patched('subtask-resource-refresh-v1')) await refreshResourcesFromChildren();
+    }
     await publish();
     if (cancelled) return await abort();
     // An agent called while the task was elsewhere (an interrupted pause, a
@@ -4109,7 +4170,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   // Recovery may carry an already-approved proposal across a replacement run
   // and bypass the review gate. Finish any interrupted resource publication too.
   if (restoredReviewApproved && resourceCandidateReview && !resourcesApplied
-    && patched('automatic-resource-review-restored-v1') && !(await applyReviewedResources())) return await abort();
+    && patched('automatic-resource-review-restored-v1') && (await applyReviewedResources()) !== 'applied') return await abort();
 
   if (repositoryless) {
     stage = 'done';
@@ -5071,6 +5132,14 @@ export function sameProposalIdentity(
 }
 
 /** Extract a meaningful message, following Temporal's wrapped `.cause` chain. */
+/** The original failure's own words, without the activity wrapping. */
+function innermostMessage(err: any): string {
+  let e: any = err;
+  let message = '';
+  for (let depth = 0; e && depth < 6; depth++) { if (e.message) message = e.message; e = e.cause; }
+  return message || String(err);
+}
+
 function describeError(err: any): string {
   const parts: string[] = [];
   let e: any = err;

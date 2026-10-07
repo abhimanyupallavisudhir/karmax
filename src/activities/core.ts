@@ -11,7 +11,7 @@ import { turnPlatformRequest } from '../agent/platform-request.js';
 import { acquireConfirmLock } from './confirm-lock.js';
 import { scriptOutput, reviewFiles } from './result-bounds.js';
 import { mapBatches } from '../util/async-batch.js';
-import type { StagingProgress } from '../world/resources.js';
+import { ResourceConflictError, type ResourceRefresh, type StagingProgress } from '../world/resources.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
@@ -3662,6 +3662,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             void record(taskId, 'staging.progress', { ...next }).catch(() => undefined);
           },
         });
+      } catch (error) {
+        // Saving again cannot resolve a conflict: the task's people must.
+        if (error instanceof ResourceConflictError)
+          throw ApplicationFailure.create({ message: error.message, type: 'resource-conflict', nonRetryable: true });
+        throw error;
+      } finally { clearInterval(pulse); }
+    },
+
+    /** Merge into a parent's world what its sub-tasks published to the
+     * writable resources it forked. */
+    async refreshResourceForks(taskId: string): Promise<ResourceRefresh[]> {
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct tests */ }
+      const pulse = setInterval(() => {
+        try { context?.heartbeat({ taskId, operation: 'refreshing-resources' }); }
+        catch { /* activity completion/cancellation */ }
+      }, 5_000);
+      try {
+        return (await deps.resources?.refreshForks(taskId, {
+          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
       } finally { clearInterval(pulse); }
     },
 
