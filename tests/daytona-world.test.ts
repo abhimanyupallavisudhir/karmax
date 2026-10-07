@@ -84,7 +84,7 @@ describe('Daytona cloud world provider', () => {
         async deleteSession() { sessionDeleted++; },
         async createPty(options: any) {
           ptyData = options.onData;
-          return { async waitForConnection() {}, async sendInput(value: string) { ptyInput += value; },
+          return { async waitForConnection() {}, async sendInput(value: string | Uint8Array) { ptyInput += typeof value === 'string' ? value : new TextDecoder().decode(value); },
             async resize(cols: number, rows: number) { size = { cols, rows }; }, wait: () => new Promise(() => {}), async kill() {} };
         },
       },
@@ -441,6 +441,58 @@ describe('Daytona cloud world provider', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const code = await new Promise<number | null>((resolve) => pty.onExit(resolve));
     expect(code).toBe(29);
+  });
+
+  // Task #514: Daytona's toolbox closes the PTY socket on any input frame over
+  // 64 KiB, and the Claude SDK's initialize line (system prompt + tool
+  // manifests) is larger than that.
+  it('splits a large PTY write into ordered frames no larger than 32 KiB', async () => {
+    const frames: Uint8Array[] = [];
+    const sandbox = fakeSandbox();
+    sandbox.process.createPty = async () => ({
+      async waitForConnection() {}, wait: () => new Promise(() => {}),
+      async sendInput(value: string | Uint8Array) { frames.push(typeof value === 'string' ? new TextEncoder().encode(value) : value); },
+      async resize() {}, async kill() {},
+    });
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'large-input', base: 'main' });
+    const pty = await world.openPty();
+    const line = `${JSON.stringify({ type: 'control_request', prompt: 'é'.repeat(50_000) + 'x'.repeat(40_000) })}\n`;
+    await Promise.all([pty.write(line), pty.write('next\n')]);
+    expect(frames.length).toBeGreaterThan(2);
+    expect(Math.max(...frames.map((frame) => frame.byteLength))).toBeLessThanOrEqual(32 * 1024);
+    expect(Buffer.concat(frames).toString('utf8')).toBe(`${line}next\n`);
+  });
+
+  it('reports a PTY socket closed without an exit status as a lost connection, not exit 0', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.createPty = async () => ({
+      async waitForConnection() {}, async wait() { return { exitCode: undefined, error: undefined }; },
+      async sendInput() {}, async resize() {}, async kill() {},
+    });
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'lost-pty', base: 'main' });
+    const pty = await world.openPty();
+    const [code, termination] = await new Promise<[number | null, any]>((resolve) =>
+      pty.onExit((exitCode, ending) => resolve([exitCode, ending])));
+    expect(code).toBeNull();
+    expect(termination?.lost).toBeInstanceOf(Error);
+    expect(termination.lost.message).toContain('without an exit status');
+  });
+
+  it('keeps a real zero exit status as exit 0', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.createPty = async () => ({
+      async waitForConnection() {}, async wait() { return { exitCode: 0 }; },
+      async sendInput() {}, async resize() {}, async kill() {},
+    });
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'zero-exit', base: 'main' });
+    const pty = await world.openPty();
+    const [code, termination] = await new Promise<[number | null, any]>((resolve) =>
+      pty.onExit((exitCode, ending) => resolve([exitCode, ending])));
+    expect(code).toBe(0);
+    expect(termination).toBeUndefined();
   });
 });
 
