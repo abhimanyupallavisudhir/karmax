@@ -40,8 +40,10 @@ jobs:
           if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$tag" ]; then echo "::error::$REQUESTED does not match cli/package.json ($tag)"; exit 1; fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      # The CLI needs only esbuild to build: it has no runtime dependencies.
-      - run: npm install --no-save --ignore-scripts --no-package-lock esbuild@0.28.1
+      # The CLI has no runtime dependencies; its build tools are locked in
+      # cli/package-lock.json. (`npm install <tool>` at the root would resolve
+      # the whole root project afresh.)
+      - run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
       - run: node scripts/build-cli.mjs
       - run: node cli/dist/tavya.mjs --version
       - uses: actions/upload-artifact@v4
@@ -64,26 +66,26 @@ jobs:
         with: { ref: '${{ needs.bundle.outputs.sha }}' }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0' }
-      - run: npm install --no-save --ignore-scripts --no-package-lock esbuild@0.28.1 postject@1.0.0-alpha.6
+      - run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
       - run: node scripts/build-cli.mjs --sea
       - name: Inject into a copy of node (Linux)
         if: runner.os == 'Linux'
         run: |
           cp "$(command -v node)" tavya-${{ matrix.target }}
-          npx postject tavya-${{ matrix.target }} NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+          cli/node_modules/.bin/postject tavya-${{ matrix.target }} NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
       - name: Inject into a copy of node (macOS)
         if: runner.os == 'macOS'
         run: |
           cp "$(command -v node)" tavya-${{ matrix.target }}
           codesign --remove-signature tavya-${{ matrix.target }}
-          npx postject tavya-${{ matrix.target }} NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --macho-segment-name NODE_SEA
+          cli/node_modules/.bin/postject tavya-${{ matrix.target }} NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --macho-segment-name NODE_SEA
           codesign --sign - tavya-${{ matrix.target }}
       - name: Inject into a copy of node (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           cp "$(command -v node)" tavya-${{ matrix.target }}.exe
-          npx postject tavya-${{ matrix.target }}.exe NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+          cli/node_modules/.bin/postject tavya-${{ matrix.target }}.exe NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
       - name: Smoke test
         shell: bash
         run: |
