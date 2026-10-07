@@ -4,13 +4,17 @@
 //   node scripts/build-cli.mjs --sea      → also cli/dist/tavya.cjs and a Node
 //                                           single-executable blob (cli/dist/sea-prep.blob)
 // The release workflow (.github/workflows/cli-release.yml) publishes both.
-import { build } from 'esbuild';
+// esbuild resolves from cli/: the release installs only cli/'s locked build
+// tools there (npm ci in cli/), while a checkout with `npm ci` at the root
+// finds the root's esbuild one directory up.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const { build } = createRequire(path.join(root, 'cli', 'package.json'))('esbuild');
 const out = path.join(root, 'cli', 'dist');
 const sea = process.argv.includes('--sea');
 fs.mkdirSync(out, { recursive: true });

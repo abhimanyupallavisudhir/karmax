@@ -9,5 +9,6 @@
   "bin": { "tavya": "dist/tavya.mjs" },
   "files": ["dist/tavya.mjs", "README.md"],
   "engines": { "node": ">=22.16.0" },
-  "keywords": ["tavya", "cli", "agents", "restic", "git"]
+  "keywords": ["tavya", "cli", "agents", "restic", "git"],
+  "devDependencies": { "esbuild": "0.28.1", "postject": "1.0.0-alpha.6" }
 }
