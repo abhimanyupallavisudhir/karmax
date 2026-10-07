@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { Daytona } from '@daytona/sdk';
 import { DaytonaWorldProvider } from '../src/world/daytona.js';
@@ -21,6 +22,31 @@ describe.skipIf(!live)('Daytona live environments', () => {
       expect(await world.exec('cat', [], { input: 'stdin-ok' })).toEqual({ stdout: 'stdin-ok', stderr: '', code: 0 });
     } finally { await world.destroy(); }
   }, 300_000);
+
+  // The sandbox is a container: /proc/meminfo shows the host, so the guard must
+  // read the cgroup to see the sandbox running out of memory.
+  it('picks the memory hog from the container limit before the kernel OOM-kills anything', async () => {
+    const world = await new DaytonaWorldProvider().create({ taskId: `live-guard-${Date.now()}`, base: 'main',
+      network: { unrestricted: true }, resources: { cpu: 2, memoryMb: 2048 } });
+    try {
+      const guard = fs.readFileSync(new URL('../src/agent/memory-guard.sh', import.meta.url), 'utf8');
+      await world.writeFile('guard/memory-guard.sh', guard);
+      await world.writeFile('guard/hog.cjs', `const fs = require('fs'); const read = (f) => Number(fs.readFileSync('/sys/fs/cgroup/' + f, 'utf8'));
+const max = read('memory.max'); const held = [];
+while (max - read('memory.current') > 120 * 2 ** 20) held.push(Buffer.alloc(16 * 2 ** 20, 1));
+fs.writeFileSync('/tmp/karmax-hog-ready', String(process.pid)); setInterval(() => held.length, 1000);`);
+      const hog = await world.startProcess({ command: `node ${world.handle.root}/guard/hog.cjs` });
+      try {
+        const ready = await world.exec('sh', ['-c', 'for i in $(seq 1 120); do [ -s /tmp/karmax-hog-ready ] && cat /tmp/karmax-hog-ready && exit 0; sleep 1; done; exit 1']);
+        expect(ready.code).toBe(0);
+        const picked = await world.exec('sh', [`${world.handle.root}/guard/memory-guard.sh`, 'pick']);
+        expect(picked).toMatchObject({ code: 0, stdout: `${ready.stdout.trim()}\n` });
+        const diagnosis = await new Promise((resolve) => setTimeout(resolve, 150_000))
+          .then(() => world.diagnose!({ since: Date.now() - 10 * 60_000 }));
+        expect(diagnosis).toMatchObject({ memoryExhausted: true });
+      } finally { await hog.kill(); }
+    } finally { await world.destroy(); }
+  }, 600_000);
 
   it.skipIf(process.env.KARMAX_DAYTONA_LIVE_BUILD !== '1')('builds a setup snapshot at the requested world size and launches it', async () => {
     const client = new Daytona();
