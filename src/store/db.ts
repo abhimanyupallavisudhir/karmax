@@ -6310,6 +6310,14 @@ export class Store {
     });
   }
 
+  /** A sub-task's pending output, handed to its parent: the parent's world
+   * holds it from now on, and the parent's Review adopts or excludes it. */
+  async reassignResourceCandidate(id: string, from: string, to: { taskId: string; worldId: string; worldGeneration: number }): Promise<void> {
+    const result = (await this.db.prepare(`UPDATE resource_candidates SET taskId=?, worldId=?, worldGeneration=?
+      WHERE id=? AND taskId=? AND state='pending'`).run(to.taskId, to.worldId, to.worldGeneration, id, from));
+    if (!Number(result.changes)) throw new Error('resource candidate is no longer pending for this task');
+  }
+
   async adoptResourceCandidate(id: string, taskId: string, resolvedBy: string): Promise<{ candidate: ResourceCandidate; attachment: ResourceAttachment }> {
     return this.db.transaction(async () => {
 
@@ -6400,12 +6408,6 @@ export class Store {
       .run(state, sealedDriverRef ?? null, state === 'released' ? Date.now() : null, id));
   
     });
-  }
-
-  /** The version a world's copy now descends from, after newer published
-   * changes were merged into it. */
-  async rebaseResourceLease(id: string, revisionId: string): Promise<void> {
-    (await this.db.prepare('UPDATE resource_leases SET revisionId=? WHERE id=?').run(revisionId, id));
   }
 
   // ─── Organization storage locations and physical snapshot accounting ─────
@@ -6854,6 +6856,13 @@ export class Store {
     for (const entry of (await this.kvEntries('resource-checkpoint:'))) {
       try { const revisionId = JSON.parse(entry.value)?.revisionId; if (revisionId) ids.add(String(revisionId)); } catch {}
     }
+    // A sub-task's output waiting for its parent's world, and the version it is relative to.
+    for (const entry of (await this.kvEntries('resource-delivery:'))) {
+      try {
+        const delivery = JSON.parse(entry.value);
+        for (const id of [delivery?.revisionId, delivery?.baseRevisionId]) if (id) ids.add(String(id));
+      } catch {}
+    }
     return ids;
   }
 
@@ -6889,7 +6898,8 @@ export class Store {
   private async resourceRevisionReferencedBesidesCurrent(id: string): Promise<boolean> {
     if ((await this.db.prepare("SELECT 1 FROM resource_leases WHERE state<>'released' AND revisionId=?").get(id))) return true;
     if ((await this.db.prepare('SELECT 1 FROM world_checkpoints WHERE manifest LIKE ?').get(`%"revisionId":"${id}"%`))) return true;
-    return (await this.kvEntries('resource-checkpoint:')).some((entry) => entry.value.includes(`"revisionId":"${id}"`));
+    if ((await this.kvEntries('resource-checkpoint:')).some((entry) => entry.value.includes(`"revisionId":"${id}"`))) return true;
+    return (await this.kvEntries('resource-delivery:')).some((entry) => entry.value.includes(`"${id}"`));
   }
 
   /** Everything an organization keeps in storage, for the storage page and the

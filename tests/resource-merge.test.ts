@@ -9,7 +9,6 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { ObjectSnapshotEngine, ProjectResourceService, ResourceConflictError } from '../src/world/resources.js';
-import { resticRef } from '../src/world/restic-engine.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import type { World } from '../src/world/types.js';
 
@@ -45,11 +44,14 @@ async function fixture(initial: Record<string, string>) {
     await store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  const task = async (title: string, revisions: Record<string, string> = {}) => {
+  const task = async (title: string, revisions: Record<string, string> = {}, parentTaskId?: string) => {
     const record = await store.createTask({ projectId: project.id, title, workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: title } });
+      workflowVersion: '1.0.0', params: { prompt: title }, ...(parentTaskId ? { parentTaskId } : {}) });
     return { task: record, world: await worldFor(record.id, revisions) };
   };
+  /** A sub-task, started from its parent's copies as prepareChildTask starts it. */
+  const subTask = async (title: string, parent: { task: { id: string }; world: World }) =>
+    task(title, await resources.snapshotForks(parent.world.handle), parent.task.id);
   const worldFor = async (taskId: string, revisions: Record<string, string> = {}, generation = 1) => {
     const world = await worlds.create('worktree', { taskId, repo, base: 'main' });
     world.handle = await resources.materialize(project.id, taskId, world, generation, revisions);
@@ -87,7 +89,7 @@ async function fixture(initial: Record<string, string>) {
   };
   const lease = async (world: World) => (await store.listResourceLeases(world.handle.id, world.handle.generation ?? 1))
     .find((candidate) => candidate.attachmentId === data.id && candidate.state === 'active')!;
-  return { store, resources, data, first, task, worldFor, write, remove, inWorld, current, published, publish, lease };
+  return { store, resources, data, first, task, subTask, worldFor, write, remove, inWorld, current, published, publish, lease };
 }
 
 describe('combining publications of one resource', () => {
@@ -166,41 +168,122 @@ describe('combining publications of one resource', () => {
     expect(await f.published()).toEqual({ 'index.txt': 'v1', 'out/a.txt': 'a', 'out/b.txt': 'b' });
   }, 180_000);
 
-  it('brings what sub-tasks published into the parent\'s world, keeping the parent\'s own work', async () => {
+  it('starts sub-tasks from the parent\'s copy and hands their output to it; the parent publishes once', async () => {
     const f = await fixture({ 'index.txt': 'v1' });
-    const parent = await f.task('Parent');
-    await f.write(parent.world, 'parent/notes.txt', 'mine');
-    expect(await f.resources.refreshForks(parent.task.id)).toEqual([]);
+    const parent = await f.task('Integrator');
+    await f.write(parent.world, 'parent/plan.txt', 'mine');
+    const ocr = await f.subTask('W2 OCR', parent);
+    const translations = await f.subTask('W7 translations', parent);
+    // Each sees the parent's unpublished work, as it sees the parent's branch.
+    expect(f.inWorld(ocr.world)).toEqual({ 'index.txt': 'v1', 'parent/plan.txt': 'mine' });
 
-    const child = await f.task('Child');
-    await f.write(child.world, 'child/out.txt', 'from child');
-    await f.write(child.world, 'index.txt', 'v2');
-    await f.publish(child.task.id, 'child');
-    const childVersion = await f.current();
+    await f.write(ocr.world, 'ocr/page-1.txt', 'ocr 1');
+    await f.write(ocr.world, 'index.txt', 'v2');
+    await f.write(translations.world, 'translations/page-1.txt', 'translated 1');
+    await f.write(translations.world, 'index.txt', 'v2');
+    await f.write(parent.world, 'parent/more.txt', 'meanwhile');
+    // A sub-task's Review shows its own changes only.
+    expect(await f.resources.summarize(ocr.task.id, f.data.id)).toMatchObject({ added: 1, modified: 1, deleted: 0 });
+    await f.publish(ocr.task.id, 'w2');
+    await f.publish(translations.task.id, 'w7');
 
-    const refreshed = await f.resources.refreshForks(parent.task.id);
-    expect(refreshed).toEqual([{ attachmentId: f.data.id, name: 'raw_data', path: 'resources/raw_data',
-      revisionId: childVersion.id, added: 1, modified: 1, deleted: 0 }]);
-    expect(f.inWorld(parent.world)).toEqual({ 'index.txt': 'v2', 'child/out.txt': 'from child', 'parent/notes.txt': 'mine' });
-    expect((await f.lease(parent.world)).revisionId).toBe(childVersion.id);
-    // Up to date: nothing more to do.
-    expect(await f.resources.refreshForks(parent.task.id)).toEqual([]);
-    // Review shows, and Confirm publishes, only the parent's own change.
-    expect(await f.resources.summarize(parent.task.id, f.data.id)).toMatchObject({ added: 1, modified: 0, deleted: 0 });
-    await f.publish(parent.task.id, 'parent');
-    expect((await f.current()).parentRevisionId).toBe(childVersion.id);
-    expect(await f.published()).toEqual({ 'index.txt': 'v2', 'child/out.txt': 'from child', 'parent/notes.txt': 'mine' });
+    // Nothing reached the project: the parent's Review decides.
+    expect((await f.current()).id).toBe(f.first.id);
+    const kept = (await f.store.listResourceRevisions(f.data.id)).filter((revision) => revision.metadata?.deliveredTo === parent.task.id);
+    expect(kept.map((revision) => revision.createdByTaskId).sort()).toEqual([ocr.task.id, translations.task.id].sort());
 
-    // A conflict leaves the parent's copy and baseline as they were, and says which files.
-    const second = await f.task('Second child');
-    await f.write(second.world, 'parent/notes.txt', 'theirs');
-    await f.publish(second.task.id, 'second');
-    await f.write(parent.world, 'parent/notes.txt', 'mine, edited');
-    const baseline = (await f.lease(parent.world)).revisionId;
-    const [conflicted] = await f.resources.refreshForks(parent.task.id);
-    expect(conflicted).toMatchObject({ name: 'raw_data', conflicts: ['parent/notes.txt'] });
-    expect(f.inWorld(parent.world)['parent/notes.txt']).toBe('mine, edited');
-    expect((await f.lease(parent.world)).revisionId).toBe(baseline);
-    expect(resticRef(await f.current()).snapshot).toBeTruthy();
+    const taken = await f.resources.takeDeliveries(parent.task.id);
+    expect(taken.map(({ added, modified, deleted, conflicts }) => ({ added, modified, deleted, conflicts })))
+      .toEqual([{ added: 1, modified: 1, deleted: 0, conflicts: undefined }, { added: 1, modified: 0, deleted: 0, conflicts: undefined }]);
+    const combined = { 'index.txt': 'v2', 'ocr/page-1.txt': 'ocr 1', 'translations/page-1.txt': 'translated 1',
+      'parent/plan.txt': 'mine', 'parent/more.txt': 'meanwhile' };
+    expect(f.inWorld(parent.world)).toEqual(combined);
+    expect(await f.resources.takeDeliveries(parent.task.id)).toEqual([]);
+
+    await f.publish(parent.task.id, 'integrator');
+    const published = await f.current();
+    expect(published).toMatchObject({ parentRevisionId: f.first.id, createdByTaskId: parent.task.id });
+    expect(await f.published()).toEqual(combined);
   }, 240_000);
+
+  it('applies a delivery still waiting when the parent is confirmed', async () => {
+    const f = await fixture({ 'index.txt': 'v1' });
+    const parent = await f.task('Integrator');
+    const child = await f.subTask('Worker', parent);
+    await f.write(child.world, 'out.txt', 'from worker');
+    await f.publish(child.task.id, 'worker');
+    await f.publish(parent.task.id, 'integrator');
+    expect(await f.published()).toEqual({ 'index.txt': 'v1', 'out.txt': 'from worker' });
+  }, 180_000);
+
+  it('hands a sub-task\'s proposed output to its parent, whose Review adopts it', async () => {
+    const f = await fixture({ 'index.txt': 'v1' });
+    const parent = await f.task('Integrator');
+    const child = await f.subTask('Worker', parent);
+    fs.mkdirSync(path.join(child.world.handle.root, 'translations'));
+    fs.writeFileSync(path.join(child.world.handle.root, 'translations/a.txt'), 'translated');
+    const { candidate, attachment } = await f.resources.proposePath(child.task.id,
+      { path: 'translations', name: 'Translations', target: { kind: 'path', path: 'translations' } });
+    await f.resources.stageCandidates(child.task.id, { final: true });
+    await f.publish(child.task.id, 'worker');
+
+    expect((await f.store.getResourceAttachment(attachment.id))?.enabled).toBe(false);
+    expect((await f.store.getResourceCandidate(candidate.id))).toMatchObject({ state: 'pending', taskId: parent.task.id });
+    const [taken] = await f.resources.takeDeliveries(parent.task.id);
+    expect(taken).toMatchObject({ name: 'Translations', path: 'translations', added: 1 });
+    expect(fs.readFileSync(path.join(parent.world.handle.root, 'translations/a.txt'), 'utf8')).toBe('translated');
+
+    await f.resources.stageCandidates(parent.task.id, { final: true });
+    await f.publish(parent.task.id, 'integrator');
+    expect((await f.store.getResourceCandidate(candidate.id))?.state).toBe('adopted');
+    expect((await f.store.getResourceAttachment(attachment.id))?.enabled).toBe(true);
+  }, 180_000);
+
+  it('keeps a delivery that conflicts with the parent\'s copy waiting, and blocks the parent\'s publication until resolved', async () => {
+    const f = await fixture({ 'index.txt': 'v1' });
+    const parent = await f.task('Integrator');
+    const child = await f.subTask('Worker', parent);
+    await f.write(child.world, 'index.txt', 'worker');
+    await f.write(child.world, 'out.txt', 'from worker');
+    await f.write(parent.world, 'index.txt', 'parent');
+    await f.publish(child.task.id, 'worker');
+
+    const [conflicted] = await f.resources.takeDeliveries(parent.task.id);
+    expect(conflicted).toMatchObject({ name: 'raw_data', conflicts: ['index.txt'] });
+    expect(f.inWorld(parent.world)).toEqual({ 'index.txt': 'parent' });
+    await expect(f.publish(parent.task.id, 'integrator')).rejects.toThrow(/changed both by this task and in a sub-task \(index\.txt\)/);
+    expect((await f.current()).id).toBe(f.first.id);
+
+    await f.write(parent.world, 'index.txt', 'worker'); // keep the sub-task's version
+    await f.publish(parent.task.id, 'integrator-again');
+    expect(await f.published()).toEqual({ 'index.txt': 'worker', 'out.txt': 'from worker' });
+  }, 180_000);
+
+  it('builds a sub-task\'s second delivery on its first, so the parent\'s edits to it do not conflict', async () => {
+    const f = await fixture({ 'index.txt': 'v1' });
+    const parent = await f.task('Integrator');
+    const child = await f.subTask('Worker', parent);
+    await f.write(child.world, 'a.txt', 'draft');
+    await f.publish(child.task.id, 'first');
+    await f.resources.takeDeliveries(parent.task.id);
+    await f.write(parent.world, 'a.txt', 'draft, corrected by the parent');
+    // A follow-up: the worker adds more and is confirmed again.
+    await f.write(child.world, 'b.txt', 'more');
+    await f.publish(child.task.id, 'second');
+    const [taken] = await f.resources.takeDeliveries(parent.task.id);
+    expect(taken).toMatchObject({ added: 1, modified: 0, deleted: 0 });
+    expect(taken!.conflicts).toBeUndefined();
+    expect(f.inWorld(parent.world)).toEqual({ 'index.txt': 'v1', 'a.txt': 'draft, corrected by the parent', 'b.txt': 'more' });
+  }, 180_000);
+
+  it('publishes a sub-task straight to the project when its parent holds no copy', async () => {
+    const f = await fixture({ 'index.txt': 'v1' });
+    // A parent without a world (an orchestrating task, say) has nothing to receive output in.
+    const parent = await f.store.createTask({ projectId: f.data.projectId, title: 'Planner', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'plan' } });
+    const child = await f.task('Worker', {}, parent.id);
+    await f.write(child.world, 'out.txt', 'from worker');
+    await f.publish(child.task.id, 'worker');
+    expect(await f.published()).toEqual({ 'index.txt': 'v1', 'out.txt': 'from worker' });
+  }, 180_000);
 });

@@ -1408,22 +1408,22 @@ async function softwareDevImpl(
     }
   }
 
-  /** Once a sub-task has landed, the writable resources this world forked
-   * take in what it published (SPEC §11.4), before the agent's next turn,
-   * as its branch did. */
+  /** Once a sub-task has landed, this world takes in what it handed over
+   * (SPEC §11.4) before the agent's next turn: its changes to the writable
+   * resources this world forked, and the output it proposed. */
   async function refreshResourcesFromChildren(): Promise<void> {
     let refreshed: Awaited<ReturnType<coreActivities['refreshResourceForks']>>;
     try { refreshed = await resourceStaging.refreshResourceForks(taskId); }
     catch (err) {
       if (isCancellation(err)) throw err;
       msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length,
-        text: `Could not bring what sub-tasks published into your resources: ${innermostMessage(err)} It stays published, and your own changes merge with it when you publish.` });
+        text: `Could not bring sub-tasks' saved data into your world: ${innermostMessage(err)} It is kept, and comes in when the next sub-task finishes or when you are confirmed.` });
       return;
     }
     for (const r of refreshed) {
       const text = r.conflicts
-        ? `${r.path} was not updated with what sub-tasks published: ${r.conflicts.length === 1 ? 'a file you changed differs' : `${r.conflicts.length} files you changed differ`} from the published version (${r.conflicts.slice(0, 5).join(', ')}${r.conflicts.length > 5 ? ', …' : ''}). Keep one version; publishing yours fails until you do.`
-        : `${r.path} now includes what sub-tasks published: ${r.added} new, ${r.modified} changed, ${r.deleted} removed file${r.deleted === 1 ? '' : 's'}.`;
+        ? `${r.path} was not updated with a sub-task's data: ${r.conflicts.length === 1 ? 'a file you changed differs' : `${r.conflicts.length} files you changed differ`} from the sub-task's (${r.conflicts.slice(0, 5).join(', ')}${r.conflicts.length > 5 ? ', …' : ''}). Keep one version (rename or remove yours); it comes in when the next sub-task finishes, and your publication fails until it does.`
+        : `${r.path} now includes a sub-task's data: ${r.added} new, ${r.modified} changed, ${r.deleted} removed file${r.deleted === 1 ? '' : 's'}.`;
       msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length, text });
     }
   }

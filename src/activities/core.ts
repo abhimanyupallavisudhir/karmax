@@ -120,6 +120,9 @@ import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { forkDevelopmentSources, forkRecordedAuthority, type ForkWorldSource } from '../world/fork.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
+
+/** A sub-task's task param: the versions of its parent's writable resources it starts from. */
+const PARENT_RESOURCES_PARAM = '_parentResources';
 import { syncLocalTarget, type LocalTargetSyncResult } from '../world/target-sync.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import { activateProjectRuntime, selectProjectEnvironment } from '../world/project-runtime.js';
@@ -1090,6 +1093,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   // state by reverting to the checkpoint. The restored world registers under the
   // same world id, so every later openWorld() (which re-resolves currentWorld via
   // ensureRunnerLease) transparently uses it.
+  /** The parent's resource versions a sub-task starts from: only versions of
+   * this project's own attachments count. */
+  async function parentResourceRevisions(projectId: string, taskId: string): Promise<Record<string, string>> {
+    const recorded = (await store.getTask(taskId))?.params?.[PARENT_RESOURCES_PARAM];
+    if (!recorded || typeof recorded !== 'object') return {};
+    const revisions: Record<string, string> = {};
+    for (const [attachmentId, revisionId] of Object.entries(recorded as Record<string, unknown>)) {
+      const revision = typeof revisionId === 'string' ? await store.getResourceRevision(revisionId) : undefined;
+      if (revision?.attachmentId === attachmentId && (await store.getResourceAttachment(attachmentId))?.projectId === projectId)
+        revisions[attachmentId] = revision.id;
+    }
+    return revisions;
+  }
+
   async function recoverVanishedWorld(handle: WorldHandle, taskId: string, cause: unknown): Promise<World | undefined> {
     if (!isRemote(handle.kind) || !deps.checkpoints) return undefined;
     // A finished task's world is deliberately gone. Without this guard a stray
@@ -1626,8 +1643,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 'The source checkpoint excludes unmanaged Git-ignored files. Recreate caches or attach required data as a project resource.'];
           }
           if (projectId && deps.resources) {
-            const revisions = Object.fromEntries((forkCheckpoint?.resources ?? [])
-              .map((resource) => [resource.attachmentId, resource.revisionId]));
+            // A sub-task starts from its parent's copy of each writable resource,
+            // saved when it was created (prepareChildTask), as it starts from its branch.
+            const revisions = { ...await parentResourceRevisions(projectId, args.taskId),
+              ...Object.fromEntries((forkCheckpoint?.resources ?? [])
+                .map((resource) => [resource.attachmentId, resource.revisionId])) };
             activitySignal?.throwIfAborted();
             world.handle = await timed('world.resources', () => deps.resources!.materialize(projectId, args.taskId, world, generation, revisions,
               { signal: activitySignal }));
@@ -3670,8 +3690,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } finally { clearInterval(pulse); }
     },
 
-    /** Merge into a parent's world what its sub-tasks published to the
-     * writable resources it forked. */
+    /** Bring into a parent's world what its sub-tasks handed it: their
+     * changes to the writable resources it forked, and their proposed output. */
     async refreshResourceForks(taskId: string): Promise<ResourceRefresh[]> {
       let context: ReturnType<typeof activityContext.current> | undefined;
       try { context = activityContext.current(); } catch { /* direct tests */ }
@@ -3680,7 +3700,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         catch { /* activity completion/cancellation */ }
       }, 5_000);
       try {
-        return (await deps.resources?.refreshForks(taskId, {
+        return (await deps.resources?.takeDeliveries(taskId, {
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
       } finally { clearInterval(pulse); }
     },
@@ -5658,6 +5678,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }));
         }
       }
+      // The parent's copies of its writable resources, saved for the child to
+      // start from, as its branch was pushed above.
+      const resourceRevisions = parentHandle && deps.resources ? await deps.resources.snapshotForks(parentHandle) : {};
       let idempotencyKey: string | undefined;
       try {
         const { info } = activityContext.current();
@@ -5673,6 +5696,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // The child's own agent fields first: its prompt and the parent's branch always win.
         params: { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
           [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
+          ...(Object.keys(resourceRevisions).length ? { [PARENT_RESOURCES_PARAM]: resourceRevisions } : {}),
           // Stored so a replacement run of this child, which is rebuilt from
           // its record, keeps the parent's profiles as this first run does.
           ...(args.profiles ? { profiles: args.profiles } : {}) },
