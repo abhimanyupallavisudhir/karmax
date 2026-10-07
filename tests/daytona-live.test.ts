@@ -42,6 +42,15 @@ describe.skipIf(!live)('Daytona live lifecycle', () => {
           capabilities: { experimentalApi: true } }), 120_000);
         rpc.notify('initialized');
         expect(await deadline(rpc.request('thread/list', { limit: 10 }))).toHaveProperty('data');
+        // Task #514: a Codex turn's thread/start carries the whole system
+        // prompt in one line, past Daytona's 64 KiB PTY frame limit. No model
+        // call is made until turn/start.
+        const developerInstructions = 'Context for the Daytona PTY framing regression (task 514).\n'.repeat(3000);
+        expect(Buffer.byteLength(developerInstructions)).toBeGreaterThan(128 * 1024);
+        const started = await deadline(rpc.request<any>('thread/start', { cwd: world.handle.root,
+          sandbox: 'danger-full-access', approvalPolicy: 'never', developerInstructions }), 120_000);
+        expect(started?.thread?.id).toBeTruthy();
+        expect(agent.lost).toBeUndefined();
       } finally { await agent.stop(); }
       expect(await checkCommand(world, 'echo', ['karmax-live-check'])).toContain('karmax-live-check');
       await world.writeFile('nested/live.txt', 'round-trip');
