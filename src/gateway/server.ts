@@ -33,7 +33,6 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
-import type { EvalResult } from '../domain/search.js';
 import type { ChildTaskSummary, KarmaxEvent, TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
@@ -308,7 +307,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     return scoped ? (read ? 'profile:read' : 'profile:write') : (read ? 'settings:read' : 'settings:write');
   }
   if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
-  if (p === '/api/search' && read) return 'none'; // each project is authorized in searchProjects
+  if (p === '/api/search' && read) return 'none'; // each project is authorized in searchEverywhere
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments' || p === '/api/files') return 'task:create';
   if (p === '/api/conversation-imports') return 'task:create';
@@ -4962,9 +4961,8 @@ export class Gateway {
       // ── search / organization (a view is a saved query) ──
       // The searchable-field registry the UI reads to build its filter/sort/group menus.
       if (p === '/api/search' && method === 'GET') {
-        const query = url.searchParams.get('q')?.trim() ?? '';
-        if (query.length > 2000) return this.json(res, 400, { error: 'Search is too long' });
-        return this.json(res, 200, await this.searchProjects(req, res, session, query));
+        if ((url.searchParams.get('q') ?? '').length > 2000) return this.json(res, 400, { error: 'Search is too long' });
+        return await this.searchEverywhere(res, session, url);
       }
       if (p === '/api/search/fields' && method === 'GET') return this.json(res, 200, (await api.searchFields(token)));
       const organizationSearch = p.match(/^\/api\/organizations\/([^/]+)\/search$/);
@@ -9457,22 +9455,19 @@ export class Gateway {
     return true;
   }
 
-  /** Global search visits only the projects the caller can read, resolved once:
-   *  a browser session's from its grants and memberships, authorized directly
-   *  (minting a token per project wrote tokens on every keystroke); a bearer's
-   *  from its own scope (UI-18/RQ-14). */
-  private async searchProjects(_req: http.IncomingMessage, res: http.ServerResponse, session: Session, query: string) {
-    const results: { projectId: string; tasks: EvalResult['tasks']; total: number }[] = [];
-    if (query.length < 2) return results;
-    const { api } = this.deps;
-    const member = this.searchMember(session);
-    for (const project of await this.searchableProjects(res, session)) {
-      if (res.destroyed) break;
-      const result = member ? await api.searchAuthorizedTasks(project.id, query, `user:${member}`)
-        : await api.searchTasks(session.apiToken, project.id, query);
-      results.push({ projectId: project.id, tasks: result.tasks.slice(0, 100), total: result.total });
-    }
-    return results;
+  /** One task list over every project the caller can read, in every
+   *  organization: a browser session's from its grants and memberships,
+   *  authorized directly (minting a token per project wrote tokens on every
+   *  keystroke); a bearer's from its own scope (UI-18/RQ-14). Sorted together
+   *  and paged like an organization's list. */
+  private async searchEverywhere(res: http.ServerResponse, session: Session, url: URL) {
+    const query = url.searchParams.get('q') ?? '';
+    const page = { limit: Number(url.searchParams.get('limit') ?? 200), offset: Number(url.searchParams.get('offset') ?? 0) };
+    const projects = await this.searchableProjects(res, session);
+    const principal = this.searchMember(session) ? `user:${this.searchMember(session)}`
+      : (await this.deps.tokens.verify(session.apiToken))?.principal;
+    if (!principal) return this.json(res, 401, { error: 'unauthorized' });
+    return this.json(res, 200, await this.deps.api.searchAuthorizedOrganization(projects, query, principal, page));
   }
 
   /** The organization task list: one query over every project of the

@@ -400,7 +400,8 @@ function parseRoute(url) {
   // Pre-organization URLs — resolved, then canonicalised to the org form.
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'insights', legacy: true };
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
-  if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', sub: seg[1] || null, legacy: true };
+  // The bell's page: what waits on you in every organization, so above them all.
+  if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', q, ...(seg[1] ? { legacy: true } : {}) };
   if (seg[0] === 'projects' && seg[1]) {
     const tab = PROJECT_SCOPED_TABS.includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
@@ -416,8 +417,8 @@ function parseRoute(url) {
   if (seg[1] === 'profile') return { name: 'profile', legacy: true };
   // Insights replaced the old Dashboard; keep its bookmarks working.
   if (seg[1] === 'dashboard') return { name: 'global', org, tab: 'insights', legacy: true };
-  // The inbox is the one org view with a sub-view (which kind of notification).
-  if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', org, tab: 'inbox', sub: seg[2] || null };
+  // The inbox was once one organization's, with a tab per kind of notification.
+  if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', tab: 'inbox', q, legacy: true };
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
   const tab = PROJECT_SCOPED_TABS.includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
@@ -516,12 +517,9 @@ function installationRoute() { return '/installation'; }
 // The profile belongs to the signed-in user, not to the selected organization.
 function profileRoute(userId) { return userId ? `/profile/${encodeURIComponent(userId)}` : '/profile'; }
 
-// The inbox pinned to one kind of notification: /<org>/inbox/<kind> ('all' is
-// the bare route). Which sub-tab you are on is part of the page, so it lives in
-// the URL like every other view; whether READ items show is a display
-// preference, so it lives in localStorage like the theme.
-function inboxRoute(filter = S.inboxFilter) {
-  return `${globalRoute('inbox')}${filter && filter !== 'all' ? `/${filter}` : ''}`;
+// The bell's page, /inbox: the Home list over every organization, its query in ?q=.
+function inboxRoute(q) {
+  return listRoute('/inbox', q ?? (S.searchScope === 'all' ? S.search : DEFAULT_LIST_QUERY));
 }
 
 // The URL we are on, query string included — the full identity of the current
@@ -625,14 +623,15 @@ async function applyRoute() {
     // Bare /<org> is the organization home: one task list over all its projects.
     if (r.tab === 'home' && S.organizationId) return applyHomeRoute(r, routeIsCurrent);
     if (r.tab === 'home') r.tab = 'insights'; // a workspace with no organization yet
+    if (r.tab === 'inbox') {
+      if (r.legacy) return go(inboxRoute(DEFAULT_LIST_QUERY), { replace: true });
+      return applyListRoute('inbox', 'all', r, routeIsCurrent);
+    }
     // Pre-org URLs (/dashboard, /organization, …) → rewrite to the org-prefixed
     // form below. Only redirect when the canonical path actually differs, so an
     // unresolvable slug renders instead of looping.
-    if (r.tab === 'inbox') {
-      S.inboxFilter = INBOX_TABS.some((tab) => tab.key === r.sub) ? r.sub : 'all';
-    }
     if (r.legacy) {
-      const dest = r.tab === 'inbox' ? inboxRoute() : globalRoute(r.tab);
+      const dest = globalRoute(r.tab);
       if (dest !== location.pathname) return go(dest, { replace: true });
     }
     closeTaskDom();
@@ -793,9 +792,13 @@ async function applyRoute() {
 // with the same query language, views and toolbar as a project list. The URL
 // owns its query exactly as it owns a project list's.
 async function applyHomeRoute(r, routeIsCurrent) {
+  return applyListRoute('home', `org:${S.organizationId}`, r, routeIsCurrent);
+}
+// A list over many projects: the organization home, or the bell's page over
+// every organization (scope 'all').
+async function applyListRoute(tab, scope, r, routeIsCurrent) {
   closeTaskDom();
-  S.tab = 'home';
-  const scope = `org:${S.organizationId}`;
+  S.tab = tab;
   const query = r.q ?? DEFAULT_LIST_QUERY;
   if (S.searchScope !== scope || S.search !== query) {
     S.search = query;
@@ -811,7 +814,7 @@ async function applyHomeRoute(r, routeIsCurrent) {
   const fields = S.fields.length || !readable ? null
     : api(`/api/search/fields?projectId=${encodeURIComponent(readable.id)}`).then((value) => { S.fields = value || []; }).catch(() => {});
   await Promise.all([runSearch().catch(() => {}), fields]);
-  if (!routeIsCurrent() || S.tab !== 'home') return;
+  if (!routeIsCurrent() || S.tab !== tab) return;
   renderMain();
 }
 
@@ -1529,7 +1532,7 @@ function prefillForkBranch(box, task) {
   const root = box.closest('#tf-body');
   const input = root?.querySelector('[data-field="base"]');
   const base = forkBranchDefaults(task, selectedDepIds().includes(task.id)).base;
-  if (!input || !base || (task.projectId && task.projectId !== S.projectId)) return;
+  if (!input || !base || (task.projectId && task.projectId !== (root.dataset.projectId || S.projectId))) return;
   input.value = base;
   input.dispatchEvent(new Event('change', { bubbles: true }));
   showForkWorldHelp(root);
@@ -2986,8 +2989,8 @@ async function fetchApi(path, opts = {}) {
 // Bytes are uploaded to the content-addressed store immediately, so task and
 // follow-up payloads carry only lightweight references. Images are provider-
 // native and previewable; ordinary files are materialized into the task world.
-async function uploadImage(file) {
-  const res = await feedbackFetch(`/api/attachments?projectId=${encodeURIComponent(S.projectId)}`, {
+async function uploadImage(file, projectId = S.projectId) {
+  const res = await feedbackFetch(`/api/attachments?projectId=${encodeURIComponent(projectId)}`, {
     method: 'POST',
     headers: { 'content-type': file.type || 'application/octet-stream', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
     body: file,
@@ -2997,8 +3000,8 @@ async function uploadImage(file) {
   return body; // ImageRef
 }
 
-async function uploadPromptFile(file) {
-  const res = await feedbackFetch(`/api/files?projectId=${encodeURIComponent(S.projectId)}`, {
+async function uploadPromptFile(file, projectId = S.projectId) {
+  const res = await feedbackFetch(`/api/files?projectId=${encodeURIComponent(projectId)}`, {
     method: 'POST',
     headers: {
       'content-type': file.type || 'application/octet-stream',
@@ -3027,8 +3030,8 @@ async function uploadConversationFile(file) {
   return body;
 }
 
-function attachmentUrl(id, name) {
-  const query = new URLSearchParams({ projectId: S.projectId });
+function attachmentUrl(id, name, projectId = S.projectId) {
+  const query = new URLSearchParams({ projectId });
   if (name) query.set('name', name);
   return `/api/attachments/${encodeURIComponent(id)}?${query}`;
 }
@@ -3047,12 +3050,12 @@ function assertCanAttachFile(file, current) {
     throw new Error('Attached files would exceed the 50 MB prompt limit');
 }
 
-function renderAttachmentChips(container, images = [], files = [], onChange) {
+function renderAttachmentChips(container, images = [], files = [], onChange, projectId = S.projectId) {
   if (!container) return;
   container.innerHTML = images
     .map(
       (ref, i) =>
-        `<span class="img-chip" title="${esc(ref.mediaType)} · ${Math.round((ref.bytes || 0) / 1024)} KB"><img src="${attachmentUrl(ref.id)}" alt="attachment"/><button class="img-chip-x" data-i="${i}" title="Remove">✕</button></span>`,
+        `<span class="img-chip" title="${esc(ref.mediaType)} · ${Math.round((ref.bytes || 0) / 1024)} KB"><img src="${attachmentUrl(ref.id, undefined, projectId)}" alt="attachment"/><button class="img-chip-x" data-i="${i}" title="Remove">✕</button></span>`,
     )
     .join('') + files.map((ref, i) =>
       `<span class="file-chip" title="${esc(ref.mediaType)} · ${formatAttachmentBytes(ref.bytes)}"><span class="file-chip-icon" aria-hidden="true">${ICON.form}</span><span class="file-chip-name">${esc(ref.name)}</span><span class="file-chip-size">${formatAttachmentBytes(ref.bytes)}</span><button class="file-chip-x" data-file-i="${i}" title="Remove ${esc(ref.name)}">✕</button></span>`,
@@ -3061,14 +3064,14 @@ function renderAttachmentChips(container, images = [], files = [], onChange) {
   container.querySelectorAll('.img-chip-x').forEach((b) =>
     b.addEventListener('click', () => {
       images.splice(Number(b.dataset.i), 1);
-      renderAttachmentChips(container, images, files, onChange);
+      renderAttachmentChips(container, images, files, onChange, projectId);
       if (onChange) onChange();
     }),
   );
   container.querySelectorAll('.file-chip-x').forEach((b) =>
     b.addEventListener('click', () => {
       files.splice(Number(b.dataset.fileI), 1);
-      renderAttachmentChips(container, images, files, onChange);
+      renderAttachmentChips(container, images, files, onChange, projectId);
       if (onChange) onChange();
     }),
   );
@@ -3076,7 +3079,8 @@ function renderAttachmentChips(container, images = [], files = [], onChange) {
 
 // Paste and drop accept both images and ordinary files. Images retain their
 // native preview/provider path; other uploads become files in the task world.
-function wirePromptAttachments(inputEl, getImages, getFiles, onChange) {
+// `projectOf()` names the project the task will be created in.
+function wirePromptAttachments(inputEl, getImages, getFiles, onChange, projectOf = () => S.projectId) {
   if (!inputEl || inputEl._imgWired) return;
   inputEl._imgWired = true;
   const ingest = async (files) => {
@@ -3084,10 +3088,10 @@ function wirePromptAttachments(inputEl, getImages, getFiles, onChange) {
     if (!selected.length) return false;
     for (const file of selected) {
       try {
-        if (file.type?.startsWith('image/')) getImages().push(await uploadImage(file));
+        if (file.type?.startsWith('image/')) getImages().push(await uploadImage(file, projectOf()));
         else {
           assertCanAttachFile(file, getFiles());
-          getFiles().push(await uploadPromptFile(file));
+          getFiles().push(await uploadPromptFile(file, projectOf()));
         }
         onChange();
       } catch (e) {
@@ -3115,7 +3119,7 @@ function wirePromptAttachments(inputEl, getImages, getFiles, onChange) {
   });
 }
 
-function wireAttachmentPicker(input, getImages, getFiles, onChange) {
+function wireAttachmentPicker(input, getImages, getFiles, onChange, projectOf = () => S.projectId) {
   if (!input || input._attachmentWired) return;
   input._attachmentWired = true;
   input.closest('label')?.addEventListener('keydown', (event) => {
@@ -3128,10 +3132,10 @@ function wireAttachmentPicker(input, getImages, getFiles, onChange) {
     input.value = '';
     for (const file of selected) {
       try {
-        if (file.type?.startsWith('image/')) getImages().push(await uploadImage(file));
+        if (file.type?.startsWith('image/')) getImages().push(await uploadImage(file, projectOf()));
         else {
           assertCanAttachFile(file, getFiles());
-          getFiles().push(await uploadPromptFile(file));
+          getFiles().push(await uploadPromptFile(file, projectOf()));
         }
         onChange();
       } catch (error) { toast(error.message, true); }
@@ -3367,7 +3371,7 @@ function resumeVisibleUpdates() {
     loadInbox().catch(() => {});
     if (S.selected) { S.liveOutput = {}; refreshTask(); refreshTaskHistory(S.selected); }
     else if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
-    else if (S.tab === 'home') scheduleHomeRefresh();
+    else if (isCrossProjectList()) scheduleHomeRefresh();
     else if (S.tab === 'activity') seedActivity();
   }
   checkConsoleRevision();
@@ -3635,7 +3639,8 @@ async function loadInbox() {
   S.announcedInbox = new Map(S.inbox.map((item) => [item.id, urgencyRank(item.urgency)]));
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
-  if (S.tab === 'inbox') bgRenderMain();
+  // The bell's page lists what the inbox says waits on you.
+  if (S.tab === 'inbox' && !S.selected) scheduleHomeRefresh();
 }
 
 function inboxEventChanges(ev) {
@@ -3810,20 +3815,22 @@ function markTaskCancelling(taskId) {
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
 async function runSearch() {
-  // The organization home searches every project of the organization; a project
-  // list (and a task page in it) searches that project.
-  const home = S.tab === 'home';
+  // The organization home searches every project of the organization, the
+  // bell's page every organization; a project list (and a task page in it)
+  // searches that project.
+  const home = isCrossProjectList();
   const organizationId = S.organizationId;
   const projectId = S.projectId;
-  if (home ? !organizationId : !projectId) return false;
-  const scope = home ? `org:${organizationId}` : projectId;
-  const isCurrent = () => (S.tab === 'home' ? `org:${S.organizationId}` : S.projectId) === scope;
+  const scopeOf = () => (S.tab === 'inbox' ? 'all' : S.tab === 'home' ? `org:${S.organizationId}` : S.projectId);
+  const scope = scopeOf();
+  if (S.tab === 'home' ? !organizationId : S.tab !== 'inbox' && !projectId) return false;
+  const isCurrent = () => scopeOf() === scope;
   const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
   S.searchPending = true;
   try {
-    const r = await api(home
-      ? `/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent(q)}`
+    const r = await api(scope === 'all' ? `/api/search?q=${encodeURIComponent(q)}`
+      : home ? `/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent(q)}`
       : `/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`);
     if (S.searchEpoch !== epoch || !isCurrent()) return false;
     // Rows of other projects have no live copy in S.tasks (the open project's).
@@ -3862,12 +3869,17 @@ async function runSearch() {
 function syncQueryUrl() {
   if (!isTaskListTab() || S.selected) return; // only the list is query-driven
   if (S.tab === 'tasks' && !S.projectId) return;
-  const path = S.tab === 'home' ? homeRoute() : projectRoute(S.projectId);
+  const path = S.tab === 'inbox' ? inboxRoute() : S.tab === 'home' ? homeRoute() : projectRoute(S.projectId);
   if (path !== currentPath()) history.replaceState({ kx: 1 }, '', path);
 }
 
-// The query-driven task lists: a project's, and the organization home.
-function isTaskListTab(tab = S.tab) { return tab === 'tasks' || tab === 'home'; }
+// The query-driven task lists: a project's, the organization home, and the
+// bell's page over every organization.
+function isTaskListTab(tab = S.tab) { return tab === 'tasks' || isCrossProjectList(tab); }
+// The lists whose rows come from many projects (and so name theirs).
+function isCrossProjectList(tab = S.tab) {
+  return tab === 'home' || tab === 'inbox';
+}
 
 let searchDebounce = null;
 function scheduleSearch(background = false) {
@@ -4051,15 +4063,16 @@ function homeEventChangesList(ev) {
   if (!(ev.type === 'view.updated' || ev.type === 'task.stage' || ev.type === 'task.mentioned'
     || ev.type === 'task.created' || ev.type === 'task.deleted' || LIST_RELOAD_EVENTS.has(ev.type))) return false;
   const project = projectById(ev.projectId || ev.payload?.projectId);
-  return !project || project.organizationId === S.organizationId;
+  return S.tab === 'inbox' || !project || project.organizationId === S.organizationId;
 }
+// Coalesced re-search of the list over many projects (Home or the bell's page).
 function scheduleHomeRefresh() {
   if (homeRefreshTimer) return;
   homeRefreshTimer = setTimeout(async () => {
     homeRefreshTimer = null;
-    if (S.tab !== 'home' || S.selected) return;
+    if (!isCrossProjectList() || S.selected) return;
     await runSearch();
-    if (S.tab === 'home' && !S.selected) bgRenderMain();
+    if (isCrossProjectList() && !S.selected) bgRenderMain();
   }, HOME_REFRESH_MS);
 }
 
@@ -4154,7 +4167,7 @@ function connectWs() {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
-    if (S.tab === 'home' && !S.selected && homeEventChangesList(ev)) scheduleHomeRefresh();
+    if (isCrossProjectList() && !S.selected && homeEventChangesList(ev)) scheduleHomeRefresh();
     if (inboxEventChanges(ev)) scheduleInboxReload();
     if (ev.type.startsWith('credential.approval-') && refreshVaultRequests) refreshVaultRequests().catch?.(() => {});
   };
@@ -4252,8 +4265,8 @@ async function refreshTasks() {
     do {
       taskRefreshQueued = false;
       try {
-        // The home's rows come from its organization search alone.
-        if (S.tab === 'home') { if (!S.selected) { await runSearch(); bgRenderMain(); } continue; }
+        // A list over many projects has its rows from its search alone.
+        if (isCrossProjectList()) { if (!S.selected) { await runSearch(); bgRenderMain(); } continue; }
         await loadTasks();
         if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
         if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
@@ -4517,13 +4530,10 @@ function renderShell() {
       ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <button class="global-search-trigger" id="topbar-search" title="${esc(commandHint('Search tasks and projects across your workspace', 'nav.globalSearch'))}" aria-haspopup="dialog">
-        <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
-      </button>
       <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
       <button class="icon-btn" id="topbar-help" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">?</button>
       <a class="topbar-user" id="topbar-user" data-spa href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
-      <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
+      <a class="icon-btn has-badge" id="bell" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
     <div class="body">
@@ -4532,9 +4542,6 @@ function renderShell() {
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
-  // Project-scoped query/filtering lives in the task list. The topbar finder is
-  // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
-  $('#topbar-search').addEventListener('click', openGlobalSearch);
   $('#topbar-palette').addEventListener('click', openPalette);
   $('#topbar-help').addEventListener('click', openHelp);
   wireVerificationBanner();
@@ -4973,7 +4980,7 @@ function dropFolder(row) {
 function switchTab(tab) {
   if (tab === 'insights') return go(globalRoute('insights'));
   if (tab === 'global' || tab === 'organization') return go(globalRoute('organization'));
-  if (tab === 'inbox') return go(globalRoute('inbox'));
+  if (tab === 'inbox') return go(inboxRoute(DEFAULT_LIST_QUERY));
   const pid = S.projectId || firstProjectForOrganization(S.organizationId)?.id;
   return go(pid ? projectRoute(pid, tab) : globalRoute('insights'));
 }
@@ -5114,7 +5121,6 @@ function renderMain() {
   else if (S.tab === 'queue') content = queuesView();
   else if (S.tab === 'activity') content = activityView();
   else if (S.tab === 'insights') content = insightsView();
-  else if (S.tab === 'inbox') content = inboxView();
   else if (S.tab === 'organization') content = organizationView();
   else if (S.tab === 'installation') content = installationView();
   else if (S.tab === 'wiki') content = wikiView(proj);
@@ -5140,7 +5146,6 @@ function renderMain() {
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'insights') { wireInsights(); renderInsights(); }
-  if (S.tab === 'inbox') wireInboxView();
   if (S.tab === 'profile') wireProfileView();
   if (S.tab === 'organization') { hydrateOrganizationView(); wireGlobalSettings(S.organizationId); }
   if (S.tab === 'installation') wireInstallationSettings();
@@ -5215,7 +5220,7 @@ function viewIdForQuery(q) {
 // to delete). Saved views belong to a project, so the organization home has none.
 function viewsBar() {
   const active = viewIdForQuery(S.search);
-  const home = S.tab === 'home';
+  const home = isCrossProjectList();
   const builtins = BUILTIN_VIEWS
     .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
     .join('');
@@ -5321,9 +5326,12 @@ function wireQueryToolbar(root, prefix, { get, set }) {
 
 function tasksView() {
   const r = S.searchResult;
-  // The organization home lists every project's tasks: rows name their project,
-  // and new tasks are created inside a project, so it has no composer.
+  // The organization home lists every project's tasks, rows naming their
+  // project, and creates tasks in any of them. The bell's page lists every
+  // organization's: rows name organization and project, and it creates nothing.
   const home = S.tab === 'home';
+  const everywhere = S.tab === 'inbox';
+  const across = home || everywhere;
   // Runs (spawned from a repeatable series) are grouped under their series row,
   // not shown at the top level. Build the lookup once for taskRow/seriesRow, and
   // hide runs from every list surface (flat + grouped) below.
@@ -5341,14 +5349,15 @@ function tasksView() {
   // Fallback (before the first result lands) filters client-side and drops archived to match.
   // Before the first result the open project's rows are a fair preview of a text
   // search, but not of a structured one (for:, status:…) nor of the home's.
-  const preview = !home && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
+  const preview = !across && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
   const flat = (r
     ? r.tasks
     : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)) : []
   ).filter(topLevel);
-  const row = (t, opts = {}) => taskRow(t, { ...opts, ...(home ? { showTags: false, project: true } : {}) });
+  const row = (t, opts = {}) => taskRow(t, { ...opts, ...(across ? { showTags: false, project: true } : {}) });
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
+  const notices = inboxNoticesHtml();
   let body;
   if (groups) {
     body = r.hierarchical
@@ -5367,15 +5376,17 @@ function tasksView() {
     ? `<div class="empty"><div class="big">Search didn’t run</div>Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button></div>`
     : !r && S.searchPending ? ''
     : viewIdForQuery(S.search) === FOR_ME_VIEW
-      ? `<div class="empty for-me-empty"><div class="big">All clear</div>Nothing is waiting on you.</div>`
+      ? (notices ? '' : `<div class="empty for-me-empty"><div class="big">All clear</div>Nothing is waiting on you.</div>`)
     : S.search
       ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
       // Done and cancelled tasks archive themselves, so an empty default list
       // does not mean the project has never had a task.
-      : `<div class="empty"><div class="big">No open tasks</div>${home ? '' : 'Describe one above. '}Finished tasks move to 🗄 Archived.</div>`;
-  const composer = home ? '' : `
+      : `<div class="empty"><div class="big">No open tasks</div>${everywhere || (home && !newTaskProjectId()) ? '' : 'Describe one above. '}Finished tasks move to 🗄 Archived.</div>`;
+  // Home creates in one of its projects; with none yet there is nowhere to put a task.
+  const composer = everywhere || (home && !newTaskProjectId()) ? '' : `
     <div class="composer">
       <div class="quick-task-field">
+        ${home ? projectPickerHtml('new-task-project', newTaskProjectId()) : ''}
         <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
         <label class="btn soft icon-only attach-composer quick-task-attach" tabindex="0" title="Attach files (25 MB each)" aria-label="Attach files">${ICON.attach}<input id="new-task-files" type="file" multiple hidden></label>
       </div>
@@ -5384,7 +5395,7 @@ function tasksView() {
       <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
     <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>`;
-  const trailing = home ? projectFilterHtml()
+  const trailing = everywhere ? '' : home ? projectFilterHtml()
     : `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`;
   return `${composer}
     <div class="organizer">
@@ -5401,7 +5412,7 @@ function tasksView() {
     <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
       <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
     </div>
-    ${body || empty}`;
+    ${notices}${body || empty}`;
 }
 
 // The organization home's project filter: a `project:` clause in the query, so
@@ -5448,9 +5459,102 @@ function attentionChip(t) {
   const [label, title] = (kind === 'escalated' && HOLD_REASONS[t.lastView?.waitingFor?.reason]) || ATTENTION_REASONS[kind];
   return `<span class="chip attention ${esc(kind)}" title="${esc(title)}">${esc(label)}</span>`;
 }
-function projectChip(t) {
-  const project = projectById(t.projectId);
-  return project ? `<span class="chip task-project" title="Project">${esc(projectPath(project))}</span>` : '';
+// A row's project as a slug — `project` within an organization, `org/project`
+// on the bell's page, whose rows span every organization. A label, not a status:
+// plain monospace, no chip. The full names are its tooltip.
+function projectLabel(t) {
+  const project = projectById(t.projectId) || S.searchResult?.projects?.find((p) => p.id === t.projectId);
+  if (!project) return '';
+  const org = S.tab === 'inbox' ? organizationById(project.organizationId) : null;
+  const name = projectPath(project) || project.name;
+  return `<span class="task-project" title="${esc(org ? `${org.name} › ${name}` : name)}">${org ? `<span class="task-project-org">${esc(orgSlug(org))}/</span>` : ''}${esc(project.slug || projectSlug(project))}</span>`;
+}
+
+// Where a new task created on an organization's Home goes: the project its
+// query names, else the one last chosen for a new task there, else the project
+// you were last in. A choice is remembered per organization, in this browser.
+const NEW_TASK_PROJECT_KEY = 'karmax-new-task-project';
+function newTaskProjectId(organizationId = S.organizationId) {
+  const inOrganization = (id) => (projectById(id)?.organizationId === organizationId ? id : null);
+  const named = S.tab === 'home' ? queryProjectSlug(S.search) : '';
+  const fromQuery = named && (S.projects || []).find((p) => p.organizationId === organizationId && projectSlug(p) === named)?.id;
+  let remembered = null;
+  try { remembered = JSON.parse(localStorage.getItem(NEW_TASK_PROJECT_KEY) || '{}')[organizationId]; } catch {}
+  return fromQuery || inOrganization(remembered) || inOrganization(S.projectId) || firstProjectForOrganization(organizationId)?.id || null;
+}
+function rememberNewTaskProject(projectId) {
+  const organizationId = projectById(projectId)?.organizationId;
+  if (!organizationId) return;
+  try {
+    const chosen = JSON.parse(localStorage.getItem(NEW_TASK_PROJECT_KEY) || '{}') || {};
+    localStorage.setItem(NEW_TASK_PROJECT_KEY, JSON.stringify({ ...chosen, [organizationId]: projectId }));
+  } catch {}
+}
+
+// The project a new task is created in, as its slug: a menu of the
+// organization's projects when there is a choice to make, else just the label.
+const CHEVRON = '<svg class="project-pick-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
+function projectPickerHtml(id, projectId, editable = true) {
+  const project = projectById(projectId);
+  if (!project) return '';
+  const label = (p) => `<span class="task-project">${esc(projectSlug(p))}</span>`;
+  const choices = editable ? (S.projects || []).filter((p) => p.organizationId === project.organizationId) : [];
+  if (choices.length < 2) return `<span class="project-pick static" id="${esc(id)}" title="${esc(projectPath(project))}">${label(project)}</span>`;
+  return `<span class="project-pick-wrap">
+    <button type="button" class="project-pick" id="${esc(id)}" data-project="${esc(project.id)}" aria-haspopup="listbox" aria-expanded="false" title="Project: ${esc(projectPath(project))}">${label(project)}${CHEVRON}</button>
+    <div class="project-pick-menu" role="listbox" aria-label="Project" hidden>
+      ${choices.length > 8 ? '<input class="project-pick-filter" placeholder="Find a project…" aria-label="Find a project" autocomplete="off" spellcheck="false">' : ''}
+      ${choices.map((p) => `<button type="button" class="project-pick-opt" role="option" data-project="${esc(p.id)}" aria-selected="${p.id === project.id}" title="${esc(projectPath(p))}">${label(p)}</button>`).join('')}
+    </div>
+  </span>`;
+}
+// `onPick(projectId)` runs when another project is chosen.
+function wireProjectPicker(button, onPick) {
+  const wrap = button?.closest('.project-pick-wrap');
+  const menu = wrap?.querySelector('.project-pick-menu');
+  if (!menu) return;
+  const filter = menu.querySelector('.project-pick-filter');
+  const options = () => [...menu.querySelectorAll('.project-pick-opt:not([hidden])')];
+  const outside = (event) => { if (!wrap.contains(event.target)) close(false); };
+  const close = (refocus) => {
+    menu.hidden = true;
+    button.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('pointerdown', outside, true);
+    if (refocus) button.focus();
+  };
+  const open = () => {
+    menu.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    document.addEventListener('pointerdown', outside, true);
+    (filter || menu.querySelector('[aria-selected="true"]') || options()[0])?.focus();
+  };
+  button.addEventListener('click', () => (menu.hidden ? open() : close(true)));
+  button.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowDown' && menu.hidden) { event.preventDefault(); open(); }
+  });
+  menu.addEventListener('click', (event) => {
+    const option = event.target.closest('.project-pick-opt');
+    if (!option) return;
+    close(true);
+    if (option.dataset.project !== button.dataset.project) onPick(option.dataset.project);
+  });
+  menu.addEventListener('keydown', (event) => {
+    const list = options();
+    const at = list.indexOf(document.activeElement);
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(true); }
+    else if (event.key === 'Tab') close(false);
+    else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && list.length) {
+      event.preventDefault();
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      list[at < 0 ? (step > 0 ? 0 : list.length - 1) : (at + step + list.length) % list.length].focus();
+    } else if (event.key === 'Enter' && document.activeElement === filter) { event.preventDefault(); list[0]?.click(); }
+  });
+  filter?.addEventListener('input', () => {
+    const query = filter.value.trim().toLowerCase();
+    menu.querySelectorAll('.project-pick-opt').forEach((option) => {
+      option.hidden = !!query && !`${option.textContent} ${option.title}`.toLowerCase().includes(query);
+    });
+  });
 }
 
 function tagGroupHtml(group, keep, depth = 0) {
@@ -5576,7 +5680,7 @@ function runSubRow(r) {
 function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
-  const where = project ? projectChip(t) : '';
+  const where = project ? projectLabel(t) : '';
   if (t.params?.repeatable && !archived) return seriesRow(t);
   if (t.params?.triggerState === 'armed' && !archived) {
     return `
@@ -5622,7 +5726,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
     ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
     : `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
   return `
-    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
+    <div class="task-row ${archived ? 'archived' : ''}${taskHasUnreadAsk(t.id) ? ' unread' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
@@ -5994,7 +6098,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
       <span class="status-dot ${status}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}</div>
-        <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectChip(t) : ''}<span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
+        <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}<span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
     </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
@@ -6245,10 +6349,11 @@ function wireTasksView() {
       openTagsManager(button.dataset.editTag);
     }),
   );
-  const home = S.tab === 'home';
+  const home = isCrossProjectList();
   $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => wireTaskNav(e, () => e.dataset.id));
-  // On the organization home a draft or armed row may belong to any project: it
-  // opens on its own project's page rather than in a form bound to this one.
+  // On the organization home (and the bell's page) a draft or armed row may
+  // belong to any project: it opens on its own project's page rather than in a
+  // form bound to this one.
   if (home) $('#main').querySelectorAll('[data-draft], [data-armed]').forEach((e) => wireTaskNav(e, () => e.dataset.draft || e.dataset.armed));
   else $('#main').querySelectorAll('[data-draft]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, taskRecord(e.dataset.draft)); }),
@@ -6313,14 +6418,36 @@ function wireTasksView() {
   );
   $('#retry-search')?.addEventListener('click', async () => { await runSearch(); renderMain(); });
   $('#q-project')?.addEventListener('change', (e) => setQuery(setProjectClause(S.search, e.target.value)));
-  if (!home) wireQuickComposer();
+  if (S.tab !== 'inbox') wireQuickComposer();
+  wireInboxNotices();
   // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
   applyCursor();
   $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 
-// The quick composer above a project's list.
+// The quick composer above a project's list, and above the organization home,
+// where it creates the task in the project its picker shows.
 function wireQuickComposer() {
+  const home = S.tab === 'home';
+  let projectId = home ? newTaskProjectId() : S.projectId;
+  const pick = (next) => {
+    projectId = next;
+    rememberNewTaskProject(next);
+    const wrap = $('#new-task-project')?.closest('.project-pick-wrap');
+    if (wrap) wrap.outerHTML = projectPickerHtml('new-task-project', next);
+    wireProjectPicker($('#new-task-project'), pick);
+    // Attachments are uploaded into a project; they cannot follow the task elsewhere.
+    if (S.newTaskImages?.length || S.newTaskFiles?.length) {
+      S.newTaskImages = [];
+      S.newTaskFiles = [];
+      paintQuickAttachments();
+      toast('Attachments removed — attach them again for this project');
+    }
+    requestTaskFormDefaults(next, QUICK_TASK_WORKFLOW);
+    $('#new-task')?.focus();
+  };
+  wireProjectPicker($('#new-task-project'), pick);
+  const openForm = () => openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task').value.trim(), undefined, { projectId });
   const add = async (draft = false) => {
     const input = $('#new-task');
     const title = input.value.trim();
@@ -6336,7 +6463,7 @@ function wireQuickComposer() {
     };
     setBusy(true);
     try {
-      const created = await api(`/api/projects/${S.projectId}/tasks`, {
+      const created = await api(`/api/projects/${projectId}/tasks`, {
         method: 'POST',
         body: JSON.stringify(quickTaskPayload(title, images, draft, files)),
       });
@@ -6346,7 +6473,7 @@ function wireQuickComposer() {
       renderAttachmentChips($('#new-task-chips'), S.newTaskImages, S.newTaskFiles);
       // A started task works on its own, so "For me" does not list it: the
       // toast is the way to it.
-      const url = !draft && created?.id ? taskUrl(created.id, { ...created, projectId: created.projectId || S.projectId }) : '';
+      const url = !draft && created?.id ? taskUrl(created.id, { ...created, projectId: created.projectId || projectId }) : '';
       toast(draft ? 'Draft saved' : 'Task created', false, url ? { label: 'Open', fn: () => spaNavigate(url) } : undefined);
       await refreshTasks();
     } catch (e) {
@@ -6370,21 +6497,21 @@ function wireQuickComposer() {
     e.stopPropagation();
     if (mode === 'draft') add(true);
     else if (mode === 'add') add(false);
-    else openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task').value.trim());
+    else openForm();
   });
   // Paste, choose, or drag files into the quick-add box.
   if (!S.newTaskImages) S.newTaskImages = [];
   if (!S.newTaskFiles) S.newTaskFiles = [];
-  const paintQuickAttachments = () => renderAttachmentChips($('#new-task-chips'), S.newTaskImages, S.newTaskFiles);
-  wirePromptAttachments($('#new-task'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments);
-  wireAttachmentPicker($('#new-task-files'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments);
+  function paintQuickAttachments() { renderAttachmentChips($('#new-task-chips'), S.newTaskImages, S.newTaskFiles, undefined, projectId); }
+  wirePromptAttachments($('#new-task'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments, () => projectId);
+  wireAttachmentPicker($('#new-task-files'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments, () => projectId);
   paintQuickAttachments();
   // Opening the full form via "More" carries over whatever was typed in the
   // quick-add box into the software-dev prompt.
-  $('#expand-task')?.addEventListener('click', () => openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task').value.trim()));
+  $('#expand-task')?.addEventListener('click', openForm);
   // Hide the defaultBranch/settings round-trip behind the time the user spends
   // reading or typing in the quick composer.
-  requestTaskFormDefaults(S.projectId, QUICK_TASK_WORKFLOW);
+  if (projectId) requestTaskFormDefaults(projectId, QUICK_TASK_WORKFLOW);
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
 const QUICK_TASK_WORKFLOW = 'software-dev';
@@ -6800,7 +6927,7 @@ function taskFormLoadingPage(project, draft) {
     <div class="tf-head"><div class="tf-head-inner">
       <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
       <h2>${taskFormTitle(draft)}</h2>
-      ${project ? `<span class="tf-crumb">in ${esc(project.name)}</span>` : ''}
+      ${project ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', project.id, false)}` : ''}
     </div></div>
     <div class="tf-loading" role="status"><span class="global-search-loading">Loading task form…</span></div>
   </div>`;
@@ -6814,6 +6941,7 @@ let activeFormToken = null;
 let activeTaskFormKeyController = null;
 // `page`: the form is a draft's own task page (see showDraftPage), so leaving it
 // leaves the task, and running the draft reveals its live task page.
+// `projectId`: the project a new task is created in (default: the open one).
 async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const page = !!opts?.page;
   activeTaskFormKeyController?.abort();
@@ -6823,7 +6951,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // mid-edit. Pin the project NOW: every later write (auto-save flush, submit)
   // must land in the project the form was opened in, not wherever S.projectId
   // points by the time the async chain runs.
-  const projectId = S.projectId;
+  const projectId = draft?.projectId || opts?.projectId || S.projectId;
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   // The prompt/consuming field (a textarea) hosts pasted-image chips inside its
@@ -6911,7 +7039,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         <div class="tf-head-inner">
           <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
           <h2>${taskFormTitle(draft)}</h2>
-          ${proj ? `<span class="tf-crumb">in ${esc(proj.name)}</span>` : ''}
+          ${proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
             ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
           </nav>` : ''}
@@ -6920,7 +7048,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         </div>
       </div>
       <div class="tf-scroll">
-        <div class="tf-columns parameter-fields" id="tf-body">
+        <div class="tf-columns parameter-fields" id="tf-body" data-project-id="${esc(projectId)}">
           <div class="tf-main">
             ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
             ${agentFields.map((f) => `<section class="tf-section tf-${esc(f.type)}">${agentSectionHtml(f)}</section>`).join('')}
@@ -7000,6 +7128,26 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       toast(error.message, true);
     }
   });
+  // Another project: the same form there, with what you wrote. Its settings
+  // are that project's defaults; the draft auto-save made here moves with you.
+  wireProjectPicker($('#tf-project'), async (nextProjectId) => {
+    const promptName = consumingField(fields)?.name;
+    const carried = promptName ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(promptName)}"]`)?.value || '' : '';
+    const hadAttachments = formImages.length + formFiles.length > 0;
+    clearTimeout(saveTimer);
+    rememberNewTaskProject(nextProjectId);
+    releaseFormKeys();
+    await saveChain;
+    if (draftId) {
+      const autoSaved = draftId;
+      draftId = null;
+      await api(`/api/tasks/${autoSaved}`, { method: 'DELETE' }).catch(() => {});
+      removeDeletedTaskLocally(autoSaved);
+    }
+    // Attachments are uploaded into a project; they cannot follow the task elsewhere.
+    if (hadAttachments) toast('Attachments removed — attach them again for this project');
+    openTaskForm(wf, undefined, carried.trim(), undefined, { projectId: nextProjectId });
+  });
   $('#tf-close').addEventListener('click', () => closeForm());
   // The other agents' Authorization rows start from the main agent's, live.
   const mainAuthority = () => ({
@@ -7068,11 +7216,11 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // Repaint chips and (unless first paint) auto-save — attaching a file fires no
   // 'input' event, so the debounced auto-save wouldn't otherwise pick it up.
   // `autoSaveSoon` is a hoisted declaration further down this same scope.
-  const paintFormChips = (save) => { renderAttachmentChips($('#tf-chips'), formImages, formFiles, () => autoSaveSoon()); if (save) autoSaveSoon(); };
+  const paintFormChips = (save) => { renderAttachmentChips($('#tf-chips'), formImages, formFiles, () => autoSaveSoon(), projectId); if (save) autoSaveSoon(); };
   $('#tf-body')
     .querySelectorAll('textarea, input[type="text"], input:not([type])')
-    .forEach((el) => wirePromptAttachments(el, () => formImages, () => formFiles, () => paintFormChips(true)));
-  wireAttachmentPicker($('#tf-files'), () => formImages, () => formFiles, () => paintFormChips(true));
+    .forEach((el) => wirePromptAttachments(el, () => formImages, () => formFiles, () => paintFormChips(true), () => projectId));
+  wireAttachmentPicker($('#tf-files'), () => formImages, () => formFiles, () => paintFormChips(true), () => projectId);
   // Typing "[[" in the prompt references wiki pages/labels/folders in the task context.
   const promptTa = $('#tf-body')?.querySelector('textarea[data-field="prompt"]');
   if (promptTa) wireWikiMention(promptTa, projectId);
@@ -7958,6 +8106,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     await new Promise((resolve) => setTimeout(resolve, TASK_WALK_SETTLE_MS));
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
   }
+  markTaskAsksRead(taskId);
   if (rec?.params?.repeatable) {
     await renderSeriesPage(rec);
     return;
@@ -18156,11 +18305,14 @@ function wireGlobalSettings(organizationId) {
 }
 
 // ── inbox + collaboration ───────────────────────────────────────────────────
+// The bell counts new asks — in every organization — until you open them. Its
+// page is the Home list over every organization (see tasksView); an ask is read
+// once you open its task (markTaskAsksRead) or the notice itself.
 function updateBell() {
   syncNotificationAlerts();
   const badge = $('#bell-badge');
   if (!badge) return;
-  const n = inboxUnreadCount('all');
+  const n = inboxUnreadCount();
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
   $('#bell')?.classList.toggle('active', S.tab === 'inbox');
@@ -18170,44 +18322,34 @@ function markInboxItemReadLocally(item) {
   item.unread = false;
   updateBell();
 }
-// The inbox is one list of live asks, split by what is being asked. Every kind
-// the server can route has a stable sub-tab, even when that tab is empty.
-const INBOX_TABS = [
-  { key: 'approval-requested', label: 'Approvals' },
-  { key: 'review-requested', label: 'Review' },
-  { key: 'escalated', label: 'Needs input' },
-  { key: 'assigned', label: 'Assigned' },
-  { key: 'mentioned', label: 'Mentions' },
-  { key: 'update', label: 'Updates' },
-];
+// Routine updates (outcomes of tasks you follow) never count toward the badge.
+function inboxUnreadCount() {
+  return (S.inbox || []).filter((item) => item.unread && item.kind !== 'update').length;
+}
+function taskHasUnreadAsk(taskId) {
+  return (S.inbox || []).some((item) => item.unread && item.kind !== 'update' && item.taskId === taskId);
+}
+// Opening a task reads everything the inbox says about it.
+function markTaskAsksRead(taskId) {
+  const items = (S.inbox || []).filter((item) => item.unread && item.taskId === taskId);
+  if (!items.length) return;
+  for (const item of items) item.unread = false;
+  // An inbox fetch already in flight predates this; it must not mark them unread again.
+  S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
+  updateBell();
+  const byOrganization = new Map();
+  for (const item of items) byOrganization.set(item.organizationId, [...(byOrganization.get(item.organizationId) || []), item]);
+  for (const [organizationId, unread] of byOrganization) {
+    api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`, { method: 'PATCH', body: JSON.stringify({ ids: unread.map((item) => item.id) }) })
+      .catch(() => { for (const item of unread) item.unread = true; updateBell(); });
+  }
+}
 // How loudly an ask asks (domain/types.ts). Ascending, so the index is the sort
 // rank; an unrecognized level reads as 'normal' rather than sinking to the floor.
 const URGENCY_LEVELS = ['low', 'normal', 'high', 'critical'];
 function urgencyRank(urgency) {
   const rank = URGENCY_LEVELS.indexOf(urgency);
   return rank < 0 ? URGENCY_LEVELS.indexOf('normal') : rank;
-}
-// Read items are hidden by default — an answered notification should stop taking
-// up space. A per-browser display choice, like the theme (see renderFlag).
-function inboxShowRead() { return renderFlag('karmax-inbox-show-read', false); }
-// Routine updates have their own stream; All is the combined attention queue.
-function inboxItemMatchesFilter(item, filter = S.inboxFilter) {
-  return filter === 'all' ? item.kind !== 'update' : item.kind === filter;
-}
-function inboxUnreadCount(filter = S.inboxFilter) {
-  return S.inbox.filter((item) => item.unread && inboxItemMatchesFilter(item, filter)).length;
-}
-// Urgency first, recency second — the same order the server returns, restated
-// here so the list is right even when a row is patched in place client-side.
-function inboxItems() {
-  const showRead = inboxShowRead();
-  return S.inbox.filter((item) => (showRead || item.unread)
-    && inboxItemMatchesFilter(item))
-    .sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency) || b.createdAt - a.createdAt);
-}
-function inboxTabs() {
-  return [{ key: 'all', label: 'All', unread: inboxUnreadCount('all') }].concat(
-    INBOX_TABS.map((tab) => ({ ...tab, unread: inboxUnreadCount(tab.key) })));
 }
 // What a row is about. An ask names itself ("review requested"); an update's
 // news is the outcome it is reporting, so it names the task's status instead.
@@ -18234,96 +18376,36 @@ function urgencyChip(urgency) {
   const level = URGENCY_LEVELS[urgencyRank(urgency)];
   return `<span class="urgency-chip ${level}" aria-label="${level} priority"><span class="priority-bars" aria-hidden="true">${'▮'.repeat(urgencyRank(level) + 1)}</span> ${level}</span>`;
 }
-function inboxTimeLabel(ts, now = Date.now()) {
-  const date = new Date(ts);
-  const today = new Date(now);
-  const yesterday = new Date(now);
-  yesterday.setDate(today.getDate() - 1);
-  if (date.toDateString() === yesterday.toDateString()) return 'yesterday';
-  if (date.toDateString() !== today.toDateString()) {
-    return date.toLocaleDateString(undefined, {
-      month: 'short', day: 'numeric', ...(date.getFullYear() !== today.getFullYear() ? { year: 'numeric' } : {}),
-    });
-  }
-  const minutes = Math.max(0, Math.floor((now - ts) / 60000));
-  if (minutes < 1) return 'just now';
-  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours} hour${hours === 1 ? '' : 's'} ago`;
-}
 
-function inboxProjectLabel(item) {
-  const projectId = item.task?.projectId || item.resource?.projectId || item.subject?.projectId;
-  return S.projects?.find((project) => project.id === projectId)?.name || '';
+// Asks that are not a task's — a sign-in to renew, storage over its limit, an
+// Avatar or resource to approve — head the bell's For me list.
+function inboxNotices() {
+  return (S.inbox || []).filter((item) => item.actionable && item.kind !== 'update' && !item.taskId && !item.task)
+    .sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency) || b.createdAt - a.createdAt);
 }
-
-function inboxView() {
-  const items = inboxItems();
-  return `<h1 class="page-title">Inbox</h1>
-    <div class="tabs inbox-tabs">${inboxTabs().map((tab) => `<a class="tab${S.inboxFilter === tab.key ? ' active' : ''}" data-spa href="${inboxRoute(tab.key)}">${tab.label}${tab.unread ? `<span class="pill">${tab.unread}</span>` : ''}</a>`).join('')}</div>
-    ${S.inboxFilter === 'update' ? '<p class="task-sub">Outcomes of tasks you follow. Updates do not count toward the bell badge.</p>' : ''}
-    <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
-      <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
-      <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
-    <div class="inbox-list">${items.length ? items.map((item) => `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.title || item.task?.title || 'Notification')}">
-      <span class="status-dot ${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}" title="${esc(item.task?.status || (item.actionable ? 'waiting' : 'done'))}"></span>
+function inboxNoticesHtml() {
+  if (S.tab !== 'inbox' || viewIdForQuery(S.search) !== FOR_ME_VIEW) return '';
+  return inboxNotices().map((item) => {
+    const projectId = item.resource?.projectId || item.subject?.projectId;
+    const organization = organizationById(item.organizationId);
+    const where = (projectId && projectLabel({ projectId }))
+      || (organization ? `<span class="task-project" title="${esc(organization.name)}"><span class="task-project-org">${esc(orgSlug(organization))}</span></span>` : '');
+    return `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(inboxTitle(item))}">
+      <span class="status-dot waiting" title="waiting"></span>
       <div class="task-main">
-        <div class="task-title">${item.task?.num != null ? `<span class="task-num">#${esc(item.task.num)}</span> ` : ''}${esc(inboxTitle(item))}</div>
-        <div class="task-sub">${inboxProjectLabel(item) ? `<span class="inbox-project" title="${esc(inboxProjectLabel(item))}">${esc(inboxProjectLabel(item))}</span>` : ''}<span class="chip">${esc(inboxRowLabel(item))}</span></div>
+        <div class="task-title">${esc(inboxTitle(item))}</div>
+        <div class="task-sub">${where}<span class="chip attention ${esc(item.kind)}">${esc(inboxRowLabel(item))}</span></div>
       </div>
-      <div class="task-right">${urgencyChip(item.urgency)}<time datetime="${new Date(item.createdAt).toISOString()}" title="${esc(new Date(item.createdAt).toLocaleString())}">${esc(inboxTimeLabel(item.createdAt))}</time><button class="icon-btn inbox-read" data-inbox-toggle="${esc(item.id)}" aria-label="${item.unread ? 'Mark as read' : 'Mark as unread'}" title="${item.unread ? 'Mark as read' : 'Mark as unread'}" aria-pressed="${!item.unread}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button></div></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
-    <p class="task-sub">Sorted by priority, newest first within each level. System notifications and sounds are set in
-      <a data-spa href="${profileRoute()}#notifications">your profile</a>.</p>`;
+      <div class="task-right">${urgencyChip(item.urgency)}</div>
+    </div>`;
+  }).join('');
 }
-
-function wireInboxView() {
+function wireInboxNotices() {
   $('#main').querySelectorAll('[data-inbox]').forEach((row) => {
-    row.addEventListener('focus', () => { S.cursorId = rowKey(row); applyCursor(); });
-    row.addEventListener('click', (e) => {
-      if (e.target.closest('[data-inbox-toggle]')) return;
-      openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
-    });
+    const open = () => openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', (event) => { if (event.key === 'Enter' && event.target === row) { event.preventDefault(); open(); } });
   });
-  $('#main').querySelectorAll('[data-inbox-toggle]').forEach((button) => button.addEventListener('click', async () => {
-    const item = S.inbox.find((candidate) => candidate.id === button.dataset.inboxToggle); if (!item) return;
-    try {
-      await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: !item.unread }) });
-      item.unread = !item.unread; updateBell(); renderMain(); renderRail();
-    } catch (error) { toast(error.message, true); }
-  }));
-  $('#inbox-show-read')?.addEventListener('change', (e) => {
-    try { localStorage.setItem('karmax-inbox-show-read', e.target.checked ? '1' : '0'); } catch {}
-    renderMain();
-  });
-  $('#inbox-read-all')?.addEventListener('click', async (event) => {
-    const button = event.currentTarget;
-    button.disabled = true;
-    try {
-      await markVisibleInboxRead();
-    } catch (error) { toast(error.message, true); }
-    finally { button.disabled = false; }
-  });
-}
-
-async function markVisibleInboxRead() {
-  const items = inboxItems().filter((item) => item.unread);
-  const groups = new Map();
-  for (const item of items) {
-    if (!groups.has(item.organizationId)) groups.set(item.organizationId, []);
-    groups.get(item.organizationId).push(item.id);
-  }
-  const savedIds = new Set();
-  await Promise.allSettled([...groups].map(async ([organizationId, ids]) => {
-    const saved = await api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`, {
-      method: 'PATCH', body: JSON.stringify({ ids }),
-    });
-    for (const item of saved) savedIds.add(item.id);
-  }));
-  for (const item of S.inbox) if (savedIds.has(item.id)) item.unread = false;
-  S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
-  updateBell(); renderMain(); renderRail();
-  const failed = items.filter(item => !savedIds.has(item.id));
-  if (failed.length) throw new Error(`${failed.length} notifications could not be marked read. Try again.`);
 }
 
 // ── notification behaviour, per urgency ─────────────────────────────────────
@@ -20197,10 +20279,14 @@ function fuzzyScore(q, s) {
 // the server's command registry (S.contributions), so packages can rebind ids.
 const HOST_COMMANDS = [
   { id: 'nav.commandPalette', title: 'Command palette', key: 'meta+k', run: () => openPalette() },
-  { id: 'nav.globalSearch', title: 'Search everything', key: 'meta+shift+F', run: () => openGlobalSearch() },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
-  { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
-  { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task')?.value.trim()); } },
+  // Home and a project list both have the composer; anywhere else opens the project's.
+  { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { if (!$('#new-task')) switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
+  { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => {
+    if ($('#new-task')) return $('#expand-task')?.click();
+    switchTab('tasks');
+    openTaskForm(QUICK_TASK_WORKFLOW);
+  } },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.home', title: 'Go home', key: 'g h', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
@@ -20212,7 +20298,7 @@ const HOST_COMMANDS = [
   { id: 'nav.global', title: 'Go to organization settings', key: 'g S', run: () => switchTab('global') },
   { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
   { id: 'nav.profile', title: 'Go to your profile', key: 'g A', run: () => go(profileRoute()) },
-  { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', run: () => go(globalRoute('inbox')) },
+  { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', run: () => go(inboxRoute(DEFAULT_LIST_QUERY)) },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
 
@@ -20531,167 +20617,6 @@ function bindKeys() {
     }
     if (dispatchKey(e)) return;
   });
-}
-
-// -- global search: read-only discovery across every accessible project -------
-// Keep this separate from the command palette: search finds durable things;
-// the palette invokes actions. The per-project search endpoint gives this the
-// same free-text + field-filter semantics as the task list without loading every
-// project's task collection into browser state.
-function assembleGlobalSearchResults(query, projects, responses, limit = 40) {
-  const q = String(query || '').trim();
-  const hasFilterSyntax = /(?:^|\s)[!-]?[\w.-]+:/.test(q);
-  const textTerms = (q.match(/"[^"]+"|\S+/g) || [])
-    .filter((term) => !/^[!-]?[\w.-]+:/.test(term))
-    .map((term) => term.replace(/^"|"$/g, ''));
-  const projectHits = hasFilterSyntax ? [] : (projects || [])
-    .map((project) => ({ project, score: fuzzyScore(q, project.name) }))
-    .filter((hit) => hit.score >= 0)
-    .sort((a, b) => b.score - a.score || a.project.name.localeCompare(b.project.name))
-    .slice(0, 8);
-
-  const allTasks = (responses || []).flatMap(({ project, result }) =>
-    (result?.tasks || []).map((task) => ({
-      task,
-      project,
-      // Text hits in the title should lead notes-only matches. Structured
-      // queries have no text terms, so their cross-project order falls back to
-      // recency. Score terms independently because task free text is intentionally
-      // order-independent ("login fix" also matches "Fix login redirect").
-      score: textTerms.length
-        ? textTerms.reduce((total, term) => {
-          const termScore = fuzzyScore(term, task.title);
-          return total < 0 || termScore < 0 ? -1 : total + termScore;
-        }, 0)
-        : 0,
-    })),
-  );
-  allTasks.sort((a, b) => b.score - a.score || (b.task.createdAt || 0) - (a.task.createdAt || 0));
-  return { projectHits, taskHits: allTasks.slice(0, limit), totalTasks: (responses || []).reduce((total, row) => total + (row.result?.total ?? row.result?.tasks?.length ?? 0), 0) };
-}
-
-function openGlobalSearch() {
-  const root = createTransientOverlay();
-  root.innerHTML = `<div class="palette-scrim" id="gs-scrim"><div class="palette global-search" role="dialog" aria-modal="true" aria-labelledby="gs-title">
-    <div class="global-search-head">
-      <span aria-hidden="true">⌕</span>
-      <input id="gs-in" aria-label="Search everything" aria-controls="gs-list" aria-autocomplete="list" placeholder="Search tasks and projects…" autocomplete="off" spellcheck="false" />
-      <button class="icon-btn" id="gs-close" title="Close" aria-label="Close search">✕</button>
-    </div>
-    <div class="global-search-context" id="gs-title">Every accessible project · title, notes, task number, status, tags, and more</div>
-    <div id="gs-list" role="listbox" aria-label="Search results" aria-live="polite"></div>
-    <div class="global-search-foot">Filter tasks with queries like <code>status:active</code>, <code>tag:frontend</code>, or <code>#42</code>.</div>
-  </div></div>`;
-  const input = $('#gs-in');
-  const list = $('#gs-list');
-  let items = [];
-  let active = 0;
-  let timer = 0;
-  let request = 0;
-  let controller = null;
-  let state = 'prompt';
-  let summary = '';
-  const close = () => { clearTimeout(timer); controller?.abort(); request++; root.remove(); };
-
-  const draw = () => {
-    if (state === 'prompt') {
-      input.removeAttribute('aria-activedescendant');
-      list.innerHTML = `<div class="global-search-empty"><b>Find work anywhere</b><span>Enter words, a task number, or a task filter. Results include archived work.</span></div>`;
-      return;
-    }
-    if (state === 'error') {
-      input.removeAttribute('aria-activedescendant');
-      list.innerHTML = '<div class="global-search-empty">Search unavailable. <button class="btn sm">Retry</button></div>';
-      list.querySelector('button').onclick = search;
-      return;
-    }
-    if (state === 'loading') {
-      input.removeAttribute('aria-activedescendant');
-      list.innerHTML = `<div class="global-search-empty"><span class="global-search-loading">Searching ${S.projects.length} project${S.projects.length === 1 ? '' : 's'}…</span></div>`;
-      return;
-    }
-    if (!items.length) {
-      input.removeAttribute('aria-activedescendant');
-      list.innerHTML = `<div class="global-search-empty"><b>No results</b><span>No accessible task or project matched this search.</span></div>`;
-      return;
-    }
-    let lastGroup = null;
-    list.innerHTML = items.map((item, i) => {
-      const head = item.group !== lastGroup ? `<div class="pal-group">${esc(item.group)}</div>` : '';
-      lastGroup = item.group;
-      // Each result is a real permalink, so it opens in a new tab with any native
-      // gesture (Ctrl/⌘-click, middle-click, right-click → Open in new tab); a plain
-      // click below still opens it in place and dismisses the palette.
-      return `${head}<a class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}"${item.href ? ` data-spa href="${esc(item.href)}"` : ''}>
-        <span class="global-search-kind" aria-hidden="true">${item.group === 'Projects' ? ICON.project : '□'}</span>
-        <span class="global-search-copy"><b>${esc(item.title)}</b><span>${esc(item.sub || '')}</span></span>
-      </a>`;
-    }).join('');
-    input.setAttribute('aria-activedescendant', `gs-result-${active}`);
-    if (summary) list.insertAdjacentHTML('beforeend', `<div class="global-search-summary">${esc(summary)}</div>`);
-    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
-  };
-
-  const search = async () => {
-    const q = input.value.trim();
-    const ownRequest = ++request;
-    if (q.length < 2) { state = 'prompt'; items = []; summary = ''; active = 0; return draw(); }
-    controller?.abort();
-    controller = new AbortController();
-    state = 'loading';
-    draw();
-    let responses;
-    try {
-      const results = await api(`/api/search?q=${encodeURIComponent(q)}`, { signal: controller.signal });
-      responses = results.map(result => ({ project: projectById(result.projectId), result })).filter(row => row.project);
-    } catch (error) {
-      if (ownRequest !== request || !root.contains(input) || error.name === 'AbortError') return;
-      state = 'error'; draw(); return;
-    }
-    if (ownRequest !== request || !root.contains(input)) return;
-    const found = assembleGlobalSearchResults(q, S.projects, responses);
-    items = [
-      ...found.projectHits.map(({ project }) => {
-        const href = projectRoute(project.id);
-        return { group: 'Projects', title: project.name, sub: 'Open project', href, run: () => spaNavigate(href) };
-      }),
-      ...found.taskHits.map(({ project, task }) => {
-        const stateLabel = task.params?.draft ? 'draft' : task.params?.archived ? 'archived' : task.lastView?.stage || task.lastView?.status || task.workflow;
-        const number = task.num != null ? `#${task.num} · ` : '';
-        const href = `${projectBase(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
-        return {
-          group: 'Tasks', title: task.title,
-          sub: `${number}${project.name} · ${stateLabel}`,
-          href, run: () => spaNavigate(href),
-        };
-      }),
-    ];
-    summary = found.totalTasks > found.taskHits.length ? `Showing ${found.taskHits.length} of ${found.totalTasks} matching tasks` : '';
-    active = 0;
-    state = 'done';
-    draw();
-  };
-  const schedule = () => { controller?.abort(); request++; clearTimeout(timer); timer = setTimeout(search, 160); };
-  const run = (i) => { const item = items[i]; if (!item) return; close(); item.run(); };
-
-  input.addEventListener('input', schedule);
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.stopPropagation(); close(); }
-    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(items.length - 1, active + 1); draw(); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
-    else if (e.key === 'Enter') { e.preventDefault(); run(active); }
-  });
-  list.addEventListener('click', (e) => {
-    const row = e.target.closest('.opt'); if (!row) return;
-    if (isNewTabClick(e)) return; // real <a> result → let the browser open it in a new tab (palette stays open)
-    e.preventDefault();
-    run(Number(row.dataset.i));
-  });
-  list.addEventListener('mousemove', (e) => { const row = e.target.closest('.opt'); if (row && Number(row.dataset.i) !== active) { active = Number(row.dataset.i); draw(); } });
-  $('#gs-close').addEventListener('click', close);
-  $('#gs-scrim').addEventListener('click', (e) => { if (e.target.id === 'gs-scrim') close(); });
-  draw();
-  input.focus();
 }
 
 // -- the ⌘K palette: fuzzy command/action invocation --------------------------

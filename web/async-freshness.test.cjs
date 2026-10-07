@@ -62,6 +62,7 @@ eval(extractFn('pendingCancellationView'));
 eval(extractFn('pendingCancellationTask'));
 eval(extractFn('loadTasks'));
 eval(extractFn('filterDeletedFromSearchResult'));
+eval(extractFn('isCrossProjectList'));
 eval(extractFn('runSearch'));
 eval(extractFn('refreshTasks'));
 eval(extractFn('refreshTask'));

@@ -29,7 +29,7 @@ async function main() {
     renderTaskPage: () => { if (c.S.view) paints.push(c.S.taskEvents.length); },
     pendingCancellationView: v => v, defaultTaskTab: () => 'checkin',
     scheduleTaskPageRender: () => c.renderTaskPage(),
-    loadParamDefaults: async () => ({}), syncLiveWatch: () => {}, toast: message => { throw new Error(message); },
+    loadParamDefaults: async () => ({}), syncLiveWatch: () => {}, markTaskAsksRead: () => {}, toast: message => { throw new Error(message); },
     api: async url => {
       if (url.endsWith('/events?since=0&limit=300')) return history.promise;
       if (url.split('?')[0].endsWith('/sessions')) return sessions.promise;

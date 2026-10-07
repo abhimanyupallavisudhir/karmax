@@ -99,7 +99,6 @@ eq(firstProjectForOrganization('org_missing'), undefined, 'project fallback does
 eq(taskUrl('T9'), '/acme/website-redesign/tasks/42', 'task permalink nests under /<org>/<project>/tasks/:num');
 eq(globalRoute('insights'), '/acme/insights', 'insights route is org-prefixed');
 eq(globalRoute('organization'), '/acme/settings', 'internal tab "organization" → URL segment "settings"');
-eq(globalRoute('inbox'), '/acme/inbox', 'inbox route is org-prefixed');
 eq(installationRoute(), '/installation', 'installation route is global, not org-prefixed');
 eq(profileRoute(), '/profile', 'profile route is user-scoped, not org-prefixed');
 eq(globalRoute('organization', organizationById('org_globex')), '/globex/settings', 'globalRoute honours an explicit org');
@@ -121,9 +120,9 @@ S.organizationId = 'org_acme';
 eq(parseRoute('/acme/insights'), { name: 'global', org: 'acme', tab: 'insights' }, 'parse /<org>/insights');
 eq(parseRoute('/acme/dashboard'), { name: 'global', org: 'acme', tab: 'insights', legacy: true }, 'old /<org>/dashboard bookmarks land on insights');
 eq(parseRoute('/acme/settings'), { name: 'global', org: 'acme', tab: 'organization' }, 'parse /<org>/settings');
-eq(parseRoute('/acme/inbox'), { name: 'global', org: 'acme', tab: 'inbox', sub: null }, 'parse /<org>/inbox');
-eq(parseRoute('/acme/inbox/review-requested'), { name: 'global', org: 'acme', tab: 'inbox', sub: 'review-requested' },
-  'parse /<org>/inbox/<kind> as the inbox pinned to one kind of notification');
+eq(parseRoute('/acme/inbox'), { name: 'global', tab: 'inbox', q: 'for:me', legacy: true }, 'an organization\'s inbox is now the bell\'s page');
+eq(parseRoute('/acme/inbox/review-requested'), { name: 'global', tab: 'inbox', q: 'for:me', legacy: true },
+  'so are its old per-kind tabs');
 eq(parseRoute('/profile'), { name: 'profile' }, 'parse the global user profile');
 eq(parseRoute('/installation'), { name: 'installation' }, 'parse the operator-owned installation page');
 eq(parseRoute('/globex/profile'), { name: 'profile', legacy: true },
@@ -181,7 +180,9 @@ eq(projectBySlug('P2', 'org_acme'), undefined, 'a raw project id cannot escape t
 eq(parseRoute('/dashboard'), { name: 'global', tab: 'insights', legacy: true }, 'legacy /dashboard');
 eq(parseRoute('/organization'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /organization');
 eq(parseRoute('/settings'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /settings alias');
-eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', sub: null, legacy: true }, 'legacy /inbox');
+eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', q: 'for:me' }, 'the bell\'s page, above every organization, opens on for:me');
+eq(parseRoute('/inbox?q='), { name: 'global', tab: 'inbox', q: '' }, 'its query rides in ?q= like any list');
+eq(parseRoute('/inbox/mentioned'), { name: 'global', tab: 'inbox', q: 'for:me', legacy: true }, 'old per-kind tabs land on it');
 eq(parseRoute('/projects/website-redesign/tasks/42'),
   { name: 'project', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me', legacy: true },
   'legacy /projects/:name/tasks/:num');

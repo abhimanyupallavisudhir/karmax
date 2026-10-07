@@ -29,24 +29,32 @@ async function fixture() {
   return { store, authorization, tokens, api, gateway, mine, theirs, own, shared, foreign };
 }
 
-describe('cross-project console search (RQ-14/UI-18)', () => {
+/** GET /api/search: one list over every project the caller can read. */
+async function search(f: Awaited<ReturnType<typeof fixture>>, session: any, query = 'q=hello', destroyed = false) {
+  let status = 0, body = '';
+  const res = { destroyed, writeHead: (code: number) => { status = code; }, end: (text: string) => { body = text; } };
+  await f.gateway.searchEverywhere(res, session, new URL(`http://gateway.invalid/api/search?${query}`));
+  return { status, body: body ? JSON.parse(body) : undefined };
+}
+const projectsOf = (body: any) => [...new Set(body.tasks.map((task: any) => task.projectId))].sort();
+
+describe('search across every organization (RQ-14/UI-18)', () => {
   it('searches only the projects the caller can read, without minting a token per project', async () => {
     const f = await fixture();
     try {
       const touched = new Set<string>();
       const capabilities = vi.spyOn(f.authorization, 'capabilitiesAsync');
       const check = vi.spyOn(f.tokens, 'check');
-      const search = vi.spyOn(f.api, 'searchAuthorizedTasks');
       const mint = vi.spyOn(f.tokens, 'mint');
       const mintPrincipal = vi.spyOn(f.tokens, 'mintPrincipal');
       const session = { user: 'Alice', userId: 'alice', email: 'alice@example.com', apiToken: 'session' };
-      const result = await f.gateway.searchProjects({ headers: {} }, { destroyed: false }, session, 'hello');
-      expect(result.map((entry: any) => entry.projectId).sort()).toEqual([f.own.id, f.shared.id].sort());
-      expect(result.find((entry: any) => entry.projectId === f.own.id).tasks[0].title).toBe('hello from Own');
+      const { body } = await search(f, session);
+      expect(projectsOf(body)).toEqual([f.own.id, f.shared.id].sort());
+      expect(body.tasks.find((task: any) => task.projectId === f.own.id).title).toBe('hello from Own');
       for (const call of capabilities.mock.calls) touched.add(String(call[1]));
       for (const call of check.mock.calls) touched.add(String(call[2]?.projectId));
-      for (const call of search.mock.calls) touched.add(String(call[0]));
-      expect(touched.has(f.foreign.id)).toBe(false);
+      expect(body.projects.map((project: any) => project.id)).not.toContain(f.foreign.id);
+      expect(touched.has(f.foreign.id)).toBe(false); // never even considered
       expect(mint).not.toHaveBeenCalled();
       expect(mintPrincipal).not.toHaveBeenCalled();
     } finally { await f.store.close(); }
@@ -57,11 +65,11 @@ describe('cross-project console search (RQ-14/UI-18)', () => {
     try {
       const { token } = await f.tokens.mintPrincipal('user:mallory', ['project:read', 'task:read'], undefined, undefined, f.theirs.id);
       const check = vi.spyOn(f.tokens, 'check');
-      const result = await f.gateway.searchProjects({ headers: {} }, { destroyed: false }, { user: 'agent', apiToken: token }, 'hello');
-      expect(result.map((entry: any) => entry.projectId).sort()).toEqual([f.shared.id, f.foreign.id].sort());
+      expect(projectsOf((await search(f, { user: 'agent', apiToken: token })).body)).toEqual([f.shared.id, f.foreign.id].sort());
       expect(check.mock.calls.some(call => call[2]?.projectId === f.own.id)).toBe(false);
       const { token: blind } = await f.tokens.mintPrincipal('user:mallory', ['project:read'], undefined, undefined, f.theirs.id);
-      expect(await f.gateway.searchProjects({ headers: {} }, { destroyed: false }, { user: 'agent', apiToken: blind }, 'hello')).toEqual([]);
+      expect((await search(f, { user: 'agent', apiToken: blind })).body.tasks).toEqual([]);
+      expect((await search(f, { user: 'agent', apiToken: 'nonsense' })).status).toBe(401);
     } finally { await f.store.close(); }
   });
 
@@ -70,32 +78,30 @@ describe('cross-project console search (RQ-14/UI-18)', () => {
     try {
       await f.store.setOrganizationIdentityPolicy({ organizationId: f.theirs.id, enforceSso: true, oidcProviderId: 'okta' });
       const session = { user: 'Alice', userId: 'alice', email: 'alice@example.com', apiToken: 'session' };
-      const result = await f.gateway.searchProjects({ headers: {} }, { destroyed: false }, session, 'hello');
-      expect(result.map((entry: any) => entry.projectId)).toEqual([f.own.id]);
+      expect(projectsOf((await search(f, session)).body)).toEqual([f.own.id]);
     } finally { await f.store.close(); }
   });
 
-  it('bounds each response and stops when the request is gone', async () => {
+  it('pages one sorted list and stops when the request is gone', async () => {
     const f = await fixture();
     try {
       for (let i = 0; i < 120; i++) await f.store.createTask({ projectId: f.own.id, title: `hello ${i}`, workflow: 'just-do',
         workflowVersion: '1', params: { prompt: 'fixture' } });
       const session = { user: 'Alice', userId: 'alice', email: 'alice@example.com', apiToken: 'session' };
-      const [own] = (await f.gateway.searchProjects({ headers: {} }, { destroyed: false }, session, 'hello'))
-        .filter((entry: any) => entry.projectId === f.own.id);
-      expect(own.tasks).toHaveLength(100);
-      expect(own.total).toBe(121);
-      expect(await f.gateway.searchProjects({ headers: {} }, { destroyed: true }, session, 'hello')).toEqual([]);
-      expect(await f.gateway.searchProjects({ headers: {} }, { destroyed: false }, session, 'h')).toEqual([]);
+      const { body } = await search(f, session, 'q=hello&limit=100');
+      expect(body.tasks).toHaveLength(100);
+      expect(body.total).toBe(122);
+      expect((await search(f, session, 'q=hello&limit=100&offset=100')).body.tasks).toHaveLength(22);
+      expect((await search(f, session, 'q=hello', true)).body.tasks).toEqual([]);
     } finally { await f.store.close(); }
   });
 
   it('does not disguise a search failure as an empty result', async () => {
     const f = await fixture();
     try {
-      vi.spyOn(f.api, 'searchAuthorizedTasks').mockRejectedValue(new Error('database unavailable'));
+      vi.spyOn(f.api, 'searchAuthorizedOrganization').mockRejectedValue(new Error('database unavailable'));
       const session = { user: 'Alice', userId: 'alice', email: 'alice@example.com', apiToken: 'session' };
-      await expect(f.gateway.searchProjects({ headers: {} }, { destroyed: false }, session, 'hello')).rejects.toThrow('database unavailable');
+      await expect(search(f, session)).rejects.toThrow('database unavailable');
     } finally { await f.store.close(); }
   });
 });

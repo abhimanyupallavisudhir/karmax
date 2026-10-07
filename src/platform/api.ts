@@ -4739,8 +4739,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return this.searchAuthorizedOrganization(readable, query, caller.principal, page, now);
   }
 
-  /** Evaluate one query across already-authorized projects of an organization:
-   *  one sort and grouping over all of them, then a page of the result. */
+  /** Evaluate one query across already-authorized projects — an organization's,
+   *  or every organization's: one sort and grouping over all of them, then a
+   *  page of the result. */
   async searchAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string,
     page: { limit?: number; offset?: number } = {}, now = Date.now()) {
     const { result, tags } = await this.evaluateProjects(projects, query, principalId, now);
@@ -4757,7 +4758,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       ...result, tasks, total: result.total, offset, limit,
       ...(result.groups ? { groups: prune(result.groups) } : {}),
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
-      projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name) })),
+      projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
       tags,
     };
   }

@@ -174,11 +174,11 @@ describe('limits (ceilings)', () => {
     // The search shortcut honours the limit too.
     for (const project of [f.site, f.docs])
       await f.g.store.createTask({ projectId: project.id, title: 'needle', workflow: 'just-do', workflowVersion: '1.0.0', params: {} as any });
-    expect((await f.call('GET', '/api/search?q=needle')).body.map((result: any) => result.projectId).sort())
+    expect((await f.call('GET', '/api/search?q=needle')).body.tasks.map((task: any) => task.projectId).sort())
       .toEqual([f.site.id, f.docs.id].sort());
     const search = await f.call('GET', '/api/search?q=needle', bearer);
     expect(search.status).toBe(200);
-    expect(search.body.map((result: any) => result.projectId)).toEqual([f.site.id]);
+    expect(search.body.tasks.map((task: any) => task.projectId)).toEqual([f.site.id]);
   });
 
   it('lists only the organization an organization-limited grant reaches', async () => {

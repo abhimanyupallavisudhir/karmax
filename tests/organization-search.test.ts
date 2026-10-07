@@ -49,8 +49,14 @@ async function fixture() {
     await gateway.searchOrganization(res, session, orgId, new URL(`http://gateway.invalid/api/organizations/${orgId}/search?${query}`));
     return { status, body: JSON.parse(body) };
   };
+  const everywhere = async (session: any, query = '') => {
+    let status = 0, body = '';
+    const res = { destroyed: false, writeHead: (code: number) => { status = code; }, end: (text: string) => { body = text; } };
+    await gateway.searchEverywhere(res, session, new URL(`http://gateway.invalid/api/search?${query}`));
+    return { status, body: JSON.parse(body) };
+  };
   const ana = { user: 'Ana', userId: 'ana', email: 'ana@example.com', apiToken: 'session' };
-  return { store, tokens, api, org, other, web, app, secret, elsewhere, t1, t2, t3, t4, t5, call, ana };
+  return { store, tokens, authorization, api, org, other, web, app, secret, elsewhere, t1, t2, t3, t4, t5, call, everywhere, ana };
 }
 
 const titles = (body: any) => body.tasks.map((task: any) => task.title).sort();
@@ -119,6 +125,44 @@ describe('organization task list', () => {
     try {
       expect((await f.call({ user: 'Sam', userId: 'sam', email: 'sam@example.com', apiToken: 'session' }, f.org.id, 'q=')).status).toBe(403);
       expect((await f.call(f.ana, 'org_missing', 'q=')).status).toBe(404);
+    } finally { await f.store.close(); }
+  });
+});
+
+/**
+ * The bell's page: one list over every organization the person belongs to —
+ * `for:me` across all of them by default — sorted together, each row naming its
+ * organization and project.
+ */
+describe('search across every organization', () => {
+  it('is a read route authorized per project', () => {
+    expect(routeCapability('GET', '/api/search')).toBe('none');
+  });
+
+  it('answers for:me over every organization, rows carrying their organization', async () => {
+    const f = await fixture();
+    try {
+      // Ana also belongs to Other, where a task waits on her.
+      await f.store.setOrganizationMembership(f.other.id, 'ana', 'member');
+      await f.authorization.grant('system:test', { principalId: 'user:ana', scopeKey: projectScope(f.elsewhere.id), profileId: 'viewer' });
+      await f.store.appendEvent({ taskId: f.t5.id, type: 'task.mentioned', ts: Date.now(), payload: { principal: { kind: 'user', userId: 'ana' } } });
+      const { status, body } = await f.everywhere(f.ana, 'q=for:me');
+      expect(status).toBe(200);
+      expect(titles(body)).toEqual(['ana draft', 'other org', 'review the app']);
+      expect(body.reasons[f.t5.id]).toEqual(['mentioned']);
+      expect(body.projects.find((project: any) => project.id === f.elsewhere.id)).toMatchObject({ slug: 'elsewhere', organizationId: f.other.id });
+      expect(body.projects.find((project: any) => project.id === f.app.id)).toMatchObject({ organizationId: f.org.id });
+      // Every query works, an empty one included; still nothing she cannot read.
+      expect(titles((await f.everywhere(f.ana, 'q=')).body)).toEqual(['ana draft', 'other org', 'redesign header', 'review the app']);
+      expect(titles((await f.everywhere(f.ana, 'q=sort:title-asc&limit=1')).body)).toEqual(['ana draft']);
+    } finally { await f.store.close(); }
+  });
+
+  it('gives an agent token the projects of its own scope', async () => {
+    const f = await fixture();
+    try {
+      const { token } = await f.tokens.mintPrincipal('user:owner', ['project:read', 'task:read'], f.app.id, undefined, f.org.id);
+      expect(titles((await f.everywhere({ user: 'agent', apiToken: token }, 'q=')).body)).toEqual(['ana draft', 'review the app']);
     } finally { await f.store.close(); }
   });
 });

@@ -9,7 +9,7 @@ test('RQ-3/UI-7: foreign projects and known sibling attempts do not reload the c
   const ctx = vm.createContext({ S: { projectId: 'p', selected: null, tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {}, attemptGroup: { principalAttemptId: 'a', attempts: [{ id: 'a' }, { id: 'b' }] } },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
     patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(['subtask.created']), inboxEventChanges: () => false, scheduleTaskListReload: () => reloads++ });
-  vm.runInContext(fn('connectWs'), ctx); ctx.connectWs();
+  vm.runInContext(`${fn('connectWs')}\n${fn('isCrossProjectList')}`, ctx); ctx.connectWs();
   for (const event of [{ taskId: 'foreign', projectId: 'other', type: 'view.updated' }, { taskId: 'foreign', projectId: 'other', type: 'subtask.created' }, { taskId: 'b', projectId: 'p', type: 'view.updated' }]) ctx.S.ws.onmessage({ data: JSON.stringify(event) });
   assert.equal(reloads, 0);
 });
@@ -18,7 +18,7 @@ test('RQ-3: a non-principal attempt the list never shows does not reload it', ()
   const ctx = vm.createContext({ S: { projectId: 'p', selected: null, tab: 'tasks', tasks: [{ id: 'a' }], taskEvents: [], activity: [], meta: {}, attemptGroup: null },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
     patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false, scheduleTaskListReload: () => reloads++ });
-  vm.runInContext(fn('connectWs'), ctx); ctx.connectWs();
+  vm.runInContext(`${fn('connectWs')}\n${fn('isCrossProjectList')}`, ctx); ctx.connectWs();
   ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 'b', projectId: 'p', type: 'view.updated', siblingAttempt: true, payload: { status: 'active' } }) });
   assert.equal(reloads, 0);
   ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 'c', projectId: 'p', type: 'view.updated', payload: { status: 'active' } }) });
@@ -30,7 +30,7 @@ test('RQ-16: the socket says which project and task this tab shows, once per cha
   WebSocket.OPEN = 1;
   const ctx = vm.createContext({ S: { projectId: 'p', selected: null }, location: { protocol: 'http:', host: 'test' }, WebSocket, document: { hidden: false },
     setWsOnline: () => {}, checkConsoleRevision: () => {}, wsHadDropped: false });
-  vm.runInContext(`${fn('connectWs')}\n${fn('syncLiveWatch')}`, ctx); ctx.connectWs();
+  vm.runInContext(`${fn('connectWs')}\n${fn('syncLiveWatch')}\n${fn('isCrossProjectList')}`, ctx); ctx.connectWs();
   ctx.S.ws.onopen();
   ctx.S.selected = 't'; ctx.syncLiveWatch(); ctx.syncLiveWatch();
   ctx.S.selected = null; ctx.S.projectId = 'q'; ctx.syncLiveWatch();

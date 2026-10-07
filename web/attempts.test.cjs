@@ -47,7 +47,9 @@ global.tagChips = () => '';
 global.pipeline = () => '';
 eval(extractFn('customBranch'));
 global.attentionChip = () => '';
-global.projectChip = () => '';
+global.projectLabel = () => '';
+global.taskHasUnreadAsk = () => false;
+global.markTaskAsksRead = () => {};
 eval(extractFn('taskRow'));
 
 let pass = 0, fail = 0;
