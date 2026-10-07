@@ -41,10 +41,34 @@ export function sizedBuildOptions(shape: MachineShape): { cpuCount: number; memo
   };
 }
 
-/** Build `name` from `base` with the shape's size unless it already exists. */
-export async function buildSizedTemplate(base: string, name: string, shape: MachineShape, options: { apiKey?: string }): Promise<void> {
+/** The free-disk ceiling (GiB) E2B states when it refuses a request above it.
+ * It depends on the account's tier (25 GiB on one Pro team, 2026-10-07). */
+export function e2bDiskLimitGb(error: unknown): number | undefined {
+  const match = /free disk can't be higher than (\d+) MiB/i.exec(error instanceof Error ? error.message : String(error));
+  return match ? Math.floor(Number(match[1]) / 1024) : undefined;
+}
+
+/** Make a template of `base` at `shape`'s size exist, and say which one. A
+ * disk above the account's ceiling is refused at once (HTTP 400, before any
+ * build), so the template is made at the ceiling under that shape's own name:
+ * every later request learns the real disk the same quick way, never by
+ * trusting a name that promises more than it holds. */
+export async function buildSizedTemplate(base: string, name: string, shape: MachineShape,
+  options: { apiKey?: string }): Promise<{ name: string; diskGb?: number }> {
   const { Template } = await import('e2b');
   const connection = options.apiKey ? { apiKey: options.apiKey } : {};
-  if (await Template.exists(name, connection)) return;
-  await Template.build(Template().fromTemplate(base), name, { ...connection, ...sizedBuildOptions(shape) });
+  const build = async (target: string, size: MachineShape) => {
+    if (!(await Template.exists(target, connection)))
+      await Template.build(Template().fromTemplate(base), target, { ...connection, ...sizedBuildOptions(size) });
+  };
+  try {
+    await build(name, shape);
+    return { name };
+  } catch (error) {
+    const limit = e2bDiskLimitGb(error);
+    if (!limit || shape.diskGb == null || limit >= shape.diskGb) throw error;
+    const capped = { ...shape, diskGb: limit };
+    await build(sizedTemplateName(base, capped), capped);
+    return { name: sizedTemplateName(base, capped), diskGb: limit };
+  }
 }

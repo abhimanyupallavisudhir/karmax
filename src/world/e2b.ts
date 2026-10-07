@@ -116,7 +116,7 @@ export interface E2BFactory {
   /** Completed lifecycle executions from E2B's seven-day event feed. */
   events?(options: { apiKey?: string; since?: number; offset?: number }): Promise<{ events: unknown[]; resumeAt?: number }>;
   /** Make template `name` exist: `base` built at `shape`'s CPU, memory and disk. */
-  ensureTemplate?(base: string, name: string, shape: MachineShape, options: { apiKey?: string }): Promise<void>;
+  ensureTemplate?(base: string, name: string, shape: MachineShape, options: { apiKey?: string }): Promise<{ name?: string; diskGb?: number } | void>;
 }
 
 /** E2B cloud worlds: one isolated sandbox per task attempt, automatically paused
@@ -161,9 +161,11 @@ export class E2BWorldProvider implements WorldProvider {
     let selectedTemplate = baseTemplate;
     if (baseTemplate && !spec.environment?.snapshot && needsSizedTemplate(shape)) {
       try {
-        selectedTemplate = await this.sizedTemplate(baseTemplate, shape, connection?.apiKey);
-        if ((shape.diskGb ?? 0) > E2B_MAX_DISK_GB)
-          sizeWarnings.push(`E2B gives a computer at most ${E2B_MAX_DISK_GB} GB of free disk; this one has ${E2B_MAX_DISK_GB} GB, not ${shape.diskGb} GB.`);
+        const sized = await this.sizedTemplate(baseTemplate, shape, connection?.apiKey);
+        selectedTemplate = sized.name;
+        const disk = sized.diskGb ?? Math.min(shape.diskGb ?? 0, E2B_MAX_DISK_GB);
+        if (shape.diskGb != null && disk < shape.diskGb)
+          sizeWarnings.push(`This E2B account gives a computer at most ${disk} GB of free disk, so this one has ${disk} GB, not ${shape.diskGb} GB.`);
       } catch (error) {
         if (spec.signal?.aborted) throw error;
         // Never fail a task over its size: it runs, at the template's own size, and says so.
@@ -278,8 +280,8 @@ export class E2BWorldProvider implements WorldProvider {
 
   /** The template of `base` at `shape`'s size, built on first use and then
    * reused (deterministic name; one in-flight build per name and key). */
-  private sizing = new Map<string, Promise<void>>();
-  private async sizedTemplate(base: string, shape: MachineShape, apiKey?: string): Promise<string> {
+  private sizing = new Map<string, Promise<{ name?: string; diskGb?: number } | void>>();
+  private async sizedTemplate(base: string, shape: MachineShape, apiKey?: string): Promise<{ name: string; diskGb?: number }> {
     const name = sizedTemplateName(base, shape);
     if (!this.factory.ensureTemplate) throw new Error('this E2B client cannot build templates');
     const key = `${crypto.createHash('sha256').update(apiKey ?? '').digest('hex')}:${name}`;
@@ -289,8 +291,9 @@ export class E2BWorldProvider implements WorldProvider {
       this.sizing.set(key, pending);
       pending.catch(() => this.sizing.delete(key));
     }
-    await pending;
-    return name;
+    const built = await pending;
+    // The factory may answer with another template (the account's disk ceiling).
+    return { name: built?.name ?? name, ...(built?.diskGb != null ? { diskGb: built.diskGb } : {}) };
   }
 
   async open(handle: WorldHandle): Promise<World> {

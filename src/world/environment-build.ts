@@ -30,7 +30,7 @@ export interface EnvironmentBuildInput {
    * they were taken from, so the builder starts at it. */
   resources?: { cpu?: number; memoryMb?: number; diskGb?: number };
   createBuilderSandbox?: (base: string, options: { apiKey?: string }) => Promise<BuilderSandbox>;
-  ensureTemplate?: (base: string, name: string, shape: MachineShape, options: { apiKey?: string }) => Promise<void>;
+  ensureTemplate?: (base: string, name: string, shape: MachineShape, options: { apiKey?: string }) => Promise<{ name?: string } | void>;
 }
 export interface BuilderSandbox {
   id?: string;
@@ -95,8 +95,11 @@ async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildR
   const shape = machineShape({ resources: input.resources });
   const base = e2bWorldTemplate(template, shape);
   const apiKey = input.connection?.apiKey ? { apiKey: input.connection.apiKey } : {};
-  if (base !== template) await (input.ensureTemplate ?? buildSizedTemplate)(template, base, shape, apiKey);
-  const builder = await create(base, apiKey);
+  // `base` stays the shape's key for matching builds to worlds; the builder
+  // starts from whatever template E2B could make at that size.
+  const start = base === template ? base
+    : ((await (input.ensureTemplate ?? buildSizedTemplate)(template, base, shape, apiKey)) || {}).name ?? base;
+  const builder = await create(start, apiKey);
   try {
     if (builder.id) await input.onBuilderCreated?.(builder.id);
     for (const command of setupCommands(input.spec)) {

@@ -129,7 +129,7 @@ const computerField = (): FieldSpec => ({
   name: 'computer',
   type: 'computer',
   label: 'Computer',
-  help: 'Where the agent works, and how big that machine is. Disk is space for the task\'s files (E2B gives up to 50 GB). A new size takes a minute to prepare the first time; a running task can grow its computer, and moves to it when it next pauses.',
+  help: 'Where the agent works, and how big that machine is. Disk is free space for the task\'s files; E2B allows 25 GB or more, depending on the plan. A running task can grow its computer, and moves to it when it next pauses.',
   scopes: ALL,
   bind: 'computer',
   mutable: 'always',

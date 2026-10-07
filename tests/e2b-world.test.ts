@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
 import { serviceHomeLabel } from '../src/world/services.js';
-import { sizedBuildOptions, sizedTemplateName } from '../src/world/e2b-template.js';
+import { e2bDiskLimitGb, sizedBuildOptions, sizedTemplateName } from '../src/world/e2b-template.js';
 import { isMissingSandbox } from '../src/world/provider-errors.js';
 
 describe('E2B cloud world provider', () => {
@@ -40,6 +40,18 @@ describe('E2B cloud world provider', () => {
     expect(created.at(-1)).toBe('env-snapshot');
     expect(sizedBuildOptions(shape)).toEqual({ cpuCount: 4, memoryMB: 8192, minFreeDiskMb: 40 * 1024 });
     expect(sizedBuildOptions({ diskGb: 200 }).minFreeDiskMb).toBe(50 * 1024);
+  });
+
+  it('builds a disk above the account\'s ceiling at the ceiling, and says so', async () => {
+    expect(e2bDiskLimitGb(new Error("400: Minimum free disk can't be higher than 25600 MiB (if you need to increase this limit, please contact support)"))).toBe(25);
+    expect(e2bDiskLimitGb(new Error('quota exceeded'))).toBeUndefined();
+    const created: Array<string | undefined> = [];
+    const provider = new E2BWorldProvider({ create: async (options: { template?: string }) => { created.push(options.template); return fakeSandbox(() => undefined); },
+      connect: async () => fakeSandbox(() => undefined),
+      ensureTemplate: async () => ({ name: 'karmax-sized-capped', diskGb: 25 }) } as any);
+    const world = await provider.create({ taskId: 'capped', base: 'main', resources: { cpu: 4, memoryMb: 4096, diskGb: 30 } });
+    expect(created).toEqual(['karmax-sized-capped']);
+    expect(world.handle.warnings).toEqual(['This E2B account gives a computer at most 25 GB of free disk, so this one has 25 GB, not 30 GB.']);
   });
 
   it('never fails a task over its size: it runs at the default size and says why', async () => {
