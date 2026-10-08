@@ -259,7 +259,7 @@ describe('account coordinator — quota engine', () => {
     const g = await grantee();
     await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', provider: 'google', allowed: ['key:handle:google:removed'] });
     await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
-      waiting: true, detail: 'No Google credential — add one in Credentials',
+      waiting: true, detail: 'No google credential — add one, or stop this agent',
     });
     expect(await grants(g.id)).toEqual([]);
     await coord.terminate('done');
