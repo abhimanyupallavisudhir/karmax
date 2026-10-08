@@ -1314,7 +1314,8 @@ export interface AgentActivity {
   /** Provider item/tool id. Repeated updates with the same id replace in-place. */
   id: string;
   kind: 'message' | 'reasoning' | 'command' | 'file' | 'tool' | 'search' | 'subagent' | 'status' | 'turn' | 'error';
-  phase: 'started' | 'updated' | 'completed' | 'failed';
+  /** `stopped`: a turn someone stopped (or whose task was cancelled). */
+  phase: 'started' | 'updated' | 'completed' | 'failed' | 'stopped';
   /** Compact human-facing label, e.g. "Read package.json" or "npm test". */
   title: string;
   /** Optional bounded detail (command output, tool arguments/result, progress). */
@@ -1462,8 +1463,11 @@ export interface TaskParticipant {
   role: AgentRole;
   /** Effective harness selection (authority is projected separately). */
   spec?: Partial<AgentSpec>;
-  /** queued: called and waiting for the running agent's turn to end. */
-  state: 'idle' | 'queued' | 'running';
+  /** running: working now. waiting: in its turn but waiting (for a
+   * credential, host capacity, a retry, people, its pause, or another agent).
+   * queued: called and waiting for the running agent's turn to end. Every
+   * state but idle can be stopped. */
+  state: 'idle' | 'queued' | 'running' | 'waiting';
   /** Messages this agent has authored. */
   messages: number;
 }

@@ -242,6 +242,7 @@ eval(extractFn('conversationPane'));
 eval(extractFn('liveOutputFor'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('wireCheckinSidebar'));
+eval(extractFn('wireStopAgents'));
 global.conversationApprovalRequests = () => '<div>Pending approvals</div>';
 global.liveRoleFor = () => 'do';
 global.localWorldPath = () => false;

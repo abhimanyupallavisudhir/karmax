@@ -1102,6 +1102,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .agent-activity.running .activity-icon, .agent-activity.started .activity-icon, .agent-activity.updated .activity-icon { color: var(--working); border-color: color-mix(in srgb, var(--working) 35%, var(--line)); }
 .agent-activity.failed .activity-icon { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); background: var(--danger-weak); }
 .agent-activity.completed .activity-icon { color: var(--merged); }
+.agent-activity.stopped .activity-icon { color: var(--ink-3); }
 .activity-body { min-width: 0; flex: 1; }
 .activity-head { min-height: 20px; display: flex; align-items: center; gap: 8px; }
 .activity-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); color: var(--ink-2); }
@@ -3152,6 +3153,13 @@ html[data-theme="dark"] .github-signin-btn:active,
 .ck-participant .ck-num { flex: none; width: 16px; font: 11px var(--font-mono); color: var(--ink-3); }
 .ck-participant .ck-queued { margin-left: auto; color: var(--ink-3); font-weight: 700; letter-spacing: .1em; }
 .ck-participant .ck-live { margin-left: auto; }
+.ck-participant .ck-waiting { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--working); flex: none; }
+.ck-participant-row { display: flex; align-items: center; }
+.ck-participant-row .ck-participant { flex: 1; min-width: 0; }
+.ck-stop { flex: none; width: 24px; height: 24px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--ink-3); cursor: pointer; }
+.ck-stop:hover { background: var(--surface); color: var(--danger); }
+.followup-stop { flex: none; display: grid; place-items: center; padding: 0 10px; min-height: 38px; color: var(--ink-2); }
+.followup-stop:hover { color: var(--danger); }
 .agent-mention-menu { min-width: 240px; }
 .agent-mention-menu .am-key { flex: none; width: 26px; font: 11px var(--font-mono); color: var(--ink-3); }
 .agent-mention-menu .am-sep { height: 1px; margin: 4px 6px; background: var(--line); }

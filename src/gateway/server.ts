@@ -370,7 +370,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
-  if (/\/signal$/.test(p)) return 'task:signal';
+  if (/\/signal$/.test(p) || /^\/api\/tasks\/[^/]+\/agents\/[^/]+\/stop$/.test(p)) return 'task:signal';
   if (/^\/api\/tasks\/[^/]+\/messages$/.test(p)) return 'task:conversation:message';
   if (/\/escalate$/.test(p)) return 'task:escalate';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
@@ -5312,6 +5312,9 @@ export class Gateway {
         const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files, { otherAttempts: b.otherAttempts, saveOtherAttemptsDefault: b.saveOtherAttemptsDefault }, receivedAt);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
+      const stopAgentMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents\/([^/]+)\/stop$/);
+      if (stopAgentMatch && method === 'POST')
+        return this.json(res, 200, { ok: true, ...(await api.stopAgent(token, stopAgentMatch[1]!, decodeURIComponent(stopAgentMatch[2]!))) });
       const messageMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages$/);
       if (messageMatch && method === 'POST') {
         const b = await this.body(req);

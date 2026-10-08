@@ -50,6 +50,7 @@ export interface PlatformOps {
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
   messageAgent(taskId: string, text: string, role?: string): Promise<void>;
+  stopAgent(taskId: string, agent: string): Promise<unknown>;
   escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   notify(a: { to: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
@@ -125,6 +126,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await api.signalTask(getToken(), id, sig as any, text, role, undefined, undefined, { otherAttempts, saveOtherAttemptsDefault })),
     messageAgent: async (id, text, role) => void (await api.messageAgent(getToken(), id, text, role)),
+    stopAgent: (id, agent) => api.stopAgent(getToken(), id, agent),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
     notify: (a) => api.notify(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
@@ -223,6 +225,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role, otherAttempts, saveOtherAttemptsDefault }) })),
     messageAgent: async (id, text, role) => void (await req(`/api/tasks/${id}/messages`, { method: 'POST', body: JSON.stringify({ text, role }) })),
+    stopAgent: (id, agent) => req(`/api/tasks/${id}/agents/${encodeURIComponent(agent)}/stop`, { method: 'POST' }),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
     notify: (a) => req('/api/agent/notify', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
@@ -855,6 +858,14 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       },
     },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role, a.otherAttempts, a.saveOtherAttemptsDefault); return 'signalled'; }),
+  );
+  server.registerTool(
+    'stop_agent',
+    {
+      description: 'Stop one agent of a task, like Ctrl+C: its turn ends now — working, or waiting for a credential, capacity or people — or, if queued, it does not run. The task goes on. `agent` is its key: do, responder, confirm, confirm-<n> or agent-<n> (list_agents).',
+      inputSchema: { taskId: z.string(), agent: z.string() },
+    },
+    async (a) => wrap(async () => { await ops.stopAgent(a.taskId, a.agent); return `stopped ${a.agent}`; }),
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', {
