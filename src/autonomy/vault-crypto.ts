@@ -190,6 +190,10 @@ export interface SecretVault {
   list(): Promise<string[]>;
   delete(handle: string): Promise<void>;
   deleteIfEqual(handle: string, observed: string): Promise<boolean>;
+  /** Compare-and-set: store `secret` only if the stored secret is still
+   * `observed` (undefined: only if there is none). A refreshed OAuth credential
+   * is written back this way (`refresh-lease.ts`). */
+  replaceIfEqual(handle: string, observed: string | undefined, secret: string, scope: VaultScope, options?: { history?: boolean }): Promise<boolean>;
   rotateDataKey(scope: VaultScope): Promise<{ reencrypted: number; retired: string[] }>;
   destroyScope(scope: VaultScope): Promise<{ entries: number; quarantined: number }>;
   wrapUnderCurrentKek(): Promise<{ wrapped: number }>;

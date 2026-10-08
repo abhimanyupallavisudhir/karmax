@@ -514,6 +514,35 @@ vault, and backups still leave the key out. `npm run vault-key` and
 back is the pre-update backup with its code**, whose `control-plane/vault/`
 still holds the files. A self-host on SQLite keeps the file vault.
 
+Epoch 6 moves model logins into the vault (wiki planned/host-local-state,
+step 2). A Claude, Codex or OpenCode login was its CLI's credential files in
+`config-homes/<provider>-<account>` (`.credentials.json`, `auth.json`, the
+captured setup token); they are now one vault entry per login,
+`model-login:<organization>:<provider>:<account>`, owned by the account's
+organization, and the files in the home are a cache the app materializes from
+the vault and writes back through the login's refresh lease. Every refresh of a
+stored OAuth credential (Claude, Codex, MCP OAuth, GitHub user tokens) takes a
+lease row in `credential_refresh_leases` and writes back with a
+compare-and-set, so the gateway and the activity worker never spend one
+single-use refresh token twice. The first boot copies each home's credential
+files into the vault, reads every entry back and compares it with the files,
+and only then records the move (`model-logins.moved-to-vault` in the audit
+log); an interrupted boot repeats the copy. It then keeps the files it found,
+unchanged, in `retired-epoch6/config-homes/` (no release reads them; a
+disconnect, a rename and an organization's deletion take them along, and a
+later release deletes the directory once epoch 6 is verified in production;
+after the first refresh their tokens are spent). Session histories stay in the
+homes. The epoch 5 release must not run on this: it would refresh from the
+cache and sign logins out. So on PostgreSQL `vault/entries` becomes a file
+explaining that, and the epoch 5 release stops at boot with "EEXIST: file
+already exists, mkdir '…/vault/entries'"; on a SQLite install `vault/secrets.json`
+becomes a sentinel the epoch 5 release refuses ("not a secret map"). From epoch
+6 on the database also records the highest data epoch that has run against it
+(`kv` row `data-epoch`), and an older release refuses to start on it.
+`npm run model-logins -- status` lists the logins in the vault and whether
+this host's cache of each agrees. **The way back is the pre-update backup with
+its code.**
+
 Recover a failed epoch transition by repairing forward, or restore the pre-update
 backup with its matching application revision **and Temporal history**. Restoring
 a snapshot can discard work performed after it was taken. Do not run an older

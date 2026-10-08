@@ -37,7 +37,7 @@ describe('disconnecting a login preserves task history', () => {
     const snapshot = () => prepareCodexHistory(session, async id => readLocalCodexHistory(home, id), { snapshot: true });
     const before = await snapshot();
     expect(isLoggedIn('codex', home)).toBe(true);
-    homes.remove('codex', 'personal');
+    await homes.remove('codex', 'personal');
     expect(homes.list()).toEqual([]);
     expect(isLoggedIn('codex', home)).toBe(false);
     expect(fs.existsSync(path.join(home, 'config.toml'))).toBe(false);
@@ -46,7 +46,7 @@ describe('disconnecting a login preserves task history', () => {
     const destination = temp();
     expect(materializeFork({ provider: 'codex', session, srcHome: home, forkHome: destination, worldPath: '/new' })).toBe(true);
     expect(readLocalCodexHistory(destination, parent).content.toString()).toBe(ancestor);
-    homes.remove('codex', 'personal'); // repeated disconnect must also be safe
+    await homes.remove('codex', 'personal'); // repeated disconnect must also be safe
     expect(homes.ensure('codex', 'personal')).toBe(home);
     expect(homes.list()).toEqual([]); // status polling must not reactivate the login
     expect(homes.prepareLogin('codex', 'personal')).toBe(home);
@@ -55,7 +55,7 @@ describe('disconnecting a login preserves task history', () => {
     expect((await snapshot())?.content).toEqual(before?.content);
   });
 
-  it('preserves Claude native history and subagents, while deleting both credential locations', () => {
+  it('preserves Claude native history and subagents, while deleting both credential locations', async () => {
     const homes = new ConfigHomeManager(temp());
     const home = homes.ensure('claude', 'personal');
     const session = crypto.randomUUID(), slug = claudeCwdSlug('/old');
@@ -64,7 +64,7 @@ describe('disconnecting a login preserves task history', () => {
     write(home, '.credentials.json', '{"claudeAiOauth":{"accessToken":"secret"}}');
     write(home, '.claude/.credentials.json', '{"claudeAiOauth":{"accessToken":"secret"}}');
     write(home, 'karmax-oauth.json', '{"token":"secret"}');
-    homes.remove('claude', 'personal');
+    await homes.remove('claude', 'personal');
     expect(homes.list()).toEqual([]);
     expect(isLoggedIn('claude', home)).toBe(false);
     expect(findProviderSession({ provider: 'claude', session, srcHome: home })).toBeDefined();
@@ -72,7 +72,7 @@ describe('disconnecting a login preserves task history', () => {
     expect(materializeFork({ provider: 'claude', session, srcHome: home, forkHome: temp(), worldPath: '/new' })).toBe(true);
   });
 
-  it('preserves OpenCode storage but removes its colocated auth, without touching another organization', () => {
+  it('preserves OpenCode storage but removes its colocated auth, without touching another organization', async () => {
     const homes = new ConfigHomeManager(temp());
     const home = homes.ensure('opencode', 'work', 'org_a');
     const other = homes.ensure('opencode', 'work', 'org_b');
@@ -80,23 +80,23 @@ describe('disconnecting a login preserves task history', () => {
     write(home, 'data/opencode/opencode.db', 'native storage');
     write(home, 'data/opencode/storage/session/session.json', '{"id":"session"}');
     write(other, 'data/opencode/auth.json', '{"openai":{"type":"oauth"}}');
-    homes.remove('opencode', 'work', 'org_a');
+    await homes.remove('opencode', 'work', 'org_a');
     expect(isLoggedIn('opencode', home)).toBe(false);
     expect(fs.readFileSync(path.join(home, 'data/opencode/opencode.db'), 'utf8')).toBe('native storage');
     expect(homes.list('org_a')).toEqual([]);
     expect(isLoggedIn('opencode', other)).toBe(true);
     expect(homes.list('org_b')).toHaveLength(1);
-    homes.removeOrganization('org_a'); // whole-tenant deletion still erases retained history
+    await homes.removeOrganization('org_a'); // whole-tenant deletion still erases retained history
     expect(fs.existsSync(home)).toBe(false);
   });
 
-  it('unlinks history symlinks without following them into another home', () => {
+  it('unlinks history symlinks without following them into another home', async () => {
     const homes = new ConfigHomeManager(temp());
     const home = homes.ensure('codex', 'personal');
     const outside = temp();
     write(outside, 'auth.json', 'unrelated credential');
     fs.symlinkSync(outside, path.join(home, 'sessions'), 'dir');
-    homes.remove('codex', 'personal');
+    await homes.remove('codex', 'personal');
     expect(fs.existsSync(path.join(home, 'sessions'))).toBe(false);
     expect(fs.readFileSync(path.join(outside, 'auth.json'), 'utf8')).toBe('unrelated credential');
   });

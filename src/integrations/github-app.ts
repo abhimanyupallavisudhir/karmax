@@ -12,6 +12,7 @@ import { GithubActionsApi } from './github-actions.js';
 import { githubActionsRunIdFromUrl } from './github-actions.js';
 import { observeDeploymentWorkflowRun } from './github-deployment-monitor.js';
 import { taskIdOfBranch, BRAND } from '../domain/brand.js';
+import { RefreshLeases } from '../autonomy/refresh-lease.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
 export const GITHUB_APP_WEBHOOK_SECRET_HANDLE = 'github-app:webhook-secret';
@@ -353,7 +354,10 @@ export class GitHubAppService {
    * requested permission; without this, every landing poll would mint a token. */
   private tokenInvalidatedAt = new Map<string, number>();
 
+  /** User tokens refresh one at a time across processes (GitHub's refresh tokens are single-use). */
+  private leases: RefreshLeases;
   constructor(private store: Store, private broker: CredentialBroker, private options: GitHubAppOptions = {}) {
+    this.leases = new RefreshLeases(store.db);
   }
 
   static async create(store: Store, broker: CredentialBroker, options: GitHubAppOptions = {}) {
@@ -1572,13 +1576,17 @@ export class GitHubAppService {
   }
 
   private async saveTokenHandle(handle: string, value: any, userId: string): Promise<void> {
+    (await this.broker.registerHandle(handle, this.tokenRecord(value), userScope(userId)));
+  }
+
+  private tokenRecord(value: any): string {
     const now = Date.now();
-    (await this.broker.registerHandle(handle, JSON.stringify({
+    return JSON.stringify({
       accessToken: String(value.access_token),
       expiresAt: value.expires_in ? now + Number(value.expires_in) * 1000 : undefined,
       refreshToken: value.refresh_token ? String(value.refresh_token) : undefined,
       refreshExpiresAt: value.refresh_token_expires_in ? now + Number(value.refresh_token_expires_in) * 1000 : undefined,
-    }), userScope(userId)));
+    });
   }
 
   private async resolvedUserToken(handle: string): Promise<{ raw: string; value: {
@@ -1693,11 +1701,17 @@ export class GitHubAppService {
       }));
       throw new Error(`${failure.summary} [${failure.code}]`);
     }
-    await this.store.transaction(async () => {
+    // A compare-and-set: a sign-in that landed meanwhile is newer than this refresh.
+    const saved = await this.store.transaction(async () => {
       await this.store.lock(`account:${userId}`);
       await this.assertUserOpen(userId);
-      await this.saveTokenHandle(handle, value, userId);
+      return this.broker.replaceHandleIfUnchanged(handle, observed, this.tokenRecord(value), userScope(userId));
     });
+    if (!saved) {
+      const replacement = await this.replacementUserToken(handle, observed);
+      if (replacement) return replacement;
+      throw new Error('The GitHub connection changed while its token was being refreshed. Retry.');
+    }
     (await this.clearUserAuthorizationFailure(userId, accountId));
     (await this.store.appendAudit({
       principalId: `user:${userId}`,
@@ -1723,7 +1737,15 @@ export class GitHubAppService {
       return resolved.value.accessToken;
     const inFlight = this.userTokenRefreshes.get(handle);
     if (inFlight) return inFlight;
-    const refresh = this.refreshUserAccessToken(userId, accountId, handle, opts.forceRefresh === true)
+    // Across processes, one refresh at a time (refresh-lease.ts): a refresh
+    // another one completed while this waited is taken, not repeated.
+    const replaced = async () => {
+      const now = await this.resolvedUserToken(handle);
+      return now && now.raw !== resolved.raw && now.value.accessToken
+        && (!now.value.expiresAt || now.value.expiresAt > Date.now() + 60_000) ? { value: now.value.accessToken } : undefined;
+    };
+    const refresh = this.leases.hold(handle, async () => (await replaced())?.value
+      ?? this.refreshUserAccessToken(userId, accountId, handle, opts.forceRefresh === true), replaced)
       .finally(() => this.userTokenRefreshes.delete(handle));
     this.userTokenRefreshes.set(handle, refresh);
     return refresh;

@@ -297,6 +297,21 @@ export class DatabaseVault implements SecretVault {
     await this.db.prepare('DELETE FROM vault_entries WHERE handle = ?').run(handle);
   }
 
+  async replaceIfEqual(handle: string, observed: string | undefined, secret: string, scope: VaultScope, options: { history?: boolean } = {}): Promise<boolean> {
+    validateScope(scope);
+    validateSecret(secret);
+    return this.write(async (tx) => {
+      const stored = await this.readEntry(handle);
+      const current = stored === undefined ? undefined : await this.decryptLocked(stored.blob, handle, stored.scope);
+      if (current !== observed) return false;
+      const prior = await tx.claim(stored, scope);
+      const data = await this.writableKey(scope);
+      const previous = options.history === false || prior === undefined ? [] : [prior.blob, ...prior.previous].slice(0, 5);
+      await this.swap({ handle, scope, blob: sealEntry(secret, handle, scope, data), previous, unresolved: false }, stored);
+      return true;
+    });
+  }
+
   async deleteIfEqual(handle: string, observed: string): Promise<boolean> {
     return this.write(async () => {
       const entry = await this.readEntry(handle);

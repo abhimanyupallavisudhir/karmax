@@ -98,7 +98,8 @@ test('boots src/main.ts as a hosted cell on PostgreSQL and Temporal without a su
       expect((await vaultRows.query("SELECT 1 FROM audit_log WHERE action = 'vault.moved-to-database'")).rowCount).toBe(1);
     } finally { await vaultRows.end(); }
     expect(JSON.parse(fs.readFileSync(path.join(vaultDir, 'secrets.json'), 'utf8'))).toEqual(MOVED_TO_DATABASE);
-    expect(fs.readdirSync(path.join(vaultDir, 'entries'))).toEqual(['.migrated']);
+    // From data epoch 6 `entries` is a note, a file, which stops the epoch 5 release from starting.
+    expect(fs.readFileSync(path.join(vaultDir, 'entries'), 'utf8')).toMatch(/data epoch 6/);
     expect(fs.existsSync(path.join(vaultDir, 'keys'))).toBe(false);
     // Kept, unchanged and unread, until a later release deletes it.
     expect(JSON.parse(fs.readFileSync(path.join(vaultDir, RETIRED_VAULT, 'entries', entryFile), 'utf8'))).toEqual(fileEntry);

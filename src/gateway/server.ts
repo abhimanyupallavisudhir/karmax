@@ -2909,7 +2909,7 @@ export class Gateway {
         const { agentAccountHandles } = await import('../platform/credential-sources.js');
         for (const handle of agentAccountHandles(await this.deps.broker?.listHandles() ?? [], organizationId))
           (await this.deps.broker?.deleteHandle(handle));
-        this.deps.configHomes?.removeOrganization(organizationId);
+        await this.deps.configHomes?.removeOrganization(organizationId);
         await this.deps.workflows?.removeOrganization(organizationId);
         const { deleteOrganizationAutonomy } = await import('../autonomy/cleanup.js');
         await deleteOrganizationAutonomy(store, this.deps.broker, organizationId);
@@ -7650,11 +7650,11 @@ export class Gateway {
         const provider = rawProvider;
         const account = decodeURIComponent(loginMatch[2]!);
         if (method === 'DELETE') {
-          this.deps.configHomes.remove(provider, account, resourceOrganizationId);
+          await this.deps.configHomes.remove(provider, account, resourceOrganizationId);
         } else {
           const b = await this.body(req);
           if (!b.account) return this.json(res, 400, { error: 'new account name required' });
-          this.deps.configHomes.rename(provider, account, String(b.account), resourceOrganizationId);
+          await this.deps.configHomes.rename(provider, account, String(b.account), resourceOrganizationId);
         }
         await this.refreshLoginPool();
         return this.json(res, 200, { ok: true });

@@ -9,6 +9,8 @@ import { ensurePaths } from '../src/config/paths.js';
 import { registerAppInstance, claimWorkerOwnership } from '../src/util/instance.js';
 import { Store } from '../src/store/db.js';
 import { openSecretVault } from '../src/autonomy/vault-backend.js';
+import { CredentialBroker } from '../src/autonomy/broker.js';
+import { ModelLogins } from '../src/autonomy/model-logins.js';
 import { startDevServer } from '../src/temporal/dev-server.js';
 import { makeClient } from '../src/temporal/client.js';
 import { WorkerProcessManager } from '../src/temporal/worker-process.js';
@@ -36,7 +38,9 @@ test('runs real application activities in an admitted child and relays its persi
     await admin.query(`CREATE SCHEMA ${schema}`);
     store = await Store.create(target.href);
     // What the primary does on its boot before it starts a worker: the child only attaches to the vault.
-    await openSecretVault(path.join(home, 'vault'), store.db, { resolveScopes: async () => new Map(), audit: async () => undefined });
+    const vault = await openSecretVault(path.join(home, 'vault'), store.db, { resolveScopes: async () => new Map(), audit: async () => undefined });
+    // ...and the model logins into it (data epoch 6).
+    await new ModelLogins(path.join(home, 'config-homes'), new CredentialBroker(vault), store.db).moveIntoVault(store.db, { audit: async () => undefined });
     const project = await store.createProject('Isolated supervised activity');
     const task = await store.createTask({ projectId: project.id, title: 'Record an event',
       workflow: 'fixture', workflowVersion: '1', params: { prompt: 'Record an isolated test event' } });

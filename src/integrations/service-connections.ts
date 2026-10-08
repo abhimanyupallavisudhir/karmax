@@ -6,7 +6,8 @@ import type { Store } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { newId } from '../util/id.js';
-import { beginOAuth, finishOAuth, connectionHeaders, type OAuthVault, type OAuthTarget } from '../mcp/connections/oauth.js';
+import { beginOAuth, finishOAuth, connectionHeaders, leasedOAuthRefresh, type OAuthVault, type OAuthTarget } from '../mcp/connections/oauth.js';
+import { RefreshLeases } from '../autonomy/refresh-lease.js';
 import { openRemoteMcp, remoteMcpAuth, type RemoteMcpTransport } from '../mcp/connections/remote.js';
 import { registryServer } from '../mcp/connections/registry.js';
 import { validateTransport } from '../mcp/connections/store.js';
@@ -111,6 +112,15 @@ export class ServiceConnections {
     setSecret: async (c, value) => {
       if ((await this.get(c.organizationId, c.id)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
       (await this.broker.registerHandle(MCP_CREDENTIALS + c.id, JSON.stringify(value), organizationScope(c.organizationId)));
+    },
+    refresh: (c, _taskId, observed, run) => {
+      const handle = MCP_CREDENTIALS + c.id;
+      return leasedOAuthRefresh(new RefreshLeases(this.store.db), handle, observed,
+        async () => await this.broker.hasHandle(handle) ? this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }) : undefined,
+        async (current, next, held) => (await this.store.lock(`vault:${c.organizationId}`), await held())
+          && (await this.get(c.organizationId, c.id)).revision === c.revision
+          && this.broker.replaceHandleIfUnchanged(handle, current, next, organizationScope(c.organizationId)),
+        run);
     },
   };
   private target(c: ServiceConnection): OAuthTarget {

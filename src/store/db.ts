@@ -237,7 +237,11 @@ export const STORE_LOCK_ORDER = [
   'vault:<orgId>', // an organization's vault item index, credential requests and connector outbox
   'kv:<key>', 'wiki:<orgId>:<path>', 'permission-requests:<orgId>:<taskId>', 'service-connections:<orgId>:<taskId>', // one value rewritten from its previous value
 ] as const;
-// Row locks follow every advisory key. The vault's (vault-database.ts): a write
+// Row locks follow every advisory key. A refresh write-back (refresh-lease.ts)
+// locks its credential_refresh_leases row FOR UPDATE, after the caller's keys
+// (`vault:<orgId>`, `account:<userId>`) and before the vault's rows; taking or
+// renewing a lease is one statement on that row alone, outside any transaction.
+// The vault's (vault-database.ts): a write
 // share-locks its scope's vault_keyrings row, then swaps vault_entries rows;
 // rotating or shredding a scope (key rotation, organization deletion, account
 // erasure) locks that keyring row FOR UPDATE first, so no write lands under a
@@ -999,6 +1003,11 @@ export class Store {
         reason TEXT NOT NULL, createdAt INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_vault_entries_scope ON vault_entries(scope);
+      -- Who may refresh a stored OAuth credential now (autonomy/refresh-lease.ts):
+      -- refresh tokens are single-use, so one refresh at a time across processes.
+      CREATE TABLE IF NOT EXISTS credential_refresh_leases (
+        credential TEXT PRIMARY KEY, holder TEXT NOT NULL, expiresAt INTEGER NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
       CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parentTaskId);
       CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_memberships(userId, organizationId);
