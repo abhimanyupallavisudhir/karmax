@@ -20977,17 +20977,14 @@ function renderLanding() {
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
         <button class="landing-theme" id="landing-theme" type="button" aria-label="Switch theme"><svg class="sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 12.6A6.8 6.8 0 0 1 7.4 3.6a6.8 6.8 0 1 0 9 9z"/></svg></button>
         <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
-        <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
+        <button class="landing-start" id="landing-start" type="button">Get started</button>
       </div>
     </div></header>
 
     <main id="landing-main">
       <section class="landing-hero" aria-labelledby="landing-title">
         <div class="landing-hero-copy">
-          <h1 id="landing-title" class="landing-analogy">
-            <span><strong>vscode</strong><span>was a fancy <b>text editor.</b></span></span>
-            <span><strong>${siteNameMarkup()}</strong><span>is a fancy <b>to-do list.</b></span></span>
-          </h1>
+          <h1 id="landing-title" class="landing-analogy"><span>vscode was a fancy <b>text editor.</b></span> <span>${siteNameMarkup()} is a fancy <b>to-do list.</b></span></h1>
           <p class="landing-intro">The interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
           <div class="landing-hero-actions">
             <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
