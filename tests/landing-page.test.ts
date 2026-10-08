@@ -87,17 +87,21 @@ describe('public landing page', () => {
     await ui.close();
   });
 
-  it('keeps each analogy sentence on one line at any width, its object in the accent', async () => {
+  it('separates the two analogy sentences by more than their line spacing, at any width', async () => {
     for (const width of [1440, 1100, 961, 800, 390, 320]) {
       const ui = await landing({ viewport: { width, height: 900 } });
-      const lines = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) => {
-        const box = span.getBoundingClientRect(), style = getComputedStyle(span);
-        return { rows: Math.round(box.height / parseFloat(style.lineHeight)), fits: box.right <= document.documentElement.clientWidth };
+      const [first, second] = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) => {
+        const box = span.getBoundingClientRect();
+        return { top: box.top, bottom: box.bottom, lineHeight: parseFloat(getComputedStyle(span).lineHeight) };
       }));
-      expect(lines, `${width}px`).toEqual([{ rows: 1, fits: true }, { rows: 1, fits: true }]);
+      // Wrapped lines of one sentence sit lineHeight apart; the sentences sit further.
+      expect(second!.top - first!.bottom, `${width}px`).toBeGreaterThan(first!.lineHeight * .4);
       expect(await ui.page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
       await ui.close();
     }
+  });
+
+  it('colours each analogy object in the accent, the past one muted', async () => {
     const ui = await landing();
     const colours = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) =>
       [getComputedStyle(span).color, getComputedStyle(span.querySelector('b')).color]));

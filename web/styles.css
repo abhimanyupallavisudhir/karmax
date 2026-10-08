@@ -1712,16 +1712,15 @@ html[data-theme="light"] .landing-theme .moon { display: block; }
 .landing-start:hover span { transform: translateX(2px); }
 .landing-start-large { min-height: 44px; padding: 0 18px; border-radius: 8px; font-size: 15px; }
 
-/* hero: the claim beside the product. Each sentence of the analogy keeps to
-   one line: the longer is 13.7em wide, so its size follows the copy column. */
+/* hero: the claim beside the product. The two sentences of the analogy may
+   each wrap, so a gap between them keeps them reading as two statements. */
 .landing-hero {
   width: var(--l-wide); margin: 0 auto; padding: 88px 0 112px;
-  display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); align-items: center; gap: 48px;
+  display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); align-items: center; gap: 56px;
 }
-.landing-hero-copy { container-type: inline-size; }
-.landing-analogy { margin: 0; font-size: min(40px, 7.1cqi); line-height: 1.2; letter-spacing: -.02em; font-weight: 650; }
-.landing-analogy > span { display: block; white-space: nowrap; }
-.landing-analogy > span + span { margin-top: .2em; }
+.landing-analogy { margin: 0; font-size: clamp(30px, 2.9vw, 40px); line-height: 1.15; letter-spacing: -.02em; font-weight: 650; }
+.landing-analogy > span { display: block; text-wrap: balance; }
+.landing-analogy > span + span { margin-top: .55em; }
 .landing-analogy > span:first-child { color: var(--l-ink-3); }
 .landing-analogy b { font-weight: inherit; color: var(--l-accent); }
 .landing-analogy > span:first-child b { color: var(--l-accent-muted); }
@@ -1741,7 +1740,7 @@ html[data-theme="light"] .landing-theme .moon { display: block; }
 .product-browserbar i { width: 9px; height: 9px; border-radius: 50%; background: var(--l-line-strong); }
 .product-browserbar span { flex: 1; text-align: center; }
 .product-browserbar b { padding: 1px 6px; border: 1px solid var(--l-line); border-radius: 4px; font-weight: 500; }
-.product-shell { display: grid; grid-template-columns: 136px 1fr; }
+.product-shell { display: grid; grid-template-columns: 150px 1fr; }
 .product-rail { padding: 14px 8px 12px; display: flex; flex-direction: column; gap: 2px; background: var(--l-surface-2); border-right: 1px solid var(--l-line); }
 .product-wordmark { display: flex; align-items: center; gap: 8px; margin: 0 8px 18px; font-size: 13px; }
 .product-wordmark .mark { width: 20px; height: 20px; border-radius: 5px; }
@@ -1761,7 +1760,7 @@ html[data-theme="light"] .landing-theme .moon { display: block; }
 .product-list { display: grid; gap: 6px; }
 .product-task {
   --d: 2s; min-height: 38px; padding: 0 10px 0 12px;
-  display: grid; grid-template-columns: 16px minmax(0, 1fr) 44px 48px; align-items: center; gap: 10px;
+  display: grid; grid-template-columns: 16px minmax(0, 1fr) 54px 56px; align-items: center; gap: 10px;
   border: 1px solid var(--l-line); border-radius: 8px; background: var(--l-surface);
   animation: product-row-in .4s cubic-bezier(.2,.75,.2,1) both;
 }
@@ -1867,6 +1866,7 @@ html[data-theme="light"] .landing-theme .moon { display: block; }
   .landing-tagline, .landing-text-link, .landing-sign-in { display: none; }
   .landing-theme { margin: 0; }
   .landing-hero { padding: 48px 0 72px; gap: 44px; }
+  .landing-analogy { font-size: min(28px, 7vw); }
   .landing-intro { font-size: 17px; margin-top: 20px; }
   .landing-hero-actions { margin-top: 28px; }
   .product-frame { border-radius: 10px; }
