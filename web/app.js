@@ -67,6 +67,16 @@ const ICON = {
   // Window controls: a matched pair, drawn on the same grid and stroke.
   minimize: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="M6 12h12"/></svg>',
   close: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="m7 7 10 10"/><path d="M17 7 7 17"/></svg>',
+  // Sidebar navigation, icon-only (the name is the aria-label and tooltip):
+  // organization views at the top, installation-wide entries at the foot.
+  home: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.2a2 2 0 0 1 .7-1.5l7-6a2 2 0 0 1 2.6 0l7 6a2 2 0 0 1 .7 1.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M9.5 21v-6.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V21"/></svg>',
+  insights: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m7 15 4-5 3.5 3L20 6.5"/></svg>',
+  wiki: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3Z"/></svg>',
+  settings: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"/><circle cx="12" cy="12" r="3"/></svg>',
+  docs: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>',
+  palette: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/></svg>',
+  keyboard: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M8 13h.01M12 13h.01M16 13h.01M7.5 16h9"/></svg>',
+  installation: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="3" width="19" height="7.5" rx="2"/><rect x="2.5" y="13.5" width="19" height="7.5" rx="2"/><path d="M6.5 6.75h.01M6.5 17.25h.01M10.5 6.75h4M10.5 17.25h4"/></svg>',
 };
 const TAG_SECTION_QUERY = 'group:tag';
 const DEFAULT_EXPLANATION_SETTINGS = {
@@ -3392,7 +3402,9 @@ async function boot() {
   // personal workspace and consumes the one-time git-onboarding flag. The
   // emailed password-reset link lands signed out, so it is one of them.
   const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
+  const docSlug = location.pathname.match(/^\/docs(?:\/([^/]+))?\/?$/);
   const publicPage = legalSlug ? () => renderLegalPage(legalSlug)
+    : docSlug ? () => renderDocsPage(docSlug[1])
     : { '/legal': renderLegalIndex, '/pricing': renderPricing,
       '/reset-password': () => renderResetPassword(new URLSearchParams(location.search).get('token') || '') }[location.pathname];
   // Independent first reads go together; each used to wait for the one before (RQ-9).
@@ -4528,23 +4540,32 @@ function renderShell() {
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">☰</button>
       <a class="brand" id="brand-home" data-spa href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
-      ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
-      <button class="icon-btn" id="topbar-help" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">?</button>
       <a class="topbar-user" id="topbar-user" data-spa href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
       <a class="icon-btn has-badge" id="bell" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
     <div class="body">
-      <div class="rail" id="rail"></div>
+      <div class="rail" id="rail">
+        <div class="rail-top">
+          ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
+          <nav class="rail-icons rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon]) =>
+            `<a class="rail-icon" id="${id}" data-spa href="#" aria-label="${label}">${ICON[icon]}</a>`).join('')}</nav>
+        </div>
+        <div class="rail-list" id="rail-list"></div>
+        <div class="rail-icons rail-foot">
+          <a class="rail-icon" id="rail-docs" href="/docs" target="_blank" rel="noopener" aria-label="Docs" title="Docs">${ICON.docs}</a>
+          <button class="rail-icon" id="rail-palette" type="button" aria-label="Command palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">${ICON.palette}</button>
+          <button class="rail-icon" id="rail-help" type="button" aria-label="Keyboard shortcuts" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">${ICON.keyboard}</button>
+        </div>
+      </div>
       <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
-  $('#topbar-palette').addEventListener('click', openPalette);
-  $('#topbar-help').addEventListener('click', openHelp);
+  $('#rail-palette').addEventListener('click', openPalette);
+  $('#rail-help').addEventListener('click', openHelp);
   wireVerificationBanner();
   const closeMobileNav = () => {
     $('#rail')?.classList.remove('mobile-open');
@@ -4564,7 +4585,7 @@ function renderShell() {
   syncRailToggle();
   $('#rail-scrim')?.addEventListener('click', closeMobileNav);
   $('#rail')?.addEventListener('click', (event) => {
-    if (event.target.closest('.folder-toggle, .rail-edit-action, .rail-inline-edit')) return;
+    if (event.target.closest('.folder-toggle, .rail-edit-action, .rail-inline-edit, .organization-combo')) return;
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
@@ -4576,6 +4597,7 @@ function renderShell() {
     if (route) await go(route);
     else toast('Organization access is no longer available', true);
   }, true);
+  syncRailNav();
   renderOnboarding();
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
@@ -4824,9 +4846,43 @@ function railProjectRows(projectScoped) {
   return walk(root, 0) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
 }
 
+// The organization's views, icon-only at the top of the sidebar:
+// [id, name (aria-label), icon, tab(s) it marks current, route, tooltip, command].
+const RAIL_ORG_NAV = [
+  ['rail-home', 'Home', 'home', ['home'], () => homeRoute(), 'Home — every project, what needs you first', 'nav.home'],
+  ['rail-insights', 'Insights', 'insights', ['insights'], () => globalRoute('insights'), 'Insights', 'nav.insights'],
+  ['rail-wiki', 'Wiki', 'wiki', ['orgwiki'], () => globalRoute('orgwiki'), 'Wiki — organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'],
+  ['rail-organization', 'Settings', 'settings', ['organization', 'global'], () => globalRoute('organization'), 'Organization settings', 'nav.global'],
+];
+
+// The sidebar's top and foot outlive every repaint of the project list (an open
+// organization menu must survive a background refresh), so a route change only
+// re-points their links and moves the current-page mark.
+function syncRailNav() {
+  for (const [id, , , tabs, route, hint, command] of RAIL_ORG_NAV) {
+    const link = document.getElementById(id);
+    if (!link) continue;
+    link.setAttribute('href', route());
+    link.title = commandHint(hint, command);
+    if (tabs.includes(S.tab)) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  }
+  const foot = $('#rail .rail-foot');
+  let installation = $('#rail-installation');
+  if (foot && S.installationAccess && !installation) {
+    foot.insertAdjacentHTML('beforeend', `<a class="rail-icon" id="rail-installation" data-spa href="${installationRoute()}" aria-label="Installation settings" title="Installation settings">${ICON.installation}</a>`);
+    installation = $('#rail-installation');
+  } else if (installation && !S.installationAccess) { installation.remove(); installation = null; }
+  if (installation) {
+    if (S.tab === 'installation') installation.setAttribute('aria-current', 'page');
+    else installation.removeAttribute('aria-current');
+  }
+}
+
 function renderRail() {
-  const rail = $('#rail');
+  const rail = $('#rail-list');
   if (!rail) return;
+  syncRailNav();
   if (draggingProject || editingRailItem) return; // never repaint out from under an interaction in flight
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
@@ -4847,22 +4903,16 @@ function renderRail() {
     rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
     $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
   } else rail.innerHTML = `
-    <a class="nav-item rail-home ${S.tab === 'home' ? 'active' : ''}" data-spa href="${esc(homeRoute())}" id="rail-home" tabindex="0" title="${esc(commandHint('Home — every project, what needs you first', 'nav.home'))}">⌂ Home</a>
     <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
     <label class="rail-search-box">
       <svg class="rail-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
     <input id="project-search" class="rail-search" type="search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
     </label>
     ${railProjectRows(projectScoped)}
-    <div class="grow" id="rail-projects-end"></div>
-    <div class="label">Organization</div>
-    <a class="nav-item ${S.tab === 'insights' ? 'active' : ''}" data-spa href="${globalRoute('insights')}" data-tab="insights" tabindex="0" title="${esc(commandHint('Insights', 'nav.insights'))}">▦ Insights</a>
-    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="${esc(commandHint('Organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'))}">🕮 Wiki</a>
-    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0" title="${esc(commandHint('Organization settings', 'nav.global'))}">⚙ Settings</a>
-    ${S.installationAccess ? `<div class="label">Installation</div><a class="nav-item ${S.tab === 'installation' ? 'active' : ''}" data-spa href="${installationRoute()}" id="rail-installation" tabindex="0">⌘ Installation</a>` : ''}`;
-  // Your profile lives in the top bar (#topbar-user), not the rail. Project +
-  // Insights/Wiki/Settings entries are real <a> links — installLinkRouter()
-  // routes their plain click in place and the browser handles new-tab gestures.
+    <div class="grow" id="rail-projects-end"></div>`;
+  // Your profile lives in the top bar (#topbar-user), not the rail. Project and
+  // organization entries are real <a> links — installLinkRouter() routes their
+  // plain click in place and the browser handles new-tab gestures.
   if (!searching) {
     $('#new-project')?.addEventListener('click', () => newProject());
     const search = $('#project-search');
@@ -20563,7 +20613,7 @@ function openAdjacentTask(delta) {
 function railRows() {
   // Search results are projects; skip their folder headings during a filtered walk.
   const folders = (S.projectSearch || '').trim() ? '' : ', #rail .folder-toggle';
-  return [...document.querySelectorAll('#rail .rail-add, #project-search, #rail .project-link, #rail .nav-item' + folders)];
+  return [...document.querySelectorAll('#rail .rail-icon, #rail .rail-add, #project-search, #rail .project-link' + folders)];
 }
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
@@ -20858,8 +20908,102 @@ function readPolicyAcceptance(context) {
 }
 
 function legalFooter() {
-  return `<footer class="legal-footer"><a href="/">${siteNameMarkup()}</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a>
+  return `<footer class="legal-footer"><a href="/">${siteNameMarkup()}</a><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a>
     <a href="/legal/security">Security</a><a href="/legal/dpa">DPA requests</a></footer>`;
+}
+
+// ── public docs ──────────────────────────────────────────────────────────────
+// A few pages of Markdown served beside the console (web/docs/<slug>.md), with
+// Pricing and the policies, under one sidebar. `{{origin}}` in a page is this
+// server, so the commands it shows work on a self-hosted installation too.
+const DOC_PAGES = [
+  { slug: 'getting-started', path: '/docs', title: 'Getting started' },
+  { slug: 'how-it-works', path: '/docs/how-it-works', title: 'How it works' },
+  { slug: 'cli', path: '/docs/cli', title: 'tavya CLI' },
+];
+
+function docsAnchor(text) { return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''); }
+
+// Links between public pages swap the page in place instead of reloading it.
+let publicLinksInstalled = false;
+function installPublicLinks() {
+  if (publicLinksInstalled) return;
+  publicLinksInstalled = true;
+  document.addEventListener('click', (event) => {
+    if (isNewTabClick(event) || event.defaultPrevented) return;
+    const link = event.target.closest('a[data-public]');
+    if (!link) return;
+    const url = new URL(link.href, location.href);
+    if (url.origin !== location.origin) return;
+    event.preventDefault();
+    if (url.pathname === location.pathname && url.hash) {
+      history.pushState({}, '', url.hash);
+      return document.getElementById(url.hash.slice(1))?.scrollIntoView();
+    }
+    history.pushState({}, '', `${url.pathname}${url.search}${url.hash}`);
+    boot();
+  });
+}
+
+/** `current` is the path whose sidebar entry is marked as this page. */
+function renderPublicShell(current, content) {
+  document.body.classList.remove('landing-active');
+  installPublicLinks();
+  const link = (href, label) => `<a href="${href}" data-public${href === current ? ' aria-current="page"' : ''}>${esc(label)}</a>`;
+  $('#app').innerHTML = `<div class="legal-shell docs-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/">Open ${siteNameMarkup()}</a></header>
+    <div class="docs-layout"><nav class="docs-nav" aria-label="Documentation">
+      <div class="docs-nav-group"><span>Docs</span>${DOC_PAGES.map((page) => link(page.path, page.title)).join('')}</div>
+      <div class="docs-nav-group">${link('/pricing', 'Pricing')}</div>
+      <div class="docs-nav-group">${link('/legal', 'Policies')}<div class="docs-nav-sub">${(S.launch?.policies || [])
+        .map((policy) => link(`/legal/${policy.slug}`, policy.title)).join('')}</div></div>
+    </nav><div class="docs-content">${content}</div></div>${legalFooter()}</div>`;
+  if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
+  else window.scrollTo(0, 0);
+  window.onpopstate = () => boot();
+}
+
+async function renderDocsPage(slug = 'getting-started') {
+  const page = DOC_PAGES.find((candidate) => candidate.slug === slug);
+  if (!page) { history.replaceState({}, '', '/docs'); return renderDocsPage(); }
+  document.title = `${page.title} · ${siteName()}`;
+  const response = await feedbackFetch(`/docs/${page.slug}.md`).catch(() => null);
+  if (location.pathname.replace(/\/$/, '') !== page.path) return; // navigated on meanwhile
+  const source = response?.ok ? await response.text() : `# ${page.title}\n\nThis page could not be loaded. Reload to try again.`;
+  const template = document.createElement('template');
+  template.innerHTML = renderMarkdown(source.replaceAll('{{origin}}', location.origin));
+  // Every section is linkable (the console points at them), links between
+  // public pages stay in this tab, wide tables scroll on their own, and a
+  // command copies with one click.
+  for (const heading of template.content.querySelectorAll('h2, h3')) heading.id = docsAnchor(heading.textContent);
+  for (const anchor of template.content.querySelectorAll('a[href^="/"], a[href^="#"]')) {
+    anchor.removeAttribute('target');
+    anchor.removeAttribute('rel');
+    if (/^\/(docs|pricing|legal)\b/.test(anchor.getAttribute('href'))) anchor.dataset.public = '';
+  }
+  for (const table of template.content.querySelectorAll('table')) {
+    const wrap = document.createElement('div');
+    wrap.className = 'docs-table';
+    table.replaceWith(wrap);
+    wrap.append(table);
+  }
+  for (const block of template.content.querySelectorAll('pre')) {
+    const wrap = document.createElement('div');
+    wrap.className = 'docs-code';
+    block.replaceWith(wrap);
+    wrap.append(block);
+    wrap.insertAdjacentHTML('beforeend', `<button class="docs-copy" type="button" aria-label="Copy" title="Copy">${ICON.copy}</button>`);
+  }
+  const article = document.createElement('article');
+  article.className = 'docs-page';
+  article.append(template.content);
+  renderPublicShell(page.path, `<main>${article.outerHTML}</main>`);
+  for (const button of document.querySelectorAll('.docs-copy')) button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(button.previousElementSibling.textContent);
+      button.classList.add('copied');
+      setTimeout(() => button.classList.remove('copied'), 1200);
+    } catch { /* the text stays selectable */ }
+  });
 }
 
 async function renderLegalPage(slug) {
@@ -20870,28 +21014,24 @@ async function renderLegalPage(slug) {
   document.title = `${policy.title} · ${siteName()}`;
   const contactRows = Object.entries(policy.contacts || {}).filter(([, email]) => email)
     .map(([kind, email]) => `<a href="mailto:${esc(email)}">${esc(kind)}: ${esc(email)}</a>`).join('');
-  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/legal">All policies</a></header>
-    <main class="legal-document"><div class="legal-kicker">Version ${esc(policy.version)} · Effective ${esc(policy.effectiveDate)}</div>
+  renderPublicShell(`/legal/${policy.slug}`, `<main class="legal-document"><div class="legal-kicker">Version ${esc(policy.version)} · Effective ${esc(policy.effectiveDate)}</div>
     <h1>${esc(policy.title)}</h1><p class="legal-summary">${esc(policy.summary)}</p>
     <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(policy.draftNotice)}</span></div>
     ${policy.operator ? `<p class="legal-operator"><b>Configured operator:</b> ${esc(policy.operator.name)}${policy.operator.country ? ` · ${esc(policy.operator.country)}` : ''}${policy.operator.governingLaw ? `<br><b>Governing law:</b> ${esc(policy.operator.governingLaw)}` : ''}${policy.operator.legalNoticeAddress ? `<br><b>Legal notices:</b> ${esc(policy.operator.legalNoticeAddress)}` : ''}</p>`
       : '<p class="legal-unresolved"><b>Launch configuration incomplete:</b> the contracting entity and jurisdiction fields are intentionally not represented.</p>'}
     ${policy.sections.map((section) => `<section><h2>${esc(section.heading)}</h2>${section.paragraphs.map((text) => `<p>${esc(text)}</p>`).join('')}
       ${section.bullets?.length ? `<ul>${section.bullets.map((text) => `<li>${esc(text)}</li>`).join('')}</ul>` : ''}</section>`).join('')}
-    ${contactRows ? `<div class="legal-contacts">${contactRows}</div>` : ''}</main>${legalFooter()}</div>`;
-  window.onpopstate = () => boot();
+    ${contactRows ? `<div class="legal-contacts">${contactRows}</div>` : ''}</main>`);
 }
 
 function renderLegalIndex() {
   document.body.classList.remove('landing-active');
   document.title = `Policies · ${siteName()}`;
-  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/pricing">Pricing</a></header>
-    <main class="legal-index"><div class="legal-kicker">Launch policy set · v${esc(S.launch?.policyVersion)}</div><h1>Policies &amp; trust</h1>
+  renderPublicShell('/legal', `<main class="legal-index"><div class="legal-kicker">Launch policy set · v${esc(S.launch?.policyVersion)}</div><h1>Policies &amp; trust</h1>
     <p class="legal-summary">Versioned product, billing, privacy, and operational disclosures for the initial paid launch.</p>
     <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(S.launch?.draftNotice)}</span></div>
-    <div class="legal-grid">${(S.launch?.policies || []).map((policy) => `<a href="/legal/${policy.slug}"><span>${esc(policy.title)}</span><small>${esc(policy.summary)}</small><i>v${esc(policy.version)} →</i></a>`).join('')}</div>
-    </main>${legalFooter()}</div>`;
-  window.onpopstate = () => boot();
+    <div class="legal-grid">${(S.launch?.policies || []).map((policy) => `<a href="/legal/${policy.slug}" data-public><span>${esc(policy.title)}</span><small>${esc(policy.summary)}</small><i>v${esc(policy.version)} →</i></a>`).join('')}</div>
+    </main>`);
 }
 
 function formatCatalogPrice(cents, currency = 'usd') {
@@ -20917,14 +21057,12 @@ function renderPricing() {
       <li>${esc(formatBytes(plan.storageBytes))} storage${plan.id === 'team' ? ` + ${esc(formatBytes(plan.additionalActiveUserStorageBytes))} per additional active user` : ''}</li></ul>
       ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
   }).join('');
-  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/login">Sign in</a></header>
-    <main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
+  renderPublicShell('/pricing', `<main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">All plans include unlimited projects. Concurrency is a maximum number of active agent runs, not reserved capacity.</p>
       <div class="pricing-grid">${cards}</div>
       <div class="pricing-terms"><p>Individual and Team renew monthly until canceled. Team is ${esc(formatCatalogPrice(team?.monthlyBasePriceCents, team?.currency))} per month including the first active user, plus ${esc(formatCatalogPrice(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional active user per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Refunds are subject to applicable law and the payment provider’s buyer terms. Request refunds through billing support or the payment provider.</p>
       ${!checkoutReady ? '<p class="legal-unresolved"><b>Paid checkout disabled:</b> the operator must complete the founder-reviewed entity, jurisdiction, and contact launch configuration before accepting charges.</p>' : ''}
-      <p class="price-policy">${policyLinks(['terms', 'privacy', 'billing'])}</p></div></main>${legalFooter()}</div>`;
-  window.onpopstate = () => boot();
+      <p class="price-policy">${policyLinks(['terms', 'privacy', 'billing'])}</p></div></main>`);
 }
 
 function openPublicAuth(path, render) {
@@ -20973,6 +21111,7 @@ function renderLanding() {
     <header class="landing-nav" aria-label="Primary navigation"><div class="landing-nav-inner">
       <div class="landing-identity"><a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a><p class="landing-tagline">Just do things.</p></div>
       <div class="landing-nav-actions">
+        <a href="/docs" class="landing-text-link">Docs</a>
         <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
         <button class="landing-theme" id="landing-theme" type="button" aria-label="Switch theme"><svg class="sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 12.6A6.8 6.8 0 0 1 7.4 3.6a6.8 6.8 0 1 0 9 9z"/></svg></button>
@@ -21055,7 +21194,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Just do things.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);

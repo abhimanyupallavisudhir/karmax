@@ -7,6 +7,9 @@ tavya gives agents isolated cloud worlds, lets people or agents own review and i
 ## Links
 
 - [Issue tracker](https://github.com/abhimanyupallavisudhir/krmax-issues/issues)
+- [Getting started](https://tavya.io/docs)
+- [How it works](https://tavya.io/docs/how-it-works)
+- [tavya CLI](https://tavya.io/docs/cli) (Markdown: https://tavya.io/docs/cli.md)
 - [Pricing](https://tavya.io/pricing)
 - [Policies and trust](https://tavya.io/legal)
 - [Security](https://tavya.io/legal/security)

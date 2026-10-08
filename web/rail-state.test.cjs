@@ -32,7 +32,8 @@ const rail = {
 
 let collapsed = [];
 global.localStorage = { getItem: () => JSON.stringify(collapsed), setItem() {} };
-global.$ = (selector) => selector === '#rail' ? rail : null;
+global.$ = (selector) => selector === '#rail-list' ? rail : null;
+global.syncRailNav = () => {}; // the static top and foot are not under test here
 global.document = { activeElement: null };
 global.projectRoute = (id) => `/projects/${id}`;
 global.projectPath = (project) => [project.folder, project.name].filter(Boolean).join('/');

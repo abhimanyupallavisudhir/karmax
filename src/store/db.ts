@@ -8925,6 +8925,8 @@ const RESERVED_ROUTE_SLUGS = new Set([
   'api', 'ws', 'mcp', 'oauth',
   // app sign-in approval (web/app.js renderDeviceApproval)
   'device',
+  // public pages (web/app.js boot: renderDocsPage, renderPricing, renderLegal*)
+  'docs', 'pricing', 'legal',
   // top-level routes / legacy org paths (an org slug is the first URL segment)
   'invite', 'projects', 'organization', 'organizations', 'installation',
   // `for:me` is the signed-in person in every search (and /me is kept free)

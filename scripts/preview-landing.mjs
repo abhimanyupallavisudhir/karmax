@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Serve the signed-out public pages (landing, pricing, policies) from web/
+// Serve the signed-out public pages (landing, docs, pricing, policies) from web/
 // without booting Temporal, the worker or the gateway. The console has no build
 // step, so this is the exact markup and CSS production serves; only the three
 // bootstrap API calls are stubbed as a signed-out visitor would see them.
@@ -20,7 +20,7 @@ const brandIcon = process.env.BRAND_ICON || 'royal-gold-arrow';
 const types = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2', '.json': 'application/json',
-  '.webmanifest': 'application/manifest+json', '.txt': 'text/plain; charset=utf-8',
+  '.webmanifest': 'application/manifest+json', '.txt': 'text/plain; charset=utf-8', '.md': 'text/markdown; charset=utf-8',
 };
 const api = {
   '/api/meta': { siteName, hosted: true, version: 'preview' },
