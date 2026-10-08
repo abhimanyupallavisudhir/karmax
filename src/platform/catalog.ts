@@ -1,3 +1,5 @@
+import { EXPLANATIONS_ENABLED } from '../config/features.js';
+
 /**
  * Agent-readable map of the first-party HTTP surface used by platform_request.
  *
@@ -127,7 +129,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/organizations/:organizationId/teams/:teamId/members/:userId',
     'GET|PUT /api/organizations/:organizationId/settings/:workflow (organization:read/edit; Administrator authority)',
     'GET|PUT /api/organizations/:organizationId/quick-settings/:workflow',
-    'GET|PUT /api/organizations/:organizationId/explanation-settings',
+    ...(EXPLANATIONS_ENABLED ? ['GET|PUT /api/organizations/:organizationId/explanation-settings'] : []),
   ],
   sourceControl: [
     'GET|PUT /api/projects/:projectId/repository-sources',
@@ -202,7 +204,8 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/conversation-imports?projectId= (raw Codex/Claude JSONL upload)',
     'GET /api/tasks/:taskId/events?since=',
     'GET /api/tasks/:taskId/timing (correlated response timing, counts/median/p95, missing data, spans and content-free observations; task:event:read)', 'POST /api/tasks/:taskId/signal (followUp + role messages an agent; task:signal)', 'POST /api/tasks/:taskId/messages (body {text, role} messages one agent; or {text, to: [agent:do | agent:responder | agent:confirm | agent:agent-<n> | person/team/Avatar selectors], agents?: {"agent-<n>": agent spec}, images?, files?} says it in the shared conversation, calls the agents in order and notifies the people; task:conversation:message, task:edit to add agents)',
-    'GET|POST /api/tasks/:taskId/explanations (durable annotations; POST body {role, sourceKey, settings?})',
+    EXPLANATIONS_ENABLED ? 'GET|POST /api/tasks/:taskId/explanations (durable annotations; POST body {role, sourceKey, settings?})'
+      : 'GET /api/tasks/:taskId/explanations (saved annotations)',
   ],
   review: [
     'POST /api/tasks/:taskId/review-action', 'GET /api/tasks/:taskId/review-action/:procId',
@@ -223,7 +226,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/profiles', 'DELETE /api/profiles/:id',
     'GET /api/models|schema|events/catalog|contributions', 'GET /api/defaults/:projectId/:workflow',
     'GET|PUT /api/settings/global/:workflow (shared installation; settings:read/write; God authority)', 'GET|PUT /api/settings/project/:projectId/:workflow',
-    'GET|PUT /api/projects/:projectId/explanation-settings',
+    ...(EXPLANATIONS_ENABLED ? ['GET|PUT /api/projects/:projectId/explanation-settings'] : []),
     'GET|PUT /api/settings/quick/global/:workflow', 'GET|PUT /api/settings/quick/project/:projectId/:workflow',
     'POST /api/skills',
   ],

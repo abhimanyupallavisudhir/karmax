@@ -8157,7 +8157,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions?metadata=1`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
-      taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`, { stable: true }).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
+      explanationsEnabled() && taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`, { stable: true }).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
         : Promise.resolve({ effective: DEFAULT_EXPLANATION_SETTINGS }),
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
       api(`/api/connections?${approvalQuery}`).catch(() => []),
@@ -10489,6 +10489,9 @@ function explanationModelLabel(model = S.explanationSettings?.model) {
   return String(model || DEFAULT_EXPLANATION_SETTINGS.model).split('/').pop();
 }
 
+/** Whether "Explain this" is offered (a server feature flag; off for now). */
+function explanationsEnabled() { return S.meta?.explanationsEnabled === true; }
+
 function explainMessageAffordance(entry, v) {
   if (!entry.sourceKey) return '';
   const pending = !!S.explanationPending?.[entry.sourceKey];
@@ -10500,9 +10503,10 @@ function explainMessageAffordance(entry, v) {
   const error = !failure ? '' : failure.code === 'explanation_api_key_missing'
     ? `<div class="explain-error">API key for ${esc(failure.provider)} not found. Please add an API key in <a data-spa href="${globalRoute('organization', organization)}#settings-agents">agent logins</a> or try with a different model (<a data-spa href="${projectRoute(project?.id, 'settings')}#project-explanation">change default</a>).</div>`
     : `<div class="explain-error">${esc(failure.message || 'Could not explain this message.')}</div>`;
+  const explain = !explanationsEnabled() ? '' : `<button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
+    <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>`;
   return `<div class="explain-tools" data-source-key="${key}" data-role="${role}">
-    <button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
-    <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>
+    ${explain}
     ${texToggleHtml(!markdownEnabled())}
     ${error}
   </div>`;
@@ -11375,7 +11379,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     const baseEnabled = new Set(base.enabled || []);
     const pol = opts.policy || {};
     const onSet = new Set(pol.on || []), offSet = new Set(pol.off || []), explainerSet = new Set(pol.explainerOnly || []);
-    const modeOf = (k) => onSet.has(k) ? 'on' : offSet.has(k) ? 'off' : explainerSet.has(k) ? 'explainer-only'
+    const modeOf = (k) => onSet.has(k) ? 'on' : offSet.has(k) ? 'off' : explainerSet.has(k) ? (explanationsEnabled() ? 'explainer-only' : 'off')
       : base.modes?.[k] || (baseEnabled.has(k) ? 'on' : 'off');
     const seen = new Set(), eff = [];
     for (const k of [...(pol.order || []), ...(base.enabled || []), ...(data.credentials || []).map((c) => c.key)]) {
@@ -11428,7 +11432,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
         ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
             <option value="on"${mode === 'on' ? ' selected' : ''}>On</option>
             <option value="off"${mode === 'off' ? ' selected' : ''}>Off</option>
-            <option value="explainer-only"${mode === 'explainer-only' ? ' selected' : ''}>Explainer-only</option>
+            ${explanationsEnabled() ? `<option value="explainer-only"${mode === 'explainer-only' ? ' selected' : ''}>Explainer-only</option>` : ''}
           </select>`
         : `<button class="cred-toggle ${mode}" title="${mode === 'on' ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${mode}</button>`;
       return `<div class="cred-row ${esc(c.signedOut ? 'signed-out' : mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
@@ -14006,6 +14010,7 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
 }
 
 function explanationSettingsCard(scope) {
+  if (!explanationsEnabled()) return '';
   const id = scope === 'project' ? 'project-explanation' : 'settings-explanation';
   return `<div class="card explanation-settings" id="${id}">
     <div class="section-h">Explanation model</div>
