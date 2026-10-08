@@ -47,3 +47,15 @@ Remote start-up in a directory sandbox (`benchmarks/remote-bootstrap.ts`: fake C
 
 - `remote-bootstrap-2026-09-28.json` — LT-1, AD-12, AD-13: one bootstrap command, history moved by its new part only.
 - `remote-bootstrap-lt22-2026-09-28.json` — LT-22: browser readiness folded into that bootstrap, first-turn smoke test beside prompt preparation.
+
+## Workflow memory (RT-35, 2026-10-08)
+
+`benchmarks/workflow-memory.ts` (real Temporal, scripted agent, N open
+software-dev tasks): the V8 heap per open task of the worker's workflow thread,
+where every cached workflow lives, before and after the conversation publisher
+kept fingerprints instead of copies. 64 KB conversations (40 tasks × 8 turns × 4 KB):
+[before](workflow-memory-before-2026-10-08.json.gz) 1.10 MB,
+[after](workflow-memory-after-2026-10-08.json.gz) 0.52 MB. 384 KB conversations
+(20 tasks × 6 turns × 32 KB): [before](workflow-memory-large-before-2026-10-08.json.gz)
+4.48 MB, [after](workflow-memory-large-after-2026-10-08.json.gz) 1.23 MB. Read in
+the wiki's `ops/performance-history`, "Control-plane memory".

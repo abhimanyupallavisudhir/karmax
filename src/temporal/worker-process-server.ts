@@ -2,10 +2,10 @@ import fs from 'node:fs';
 import { Worker as Guardian } from 'node:worker_threads';
 import type { WorkerManager } from './worker-pool.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
-import { heapNow, type WorkerProcessRequest, type WorkerProcessReply, type WorkerProcessNotice } from './worker-process.js';
+import { heapNow, type WorkerHeap, type WorkerProcessRequest, type WorkerProcessReply, type WorkerProcessNotice } from './worker-process.js';
 
 export interface WorkerProcessRuntime {
-  worker: Pick<WorkerManager, 'start' | 'refresh' | 'stop'>;
+  worker: Pick<WorkerManager, 'start' | 'refresh' | 'stop'> & { status?(): Pick<WorkerHeap, 'workflows' | 'workflowCache'> };
   close(): Promise<void>;
 }
 
@@ -101,7 +101,7 @@ export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, 
     const id = request.id!;
     if (closing || (pending >= 16 && request.action !== 'stop')) { void reply(id, false, 'worker is not accepting commands'); return; }
     if (request.action === 'ping') {
-      void reply(id, !!runtime, runtime ? undefined : 'worker is not started', { heap: heapNow() });
+      void reply(id, !!runtime, runtime ? undefined : 'worker is not started', { heap: heapNow(runtime?.worker.status?.()) });
       return;
     }
     if (request.action !== 'stop' && (!Array.isArray(request.packages) || request.packages.some(ref =>

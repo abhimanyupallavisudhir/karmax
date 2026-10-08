@@ -128,6 +128,8 @@ export const SERVICE_CATALOG: ServiceSpec[] = [
         tip: 'Memory in use on the server.' },
       { id: 'host.heap', label: 'Worker heap', unit: 'bytes', window: 'now', source: 'host',
         tip: 'Memory used by the process that runs agent work. If it reaches its limit the process crashes and restarts.' },
+      { id: 'host.workflow-heap', label: 'Workflow heap', unit: 'bytes', window: 'now', source: 'host',
+        tip: 'Memory holding open tasks. Near its limit tavya keeps fewer tasks in memory, so they respond more slowly; at it, the process restarts.' },
       { id: 'host.database', label: 'Database connections', unit: 'count', window: 'now', source: 'host',
         tip: 'Connections open to PostgreSQL, against its maximum.' },
     ] },
