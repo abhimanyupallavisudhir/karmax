@@ -225,6 +225,18 @@ a { color: var(--accent); text-decoration: none; }
   max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .topbar-user:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface); }
+/* The shortcut echo: the keys for what you just did, fading after a moment
+   (held while hovered; a pending chord prefix holds until it resolves). */
+.key-echo {
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.5; white-space: nowrap;
+  color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 7px;
+  animation: key-echo-fade 2.4s ease-in forwards;
+}
+.key-echo:empty { display: none; }
+.key-echo.pending { animation: none; }
+.key-echo:hover { animation-play-state: paused; }
+@keyframes key-echo-fade { 0%, 75% { opacity: 1; } 100% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .key-echo { animation-timing-function: step-end; } }
 
 .body { flex: 1; min-height: 0; display: grid; grid-template-columns: 232px 1fr; overflow: hidden; }
 /* Folding the rail (☰ on a wide screen): the column closes smoothly and the
@@ -2097,7 +2109,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   .topbar { gap: 8px; padding-left:max(10px, env(safe-area-inset-left)); padding-right:max(10px, env(safe-area-inset-right)); }
   .mobile-menu { display:grid; flex:none; }
   .topbar .brand { font-size:0; gap:0; }
-  .topbar #topbar-help, .topbar #topbar-palette { display:none; }
+  .topbar #topbar-help, .topbar #topbar-palette, .topbar .key-echo { display:none; }
   .topbar-user { max-width:84px; padding:0 9px; }
   .body { grid-template-columns: 1fr; }
   .rail {

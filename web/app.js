@@ -374,6 +374,7 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
  *  the rail highlights the project, the main pane shows its tab bar). One list
  *  so they never drift apart again. */
 const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
+const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', wiki: 'nav.wiki', settings: 'nav.settings' };
 // The query a task list opens with: what needs the signed-in person.
 const DEFAULT_LIST_QUERY = 'for:me';
 // Second-segment words that name an organization-level view rather than a project.
@@ -3531,6 +3532,7 @@ function installShellListeners() {
   if (installShellListeners.installed) return;
   installShellListeners.installed = true;
   bindKeys();
+  document.addEventListener('click', echoClickedShortcut, true);
   installLinkRouter();
   installTagRouter();
   installInfoDotTips();
@@ -4527,14 +4529,15 @@ function renderShell() {
   app.innerHTML = `
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">☰</button>
-      <a class="brand" id="brand-home" data-spa href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
+      <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
       ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
-      <button class="icon-btn" id="topbar-help" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">?</button>
-      <a class="topbar-user" id="topbar-user" data-spa href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
-      <a class="icon-btn has-badge" id="bell" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
+      <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
+      <button class="icon-btn" id="topbar-palette" data-shortcut="nav.commandPalette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
+      <button class="icon-btn" id="topbar-help" data-shortcut="help.keyboard" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">?</button>
+      <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
+      <a class="icon-btn has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
     <div class="body">
@@ -4545,6 +4548,7 @@ function renderShell() {
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   $('#topbar-palette').addEventListener('click', openPalette);
   $('#topbar-help').addEventListener('click', openHelp);
+  $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
   const closeMobileNav = () => {
     $('#rail')?.classList.remove('mobile-open');
@@ -4847,18 +4851,18 @@ function renderRail() {
     rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
     $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
   } else rail.innerHTML = `
-    <a class="nav-item rail-home ${S.tab === 'home' ? 'active' : ''}" data-spa href="${esc(homeRoute())}" id="rail-home" tabindex="0" title="${esc(commandHint('Home — every project, what needs you first', 'nav.home'))}">⌂ Home</a>
-    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
+    <a class="nav-item rail-home ${S.tab === 'home' ? 'active' : ''}" data-spa href="${esc(homeRoute())}" id="rail-home" data-shortcut="nav.home" tabindex="0" title="${esc(commandHint('Home — every project, what needs you first', 'nav.home'))}">⌂ Home</a>
+    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" data-shortcut="nav.projects rail.newProject" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
     <label class="rail-search-box">
       <svg class="rail-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
-    <input id="project-search" class="rail-search" type="search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
+    <input id="project-search" class="rail-search" type="search" data-shortcut="nav.projects rail.search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
     </label>
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>
     <div class="label">Organization</div>
-    <a class="nav-item ${S.tab === 'insights' ? 'active' : ''}" data-spa href="${globalRoute('insights')}" data-tab="insights" tabindex="0" title="${esc(commandHint('Insights', 'nav.insights'))}">▦ Insights</a>
-    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="${esc(commandHint('Organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'))}">🕮 Wiki</a>
-    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0" title="${esc(commandHint('Organization settings', 'nav.global'))}">⚙ Settings</a>
+    <a class="nav-item ${S.tab === 'insights' ? 'active' : ''}" data-spa href="${globalRoute('insights')}" data-tab="insights" data-shortcut="nav.insights" tabindex="0" title="${esc(commandHint('Insights', 'nav.insights'))}">▦ Insights</a>
+    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" data-shortcut="nav.orgwiki" tabindex="0" title="${esc(commandHint('Organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'))}">🕮 Wiki</a>
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" data-shortcut="nav.global" tabindex="0" title="${esc(commandHint('Organization settings', 'nav.global'))}">⚙ Settings</a>
     ${S.installationAccess ? `<div class="label">Installation</div><a class="nav-item ${S.tab === 'installation' ? 'active' : ''}" data-spa href="${installationRoute()}" id="rail-installation" tabindex="0">⌘ Installation</a>` : ''}`;
   // Your profile lives in the top bar (#topbar-user), not the rail. Project +
   // Insights/Wiki/Settings entries are real <a> links — installLinkRouter()
@@ -5113,7 +5117,7 @@ function renderMain() {
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
-        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
+        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}"${PROJECT_TAB_COMMANDS[t] ? ` data-shortcut="${PROJECT_TAB_COMMANDS[t]}"` : ''}>${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
         .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
     : '';
 
@@ -5388,12 +5392,12 @@ function tasksView() {
     <div class="composer">
       <div class="quick-task-field">
         ${home ? projectPickerHtml('new-task-project', newTaskProjectId()) : ''}
-        <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
+        <input class="title-in" id="new-task" data-shortcut="nav.newTask" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
         <label class="btn soft icon-only attach-composer quick-task-attach" tabindex="0" title="Attach files (25 MB each)" aria-label="Attach files">${ICON.attach}<input id="new-task-files" type="file" multiple hidden></label>
       </div>
       <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.save}</button>
-      <button class="btn icon-only" id="expand-task" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
-      <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
+      <button class="btn icon-only" id="expand-task" data-shortcut="nav.newTaskForm" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
+      <button class="btn primary icon-only" id="add-task" data-shortcut="list.quickAdd" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
     <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>`;
   const trailing = everywhere ? '' : home ? projectFilterHtml()
@@ -5402,7 +5406,7 @@ function tasksView() {
     <div class="organizer">
       <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
-        <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
+        <input id="task-search" class="task-search" data-shortcut="nav.search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
         ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
         ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : ''}
@@ -5724,8 +5728,8 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
-    ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
-    : `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
+    ? `<button class="icon-btn" data-unarchive="${t.id}" data-shortcut="list.archive" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
+    : `<button class="icon-btn" data-archive="${t.id}" data-shortcut="list.archive" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
   return `
     <div class="task-row ${archived ? 'archived' : ''}${taskHasUnreadAsk(t.id) ? ' unread' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
@@ -6915,7 +6919,7 @@ function taskFormTitle(draft) {
 function taskFormLoadingPage(project, draft) {
   return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
     <div class="tf-head"><div class="tf-head-inner">
-      <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
+      <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
       <h2>${taskFormTitle(draft)}</h2>
       ${project ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', project.id, false)}` : ''}
     </div></div>
@@ -7027,7 +7031,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     <div class="task-form-page" id="tf-page" tabindex="-1">
       <div class="tf-head">
         <div class="tf-head-inner">
-          <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
+          <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
           <h2>${taskFormTitle(draft)}</h2>
           ${proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
@@ -7722,7 +7726,7 @@ function renderTaskLoadingPage(rec, error) {
   const title = rec?.title || 'Task';
   main.innerHTML = `<div class="task-page" aria-busy="${error ? 'false' : 'true'}">
     <div class="tp-head"><div class="row1">
-      <button class="icon-btn" id="tp-back" title="Back (Esc)">←</button>
+      <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
       ${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
       <h2>${esc(title)}</h2>
     </div></div>
@@ -7752,7 +7756,7 @@ async function renderSeriesPage(rec) {
     <div class="task-page">
       <div class="tp-head">
         <div class="row1">
-          <button class="icon-btn" id="tp-back" title="Back (Esc)">←</button>
+          <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
           ${rec.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
           <h2>${esc(rec.title)}</h2>
           <span class="chip">repeatable</span>
@@ -7856,7 +7860,7 @@ function attemptCard(a, g, v, { tab = '', form = false } = {}) {
 
 function addAttemptButton(cls = '') {
   const g = S.attemptGroup;
-  return `<button type="button" class="btn tool attempt-add ${cls}" id="add-attempt" ${g?.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g?.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>`;
+  return `<button type="button" class="btn tool attempt-add ${cls}" id="add-attempt" data-shortcut="task.attempt.new" ${g?.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g?.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>`;
 }
 
 // Follow the rendered links so keyboard navigation uses the same pinned routes
@@ -8701,7 +8705,7 @@ function renderTaskPage() {
       <div class="tp-head">
         ${parentTaskContext(v)}
         <div class="row1">
-          <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
+          <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
           ${stageIndicator(v, v.taskId)}
@@ -10093,7 +10097,7 @@ function conversationPane(v, t) {
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         </div>
         ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
-        <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
+        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}>Send</button>
       </div></div>`
     : '';
   return `
@@ -20345,7 +20349,7 @@ const HOST_COMMANDS = [
     openTaskForm(QUICK_TASK_WORKFLOW);
   } },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
-  { id: 'nav.home', title: 'Go home', key: 'g h', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
+  { id: 'nav.home', title: 'Go home', key: 'g H', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
   { id: 'nav.insights', title: 'Go to insights', key: 'g i', run: () => switchTab('insights') },
@@ -20593,9 +20597,47 @@ function closeTopOverlay() {
   if (S.selected) return closeTask();
 }
 
+// -- the shortcut echo: what you just did, as keys ---------------------------
+// Every action with a shortcut — clicked, run from the palette or typed — shows
+// its keys in the topbar for a moment, so the console teaches its own keyboard.
+// A chord prefix ('g') shows until the chord completes or lapses. The keys come
+// from the same registry as dispatch: clickable controls name their command in
+// `data-shortcut` (space-separated ids form a sequence: 'nav.projects
+// rail.newProject' is g P then n), or a raw binding in `data-keys`.
+function echoKeys(keys, title = '', pending = false) {
+  const el = $('#key-echo');
+  if (!el) return;
+  el.textContent = keys || '';
+  el.title = title;
+  el.classList.toggle('pending', pending);
+  el.style.animation = 'none'; void el.offsetWidth; el.style.animation = ''; // restart the fade
+}
+function clearPendingEcho() { if ($('#key-echo.pending')) echoKeys(''); }
+function controlShortcut(control) {
+  if (control.disabled) return null;
+  if (control.dataset.keys) return { keys: fmtKeys(control.dataset.keys), title: control.getAttribute('aria-label') || control.textContent.trim() };
+  const cmds = allCommands();
+  if (control.dataset.act) { // a task action: its workflow's binding, else the digit it shows
+    const bound = cmds.find((c) => c.id === `task.${control.dataset.act}` && c.available && c.keybinding);
+    const keys = bound ? fmtKeys(bound.keybinding) : control.querySelector('.kbd')?.textContent;
+    return keys ? { keys, title: control.dataset.label } : null;
+  }
+  const steps = control.dataset.shortcut.split(' ').map((id) => cmds.find((c) => c.id === id));
+  if (!steps.every((c) => c?.keybinding)) return null;
+  return { keys: steps.map((c) => fmtKeys(c.keybinding)).join(' '), title: steps.at(-1).title };
+}
+function echoClickedShortcut(e) {
+  // Clicks a command fires itself (digits press action buttons) are untrusted;
+  // the keys that fired it are already showing.
+  if (!e.isTrusted || !e.target?.closest) return;
+  const control = e.target.closest('[data-shortcut], [data-keys], #tp-foot [data-act]');
+  const hint = control && controlShortcut(control);
+  if (hint) echoKeys(hint.keys, hint.title);
+}
+
 // -- the dispatcher ------------------------------------------------------------
 const CHORD = { pending: [], timer: 0 };
-function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
+function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); clearPendingEcho(); }
 // A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires on its own before the key
 // it modifies. It must be transparent to the chord buffer — otherwise pressing
 // Shift for the second step of a shifted chord (`g P`, `g W`, `g D`, `g S`, …)
@@ -20621,8 +20663,9 @@ function dispatchKey(e) {
   e.preventDefault();
   const exact = candidates.find((c) => c.keys.length === CHORD.pending.length + 1);
   const longer = candidates.some((c) => c.keys.length > CHORD.pending.length + 1);
-  if (exact && !longer) { resetChord(); exact.run(); return true; }
+  if (exact && !longer) { resetChord(); echoKeys(fmtKeys(exact.keybinding), exact.title); exact.run(); return true; }
   CHORD.pending.push(snap); // a chord prefix ('g' …) — wait briefly for the rest
+  echoKeys(fmtKeys(candidates[0].keybinding).split(' ').slice(0, CHORD.pending.length).join(' '), '', true);
   clearTimeout(CHORD.timer);
   CHORD.timer = setTimeout(resetChord, 900);
   return true;
@@ -20712,7 +20755,7 @@ function openPalette() {
     }).join('') || `<div class="pal-empty">No matches</div>`;
     list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
   };
-  const run = (i) => { const it = items[i]; if (!it) return; close(); it.run(); };
+  const run = (i) => { const it = items[i]; if (!it) return; close(); if (it.kbd) echoKeys(fmtKeys(it.kbd), it.title); it.run(); };
   input.addEventListener('input', build);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
