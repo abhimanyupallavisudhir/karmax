@@ -1731,7 +1731,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const { gatherCredentialSources, readPolicyLayers } = await import('../platform/credential-sources.js');
       const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
       const organizationId = (await store.getProject(args.projectId))?.organizationId ?? 'org_personal';
-      const sources = gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId });
+      const sources = await gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId });
       const all = enumerateCredentials(sources);
       const layers = (await readPolicyLayers(async (k) => (await store.kvGet(k)), { organizationId, projectId: args.projectId, taskId: args.taskId }));
       const profile = args.role && args.task
@@ -2081,7 +2081,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if ((args.accountConfigHome || args.accountApiKeyHandle) && profile.provider !== 'mock') {
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
         const { enumerateCredentials } = await import('../platform/credentials.js');
-        const own = enumerateCredentials(gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId }));
+        const own = enumerateCredentials(await gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId }));
         if ((args.accountConfigHome && !own.some((c) => c.configHome && path.resolve(c.configHome) === path.resolve(args.accountConfigHome!)))
           || (args.accountApiKeyHandle && !own.some((c) => c.apiKeyHandle === args.accountApiKeyHandle)))
           throw ApplicationFailure.create({
@@ -2100,7 +2100,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // resolve JIT; reserved environment-key references carry only the provider
       // identity and let the adapter read that provider's process environment.
       if (args.accountApiKeyHandle && deps.broker) {
-        const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: [`use-credential:${args.accountApiKeyHandle}`] });
+        const apiKey = await deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: [`use-credential:${args.accountApiKeyHandle}`] });
         (await recordSecretRefs(store, args.taskId, [handleRef(args.accountApiKeyHandle)]));
         resolvedAuth = { apiKey };
       }

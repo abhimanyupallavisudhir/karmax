@@ -27,7 +27,7 @@ const [command, argument] = args;
 try {
   if (!dir || !command) throw new Error(usage);
   if (command === 'status') {
-    const status = new Vault(dir, { readOnly: true }).keyStatus();
+    const status = await new Vault(dir, { readOnly: true }).keyStatus();
     console.log(`vault key ${status.kek}; ${status.scoped ? 'every secret is under a data key' : 'the data epoch 4 migration has not finished'}`);
     console.log(`${status.keyrings} keyrings; data keys wrapped under: ${Object.entries(status.wraps).map(([id, n]) => `${id} (${n})`).join(', ') || 'none'}`);
     console.log(`canaries: ${status.canaries.join(', ') || 'none'}`);
@@ -43,7 +43,7 @@ try {
     console.log(pruned.length ? `removed the wraps and canaries of ${pruned.join(', ')}` : 'no other vault key wraps remain');
   } else if (command === 'rotate-data-key') {
     const vault = new Vault(dir);
-    const scopes = argument === '--all' ? vault.keyStatus().scopes : [argument];
+    const scopes = argument === '--all' ? (await vault.keyStatus()).scopes : [argument];
     for (const scope of scopes) {
       if (!isVaultScope(scope)) throw new Error(`not a vault scope: ${scope} (installation, organization:<id> or user:<id>)`);
       const { reencrypted, retired } = await vault.rotateDataKey(scope);

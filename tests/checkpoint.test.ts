@@ -551,9 +551,9 @@ esac
       expect((await wrapped.exec('bash', ['-lc', 'printf %s "$DATABASE_URL"'])).stdout)
         .toBe('postgres://app@172.17.0.8:5432/app');
       const serviceHandle = Object.values(restoredHandle.meta?.serviceEnvironmentHandles as Record<string, string>)[0]!;
-      expect(broker.hasHandle(serviceHandle)).toBe(true);
+      expect(await broker.hasHandle(serviceHandle)).toBe(true);
       await resources.release(restoredHandle);
-      expect(broker.hasHandle(serviceHandle)).toBe(false);
+      expect(await broker.hasHandle(serviceHandle)).toBe(false);
       await restored.destroy();
       (await store.close());
     } finally {

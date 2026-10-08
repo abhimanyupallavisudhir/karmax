@@ -80,7 +80,7 @@ export class McpConnections {
           const clientId = bounded(v.clientId, 2048, 'OAuth client ID').trim();
           const method = v.tokenEndpointAuthMethod ?? 'none';
           if (!['none', 'client_secret_basic', 'client_secret_post'].includes(method)) throw new Error('Unsupported OAuth client authentication method');
-          const previous = prior && !changed ? this.secret(prior).manualClient : undefined;
+          const previous = prior && !changed ? (await this.secret(prior)).manualClient : undefined;
           const secret = v.clientSecret === undefined && previous?.client_id === clientId && previous?.token_endpoint_auth_method === method
             ? previous.client_secret : v.clientSecret;
           if (method !== 'none' && (typeof secret !== 'string' || !secret || secret.length > 16384 || /[\r\n\0]/.test(secret)))
@@ -103,7 +103,7 @@ export class McpConnections {
       if (input.secrets !== undefined && auth === 'secrets') {
         secrets = validateSecrets(input.secrets, transport.type === 'stdio');
         if (input.mergeSecrets && prior && !changed && prior.auth === 'secrets') {
-          const old = this.secret(prior);
+          const old = await this.secret(prior);
           const keep = Array.isArray(input.retainSecretNames) ? input.retainSecretNames : Object.keys(old);
           secrets = validateSecrets({ ...Object.fromEntries(Object.entries(old).filter(([key]) => keep.includes(key))), ...secrets }, transport.type === 'stdio');
         }
@@ -135,10 +135,10 @@ export class McpConnections {
   async delivered(taskId: string, connections: McpConnection[]): Promise<void> {
     (await recordSecretRefs(this.store, taskId, connections.map((c) => handleRef(this.handle(c.id)))));
   }
-  secret(c: McpConnection, taskId?: string): any {
+  async secret(c: McpConnection, taskId?: string): Promise<any> {
     const handle = this.handle(c.id);
-    if (!this.broker.hasHandle(handle)) return {};
-    return JSON.parse(this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }));
+    if (!await this.broker.hasHandle(handle)) return {};
+    return JSON.parse(await this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }));
   }
   async setSecret(c: McpConnection, value: unknown) {
     await this.store.transaction(async () => {

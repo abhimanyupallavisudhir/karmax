@@ -107,7 +107,7 @@ export async function settleTaskSessions(args: {
       const vault = new VaultItems(store, args.broker, undefined, hold.organizationId);
       const item = await vault.get(hold.itemId);
       if (item?.type === 'session' && world && args.broker && args.openPage && item.domains?.length) {
-        const raw = vault.readSecret(item, 'session');
+        const raw = await vault.readSecret(item, 'session');
         if (raw) {
           const page = await args.openPage(world, item.domains);
           try {

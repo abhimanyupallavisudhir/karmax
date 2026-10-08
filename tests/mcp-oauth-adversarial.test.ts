@@ -30,7 +30,7 @@ describe('MCP OAuth hostile inputs and concurrency', () => {
   afterEach(async () => { vi.restoreAllMocks(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true }); });
   it.each(['expired', 'changed', 'deleted', 'wrong-user', 'wrong-state', 'unicode-state', 'missing-code', 'object-code'])('rejects %s before token exchange', async (scenario) => {
     let actor = 'user:alice', suppliedState = state, code: any = 'code';
-    if (scenario === 'expired') { const data = service.secret(connection); data.pending.expires = 0; (await service.setSecret(connection, data)); }
+    if (scenario === 'expired') { const data = (await service.secret(connection)); data.pending.expires = 0; (await service.setSecret(connection, data)); }
     if (scenario === 'changed') connection = (await service.save({ ...connection, label: 'Edited' }));
     if (scenario === 'deleted') (await service.remove(connection.id));
     if (scenario === 'wrong-user') actor = 'user:mallory';
@@ -45,11 +45,11 @@ describe('MCP OAuth hostile inputs and concurrency', () => {
     const outcomes = await Promise.allSettled([1, 2, 3].map(() => finishOAuth(service, connection, 'user:alice', state, 'code')));
     expect(outcomes.filter((o) => o.status === 'fulfilled')).toHaveLength(1);
     expect(exchanges).toHaveLength(1);
-    expect(service.secret(connection).pending).toBeUndefined();
+    expect((await service.secret(connection)).pending).toBeUndefined();
   });
   it('coalesces concurrent refreshes and never projects refresh tokens or client credentials', async () => {
     await finishOAuth(service, connection, 'user:alice', state, 'code');
-    (await service.setSecret(connection, { ...service.secret(connection), expiresAt: 0 }));
+    (await service.setSecret(connection, { ...(await service.secret(connection)), expiresAt: 0 }));
     const headers = await Promise.all([1, 2, 3, 4].map(() => connectionHeaders(service, connection, 'task')));
     expect(headers).toEqual(Array(4).fill({ Authorization: 'Bearer scoped-access' }));
     expect(exchanges.filter((e) => e.get('grant_type') === 'refresh_token')).toHaveLength(1);

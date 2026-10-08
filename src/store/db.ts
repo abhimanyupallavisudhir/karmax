@@ -864,6 +864,24 @@ export class Store {
         projectId TEXT NOT NULL,
         PRIMARY KEY(attachmentId, projectId)
       );
+      -- The credential vault on PostgreSQL (autonomy/vault-database.ts): ciphertext
+      -- and wrapped data keys only, never a plaintext secret or the vault key.
+      CREATE TABLE IF NOT EXISTS vault_entries (
+        handle TEXT PRIMARY KEY, scope TEXT NOT NULL, blob TEXT NOT NULL,
+        previous TEXT NOT NULL DEFAULT '[]', unresolved INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS vault_keyrings (
+        scope TEXT PRIMARY KEY, ring TEXT NOT NULL, version INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS vault_kek_canaries (
+        kek TEXT PRIMARY KEY, record TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS vault_quarantine (
+        id TEXT PRIMARY KEY, handle TEXT, scope TEXT, record TEXT NOT NULL,
+        reason TEXT NOT NULL, createdAt INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_vault_entries_scope ON vault_entries(scope);
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
       CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parentTaskId);
       CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_memberships(userId, organizationId);

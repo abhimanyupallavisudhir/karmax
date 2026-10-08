@@ -29,7 +29,7 @@ it('attaches a secondary process without seeding profiles, importing credentials
     expect(await store.listProfiles()).toEqual([]);
     expect(await secondary.providerConnections.list('org_personal')).toEqual([]);
     expect(await store.listStorageLocations('org_personal')).toEqual([]);
-    expect(broker.listHandles()).toEqual([]);
+    expect(await broker.listHandles()).toEqual([]);
     const primary = await createExecutionServices({ ...input, bootstrap: true });
     expect((await store.listProfiles()).length).toBeGreaterThan(0);
     expect(await primary.providerConnections.get('org_personal', 'e2b')).toMatchObject({ credentialConfigured: true });

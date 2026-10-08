@@ -2506,11 +2506,11 @@ esac
     expect(JSON.stringify(card)).not.toContain('4242424242424242');
     const listed = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { headers: auth() })).text();
     expect(listed).not.toContain('4242424242424242');
-    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(true);
+    expect(await h.broker.hasHandle(`payment:card:${card.id}`)).toBe(true);
 
     // Revoking destroys the secret rather than merely hiding the row.
     expect((await fetch(`${base}/api/cards/${card.id}?organizationId=${orgId}`,
       { method: 'DELETE', headers: auth() })).status).toBe(200);
-    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(false);
+    expect(await h.broker.hasHandle(`payment:card:${card.id}`)).toBe(false);
   });
 });

@@ -78,7 +78,7 @@ describe('project resource credentials', () => {
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     return resources.environmentFor((await resources.prepare(world)).handle);
   };
-  const platformIntact = () => expect(broker.resolve(PLATFORM_HANDLE, { caps: [`use-credential:${PLATFORM_HANDLE}`] }))
+  const platformIntact = async () => expect(await broker.resolve(PLATFORM_HANDLE, { caps: [`use-credential:${PLATFORM_HANDLE}`] }))
     .toBe(PLATFORM_SECRET);
 
   it('refuses a request that names the vault handles a resource uses', async () => {
@@ -103,14 +103,14 @@ describe('project resource credentials', () => {
     const id = await createSecret();
     await tamper(id);
     await expect(environment()).rejects.toThrow(/does not own/);
-    platformIntact();
+    await platformIntact();
   });
 
   it('writes a new secret to the resource\'s own handle, never the one it named', async () => {
     const id = await createSecret();
     await tamper(id);
     expect((await patch(id, { secret: 'replacement' })).status).toBe(200);
-    platformIntact();
+    await platformIntact();
     expect((await store.getResourceAttachment(id))!.credentialHandles).toEqual([`resource:${id}:credential`]);
     expect(await environment()).toEqual({ APP_TOKEN: 'replacement' });
   });
@@ -121,7 +121,7 @@ describe('project resource credentials', () => {
     const response = await fetch(`${server.url}/api/projects/${project.id}/secrets`, { method: 'POST', headers,
       body: JSON.stringify({ env: 'APP_TOKEN=pasted\n' }) });
     expect(response.status).toBe(200);
-    platformIntact();
+    await platformIntact();
     expect(await environment()).toEqual({ APP_TOKEN: 'pasted' });
   });
 
@@ -130,7 +130,7 @@ describe('project resource credentials', () => {
     await tamper(id);
     expect((await fetch(`${server.url}/api/projects/${project.id}/resources/${id}`, { method: 'DELETE', headers })).status)
       .toBe(200);
-    platformIntact();
+    await platformIntact();
   });
 
   it('still projects a vault item of its own organization, and refuses one of another', async () => {
