@@ -38,7 +38,11 @@ const key = (organizationId: string) => `authorization:requests:${organizationId
  * Unlike agent permission requests these never elevate the requester: approval
  * is applied directly to the named task or Avatar. */
 export class AuthorizationRequests {
-  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'appendAudit'>, private organizationId: string) {}
+  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'appendAudit'> & Partial<Pick<Store, 'lock'>>,
+    private organizationId: string) {}
+
+  /** The organization's requests are one kv value, rewritten under its lock. */
+  private async locked(): Promise<void> { await this.store.lock?.(`kv:${key(this.organizationId)}`); }
 
   async requests(filter: { status?: AuthorizationRequest['status']; taskId?: string; avatarId?: string } = {}): Promise<AuthorizationRequest[]> {
     let all: AuthorizationRequest[] = [];
@@ -53,6 +57,7 @@ export class AuthorizationRequests {
 
   async request(input: Omit<AuthorizationRequest, 'id' | 'type' | 'organizationId' | 'status' | 'createdAt' | 'claim'>): Promise<AuthorizationRequest> {
     return this.store.transaction(async () => {
+    await this.locked();
     const audience = [...new Set(input.audience.map(String).map((value) => value.trim()).filter(Boolean))];
     const recipients = [...new Set(input.recipients.map(String).filter(Boolean))];
     const avatarRecipients = [...new Set((input.avatarRecipients ?? []).map(String).filter(Boolean))];
@@ -86,6 +91,7 @@ export class AuthorizationRequests {
    * boundaries, so expiring it could admit a conflicting decision mid-apply. */
   async claim(id: string, action: 'approve' | 'deny', by: string): Promise<string> {
     return this.store.transaction(async () => {
+    await this.locked();
       const all = await this.requests();
       const request = all.find((candidate) => candidate.id === id);
       if (!request) throw new Error(`no authorization request ${id}`);
@@ -99,6 +105,7 @@ export class AuthorizationRequests {
 
   async resolve(id: string, action: 'approve' | 'deny', by: string, claimId?: string): Promise<AuthorizationRequest> {
     return this.store.transaction(async () => {
+    await this.locked();
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);
@@ -123,6 +130,7 @@ export class AuthorizationRequests {
 
   async dismiss(id: string, by: string): Promise<AuthorizationRequest> {
     return this.store.transaction(async () => {
+    await this.locked();
     const all = (await this.requests());
     const request = all.find((candidate) => candidate.id === id);
     if (!request) throw new Error(`no authorization request ${id}`);

@@ -38,6 +38,8 @@ export interface AgentMessage {
 export interface AgentMailStore {
   transaction<T>(operation: () => Promise<T>): Promise<T>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
+  /** Store.lock: entity locks held until the transaction ends. */
+  lock?(...keys: string[]): Promise<void>;
   kvSet(k: string, v: string): (void) | Promise<void>;
 }
 
@@ -180,6 +182,7 @@ const kvSecretOwner = (secret: string) => `agent-mail:secret-owner:${crypto.crea
  *  webhook URL forge verification mail into every other organization's inbox. */
 export async function ingestSecret(store: AgentMailStore, organizationId: string): Promise<string> {
     return store.transaction(async () => {
+  (await store.lock?.(`kv:${kvSecret(organizationId)}`));
   const existing = (await store.kvGet(kvSecret(organizationId)));
   if (existing) return existing;
   const secret = crypto.randomBytes(18).toString('base64url');
@@ -279,11 +282,14 @@ export class AgentMail {
    */
   async address(organizationId: string): Promise<string> {
     return this.store.transaction(async () => {
+      await this.store.lock?.(`kv:${kvAddress(organizationId)}`);
       const existing = await this.store.kvGet(kvAddress(organizationId));
       const token = existing?.match(/(agent-[0-9a-f]+)/)?.[1] ?? `agent-${crypto.randomBytes(6).toString('hex')}`;
       const local = this.fixedLocal ? `${this.fixedLocal}+${token}` : token;
       const address = this.exactAddress ? cleanAddress(this.exactAddress)
         : existing && !this.domain ? existing : `${local}@${this.domain || 'agent.local'}`;
+      // An address is claimed by one organization.
+      await this.store.lock?.(`kv:${kvOwner(address)}`);
       const owner = await this.store.kvGet(kvOwner(address)) || await this.ownerOf(address);
       if (owner && owner !== organizationId) throw new Error('mailbox address is already owned by another organization');
       if (existing && existing !== address) await this.store.kvSet(kvOwner(existing), '');
@@ -334,6 +340,8 @@ export class AgentMail {
     return this.store.transaction(async () => {
     const organizationId = (await this.ownerOf(msg.to));
     if (!organizationId || (onlyFor && organizationId !== onlyFor)) return { delivered: false };
+    // The inbox is one kv value: deliveries append to it one at a time.
+    (await this.store.lock?.(`kv:${kvMessages(organizationId)}`));
     const id = msg.sourceId
       ? `msg_${crypto.createHash('sha256').update(`${organizationId}\0${msg.sourceId}`).digest('hex')}`
       : `msg_${crypto.randomBytes(8).toString('hex')}`;

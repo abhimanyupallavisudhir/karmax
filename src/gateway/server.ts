@@ -114,6 +114,8 @@ import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
 export interface GatewayDeps {
   /** Primary startup/recovery and worker liveness, independent of DB health. */
   runtimeReady?: () => boolean;
+  /** The separate activity process's Store transaction timings, if any. */
+  workerStoreMetrics?: () => import('../store/transaction-metrics.js').StoreMetricsSnapshot | undefined;
   serviceConnections?: ServiceConnections;
   api: KarmaxApi;
   store: Store;
@@ -3531,7 +3533,7 @@ export class Gateway {
       }
       if (p === '/api/metrics' && method === 'GET') {
         const pool = store.asyncReadStats;
-        const value = prometheusMetrics((await store.operationalSnapshot())) + (this.operationalMetrics?.prometheus() ?? '')
+        const value = prometheusMetrics((await store.operationalSnapshot())) + (this.operationalMetrics?.prometheus(this.deps.workerStoreMetrics?.()) ?? '')
           + `# TYPE karmax_database_pending gauge\nkarmax_database_pending ${pool.pending}\n`
           + `# TYPE karmax_database_connections gauge\nkarmax_database_connections ${pool.connections}\n`
           + `# TYPE karmax_database_waiting gauge\nkarmax_database_waiting ${pool.waiting}\n`;
@@ -7223,6 +7225,8 @@ export class Gateway {
                   const started = await this.passkeys.begin(async () => page, { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner, reserved: true,
                     onCredentials: async updated => {
                       await store.transaction(async () => {
+                        // The sign counter only grows: rewrite it under the vault lock.
+                        await store.lock(`vault:${organizationId}`);
                         const current = await vault.get(item.id);
                         if (!current || current.type !== 'passkey') return;
                         const secret = await vault.readSecret(current, 'passkey');

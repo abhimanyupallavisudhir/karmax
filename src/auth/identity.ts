@@ -515,13 +515,15 @@ export class IdentityService {
   async bootstrap(input: { name: string; email: string; password: string }, headers?: Headers): Promise<{ response: Response; user: IdentityUser }> {
     return this.db.transaction(async () => {
 
+    // Concurrent bootstraps take turns: the second sees the first's account.
+    (await this.db.lock('account-names'));
     if ((await this.hasUsers())) throw new Error(`${BRAND} has already been set up`);
     const response = await this.auth.api.signUpEmail({
       body: { ...input, name: (await this.assertUserNameAvailable(input.name)) }, headers, asResponse: true });
     if (!response.ok) throw new Error((await response.clone().json().catch(() => ({})) as any)?.message ?? 'could not create account');
     // Promote the account this call actually created, resolved by its own email —
-    // NOT `listUsers()[0]`. The surrounding transaction serializes the empty-
-    // installation check, so only one concurrent bootstrap may create an admin.
+    // NOT `listUsers()[0]`. The lock above serializes the empty-installation
+    // check, so only one concurrent bootstrap may create an admin.
     const created = (await response.clone().json().catch(() => ({})) as any)?.user as { id?: string } | undefined;
     const email = input.email.trim().toLowerCase();
     const user = (await this.listUsers()).find((candidate) => (created?.id ? candidate.id === created.id

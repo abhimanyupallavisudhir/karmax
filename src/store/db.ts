@@ -217,11 +217,109 @@ function checkpointGcEntry(worldId: string, checkpoint: WorldCheckpoint): string
     ...(checkpoint.filesystemDelta!.format === 2 ? { projectId: checkpoint.projectId, filesystemDelta: checkpoint.filesystemDelta } : {}) });
 }
 
+/**
+ * PostgreSQL Store transactions run concurrently (READ COMMITTED); there is no
+ * installation-wide write lock (`KARMAX_STORE_GLOBAL_LOCK=1` restores it for
+ * one release). A compound read-modify-write protects its invariant itself:
+ * a conditional UPDATE or a unique constraint when one statement suffices, a
+ * row lock (`FOR UPDATE`, `lockTask`) for one row, or `db.lock` on the entity
+ * that owns an invariant spanning rows. Advisory keys come before row locks,
+ * in this order (a transaction may skip levels, never go back up):
+ */
+export const STORE_LOCK_ORDER = [
+  'store-migration', // boot migrations
+  'account-closure', 'account-names', // closing an account; organization and user names, unique across the installation
+  'account:<userId>', // a user's preferences, closure and user-owned credentials
+  'org:<orgId>', // organization administration: members, teams, policies, projects, repos, pools, locations, requests, vault index
+  'world-lease:<orgId>', 'usage:<orgId>', 'storage:<orgId>', // admission against an organization's caps and quota
+  'project:<projectId>', 'task-num:<projectId>', // project tags/views/members; task numbers and order
+  'world:<worldId>', 'execution:<id>',
+  'vault:<orgId>', // an organization's vault item index, credential requests and connector outbox
+  'kv:<key>', 'wiki:<orgId>:<path>', 'permission-requests:<orgId>:<taskId>', 'service-connections:<orgId>:<taskId>', // one value rewritten from its previous value
+] as const;
+
 export class Store {
   /** Compound service mutations must include their reads in this boundary. */
   transaction<T>(operation: () => Promise<T>): Promise<T> {
     return this.db.transaction(operation);
   }
+
+  /** Entity locks held until the surrounding transaction ends (`SqlDatabase.lock`). */
+  lock(...keys: string[]): Promise<void> { return this.db.lock(...keys); }
+
+  /** Lock a task's row for a read-modify-write of it, or of anything only it
+   * owns (its view, params, review info, inbox). Nothing on SQLite. */
+  async lockTask(taskId: string): Promise<void> {
+    if (!this.db.inTransaction()) throw new Error('lockTask() must run inside a transaction');
+    if (this.db.dialect === 'postgres') await this.db.prepare('SELECT 1 FROM tasks WHERE id = ? FOR UPDATE').get(taskId);
+  }
+
+  /** Lock a logical task's attempt group (its `task_intents` row) for a
+   * decision over its attempts. Lock attempt rows (`lockTask`) before it. */
+  private async lockIntent(intentId: string): Promise<void> {
+    if (this.db.dialect === 'postgres') await this.db.prepare('SELECT 1 FROM task_intents WHERE id = ? FOR UPDATE').get(intentId);
+  }
+
+  /** Lock a resource attachment's row: `update` to change what it owns (its
+   * current revision, revisions, enabled state), `key share` to add a child
+   * that depends on it (a revision, lease, candidate or checkpoint reference). */
+  private async lockAttachment(id: string, mode: 'update' | 'key share'): Promise<void> {
+    if (this.db.dialect === 'postgres')
+      await this.db.prepare(`SELECT 1 FROM resource_attachments WHERE id = ? FOR ${mode === 'update' ? 'UPDATE' : 'KEY SHARE'}`).get(id);
+  }
+
+  /** Read a kv value this transaction will rewrite: other rewriters of `k`
+   * wait until it commits. */
+  async kvGetForUpdate(k: string): Promise<string | undefined> {
+    if (!this.db.inTransaction()) throw new Error('kvGetForUpdate() must run inside a transaction');
+    await this.db.lock(`kv:${k}`);
+    return this.kvGet(k);
+  }
+
+  /** Lock an organization's administration (`org:<id>` in STORE_LOCK_ORDER). */
+  private async lockOrganization(organizationId: string | undefined): Promise<void> {
+    await this.db.lock(`org:${organizationId ?? 'org_personal'}`);
+  }
+
+  /** Lock the organization a team belongs to and return the team. */
+  private async lockTeamOrganization(teamId: string): Promise<Team | undefined> {
+    const team = await this.getTeam(teamId);
+    if (team) await this.lockOrganization(team.organizationId);
+    return team;
+  }
+
+  /** Lock the organization a project belongs to and return the project as of
+   * holding it. A project transfer holds both organizations' locks, so a
+   * project read under its organization's lock cannot move meanwhile. */
+  private async lockProjectOrganization(projectId: string): Promise<Project | undefined> {
+    for (;;) {
+      const before = await this.getProject(projectId);
+      if (!before) return undefined;
+      await this.lockOrganization(before.organizationId);
+      const after = await this.getProject(projectId);
+      if (!after || (after.organizationId ?? 'org_personal') === (before.organizationId ?? 'org_personal')) return after;
+    }
+  }
+
+  /** Lock a project's row: `update` to rewrite what it owns (its config,
+   * services), `key share` to add a child that must not outlive it or move
+   * with a transfer it missed. Nothing on SQLite. */
+  async lockProjectRow(projectId: string, mode: 'update' | 'key share'): Promise<void> {
+    if (this.db.dialect === 'postgres')
+      await this.db.prepare(`SELECT 1 FROM projects WHERE id = ? FOR ${mode === 'update' ? 'UPDATE' : 'KEY SHARE'}`).get(projectId);
+  }
+
+  /** A project read with its row locked, for a rewrite of its config. */
+  private async lockedProject(projectId: string): Promise<Project | undefined> {
+    await this.lockProjectRow(projectId, 'update');
+    return this.getProject(projectId);
+  }
+
+  /** ` FOR UPDATE` on PostgreSQL, for a SELECT whose row the transaction rewrites. */
+  private get forUpdate(): string { return this.db.dialect === 'postgres' ? ' FOR UPDATE' : ''; }
+  /** ` FOR KEY SHARE` on PostgreSQL, for the parent row a new child depends
+   * on: its deletion (or a project transfer) waits for the child to commit. */
+  private get forKeyShare(): string { return this.db.dialect === 'postgres' ? ' FOR KEY SHARE' : ''; }
    db!: SqlDatabase;
    hosted!: boolean;
   private userNames?: () => Array<{ id: string; name: string; email?: string }> | Promise<Array<{ id: string; name: string; email?: string }>>;
@@ -275,6 +373,7 @@ export class Store {
    * fields remain readable during imports; every new write uses the split form. */
   private async migrateConversations(): Promise<void> {
     return this.db.transaction(async () => {
+    (await this.db.lock('store-migration'));
 
     let cursor = '';
     for (;;) {
@@ -285,8 +384,9 @@ export class Store {
       for (const row of rows) {
         cursor = row.id;
         const { messages, transcripts, ...status } = JSON.parse(row.lastView);
-        (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=? WHERE id=? AND conversation IS NULL')
-          .run(JSON.stringify(status), JSON.stringify({ messages: messages ?? [], transcripts }), row.id));
+        // Conditional on the value read: a live writer's newer view wins.
+        (await this.db.prepare('UPDATE tasks SET lastView=?, conversation=? WHERE id=? AND conversation IS NULL AND lastView=?')
+          .run(JSON.stringify(status), JSON.stringify({ messages: messages ?? [], transcripts }), row.id, row.lastView));
       }
     }
   
@@ -296,6 +396,9 @@ export class Store {
   /** One-time data migrations. Legacy imports explicitly rerun them after copying rows. */
   private async migrateData(force = false) {
     return this.db.transaction(async () => {
+    // Booting processes migrate one at a time; every rewrite below is
+    // conditional on the value it read, so a concurrent live write wins.
+    (await this.db.lock('store-migration'));
     const marker = process.env.KARMAX_DEPLOYMENT === 'hosted'
       ? 'migration:data-2026-09-26:hosted' : 'migration:data-2026-09-26';
     if (!force && await this.kvGet(marker)) return;
@@ -346,18 +449,18 @@ export class Store {
         configChanged = true;
       }
       if (configChanged)
-        (await this.db.prepare('UPDATE projects SET config=? WHERE id=?').run(JSON.stringify(config), row.id));
+        (await this.db.prepare('UPDATE projects SET config=? WHERE id=? AND config=?').run(JSON.stringify(config), row.id, row.config));
     }
 
     if (process.env.KARMAX_DEPLOYMENT === 'hosted') {
       const settings: Array<{ scopeKey: string; workflow: string; json: string }> =
         (await this.db.prepare('SELECT scopeKey, workflow, json FROM settings').all()) as any;
-      const update = this.db.prepare('UPDATE settings SET json=? WHERE scopeKey=? AND workflow=?');
+      const update = this.db.prepare('UPDATE settings SET json=? WHERE scopeKey=? AND workflow=? AND json=?');
       for (const row of settings) {
         let values: Record<string, unknown>;
         try { values = JSON.parse(row.json) as Record<string, unknown>; } catch { continue; }
         if (!values || typeof values !== 'object' || values.remote !== 'none') continue;
-        (await update.run(JSON.stringify({ ...values, remote: 'pr' }), row.scopeKey, row.workflow));
+        (await update.run(JSON.stringify({ ...values, remote: 'pr' }), row.scopeKey, row.workflow, row.json));
       }
     }
 
@@ -389,7 +492,7 @@ export class Store {
       }
       // Only write when something actually changed: an unconditional UPDATE
       // rewrote every role-default profile row on every boot.
-      if (profileChanged) (await this.db.prepare('UPDATE profiles SET json = ? WHERE id = ?').run(JSON.stringify(p), r.id));
+      if (profileChanged) (await this.db.prepare('UPDATE profiles SET json = ? WHERE id = ? AND json = ?').run(JSON.stringify(p), r.id, r.json));
     }
 
     // Older `pass`-connector mirrors stored `domains` as the entry's TOP FOLDER
@@ -416,7 +519,7 @@ export class Store {
         if (domain && !hasRealDomain) { item.domains = [domain]; changed = true; }
         if (username && !item.username) { item.username = username; changed = true; }
       }
-      if (changed) (await this.db.prepare('UPDATE kv SET v=? WHERE k=?').run(JSON.stringify(items), vrow.k));
+      if (changed) (await this.db.prepare('UPDATE kv SET v=? WHERE k=? AND v=?').run(JSON.stringify(items), vrow.k, vrow.v));
     }
 
     // Tag `kind` used to be optional, surfaced as a "general" choice. That option is
@@ -442,6 +545,8 @@ export class Store {
 
   private async migrate() {
     return this.db.transaction(async () => {
+    // Processes booting together must not race on catalog checks and DDL.
+    (await this.db.lock('store-migration'));
 
     (await this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects (
@@ -1201,6 +1306,8 @@ export class Store {
    */
   private async allocateTaskNum(projectId: string, taskId: string): Promise<number | undefined> {
     return this.db.transaction(async () => {
+    // MAX(num)+1 reads a statement snapshot: concurrent allocations take turns.
+    (await this.db.lock(`task-num:${projectId}`));
 
     (await this.db.prepare(`UPDATE tasks SET num = (
       SELECT COALESCE(MAX(num), 0) + 1 FROM tasks WHERE projectId = ?
@@ -1213,16 +1320,10 @@ export class Store {
 
   // ─── Projects ──────────────────────────────────────────────────────────────
 
-  /** Keep slug checks and transfers under the same database transaction lock. */
-  private async projectNameTransaction<T>(write: () => Promise<T>): Promise<T> {
-    return this.db.transaction(async () => {
-      if (this.db.dialect === 'postgres') await this.db.exec('LOCK TABLE projects IN SHARE ROW EXCLUSIVE MODE');
-      return write();
-    });
-  }
-
   async createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Promise<Project> {
-    return this.projectNameTransaction(async () => {
+    return this.db.transaction(async () => {
+    // Slugs are unique per organization; transfers hold both organizations.
+    (await this.lockOrganization(organizationId));
 
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
     const path = parseProjectPath(name);
@@ -1275,9 +1376,9 @@ export class Store {
   }
 
   async renameProject(id: string, name: string): Promise<Project> {
-    return this.projectNameTransaction(async () => {
+    return this.db.transaction(async () => {
 
-    const existing = (await this.getProject(id));
+    const existing = (await this.lockProjectOrganization(id));
     if (!existing) throw new Error(`no project ${id}`);
     const path = parseProjectPath(name);
     assertRoutableName('project', path.name);
@@ -1304,7 +1405,7 @@ export class Store {
   async setProjectFolder(id: string, folder: string): Promise<Project> {
     return this.db.transaction(async () => {
 
-    const existing = (await this.getProject(id));
+    const existing = (await this.lockProjectOrganization(id));
     if (!existing) throw new Error(`no project ${id}`);
     const next = normalizeFolder(folder);
     (await this.db.prepare('UPDATE projects SET folder = ? WHERE id = ?').run(next ?? null, id));
@@ -1341,6 +1442,7 @@ export class Store {
     const segment = String(name ?? '').trim();
     if (!segment) throw new Error('folder name is required');
     if (segment.includes('/')) throw new Error('folder name cannot contain "/"');
+    (await this.lockProjectOrganization(id));
     const projects = (await this.projectFolderProjects(id, source));
     const cut = source.lastIndexOf('/');
     const parent = cut < 0 ? '' : source.slice(0, cut);
@@ -1383,7 +1485,7 @@ export class Store {
   async reorderProject(id: string, beforeProjectId?: string, folder?: string): Promise<Project[]> {
     return this.db.transaction(async () => {
 
-    let moving = (await this.getProject(id));
+    let moving = (await this.lockProjectOrganization(id));
     if (!moving) throw new Error(`no project ${id}`);
     if (folder !== undefined) moving = (await this.setProjectFolder(id, folder));
     const organizationId = moving.organizationId ?? 'org_personal';
@@ -1427,6 +1529,7 @@ export class Store {
 
   async setOrganizationExecutionPolicy(organizationId: string, policy: OrganizationExecutionPolicy): Promise<OrganizationExecutionPolicy> {
     return this.db.transaction(async () => {
+    (await this.lockOrganization(organizationId));
 
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
     const current = (await this.getOrganizationExecutionPolicy(organizationId));
@@ -1491,6 +1594,7 @@ export class Store {
 
   async setOrganizationUsagePolicy(organizationId: string, patch: Partial<OrganizationUsagePolicy>): Promise<OrganizationUsagePolicy> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`org:${organizationId}`, `world-lease:${organizationId}`));
 
     const current = (await this.getOrganizationUsagePolicy(organizationId));
     const effectivePatch = { ...patch };
@@ -1567,7 +1671,9 @@ export class Store {
   async setProjectExecutionPolicy(id: string, override: Partial<Record<keyof OrganizationExecutionPolicy, unknown>>): Promise<Project> {
     return this.db.transaction(async () => {
 
-    const existing = (await this.getProject(id));
+    // The organization budget bounds project budgets: check it under its lock.
+    (await this.lockProjectOrganization(id));
+    const existing = (await this.lockedProject(id));
     if (!existing) throw new Error(`no project ${id}`);
     const config: Record<string, unknown> = { ...existing.config };
     for (const key of ['worldProvider', 'runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const) {
@@ -1593,7 +1699,7 @@ export class Store {
   async updateProjectConfig(id: string, config: ProjectConfig): Promise<Project> {
     return this.db.transaction(async () => {
 
-    const existing = (await this.getProject(id));
+    const existing = (await this.lockedProject(id));
     if (!existing) throw new Error(`no project ${id}`);
     const merged = writableProjectConfig({ ...existing.config, ...config });
     validateProjectExecutionConfig(merged);
@@ -1611,7 +1717,10 @@ export class Store {
   async deleteProject(id: string): Promise<void> {
     return this.db.transaction(async () => {
 
-    const project = (await this.getProject(id));
+    // Creators of its children hold the project row FOR KEY SHARE: they either
+    // committed (and are deleted below) or see no project.
+    (await this.lockProjectOrganization(id));
+    const project = (await this.lockedProject(id));
     if (!project) throw new Error('project not found');
     const tasks = (await selectRows(this.db, 'tasks', 'projectId=?', [id]));
     const taskIds = tasks.map((row) => String(row.id));
@@ -1742,12 +1851,14 @@ export class Store {
    * notification above; world leases are store-owned and can refresh here. */
   private async reconcileHostedUsageCapacity(organizationId: string): Promise<void> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`world-lease:${organizationId}`));
 
     if (!this.hosted || !(await this.getOrganization(organizationId))) return;
     const activeWorlds = (await this.getOrganizationUsagePolicy(organizationId)).maxActiveWorlds;
     for (const pool of (await this.listRunnerPools(organizationId))) {
+      // Only the capacity: an administrator's concurrent edit of the pool stands.
       if (pool.mode === 'customer' && !['worktree', 'container', 'memory'].includes(pool.provider))
-        (await this.createRunnerPool({ ...pool, capacity: { ...pool.capacity, activeWorlds } }));
+        (await this.db.prepare('UPDATE runner_pools SET capacity=? WHERE id=?').run(JSON.stringify({ ...pool.capacity, activeWorlds }), pool.id));
     }
     (await this.reconcileWorldLeaseCapacity(organizationId));
   
@@ -1766,6 +1877,7 @@ export class Store {
   async migrateLegacyAccountNameCollisions(users: Array<{ id: string; name: string }>): Promise<number> {
     return this.db.transaction(async () => {
 
+    (await this.db.lock('account-names'));
     const marker = 'migration:account-name-namespace-v1';
     if ((await this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(marker))) return 0;
     let changed = 0;
@@ -1831,6 +1943,7 @@ export class Store {
 
   async createOrganization(input: { name: string; slug?: string; kind?: Organization['kind']; ownerUserId?: string; maxOwned?: number }): Promise<Organization> {
     return this.db.transaction(async () => {
+    (await this.db.lock('account-names', ...(input.ownerUserId ? [`account:${input.ownerUserId}`] : [])));
 
     if (input.ownerUserId && input.maxOwned != null) {
       const count = (await this.db.prepare("SELECT COUNT(*) AS n FROM organization_memberships WHERE userId=? AND role='owner'")
@@ -1915,6 +2028,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     if (!isHostedPlanId(plan)) throw new Error(`unknown hosted plan ${String(plan)}`);
+    (await this.db.lock(`org:${organizationId}`, `world-lease:${organizationId}`));
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
     (await this.db.prepare('UPDATE organizations SET plan=? WHERE id=?').run(plan, organizationId));
     (await this.reconcileHostedUsageCapacity(organizationId));
@@ -1943,6 +2057,7 @@ export class Store {
 
   async renameOrganization(id: string, name: string): Promise<Organization> {
     return this.db.transaction(async () => {
+    (await this.db.lock('account-names', `org:${id}`));
 
     const existing = (await this.getOrganization(id));
     if (!existing) throw new Error(`no organization ${id}`);
@@ -1995,6 +2110,7 @@ export class Store {
    * own; joining or creating another organization must never change it. */
   async defaultOrganization(userId: string, operator = false): Promise<Organization | undefined> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`account:${userId}`));
 
     const row = (await this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?').get(userId)) as any;
     const organizations = (await this.listOrganizations(operator ? undefined : userId));
@@ -2012,6 +2128,7 @@ export class Store {
 
   async setDefaultOrganization(userId: string, organizationId: string, operator = false): Promise<Organization> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`account:${userId}`));
 
     const organization = (await this.getOrganization(organizationId));
     if (!organization || (!operator && !(await this.organizationMembership(organizationId, userId))))
@@ -2320,6 +2437,11 @@ export class Store {
     return this.db.transaction(async () => {
 
     if (organizationId === 'org_personal') throw new Error('the installation personal organization cannot be deleted');
+    // Organization children are created under its lock; project children hold
+    // their project row FOR KEY SHARE.
+    (await this.lockOrganization(organizationId));
+    if (this.db.dialect === 'postgres')
+      (await this.db.prepare('SELECT id FROM projects WHERE organizationId=? ORDER BY id FOR UPDATE').all(organizationId));
     if (!(await this.getOrganization(organizationId))) throw new Error('organization not found');
     const projectIds = ((await this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
     const tasks = (await rowsFor(this.db, 'tasks', 'projectId', projectIds));
@@ -2426,6 +2548,7 @@ export class Store {
   /** Claim the migration-created personal tenant for the installation owner. */
   async claimPersonalOrganization(userId: string, name?: string): Promise<Organization> {
     return this.db.transaction(async () => {
+    (await this.db.lock('account-names', `account:${userId}`, 'org:org_personal'));
 
     const organization = (await this.getOrganization('org_personal'))!;
     (await this.setOrganizationMembership(organization.id, userId, 'owner'));
@@ -2451,6 +2574,7 @@ export class Store {
    */
   async migratePersonalOrganizationNames(users: Array<{ id: string; name: string }>): Promise<number> {
     return this.db.transaction(async () => {
+    (await this.db.lock('account-names'));
 
     const names = new Map(users.map((user) => [user.id, user.name.trim()]));
     const rows = (await this.db.prepare(`SELECT o.id, o.name, m.userId
@@ -2511,6 +2635,9 @@ export class Store {
 
   async setOrganizationMembership(organizationId: string, userId: string, role: OrganizationMembership['role']): Promise<OrganizationMembership> {
     return this.db.transaction(async () => {
+    // The member cap, the last owner and account closure are checked under
+    // the locks every writer of them takes.
+    (await this.db.lock(`account:${userId}`, `org:${organizationId}`));
 
     if (await this.kvGet(`account-closed:${userId}`)) throw new Error('account is closed');
     if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
@@ -2544,6 +2671,7 @@ export class Store {
 
   async removeOrganizationMembership(organizationId: string, userId: string): Promise<void> {
     return this.db.transaction(async () => {
+    (await this.lockOrganization(organizationId));
 
     const membership = (await this.organizationMembership(organizationId, userId));
     if (membership?.role === 'owner') {
@@ -2577,6 +2705,7 @@ export class Store {
   async setOrganizationIdentityPolicy(input: { organizationId: string; oidcProviderId?: string;
     verifiedDomains?: string[]; enforceSso?: boolean }): Promise<OrganizationIdentityPolicy> {
     return this.db.transaction(async () => {
+    (await this.lockOrganization(input.organizationId));
 
     if (!(await this.getOrganization(input.organizationId))) throw new Error('organization not found');
     const current = (await this.getOrganizationIdentityPolicy(input.organizationId));
@@ -2626,6 +2755,7 @@ export class Store {
 
   async deprovisionOrganizationUser(organizationId: string, userId: string): Promise<void> {
     return this.db.transaction(async () => {
+    (await this.lockOrganization(organizationId));
 
     const projectIds = (await this.listProjects()).filter((project) => project.organizationId === organizationId).map((project) => project.id);
     const teamIds = (await this.listTeams(organizationId)).map((team) => team.id);
@@ -2680,7 +2810,11 @@ export class Store {
   async acceptOrganizationInvitation(token: string, userId: string, email: string): Promise<OrganizationMembership & { profileId?: string; authorization?: AuthorizationSelection }> {
     return this.db.transaction(async () => {
 
-    const r = (await this.db.prepare('SELECT * FROM organization_invitations WHERE tokenHash=?').get(sha256(token))) as any;
+    const invited = (await this.db.prepare('SELECT organizationId FROM organization_invitations WHERE tokenHash=?').get(sha256(token))) as
+      { organizationId: string } | undefined;
+    // One-time: the second of two concurrent accepts sees it used.
+    if (invited) (await this.db.lock(`account:${userId}`, `org:${invited.organizationId}`));
+    const r = (await this.db.prepare(`SELECT * FROM organization_invitations WHERE tokenHash=?${this.forUpdate}`).get(sha256(token))) as any;
     if (!r || r.acceptedAt) throw new Error('invitation is invalid or already used');
     if (r.expiresAt <= Date.now()) throw new Error('invitation has expired');
     if (String(r.email).toLowerCase() !== email.trim().toLowerCase()) throw new Error('invitation belongs to a different email address');
@@ -2710,6 +2844,7 @@ export class Store {
 
   async createTeam(input: { organizationId: string; projectId?: string; name: string; slug?: string }): Promise<Team> {
     return this.db.transaction(async () => {
+    (await this.lockOrganization(input.organizationId));
 
     const organization = (await this.getOrganization(input.organizationId));
     if (!organization) throw new Error(`no organization ${input.organizationId}`);
@@ -2758,7 +2893,7 @@ export class Store {
   async updateTeam(id: string, input: { name: string }): Promise<Team> {
     return this.db.transaction(async () => {
 
-    const team = (await this.getTeam(id));
+    const team = (await this.lockTeamOrganization(id));
     if (!team) throw new Error('team not found');
     const name = input.name.trim();
     if (!name) throw new Error('team name is required');
@@ -2789,7 +2924,7 @@ export class Store {
   async deleteTeam(id: string): Promise<void> {
     return this.db.transaction(async () => {
 
-    const team = (await this.getTeam(id));
+    const team = (await this.lockTeamOrganization(id));
     if (!team) throw new Error('team not found');
     const selectors = [`team:${team.id}`, `@team:${team.slug}`,
       ...((await this.db.prepare('SELECT slug FROM team_aliases WHERE teamId=?').all(team.id)) as any[])
@@ -2849,7 +2984,7 @@ export class Store {
   async setTeamMembership(teamId: string, userId: string): Promise<TeamMembership> {
     return this.db.transaction(async () => {
 
-    const team = (await this.getTeam(teamId));
+    const team = (await this.lockTeamOrganization(teamId));
     if (!team) throw new Error(`no team ${teamId}`);
     if (!(await this.organizationMembership(team.organizationId, userId)))
       throw new Error('a team member must belong to the organization');
@@ -2876,7 +3011,7 @@ export class Store {
   async setProjectMembership(projectId: string, principal: ProjectPrincipalRef, role: ProjectMembership['role']): Promise<ProjectMembership> {
     return this.db.transaction(async () => {
 
-    const project = (await this.getProject(projectId));
+    const project = (await this.lockProjectOrganization(projectId));
     if (!project) throw new Error(`no project ${projectId}`);
     (await this.assertPrincipalInOrganization(principal, project.organizationId!));
     const key = principalKey(principal);
@@ -2902,6 +3037,7 @@ export class Store {
 
   async removeProjectMembership(projectId: string, principal: ProjectPrincipalRef): Promise<void> {
     return this.db.transaction(async () => {
+    (await this.lockProjectOrganization(projectId));
 
     const key = principalKey(principal);
     const row = (await this.db.prepare('SELECT role FROM project_memberships WHERE projectId=? AND principalKey=?')
@@ -2980,6 +3116,8 @@ export class Store {
     return this.db.transaction(async () => {
 
     if (!/^git@github\.com:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/.test(input.sshUrl)) throw new Error('repository must use a GitHub SSH URL');
+    // Found-or-created by provider id or name, which no constraint covers alone.
+    (await this.lockOrganization(input.organizationId));
     const byProvider = input.providerId ? await this.db.prepare(
       'SELECT id, createdAt FROM repositories WHERE organizationId=? AND provider=? AND providerId=?')
       .get(input.organizationId, input.provider, input.providerId) as any : undefined;
@@ -3022,6 +3160,8 @@ export class Store {
 
   async deleteRepository(id: string): Promise<void> {
     return this.db.transaction(async () => {
+    const owner = (await this.getRepository(id))?.organizationId;
+    if (owner) (await this.lockOrganization(owner));
 
     const projects = ((await this.db.prepare('SELECT DISTINCT projectId FROM project_repositories WHERE repositoryId=?').all(id)) as any[])
       .map((r) => String(r.projectId));
@@ -3111,8 +3251,9 @@ export class Store {
     const now = Date.now();
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
+      // One-time: a concurrent consumer waits on the row, then sees it used.
       const row = (await this.db.prepare(`SELECT organizationId, userId, returnTo, githubAccountId, githubLogin, selectAccount, purpose FROM github_install_states
-        WHERE tokenHash=? AND usedAt IS NULL AND expiresAt>?`).get(hash, now)) as any;
+        WHERE tokenHash=? AND usedAt IS NULL AND expiresAt>?${this.forUpdate}`).get(hash, now)) as any;
       if (!row || row.userId !== userId) {
         (await this.db.exec('ROLLBACK'));
         return undefined;
@@ -3139,7 +3280,7 @@ export class Store {
   async attachProjectRepository(input: Omit<ProjectRepository, 'order'> & { order?: number }): Promise<ProjectRepository> {
     return this.db.transaction(async () => {
 
-    const project = (await this.getProject(input.projectId));
+    const project = (await this.lockProjectOrganization(input.projectId));
     const repository = (await this.getRepository(input.repositoryId));
     if (!project || !repository || project.organizationId !== repository.organizationId) throw new Error('project and repository must belong to the same organization');
     const baseBranch = input.baseBranch?.trim() || undefined;
@@ -3184,7 +3325,7 @@ export class Store {
   async setProjectWikiRepository(projectId: string, repositoryId?: string): Promise<void> {
     return this.db.transaction(async () => {
 
-    if (!(await this.getProject(projectId))) throw new Error(`no project ${projectId}`);
+    if (!(await this.lockProjectOrganization(projectId))) throw new Error(`no project ${projectId}`);
     if (repositoryId && !(await this.getRepository(repositoryId))) throw new Error(`no repository ${repositoryId}`);
     const now = Date.now();
     (await this.db.prepare(`INSERT INTO project_wikis (projectId, repositoryId, createdAt, updatedAt)
@@ -3209,6 +3350,8 @@ export class Store {
   }): Promise<boolean> {
     return this.db.transaction(async () => {
 
+    // Versions of one path are numbered MAX+1.
+    (await this.db.lock(`wiki:${input.organizationId}:${input.path}`));
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       if (input.ifEmpty && (await this.db.prepare(`SELECT 1 FROM organization_wiki_versions
@@ -3255,6 +3398,7 @@ export class Store {
 
   async detachProjectRepository(projectId: string, repositoryId: string): Promise<void> {
     return this.db.transaction(async () => {
+    (await this.lockProjectOrganization(projectId));
 
     (await this.db.prepare('DELETE FROM project_repositories WHERE projectId=? AND repositoryId=?').run(projectId, repositoryId));
     (await this.syncProjectRepositoryConfig(projectId));
@@ -3270,7 +3414,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     const sources = [...new Set(repos.map((repo) => repo.trim()).filter(Boolean))];
-    const projectBefore = (await this.getProject(projectId));
+    const projectBefore = (await this.lockProjectOrganization(projectId));
     if (!projectBefore) throw new Error(`no project ${projectId}`);
     // A catalog SSH URL carries its GitHub connection/deploy-key metadata. Keep
     // those attachments synchronized automatically; users edit one plain list.
@@ -3296,9 +3440,9 @@ export class Store {
   private async syncProjectRepositoryConfig(projectId: string): Promise<void> {
     return this.db.transaction(async () => {
 
-    const linked = (await this.listProjectRepositories(projectId));
-    const project = (await this.getProject(projectId));
+    const project = (await this.lockedProject(projectId));
     if (!project) return;
+    const linked = (await this.listProjectRepositories(projectId));
     const first = linked[0];
     const base = first?.baseBranch ?? first?.repository.defaultBranch;
     const target = first?.targetBranch ?? base;
@@ -3318,7 +3462,7 @@ export class Store {
   private async syncProjectRepositorySettings(projectId: string, repos: string[]): Promise<void> {
     return this.db.transaction(async () => {
 
-    for (const row of (await this.db.prepare('SELECT scopeKey, workflow, json FROM settings WHERE scopeKey IN (?, ?)')
+    for (const row of (await this.db.prepare(`SELECT scopeKey, workflow, json FROM settings WHERE scopeKey IN (?, ?)${this.forUpdate}`)
       .all(projectId, `quick:${projectId}`)) as any[]) {
       const values = JSON.parse(String(row.json)) as Record<string, unknown>;
       if (repos.length) values.repos = repos;
@@ -3334,6 +3478,7 @@ export class Store {
 
   async createList(projectId: string, name: string): Promise<TaskList> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`task-num:${projectId}`));
 
     const ord =
       ((await this.db
@@ -3379,6 +3524,15 @@ export class Store {
   }): Promise<TaskRecord> {
     return this.db.transaction(async () => {
 
+    // Account closure, list and task order and numbers are checked or
+    // allocated under their locks; the project (and an alternate's intent) must
+    // exist and stay put: deleting or transferring it locks its row.
+    const users = [input.createdBy, input.assignee, input.delegate].flatMap(principal => principal?.kind === 'user' ? [principal.userId] : []);
+    (await this.db.lock(...[...new Set(users)].sort().map(userId => `account:${userId}`), `task-num:${input.projectId}`));
+    if (this.db.dialect === 'postgres') {
+      (await this.db.prepare('SELECT 1 FROM projects WHERE id = ? FOR KEY SHARE').get(input.projectId));
+      if (input.intentId) (await this.db.prepare('SELECT 1 FROM task_intents WHERE id = ? FOR KEY SHARE').get(input.intentId));
+    }
     const creationKey = input.idempotencyKey ? `task-create:${input.idempotencyKey}` : undefined;
     if (creationKey) {
       // The no-op conflict update serializes concurrent retries on PostgreSQL too.
@@ -3649,6 +3803,8 @@ export class Store {
 
     const t = (await this.getTask(taskId));
     if (!t?.intentId) return { accepted: true, cancel: [] };
+    // Exactly one attempt of an exclusive group is committed.
+    (await this.lockIntent(t.intentId));
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       let group = (await this.attemptGroup(t.intentId))!;
@@ -3677,13 +3833,14 @@ export class Store {
   async markDraftSuperseded(taskId: string, winnerId: string) {
     return this.db.transaction(async () => {
 
+    (await this.lockTask(taskId));
     const t = (await this.getTask(taskId));
     if (!t?.params.draft) return;
     const view: TaskView = {
       taskId, title: t.title, workflow: t.workflow, stage: 'cancelled', status: 'cancelled',
       messages: [], actions: [], state: { supersededBy: winnerId }, updatedAt: Date.now(),
     };
-    (await this.updateTaskParams(taskId, { ...t.params, draft: false, archived: true }));
+    (await this.patchTaskParams(taskId, { draft: false, archived: true }));
     // A draft never ran: closing it is bookkeeping, not a lifecycle to report.
     (await this.saveView(taskId, view, undefined, undefined, undefined, { lifecycleEvent: false }));
   
@@ -3696,6 +3853,8 @@ export class Store {
 
     const task = (await this.getTask(taskId));
     if (!task?.intentId) throw new Error('attempt not found');
+    (await this.lockTask(taskId));
+    (await this.lockIntent(task.intentId));
     const changed = (await this.db.prepare(`UPDATE task_intents SET principalAttemptId=?
       WHERE id=? AND committedAttemptId IS NULL
       AND EXISTS (SELECT 1 FROM tasks WHERE id=?
@@ -3709,6 +3868,7 @@ export class Store {
   /** Re-elect after principal cancellation. Drafts and live attempts are eligible. */
   async electPrincipal(intentId: string) {
     return this.db.transaction(async () => {
+    (await this.lockIntent(intentId));
 
     const g = (await this.attemptGroup(intentId));
     if (!g || (g.committedAttemptId && g.otherAttempts !== 'keep')) return;
@@ -3733,6 +3893,9 @@ export class Store {
    */
   async setIntentConfirmer(intentId: string, field: string, confirmer: unknown, opts?: { inFlight?: boolean }) {
     return this.db.transaction(async () => {
+    // Whether every attempt is still a draft is decided under their rows.
+    if (this.db.dialect === 'postgres') (await this.db.prepare('SELECT id FROM tasks WHERE intentId = ? ORDER BY id FOR UPDATE').all(intentId));
+    (await this.lockIntent(intentId));
 
     const attempts = (await this.attemptsOf(intentId));
     const group = (await this.attemptGroup(intentId));
@@ -3743,7 +3906,7 @@ export class Store {
       throw new Error('the confirmer is shared; edit it on the task page while its Review gate is still open');
     }
     (await this.db.prepare('UPDATE task_intents SET confirmer=? WHERE id=?').run(JSON.stringify(confirmer), intentId));
-    for (const a of attempts) (await this.updateTaskParams(a.id, { ...a.params, [field]: confirmer }));
+    for (const a of attempts) (await this.patchTaskParams(a.id, { [field]: confirmer }));
   
     });
   }
@@ -3959,6 +4122,7 @@ export class Store {
    * Keep only explicitly supplied fields; workflow-owned completion/diffs stay intact. */
   async checkpointReviewInfo(taskId: string, info: ReviewInfo): Promise<void> {
     return this.db.transaction(async () => {
+    (await this.lockTask(taskId));
 
     const previous = (await this.kvGet(`pending-review:${taskId}`));
     const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
@@ -3995,6 +4159,7 @@ export class Store {
    * manual Done): no successor run will publish to retire it. */
   async retireViewRun(taskId: string, runId: string): Promise<void> {
     return this.db.transaction(async () => {
+      (await this.lockTask(taskId));
       const raw = (await this.kvGet(`view-order:${taskId}`));
       const state = raw ? JSON.parse(raw) as ViewOrderState : undefined;
       if (state?.retired.includes(runId)) return;
@@ -4079,6 +4244,8 @@ export class Store {
   async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder,
     retain?: string[], options?: { lifecycleEvent?: boolean }): Promise<boolean> {
     return this.db.transaction(async () => {
+    // Publication order, the previous view and its transitions are decided under the task's row.
+    (await this.lockTask(taskId));
     if (order && !(await this.admitViewPublication(taskId, order))) return false;
 
     const pending = (await this.kvGet(`pending-review:${taskId}`));
@@ -4324,10 +4491,9 @@ export class Store {
   async setTaskPriority(taskId: string, priority: number) {
     return this.db.transaction(async () => {
 
-    const t = (await this.getTask(taskId));
-    if (!t) return;
+    if (!(await this.getTaskShallow(taskId))) return;
     const p = Math.max(0, Math.min(4, Math.round(priority)));
-    (await this.updateTaskParams(taskId, { ...t.params, priority: p }));
+    (await this.patchTaskParams(taskId, { priority: p }));
   
     });
   }
@@ -4340,15 +4506,19 @@ export class Store {
   async clearDraft(taskId: string) {
     return this.db.transaction(async () => {
 
+    const projectId = await this.taskProjectIdAsync(taskId);
+    if (projectId) (await this.db.lock(`task-num:${projectId}`));
+    (await this.lockTask(taskId));
     const t = (await this.getTask(taskId));
     if (t?.projectId) await this.assertProjectNotTransferring(t.projectId);
     if (!t) return;
+    if (t.intentId && this.db.dialect === 'postgres') (await this.db.prepare('SELECT 1 FROM task_intents WHERE id = ? FOR SHARE').get(t.intentId));
     // A single UPDATE makes MAX+1 allocation safe even if two Store instances
     // queue tasks concurrently against the same SQLite database.
     (await this.db.prepare(`UPDATE tasks SET num = (
       SELECT COALESCE(MAX(num), 0) + 1 FROM tasks WHERE projectId = ?
     ) WHERE id = ? AND num IS NULL`).run(t.projectId, t.intentId ?? t.id));
-    (await this.updateTaskParams(taskId, { ...t.params, draft: false }));
+    (await this.patchTaskParams(taskId, { draft: false }));
   
     });
   }
@@ -4358,9 +4528,12 @@ export class Store {
   async restoreDraft(taskId: string, releaseNumber = false) {
     return this.db.transaction(async () => {
 
+    const projectId = await this.taskProjectIdAsync(taskId);
+    if (projectId) (await this.db.lock(`task-num:${projectId}`));
+    (await this.lockTask(taskId));
     const t = (await this.getTask(taskId));
     if (!t) return;
-    (await this.updateTaskParams(taskId, { ...t.params, draft: true }));
+    (await this.patchTaskParams(taskId, { draft: true }));
     if (!releaseNumber) return;
     const intentId = t.intentId ?? t.id;
     const stillQueued = (await this.attemptsOf(intentId)).some((attempt) => !attempt.params.draft);
@@ -4373,13 +4546,20 @@ export class Store {
   async deleteTask(taskId: string) {
     return this.db.transaction(async () => {
 
+    // Lock the attempt rows, then the group: whoever appends to this task or
+    // adds an attempt to the group either committed first or finds it gone.
+    const intentId = (await this.getTaskShallow(taskId))?.intentId;
+    if (this.db.dialect === 'postgres') {
+      (await this.db.prepare('SELECT id FROM tasks WHERE id = ? OR intentId = ? ORDER BY id FOR UPDATE').all(taskId, intentId ?? taskId));
+      if (intentId) (await this.lockIntent(intentId));
+    }
     const prior = (await this.getTask(taskId));
     const siblings = prior?.intentId ? (await this.attemptsOf(prior.intentId)) : [];
     // The first attempt's id is also the permanent logical-task id/number. Once
     // alternates exist, preserve that anchor as cancelled history instead of
     // deleting it out from under the intent.
     if (prior && prior.id === prior.intentId && siblings.length > 1) {
-      (await this.updateTaskParams(taskId, { ...prior.params, draft: false, archived: true }));
+      (await this.patchTaskParams(taskId, { draft: false, archived: true }));
       (await this.saveView(taskId, { taskId, title: prior.title, workflow: prior.workflow, stage: 'cancelled', status: 'cancelled', messages: [], actions: [], state: { deletedDraft: true }, updatedAt: Date.now() },
         undefined, undefined, undefined, { lifecycleEvent: false }));
       return;
@@ -4434,6 +4614,7 @@ export class Store {
   }): Promise<TaskRecord> {
     return this.db.transaction(async () => {
 
+    (await this.lockTask(taskId));
     const task = (await this.getTask(taskId));
     if (!task) throw new Error(`no task ${taskId}`);
     const organizationId = (await this.getProject(task.projectId))?.organizationId!;
@@ -4465,6 +4646,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     validateConfirmationPolicy(policy);
+    (await this.lockTask(taskId));
     const cycle = Number(((await this.db.prepare('SELECT COALESCE(cycle,0)+1 cycle FROM task_confirmation WHERE taskId=?').get(taskId)) as any)?.cycle ?? 1);
     (await this.db.prepare(`INSERT INTO task_confirmation (taskId, cycle, policy, createdAt, satisfiedAt)
       VALUES (?, ?, ?, ?, NULL) ON CONFLICT(taskId) DO UPDATE SET cycle=excluded.cycle,
@@ -4477,6 +4659,8 @@ export class Store {
 
   async voteConfirmation(taskId: string, userId: string): Promise<{ authorized: boolean; satisfied: boolean; votes: number; required: number }> {
     return this.db.transaction(async () => {
+    // Votes are counted, and a cycle begun, one at a time per task.
+    (await this.lockTask(taskId));
 
     const task = (await this.getTask(taskId));
     if (!task) throw new Error(`no task ${taskId}`);
@@ -4498,7 +4682,7 @@ export class Store {
     const satisfiedTargets = audiences.filter((users) => users.some((candidate) => voters.has(candidate))).length;
     const required = requiredTargets(policy);
     const satisfied = satisfiedTargets >= required;
-    if (satisfied && !request.satisfiedAt) (await this.db.prepare('UPDATE task_confirmation SET satisfiedAt=? WHERE taskId=?').run(Date.now(), taskId));
+    if (satisfied && !request.satisfiedAt) (await this.db.prepare('UPDATE task_confirmation SET satisfiedAt=? WHERE taskId=? AND cycle=?').run(Date.now(), taskId, request.cycle));
     return { authorized: true, satisfied, votes: satisfiedTargets, required };
   
     });
@@ -4516,6 +4700,7 @@ export class Store {
 
   async subscribeTask(taskId: string, principal: PrincipalRef): Promise<void> {
     return this.db.transaction(async () => {
+    (await this.lockTask(taskId));
 
     const task = (await this.getTaskShallow(taskId));
     if (!task) throw new Error(`no task ${taskId}`);
@@ -4528,6 +4713,7 @@ export class Store {
 
   async unsubscribeTask(taskId: string, principal: PrincipalRef): Promise<void> {
     return this.db.transaction(async () => {
+    (await this.lockTask(taskId));
 
     const task = (await this.getTaskShallow(taskId));
     if (!task) return;
@@ -4624,7 +4810,7 @@ export class Store {
     // Synthetic inbox events use negative, transaction-allocated sequence
     // numbers; real event sequences are positive. Hashing request ids can
     // collide for different simultaneous asks to the same user.
-    const eventSeq = Number(await this.kvGet('inbox:next-synthetic-seq') ?? '0') - 1;
+    const eventSeq = Number(await this.kvGetForUpdate('inbox:next-synthetic-seq') ?? '0') - 1;
     await this.kvSet('inbox:next-synthetic-seq', String(eventSeq));
     for (const userId of new Set(userIds)) {
       (await this.deleteInbox("userId=? AND taskId=? AND kind='approval-requested'", [userId, `avatar:${subject.avatarId}`]));
@@ -4657,6 +4843,8 @@ export class Store {
     createdAt = Date.now()): Promise<void> {
     return this.db.transaction(async () => {
 
+    // One sweep at a time sees (and withdraws) the previous notices.
+    (await this.lockOrganization(organizationId));
     const rows = new Map<string, { userId: string; notice: CredentialNotice }>();
     for (const notice of notices) for (const userId of new Set(userIds))
       rows.set(`inbox_credential_${crypto.createHash('sha256')
@@ -4695,6 +4883,7 @@ export class Store {
   async syncStorageInbox(organizationId: string, userIds: string[],
     notice: { stage: string; retainedBytes: number; quotaBytes: number; deleteAt: number } | undefined, createdAt = Date.now()): Promise<void> {
     return this.db.transaction(async () => {
+      (await this.lockOrganization(organizationId));
       const ids = new Map<string, string>();
       if (notice) for (const userId of new Set(userIds)) ids.set(`inbox_storage_${crypto.createHash('sha256')
         .update(JSON.stringify([organizationId, userId, notice.stage, notice.deleteAt])).digest('hex').slice(0, 24)}`, userId);
@@ -5038,9 +5227,14 @@ export class Store {
         .run(now - 60_000));
       const row = (await this.db.prepare(`SELECT d.*, i.organizationId, i.userId, i.eventSeq, i.taskId, i.kind, i.urgency,
         i.unread, i.actionable, i.subject, i.createdAt inboxCreatedAt, i.readAt FROM delivery_outbox d
-        JOIN inbox i ON i.id=d.inboxId WHERE d.state='pending' AND d.nextAt<=? ORDER BY d.createdAt LIMIT 1`).get(now)) as any;
+        JOIN inbox i ON i.id=d.inboxId WHERE d.state='pending' AND d.nextAt<=? ORDER BY d.createdAt LIMIT 1${
+          this.db.dialect === 'postgres' ? ' FOR UPDATE OF d SKIP LOCKED' : ''}`).get(now)) as any;
       if (!row) { (await this.db.exec('COMMIT')); return undefined; }
-      (await this.db.prepare("UPDATE delivery_outbox SET state='sending', claimedAt=? WHERE id=? AND state='pending'").run(now, row.id));
+      // Each delivery is claimed by one dispatcher.
+      if (!Number((await this.db.prepare("UPDATE delivery_outbox SET state='sending', claimedAt=? WHERE id=? AND state='pending'").run(now, row.id)).changes)) {
+        (await this.db.exec('COMMIT'));
+        return undefined;
+      }
       (await this.db.exec('COMMIT'));
       return { id: row.id, channel: row.channel, attempts: Number(row.attempts), inbox: rowToInbox({
         id: row.inboxId, organizationId: row.organizationId, userId: row.userId, eventSeq: row.eventSeq,
@@ -5131,6 +5325,8 @@ export class Store {
 
   async createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Promise<Tag> {
     return this.db.transaction(async () => {
+    // A project's tag tree (names, parents, cycles) changes one write at a time.
+    (await this.db.lock(`project:${input.projectId}`));
 
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
@@ -5166,6 +5362,7 @@ export class Store {
   /** Create-or-reuse a single tag under an explicit parent (no path parsing). */
   private async createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Promise<Tag> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`project:${input.projectId}`));
 
     const name = input.name.trim();
     if (!name) throw new Error('tag name required');
@@ -5214,6 +5411,8 @@ export class Store {
 
     assertTagColor(patch.color);
     assertTagKind(patch.kind);
+    const owner = (await this.getTag(id))?.projectId;
+    if (owner) (await this.db.lock(`project:${owner}`));
     const cur = (await this.getTag(id));
     if (!cur) return undefined;
     const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;
@@ -5258,6 +5457,8 @@ export class Store {
   async deleteTag(id: string) {
     return this.db.transaction(async () => {
 
+    const owner = (await this.getTag(id))?.projectId;
+    if (owner) (await this.db.lock(`project:${owner}`));
     const cur = (await this.getTag(id));
     if (!cur) return;
     (await this.db.prepare('UPDATE tags SET parentId = ? WHERE parentId = ?').run(cur.parentId ?? null, id));
@@ -5275,8 +5476,9 @@ export class Store {
   async setTaskTags(taskId: string, tagIds: string[]) {
     return this.db.transaction(async () => {
 
-    const t = (await this.getTask(taskId));
+    const t = (await this.getTaskShallow(taskId));
     if (!t) return;
+    (await this.db.lock(`project:${t.projectId}`));
     const valid = new Set((await this.listTags(t.projectId)).map((x) => x.id));
     (await this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId));
     const ins = this.db.prepare('INSERT OR IGNORE INTO task_tags (taskId, tagId) VALUES (?, ?)');
@@ -5287,6 +5489,8 @@ export class Store {
 
   async addTaskTag(taskId: string, tagId: string) {
     return this.db.transaction(async () => {
+    const projectId = await this.taskProjectIdAsync(taskId);
+    if (projectId) (await this.db.lock(`project:${projectId}`));
 
     const cur = new Set((await this.tagsFor(taskId)));
     cur.add(tagId);
@@ -5318,6 +5522,7 @@ export class Store {
 
   async createView(input: { projectId: string; name: string; query: TaskQuery; icon?: string }): Promise<SavedView> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`project:${input.projectId}`));
 
     const ord =
       ((await this.db.prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM saved_views WHERE projectId = ?').get(input.projectId)) as any).m + 1;
@@ -5340,6 +5545,7 @@ export class Store {
 
   async updateView(id: string, patch: { name?: string; query?: TaskQuery; icon?: string | null }): Promise<SavedView | undefined> {
     return this.db.transaction(async () => {
+    if (this.db.dialect === 'postgres') (await this.db.prepare('SELECT 1 FROM saved_views WHERE id = ? FOR UPDATE').get(id));
 
     const cur = (await this.getView(id));
     if (!cur) return undefined;
@@ -5407,6 +5613,8 @@ export class Store {
   async upsertAvatar(avatar: Avatar): Promise<Avatar> {
     return this.db.transaction(async () => {
 
+    // Account closure deletes avatars under the same lock.
+    (await this.db.lock(`account:${avatar.ownerUserId}`));
     if (await this.kvGet(`account-closed:${avatar.ownerUserId}`)) throw new Error('account is closed');
     (await this.db.prepare(`INSERT INTO avatars
       (id, organizationId, projectId, ownerUserId, json, createdAt, updatedAt, deletedAt)
@@ -5531,6 +5739,7 @@ export class Store {
 
   async setPrincipalGrant(principalId: string, scopeKey: string, grant: Record<string, unknown>): Promise<void> {
     return this.db.transaction(async () => {
+    if (principalId.startsWith('user:')) (await this.db.lock(`account:${principalId.slice(5)}`));
     if (principalId.startsWith('user:') && await this.kvGet(`account-closed:${principalId.slice(5)}`)) throw new Error('account is closed');
 
     const { principalId: _p, scopeKey: _s, ...json } = grant as any;
@@ -5707,7 +5916,7 @@ export class Store {
     }
     // An organization whose requests predate per-request rows (PL-8).
     const key = `permission:requests:${organizationId}`;
-    const raw = (await this.kvGet(key));
+    const raw = (await this.kvGetForUpdate(key));
     if (!raw) return;
     try {
       const removed = new Set(taskIds);
@@ -5733,7 +5942,7 @@ export class Store {
 
     if (!organizationId || !target.ids.length) return;
     const key = `authorization:requests:${organizationId}`;
-    const raw = (await this.kvGet(key));
+    const raw = (await this.kvGetForUpdate(key));
     if (!raw) return;
     try {
       const removed = new Set(target.ids);
@@ -5764,7 +5973,11 @@ export class Store {
     return this.db.transaction(async () => {
 
     const now = Date.now();
-    const afterSeq = Number(((await this.db.prepare('SELECT COALESCE(MAX(seq), 0) seq FROM events').get()) as any)?.seq ?? 0);
+    // The target's events append under its row: every one either committed
+    // before this request (and is at most afterSeq) or is numbered after it.
+    (await this.lockTask(input.targetTaskId));
+    const afterSeq = Number(((await this.db.prepare('SELECT COALESCE(MAX(seq), 0) seq FROM events WHERE taskId = ?').get(input.targetTaskId)) as
+      { seq?: number } | undefined)?.seq ?? 0);
     const request: CollaborationRequest = {
       id: newId('collab'),
       requesterTaskId: input.requesterTaskId,
@@ -5902,6 +6115,9 @@ export class Store {
     const nested = this.db.inTransaction();
     if (!nested) (await this.db.exec('BEGIN IMMEDIATE'));
     try {
+      // A task's events append under its row, so they commit in seq order and
+      // its inbox (one actionable row per user) is rewritten one event at a time.
+      (await this.lockTask(ev.taskId));
       const info = (await this.db
         .prepare('INSERT INTO events (taskId, type, ts, payload, origin) VALUES (?, ?, ?, ?, ?)')
         .run(ev.taskId, ev.type, ev.ts, JSON.stringify(ev.payload), PROCESS_EVENT_ORIGIN));
@@ -5926,6 +6142,7 @@ export class Store {
    *  item 2); the new row still gets a fresh seq for incremental readers. */
   async appendLiveOutput(ev: KarmaxEvent): Promise<number> {
     return this.db.transaction(async () => {
+      (await this.lockTask(ev.taskId));
       (await this.db.prepare(`DELETE FROM events WHERE type = 'agent.output' AND taskId = ?
         AND json_extract(payload, '$.source') = 'assistant' AND json_extract(payload, '$.role') = ?`)
         .run(ev.taskId, String((ev.payload as { role?: unknown }).role ?? '')));
@@ -5937,6 +6154,7 @@ export class Store {
    *  that outlives an undone creation leaves no orphan event. */
   async appendEventIfTaskExists(ev: KarmaxEvent): Promise<number | undefined> {
     return this.db.transaction(async () => {
+      (await this.lockTask(ev.taskId));
       if (!(await this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(ev.taskId))) return undefined;
       return this.appendEvent(ev);
     });
@@ -6038,6 +6256,14 @@ export class Store {
       `SELECT * FROM events WHERE seq IN (${seqs.map(() => '?').join(',')}) ORDER BY seq`, [...seqs]));
   }
 
+  /** The rows among `seqs` that exist now: how a forward reader finds rows
+   *  that committed after it read past their seq. */
+  async eventsAt(seqs: readonly number[]): Promise<Array<KarmaxEvent & { seq: number }>> {
+    if (!seqs.length) return [];
+    return (await this.readRows<any>(`SELECT * FROM events WHERE seq IN (${seqs.map(() => '?').join(',')}) ORDER BY seq`, [...seqs]))
+      .map((r) => ({ seq: Number(r.seq), type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  }
+
   /** Event routing needs ownership, never a conversation or reviewer expansion. */
   async taskProjectIds(taskIds: readonly string[]): Promise<Map<string, string>> {
     return new Map([...(await this.taskEventRoutes(taskIds))].map(([id, route]) => [id, route.projectId]));
@@ -6131,7 +6357,11 @@ export class Store {
   }
 
   /** Fence late asynchronous provisioning across an organization transfer. */
+  /** In a transaction, also holds the project row: a transfer or deletion
+   * waits for the caller's new row to commit. */
   async assertProjectOrganization(projectId: string, organizationId: string): Promise<void> {
+    if (this.db.inTransaction() && this.db.dialect === 'postgres')
+      await this.db.prepare('SELECT 1 FROM projects WHERE id = ? FOR KEY SHARE').get(projectId);
     const project = await this.getProject(projectId);
     if (!project || project.organizationId !== organizationId) throw new Error('project organization changed; reload and retry');
     await this.assertProjectNotTransferring(projectId);
@@ -6149,6 +6379,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     await this.assertProjectOrganization(input.projectId, input.organizationId);
+    (await this.lockStorageLocation(input.storageLocationId));
     const now = input.createdAt ?? Date.now();
     const value: ResourceAttachment = { ...input, id: input.id ?? newId('resource'), enabled: input.enabled ?? true,
       createdAt: now, updatedAt: input.updatedAt ?? now };
@@ -6180,6 +6411,7 @@ export class Store {
     'name' | 'target' | 'access' | 'isolation' | 'source' | 'credentialHandles' | 'storageLocationId' | 'publish' | 'enabled'>>): Promise<ResourceAttachment> {
     return this.db.transaction(async () => {
 
+    (await this.lockAttachment(id, 'update'));
     const current = (await this.getResourceAttachment(id));
     if (!current) throw new Error('resource attachment not found');
     const next = { ...current, ...patch, updatedAt: Date.now() };
@@ -6195,6 +6427,7 @@ export class Store {
 
   async deleteResourceAttachment(id: string): Promise<ResourceAttachment | undefined> {
     return this.db.transaction(async () => {
+    (await this.lockAttachment(id, 'update'));
 
     const value = (await this.getResourceAttachment(id));
     if (!value) return undefined;
@@ -6218,6 +6451,8 @@ export class Store {
     return this.db.transaction(async () => {
 
     const value: ResourceRevision = { ...input, id: input.id ?? newId('revision'), createdAt: input.createdAt ?? Date.now() };
+    (await this.lockAttachment(value.attachmentId, 'key share'));
+    (await this.lockStorageLocation(value.storageLocationId));
     if (!(await this.getResourceAttachment(value.attachmentId))) throw new Error('resource attachment not found');
     (await this.db.prepare(`INSERT INTO resource_revisions (id, attachmentId, parentRevisionId, engine, sealedRef,
       rootDigest, bytes, files, metadata, createdByTaskId, storageLocationId, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -6243,6 +6478,7 @@ export class Store {
     & Partial<Pick<ResourceCandidate, 'id' | 'createdAt' | 'state'>>): Promise<ResourceCandidate> {
     return this.db.transaction(async () => {
 
+    (await this.lockAttachment(input.attachmentId, 'key share'));
     const task = (await this.getTask(input.taskId));
     const attachment = (await this.getResourceAttachment(input.attachmentId));
     if (!task || task.projectId !== input.projectId) throw new Error('resource candidate task does not belong to project');
@@ -6260,6 +6496,16 @@ export class Store {
     return value;
   
     });
+  }
+
+  /** Hold a storage location while writing a row that names it (its deletion
+   * locks the row and counts what names it). */
+  private async lockStorageLocation(id: string | undefined): Promise<void> {
+    if (id && this.db.dialect === 'postgres') await this.db.prepare('SELECT 1 FROM storage_locations WHERE id = ? FOR KEY SHARE').get(id);
+  }
+
+  private async lockResourceCandidate(id: string): Promise<void> {
+    if (this.db.dialect === 'postgres') await this.db.prepare('SELECT 1 FROM resource_candidates WHERE id = ? FOR UPDATE').get(id);
   }
 
   async getResourceCandidate(id: string): Promise<ResourceCandidate | undefined> {
@@ -6284,6 +6530,8 @@ export class Store {
   async resolveResourceCandidate(id: string, state: 'adopted' | 'discarded', resolvedBy: string, error?: string): Promise<ResourceCandidate> {
     return this.db.transaction(async () => {
 
+    // One resolution per candidate: a concurrent one waits, then sees it resolved.
+    (await this.lockResourceCandidate(id));
     const current = (await this.getResourceCandidate(id));
     if (!current) throw new Error('resource candidate not found');
     const expected = state === 'discarded' ? 'discarding' : 'pending';
@@ -6299,6 +6547,7 @@ export class Store {
   async beginDiscardResourceCandidate(id: string, taskId: string): Promise<ResourceCandidate> {
     return this.db.transaction(async () => {
 
+    (await this.lockResourceCandidate(id));
     const current = (await this.getResourceCandidate(id));
     if (!current || current.taskId !== taskId) throw new Error('resource candidate does not belong to task');
     if (current.state === 'discarding') return current;
@@ -6316,6 +6565,7 @@ export class Store {
     const current = (await this.getResourceCandidate(id));
     if (!current || current.taskId !== taskId) throw new Error('resource candidate does not belong to task');
     if (current.state !== 'pending') throw new Error(`resource candidate is already ${current.state}`);
+    (await this.lockAttachment(current.attachmentId, 'update'));
     const attachment = (await this.getResourceAttachment(current.attachmentId));
     if (!attachment || attachment.enabled) throw new Error('resource candidate attachment is unavailable');
     if (current.sourceKind === 'path' && !attachment.currentRevisionId)
@@ -6354,6 +6604,8 @@ export class Store {
   async promoteResourceRevision(attachmentId: string, revisionId: string, expectedRevisionId?: string): Promise<ResourceAttachment> {
     return this.db.transaction(async () => {
 
+    // Deleting an unreferenced revision holds the attachment too.
+    (await this.lockAttachment(attachmentId, 'update'));
     const revision = (await this.getResourceRevision(revisionId));
     if (!revision || revision.attachmentId !== attachmentId) throw new Error('resource revision does not belong to attachment');
     const now = Date.now();
@@ -6374,6 +6626,8 @@ export class Store {
 
     const value: ResourceLease = { ...input, id: input.id ?? newId('resource-lease'), state: input.state ?? 'preparing',
       createdAt: input.createdAt ?? Date.now() };
+    // A leased revision is referenced: its deletion checks under the attachment.
+    (await this.lockAttachment(value.attachmentId, 'key share'));
     (await this.db.prepare(`INSERT INTO resource_leases (id, attachmentId, revisionId, taskId, worldId, worldGeneration,
       access, state, sealedDriverRef, createdAt, expiresAt, releasedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(attachmentId, taskId, worldGeneration) DO UPDATE SET revisionId=excluded.revisionId,
@@ -6408,6 +6662,8 @@ export class Store {
     & Partial<Pick<StorageLocation, 'createdAt' | 'updatedAt'>>): Promise<StorageLocation> {
     return this.db.transaction(async () => {
 
+    // One default location per organization.
+    (await this.lockOrganization(input.organizationId));
     if (!(await this.getOrganization(input.organizationId))) throw new Error('storage organization not found');
     if (!['managed', 's3'].includes(input.kind)) throw new Error('unsupported storage location kind');
     const now = Date.now();
@@ -6444,6 +6700,8 @@ export class Store {
 
   async deleteStorageLocation(id: string): Promise<StorageLocation | undefined> {
     return this.db.transaction(async () => {
+    // Whatever names the location holds its row FOR KEY SHARE (lockStorageLocation).
+    if (this.db.dialect === 'postgres') (await this.db.prepare('SELECT 1 FROM storage_locations WHERE id = ? FOR UPDATE').get(id));
 
     const value = (await this.getStorageLocation(id));
     if (!value) return undefined;
@@ -6508,6 +6766,9 @@ export class Store {
     return this.db.transaction(async () => {
 
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('invalid storage upload reservation');
+    // Usage plus pending reservations is checked against the quota under the
+    // organization's storage lock, which every retaining writer takes.
+    (await this.db.lock(`storage:${organizationId}`));
     const location = (await this.getStorageLocation(storageLocationId));
     if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
     (await this.db.exec('BEGIN IMMEDIATE'));
@@ -6541,6 +6802,8 @@ export class Store {
 
     const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes)
       VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=resource_snapshot_chunks.refs+1`);
+    // Quota checks and reference counts of an organization's chunks.
+    (await this.db.lock(`storage:${organizationId}`));
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       if (storageLocationId) {
@@ -6635,6 +6898,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     const zero: string[] = [];
+    (await this.db.lock(`storage:${organizationId}`));
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       for (const id of chunkIds) {
@@ -6658,6 +6922,9 @@ export class Store {
 
   async registerWorld(handle: WorldHandleRef, projectId: string, defaults: { runnerPoolId?: string; environmentDigest?: string } = {}): Promise<WorldHandleRef> {
     return this.db.transaction(async () => {
+    // A world's handle (generations, checkpoint, checkouts, meta) and its
+    // checkpoint pins change under its lock.
+    (await this.db.lock(`world:${handle.id}`));
 
     const latest = (await this.currentWorld(handle.id));
     const generation = handle.generation ?? ((latest?.generation ?? 0) + 1);
@@ -6702,6 +6969,7 @@ export class Store {
 
   async attachWorldCheckpoint(handle: WorldHandleRef, checkpointId: string): Promise<WorldHandleRef> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`world:${handle.id}`));
 
     const current = (await this.currentWorld(handle.id));
     if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot checkpoint a stale world generation');
@@ -6719,6 +6987,7 @@ export class Store {
    *  would simply not be merged or reviewed. */
   async updateWorldCheckouts(handle: WorldHandleRef, repos: NonNullable<WorldHandleRef['repos']>): Promise<WorldHandleRef> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`world:${handle.id}`));
 
     const current = (await this.currentWorld(handle.id));
     if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
@@ -6735,6 +7004,7 @@ export class Store {
    * follow the task-level destination. */
   async updateCurrentWorldTarget(worldId: string, target: string): Promise<WorldHandleRef> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`world:${worldId}`));
 
     const current = (await this.currentWorld(worldId));
     if (!current) throw new Error('cannot retarget a missing world');
@@ -6749,6 +7019,7 @@ export class Store {
 
   async updateWorldMeta(handle: WorldHandleRef, patch: Record<string, unknown>): Promise<WorldHandleRef> {
     return this.db.transaction(async () => {
+    (await this.db.lock(`world:${handle.id}`));
 
     const current = (await this.currentWorld(handle.id));
     if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
@@ -6773,6 +7044,10 @@ export class Store {
 
   async saveWorldCheckpoint(checkpoint: WorldCheckpoint): Promise<WorldCheckpoint> {
     return this.db.transaction(async () => {
+    // The revisions and storage location it references must outlive it.
+    for (const attachmentId of [...new Set((checkpoint.resources ?? []).map((ref) => ref.attachmentId))].sort())
+      (await this.lockAttachment(attachmentId, 'key share'));
+    (await this.lockStorageLocation(checkpoint.filesystemDelta?.storageLocationId));
 
     (await this.db.prepare(`INSERT INTO world_checkpoints (id, worldId, generation, projectId, manifest, createdAt)
       VALUES (?, ?, ?, ?, ?, ?)`).run(checkpoint.id, checkpoint.worldId, checkpoint.generation,
@@ -6784,6 +7059,7 @@ export class Store {
 
   async pruneWorldCheckpoints(worldId: string): Promise<void> {
     await this.db.transaction(async () => {
+      (await this.db.lock(`world:${worldId}`));
       const rows = await this.db.prepare('SELECT manifest FROM world_checkpoints WHERE worldId=? ORDER BY createdAt DESC, id DESC').all(worldId) as any[];
       const checkpoints = rows.map(row => JSON.parse(row.manifest) as WorldCheckpoint);
       const pinned = new Set((await this.kvEntries('fork-checkpoint:')).map(row => row.value));
@@ -6817,9 +7093,11 @@ export class Store {
       .all(olderThan, ...(organizationId ? [organizationId] : []), ...(projectId ? [projectId] : []), olderThan, limit)) as Array<{ worldId: string }>)
       .map((row) => String(row.worldId));
     if (!worlds.length) return 0;
-    const pinned = new Set((await this.kvEntries('fork-checkpoint:')).map((row) => row.value));
     let queued = 0;
     for (const worldId of worlds) await this.db.transaction(async () => {
+      // Pins are added under the world's lock (pinWorldCheckpointForFork).
+      (await this.db.lock(`world:${worldId}`));
+      const pinned = new Set((await this.kvEntries('fork-checkpoint:')).map((row) => row.value));
       const rows = (await this.db.prepare('SELECT id, manifest FROM world_checkpoints WHERE worldId=?').all(worldId)) as Array<{ id: string; manifest: string }>;
       for (const row of rows) {
         if (pinned.has(String(row.id))) continue;
@@ -6866,15 +7144,19 @@ export class Store {
    * `allowCurrent` also clears it as its attachment's current revision. */
   async deleteResourceRevisionIfUnreferenced(id: string, options: { allowCurrent?: boolean } = {}): Promise<ResourceRevision | undefined> {
     return this.db.transaction(async () => {
+      const owner = (await this.getResourceRevision(id))?.attachmentId;
+      if (!owner) return undefined;
+      // Whatever references a revision holds its attachment's row: under it,
+      // the checks below see every reference that will ever commit.
+      (await this.lockAttachment(owner, 'update'));
       const revision = (await this.getResourceRevision(id));
       if (!revision) return undefined;
-      // Targeted checks, not referencedResourceRevisionIds(): this runs once
-      // per deletion while holding the Store's write lock.
+      // Targeted checks, not referencedResourceRevisionIds(): this runs once per deletion.
       const attachment = (await this.getResourceAttachment(revision.attachmentId));
       const current = attachment?.currentRevisionId === id;
       if ((current && !options.allowCurrent) || (await this.resourceRevisionReferencedBesidesCurrent(id))) return undefined;
-      if (current) (await this.db.prepare('UPDATE resource_attachments SET currentRevisionId=NULL, updatedAt=? WHERE id=?')
-        .run(Date.now(), revision.attachmentId));
+      if (current) (await this.db.prepare('UPDATE resource_attachments SET currentRevisionId=NULL, updatedAt=? WHERE id=? AND currentRevisionId=?')
+        .run(Date.now(), revision.attachmentId, id));
       (await this.db.prepare('DELETE FROM resource_revisions WHERE id=?').run(id));
       return revision;
     });
@@ -6936,6 +7218,8 @@ export class Store {
 
   async pinWorldCheckpointForFork(taskId: string, checkpointId: string): Promise<void> {
     await this.db.transaction(async () => {
+      const worldId = ((await this.db.prepare('SELECT worldId FROM world_checkpoints WHERE id=?').get(checkpointId)) as { worldId?: string } | undefined)?.worldId;
+      if (worldId) (await this.db.lock(`world:${worldId}`));
       if (!(await this.getWorldCheckpoint(checkpointId))) throw new Error('fork checkpoint is no longer available');
       await this.kvSet(`fork-checkpoint:${taskId}`, checkpointId);
     });
@@ -6977,6 +7261,7 @@ export class Store {
   }): Promise<WorldProviderConnection> {
     return this.db.transaction(async () => {
 
+    (await this.lockOrganization(input.organizationId));
     if (!(await this.getOrganization(input.organizationId))) throw new Error('organization not found');
     if (!/^[a-z][a-z0-9-]{0,31}$/.test(input.provider)) throw new Error('invalid world provider');
     const existing = (await this.getWorldProviderConnection(input.organizationId, input.provider));
@@ -7071,6 +7356,10 @@ export class Store {
   async deleteRunnerPool(id: string): Promise<RunnerPool | undefined> {
     return this.db.transaction(async () => {
 
+    const owner = (await this.getRunnerPool(id))?.organizationId;
+    if (!owner) return undefined;
+    // Leases are admitted to its pools, and projects select them, under these locks.
+    (await this.db.lock(`org:${owner}`, `world-lease:${owner}`));
     const value = (await this.getRunnerPool(id));
     if (!value) return undefined;
     const leases = Number(((await this.db.prepare("SELECT COUNT(*) n FROM world_leases WHERE runnerPoolId=? AND state!='released'")
@@ -7087,6 +7376,10 @@ export class Store {
   async requestWorldLease(input: { runnerPoolId: string; organizationId: string; projectId: string; taskId: string;
     worldId: string; cpu?: number; memoryMb?: number; gpu?: number; priority?: number }): Promise<{ id: string; acquired: boolean }> {
     return this.db.transaction(async () => {
+    // A pool belongs to one organization, so this one key covers the pool's
+    // capacity and the organization's active-world and start-rate limits.
+    (await this.db.lock(`world-lease:${input.organizationId}`));
+    if (this.db.dialect === 'postgres') (await this.db.prepare('SELECT 1 FROM projects WHERE id = ? FOR KEY SHARE').get(input.projectId));
 
     const pool = (await this.getRunnerPool(input.runnerPoolId));
     if (!pool?.enabled || pool.organizationId !== input.organizationId) throw new Error('runner pool is unavailable');
@@ -7155,6 +7448,8 @@ export class Store {
 
   private async promoteQueuedWorldLeases(filter: { runnerPoolId?: string; organizationId?: string; remoteOnly?: boolean }): Promise<string[]> {
     return this.db.transaction(async () => {
+    const organizationId = filter.organizationId ?? (filter.runnerPoolId ? (await this.getRunnerPool(filter.runnerPoolId))?.organizationId : undefined);
+    if (organizationId) (await this.db.lock(`world-lease:${organizationId}`));
 
     const queued = filter.runnerPoolId
       ? (await this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state='queued'
@@ -7192,8 +7487,8 @@ export class Store {
         if (Number(active.n) >= pool.capacity.activeWorlds || Number(active.cpu) + candidate.cpu > pool.capacity.cpu
           || Number(active.memoryMb) + candidate.memoryMb > pool.capacity.memoryMb || Number(active.gpu) + candidate.gpu > pool.capacity.gpu) continue;
       }
-      (await this.db.prepare("UPDATE world_leases SET state='active', acquiredAt=? WHERE id=? AND state='queued'").run(Date.now(), candidate.id));
-      activated.push(candidate.id);
+      if (Number((await this.db.prepare("UPDATE world_leases SET state='active', acquiredAt=? WHERE id=? AND state='queued'")
+        .run(Date.now(), candidate.id)).changes)) activated.push(candidate.id);
     }
     return activated;
   
@@ -7226,6 +7521,10 @@ export class Store {
   async releaseWorldLease(id: string): Promise<string[]> {
     return this.db.transaction(async () => {
 
+    // Lock the organization's leases before this lease's row: promotion holds
+    // the same key and then updates queued rows.
+    const owner = ((await this.db.prepare('SELECT organizationId FROM world_leases WHERE id=?').get(id)) as { organizationId: string } | undefined)?.organizationId;
+    if (owner) (await this.db.lock(`world-lease:${owner}`));
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       const lease = (await this.db.prepare('SELECT runnerPoolId, organizationId FROM world_leases WHERE id=?').get(id)) as any;
@@ -7361,6 +7660,9 @@ export class Store {
     return this.db.transaction(async () => {
 
     const now = input.now ?? Date.now();
+    // Active turns, the start rate and the managed spend cap are counted under
+    // the organization's usage lock, which finishing a turn also takes.
+    (await this.db.lock(`usage:${input.organizationId}`));
     const project = (await this.getProject(input.projectId));
     const taskProjectId = await this.taskProjectIdAsync(input.taskId);
     if (!project || project.organizationId !== input.organizationId || taskProjectId !== project.id)
@@ -7459,6 +7761,9 @@ export class Store {
   async finishUsageAdmission(id: string, completed: boolean | undefined, now = Date.now(),
     events: Array<Omit<UsageEvent, 'id'> & { id?: string }> = []): Promise<void> {
     return this.db.transaction(async () => {
+    const owner = ((await this.db.prepare('SELECT organizationId FROM usage_admissions WHERE id=?').get(id)) as { organizationId: string } | undefined)?.organizationId
+      ?? events[0]?.organizationId;
+    if (owner) (await this.db.lock(`usage:${owner}`));
 
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
@@ -7655,8 +7960,11 @@ export class Store {
   }
 
   // Delayed deletion of managed objects (src/store/deferred-delete.ts).
-  async objectTombstone(key: string): Promise<{ key: string; deletedAt: number; purgeAfter: number } | undefined> {
-    const row = (await this.db.prepare('SELECT deletedAt, purgeAfter FROM object_tombstones WHERE objectKey=?').get(key)) as
+  /** `lock` (in a transaction) holds the row: a put clearing it waits for
+   * the caller, e.g. a purge deleting the object, to commit. */
+  async objectTombstone(key: string, options: { lock?: boolean } = {}): Promise<{ key: string; deletedAt: number; purgeAfter: number } | undefined> {
+    const row = (await this.db.prepare(`SELECT deletedAt, purgeAfter FROM object_tombstones WHERE objectKey=?${
+      options.lock ? this.forUpdate : ''}`).get(key)) as
       { deletedAt: number | bigint; purgeAfter: number | bigint } | undefined;
     return row ? { key, deletedAt: Number(row.deletedAt), purgeAfter: Number(row.purgeAfter) } : undefined;
   }
@@ -7749,6 +8057,8 @@ export class Store {
     data = utf8Tail(data, 200_000);
     return this.db.transaction(async () => {
 
+    // Frames are numbered MAX+1 per execution.
+    (await this.db.lock(`execution:${id}`));
     (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       const seq = Number(((await this.db.prepare('SELECT COALESCE(MAX(seq),0)+1 seq FROM execution_frames WHERE executionId=?')
@@ -7789,8 +8099,16 @@ export class Store {
 
     const rows = (await this.db.prepare("SELECT id FROM executions WHERE state IN ('starting','running','stop-requested') AND heartbeatAt<?")
       .all(staleBefore)) as any[];
-    for (const row of rows) (await this.finishExecution(row.id, null, 'lost'));
-    return rows.map((row) => String(row.id));
+    // Re-checked per row: a heartbeat or another sweep may have come first.
+    const lost: string[] = [];
+    for (const row of rows) {
+      if ((await this.db.prepare(`SELECT 1 FROM executions WHERE id=? AND state IN ('starting','running','stop-requested') AND heartbeatAt<?${this.forUpdate}`)
+        .get(row.id, staleBefore))) {
+        (await this.finishExecution(row.id, null, 'lost'));
+        lost.push(String(row.id));
+      }
+    }
+    return lost;
   
     });
   }
@@ -7823,6 +8141,7 @@ export class Store {
   async revokePreviewLease(id: string): Promise<PreviewLease | undefined> {
     return this.db.transaction(async () => {
 
+    if (this.db.dialect === 'postgres') (await this.db.prepare('SELECT 1 FROM preview_leases WHERE id = ? FOR UPDATE').get(id));
     const lease = (await this.previewLease(id));
     if (lease && !lease.revokedAt) (await this.db.prepare('UPDATE preview_leases SET revokedAt=? WHERE id=?').run(Date.now(), id));
     return lease;
@@ -7925,11 +8244,11 @@ export class Store {
   async updateCard(id: string, patch: { available?: number; cap?: number; status?: string; last4?: string }) {
     return this.db.transaction(async () => {
 
-    const c = (await this.getCard(id));
-    if (!c) return;
-    (await this.db.prepare('UPDATE cards SET available=?, cap=?, status=?, last4=? WHERE id=?')
-      .run(patch.available ?? c.available, patch.cap ?? c.cap, patch.status ?? c.status,
-        patch.last4 ?? c.last4 ?? null, id));
+    // One statement: an omitted field keeps the row's value at the write, not
+    // a value read earlier. Balance changes run in paymentTransaction.
+    (await this.db.prepare(`UPDATE cards SET available=COALESCE(?, available), cap=COALESCE(?, cap),
+      status=COALESCE(?, status), last4=COALESCE(?, last4) WHERE id=?`)
+      .run(patch.available ?? null, patch.cap ?? null, patch.status ?? null, patch.last4 ?? null, id));
   
     });
   }
@@ -8073,13 +8392,12 @@ export class Store {
 
     const current = (await this.getPaymentSpendRequest(id));
     if (!current) return undefined;
-    (await this.db.prepare(`UPDATE payment_spend_requests SET status=?, reason=?, shortfall=?,
-      providerAuthorizationId=?, resolvedBy=?, expiresAt=?, amount=?, updatedAt=? WHERE id=?`)
-      .run(patch.status ?? current.status, patch.reason ?? current.reason ?? null,
-        patch.shortfall ?? current.shortfall ?? null,
-        patch.providerAuthorizationId ?? current.providerAuthorizationId ?? null,
-        patch.resolvedBy ?? current.resolvedBy ?? null, patch.expiresAt ?? current.expiresAt,
-        patch.amount ?? current.amount, Date.now(), id));
+    // One statement: an omitted field keeps the row's value at the write.
+    (await this.db.prepare(`UPDATE payment_spend_requests SET status=COALESCE(?, status), reason=COALESCE(?, reason),
+      shortfall=COALESCE(?, shortfall), providerAuthorizationId=COALESCE(?, providerAuthorizationId),
+      resolvedBy=COALESCE(?, resolvedBy), expiresAt=COALESCE(?, expiresAt), amount=COALESCE(?, amount), updatedAt=? WHERE id=?`)
+      .run(patch.status ?? null, patch.reason ?? null, patch.shortfall ?? null, patch.providerAuthorizationId ?? null,
+        patch.resolvedBy ?? null, patch.expiresAt ?? null, patch.amount ?? null, Date.now(), id));
     const updated = (await this.getPaymentSpendRequest(id));
     (await this.kvSet(`spent:${current.taskId}`, String((await this.paymentSpent(current.taskId))))); // see the note above
     return updated;
@@ -8157,14 +8475,17 @@ export class Store {
       WHERE taskId=? AND status IN ('pending_approval', 'needs_funding')`).all(taskId) as Array<{
         id: string; projectId: string; cardId: string | null; amount: number; status: string }>;
     const now = Date.now();
+    let retired = 0;
     for (const request of waiting) {
-      await this.db.prepare(`UPDATE payment_spend_requests SET status='denied', reason=?, resolvedBy='system:payments', updatedAt=?
-        WHERE id=? AND status=?`).run(`task ${status} before approval`, now, request.id, request.status);
+      // Only the request this call retired is audited and counted.
+      if (!Number((await this.db.prepare(`UPDATE payment_spend_requests SET status='denied', reason=?, resolvedBy='system:payments', updatedAt=?
+        WHERE id=? AND status=?`).run(`task ${status} before approval`, now, request.id, request.status)).changes)) continue;
+      retired++;
       await this.appendAudit({ ts: now, principalId: 'system:payments', action: 'payment.request.retired',
         scopeKey: `project:${request.projectId}`, detail: { requestId: request.id, taskId, cardId: request.cardId,
           amount: request.amount, previousStatus: request.status, taskStatus: status } });
     }
-    return waiting.length;
+    return retired;
   
     });
   }
@@ -8382,9 +8703,13 @@ export class Store {
 
   async purgeScopedTokens(now = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
-    (await this.db.prepare(`DELETE FROM scoped_token_projects WHERE tokenHash IN
-      (SELECT tokenHash FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL)`).run(now));
-    return Number((await this.db.prepare('DELETE FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now)).changes);
+    // Delete the same tokens from both tables: one revoked between two
+    // statements must not lose its row but keep its scopes.
+    const hashes = ((await this.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL').all(now)) as Array<{ tokenHash: string }>)
+      .map((row) => String(row.tokenHash));
+    (await deleteRows(this.db, 'scoped_token_projects', 'tokenHash', hashes));
+    (await deleteRows(this.db, 'scoped_tokens', 'tokenHash', hashes));
+    return hashes.length;
   
     });
   }
@@ -8462,7 +8787,13 @@ export class Store {
         AND CASE WHEN settle.k LIKE 'retention:settled:%' THEN CAST(settle.v AS BIGINT) END < ?
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='retention:view:' || tasks.id AND v='2')`)
       .all(now - 7 * 24 * 60 * 60 * 1000) as Array<{ id: string; conversationRef: string | null; runId: string | null }>;
-    for (const task of settled) {
+    for (const settledTask of settled) {
+      // Hold the row and re-check: a task resumed (or re-published) since the
+      // query above is not settled any more.
+      const task = (await this.db.prepare(`SELECT id, conversationRef, json_extract(params, '$._workflowRunId') runId FROM tasks
+        WHERE id=? AND json_extract(lastView, '$.status') IN ('done', 'cancelled', 'failed')${this.forKeyShare}`)
+        .get(settledTask.id)) as { id: string; conversationRef: string | null; runId: string | null } | undefined;
+      if (!task) continue;
       const snapshotPrefix = `view-conversation:${task.id}:`;
       viewSnapshots += Number((await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<? AND k<>?`)
         .run(snapshotPrefix, `view-conversation:${task.id};`, `${snapshotPrefix}${task.conversationRef ?? ''}`)).changes);

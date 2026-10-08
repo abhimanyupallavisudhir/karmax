@@ -1,10 +1,12 @@
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { performance } from 'node:perf_hooks';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { AsyncPostgres } from './async-sql.js';
 import { DatabaseQueue } from './database-queue.js';
 import { splitStatements } from './postgres-sql.mjs';
+import { countStoreFailure, observeStore } from './transaction-metrics.js';
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 export interface SqlRunResult { changes: number | bigint; lastInsertRowid: number | bigint }
 export interface SqlStatement {
@@ -19,19 +21,36 @@ export interface SqlDatabase {
   exec(sql: string): Promise<void>;
   result(sql: string, params: unknown[]): Promise<{ rows: unknown[]; changes?: number | bigint; lastInsertRowid?: number | bigint }>;
   transaction<T>(operation: () => Promise<T>): Promise<T>;
+  /** Exclusive locks on named entities (`<domain>:<id>`), held until the
+   * surrounding transaction ends. On PostgreSQL, transactions otherwise run
+   * concurrently under READ COMMITTED: a compound read-modify-write whose
+   * invariant spans rows (a count against a cap, uniqueness no constraint
+   * enforces, an ordering) locks the entity that owns the invariant before
+   * reading it. Take them before any row lock, coarsest first, in the order
+   * of `STORE_LOCK_ORDER` (store/db.ts); a key already held is free. A no-op
+   * on SQLite, whose writers are serialized. */
+  lock(...keys: string[]): Promise<void>;
   inTransaction(): boolean;
   afterCommit(operation: () => unknown): void;
   close(): Promise<void>;
 }
-interface Scope { active: boolean; rollback: boolean; afterCommit: Array<() => unknown> }
+interface Scope { active: boolean; rollback: boolean; afterCommit: Array<() => unknown>; locks: Set<string> }
+/** The former installation-wide write lock, kept as a kill switch for one
+ * release: `KARMAX_STORE_GLOBAL_LOCK=1` serializes every PostgreSQL Store
+ * transaction again (in-process queue plus one advisory key across processes),
+ * in case production finds an invariant the per-entity locks missed. */
+const GLOBAL_LOCK_KEY = 1262572115;
+export const globalStoreLock = (): boolean => /^(?:1|true|on)$/i.test(process.env.KARMAX_STORE_GLOBAL_LOCK ?? '');
 class AsyncDatabase implements SqlDatabase {
   readonly dialect: 'sqlite' | 'postgres';
   readonly native?: DatabaseSyncType;
   private postgres?: AsyncPostgres;
   private scope = new AsyncLocalStorage<Scope>();
-  private queue = new DatabaseQueue();
+  private queue: DatabaseQueue;
   private closed = false;
   private closing = false;
+  /** Whether PostgreSQL transactions serialize under the global lock. */
+  private readonly serialized: boolean;
   get stats() {
     const pool = this.postgres?.stats ?? { pending: 0, connections: 0, waiting: 0 };
     return {
@@ -46,8 +65,15 @@ class AsyncDatabase implements SqlDatabase {
   }
   constructor(target: string, options?: { readOnly?: boolean }) {
     this.dialect = isPostgresTarget(target) ? 'postgres' : 'sqlite';
+    this.serialized = this.dialect === 'postgres' && globalStoreLock();
     if (this.dialect === 'postgres') this.postgres = new AsyncPostgres(target);
     else this.native = options ? new DatabaseSync(target, options) : new DatabaseSync(target);
+    // PostgreSQL transactions run concurrently, each on a pooled connection,
+    // but never on the last one: transactions waiting on an entity lock must
+    // not starve every other request's reads. SQLite (and the kill switch)
+    // admit one at a time.
+    this.queue = new DatabaseQueue({ concurrency: this.postgres && !this.serialized
+      ? Math.max(1, this.postgres.maxConnections - 1) : 1 });
   }
   private async access<T>(operation: () => Promise<T>): Promise<T> {
     const scope = this.scope.getStore();
@@ -106,17 +132,33 @@ class AsyncDatabase implements SqlDatabase {
     });
   }
   inTransaction(): boolean { return this.scope.getStore()?.active === true; }
+  async lock(...keys: string[]): Promise<void> {
+    const scope = this.scope.getStore();
+    if (!scope?.active) throw new Error('lock() must run inside a transaction');
+    if (!this.postgres || this.serialized) return;
+    for (const key of keys) {
+      if (scope.locks.has(key)) continue;
+      const started = performance.now();
+      await this.postgres.query('SELECT pg_advisory_xact_lock(hashtextextended(?, 0))', [key]);
+      observeStore('entityLock', started);
+      scope.locks.add(key);
+    }
+  }
   async transaction<T>(operation: () => Promise<T>): Promise<T> {
     const inherited = this.scope.getStore();
     if (inherited) {
       if (!inherited.active) throw Error('transaction is already closed');
       return operation();
     }
+    const requested = performance.now();
     const run = async () => {
-      const scope: Scope = { active: true, rollback: false, afterCommit: [] };
+      const scope: Scope = { active: true, rollback: false, afterCommit: [], locks: new Set() };
       const rollback = new Error('transaction requested rollback');
       let result!: T;
+      let opened = 0;
       const work = async () => {
+        opened = performance.now();
+        observeStore('admission', requested);
         try {
           result = await this.scope.run(scope, operation);
           if (scope.rollback) throw rollback;
@@ -124,19 +166,28 @@ class AsyncDatabase implements SqlDatabase {
         } finally { scope.active = false; }
       };
       try {
-        if (this.postgres) {
-          const value = await this.postgres.transaction(async () => {
-            // Preserve the former atomic Store mutation boundary across processes.
-            await this.postgres!.query('SELECT pg_advisory_xact_lock(1262572115)');
-            return work();
-          });
-          this.dispatchAfterCommit(scope.afterCommit);
-          return value;
-        }
-        this.native!.exec('BEGIN IMMEDIATE');
-        try { const value = await work(); this.native!.exec('COMMIT'); this.dispatchAfterCommit(scope.afterCommit); return value; }
-        catch (error) { this.native!.exec('ROLLBACK'); throw error; }
-      } catch (error) { if (error === rollback) return result; throw error; }
+        try {
+          if (this.postgres) {
+            const value = await this.postgres.transaction(async () => {
+              if (this.serialized) {
+                const started = performance.now();
+                await this.postgres!.query(`SELECT pg_advisory_xact_lock(${GLOBAL_LOCK_KEY})`);
+                observeStore('globalLock', started);
+              }
+              return work();
+            });
+            this.dispatchAfterCommit(scope.afterCommit);
+            return value;
+          }
+          this.native!.exec('BEGIN IMMEDIATE');
+          try { const value = await work(); this.native!.exec('COMMIT'); this.dispatchAfterCommit(scope.afterCommit); return value; }
+          catch (error) { this.native!.exec('ROLLBACK'); throw error; }
+        } finally { if (opened) observeStore('duration', opened); }
+      } catch (error) {
+        if (error === rollback) return result;
+        countStoreFailure(error);
+        throw error;
+      }
     };
     return this.enqueue(run);
   }
@@ -182,6 +233,7 @@ export function openSqlDatabase(target: string, options?: { readOnly?: boolean }
     async exec(sql) { check(); return backend.db.exec(sql); },
     async result(sql, params) { check(); return backend.db.result(sql, params); },
     async transaction(operation) { check(); return backend.db.transaction(operation); },
+    async lock(...keys) { check(); return backend.db.lock(...keys); },
     inTransaction() { check(); return backend.db.inTransaction(); },
     afterCommit(operation) { check(); backend.db.afterCommit(operation); },
     async close() {

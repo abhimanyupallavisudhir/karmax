@@ -128,6 +128,9 @@ export class AccountErasureService {
     // Commit the fence and manifest together. Revalidate ownership under the same
     // cross-process SQL write transaction; never rely on an earlier UI preview.
     let record = await this.store.transaction(async () => {
+      // Blockers span users (the last administrator); the account's own
+      // writers check the fence under its account lock.
+      await this.store.lock('account-closure', `account:${userId}`);
       const preview = await this.preview(userId);
       if (preview.case?.state === 'closed' || preview.case?.state === 'review-complete') return preview.case;
       if (!preview.case) {
@@ -162,6 +165,7 @@ export class AccountErasureService {
       if ((await this.get(userId))!.steps.includes(name)) return;
       await work();
       await this.store.transaction(async () => {
+        await this.store.lock(`account:${userId}`);
         const latest = (await this.get(userId))!;
         if (!latest.steps.includes(name)) latest.steps.push(name);
         latest.revision++;
@@ -186,6 +190,7 @@ export class AccountErasureService {
       await step('access-and-preferences', () => this.clearAccess(userId));
       await step('identity', () => this.identity.removeUser(userId));
       record = await this.store.transaction(async () => {
+        await this.store.lock(`account:${userId}`);
         const latest = (await this.get(userId))!;
         // A slower concurrent retry must not undo a later operator review.
         if (latest.state === 'closing') latest.state = 'closed';
@@ -198,6 +203,7 @@ export class AccountErasureService {
       return record;
     } catch {
       await this.store.transaction(async () => {
+        await this.store.lock(`account:${userId}`);
         const latest = (await this.get(userId))!;
         if (latest.state !== 'closing') return;
         latest.retryRequired = true; latest.failedStep = activeStep; latest.revision++;
@@ -210,6 +216,7 @@ export class AccountErasureService {
 
   private async clearAccess(userId: string) {
     await this.store.transaction(async () => {
+      await this.store.lock(`account:${userId}`);
       const db = this.store.db, principal = `user:${userId}`;
       for (const org of await this.store.listOrganizations(userId)) await this.store.removeOrganizationMembership(org.id, userId);
       await db.prepare('DELETE FROM delivery_outbox WHERE inboxId IN (SELECT id FROM inbox WHERE userId=?)').run(userId);
@@ -238,6 +245,7 @@ export class AccountErasureService {
     if (input.reviewAt !== undefined && (!Number.isSafeInteger(input.reviewAt) || input.reviewAt <= Date.now()))
       throw new ErasureError('reviewAt must be a future epoch-millisecond date.', 400);
     return this.store.transaction(async () => {
+      await this.store.lock(`account:${userId}`);
       const record = await this.get(userId);
       if (!record || record.state === 'closing') throw new ErasureError('Close the account successfully before resolving content review.');
       if (record.revision !== input.revision) throw new ErasureError('Case changed; reload before saving.');
@@ -254,6 +262,7 @@ export class AccountErasureService {
 
   async complete(userId: string, revision: number, confirmation: string, actor: string) {
     return this.store.transaction(async () => {
+      await this.store.lock(`account:${userId}`);
       const record = await this.get(userId);
       if (!record || record.state === 'closing') throw new ErasureError('Account cleanup is incomplete.');
       if (record.revision !== revision) throw new ErasureError('Case changed; reload before completing.');

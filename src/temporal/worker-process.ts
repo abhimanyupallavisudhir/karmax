@@ -1,5 +1,6 @@
 import { fork, type ChildProcess } from 'node:child_process';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
+import type { StoreMetricsSnapshot } from '../store/transaction-metrics.js';
 
 export interface WorkerProcessRequest {
   type: 'worker.request'; id: number; action: 'start' | 'refresh' | 'stop' | 'ping';
@@ -7,6 +8,8 @@ export interface WorkerProcessRequest {
 }
 export interface WorkerProcessReply {
   type: 'worker.reply'; id: number; ok: boolean; error?: string;
+  /** A ping's reply carries the child's Store transaction timings. */
+  store?: StoreMetricsSnapshot;
 }
 /** Unsolicited child → supervisor hint: events were committed to the shared store. */
 export interface WorkerProcessNotice { type: 'worker.events' }
@@ -33,6 +36,8 @@ export class WorkerProcessManager {
   private externals: ExternalWorkflowRef[] = [];
   private pending = new Map<number, { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   failure?: Error;
+  /** The child's Store timings as of its last answered liveness ping. */
+  storeMetrics?: StoreMetricsSnapshot;
 
   constructor(private options: {
     entrypoint: string;
@@ -124,6 +129,7 @@ export class WorkerProcessManager {
         if (!request) return;
         this.pending.delete(reply.id);
         clearTimeout(request.timer);
+        if (reply.store && typeof reply.store === 'object') this.storeMetrics = reply.store;
         if (reply.ok) request.resolve();
         else request.reject(new Error(typeof reply.error === 'string' ? reply.error.slice(0, 2_000) : 'worker request failed'));
       });

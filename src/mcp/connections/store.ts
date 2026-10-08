@@ -60,6 +60,8 @@ export class McpConnections {
   private handle(id: string) { return `mcp:${this.organizationId}:${id}`; }
   async save(input: any, projectId?: string): Promise<McpConnection> {
     return this.store.transaction(async () => {
+      // The organization's connection list (and its cap) is rewritten under its vault lock.
+      (await this.store.lock(`vault:${this.organizationId}`));
       if (projectId && (await this.store.getProject(projectId))?.organizationId !== this.organizationId) throw new Error('Project does not belong to this organization');
       const prior = input.id ? (await this.get(input.id, projectId)) : undefined;
       if (prior && prior.projectId !== projectId) throw new Error('Edit this connection in its owning settings');
@@ -123,6 +125,7 @@ export class McpConnections {
 
   async remove(id: string, projectId?: string) {
     return this.store.transaction(async () => {
+      (await this.store.lock(`vault:${this.organizationId}`));
       const c = (await this.get(id, projectId));
       if (c.projectId !== projectId) throw new Error('Remove this connection in its owning settings');
       (await this.store.setSettings(this.key(), 'mcp', { connections: (await this.all()).filter((v) => v.id !== id) }));
@@ -142,6 +145,7 @@ export class McpConnections {
   }
   async setSecret(c: McpConnection, value: unknown) {
     await this.store.transaction(async () => {
+      (await this.store.lock(`vault:${this.organizationId}`));
       if ((await this.get(c.id, c.projectId)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
       (await this.broker.registerHandle(this.handle(c.id), JSON.stringify(value), organizationScope(this.organizationId)));
     });

@@ -233,7 +233,8 @@ export class MockPaymentProvider implements PaymentProvider {
     return (await this.store.getCard(cardId));
   }
   async fund(cardId: string, amount: number): Promise<void> {
-    return this.store.transaction(async () => {
+    // Balances change under the payment table lock (paymentTransaction).
+    return this.store.paymentTransaction(async () => {
     if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('funding amount must be a positive number of cents');
     const c = (await this.store.getCard(cardId));
     if (!c) throw new Error('no such card');
@@ -242,7 +243,7 @@ export class MockPaymentProvider implements PaymentProvider {
     });
   }
   async authorize(cardId: string, amount: number, merchant?: string): Promise<AuthorizeResult> {
-    return this.store.transaction(async () => {
+    return this.store.paymentTransaction(async () => {
     const c = (await this.store.getCard(cardId));
     if (!c) return { ok: false, reason: 'no such card' };
     if (!Number.isSafeInteger(amount) || amount <= 0) return { ok: false, reason: 'amount must be a positive number of cents' };
@@ -266,7 +267,7 @@ export class MockPaymentProvider implements PaymentProvider {
       .filter((card) => card.provider === this.name).reduce((sum, card) => sum + card.available, 0), currency: 'usd' };
   }
   async revoke(cardId: string): Promise<void> {
-    return this.store.transaction(async () => {
+    return this.store.paymentTransaction(async () => {
     if (!(await this.store.getCard(cardId))) throw new Error('no such card');
     (await this.store.updateCard(cardId, { status: 'canceled', available: 0 }));
 
@@ -346,10 +347,12 @@ export class VaultCardProvider implements PaymentProvider {
   async fund(cardId: string, amount: number): Promise<void> {
     if (!Number.isSafeInteger(amount) || amount <= 0)
       throw new Error('top-up amount must be a positive number of cents');
-    const card = await this.getCard(cardId);
-    if (!card) throw new Error('no such card');
-    if (card.status === 'canceled') throw new Error('card is not active');
-    (await this.store.updateCard(cardId, { available: card.available + amount, cap: card.cap + amount }));
+    await this.store.paymentTransaction(async () => {
+      const card = await this.getCard(cardId);
+      if (!card) throw new Error('no such card');
+      if (card.status === 'canceled') throw new Error('card is not active');
+      (await this.store.updateCard(cardId, { available: card.available + amount, cap: card.cap + amount }));
+    });
   }
   async authorize(cardId: string, amount: number, merchant?: string): Promise<AuthorizeResult> {
     const card = await this.getCard(cardId);

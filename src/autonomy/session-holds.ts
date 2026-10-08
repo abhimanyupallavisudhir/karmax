@@ -43,6 +43,7 @@ const read = async <T>(store: HoldStore, key: string): Promise<T | undefined> =>
 /** Record that `taskId`'s browser holds `itemId`. */
 export async function recordHold(store: HoldStore, organizationId: string, taskId: string, itemId: string): Promise<void> {
   await store.transaction(async () => {
+    await store.lock?.(`kv:${kvHolds(taskId)}`);
     const holds = (await read<Array<{ itemId: string; organizationId: string }>>(store, kvHolds(taskId))) ?? [];
     if (!holds.some((h) => h.itemId === itemId)) await store.kvSet(kvHolds(taskId), JSON.stringify([...holds, { itemId, organizationId }]));
   });
@@ -64,6 +65,8 @@ export async function acquireLease(store: HoldStore, organizationId: string, ite
   Promise<{ granted: true } | { granted: false; heldBy: { taskId: string; num?: number; title?: string } }> {
   if (!item.exclusive) return { granted: true };
   return store.transaction(async () => {
+    // One live holder at a time.
+    await store.lock?.(`kv:${kvLease(organizationId, item.id)}`);
     const holder = await liveHolder(store, await read<Lease>(store, kvLease(organizationId, item.id)), taskId, now);
     if (holder) return { granted: false as const, heldBy: { taskId: holder.id, ...(holder.num !== undefined ? { num: holder.num } : {}), ...(holder.title ? { title: holder.title } : {}) } };
     await store.kvSet(kvLease(organizationId, item.id), JSON.stringify({ taskId, at: now }));
@@ -74,6 +77,7 @@ export async function acquireLease(store: HoldStore, organizationId: string, ite
 /** Give back a lease `taskId` took for a restore that did not happen. */
 export async function releaseLease(store: HoldStore, organizationId: string, itemId: string, taskId: string): Promise<void> {
   await store.transaction(async () => {
+    await store.lock?.(`kv:${kvLease(organizationId, itemId)}`);
     const lease = await read<Lease>(store, kvLease(organizationId, itemId));
     if (lease?.taskId === taskId) await store.kvDelete?.(kvLease(organizationId, itemId));
   });
@@ -122,6 +126,7 @@ export async function settleTaskSessions(args: {
       }
       if (item?.exclusive && !args.release) {
         await store.transaction(async () => {
+          await store.lock?.(`kv:${kvLease(hold.organizationId, hold.itemId)}`);
           const lease = await read<Lease>(store, kvLease(hold.organizationId, hold.itemId));
           if (lease?.taskId === taskId) await store.kvSet(kvLease(hold.organizationId, hold.itemId), JSON.stringify({ taskId, at: now() }));
         });
@@ -130,6 +135,8 @@ export async function settleTaskSessions(args: {
   }
   if (args.release) {
     await store.transaction(async () => {
+      await store.lock?.(`kv:${kvHolds(taskId)}`,
+        ...[...new Set(holds.map((hold) => `kv:${kvLease(hold.organizationId, hold.itemId)}`))].sort());
       for (const hold of holds) {
         const lease = await read<Lease>(store, kvLease(hold.organizationId, hold.itemId));
         if (lease?.taskId === taskId) await store.kvDelete?.(kvLease(hold.organizationId, hold.itemId));

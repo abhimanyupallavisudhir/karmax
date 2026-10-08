@@ -2,12 +2,15 @@ import type { Store } from '../store/db.js';
 import type { KarmaxEvent } from '../domain/types.js';
 import type { KarmaxBus } from '../contrib/bus.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
+import { EventGaps } from '../contrib/event-gaps.js';
 
 /**
  * Durable gateway fan-out. The event table, not an in-process emitter, is the
  * cursor source, so another worker/gateway replica can append an event and all
  * connected browsers still observe it. The local bus only wakes the poller to
- * reduce latency; correctness comes from monotonically increasing event.seq.
+ * reduce latency. Seqs increase, but concurrent transactions commit out of seq
+ * order, so a seq the cursor passes without a row is re-read until it commits
+ * (`EventGaps`); subscribers may receive such an event after a higher seq.
  */
 type RoutedEvent = { event: KarmaxEvent & { seq?: number }; projectId?: string; siblingAttempt?: boolean; bytes: number };
 interface Subscriber {
@@ -22,6 +25,7 @@ interface Subscriber {
 export class DurableEventFanout {
   private listeners = new Set<Subscriber>();
   private cursor!: number;
+  private readonly gaps = new EventGaps();
   private timer!: NodeJS.Timeout;
   private offBus?: () => void;
   private draining = false;
@@ -107,24 +111,36 @@ export class DurableEventFanout {
     });
   }
 
+  private async route(rows: Array<KarmaxEvent & { seq: number }>): Promise<void> {
+    if (!rows.length) return;
+    const routes = await this.store.taskEventRoutes(rows.map(row => row.taskId));
+    for (const event of rows) {
+      if (this.closed) break;
+      this.cursor = Math.max(this.cursor, event.seq);
+      const route = routes.get(event.taskId);
+      const routed = { event, projectId: route?.projectId, siblingAttempt: route?.siblingAttempt, bytes: Buffer.byteLength(JSON.stringify(event)) };
+      for (const subscriber of this.listeners) this.deliver(subscriber, routed);
+    }
+  }
+
   private async drain(): Promise<void> {
     if (this.draining || this.closed) return;
     this.draining = true;
     try {
+      for (const batch of this.gaps.pending()) {
+        if (this.closed) break;
+        const rows = await this.store.eventsAt(batch);
+        this.gaps.fill(rows.map(row => row.seq));
+        await this.route(rows);
+      }
       while (!this.closed) {
         // Consume the oldest page after the cursor. allEventsSince(..., limit)
         // intentionally returns the newest page for activity/history views; using
         // it here would skip the middle of bursts larger than one page.
         const rows = await this.store.nextEventsSince(this.cursor, 500);
         if (!rows.length) break;
-        const routes = await this.store.taskEventRoutes(rows.map(row => row.taskId));
-        for (const event of rows) {
-          if (this.closed) break;
-          this.cursor = Math.max(this.cursor, event.seq ?? 0);
-          const route = routes.get(event.taskId);
-          const routed = { event, projectId: route?.projectId, siblingAttempt: route?.siblingAttempt, bytes: Buffer.byteLength(JSON.stringify(event)) };
-          for (const subscriber of this.listeners) this.deliver(subscriber, routed);
-        }
+        this.gaps.note(this.cursor, rows.map(row => row.seq));
+        await this.route(rows);
         if (rows.length < 500) break;
         await yieldTurn();
       }

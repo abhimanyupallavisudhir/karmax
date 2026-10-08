@@ -1552,6 +1552,7 @@ export interface SyncResult {
 
 export interface ConnectorStore {
   transaction<T>(operation: () => Promise<T>): Promise<T>;
+  lock?(...keys: string[]): Promise<void>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
   findRepositoryBySshUrl?(organizationId: string, sshUrl: string): (Repository | undefined) | Promise<Repository | undefined>;
@@ -1601,8 +1602,15 @@ export class Connectors {
       return {};
     }
   }
+  /** Connector configs and the outbox are rewritten under the organization's
+   * vault lock (as are its items). */
+  private lockVault(): Promise<void> | undefined {
+    return this.store.lock?.(`vault:${this.organizationId}`);
+  }
+
   async setConfig(name: string, patch: Partial<ConnectorConfig>): Promise<ConnectorConfig> {
     return this.store.transaction(async () => {
+    await this.lockVault();
     const current = (await this.config(name));
     const next = { ...current, ...patch };
     (await this.store.kvSet(kvConfig(this.organizationId, name), JSON.stringify(next)));
@@ -1743,6 +1751,7 @@ export class Connectors {
       // record is what keeps an import from overwriting it.
       if (replacedGitPassStore)
         await this.store.transaction(async () => {
+          await this.lockVault();
           (await this.store.kvSet(
             kvConfig(this.organizationId, name),
             JSON.stringify({
@@ -1907,6 +1916,7 @@ export class Connectors {
   }
   private async saveWrite(write: PendingConnectorWrite, remove = false): Promise<void> {
     return this.store.transaction(async () => {
+    await this.lockVault();
     const current = (await this.pendingWrites());
     if (!current.some((entry) => entry.id === write.id)) return;
     if (
@@ -1937,6 +1947,7 @@ export class Connectors {
   }
   private async queueWrite(name: string, itemId: string, externalId: string, field?: VaultFieldName): Promise<PendingConnectorWrite> {
     return this.store.transaction(async () => {
+    await this.lockVault();
     const existing = (await this.pendingWrites()).find(
       (entry) => entry.connector === name && entry.itemId === itemId && entry.field === field,
     );
@@ -2063,6 +2074,7 @@ export class Connectors {
   }
   async discardWrites(name: string): Promise<number> {
     return this.store.transaction(async () => {
+    await this.lockVault();
     const pending = (await this.pendingWrites()).filter((write) => write.connector === name);
     for (const write of pending) (await this.saveWrite(write, true));
     let rotations = 0;
@@ -2083,6 +2095,7 @@ export class Connectors {
   private async retargetWrites(name: string): Promise<void> {
     if (name !== 'pass-git') return;
     return this.store.transaction(async () => {
+      await this.lockVault();
       const target = this.writeTarget(name);
       const writes = (await this.pendingWrites());
       if (writes.some((write) => write.connector === name && write.target !== target))

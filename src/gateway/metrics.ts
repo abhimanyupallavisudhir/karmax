@@ -1,4 +1,5 @@
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
+import { STORE_BOUNDS, storeMetricsSnapshot, type StoreMetricsSnapshot } from '../store/transaction-metrics.js';
 
 const BOUNDS = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 10];
 type Sample = { count: number; sum: number; errors: number; buckets: number[] };
@@ -36,7 +37,8 @@ export class GatewayMetrics {
     };
   }
 
-  prometheus(): string {
+  /** `worker` is the supervised activity child's latest Store snapshot. */
+  prometheus(worker?: StoreMetricsSnapshot): string {
     const seconds = (n: number) => Number.isFinite(n) ? n / 1e9 : 0;
     const lines = [
       '# TYPE karmax_http_inflight gauge', `karmax_http_inflight ${this.active}`,
@@ -57,6 +59,34 @@ export class GatewayMetrics {
         `karmax_http_request_duration_seconds_sum{route="${route}"} ${sample.sum}`,
         `karmax_http_errors_total{route="${route}"} ${sample.errors}`);
     }
+    lines.push(...storeLines({ gateway: storeMetricsSnapshot(), ...(worker ? { worker } : {}) }));
     return lines.join('\n') + '\n';
   }
+}
+
+const STORE_HISTOGRAMS = {
+  admission: 'karmax_store_transaction_admission_seconds',
+  globalLock: 'karmax_store_global_lock_wait_seconds',
+  entityLock: 'karmax_store_entity_lock_wait_seconds',
+  duration: 'karmax_store_transaction_seconds',
+} as const;
+
+/** Store transaction timings per process (`gateway`, `worker`). */
+function storeLines(processes: Record<string, StoreMetricsSnapshot>): string[] {
+  const lines: string[] = [];
+  for (const [timing, name] of Object.entries(STORE_HISTOGRAMS) as Array<[keyof typeof STORE_HISTOGRAMS, string]>) {
+    lines.push(`# TYPE ${name} histogram`);
+    for (const [process, snapshot] of Object.entries(processes)) {
+      const sample = snapshot.timings[timing];
+      for (let i = 0; i < STORE_BOUNDS.length; i++)
+        lines.push(`${name}_bucket{process="${process}",le="${STORE_BOUNDS[i]}"} ${sample.buckets[i]}`);
+      lines.push(`${name}_bucket{process="${process}",le="+Inf"} ${sample.count}`,
+        `${name}_count{process="${process}"} ${sample.count}`, `${name}_sum{process="${process}"} ${sample.sum}`);
+    }
+  }
+  lines.push('# TYPE karmax_store_transaction_failures_total counter');
+  for (const [process, snapshot] of Object.entries(processes))
+    for (const [reason, count] of Object.entries(snapshot.failures))
+      lines.push(`karmax_store_transaction_failures_total{process="${process}",reason="${reason}"} ${count}`);
+  return lines;
 }
