@@ -24,30 +24,9 @@ export interface ConversationPatch {
  * an acknowledged conversation snapshot. The turn's `messages` are the rest. */
 export interface TurnConversationBase { reference: string; role: string; count: number }
 
-function sharedPrefix(base: Message[], next: Message[]): number {
-  let keep = 0;
-  while (keep < base.length && keep < next.length && JSON.stringify(base[keep]) === JSON.stringify(next[keep])) keep++;
-  return keep;
-}
-
 export function transcriptOf(conversation: ViewConversation, role: string): Message[] {
   return role === 'do' ? conversation.messages
     : conversation.transcripts?.find((transcript) => transcript.role === role)?.messages ?? [];
-}
-
-function diffTranscript(base: Message[], next: Message[]): TranscriptPatch {
-  const keep = sharedPrefix(base, next);
-  return { keep, append: next.slice(keep) };
-}
-
-export function diffConversation(base: ViewConversation, next: ViewConversation, reference: string): ConversationPatch {
-  return {
-    base: reference,
-    messages: diffTranscript(base.messages, next.messages),
-    ...(next.transcripts ? { transcripts: next.transcripts.map(({ role, label, messages }) => messages === next.messages
-      ? { role, label, sameAsMessages: true as const }
-      : { role, label, ...diffTranscript(transcriptOf(base, role), messages) }) } : {}),
-  };
 }
 
 export function applyConversationPatch(base: ViewConversation, patch: ConversationPatch): ViewConversation {
@@ -95,17 +74,78 @@ export type ConversationPublisher = ((view: TaskView) => Promise<void>) & {
   seed(reference: string, conversation: ViewConversation): void;
 };
 
+/** A message's identity for change detection: the length of its JSON and two
+ * independent 32-bit hashes of it (FNV-1a and a Murmur-style mix). Deciding
+ * which messages a snapshot already has needs only this, so a publisher keeps
+ * these instead of a copy of the conversation (RT-35). Treating a changed
+ * message as unchanged takes a 64-bit collision between two versions of the
+ * message at the same position, and would only stale that task's own view. */
+function fingerprint(message: Message): string {
+  const json = JSON.stringify(message);
+  let a = 0x811c9dc5, b = 0x9747b28c;
+  for (let i = 0; i < json.length; i++) {
+    const c = json.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193);
+    b = Math.imul(b ^ c, 0x5bd1e995);
+    b ^= b >>> 15;
+  }
+  return `${json.length.toString(36)}.${(a >>> 0).toString(36)}.${(b >>> 0).toString(36)}`;
+}
+
+/** The fingerprints of a conversation, shaped like it. */
+interface ConversationPrint {
+  messages: string[];
+  transcripts?: { role: string; label: string; messages: string[] }[];
+}
+
+function printOf({ messages, transcripts }: ViewConversation): ConversationPrint {
+  const prints = messages.map(fingerprint);
+  return { messages: prints, ...(transcripts ? { transcripts: transcripts.map(({ role, label, messages: own }) =>
+    ({ role, label, messages: own === messages ? prints : own.map(fingerprint) })) } : {}) };
+}
+
+function printedTranscript(print: ConversationPrint, role: string): string[] {
+  return role === 'do' ? print.messages : print.transcripts?.find((transcript) => transcript.role === role)?.messages ?? [];
+}
+
+function printedPrefix(base: string[], next: string[]): number {
+  let keep = 0;
+  while (keep < base.length && keep < next.length && base[keep] === next[keep]) keep++;
+  return keep;
+}
+
+/** How `next` extends the base snapshot, from the base's fingerprints: per
+ * transcript, the shared prefix to keep and the messages to append. */
+function diffPrinted(base: ConversationPrint, print: ConversationPrint, next: ViewConversation, reference: string): ConversationPatch {
+  const patch = (from: string[], to: string[], messages: Message[]): TranscriptPatch => {
+    const keep = printedPrefix(from, to);
+    return { keep, append: messages.slice(keep) };
+  };
+  return {
+    base: reference,
+    messages: patch(base.messages, print.messages, next.messages),
+    ...(next.transcripts ? { transcripts: next.transcripts.map(({ role, label, messages }, index) => messages === next.messages
+      ? { role, label, sameAsMessages: true as const }
+      : { role, label, ...patch(printedTranscript(base, role), print.transcripts![index]!.messages, messages) }) } : {}),
+  };
+}
+
 /** Keep immutable conversations out of repeated status activity arguments.
  * References are scoped to a workflow run and never depend on the mutable UI
  * projection. Replays rebuild this cache; only acknowledged writes are reused.
  * With `patches`, a changed conversation is written as a delta against the
- * previous snapshot; it is consulted only when a delta would be written. */
+ * previous snapshot; it is consulted only when a delta would be written.
+ *
+ * It remembers the last snapshot only as fingerprints: workflows stay cached
+ * for weeks in the worker's workflow heap, and a copy of every conversation
+ * there was what exhausted it (RT-35). The patches it writes are the ones a
+ * copy would produce, so replay schedules the same activities. */
 export function conversationPublisher(
   runId: string,
   write: (view: PublishedView, reference: string) => Promise<unknown>,
   options: { patches?: () => boolean } = {},
 ): ConversationPublisher {
-  let previous: { json: string; reference: string; conversation: ViewConversation } | undefined;
+  let previous: { key: string; reference: string; print: ConversationPrint } | undefined;
   let revision = 0;
   // What the run may still read, so the store never drops it: each write in
   // flight and its delta base, each role's current turn base, and, once deltas
@@ -116,10 +156,10 @@ export function conversationPublisher(
   let writes = 0;
   const publish = async (view: TaskView) => {
     const { messages, transcripts, ...status } = view;
-    const json = JSON.stringify({ messages, transcripts });
-    const cached = previous?.json === json ? previous : undefined;
+    const print = printOf({ messages, transcripts });
+    const key = JSON.stringify(print);
+    const cached = previous?.key === key ? previous : undefined;
     const reference = cached?.reference ?? `${runId}:${revision++}`;
-    const conversation: ViewConversation = JSON.parse(json);
     const delta = !cached && previous && options.patches?.();
     if (delta) deltas = true;
     const id = writes++;
@@ -128,14 +168,16 @@ export function conversationPublisher(
       ...[...inFlight.values()].flat(), ...turnBases.values()])].filter((held) => held !== reference);
     try {
       await write({ ...(cached ? status
-        : delta ? { ...status, conversationPatch: diffConversation(previous!.conversation, { messages, transcripts }, previous!.reference) }
-          : { ...status, ...conversation }), conversationRetain }, reference);
+        : delta ? { ...status, conversationPatch: diffPrinted(previous!.print, print, { messages, transcripts }, previous!.reference) }
+          // A full write still serializes once at the activity boundary, so
+          // later in-place edits of `messages` cannot reach a pending write.
+          : { ...status, ...JSON.parse(JSON.stringify({ messages, transcripts })) as ViewConversation }), conversationRetain }, reference);
     } finally { inFlight.delete(id); }
-    previous = { json, reference, conversation };
+    previous = { key, reference, print };
   };
   return Object.assign(publish, {
     turnBase(messages: Message[], role: string) {
-      const count = previous ? sharedPrefix(transcriptOf(previous.conversation, role), messages) : 0;
+      const count = previous ? printedPrefix(printedTranscript(previous.print, role), messages.map(fingerprint)) : 0;
       // A role runs one turn at a time: its next turn releases this base.
       if (count && previous) turnBases.set(role, previous.reference);
       else turnBases.delete(role);
@@ -143,12 +185,12 @@ export function conversationPublisher(
         ? { base: { reference: previous.reference, role, count }, messages: messages.slice(count) }
         : { messages };
     },
-    acknowledges({ messages, transcripts }: ViewConversation) {
-      return previous?.json === JSON.stringify({ messages, transcripts }) ? previous.reference : undefined;
+    acknowledges(conversation: ViewConversation) {
+      return previous?.key === JSON.stringify(printOf(conversation)) ? previous.reference : undefined;
     },
-    seed(reference: string, { messages, transcripts }: ViewConversation) {
-      const json = JSON.stringify({ messages, transcripts });
-      previous = { json, reference, conversation: JSON.parse(json) };
+    seed(reference: string, conversation: ViewConversation) {
+      const print = printOf(conversation);
+      previous = { key: JSON.stringify(print), reference, print };
       deltas = true;
     },
   });

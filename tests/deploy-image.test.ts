@@ -79,3 +79,20 @@ describe('base images (CI-27)', () => {
     for (const file of dockerfiles) expect(docker, file).toContain(`/${path.posix.dirname(file)}`);
   });
 });
+
+// RT-35: V8 sizes a heap from the host's memory, so the gateway's limit must
+// come from the container's budget, and it can only be set as Node starts.
+describe('control-plane process memory', () => {
+  it('starts the gateway with the heap limit its memory budget allows', () => {
+    const cmd = read('deploy/Dockerfile').split('\n').find((line) => line.startsWith('CMD '))!;
+    const argv = JSON.parse(cmd.slice(4)) as string[];
+    expect(argv.slice(0, 2)).toEqual(['sh', '-c']);
+    const script = argv[2]!;
+    expect(script).toContain('src/runtime/memory-budget.ts gateway');
+    expect(script).toMatch(/exec node --max-old-space-size="\$heap" --import tsx src\/main\.ts$/);
+    // The budget itself answers from this checkout.
+    const heap = execFileSync(process.execPath, ['--import', 'tsx', 'src/runtime/memory-budget.ts', 'gateway'],
+      { cwd: repoRoot, encoding: 'utf8', env: { ...process.env, KARMAX_WORKER_MODE: 'process', KARMAX_MEMORY_LIMIT_MB: '4096' } });
+    expect(heap.trim()).toBe('614');
+  });
+});

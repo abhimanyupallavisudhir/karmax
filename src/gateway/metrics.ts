@@ -1,4 +1,12 @@
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
+import { heapNow, type WorkerHeap } from '../temporal/worker-process.js';
+
+/** The worker's heaps (`WorkerProcessManager.heap` / `WorkerManager.heap`),
+ * and whether it is a separate child process rather than this one. */
+export type MemorySource = () => { heap?: WorkerHeap; separate: boolean };
+
+/** A child report older than a few heartbeats is unknown, not current. */
+const STALE_MS = 60_000;
 
 const BOUNDS = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 10];
 type Sample = { count: number; sum: number; errors: number; buckets: number[] };
@@ -9,7 +17,7 @@ export class GatewayMetrics {
   private readonly delay = monitorEventLoopDelay({ resolution: 20 });
   private readonly requests = new Map<string, Sample>();
   private active = 0;
-  constructor() { this.delay.enable(); }
+  constructor(private readonly memory: MemorySource = () => ({ separate: false })) { this.delay.enable(); }
   close(): void { this.delay.disable(); }
 
   begin(url: string): (status: number) => void {
@@ -40,7 +48,7 @@ export class GatewayMetrics {
     const seconds = (n: number) => Number.isFinite(n) ? n / 1e9 : 0;
     const lines = [
       '# TYPE karmax_http_inflight gauge', `karmax_http_inflight ${this.active}`,
-      '# TYPE karmax_process_rss_bytes gauge', `karmax_process_rss_bytes ${process.memoryUsage().rss}`,
+      ...this.memoryLines(),
       '# TYPE karmax_event_loop_delay_seconds gauge',
       `karmax_event_loop_delay_seconds{quantile="0.95"} ${seconds(this.delay.percentile(95))}`,
       `karmax_event_loop_delay_seconds{quantile="0.99"} ${seconds(this.delay.percentile(99))}`,
@@ -58,5 +66,28 @@ export class GatewayMetrics {
         `karmax_http_errors_total{route="${route}"} ${sample.errors}`);
     }
     return lines.join('\n') + '\n';
+  }
+
+  /** Heap used/limit per V8 heap (RT-35): what operator alerts compare.
+   * `workflows` is the worker's workflow thread, an isolate with its own limit
+   * that holds every cached workflow; `worker` is the worker child's main heap. */
+  private memoryLines(): string[] {
+    const { heap: reported, separate } = this.memory();
+    const worker = reported && Date.now() - reported.at < STALE_MS ? reported : undefined;
+    const gateway = heapNow();
+    const heaps: [string, { usedBytes: number; limitBytes: number }][] = [['gateway', gateway],
+      ...(separate && worker ? [['worker', worker] as [string, WorkerHeap]] : []),
+      ...(worker?.workflows ? [['workflows', worker.workflows] as [string, WorkerHeap]] : [])];
+    const processes: [string, number | undefined][] = [['gateway', gateway.rssBytes], ...(separate && worker ? [['worker', worker.rssBytes] as [string, number | undefined]] : [])];
+    const cache = worker?.workflowCache;
+    return [
+      '# TYPE karmax_heap_used_bytes gauge', ...heaps.map(([name, h]) => `karmax_heap_used_bytes{heap="${name}"} ${h.usedBytes}`),
+      '# TYPE karmax_heap_limit_bytes gauge', ...heaps.map(([name, h]) => `karmax_heap_limit_bytes{heap="${name}"} ${h.limitBytes}`),
+      '# TYPE karmax_process_rss_bytes gauge', ...processes.filter(([, rss]) => rss !== undefined)
+        .map(([name, rss]) => `karmax_process_rss_bytes{process="${name}"} ${rss}`),
+      ...(cache ? ['# TYPE karmax_workflow_cache_workflows gauge', `karmax_workflow_cache_workflows ${cache.cached}`,
+        '# TYPE karmax_workflow_cache_limit gauge', `karmax_workflow_cache_limit ${cache.limit}`,
+        '# TYPE karmax_workflow_cache_shrinks_total counter', `karmax_workflow_cache_shrinks_total ${cache.shrinks}`] : []),
+    ];
   }
 }
