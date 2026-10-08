@@ -97,6 +97,30 @@ const PUBLIC_TASK_SIGNALS = new Set<string>([SIG.followUp, SIG.confirm, SIG.open
  * wired, triggered tasks are simply held as armed rows and picked up on the next
  * boot's re-arm (the store is the durable source of truth).
  */
+/** Who a task may ask for input (`GET /api/agent/escalation-targets`). */
+export interface EscalationTargets {
+  taskId: string;
+  users: Array<{ id: string; selector: string; name?: string }>;
+  teams: Array<{ id: string; name: string; slug: string; selector: string }>;
+  special: Array<{ selector: string; description: string }>;
+  avatars: Array<{ id: string; name: string; purpose?: string; selector: string; roles: string[] }>;
+}
+
+/** The refusal for an ask that names nobody: what the tool is for, the
+ * alternative, and every selector the agent may use. */
+export function unnamedAudienceError(targets: EscalationTargets, subTask: boolean): string {
+  const choices = [
+    ...targets.users.map((user) => `${user.selector}${user.name ? ` (${user.name})` : ''}`),
+    ...targets.teams.map((team) => `${team.selector} (${team.name})`),
+    ...targets.special.map((option) => `${option.selector} (${option.description.replace(/\.$/, '')})`),
+    ...targets.avatars.map((avatar) => `${avatar.selector} (Avatar ${avatar.name})`),
+  ];
+  return 'Name who to ask (audience). escalate_to_human is for input only a person can give — an approval, a secret, '
+    + 'an action in the real world, a personal decision. For anything else, end your turn with the question; '
+    + `it goes to ${subTask ? 'your parent task' : "whoever answers this task's questions"}.`
+    + `\nYou can ask: ${choices.join('; ') || 'nobody — this task has no people to ask'}`;
+}
+
 export interface TriggerArmer {
   arm(task: TaskRecord): unknown;
   disarm(taskId: string): void;
@@ -603,6 +627,21 @@ export class KarmaxApi {
     if (!settled) return (await this.deps.store.getCollaborationRequest(request.id)) ?? request;
     await this.notifyCollaborationRequest(settled);
     return (await this.deps.store.getCollaborationRequest(request.id)) ?? settled;
+  }
+
+  /** A sub-task asking people tells its parent so, in the parent's conversation.
+   * Addressed to those people, it does not call the parent's agent, which reads
+   * it on its next turn. Before shared conversations any message called it, so
+   * such a parent is not told. */
+  private async noteInParent(task: TaskRecord, audience: string[], detail: string): Promise<void> {
+    const parent = (await this.deps.store.getTask(task.parentTaskId!));
+    if (!parent || !this.sharedConversation(parent)) return;
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${task.id}`,
+      authorLabel: `Task #${task.num ?? task.id}`, to: audience, text: detail, ts: Date.now() };
+    try {
+      await (await this.workflowHandle(parent.id)).signal(SIG.followUp, message);
+      (await this.publishConversationMessage(parent.id, MAIN_AGENT, message));
+    } catch { /* the parent is gone: nobody is left to tell */ }
   }
 
   private async deliverWorkflowMessage(taskId: string, text: string, role = 'do'): Promise<Message> {
@@ -3652,7 +3691,8 @@ export class KarmaxApi {
     // it asks them in the conversation, and their reply calls it back.
     if (task && caller.taskId === taskId && caller.participant && caller.participant !== MAIN_AGENT && this.sharedConversation(task)
       && task.lastView?.waitingFor?.kind !== 'responder') {
-      const audience = args.audience?.length ? args.audience : ['@creator'];
+      if (!args.audience?.length) throw new ValidationError(unnamedAudienceError(await this.escalationTargets(task), !!task.parentTaskId));
+      const audience = args.audience;
       const posted = await this.postTaskMessage(token, taskId, { text: args.message, to: audience,
         ...(args.urgency ? { urgency: args.urgency } : {}) });
       return { ...(task.lastView as TaskView), asked: posted.notified,
@@ -3674,13 +3714,11 @@ export class KarmaxApi {
     if (!redirect && !(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
-    let audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
-    // Without an audience, ask whoever answers this task's questions: its human
-    // Responder route, else the person the task works for.
-    if (!audience.length) {
-      const route = task.params?.responder as { kind?: string; audience?: string[] } | undefined;
-      audience = route?.kind === 'human' && route.audience?.length ? [...route.audience] : ['@creator'];
-    }
+    const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
+    // An ask a person must answer names them. A default here once sent a
+    // sub-task's question past its parent to the top of its creator chain (#533);
+    // what an agent can answer goes to the task's ordinary route instead.
+    if (!audience.length) throw new ValidationError(unnamedAudienceError(await this.escalationTargets(task), !!task.parentTaskId));
     if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
     const avatarRecipients: import('../domain/types.js').Avatar[] = [];
     const initiatingUserId = (await this.deps.store.taskCreatorUserId(task.id));
@@ -3724,6 +3762,7 @@ export class KarmaxApi {
     };
     const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
+    if (task.parentTaskId && caller.taskId === taskId) await this.noteInParent(task, audience, detail);
     for (const avatar of avatarRecipients) {
       try {
         await this.createTask(token, {
@@ -4454,23 +4493,24 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   /** Discover only the people and teams that can receive an escalation for the
    * calling task. Kept behind the same narrow capability so Merge/Confirm and
    * custom roles do not need broad organization-directory access. */
-  async humanEscalationTargets(token: string): Promise<{
-    taskId: string;
-    users: Array<{ id: string; selector: string }>;
-    teams: Array<{ id: string; name: string; slug: string; selector: string }>;
-    special: Array<{ selector: string; description: string }>;
-    avatars: Array<{ id: string; name: string; purpose?: string; selector: string; roles: string[] }>;
-  }> {
+  async humanEscalationTargets(token: string): Promise<EscalationTargets> {
     const caller = (await this.require(token, 'escalate_to_human'));
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
     const task = (await this.deps.store.getTask(caller.taskId));
     (await this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId: caller.taskId }));
     if (!task) throw new Error(`no task ${caller.taskId}`);
+    return this.escalationTargets(task);
+  }
+
+  private async escalationTargets(task: TaskRecord): Promise<EscalationTargets> {
     const project = (await this.deps.store.getProject(task.projectId));
     if (!project?.organizationId) throw new Error('task project has no organization');
 
     const projectUsers = (await this.deps.store.humanAudience(task.id, ['@project']));
-    const users = projectUsers.map((id) => ({ id, selector: `user:${id}` }));
+    const users = (await __asyncCollections.map(projectUsers, async (id) => {
+      const name = (await this.deps.store.userDisplayName(id));
+      return { id, selector: `user:${id}`, ...(name ? { name } : {}) };
+    }));
     const teams = (await __asyncCollections.filter((await this.deps.store.listTeams(project.organizationId, project.id)), async (team) => (await this.deps.store.listTeamMemberships(team.id))
         .some((member) => projectUsers.includes(member.userId))))
       .map((team) => ({ id: team.id, name: team.name, slug: team.slug, selector: `@team:${team.slug}` }));

@@ -197,7 +197,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'pause',
     description:
       'End your turn to wait for durable jobs or a real-world event (CI, a deploy, a set time), and be resumed when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. ' +
-      'It is not for asking: if you need an answer to continue, call escalate_to_human or end your turn with the question. Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. After calling it, end your turn.',
+      'It is not for asking: if you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give). Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. After calling it, end your turn.',
     parameters: {
       type: 'object',
       properties: {
@@ -757,19 +757,20 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'escalate_to_human',
     description:
-      'Pause your current task at its exact stage and ask selected people, teams, or Avatars for input. ' +
+      'Ask named people, teams, or Avatars for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
+      'For anything an agent could answer, end your turn with the question instead; it goes to your task\'s usual input route (a sub-task\'s parent, else its Responder). ' +
+      'This pauses your task at its exact stage and ends your turn. A reply resumes you, and the answer or question you end that turn with reaches them too. ' +
       'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
-      'Discover valid choices with platform_request(GET, "/api/agent/escalation-targets"). ' +
-      'Calling this stops your current turn; the task resumes when a selected principal responds.',
+      'Discover valid choices with platform_request(GET, "/api/agent/escalation-targets").',
     parameters: {
       type: 'object',
       properties: {
         audience: {
           type: 'array',
           items: { type: 'string' },
-          minItems: 1,
           maxItems: 32,
-          description: 'One or more person/team/Avatar routing selectors; any selected principal may respond. Default: the task\'s Responder (people), else its creator.',
+          // Required, but checked by the platform, whose refusal lists who can be asked.
+          description: 'Required. Who to ask: person/team/Avatar selectors; any of them may answer.',
         },
         message: {
           type: 'string',
