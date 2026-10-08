@@ -8,7 +8,8 @@ name: Rehearse upgrade
 # with the mock agent and a local E2B stand-in. Dispatch it with `to` set to
 # the branch to upgrade to (GitHub dispatches only workflows on the default
 # branch); a push to a task branch that changes deploy/ (the data epoch, the
-# updater, Compose, the image) or the rehearsal itself rehearses that branch
+# updater, Compose, the image), the Store's schema and boot migrations (work a
+# release's first boot does) or the rehearsal itself rehearses that branch
 # from master on its own. The summary
 # is the run's job summary, and the summary, the full output and every step's
 # logs are the `rehearsal` artifact.
@@ -19,6 +20,14 @@ on:
       # The data epoch, and everything else the updater, Compose and the
       # image are made of: a change to how the stack upgrades.
       - deploy/**
+      # Schema and migrations a release runs on its first boot: tables,
+      # columns, functions and defaults (store/db.ts migrate*), their
+      # PostgreSQL translation, the SQLite → PostgreSQL import and the
+      # vault's move into the database.
+      - src/store/db.ts
+      - src/store/postgres-sql.mjs
+      - src/store/postgres-migration.ts
+      - src/autonomy/vault-backend.ts
       - scripts/rehearse-upgrade.sh
       - scripts/rehearsal/**
       - .github/workflows/rehearse.yml

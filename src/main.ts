@@ -368,6 +368,7 @@ async function main() {
   const remoteAccess = new RemoteAccessController({ port: () => gatewayPort });
   const gateway = (await Gateway.create({
     runtimeReady: () => startupReady && !workerManager.failure,
+    workerStoreMetrics: () => workerManager instanceof WorkerProcessManager ? workerManager.storeMetrics : undefined,
     memory: () => ({ heap: workerManager.heap, separate: workerManager instanceof WorkerProcessManager }),
     api,
     store,

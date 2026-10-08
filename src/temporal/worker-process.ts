@@ -1,6 +1,7 @@
 import { fork, type ChildProcess } from 'node:child_process';
 import v8 from 'node:v8';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
+import type { StoreMetricsSnapshot } from '../store/transaction-metrics.js';
 import type { WorkflowCacheStatus } from '../runtime/memory-budget.js';
 
 export interface WorkerProcessRequest {
@@ -9,6 +10,8 @@ export interface WorkerProcessRequest {
 }
 export interface WorkerProcessReply {
   type: 'worker.reply'; id: number; ok: boolean; error?: string;
+  /** A ping's reply carries the child's Store transaction timings. */
+  store?: StoreMetricsSnapshot;
   /** On a ping: the worker's heaps, for metrics and the service-limits page. */
   heap?: WorkerHeap;
 }
@@ -63,6 +66,8 @@ export class WorkerProcessManager {
   private externals: ExternalWorkflowRef[] = [];
   private pending = new Map<number, { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   failure?: Error;
+  /** The child's Store timings as of its last answered liveness ping. */
+  storeMetrics?: StoreMetricsSnapshot;
   /** The child's heap as of its last heartbeat. */
   heap?: WorkerHeap;
 
@@ -158,6 +163,7 @@ export class WorkerProcessManager {
         if (!request) return;
         this.pending.delete(reply.id);
         clearTimeout(request.timer);
+        if (reply.store && typeof reply.store === 'object') this.storeMetrics = reply.store;
         if (reply.ok) request.resolve();
         else request.reject(new Error(typeof reply.error === 'string' ? reply.error.slice(0, 2_000) : 'worker request failed'));
       });

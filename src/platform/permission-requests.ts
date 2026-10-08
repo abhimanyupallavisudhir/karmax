@@ -64,7 +64,21 @@ export function exactCapability(raw: string): Capability {
  * axes of the next turn's scoped token. Nothing mutates a human/profile grant.
  */
 export class PermissionRequests {
-  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'kvDelete' | 'kvEntries' | 'appendAudit'>, private organizationId: string) {}
+  constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'kvDelete' | 'kvEntries' | 'appendAudit'> & Partial<Pick<Store, 'lock'>>,
+    private organizationId: string) {}
+
+  /** A task's requests (and the grants they add) change under one lock. */
+  private async lockTaskRequests(taskId: string): Promise<void> {
+    await this.store.lock?.(`permission-requests:${this.organizationId}:${taskId}`, `kv:${extensionsKey(taskId)}`);
+  }
+
+  /** A request read under its task's lock. */
+  private async lockedRequest(requestId: string): Promise<PermissionRequest | undefined> {
+    const request = await this.find(requestId);
+    if (!request || !this.store.lock) return request;
+    await this.lockTaskRequests(request.taskId);
+    return this.find(requestId);
+  }
 
   /**
    * Claim the right to decide a request. Approving can widen the task's scope
@@ -75,6 +89,7 @@ export class PermissionRequests {
    */
   async claim(requestId: string): Promise<string | undefined> {
     return this.store.transaction(async () => {
+      await this.store.lock?.(`kv:${claimKey(requestId)}`);
       if (await this.liveClaim(requestId)) return undefined;
       const claim = newId('pclaim');
       (await this.store.kvSet(claimKey(requestId), JSON.stringify({ claim, at: Date.now() })));
@@ -85,6 +100,7 @@ export class PermissionRequests {
   /** Give up a claim (a decision that failed). Only the holder's claim is removed. */
   async release(requestId: string, claim: string): Promise<void> {
     return this.store.transaction(async () => {
+      await this.store.lock?.(`kv:${claimKey(requestId)}`);
       if ((await this.liveClaim(requestId)) === claim) (await this.store.kvDelete(claimKey(requestId)));
     });
   }
@@ -119,6 +135,7 @@ export class PermissionRequests {
   private async migrate(): Promise<void> {
     if ((await this.store.kvGet(legacyRequestsKey(this.organizationId))) === undefined) return;
     return this.store.transaction(async () => {
+      await this.store.lock?.(`kv:${legacyRequestsKey(this.organizationId)}`);
       const raw = (await this.store.kvGet(legacyRequestsKey(this.organizationId)));
       if (raw === undefined) return;
       let legacy: unknown;
@@ -161,6 +178,8 @@ export class PermissionRequests {
     requestedBy: string;
   }): Promise<PermissionRequest> {
     return this.store.transaction(async () => {
+    // One pending request per identical ask.
+    (await this.lockTaskRequests(input.taskId));
     const capabilities = [...new Set(input.capabilities.map(exactCapability))];
     const projectIds = [...new Set((input.projectIds ?? []).map(String))];
     if (!capabilities.length && !projectIds.length) throw new Error('choose at least one capability or project');
@@ -212,7 +231,7 @@ export class PermissionRequests {
 
   async resolve(requestId: string, input: { action: 'approve' | 'deny'; by: string; alreadyAuthorized?: boolean; claim?: string }): Promise<PermissionRequest> {
     return this.store.transaction(async () => {
-    const request = (await this.find(requestId));
+    const request = (await this.lockedRequest(requestId));
     if (!request) throw new Error(`no permission request ${requestId}`);
     if (request.status !== 'pending') throw new Error(`request ${requestId} is already ${request.status}`);
     (await this.assertUnclaimed(requestId, input.claim));
@@ -243,7 +262,7 @@ export class PermissionRequests {
 
   async dismiss(id: string, by: string, claim?: string): Promise<PermissionRequest> {
     return this.store.transaction(async () => {
-    const request = (await this.find(id));
+    const request = (await this.lockedRequest(id));
     if (!request) throw new Error(`no permission request ${id}`);
     if (request.status !== 'pending') throw new Error(`request ${id} is already ${request.status}`);
     (await this.assertUnclaimed(id, claim));
@@ -260,6 +279,7 @@ export class PermissionRequests {
    * could no longer reach its agent. Returns the requests it withdrew. */
   async withdrawForTask(taskId: string, reason: string): Promise<PermissionRequest[]> {
     return this.store.transaction(async () => {
+      (await this.lockTaskRequests(taskId));
       const withdrawn: PermissionRequest[] = [];
       for (const request of (await this.requests({ taskId, status: 'pending' }))) {
         request.status = 'withdrawn';

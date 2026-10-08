@@ -114,6 +114,8 @@ import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
 export interface GatewayDeps {
   /** Primary startup/recovery and worker liveness, independent of DB health. */
   runtimeReady?: () => boolean;
+  /** The separate activity process's Store transaction timings, if any. */
+  workerStoreMetrics?: () => import('../store/transaction-metrics.js').StoreMetricsSnapshot | undefined;
   /** The worker's memory for /api/metrics (RT-35): its child's last report,
    * or the in-process worker's workflow heap and cache. */
   memory?: MemorySource;
@@ -3560,7 +3562,7 @@ export class Gateway {
       }
       if (p === '/api/metrics' && method === 'GET') {
         const pool = store.asyncReadStats;
-        const value = prometheusMetrics((await store.operationalSnapshot())) + (this.operationalMetrics?.prometheus() ?? '')
+        const value = prometheusMetrics((await store.operationalSnapshot())) + (this.operationalMetrics?.prometheus(this.deps.workerStoreMetrics?.()) ?? '')
           + `# TYPE karmax_database_pending gauge\nkarmax_database_pending ${pool.pending}\n`
           + `# TYPE karmax_database_connections gauge\nkarmax_database_connections ${pool.connections}\n`
           + `# TYPE karmax_database_waiting gauge\nkarmax_database_waiting ${pool.waiting}\n`;
@@ -7252,6 +7254,8 @@ export class Gateway {
                   const started = await this.passkeys.begin(async () => page, { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner, reserved: true,
                     onCredentials: async updated => {
                       await store.transaction(async () => {
+                        // The sign counter only grows: rewrite it under the vault lock.
+                        await store.lock(`vault:${organizationId}`);
                         const current = await vault.get(item.id);
                         if (!current || current.type !== 'passkey') return;
                         const secret = await vault.readSecret(current, 'passkey');
@@ -9049,8 +9053,9 @@ export class Gateway {
   private async withDeletionFence<T>(projectIds: string[], organizationId: string | undefined, work: (projectIds: string[]) => Promise<T>): Promise<T> {
     const store = this.deps.store;
     const value = JSON.stringify({ id: crypto.randomUUID(), kind: 'delete', expiresAt: Number.MAX_SAFE_INTEGER });
-    const keys: string[] = [];
-    await store.transaction(async () => {
+    const keys = await store.transaction(async () => {
+      // Built per attempt: a re-run transaction starts over.
+      const keys: string[] = [];
       if (organizationId) {
         if (store.db.dialect === 'postgres') await store.db.prepare('SELECT id FROM organizations WHERE id=? FOR UPDATE').get(organizationId);
         projectIds = (await store.listProjects()).filter(p => p.organizationId === organizationId).map(p => p.id);
@@ -9064,6 +9069,7 @@ export class Gateway {
           throw new ProjectTransferError('A project move is in progress. Retry deletion when it finishes.');
       }
       for (const key of keys) await store.kvSet(key, value);
+      return keys;
     });
     try { return await work(projectIds); }
     finally { for (const key of keys) await store.db.prepare('DELETE FROM kv WHERE k=? AND v=?').run(key, value); }

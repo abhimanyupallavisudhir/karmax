@@ -79,6 +79,7 @@ export interface GitIdentity {
 
 export interface GitProfileStore {
   transaction<T>(operation: () => Promise<T>): Promise<T>;
+  lock?(...keys: string[]): Promise<void>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
 }
@@ -95,6 +96,13 @@ export class GitProfiles {
     private home = paths().state,
     private organizationId = 'org_personal',
   ) {}
+
+  /** A scope's profile list and default are rewritten under its vault lock; a
+   * user's, also under their account lock, which account closure takes. */
+  private lockProfiles(): Promise<void> | undefined {
+    const userId = userIdOfScope(this.organizationId);
+    return this.store.lock?.(...(userId ? [`account:${userId}`] : []), `vault:${this.organizationId}`);
+  }
 
   async list(): Promise<GitProfile[]> {
     const raw = (await this.store.kvGet(this.profilesKey()))
@@ -127,6 +135,7 @@ export class GitProfiles {
 
   async setDefault(name: string | undefined) {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     if (name && !(await this.get(name))) throw new Error(`unknown git profile "${name}" in ${this.scopeLabel()}`);
     (await this.store.kvSet(this.defaultKey(), name ?? ''));
 
@@ -138,6 +147,7 @@ export class GitProfiles {
    * so there is one rotation/revocation authority rather than a stale copy. */
   async reuseUserProfile(userProfiles: GitProfiles): Promise<GitProfile> {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     if (userIdOfScope(this.organizationId)) throw new Error('a user profile cannot reuse another user profile');
     if ((await this.list()).length || (await this.defaultProfile())) throw new Error('organization Git is already configured');
     const userId = userIdOfScope(userProfiles.organizationId);
@@ -171,6 +181,7 @@ export class GitProfiles {
     githubToken?: string; github?: { id: string; login: string; name?: string };
     customIdentity?: { userName?: string; userEmail?: string }; clearSigningKey?: boolean }): Promise<GitProfile> {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     const userId = userIdOfScope(this.organizationId);
     if (userId && await this.store.kvGet(`account-closed:${userId}`)) throw new Error('account is closed');
     const name = args.name.trim();
@@ -212,6 +223,7 @@ export class GitProfiles {
    * App's refreshable user grant rather than this profile. */
   async saveGithubIdentity(identity: { id: string | number; login: string; name?: string | null }): Promise<GitProfile> {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     const id = String(identity.id).trim();
     const login = identity.login.trim();
     if (!/^\d+$/.test(id) || !/^[A-Za-z0-9-]+$/.test(login))
@@ -237,6 +249,7 @@ export class GitProfiles {
 
   async setActiveGithub(accountId: string): Promise<GitProfile> {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     const profile = (await this.githubProfile(accountId));
     if (!profile) throw new Error('GitHub account identity is not configured');
     (await this.setDefault(profile.name));
@@ -248,6 +261,7 @@ export class GitProfiles {
   async saveGithubCustomIdentity(accountId: string, args: { userName?: string; userEmail?: string;
     signingKey?: string; removeSigningKey?: boolean }): Promise<GitProfile> {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     const profile = (await this.githubProfile(accountId));
     if (!profile?.github) throw new Error('Connect GitHub before customizing its identity');
     const customIdentity = {
@@ -270,6 +284,7 @@ export class GitProfiles {
   /** Compatibility for callers from the single-account UI/API. */
   async saveGithubSigningKey(signingKey: string): Promise<GitProfile> {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     const profile = (await this.resolve(undefined));
     if (!profile?.github) throw new Error('Connect GitHub before adding a signing key');
     return (await this.saveGithubCustomIdentity(profile.github.id, { signingKey }));
@@ -279,6 +294,7 @@ export class GitProfiles {
 
   async deleteGithubIdentity(accountId: string): Promise<void> {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     const profile = (await this.githubProfile(accountId));
     if (profile) (await this.delete(profile.name));
 
@@ -292,6 +308,7 @@ export class GitProfiles {
   async saveAutomationIdentity(args: { userName?: string; userEmail?: string; signingKey?: string;
     removeSigningKey?: boolean }): Promise<GitProfile | undefined> {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     const customIdentity = {
       ...(args.userName?.trim() ? { userName: args.userName.trim() } : {}),
       ...(args.userEmail?.trim() ? { userEmail: args.userEmail.trim() } : {}),
@@ -312,6 +329,7 @@ export class GitProfiles {
 
   async delete(name: string) {
     return this.store.transaction(async () => {
+    await this.lockProfiles();
     const profile = (await this.get(name));
     (await this.store.kvSet(this.profilesKey(), JSON.stringify((await this.list()).filter((p) => p.name !== name))));
     if ((await this.defaultProfile()) === name) (await this.setDefault(undefined));

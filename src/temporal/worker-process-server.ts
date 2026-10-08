@@ -3,6 +3,7 @@ import { Worker as Guardian } from 'node:worker_threads';
 import type { WorkerManager } from './worker-pool.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
 import { heapNow, type WorkerHeap, type WorkerProcessRequest, type WorkerProcessReply, type WorkerProcessNotice } from './worker-process.js';
+import { storeMetricsSnapshot } from '../store/transaction-metrics.js';
 
 export interface WorkerProcessRuntime {
   worker: Pick<WorkerManager, 'start' | 'refresh' | 'stop'> & { status?(): Pick<WorkerHeap, 'workflows' | 'workflowCache'> };
@@ -101,7 +102,8 @@ export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, 
     const id = request.id!;
     if (closing || (pending >= 16 && request.action !== 'stop')) { void reply(id, false, 'worker is not accepting commands'); return; }
     if (request.action === 'ping') {
-      void reply(id, !!runtime, runtime ? undefined : 'worker is not started', { heap: heapNow(runtime?.worker.status?.()) });
+      void reply(id, !!runtime, runtime ? undefined : 'worker is not started',
+        { heap: heapNow(runtime?.worker.status?.()), store: storeMetricsSnapshot() });
       return;
     }
     if (request.action !== 'stop' && (!Array.isArray(request.packages) || request.packages.some(ref =>

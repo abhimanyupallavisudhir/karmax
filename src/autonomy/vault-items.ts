@@ -164,6 +164,9 @@ export interface CredentialAccessRequest {
 export interface VaultItemStore {
   /** Serialize compound reads and writes on the same transaction connection. */
   transaction<T>(operation: () => Promise<T>): Promise<T>;
+  /** Store.lock: entity locks held until the transaction ends. In-memory
+   * stores, whose transactions never interleave, need none. */
+  lock?(...keys: string[]): Promise<void>;
   vaultSelectionHistory?(organizationId: string, now: number): Promise<Record<string, VaultSelectionUsage>>;
   vaultUsageHistory?(itemIds: string[], now: number): (Record<string, VaultUsage>) | Promise<Record<string, VaultUsage>>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
@@ -322,13 +325,27 @@ export class VaultItems {
     private participant?: string,
   ) {}
 
+  /** The organization's item index, access requests and connector outbox are
+   * rewritten under one lock (`vault:<orgId>` in STORE_LOCK_ORDER). */
+  private lockVault(): Promise<void> | undefined {
+    return this.store.lock?.(`vault:${this.organizationId}`);
+  }
+
   // ── items ──
   async list(): Promise<VaultItem[]> {
     return this.store.transaction(async () => {
-    const raw = (await this.store.kvGet(kvItems(this.organizationId)));
+    let raw = (await this.store.kvGet(kvItems(this.organizationId)));
     if (!raw) return [];
-    const items = parseIndex<VaultItem[]>(raw, 'The vault item index');
-    const legacy = items.filter((item) => item.frecencyUpdatedAt === undefined);
+    let items = parseIndex<VaultItem[]>(raw, 'The vault item index');
+    let legacy = items.filter((item) => item.frecencyUpdatedAt === undefined);
+    if (legacy.length && this.store.lock) {
+      // Rewriting the index: re-read it under the lock its writers take.
+      await this.lockVault();
+      raw = (await this.store.kvGet(kvItems(this.organizationId)));
+      if (!raw) return [];
+      items = parseIndex<VaultItem[]>(raw, 'The vault item index');
+      legacy = items.filter((item) => item.frecencyUpdatedAt === undefined);
+    }
     if (legacy.length) {
       const now = Date.now();
       const history = (await this.store.vaultUsageHistory?.(legacy.map((item) => item.id), now)) ?? {};
@@ -408,8 +425,11 @@ export class VaultItems {
     replaceSecrets?: boolean;
     provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; connectorFormatVersion?: number; syncedAt?: number; sourceRevision?: string };
   }): Promise<VaultItem> {
+    // Chosen once: a re-run transaction must write the same handles, not orphan the first attempt's.
+    const freshId = newId('vi');
     return this.store.transaction(async () => {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
+    await this.lockVault();
     const prior = args.id ? (await this.get(args.id)) : undefined;
     if (args.id && !prior) throw new Error(`no vault item ${args.id}`);
     if (prior && prior.type !== args.type) throw new Error(`vault item ${prior.id} is a ${prior.type}, not a ${args.type}`);
@@ -430,7 +450,7 @@ export class VaultItems {
     const envVar = args.envVar !== undefined ? args.envVar.trim() : prior?.envVar;
     if (envVar && envVar !== prior?.envVar && !isEnvName(envVar))
       throw new Error('The env var name may contain only letters, digits and _, and cannot start with a digit (e.g. DEPLOY_KEY)');
-    const id = prior?.id ?? newId('vi');
+    const id = prior?.id ?? freshId;
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
       if (args.secrets?.[field] === undefined || (field !== 'note' && !args.secrets[field]?.trim())) {
@@ -496,6 +516,7 @@ export class VaultItems {
   setExternalId(id: string, connector: string, externalId: string): Promise<VaultItem>;
   async setExternalId(id: string, connectorOrExternalId: string, boundExternalId?: string): Promise<VaultItem> {
     return this.store.transaction(async () => {
+    await this.lockVault();
     const all = (await this.list());
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
@@ -519,6 +540,7 @@ export class VaultItems {
 
   async setPolicy(id: string, patch: Partial<VaultItemPolicy>): Promise<VaultItem> {
     return this.store.transaction(async () => {
+    await this.lockVault();
     const all = (await this.list());
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
@@ -532,6 +554,7 @@ export class VaultItems {
 
   async delete(id: string) {
     return this.store.transaction(async () => {
+    await this.lockVault();
     const item = (await this.get(id));
     (await deleteItemConnectorWrites(this.store, this.broker, this.organizationId, id));
     for (const field of item?.fields ?? []) (await this.broker?.deleteHandle(itemHandle(id, field)));
@@ -562,6 +585,7 @@ export class VaultItems {
 
   private async extend(taskId: string, cap: Capability, grantedBy: string) {
     return this.store.transaction(async () => {
+    await this.store.lock?.(`kv:${kvGrant(taskId)}`);
     const cur = (await this.extensions(taskId));
     if (!cur.some((e) => e.cap === cap)) {
       (await this.store.kvSet(kvGrant(taskId), JSON.stringify([...cur, { cap, grantedBy, at: Date.now() }])));
@@ -582,6 +606,7 @@ export class VaultItems {
 
   private async addPass(taskId: string, itemId: string, mode: AccessMode) {
     return this.store.transaction(async () => {
+    await this.store.lock?.(`kv:${kvPasses(taskId)}`);
     (await this.store.kvSet(kvPasses(taskId), JSON.stringify([...(await this.passes(taskId)), { itemId, mode }])));
 
     });
@@ -589,6 +614,8 @@ export class VaultItems {
 
   private async takePass(taskId: string, itemId: string, mode: AccessMode, consume: boolean): Promise<boolean> {
     return this.store.transaction(async () => {
+    // A one-shot pass is taken once.
+    await this.store.lock?.(`kv:${kvPasses(taskId)}`);
     const all = (await this.passes(taskId));
     // A reveal pass also covers non-revealing use of the same item.
     const idx = all.findIndex((p) => p.itemId === itemId && (p.mode === mode || p.mode === 'reveal'));
@@ -689,14 +716,16 @@ export class VaultItems {
 
   /** Resolve a secret field AFTER an access decision granted it. Audited. */
   async resolveField(item: VaultItem, field: VaultFieldName, ctx: { taskId?: string; principal?: string; mode: AccessMode }): Promise<string> {
-    return this.store.transaction(async () => {
     if (!item.fields.includes(field)) throw new Error(`item "${item.label}" has no ${field}`);
     const handle = itemHandle(item.id, field);
+    // Resolved (and audited by the broker) once, outside the re-runnable transaction.
     const secret = await this.requireBroker().resolve(handle, { taskId: ctx.taskId, caps: [`use-credential:${handle}`] });
+    return this.store.transaction(async () => {
     // Read fresh usage: callers may reuse an item across several fields. An item
     // without its own usage key yet reads the index, which also migrates legacy
     // history before this access is audited, so it is counted only once.
     const usageKey = kvUsagePrefix(this.organizationId) + item.id;
+    await this.store.lock?.(`kv:${usageKey}`);
     const stored = (await this.store.kvGet(usageKey));
     const current: ItemUsage | undefined = stored ? JSON.parse(stored) : (await this.list()).find((candidate) => candidate.id === item.id);
     // Whatever the task does with the value from here on is scrubbed from what
@@ -827,6 +856,7 @@ export class VaultItems {
 
   private async park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string }): Promise<CredentialAccessRequest> {
     return this.store.transaction(async () => {
+    await this.lockVault();
     const all = (await this.requests());
     const existing = all.find((r) => r.status === 'pending' && r.taskId === args.taskId && r.mode === args.mode
       && (r.kind ?? 'access') === (args.kind ?? 'access')
@@ -860,6 +890,8 @@ export class VaultItems {
    */
   async resolve(requestId: string, args: { action: 'once' | 'task' | 'always' | 'deny'; by: string; itemId?: string }): Promise<CredentialAccessRequest> {
     return this.store.transaction(async () => {
+    // Resolved once: a concurrent resolution waits, then sees it decided.
+    await this.lockVault();
     const all = (await this.requests());
     const req = all.find((r) => r.id === requestId);
     if (!req) throw new Error(`no credential request ${requestId}`);

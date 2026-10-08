@@ -165,6 +165,7 @@ export class ServiceConnections {
   private async user(c: ServiceConnection) {
     return this.store.transaction(async () => {
     if (!c.ownerId) throw new ConnectionError('Connection has no owner');
+    (await this.store.lock('kv:service-connections:installation'));
     let installation = (await this.store.kvGet('service-connections:installation'));
     if (!installation) { installation = crypto.randomUUID(); (await this.store.kvSet('service-connections:installation', installation)); }
     return 'karmax_' + crypto.createHash('sha256').update(JSON.stringify([installation, c.organizationId, c.ownerId])).digest('hex');
@@ -182,6 +183,8 @@ export class ServiceConnections {
   async request(org: string, toolkit: string, taskId: string, role: string, why: string) {
     return this.store.transaction(async () => {
     this.slug(toolkit);
+    // One open request per task and app.
+    (await this.store.lock(`service-connections:${org}:${taskId}`));
     const existing = (await this.all()).find(c => c.organizationId === org && c.toolkit === toolkit && c.taskId === taskId && !['disconnected', 'expired'].includes(c.status));
     if (existing) return existing;
     return (await this.save({ id: newId('conn'), organizationId: org, toolkit, label: toolkit,
@@ -211,7 +214,7 @@ export class ServiceConnections {
     if (prior) return prior;
     let auth: McpServer['auth'];
     try { auth = await remoteMcpAuth(server.transport); } catch { throw new ConnectionError('Could not reach that MCP server. Check its URL.', 502); }
-    return this.store.transaction(async () => (await open()) ?? (await this.save({ id: newId('conn'), organizationId: org,
+    return this.store.transaction(async () => (await this.store.lock(`service-connections:${org}:${taskId}`), await open()) ?? (await this.save({ id: newId('conn'), organizationId: org,
       toolkit: `mcp:${server.registry?.name ?? new URL(server.transport.url).hostname}`.slice(0, 120), label: server.label.slice(0, 120),
       mcp: { ...server.transport, auth, ...(server.registry ? { registry: server.registry } : {}) },
       taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() })));

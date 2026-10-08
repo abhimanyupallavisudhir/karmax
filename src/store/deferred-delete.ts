@@ -1,3 +1,4 @@
+import { noteExternalEffect } from './transaction-effects.js';
 import type { Store } from './db.js';
 import type { ObjectRequestOptions, ObjectStore } from './objects.js';
 
@@ -114,11 +115,17 @@ export class DeferredDeleteObjectStore implements ObjectStore {
     for (const key of await this.store.dueObjectTombstones(now, this.batchSize)) {
       try {
         const done = await this.store.transaction(async () => {
-          const tombstone = await this.store.objectTombstone(key);
-          if (!tombstone || tombstone.purgeAfter > now) return false; // resurrected or deleted again since
+          // A capture retains a chunk, and cancels its tombstone, under its
+          // organization's storage lock: decide and delete under it too.
           const chunk = RESOURCE_CHUNK.exec(key);
+          if (chunk) await this.store.lock(`storage:${chunk[1]}`);
+          const tombstone = await this.store.objectTombstone(key, { lock: true });
+          if (!tombstone || tombstone.purgeAfter > now) return false; // resurrected or deleted again since
           const referenced = !!chunk && await this.store.hasResourceChunk(chunk[1]!, chunk[2]!);
-          if (!referenced) await withTimeout(this.inner.delete(key, { timeoutMs: this.deleteTimeoutMs }), this.deleteTimeoutMs);
+          if (!referenced) {
+            noteExternalEffect(); // a deleted object is not rolled back: never re-run this attempt
+            await withTimeout(this.inner.delete(key, { timeoutMs: this.deleteTimeoutMs }), this.deleteTimeoutMs);
+          }
           await this.store.deleteObjectTombstone(key);
           return !referenced;
         });
