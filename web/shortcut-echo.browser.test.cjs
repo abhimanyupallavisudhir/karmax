@@ -36,9 +36,9 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
       if (title) assert.equal(await echo.getAttribute('title'), title);
     };
 
-    // It leads the topbar's right-hand cluster (⌘ ? profile 🔔) — appearing
+    // It leads the topbar's right-hand cluster (profile 🔔) — appearing
     // there shifts none of those buttons — and is invisible until something happens.
-    assert.equal(await page.evaluate(() => document.querySelector('#key-echo').nextElementSibling?.id), 'topbar-palette');
+    assert.equal(await page.evaluate(() => document.querySelector('#key-echo').nextElementSibling?.id), 'topbar-user');
     assert.equal(await echo.textContent(), '');
     assert.equal(await echo.isVisible(), false, 'nothing to show before the first action');
 
@@ -49,6 +49,9 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await shows('g A', 'Go to your profile');
     await page.locator('#bell').click();
     await shows('g N', 'Go to inbox');
+    // The sidebar's icon-only entries teach theirs too.
+    await page.locator('#rail-wiki').click();
+    await shows('g W', 'Go to organization wiki');
     await page.goto('http://console.test/org/workspace');
     await page.locator('[data-id="t"]').waitFor();
     await page.locator('#task-search').click();
@@ -71,7 +74,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(page.url(), at, 'g h does nothing');
 
     // Palette: running a command from it teaches that command's keys.
-    await page.locator('#topbar-palette').click();
+    await page.locator('#rail-palette').click();
     await shows('Ctrl+k', 'Command palette');
     await page.locator('#pal-in').fill('go to queues');
     await page.locator('#pal-in').press('Enter');
