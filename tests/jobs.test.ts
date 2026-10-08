@@ -270,7 +270,7 @@ describe('durable jobs (real worktree world)', () => {
       } as any);
       // pause waits on jobs and events; it is not how an agent asks for input it needs.
       const pause = TOOL_SCHEMAS.find((tool) => tool.name === 'pause')!;
-      expect(pause.description).toContain('It is not for asking: if you need an answer to continue, call escalate_to_human or end your turn with the question.');
+      expect(pause.description).toContain('It is not for asking: if you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give).');
       const schema = pause.parameters as any;
       expect(Object.keys(schema.properties)).toEqual(['minutes', 'jobs', 'needs_input', 'message', 'audience', 'urgency']);
       expect(schema.properties.urgency.enum).toEqual(['low', 'normal', 'high', 'critical']);

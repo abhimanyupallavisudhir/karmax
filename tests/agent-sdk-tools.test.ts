@@ -90,7 +90,7 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     // It is for what only a person can give, and names them: the platform
     // refuses an ask without an audience by listing who can be asked (#533).
     expect(schema.description).toMatch(/only a person can give/);
-    expect(schema.parameters.properties.audience.description).toMatch(/^Required\./);
+    expect((schema.parameters.properties.audience as { description?: string }).description).toMatch(/^Required\./);
     expect(schema.parameters.required).toEqual(['message']);
     expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain('escalate_to_human');
     // notify and escalate (redirect a received request) are gateway-backed too.
