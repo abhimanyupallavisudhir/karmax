@@ -88,6 +88,9 @@ const BIN_DIR = '.karmax-injection/bin';
 const CACHE_DIR = '.karmax-injection/restic-cache';
 const TOKEN_HOURS = 24;
 const POLL_MS = 2_000;
+/** A job in a world is polled from this soon, backing off to POLL_MS: most
+ * saves and restores of a changed few files take well under a second. */
+const FIRST_POLL_MS = 100;
 const CONNECTIONS = 8;
 /** Each upload through the edge waits on two calls to this server, an ocean
  * away from many sandboxes: measured from E2B (Seattle) to R2 EU, 8, 16 and 32
@@ -502,7 +505,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     }
     const forget = () => this.deps.store.kvCompareAndSet(recordKey, recorded, undefined).catch(() => false);
     try {
-      for (;;) {
+      for (let wait = FIRST_POLL_MS; ; wait = Math.min(wait * 2, POLL_MS)) {
         await options.checkContinue?.();
         const [status] = await jobStatuses(world, [job], { root: SYSTEM_JOB_ROOT, tailLines: 4 });
         for (const line of (status?.tail ?? '').split('\n').reverse()) {
@@ -519,7 +522,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
           await forget();
           throw new Error('restic stopped without finishing (the sandbox was restarted); it resumes from what it stored when retried');
         }
-        await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+        await new Promise((resolve) => setTimeout(resolve, wait));
       }
     } catch (error) {
       // Cancelled: the job stops with the activity that waited on it.
