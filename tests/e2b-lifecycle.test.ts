@@ -54,7 +54,7 @@ describe('E2B provider lifecycle', () => {
       network: { allowDomains: ['example.test'] } });
     expect(sdk.create).toHaveBeenCalledWith(expect.objectContaining({ template: 'org-template', apiKey: 'org-key',
       timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: true }, allowInternetAccess: true,
-      metadata: expect.objectContaining({ karmaxTaskId: 'task-1', karmaxGeneration: '1' }) }));
+      metadata: expect.objectContaining({ karmaxTaskId: 'task-1', karmaxGeneration: '1', karmaxOrganizationId: 'org-1' }) }));
     expect(box.updateNetwork).toHaveBeenCalledWith({ allowOut: expect.arrayContaining(['example.test', 'github.com']),
       denyOut: ['0.0.0.0/0'] });
     // Clone credentials never outlive provisioning.

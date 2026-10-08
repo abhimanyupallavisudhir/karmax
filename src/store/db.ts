@@ -7316,15 +7316,23 @@ export class Store {
       ORDER BY createdAt`).all()) as any[];
   }
 
-  async recordedUsageEventIds(ids: string[]): Promise<Set<string>> {
-    const recorded = new Set<string>();
+  /** Which of these usage ids are recorded, and whom each is booked to. */
+  async recordedUsageEvents(ids: string[]): Promise<Map<string, { organizationId: string; taskId?: string }>> {
+    const recorded = new Map<string, { organizationId: string; taskId?: string }>();
     for (let offset = 0; offset < ids.length; offset += 500) {
       const batch = ids.slice(offset, offset + 500);
-      const rows = (await this.db.prepare(`SELECT id FROM usage_events WHERE id IN (${batch.map(() => '?').join(',')})`)
-        .all(...batch)) as Array<{ id: string }>;
-      for (const row of rows) recorded.add(row.id);
+      const rows = (await this.db.prepare(`SELECT id, organizationId, taskId FROM usage_events WHERE id IN (${batch.map(() => '?').join(',')})`)
+        .all(...batch)) as Array<{ id: string; organizationId: string; taskId: string | null }>;
+      for (const row of rows) recorded.set(row.id, { organizationId: row.organizationId, ...(row.taskId ? { taskId: row.taskId } : {}) });
     }
     return recorded;
+  }
+
+  /** Move a usage row that no task claimed yet to the organization (and task)
+   * it turned out to belong to. Rows already attributed to a task are final. */
+  async reattributeUsageEvent(id: string, owner: { organizationId: string; projectId?: string; taskId?: string; worldId?: string }): Promise<void> {
+    (await this.db.prepare('UPDATE usage_events SET organizationId=?, projectId=?, taskId=?, worldId=? WHERE id=? AND taskId IS NULL')
+      .run(owner.organizationId, owner.projectId ?? null, owner.taskId ?? null, owner.worldId ?? null, id));
   }
 
   /** Ownership lookups do not need a task's potentially huge transcript. */
