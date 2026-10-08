@@ -1659,7 +1659,7 @@ export class ProjectResourceService {
       const file = attachment.target.kind === 'path' ? attachment.target.path : undefined;
       if (wanted && !wanted.has(attachment.name) && !(variable && wanted.has(variable))) continue;
       const handle = await this.ownedCredentialHandle(attachment);
-      const value = this.broker.resolve(handle, { taskId: `workspace:${principal}`, caps: [`use-credential:${handle}`] });
+      const value = await this.broker.resolve(handle, { taskId: `workspace:${principal}`, caps: [`use-credential:${handle}`] });
       (await this.store.appendAudit({ principalId: principal, action: 'resource:secret-read', scopeKey: `project:${projectId}`,
         detail: { attachmentId: attachment.id, name: attachment.name } }));
       values.push({ id: attachment.id, name: attachment.name, ...(variable ? { variable } : {}), ...(file ? { file } : {}), value });
