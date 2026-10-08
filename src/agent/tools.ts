@@ -592,6 +592,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'stop_agent',
+    description: 'Stop one agent of a task, like Ctrl+C: its turn ends now — working, or waiting for a credential, capacity or people — or, if queued, it does not run. The task goes on. `agent` is its key: do, responder, confirm, confirm-<n> or agent-<n> (list_agents).',
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, agent: { type: 'string' } }, required: ['task_id', 'agent'] },
+  },
+  {
     name: 'reorder_queue',
     description: 'Prioritize a task in a merge queue domain.',
     parameters: { type: 'object', properties: { domain: { type: 'string' }, task_id: { type: 'string' } }, required: ['domain', 'task_id'] },
@@ -1404,6 +1409,10 @@ export function platformToolHandlers(
       await platformRequest('POST', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/signal`,
         { signal: args?.signal, text: args?.text, role: args?.role, otherAttempts: args?.otherAttempts, saveOtherAttemptsDefault: args?.saveOtherAttemptsDefault });
       return 'signalled';
+    },
+    async stop_agent(args) {
+      await platformRequest('POST', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/agents/${encodeURIComponent(String(args?.agent ?? ''))}/stop`);
+      return `stopped ${args?.agent}`;
     },
     async reorder_queue(args) {
       await platformRequest('POST', '/api/queue/prioritize', { domain: args?.domain, taskId: args?.task_id });

@@ -43,6 +43,7 @@ function formatBytes(value) {
 // the no-build-step console self-contained while still giving every button a
 // proper text alternative through its aria-label/title.
 const ICON = {
+  stop: '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
   expand: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg>',
   collapse: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h5V3m13 5h-5V3M8 21v-5H3m13 5v-5h5"/></svg>',
   save: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15.2 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8.8a2 2 0 0 0-.6-1.4l-3.8-3.8a2 2 0 0 0-1.4-.6Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>',
@@ -6591,35 +6592,24 @@ function triggersSection(values, selfId) {
   const gridCells = CRON_FIELDS.map(
     (f, i) => `<label class="cron-cell">${f.label}<input id="${f.id}" placeholder="*" value="${esc(cronVal(i))}"><small>${f.hint}</small></label>`,
   ).join('');
+  // One block like the agent and computer blocks: when the task starts, and
+  // whether each start is a fresh run (a schedule forces that on).
   return `
-    <details class="advanced" style="margin-top:10px" ${existing.length ? 'open' : ''}>
-      <summary>Triggers ${policyTip('Start this task after other tasks finish, on a schedule, or both (it waits for all of them). Leave empty to start now.')}</summary>
-      <div class="form-row">
-        <div class="label-row"><label>Task dependencies</label></div>
+    <div class="form-row" data-row="__triggers">
+      <div class="label-row"><label>Triggers</label>${policyTip('Start this task after other tasks finish, on a schedule, or both (it waits for all of them). Leave empty to start now.')}<span class="label-row-fill"></span></div>
+      <div class="triggers-block">
+        <span class="tb-label">After</span>
         <div class="chip-input" id="dep-box">
           <span class="chips" id="dep-chips"></span>
           <button type="button" class="btn sm" id="dep-add">＋ Add a task…</button>
         </div>
-      </div>
-      <div class="form-row">
-        <div class="label-row"><label>On a schedule <span class="hint" title="Cron, in UTC. Each field: * = every, */5 = every 5, 1-5 = range, 1,3 = list.">cron, UTC ⓘ</span></div>
+        <span class="tb-label">Schedule ${policyTip('Cron, in UTC. Each field: * = every, */5 = every 5, 1-5 = range, 1,3 = list.')}</span>
         <div class="cron-grid">${gridCells}</div>
+        <label class="tb-label" for="trig-at">Once at</label>
+        <input id="trig-at" type="datetime-local" value="${atVal}">
+        <label class="tb-repeat"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
+          Repeatable ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</label>
       </div>
-      <div class="form-row">
-        <div class="label-row"><label>Or run once at</label></div>
-        <input id="trig-at" type="datetime-local" value="${atVal}" style="width:100%">
-      </div>
-    </details>`;
-}
-
-// A prominent, always-visible task-level toggle (repeatable is a lifecycle choice,
-// not a trigger — so it lives outside the collapsible Triggers section).
-function repeatableToggleHtml(values) {
-  return `
-    <div class="form-row repeat-row">
-      <label class="repeat-toggle"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
-        <span><b>Repeatable</b> ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</span>
-      </label>
     </div>`;
 }
 
@@ -7059,8 +7049,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               <label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>
               <span style="color:var(--ink-3);font-size:12px">Drop files into a text field above, or choose up to 8 files (25 MB each, 50 MB total).</span>
             </div>`}
-            ${triggersSection(values, draft?.id)}
-            ${repeatableToggleHtml(values)}
+            <section class="tf-section tf-triggers">${triggersSection(values, draft?.id)}</section>
           </div>
           <aside class="tf-side">
             <div class="form-row" data-row="__org">
@@ -7786,7 +7775,6 @@ async function renderSeriesPage(rec) {
             <div id="cred-editor-newtask">Loading…</div>
           </details>
           ${triggersSection(values, rec.id)}
-          ${repeatableToggleHtml(values)}
         </div>
         <div class="series-runs">
           <div class="series-runs-h">Runs</div>
@@ -10104,6 +10092,7 @@ function conversationPane(v, t) {
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         </div>
+        ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
         <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
       </div></div>`
     : '';
@@ -10195,7 +10184,7 @@ function conversationEntries(t) {
     if (attempt == null) {
       let generation = legacyGenerations.get(base) || 1;
       const prior = activities.get(`${base}/legacy-${generation}`);
-      if (activity.phase === 'started' && ['completed', 'failed'].includes(prior?.activity?.phase)) generation++;
+      if (activity.phase === 'started' && ['completed', 'failed', 'stopped'].includes(prior?.activity?.phase)) generation++;
       legacyGenerations.set(base, generation);
       attempt = `legacy-${generation}`;
       retry = generation > 1;
@@ -10615,6 +10604,8 @@ function conversationPresence(v, t) {
   if (t.shared) {
     const running = v.participants.find((p) => p.state === 'running');
     if (running) return { label: v.agentTurn?.state === 'running' || running.key !== 'do' ? `${running.label} working` : 'Starting agent', tone: 'working' };
+    const waiting = stoppableAgent(v);
+    if (waiting) return { label: `${waiting.label} · ${v.waitingFor ? waitingText(v.waitingFor) : 'waiting'}`, tone: 'waiting' };
   }
   if (v.agentTurn?.role === t.role) {
     return v.agentTurn.state === 'running'
@@ -10718,6 +10709,7 @@ async function openConversationShare(v, role) {
 }
 
 function wireCheckinSidebar(v) {
+  wireStopAgents(v);
   $('#main').querySelector('[data-reload-history]')?.addEventListener('click', () => refreshTaskHistory(v.taskId));
   $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
     el.addEventListener('click', () => {
@@ -12301,11 +12293,38 @@ function recipientsHtml(m, v) {
 }
 // The task's agents beside the conversation. Clicking one starts a message to it.
 function participantListHtml(v) {
+  const hint = { running: 'Working now', waiting: 'Waiting', queued: 'Called — runs when the current turn ends' };
   return `<div class="ck-side-h">Agents</div>${v.participants.map((p, index) => `
-    <button type="button" class="ck-item ck-participant" data-call-agent="${esc(p.key)}" title="${p.state === 'running' ? 'Working now' : p.state === 'queued' ? 'Called — runs when the current turn ends' : 'Message this agent'}">
-      <span class="ck-num">${index}</span><span class="ck-name">${esc(p.label)}</span>
-      ${p.state === 'running' ? '<span class="ck-live"></span>' : p.state === 'queued' ? '<span class="ck-queued" aria-label="queued">⋯</span>' : ''}
-    </button>`).join('')}`;
+    <div class="ck-participant-row">
+      <button type="button" class="ck-item ck-participant" data-call-agent="${esc(p.key)}" title="${hint[p.state] || 'Message this agent'}">
+        <span class="ck-num">${index}</span><span class="ck-name">${esc(p.label)}</span>
+        ${p.state === 'running' ? '<span class="ck-live"></span>' : p.state === 'waiting' ? '<span class="ck-waiting" aria-label="waiting"></span>' : p.state === 'queued' ? '<span class="ck-queued" aria-label="queued">⋯</span>' : ''}
+      </button>
+      ${p.state && p.state !== 'idle' ? stopAgentButton(p, 'ck-stop') : ''}
+    </div>`).join('')}`;
+}
+// The agent the composer's Stop button stops: the one working now, else the
+// innermost one waiting in its turn (for a credential, capacity, a retry or people).
+function stoppableAgent(v) {
+  const listed = v?.participants || [];
+  return listed.find((p) => p.state === 'running') || [...listed].reverse().find((p) => p.state === 'waiting');
+}
+function stopAgentButton(p, cls) {
+  return `<button type="button" class="${cls}" data-stop-agent="${esc(p.key)}" title="Stop ${esc(p.label)}" aria-label="Stop ${esc(p.label)}">${ICON.stop}</button>`;
+}
+// Like Ctrl+C: the agent's turn ends now (or, if queued, it does not run); the task goes on.
+function wireStopAgents(v) {
+  $('#main').querySelectorAll('[data-stop-agent]').forEach((btn) => !btn.dataset.wired && (btn.dataset.wired = '1') && btn.addEventListener('click', async (event) => {
+    event.stopPropagation();
+    btn.disabled = true;
+    try {
+      await api(`/api/tasks/${encodeURIComponent(v.taskId)}/agents/${encodeURIComponent(btn.dataset.stopAgent)}/stop`, { method: 'POST' });
+      setTimeout(refreshTask, 250);
+    } catch (e) {
+      btn.disabled = false;
+      toast(e.message, true);
+    }
+  }));
 }
 
 // Whom unaddressed text goes to: the agent that last asked you something (a
