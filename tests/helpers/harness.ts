@@ -228,7 +228,7 @@ export async function bootHarness(
         objects,
         resources,
         handoffs,
-        // Never the operator's key: a test must not spend its daily allowance.
+        // The bundled snapshot, never the operator's key: a test must not spend its daily allowance.
         artificialAnalysis: opts?.artificialAnalysis ?? new ArtificialAnalysis({}),
       }));
       const started = await gw.listen(opts?.port);

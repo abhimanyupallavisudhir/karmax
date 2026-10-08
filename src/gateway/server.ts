@@ -166,7 +166,8 @@ export interface GatewayDeps {
   remoteAccess?: RemoteAccessController;
   /** Fetches OAuth client ID metadata documents (default: the outbound SSRF guard). */
   oauthMetadataFetch?: typeof fetch;
-  /** Model benchmarks for the model picker (default: ARTIFICIAL_ANALYSIS_API_KEY). */
+  /** Model benchmarks for the model picker (default: the bundled snapshot,
+   *  refreshed daily when ARTIFICIAL_ANALYSIS_API_KEY is set). */
   artificialAnalysis?: ArtificialAnalysis;
 }
 
@@ -2191,7 +2192,7 @@ export class Gateway {
         sso: ssoSession(this.deps.identity),
         google: this.deps.identity?.googleEnabled ?? false,
         github: this.deps.identity?.githubEnabled ?? false,
-        modelBenchmarks: this.artificialAnalysis.configured,
+        modelBenchmarks: this.artificialAnalysis.available,
       });
     }
     if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
@@ -6519,7 +6520,7 @@ export class Gateway {
       }
       // Intelligence, price and speed of the runnable models, for the picker's chart.
       if (p === '/api/models/benchmarks' && method === 'GET') {
-        if (!this.artificialAnalysis.configured) return this.json(res, 404, { error: 'Model benchmarks are not configured' });
+        if (!this.artificialAnalysis.available) return this.json(res, 404, { error: 'Model benchmarks are not configured' });
         const organizationId = requestedScope.organizationId ?? 'org_personal';
         try {
           const [{ at, data }, catalog] = await Promise.all([
@@ -6529,7 +6530,7 @@ export class Gateway {
           return this.json(res, 200, {
             source: { name: 'Artificial Analysis', url: 'https://artificialanalysis.ai/' },
             fetchedAt: at,
-            models: toBenchmarks(data, catalog.value),
+            models: toBenchmarks(data, catalog.value, at),
           } satisfies ModelBenchmarks);
         } catch (error) {
           console.warn(`[karmax] model benchmarks unavailable: ${error instanceof Error ? error.message : 'unknown error'}`);

@@ -77,9 +77,13 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       .toEqual(expect.arrayContaining(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']));
   });
 
-  it('charts runnable models from Artificial Analysis, server-side and only when configured', async () => {
-    expect((await (await fetch(`${base}/api/meta`)).json() as any).modelBenchmarks).toBe(false);
-    expect((await fetch(`${base}/api/models/benchmarks`, { headers: auth() })).status).toBe(404);
+  it('charts runnable models from Artificial Analysis: the bundled snapshot, or the live list with a key', async () => {
+    // No key: the snapshot that ships with tavya.
+    expect((await (await fetch(`${base}/api/meta`)).json() as any).modelBenchmarks).toBe(true);
+    const bundled: any = await (await fetch(`${base}/api/models/benchmarks`, { headers: auth() })).json();
+    expect(bundled.fetchedAt).toBe(Date.parse((await import('../src/agent/model-benchmarks.json', { with: { type: 'json' } })).default.fetchedAt));
+    expect(bundled.models.length).toBeGreaterThan(20);
+    expect(bundled.models).toContainEqual(expect.objectContaining({ ref: { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' } }));
 
     const requests: string[] = [];
     const { ArtificialAnalysis } = await import('../src/agent/model-benchmarks.js');
@@ -113,6 +117,13 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     }
     expect(requests).toEqual(['aa-test-key']);
     expect((await fetch(`${gw.url}/api/models/benchmarks`)).status).toBe(401);
+
+    // Neither a snapshot nor a key: the chart is withdrawn.
+    const none = await h.startGateway({ artificialAnalysis: new ArtificialAnalysis({ snapshot: null }) });
+    const noneSession: any = await (await fetch(`${none.url}/api/session`)).json();
+    expect((await (await fetch(`${none.url}/api/meta`)).json() as any).modelBenchmarks).toBe(false);
+    expect((await fetch(`${none.url}/api/models/benchmarks`, { headers: { authorization: `Bearer ${noneSession.token}` } })).status).toBe(404);
+    await none.close();
     await gw.close();
   });
 

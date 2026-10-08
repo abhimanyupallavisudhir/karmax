@@ -58,7 +58,8 @@ services:
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_CLIENT_ID: ${STRIPE_CLIENT_ID:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-      # Model benchmarks for the model picker's chart (artificialanalysis.ai); empty hides it.
+      # Optional: refresh the model picker's benchmark chart daily from artificialanalysis.ai;
+      # empty uses the snapshot bundled with the release.
       ARTIFICIAL_ANALYSIS_API_KEY: ${ARTIFICIAL_ANALYSIS_API_KEY:-}
     secrets:
       - auth_secret

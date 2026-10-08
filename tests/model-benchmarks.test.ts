@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ArtificialAnalysis, baseSlug, benchmarkRef, toBenchmarks, variantEffort } from '../src/agent/model-benchmarks.js';
+import { ArtificialAnalysis, BUNDLED_MODELS, baseSlug, benchmarkRef, toBenchmarks, trimModels, variantEffort } from '../src/agent/model-benchmarks.js';
 
 const NOW = Date.parse('2026-10-08T00:00:00Z');
 const row = (creator: string, slug: string, name: string, extra: Record<string, unknown> = {}) => ({
@@ -112,10 +112,41 @@ describe('Artificial Analysis client', () => {
     expect((await source.models()).data).toEqual([{ id: 'ok' }]);
     expect(calls).toBe(2);
 
-    const fresh = new ArtificialAnalysis({ apiKey: 'aa-key', now: () => now, fetch: async () => { calls++; return new Response('key aa-key rejected', { status: 401 }); } });
+    const fresh = new ArtificialAnalysis({ apiKey: 'aa-key', snapshot: null, now: () => now, fetch: async () => { calls++; return new Response('key aa-key rejected', { status: 401 }); } });
     await expect(fresh.models()).rejects.toThrow(/^Artificial Analysis returned 401$/);
     await expect(fresh.models()).rejects.toThrow(/401/);
     expect(calls).toBe(3);
-    await expect(new ArtificialAnalysis({}).models()).rejects.toThrow(/not configured/);
+    await expect(new ArtificialAnalysis({ snapshot: null }).models()).rejects.toThrow(/not configured/);
+  });
+});
+
+describe('bundled snapshot', () => {
+  it('serves without a key and never touches the network', async () => {
+    const source = new ArtificialAnalysis({ fetch: async () => { throw new Error('no network'); } });
+    expect(source.available).toBe(true);
+    const { at, data } = await source.models();
+    expect(at).toBe(BUNDLED_MODELS.at);
+    // Charted as of the snapshot's own date, so an old snapshot keeps its newest models.
+    const models = toBenchmarks(data, {}, at);
+    expect(models.length).toBeGreaterThan(20);
+    expect(new Set(models.map((model) => model.ref.provider))).toEqual(new Set(['claude', 'codex']));
+    expect(models.some((model) => model.cost && model.seconds)).toBe(true);
+  });
+
+  it('falls back to the snapshot when the live list cannot be fetched', async () => {
+    const source = new ArtificialAnalysis({ apiKey: 'aa-key', now: () => NOW, fetch: async () => new Response('', { status: 500 }) });
+    expect((await source.models()).at).toBe(BUNDLED_MODELS.at);
+  });
+
+  it('keeps only the fields the chart reads, for the year before the fetch', () => {
+    const [kept, ...rest] = trimModels([
+      row('anthropic', 'claude-opus-5-5-high', 'Claude Opus 5.5 (High)', { secret_field: 'x', evaluations: { artificial_analysis_intelligence_index: 50, gpqa: 0.9 } }),
+      row('anthropic', 'claude-opus-4-1', 'Claude 4.1 Opus', { release_date: '2025-08-05' }),
+      row('anthropic', 'claude-x', 'Claude X', { evaluations: { artificial_analysis_intelligence_index: null } }),
+    ], NOW);
+    expect(rest).toEqual([]);
+    expect(kept).not.toHaveProperty('secret_field');
+    expect(kept!.evaluations).toEqual({ artificial_analysis_intelligence_index: 50 });
+    expect(toBenchmarks([kept], {}, NOW)).toHaveLength(1);
   });
 });

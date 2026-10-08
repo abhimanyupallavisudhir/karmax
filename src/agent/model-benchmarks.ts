@@ -11,17 +11,22 @@
  * cannot reproduce (non-reasoning modes, ChatGPT-only and Pro models, efforts
  * the model does not accept) are dropped rather than mislabelled.
  *
- * Their free API asks to be called server-side only, cached, and credited; it
- * allows 1,000 requests a day. One fetch serves every organization for a day.
+ * The list ships with tavya as a snapshot (model-benchmarks.json, refreshed by
+ * scripts/refresh-model-benchmarks.ts), so the chart works on any installation
+ * without a key. With ARTIFICIAL_ANALYSIS_API_KEY the server also fetches the
+ * live list once a day — their free API asks to be called server-side only,
+ * cached and credited, and allows 1,000 requests a day — falling back to the
+ * snapshot when that fails.
  */
 import type { Provider } from '../domain/types.js';
 import { claudeMessagesEffort, codexReasoningEffort, type Effort } from './effort.js';
 import type { ModelCatalog } from './models.js';
+import bundled from './model-benchmarks.json' with { type: 'json' };
 
 export const ARTIFICIAL_ANALYSIS_URL = 'https://artificialanalysis.ai/api/v2/data/llms/models';
 export const ARTIFICIAL_ANALYSIS_KEY_ENV = 'ARTIFICIAL_ANALYSIS_API_KEY';
 const DAY_MS = 24 * 60 * 60_000;
-/** Older models are rarely what anyone wants and crowd the chart. */
+/** Older models (than the list) are rarely what anyone wants and crowd the chart. */
 const MAX_AGE_MS = 365 * DAY_MS;
 /** Artificial Analysis times a 1,000-token prompt (`prompt_length: medium`)
  * and reports end-to-end response time for a 500-token answer. */
@@ -140,7 +145,32 @@ export function benchmarkRef(row: { creator: string; slug: string; name: string 
   return undefined;
 }
 
-/** The rows of an Artificial Analysis response that some harness can run. */
+/** A response reduced to the fields read here, for the bundled snapshot. */
+export function trimModels(data: unknown, now = Date.now()): RawModel[] {
+  if (!Array.isArray(data)) return [];
+  return (data as RawModel[]).flatMap((raw) => {
+    const released = typeof raw?.release_date === 'string' ? raw.release_date : undefined;
+    if (!raw?.evaluations?.artificial_analysis_intelligence_index || (released && now - Date.parse(released) > MAX_AGE_MS)) return [];
+    return [{
+      id: raw.id, name: raw.name, slug: raw.slug, release_date: raw.release_date,
+      model_creator: { slug: raw.model_creator?.slug, name: raw.model_creator?.name },
+      evaluations: { artificial_analysis_intelligence_index: raw.evaluations.artificial_analysis_intelligence_index },
+      pricing: {
+        price_1m_blended_3_to_1: raw.pricing?.price_1m_blended_3_to_1,
+        price_1m_input_tokens: raw.pricing?.price_1m_input_tokens,
+        price_1m_output_tokens: raw.pricing?.price_1m_output_tokens,
+      },
+      median_output_tokens_per_second: raw.median_output_tokens_per_second,
+      median_time_to_first_token_seconds: raw.median_time_to_first_token_seconds,
+      median_time_to_first_answer_token: raw.median_time_to_first_answer_token,
+    }];
+  });
+}
+
+/**
+ * The rows of an Artificial Analysis list that some harness can run. `now` is
+ * when the list was fetched, so an old snapshot still shows its newest models.
+ */
 export function toBenchmarks(data: unknown, catalog: Partial<ModelCatalog>, now = Date.now()): ModelBenchmark[] {
   if (!Array.isArray(data)) return [];
   const out: ModelBenchmark[] = [];
@@ -177,9 +207,12 @@ export function toBenchmarks(data: unknown, catalog: Partial<ModelCatalog>, now 
   return out;
 }
 
-/** The Artificial Analysis model list, fetched at most once a day. A failed
- * fetch is remembered for a few minutes so a broken key or an outage cannot
- * spend the daily request allowance. */
+export const BUNDLED_MODELS = { at: Date.parse(bundled.fetchedAt), data: bundled.data as unknown[] };
+
+/** The Artificial Analysis model list: the bundled snapshot, or with a key the
+ * live list fetched at most once a day. A failed fetch is remembered for a few
+ * minutes so a broken key or an outage cannot spend the daily allowance, and
+ * the newest list in hand keeps serving meanwhile. */
 export class ArtificialAnalysis {
   private cached?: { at: number; data: unknown[] };
   private failed?: { at: number; error: Error };
@@ -190,31 +223,40 @@ export class ArtificialAnalysis {
     fetch?: typeof fetch;
     now?: () => number;
     url?: string;
+    /** The list served without a key or before a fetch succeeds; null for none. */
+    snapshot?: { at: number; data: unknown[] } | null;
   } = {}) {}
 
-  get configured(): boolean { return !!this.options.apiKey; }
+  private get snapshot() { return this.options.snapshot === undefined ? BUNDLED_MODELS : this.options.snapshot; }
+
+  /** Whether there is any list to chart. */
+  get available(): boolean { return !!this.options.apiKey || !!this.snapshot?.data.length; }
 
   async models(): Promise<{ at: number; data: unknown[] }> {
+    const fallback = this.cached ?? this.snapshot;
+    if (!this.options.apiKey) {
+      if (fallback) return fallback;
+      throw new Error('Artificial Analysis is not configured');
+    }
     const now = (this.options.now ?? Date.now)();
     if (this.cached && now - this.cached.at < DAY_MS) return this.cached;
     if (this.failed && now - this.failed.at < 5 * 60_000) {
-      if (this.cached) return this.cached;
+      if (fallback) return fallback;
       throw this.failed.error;
     }
     this.pending ??= this.load(now).finally(() => { this.pending = undefined; });
     try {
       return await this.pending;
     } catch (error) {
-      if (this.cached) return this.cached; // a stale chart beats none
+      if (fallback) return fallback; // a stale chart beats none
       throw error;
     }
   }
 
   private async load(now: number): Promise<{ at: number; data: unknown[] }> {
-    if (!this.options.apiKey) throw new Error('Artificial Analysis is not configured');
     try {
       const response = await (this.options.fetch ?? fetch)(this.options.url ?? ARTIFICIAL_ANALYSIS_URL, {
-        headers: { 'x-api-key': this.options.apiKey },
+        headers: { 'x-api-key': this.options.apiKey! },
         signal: AbortSignal.timeout(15_000),
       });
       // Never echo the response body: it may repeat the request's key.
