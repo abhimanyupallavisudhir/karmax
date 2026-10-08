@@ -793,7 +793,6 @@ export class AcpAdapter implements AgentAdapter {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`${this.provider} ACP turn failed: ${message}${detail ? `: ${detail.slice(-800)}` : ''}`, { cause: error });
     } finally {
-      if (heartbeat) clearInterval(heartbeat);
       (await control?.close());
       remoteBridge?.close();
       ctx.signal?.removeEventListener('abort', abort);
@@ -812,6 +811,9 @@ export class AcpAdapter implements AgentAdapter {
           ...(activityDetail(failure.message) ? { detail: activityDetail(failure.message) } : {}) });
       }
       await release();
+      // Only now: stopping a sandbox agent and exporting its session can take
+      // longer than the activity's heartbeat timeout.
+      if (heartbeat) clearInterval(heartbeat);
     }
   }
 }
