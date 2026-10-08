@@ -197,7 +197,7 @@ describe('outward-facing brand', () => {
   });
 
   it('shows the brand for the persisted karmax landing-authority value', () => {
-    expect(read('src/contrib/manifests.ts')).toContain("options: ['auto', 'external', 'karmax'],\n  // The stored value predates the product name.\n  optionLabels: { karmax: BRAND },");
+    expect(read('src/contrib/manifests.ts')).toContain("options: ['auto', 'external', 'karmax'],\n  // The stored value predates the product name.\n  optionLabels: { auto: 'Automatic', external: 'External system', karmax: BRAND },");
     expect(read('web/app.js')).toContain("esc(f.optionLabels?.[o] ?? o)");
   });
 

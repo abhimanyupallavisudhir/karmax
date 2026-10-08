@@ -56,7 +56,14 @@ describe('the Computer block', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
   const open = async (route: string): Promise<{ page: Page; errors: string[] }> => {
-    const page = await (await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 1000 } })).newPage();
+    const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1280, height: 1000 } });
+    // Saved defaults arrive late on a loaded runner (master CI #1623): a block
+    // must not show, and be read or edited, before it holds what it inherits.
+    await context.route('**/api/defaults/**', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await route.continue();
+    });
+    const page = await context.newPage();
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.goto(`${base}${route}`);

@@ -382,6 +382,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const c: any = await (await fetch(`${base}/api/contributions`, { headers: auth() })).json();
     expect(c.commands.find((x: any) => x.id === 'nav.newTask')).toBeTruthy();
     expect(c.commands.find((x: any) => x.id === 'nav.notifications')?.keybinding).toBe('g N');
+    expect(c.commands.find((x: any) => x.id === 'nav.home')?.keybinding).toBe('g H');
     expect(c.commands.find((x: any) => x.id === 'nav.activity')).toBeUndefined();
     expect(c.slots.some((s: any) => s.contribution.slot === 'task-detail')).toBe(true);
     expect(c.events.some((e: any) => e.type === 'software-dev.merged')).toBe(true);

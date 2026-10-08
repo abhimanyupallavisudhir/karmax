@@ -16,7 +16,7 @@ function extractFunction(name: string): string {
 }
 
 const esc = (value: unknown) => String(value);
-const markup = Function('esc', `${extractFunction('organizationPlanMarkup')}; return organizationPlanMarkup;`)(esc);
+const markup = Function('esc', `${extractFunction('policyTip')}; ${extractFunction('organizationPlanMarkup')}; return organizationPlanMarkup;`)(esc);
 
 describe('hosted plan organization UI', () => {
   it('shows plan limits and explains shared queued concurrency', () => {

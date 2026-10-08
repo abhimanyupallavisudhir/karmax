@@ -40,7 +40,7 @@ ok(hostLocal() === false, 'a gateway served elsewhere withdraws them');
 // karmax runs on. (`#environment-propose` is deliberately absent: it reads the
 // project's repo server-side, so it works wherever karmax is served.)
 const gated = [
-  ['/srv/code/repo', 'repository source accepting a host path'],
+  ["'local path'", 'repository source accepting a host path'],
   ['id="data-source"', 'data import from a host path'],
   ['id="data-discover"', 'discovery of ignored files in the host checkout'],
 ];
