@@ -8,7 +8,8 @@
 # envd for up to 19 minutes (tasks 348/349, 2026-09-24). That froze every
 # karmax call into the sandbox and killed the agent's turn.
 #
-# Like earlyoom, this polls MemAvailable and, below 5% of RAM (64–256 MB), sends
+# Like earlyoom, this polls MemAvailable (or, in a container such as a
+# Daytona sandbox, the cgroup's own limit) and, below 5% of RAM (64–256 MB), sends
 # SIGKILL to the process with the highest kernel oom_score. Unlike earlyoom it
 # needs no package or root, and it never kills the agent (claude/codex) or any
 # of its ancestors. The victim's stderr gets a one-line explanation first, so
@@ -18,6 +19,7 @@
 #   sh memory-guard.sh pick    print the PID it would kill now (diagnostics/tests)
 set -u
 PROC=${KARMAX_GUARD_PROC:-/proc}
+CGROUP=${KARMAX_GUARD_CGROUP:-/sys/fs/cgroup}
 INTERVAL=${KARMAX_GUARD_INTERVAL:-0.5}
 DIR=$(cd "$(dirname "$0")" && pwd)
 PIDFILE=$DIR/memory-guard.pid
@@ -29,9 +31,33 @@ read_meminfo() {
   while read -r key value _; do
     case $key in MemTotal:) total_kb=$value ;; MemAvailable:) avail_kb=$value ;; esac
   done < "$PROC/meminfo"
+  read_cgroup
   limit_kb=$((total_kb / 20))
   [ "$limit_kb" -lt 65536 ] && limit_kb=65536
   [ "$limit_kb" -gt 262144 ] && limit_kb=262144
+}
+
+# A container (Daytona) sees the host's memory in meminfo; its own limit is
+# the cgroup's. Use it when it is the tighter one: usage minus reclaimable
+# page cache (inactive_file) is what the kernel cannot give back.
+read_cgroup() {
+  [ -r "$CGROUP/memory.max" ] && [ -r "$CGROUP/memory.current" ] || return 0
+  read -r max_b < "$CGROUP/memory.max" || return 0
+  case $max_b in ''|*[!0-9]*) return 0 ;; esac
+  read -r current_b < "$CGROUP/memory.current" || return 0
+  case $current_b in ''|*[!0-9]*) return 0 ;; esac
+  max_kb=$((max_b / 1024))
+  [ "$total_kb" -gt 0 ] && [ "$max_kb" -ge "$total_kb" ] && return 0
+  inactive_kb=0
+  if [ -r "$CGROUP/memory.stat" ]; then
+    while read -r key value; do
+      [ "$key" = inactive_file ] && inactive_kb=$((value / 1024))
+    done < "$CGROUP/memory.stat"
+  fi
+  total_kb=$max_kb
+  avail_kb=$((max_kb - current_b / 1024 + inactive_kb))
+  [ "$avail_kb" -lt 1 ] && avail_kb=1
+  return 0
 }
 
 low_memory() { read_meminfo; [ "$avail_kb" -gt 0 ] && [ "$avail_kb" -lt "$limit_kb" ]; }

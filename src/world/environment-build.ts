@@ -7,6 +7,7 @@ import type { ProjectEnvironmentSpec } from '../domain/types.js';
 import { environmentArtifactName } from '../util/environment-artifact.js';
 import { buildSizedTemplate, e2bTemplate, e2bWorldTemplate } from './e2b-template.js';
 import { machineShape, type MachineShape } from '../domain/computer.js';
+import { daytonaSize } from './daytona.js';
 export { environmentArtifactName } from '../util/environment-artifact.js';
 
 const pexec = promisify(execFile);
@@ -27,7 +28,8 @@ export interface EnvironmentBuildInput {
   spec: ProjectEnvironmentSpec;
   connection?: { apiKey?: string; apiUrl?: string; target?: string; template?: string };
   /** The project's machine size. E2B snapshots keep the size of the sandbox
-   * they were taken from, so the builder starts at it. */
+   * they were taken from, so the builder starts at it; Daytona bakes the
+   * covering general size into the setup snapshot. */
   resources?: { cpu?: number; memoryMb?: number; diskGb?: number };
   createBuilderSandbox?: (base: string, options: { apiKey?: string }) => Promise<BuilderSandbox>;
   ensureTemplate?: (base: string, name: string, shape: MachineShape, options: { apiKey?: string }) => Promise<{ name?: string } | void>;
@@ -125,7 +127,8 @@ async function buildDaytona(input: EnvironmentBuildInput): Promise<EnvironmentBu
     if (commands.length) image = image.runCommands(...commands);
     const name = environmentArtifactName(input.projectId, input.digest, input.buildId);
     await input.assertActive?.();
-    await daytona.snapshot.create({ name, image }, { timeout: 45 * 60 });
+    const { cpu, memory, disk } = daytonaSize(input.resources);
+    await daytona.snapshot.create({ name, image, resources: { cpu, memory, disk } }, { timeout: 45 * 60 });
     return { ref: name };
   } catch (error) {
     if (error instanceof DaytonaAuthorizationError)

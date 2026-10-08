@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { DaytonaWorldProvider, type DaytonaFactory, type DaytonaSandboxLike } from '../src/world/daytona.js';
+import { spawnSync } from 'node:child_process';
+import { DaytonaWorldProvider, daytonaSize, provisionTarget, type DaytonaFactory, type DaytonaSandboxLike } from '../src/world/daytona.js';
 
 describe('Daytona cloud world provider', () => {
   it('rejects an unauthenticated legacy sandbox ID before any provider operation (WD-30)', async () => {
@@ -84,7 +85,7 @@ describe('Daytona cloud world provider', () => {
         async deleteSession() { sessionDeleted++; },
         async createPty(options: any) {
           ptyData = options.onData;
-          return { async waitForConnection() {}, async sendInput(value: string) { ptyInput += value; },
+          return { async waitForConnection() {}, async sendInput(value: string | Uint8Array) { ptyInput += typeof value === 'string' ? value : new TextDecoder().decode(value); },
             async resize(cols: number, rows: number) { size = { cols, rows }; }, wait: () => new Promise(() => {}), async kill() {} };
         },
       },
@@ -225,12 +226,15 @@ describe('Daytona cloud world provider', () => {
 
   it('keeps the snapshot size and says so when this Daytona cannot resize', async () => {
     const sandbox = fakeSandbox();
-    Object.assign(sandbox, { cpu: 4, memory: 2, disk: 10, gpu: 0, resize: async () => { throw new Error('resize is not implemented'); } });
+    const resized: object[] = [];
+    Object.assign(sandbox, { cpu: 4, memory: 2, disk: 10, gpu: 0,
+      resize: async (change: object) => { resized.push(change); throw new Error('resize is not implemented'); } });
     const world = await new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox }).create({
       taskId: 'size', base: 'main', resources: { cpu: 2, memoryMb: 4096, diskGb: 5, gpu: 0 },
     });
+    // Grow only: the extra CPU and disk are kept, only the missing memory is asked for.
+    expect(resized).toEqual([{ memory: 4 }]);
     expect(world.handle.warnings).toEqual([
-      'Daytona cannot shrink a disk: this computer keeps the snapshot\'s 10 GB.',
       expect.stringMatching(/runs at the Daytona snapshot's size \(4 CPU · 2 GB · 10 GB disk\): resize is not implemented/),
     ]);
   });
@@ -472,6 +476,210 @@ describe('Daytona cloud world provider', () => {
     const code = await new Promise<number | null>((resolve) => pty.onExit(resolve));
     expect(code).toBe(29);
   });
+
+  // Task #514: Daytona's toolbox closes the PTY socket on any input frame over
+  // 64 KiB, and the Claude SDK's initialize line (system prompt + tool
+  // manifests) is larger than that.
+  it('splits a large PTY write into ordered frames no larger than 32 KiB', async () => {
+    const frames: Uint8Array[] = [];
+    const sandbox = fakeSandbox();
+    sandbox.process.createPty = async () => ({
+      async waitForConnection() {}, wait: () => new Promise(() => {}),
+      async sendInput(value: string | Uint8Array) { frames.push(typeof value === 'string' ? new TextEncoder().encode(value) : value); },
+      async resize() {}, async kill() {},
+    });
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'large-input', base: 'main' });
+    const pty = await world.openPty();
+    const line = `${JSON.stringify({ type: 'control_request', prompt: 'é'.repeat(50_000) + 'x'.repeat(40_000) })}\n`;
+    await Promise.all([pty.write(line), pty.write('next\n')]);
+    expect(frames.length).toBeGreaterThan(2);
+    expect(Math.max(...frames.map((frame) => frame.byteLength))).toBeLessThanOrEqual(32 * 1024);
+    expect(Buffer.concat(frames).toString('utf8')).toBe(`${line}next\n`);
+  });
+
+  it('reports a PTY socket closed without an exit status as a lost connection, not exit 0', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.createPty = async () => ({
+      async waitForConnection() {}, async wait() { return { exitCode: undefined, error: undefined }; },
+      async sendInput() {}, async resize() {}, async kill() {},
+    });
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'lost-pty', base: 'main' });
+    const pty = await world.openPty();
+    const [code, termination] = await new Promise<[number | null, any]>((resolve) =>
+      pty.onExit((exitCode, ending) => resolve([exitCode, ending])));
+    expect(code).toBeNull();
+    expect(termination?.lost).toBeInstanceOf(Error);
+    expect(termination.lost.message).toContain('without an exit status');
+  });
+
+  it('reattaches a dropped PTY socket to the still-running session and keeps its output and input', async () => {
+    const sandbox = fakeSandbox();
+    const inputs: string[] = [];
+    let drop!: () => void;
+    let created: any;
+    sandbox.process.createPty = async (options: any) => {
+      created = options;
+      return { async waitForConnection() {}, async resize() {}, async kill() {},
+        async sendInput(value: Uint8Array) { inputs.push(`first:${new TextDecoder().decode(value)}`); },
+        wait: () => new Promise((resolve) => { drop = () => resolve({ exitCode: undefined }); }) };
+    };
+    const connects: string[] = [];
+    (sandbox.process as any).connectPty = async (id: string, options: any) => {
+      connects.push(id);
+      queueMicrotask(() => options.onData(new TextEncoder().encode('after')));
+      return { async waitForConnection() {}, async resize() {}, async kill() {},
+        async sendInput(value: Uint8Array) { inputs.push(`second:${new TextDecoder().decode(value)}`); },
+        wait: () => new Promise((resolve) => setTimeout(() => resolve({ exitCode: 5 }), 20)) };
+    };
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'reattach', base: 'main' });
+    const pty = await world.openPty({ command: 'exec agent' });
+    let output = '';
+    pty.onData((chunk) => { output += chunk; });
+    const exited = new Promise<[number | null, any]>((resolve) => pty.onExit((code, ending) => resolve([code, ending])));
+    created.onData(new TextEncoder().encode('before|'));
+    drop();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await pty.write('ping\n');
+    expect(await exited).toEqual([5, undefined]);
+    expect(connects).toEqual([created.id]);
+    expect(output).toBe('before|after');
+    expect(inputs).toEqual(['first:exec agent\n', 'second:ping\n']);
+  });
+
+  it('stops reattaching after three drops in ten minutes and reports the connection lost', async () => {
+    const sandbox = fakeSandbox();
+    const drops = () => ({ async waitForConnection() {}, async resize() {}, async kill() {}, async sendInput() {},
+      async wait() { return { exitCode: undefined, error: 'socket closed' }; } });
+    sandbox.process.createPty = async () => drops();
+    let connects = 0;
+    (sandbox.process as any).connectPty = async () => { connects++; return drops(); };
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'reattach-limit', base: 'main' });
+    const pty = await world.openPty();
+    const [code, ending] = await new Promise<[number | null, any]>((resolve) => pty.onExit((c, e) => resolve([c, e])));
+    expect(connects).toBe(3);
+    expect(code).toBeNull();
+    expect(ending.lost.message).toContain('socket closed');
+  });
+
+  it('never reattaches a PTY that karmax closed', async () => {
+    const sandbox = fakeSandbox();
+    let drop!: () => void;
+    sandbox.process.createPty = async () => ({ async waitForConnection() {}, async resize() {}, async sendInput() {},
+      async kill() { drop(); }, async disconnect() {},
+      wait: () => new Promise((resolve) => { drop = () => resolve({ exitCode: undefined }); }) });
+    const connectPty = vi.fn();
+    (sandbox.process as any).connectPty = connectPty;
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'closed', base: 'main' });
+    const pty = await world.openPty();
+    const exited = new Promise((resolve) => pty.onExit(resolve));
+    await pty.close();
+    await exited;
+    expect(connectPty).not.toHaveBeenCalled();
+  });
+
+  // Daytona's execute API returns stdout and stderr merged into one `result`.
+  it('returns stdout and stderr separately although Daytona merges them', async () => {
+    const sandbox = fakeSandbox();
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'stderr', base: 'main' });
+    sandbox.process.executeCommand = async (command: string) => mergedShell(command);
+    expect(await world.exec('sh', ['-c', 'printf abc; printf XYZ >&2; printf def; exit 4']))
+      .toEqual({ stdout: 'abcdef', stderr: 'XYZ', code: 4 });
+    expect(await world.exec('printf', ['%s', 'only-out'])).toEqual({ stdout: 'only-out', stderr: '', code: 0 });
+    expect(await world.exec('sh', ['-c', 'printf "a\\nKARMAX_ERR"; printf "e\\0f" >&2'])).toEqual({ stdout: 'a\nKARMAX_ERR', stderr: 'e\0f', code: 0 });
+  });
+
+  it('separates stderr from stdout during trusted provisioning', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.executeCommand = async (command: string) => mergedShell(command);
+    expect(await provisionTarget(sandbox).run("echo 'warning: x' >&2; echo out; exit 2", 10_000))
+      .toEqual({ stdout: 'out\n', stderr: 'warning: x\n', code: 2 });
+  });
+
+  it('sizes a world from Daytona\'s general snapshots, defaulting to E2B\'s 2 vCPU / 2 GB', async () => {
+    expect(daytonaSize(undefined)).toMatchObject({ snapshot: 'daytona-medium', cpu: 2, memory: 4 });
+    expect(daytonaSize({ cpu: 1, memoryMb: 1024 })).toMatchObject({ snapshot: 'daytona-small', cpu: 1, memory: 1 });
+    expect(daytonaSize({ cpu: 2, memoryMb: 2048 })).toMatchObject({ snapshot: 'daytona-medium' });
+    expect(daytonaSize({ cpu: 1, memoryMb: 6144 })).toMatchObject({ snapshot: 'daytona-large', cpu: 4, memory: 8 });
+    expect(daytonaSize({ cpu: 16, memoryMb: 65536 })).toMatchObject({ snapshot: 'daytona-large' });
+    const created: any[] = [];
+    const sandbox = fakeSandbox();
+    Object.assign(sandbox, { cpu: 2, memory: 4 });
+    const provider = new DaytonaWorldProvider({ create: async (options) => { created.push(options); return sandbox; }, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'sized', base: 'main', resources: { cpu: 2, memoryMb: 2048 } });
+    expect(created[0]).toMatchObject({ snapshot: 'daytona-medium' });
+    expect(world.handle.warnings ?? []).toEqual([]);
+    await provider.create({ taskId: 'sized-default', base: 'main' });
+    expect(created[1]).toMatchObject({ snapshot: 'daytona-medium' });
+  });
+
+  it('keeps an explicitly configured snapshot and warns only when it is smaller than requested', async () => {
+    const created: any[] = [];
+    const sandbox = fakeSandbox();
+    Object.assign(sandbox, { cpu: 1, memory: 1 });
+    const provider = new DaytonaWorldProvider({ create: async (options) => { created.push(options); return sandbox; }, get: async () => sandbox },
+      undefined, 'custom-snapshot');
+    const small = await provider.create({ taskId: 'custom', base: 'main', resources: { cpu: 2, memoryMb: 2048 } });
+    expect(created[0]).toMatchObject({ snapshot: 'custom-snapshot' });
+    expect(small.handle.warnings?.[0]).toContain("runs at the Daytona snapshot's size (1 CPU · 1 GB");
+    Object.assign(sandbox, { cpu: 4, memory: 8 });
+    const large = await provider.create({ taskId: 'custom-large', base: 'main', resources: { cpu: 2, memoryMb: 2048 } });
+    expect(large.handle.warnings ?? []).toEqual([]);
+  });
+
+  it('falls back to Daytona\'s default when a general size snapshot is unavailable', async () => {
+    const created: any[] = [];
+    const sandbox = fakeSandbox();
+    const provider = new DaytonaWorldProvider({ create: async (options) => {
+      created.push(options);
+      if (options.snapshot) throw Object.assign(new Error('Snapshot daytona-medium not found'), { statusCode: 404 });
+      return sandbox;
+    }, get: async () => sandbox });
+    await provider.create({ taskId: 'fallback', base: 'main' });
+    expect(created.map((options) => options.snapshot)).toEqual(['daytona-medium', undefined]);
+  });
+
+  it('explains a failure from Daytona\'s minute-granular memory metrics without crying stall', async () => {
+    const sandbox = fakeSandbox();
+    const now = Date.parse('2026-10-07T08:12:00Z');
+    let samples: Array<{ timestamp: Date; memUsed: number; memTotal: number }> = [];
+    (sandbox as any).getMetrics = async (start: Date, end: Date) => {
+      expect(end.getTime()).toBe(now);
+      expect(start.getTime()).toBeLessThan(now);
+      return samples;
+    };
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'diagnose', base: 'main' });
+    const gib = 2 ** 30;
+    samples = [{ timestamp: new Date('2026-10-07T08:09:00Z'), memUsed: 0.5 * gib, memTotal: 4 * gib },
+      { timestamp: new Date('2026-10-07T08:10:00Z'), memUsed: 0.6 * gib, memTotal: 4 * gib }];
+    expect(await world.diagnose!({ since: now - 10 * 60_000, now })).toBeUndefined();
+    samples = [...samples, { timestamp: new Date('2026-10-07T08:11:00Z'), memUsed: 3.95 * gib, memTotal: 4 * gib }];
+    expect(await world.diagnose!({ since: now - 10 * 60_000, now })).toMatchObject({ memoryExhausted: true,
+      summary: expect.stringContaining('of 4096 MB') });
+    (sandbox as any).getMetrics = async () => { throw new Error('telemetry down'); };
+    expect(await world.diagnose!({ since: now - 10 * 60_000, now })).toBeUndefined();
+  });
+
+  it('keeps a real zero exit status as exit 0', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.createPty = async () => ({
+      async waitForConnection() {}, async wait() { return { exitCode: 0 }; },
+      async sendInput() {}, async resize() {}, async kill() {},
+    });
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'zero-exit', base: 'main' });
+    const pty = await world.openPty();
+    const [code, termination] = await new Promise<[number | null, any]>((resolve) =>
+      pty.onExit((exitCode, ending) => resolve([exitCode, ending])));
+    expect(code).toBe(0);
+    expect(termination).toBeUndefined();
+  });
 });
 
 function fakeSandbox(): DaytonaSandboxLike {
@@ -483,4 +691,10 @@ function fakeSandbox(): DaytonaSandboxLike {
     getUserHomeDir: async () => '/home/daytona', getSignedPreviewUrl: async () => ({ url: 'https://invalid/' }),
     start: async () => {}, stop: async () => {}, archive: async () => {}, delete: async () => {},
   };
+}
+
+/** Daytona's execute API: run through a shell, stdout and stderr merged. */
+function mergedShell(command: string) {
+  const run = spawnSync('sh', ['-c', `exec 2>&1; ${command}`], { encoding: 'utf8' });
+  return { exitCode: run.status ?? -1, result: run.stdout };
 }

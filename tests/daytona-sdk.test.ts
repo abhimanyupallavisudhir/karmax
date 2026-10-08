@@ -28,6 +28,15 @@ describe('Daytona SDK boundary', () => {
     expect(sdk.dispose).toHaveBeenCalledTimes(2);
   });
 
+  it('builds setup snapshots at the size task worlds use', async () => {
+    sdk.create.mockResolvedValueOnce(undefined);
+    await buildEnvironment({ provider: 'daytona', projectId: 'project', digest: 'sized', spec: {}, resources: { cpu: 2, memoryMb: 2048 } });
+    expect(sdk.create).toHaveBeenCalledWith(expect.objectContaining({ resources: { cpu: 2, memory: 4, disk: 8 } }), { timeout: 2700 });
+    sdk.create.mockResolvedValueOnce(undefined);
+    await buildEnvironment({ provider: 'daytona', projectId: 'project', digest: 'large', spec: {}, resources: { cpu: 4, memoryMb: 8192 } });
+    expect(sdk.create).toHaveBeenLastCalledWith(expect.objectContaining({ resources: { cpu: 4, memory: 8, disk: 10 } }), { timeout: 2700 });
+  });
+
   it('explains missing snapshot permissions and disposes the build client', async () => {
     const { DaytonaAuthorizationError } = await import('@daytona/sdk');
     sdk.create.mockRejectedValueOnce(new DaytonaAuthorizationError('Access denied'));
@@ -73,7 +82,7 @@ describe('Daytona SDK boundary', () => {
       connection: { apiKey: 'secret' },
     })).rejects.toThrow('build failed');
     expect(sdk.create).toHaveBeenCalledWith({ name: 'tavya-env-project-abc',
-      image: { base: 'ubuntu:24.04', commands: ['echo built'] } }, { timeout: 2700 });
+      image: { base: 'ubuntu:24.04', commands: ['echo built'] }, resources: { cpu: 2, memory: 4, disk: 8 } }, { timeout: 2700 });
     expect(sdk.dispose).toHaveBeenCalledOnce();
   });
 });
