@@ -80,6 +80,22 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
   expect(v.stage).toBe('review');
   expect(v.participants.map((p: any) => p.key)).toEqual(['do', 'agent-1']);
   if (shots) await page.screenshot({ path: path.join(shots, 'conversation.png'), fullPage: false });
+
+  // Stop, like Ctrl+C: the working agent's turn ends and the task goes on.
+  // (Unaddressed text replies to Agent 1, which just answered you.)
+  await box.fill('Take your time.\n@sleep 120000');
+  await page.locator('.followup-box[data-role="do"] .followup-send').click();
+  const stop = page.locator('.followup-box[data-role="do"] .followup-stop');
+  await step('Stop appears while the agent works', () => stop.waitFor({ timeout: 60_000 }));
+  expect(await stop.getAttribute('title')).toBe('Stop Agent 1');
+  if (shots) await page.screenshot({ path: path.join(shots, 'stop-button.png'), fullPage: false });
+  await stop.click();
+  await step('the thread says who stopped it', () => page.locator('.msg.system').filter({ hasText: 'Ann Author stopped Agent 1.' }).waitFor({ timeout: 30_000 }));
+  await step('Stop is gone', () => stop.waitFor({ state: 'detached' }));
+  const after = await consoleRequest(context, app.url, 'GET', `/api/tasks/${task.id}`);
+  expect(after.stage).toBe('review');
+  expect(after.participants.map((p: any) => p.state)).toEqual(['idle', 'idle']);
+  if (shots) await page.screenshot({ path: path.join(shots, 'stopped.png'), fullPage: false });
   expect(errors).toEqual([]);
   await context.close();
 }, 240_000);
