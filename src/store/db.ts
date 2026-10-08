@@ -638,6 +638,10 @@ export class Store {
         priority INTEGER NOT NULL, state TEXT NOT NULL, createdAt INTEGER NOT NULL,
         acquiredAt INTEGER, releasedAt INTEGER
       );
+      CREATE TABLE IF NOT EXISTS service_usage_counts (
+        meter TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (meter, day)
+      );
       CREATE TABLE IF NOT EXISTS usage_events (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT, taskId TEXT,
         worldId TEXT, provider TEXT NOT NULL, kind TEXT NOT NULL, quantity REAL NOT NULL,
@@ -681,7 +685,7 @@ export class Store {
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, generation INTEGER NOT NULL,
         port INTEGER NOT NULL, public INTEGER NOT NULL, tokenHash TEXT, runnerLeaseId TEXT,
         provider TEXT NOT NULL, createdBy TEXT NOT NULL, createdAt INTEGER NOT NULL,
-        expiresAt INTEGER NOT NULL, revokedAt INTEGER, hostname TEXT
+        expiresAt INTEGER NOT NULL, revokedAt INTEGER, hostname TEXT, tlsRequestedAt INTEGER
       );
       CREATE TABLE IF NOT EXISTS inbox (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT NOT NULL,
@@ -1033,6 +1037,7 @@ export class Store {
     if (!invitationCols.some((c) => c.name === 'authorizationJson')) (await this.db.exec('ALTER TABLE organization_invitations ADD COLUMN authorizationJson TEXT'));
     const previewCols = (await this.db.prepare('PRAGMA table_info(preview_leases)').all()) as any[];
     if (!previewCols.some((c) => c.name === 'hostname')) (await this.db.exec('ALTER TABLE preview_leases ADD COLUMN hostname TEXT'));
+    if (!previewCols.some((c) => c.name === 'tlsRequestedAt')) (await this.db.exec('ALTER TABLE preview_leases ADD COLUMN tlsRequestedAt INTEGER'));
     const usageCols = (await this.db.prepare('PRAGMA table_info(usage_events)').all()) as { name: string }[];
     if (!usageCols.some((c) => c.name === 'fundingSource'))
       (await this.db.exec("ALTER TABLE usage_events ADD COLUMN fundingSource TEXT NOT NULL DEFAULT 'customer'"));
@@ -4723,6 +4728,38 @@ export class Store {
     });
   }
 
+  /** The installation operators' service-limit alerts, as a whole set: rows
+   * no longer in it are withdrawn (usage dropped, a probe recovered, a new
+   * period began). `deliver` pushes a newly inserted row to the person's
+   * browser/Slack channels; a row re-inserted for a level already announced in
+   * this period (dropping from 95% back to 80%) is shown without a push. */
+  async syncServiceLimitInbox(entries: Array<{ userId: string; organizationId: string; key: string;
+    urgency: 'normal' | 'high' | 'critical'; subject: Record<string, unknown>; deliver: boolean }>, createdAt = Date.now()): Promise<void> {
+    return this.db.transaction(async () => {
+      const rows = new Map(entries.map((entry) => [`inbox_limit_${crypto.createHash('sha256')
+        .update(JSON.stringify([entry.userId, entry.organizationId, entry.key])).digest('hex').slice(0, 24)}`, entry]));
+      const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE json_extract(subject, '$.kind')='service-limit'`)
+        .all()) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !rows.has(id));
+      if (stale.length) {
+        (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+        (await deleteRows(this.db, 'inbox', 'id', stale));
+      }
+      for (const [id, entry] of rows) {
+        const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+          (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
+          VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
+          id, entry.organizationId, entry.userId, createdAt * 1000, `service-limit:${entry.key}`, urgencyRank(entry.urgency), createdAt,
+          JSON.stringify({ ...entry.subject, kind: 'service-limit' })));
+        if (!Number(inserted.changes) || !entry.deliver) continue;
+        const preferences = (await this.getDeliveryPreferences(entry.userId, entry.organizationId));
+        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
+          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+            .run(newId('delivery'), id, channel, createdAt, createdAt));
+      }
+    });
+  }
+
   async removeAuthorizationInbox(requestId: string): Promise<void> {
     (await this.deleteInbox("kind='approval-requested' AND json_extract(subject, '$.requestId')=?", [requestId]));
   }
@@ -7282,6 +7319,49 @@ export class Store {
       ORDER BY createdAt`).all()) as any[];
   }
 
+  /** Count one use of an operator account that tavya itself drives (an email
+   * sent, a Composio tool call, a preview certificate), in a UTC-day bucket.
+   * These are the service-limits page's own counts where a provider's API
+   * cannot report usage. */
+  async countServiceUsage(meter: string, at = Date.now(), n = 1): Promise<void> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare(`INSERT INTO service_usage_counts (meter, day, count) VALUES (?, ?, ?)
+        ON CONFLICT(meter, day) DO UPDATE SET count = service_usage_counts.count + excluded.count`)
+        .run(meter, new Date(at).toISOString().slice(0, 10), n));
+    });
+  }
+
+  /** The sum of a counted meter's buckets from `fromDay` (YYYY-MM-DD, UTC) on. */
+  async serviceUsageSince(meter: string, fromDay: string): Promise<number> {
+    const row = (await this.db.prepare('SELECT SUM(count) AS n FROM service_usage_counts WHERE meter=? AND day>=?')
+      .get(meter, fromDay)) as { n: number | null } | undefined;
+    return Number(row?.n ?? 0);
+  }
+
+  async pruneServiceUsage(beforeDay: string): Promise<void> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare('DELETE FROM service_usage_counts WHERE day<?').run(beforeDay));
+    });
+  }
+
+  /** Seconds of `world.active` metered for one organization and provider that
+   * started since `since` (by start time, so idx_usage_org_time serves it). */
+  async worldActiveSeconds(organizationId: string, provider: string, since: number): Promise<number> {
+    const row = (await this.db.prepare(`SELECT SUM(quantity) AS seconds FROM usage_events
+      WHERE organizationId=? AND startedAt>=? AND provider=? AND kind='world.active'`)
+      .get(organizationId, since, provider)) as { seconds: number | null } | undefined;
+    return Number(row?.seconds ?? 0);
+  }
+
+  /** PostgreSQL's server-wide connection use against `max_connections`;
+   * undefined on SQLite, which has no connection limit. */
+  async databaseConnections(): Promise<{ used: number; max: number } | undefined> {
+    if (this.db.dialect !== 'postgres') return undefined;
+    const row = (await this.db.prepare(`SELECT COUNT(*) AS used, current_setting('max_connections') AS allowed FROM pg_stat_activity`)
+      .get()) as { used: number | string; allowed: number | string };
+    return { used: Number(row.used), max: Number(row.allowed) };
+  }
+
   async recordedUsageEventIds(ids: string[]): Promise<Set<string>> {
     const recorded = new Set<string>();
     for (let offset = 0; offset < ids.length; offset += 500) {
@@ -7843,6 +7923,18 @@ export class Store {
     if (!hostname) return false;
     return Boolean((await this.db.prepare(`SELECT 1 FROM preview_leases
       WHERE hostname=? AND expiresAt>? LIMIT 1`).get(hostname.toLowerCase(), now - PREVIEW_TLS_GRACE_MS)));
+  }
+
+  /** Caddy asked to issue a certificate for a live preview hostname. Each
+   * hostname is counted once, toward Let's Encrypt's weekly limit of new
+   * certificates per registered domain; a lease's later asks are renewals or
+   * retries of the same request. */
+  async recordPreviewCertificateRequest(hostname: string, now = Date.now()): Promise<void> {
+    return this.db.transaction(async () => {
+      const first = (await this.db.prepare('UPDATE preview_leases SET tlsRequestedAt=? WHERE hostname=? AND tlsRequestedAt IS NULL')
+        .run(now, hostname.toLowerCase()));
+      if (Number(first.changes)) (await this.countServiceUsage('letsencrypt.certificates', now));
+    });
   }
 
   // ─── Cards (payment resources; SPEC §7.6) ────────────────────────────────────

@@ -18,10 +18,8 @@ it('bounds labels, omits sensitive URL values, and counts completion/abort only 
 });
 
 it('reports heap used and limit for the gateway, the worker child and its workflow thread (RT-35)', () => {
-  const metrics = new GatewayMetrics(() => ({
-    worker: { heapUsed: 300, heapLimit: 2048, rss: 900, workflowHeap: { heapUsed: 40, heapLimit: 1024 },
-      workflowCache: { cached: 120, limit: 125, shrinks: 1 } },
-  }));
+  const metrics = new GatewayMetrics(() => ({ separate: true, heap: { usedBytes: 300, limitBytes: 2048, at: Date.now(), rssBytes: 900,
+    workflows: { usedBytes: 40, limitBytes: 1024 }, workflowCache: { cached: 120, limit: 125, shrinks: 1 } } }));
   try {
     const output = metrics.prometheus();
     expect(output).toMatch(/^karmax_heap_used_bytes\{heap="gateway"\} [1-9]\d+$/m);
@@ -41,8 +39,8 @@ it('reports heap used and limit for the gateway, the worker child and its workfl
 });
 
 it('reports an in-process worker as the gateway\'s workflow thread', () => {
-  const metrics = new GatewayMetrics(() => ({ inProcess: { workflowHeap: { heapUsed: 5, heapLimit: 6 },
-    workflowCache: { cached: 2, limit: 20, shrinks: 0 } } }));
+  const metrics = new GatewayMetrics(() => ({ separate: false, heap: { usedBytes: 1, limitBytes: 2, at: Date.now(),
+    workflows: { usedBytes: 5, limitBytes: 6 }, workflowCache: { cached: 2, limit: 20, shrinks: 0 } } }));
   try {
     const output = metrics.prometheus();
     expect(output).toContain('karmax_heap_used_bytes{heap="workflows"} 5\n');
@@ -52,7 +50,8 @@ it('reports an in-process worker as the gateway\'s workflow thread', () => {
 });
 
 it('omits the worker series when the child has not reported recently', () => {
-  const metrics = new GatewayMetrics(() => ({}));
+  const metrics = new GatewayMetrics(() => ({ separate: true, heap: { usedBytes: 300, limitBytes: 2048, at: Date.now() - 120_000,
+    workflows: { usedBytes: 40, limitBytes: 1024 } } }));
   try {
     const output = metrics.prometheus();
     expect(output).toContain('karmax_heap_used_bytes{heap="gateway"}');

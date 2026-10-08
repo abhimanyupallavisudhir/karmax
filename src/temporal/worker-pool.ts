@@ -1,10 +1,10 @@
+import { heapNow, type WorkerHeap } from './worker-process.js';
 import type { WorkflowBundle } from '@temporalio/worker';
 import { TemporalConn } from './config.js';
 import { ActivityDeps } from '../activities/index.js';
 import { makeWorker, workflowCacheSize, WorkerHandle, WorkerStatus } from './worker.js';
 import { buildVersionedBundle, ExternalWorkflowRef } from '../packages/bundle.js';
 import { governorConfig, governWorkflowCache, type GovernorState } from './heap-governor.js';
-import type { ProcessMemory } from '../runtime/memory-budget.js';
 
 /** Let the supervisor restart the service instead of serving without a poller. */
 export function terminateOnWorkerFailure(error: unknown): void {
@@ -64,6 +64,10 @@ export class WorkerManager {
     });
   }
 
+  /** This process hosts the activities, so its own heap is the worker's;
+   * with the workflow thread's heap and cache as of the last check (RT-35). */
+  get heap(): WorkerHeap { return heapNow(this.status()); }
+
   /** Currently-registered external packages (version-qualified). */
   get packages(): ExternalWorkflowRef[] {
     return [...this.externals];
@@ -120,11 +124,11 @@ export class WorkerManager {
   }
 
   /** The live worker's cache and workflow heap as of the last check (RT-35). */
-  status(): Pick<ProcessMemory, 'workflowCache' | 'workflowHeap'> {
+  status(): Pick<WorkerHeap, 'workflows' | 'workflowCache'> {
     const status = this.lastStatus;
     if (!status) return {};
     return { workflowCache: { cached: status.cachedWorkflows, limit: this.cache.limit, shrinks: this.shrinks },
-      ...(status.workflowHeap ? { workflowHeap: status.workflowHeap } : {}) };
+      ...(status.workflowHeap ? { workflows: { usedBytes: status.workflowHeap.heapUsed, limitBytes: status.workflowHeap.heapLimit } } : {}) };
   }
 
   /** Shrink the sticky cache when the workflow thread's heap is under

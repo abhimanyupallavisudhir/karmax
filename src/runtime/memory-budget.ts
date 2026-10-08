@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import os from 'node:os';
-import v8 from 'node:v8';
 import { fileURLToPath } from 'node:url';
 
 /**
@@ -71,21 +70,6 @@ export interface WorkflowCacheStatus {
 }
 
 export interface HeapUsage { heapUsed: number; heapLimit: number }
-
-/** What /api/metrics reports for one Node process: its main heap, and if it
- * hosts the worker, the workflow thread's separate heap and the cache in it. */
-export interface ProcessMemory extends HeapUsage {
-  rss: number;
-  workflowHeap?: HeapUsage;
-  workflowCache?: WorkflowCacheStatus;
-}
-
-export function processMemory(worker: Pick<ProcessMemory, 'workflowHeap' | 'workflowCache'> = {}): ProcessMemory {
-  const heap = v8.getHeapStatistics();
-  return { heapUsed: heap.used_heap_size, heapLimit: heap.heap_size_limit, rss: process.memoryUsage.rss(),
-    ...(worker.workflowHeap ? { workflowHeap: worker.workflowHeap } : {}),
-    ...(worker.workflowCache ? { workflowCache: worker.workflowCache } : {}) };
-}
 
 export function separateWorkerMode(env: NodeJS.ProcessEnv = process.env): boolean {
   return (env.KARMAX_WORKER_MODE ?? 'combined') === 'process';

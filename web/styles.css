@@ -3096,6 +3096,68 @@ html[data-theme="dark"] .github-signin-btn:active,
 .storage-project .storage-item { padding-left: 14px; font-size: .92em; color: var(--ink-2); }
 .storage-project .storage-item > span:first-child { flex: 1; }
 
+/* Installation → Service limits. One row per measure; every row shares the
+   same columns so bars line up. The track is scored at 80% and 95%, where
+   alerts fire, and a tick marks the 7-day high when it is above today. */
+.service-limits { padding: 10px 16px 6px; container-type: inline-size; }
+.limits-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 8px; }
+.limits-head .info-dot { margin-left: 2px; vertical-align: -2px; }
+.limits-head .btn { flex: none; white-space: nowrap; }
+.limits-row { display: grid; grid-template-columns: 9rem minmax(10rem, 1fr) minmax(13rem, 1.3fr) 5.5rem;
+  column-gap: 14px; align-items: start; padding: 7px 0; border-top: 1px solid var(--line); font-size: 13px; line-height: 20px; }
+.limits-row.cont { border-top-color: transparent; padding-top: 0; }
+.limits-row > * { min-width: 0; }
+.limits-service { overflow-wrap: anywhere; }
+.limits-name.info-dot { color: var(--ink); font-weight: 600; }
+.limits-off .info-dot { vertical-align: -2px; }
+.limits-plan { display: block; color: var(--ink-3); font-size: 11.5px; line-height: 16px; }
+.limits-failed { display: block; color: var(--danger); font-size: 11.5px; line-height: 16px; }
+.limits-measure { color: var(--ink-2); }
+/* The measure's own name opens its explanation (hover, or tap on a phone). */
+.limits-label.info-dot { display: inline; width: auto; height: auto; border-radius: 0; background: none; color: inherit;
+  font-size: inherit; line-height: inherit; text-align: left; cursor: help; }
+.limits-label.info-dot:hover { color: var(--ink); }
+.limits-source { margin-left: 3px; color: var(--ink-3); font: 10.5px/1.2 var(--font-mono); white-space: nowrap; cursor: help; }
+.limits-usage, .limits-actions { min-height: 20px; }
+.limits-usage { display: flex; align-items: center; gap: 8px; }
+.limits-bar { position: relative; flex: 1 1 auto; min-width: 48px; height: 6px; border-radius: 999px; background: var(--line); }
+.limits-bar > i { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.limits-bar::before, .limits-bar::after { content: ""; position: absolute; top: 0; bottom: 0; width: 2px; background: var(--surface); }
+.limits-bar::before { left: calc(80% - 1px); }
+.limits-bar::after { left: calc(95% - 1px); }
+.limits-peak { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--ink-3); }
+.limits-row[data-level="80"] .limits-bar > i { background: var(--working); }
+.limits-row[data-level="95"] .limits-bar > i { background: var(--danger); }
+.limits-numbers { color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.limits-limit { color: var(--ink-2); }
+.limits-limit.entered { text-decoration: underline dotted; text-underline-offset: 3px; }
+.limits-level { min-width: 3.4em; padding: 1px 5px; border-radius: 4px; color: var(--ink-3); font-size: 11px;
+  font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.limits-level.warn { background: var(--working-weak); color: var(--ink); }
+.limits-level.critical { background: var(--danger-weak); color: var(--ink); font-weight: 600; }
+.limits-none, .limits-off { color: var(--ink-3); }
+.limits-row.off { grid-template-columns: 9rem 1fr 5.5rem; }
+.limits-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; white-space: nowrap; }
+.limits-actions a { color: var(--accent); text-decoration: none; }
+.limits-actions a:hover { text-decoration: underline; }
+.limits-edit { padding: 0 2px; border: 0; background: none; color: var(--ink-3); font: inherit; cursor: pointer; }
+.limits-edit:hover, .limits-edit:focus-visible { color: var(--accent); }
+.limits-editor { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 14px; margin: 0 0 8px; padding: 10px 12px;
+  border-radius: var(--r-sm); background: var(--surface-2); font-size: 12.5px; }
+.limits-editor label { display: flex; flex-direction: column; gap: 4px; color: var(--ink-2); }
+.limits-editor input, .limits-editor select { width: 11rem; }
+.limits-editor [data-cloudflare-account] { width: 17rem; font-family: var(--font-mono); }
+.limits-editor-actions { display: flex; gap: 6px; }
+/* Narrow cards (a phone, or a narrow settings column): name and actions, then the measure, then its bar. */
+@container (max-width: 600px) {
+  .limits-row { grid-template-columns: 1fr auto; grid-template-areas: "service actions" "measure measure" "usage usage"; row-gap: 3px; }
+  .limits-row.cont { grid-template-areas: "measure measure" "usage usage"; }
+  .limits-row.cont .limits-service, .limits-row.cont .limits-actions { display: none; }
+  .limits-row.off { grid-template-columns: 1fr auto; grid-template-areas: "service actions" "off off"; }
+  .limits-service { grid-area: service; } .limits-measure { grid-area: measure; } .limits-actions { grid-area: actions; }
+  .limits-usage { grid-area: usage; } .limits-off { grid-area: off; }
+}
+
 /* ── One conversation, several agents (software-dev ≥1.27) ───────────────── */
 .msg.agent.other-agent { background: color-mix(in srgb, var(--accent) 6%, var(--surface-2)); border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); }
 .msg-to { font-size: 11px; color: currentColor; opacity: .72; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }

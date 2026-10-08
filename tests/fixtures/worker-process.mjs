@@ -23,7 +23,7 @@ serveWorkerProcess(async () => ({
     },
     async stop() { if (mode === 'failed-stop') throw new Error('drain failed'); },
     ...(mode === 'cache-status' ? { status: () => ({ workflowCache: { cached: 3, limit: 250, shrinks: 1 },
-      workflowHeap: { heapUsed: 10, heapLimit: 20 } }) } : {}),
+      workflows: { usedBytes: 10, limitBytes: 20 } }) } : {}),
   },
   async close() {},
 }));

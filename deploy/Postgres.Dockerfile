@@ -1,12 +1,18 @@
 # PostgreSQL with WAL-G for continuous off-host backups (deploy/postgres/pg-backup.sh;
 # wiki ops/production-tavya). Same major version and data format as the stock
 # image it extends; with no backup settings it behaves exactly like it.
-ARG POSTGRES_VERSION=16
-FROM postgres:${POSTGRES_VERSION}
+# Digest-pinned like every base image; Dependabot proposes each refresh.
+FROM postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
 
-# WAL-G v3.0.9 (2026-08-20), the Ubuntu 22.04 build: glibc 2.35, which the
-# Debian bookworm base satisfies. The checksums are the release's own .sha256
-# files; a new version needs both updated.
+# The data directory's major version must match the image's: a different
+# POSTGRES_VERSION in .turnkey.env needs this file's FROM moved with it, never a
+# silent mismatch.
+ARG POSTGRES_VERSION=16
+RUN [ "$POSTGRES_VERSION" = 16 ] || { echo "Postgres.Dockerfile pins PostgreSQL 16, not $POSTGRES_VERSION" >&2; exit 1; }
+
+# WAL-G v3.0.9 (2026-08-20), the Ubuntu 22.04 build: it needs glibc 2.35, and
+# the Debian base has a newer one (trixie, 2.41, in October 2026). The checksums
+# are the release's own .sha256 files; a new version needs both updated.
 ARG TARGETARCH
 RUN set -eu; \
     case "${TARGETARCH:-amd64}" in \

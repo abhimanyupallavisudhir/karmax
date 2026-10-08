@@ -76,18 +76,18 @@ test('shrinks the workflow cache under workflow-heap pressure and keeps every wo
       taskQueue: queue, workflowId: `${name}-${crypto.randomUUID()}`, args: [name] })));
     for (const handle of handles) await handle.signal(bump, 2);
     for (const handle of handles) await expect.poll(() => handle.query(countQuery), { timeout: 10_000 }).toBe(2);
-    await expect.poll(() => worker.memory?.workflowCache, { timeout: 15_000 })
+    await expect.poll(() => worker.heap?.workflowCache, { timeout: 15_000 })
       .toEqual({ cached: expect.any(Number), limit: 10, shrinks: 1 });
-    const memory = worker.memory!;
+    const heap = worker.heap!;
     // The thread is its own isolate, sized by the same flag as its process.
-    expect(memory.workflowHeap!.heapLimit).toBeGreaterThan(500 * 2 ** 20);
-    expect(memory.workflowHeap!.heapLimit).toBeLessThan(640 * 2 ** 20);
-    expect(memory.workflowHeap!.heapUsed).toBeGreaterThan(0);
+    expect(heap.workflows!.limitBytes).toBeGreaterThan(500 * 2 ** 20);
+    expect(heap.workflows!.limitBytes).toBeLessThan(640 * 2 ** 20);
+    expect(heap.workflows!.usedBytes).toBeGreaterThan(0);
     // At the floor it stops shrinking, and the evicted workflows still work.
     for (const handle of handles) await handle.signal(bump, 3);
     for (const handle of handles) await handle.signal(finish);
     for (const handle of handles) expect(await handle.result()).toMatchObject({ count: 5 });
-    expect(worker.memory!.workflowCache).toMatchObject({ limit: 10, shrinks: 1 });
+    expect(worker.heap!.workflowCache).toMatchObject({ limit: 10, shrinks: 1 });
     await worker.stop();
     expect(worker.failure).toBeUndefined();
   } finally {
