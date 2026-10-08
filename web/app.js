@@ -6605,7 +6605,7 @@ function triggersSection(values, selfId) {
         </div>
         <span class="tb-label">Schedule ${policyTip('Cron, in UTC. Each field: * = every, */5 = every 5, 1-5 = range, 1,3 = list.')}</span>
         <div class="cron-grid">${gridCells}</div>
-        <label class="tb-label" for="trig-at">Once at</label>
+        <label class="tb-label" for="trig-at">Or once at</label>
         <input id="trig-at" type="datetime-local" value="${atVal}">
         <label class="tb-repeat"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
           Repeatable ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</label>
