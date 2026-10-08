@@ -1,8 +1,10 @@
 import type { WorkflowBundle } from '@temporalio/worker';
 import { TemporalConn } from './config.js';
 import { ActivityDeps } from '../activities/index.js';
-import { makeWorker, WorkerHandle } from './worker.js';
+import { makeWorker, workflowCacheSize, WorkerHandle, WorkerStatus } from './worker.js';
 import { buildVersionedBundle, ExternalWorkflowRef } from '../packages/bundle.js';
+import { governorConfig, governWorkflowCache, type GovernorState } from './heap-governor.js';
+import type { ProcessMemory } from '../runtime/memory-budget.js';
 
 /** Let the supervisor restart the service instead of serving without a poller. */
 export function terminateOnWorkerFailure(error: unknown): void {
@@ -34,6 +36,12 @@ export class WorkerManager {
   private stopping?: Promise<void>;
   private draining = new Set<Promise<void>>();
   private stopRequested = false;
+  private readonly governor = governorConfig(process.env, workflowCacheSize());
+  private cache: GovernorState = { limit: this.governor.configured, highStreak: 0, lastChangeAt: 0 };
+  private shrinks = 0;
+  private governing = false;
+  private governTimer?: NodeJS.Timeout;
+  private lastStatus?: WorkerStatus;
 
   /** Why the live worker stopped, if it did (see `watch`). */
   failure?: unknown;
@@ -69,6 +77,8 @@ export class WorkerManager {
       this.externals = externals;
       this.handle = await this.build(externals, bundle);
       this.runPromise = this.watch(this.handle, this.handle.run());
+      this.governTimer = setInterval(() => void this.govern(), this.governor.checkMs);
+      this.governTimer.unref();
     })();
     try { await this.starting; }
     finally { this.starting = undefined; }
@@ -76,7 +86,8 @@ export class WorkerManager {
 
   private async build(externals: ExternalWorkflowRef[], prepared?: WorkflowBundle): Promise<WorkerHandle> {
     const workflowBundle = prepared ?? await buildVersionedBundle(externals);
-    const handle = await makeWorker(this.conn, { ...this.deps, workflowBundle: () => this.bundle ?? workflowBundle }, { workflowBundle, shutdownGraceTime: '45 minutes' });
+    const handle = await makeWorker(this.conn, { ...this.deps, workflowBundle: () => this.bundle ?? workflowBundle },
+      { workflowBundle, shutdownGraceTime: '45 minutes', maxCachedWorkflows: this.cache.limit });
     this.bundle = workflowBundle;
     return handle;
   }
@@ -86,12 +97,12 @@ export class WorkerManager {
    * Serialized: overlapping refreshes would race the handle swap. Starts the new
    * worker before draining the old so the queue is never unserved.
    */
-  async refresh(externals: ExternalWorkflowRef[]): Promise<void> {
+  async refresh(externals: ExternalWorkflowRef[], prepared?: WorkflowBundle): Promise<void> {
     if (this.stopRequested) throw new Error('worker manager is stopping');
     // Chain onto any in-progress refresh so swaps stay ordered.
     const run = async () => {
       await this.starting;
-      const next = await this.build(externals);
+      const next = await this.build(externals, prepared);
       const old = this.handle;
       this.handle = next;
       const nextRun = this.watch(next, next.run());
@@ -108,10 +119,44 @@ export class WorkerManager {
     return this.refreshing;
   }
 
+  /** The live worker's cache and workflow heap as of the last check (RT-35). */
+  status(): Pick<ProcessMemory, 'workflowCache' | 'workflowHeap'> {
+    const status = this.lastStatus;
+    if (!status) return {};
+    return { workflowCache: { cached: status.cachedWorkflows, limit: this.cache.limit, shrinks: this.shrinks },
+      ...(status.workflowHeap ? { workflowHeap: status.workflowHeap } : {}) };
+  }
+
+  /** Shrink the sticky cache when the workflow thread's heap is under
+   * sustained pressure, and grow it back after a long calm (heap-governor.ts).
+   * The roll reuses the live bundle: no rebuild while memory is short. */
+  private async govern(): Promise<void> {
+    if (this.governing || this.stopRequested) return;
+    this.governing = true;
+    try {
+      const status = await this.handle?.status();
+      if (!status) return;
+      this.lastStatus = status;
+      if (!status.workflowHeap?.heapLimit) return;
+      const previous = this.cache.limit;
+      this.cache = governWorkflowCache(this.cache, { ratio: status.workflowHeap.heapUsed / status.workflowHeap.heapLimit,
+        cached: status.cachedWorkflows, now: Date.now() }, this.governor);
+      if (this.cache.limit === previous) return;
+      if (this.cache.limit < previous) this.shrinks++;
+      console.warn(`[worker] workflow heap ${Math.round(100 * status.workflowHeap.heapUsed / status.workflowHeap.heapLimit)}% `
+        + `of ${Math.round(status.workflowHeap.heapLimit / 2 ** 20)} MiB with ${status.cachedWorkflows} cached workflows: `
+        + `${this.cache.limit < previous ? 'shrinking' : 'growing'} the workflow cache from ${previous} to ${this.cache.limit}`);
+      await this.refresh(this.externals, this.bundle);
+    } catch (error) {
+      console.error('[worker] workflow cache governor failed:', error);
+    } finally { this.governing = false; }
+  }
+
   async stop(): Promise<void> {
     // Close admission synchronously, before waiting for a build/refresh. Every
     // already-accepted operation must finish before we drain the final handle.
     this.stopRequested = true;
+    clearInterval(this.governTimer);
     this.stopping ??= (async () => {
       await this.starting?.catch(() => {});
       await this.refreshing?.catch(() => {});

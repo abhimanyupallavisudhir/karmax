@@ -1,5 +1,6 @@
 import { fork, type ChildProcess } from 'node:child_process';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
+import type { ProcessMemory } from '../runtime/memory-budget.js';
 
 export interface WorkerProcessRequest {
   type: 'worker.request'; id: number; action: 'start' | 'refresh' | 'stop' | 'ping';
@@ -7,6 +8,8 @@ export interface WorkerProcessRequest {
 }
 export interface WorkerProcessReply {
   type: 'worker.reply'; id: number; ok: boolean; error?: string;
+  /** A ping's answer carries the child's heap and workflow cache (RT-35). */
+  memory?: ProcessMemory;
 }
 /** Unsolicited child → supervisor hint: events were committed to the shared store. */
 export interface WorkerProcessNotice { type: 'worker.events' }
@@ -33,6 +36,9 @@ export class WorkerProcessManager {
   private externals: ExternalWorkflowRef[] = [];
   private pending = new Map<number, { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   failure?: Error;
+  /** The child's memory as of its last heartbeat (`memoryAt`), for metrics. */
+  memory?: ProcessMemory;
+  memoryAt?: number;
 
   constructor(private options: {
     entrypoint: string;
@@ -124,6 +130,10 @@ export class WorkerProcessManager {
         if (!request) return;
         this.pending.delete(reply.id);
         clearTimeout(request.timer);
+        if (reply.memory && typeof reply.memory === 'object') {
+          this.memory = reply.memory;
+          this.memoryAt = Date.now();
+        }
         if (reply.ok) request.resolve();
         else request.reject(new Error(typeof reply.error === 'string' ? reply.error.slice(0, 2_000) : 'worker request failed'));
       });

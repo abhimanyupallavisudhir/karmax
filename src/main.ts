@@ -12,6 +12,7 @@ import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager, terminateOnWorkerFailure } from './temporal/worker-pool.js';
 import { WorkerProcessManager } from './temporal/worker-process.js';
+import { memoryBudget } from './runtime/memory-budget.js';
 import { ForeignEventRelay } from './contrib/foreign-event-relay.js';
 import { TASK_QUEUE } from './temporal/config.js';
 import { WorkflowManager } from './packages/manager.js';
@@ -300,9 +301,15 @@ async function main() {
   // rolling the worker without a restart (§21d/§21e).
   const workerEnvironment: NodeJS.ProcessEnv = { ...process.env, KARMAX_TEMPORAL_ADDRESS: conn.address,
     KARMAX_TEMPORAL_NAMESPACE: conn.namespace };
+  // One budget for the container (RT-35): the worker child's heap flag also
+  // sizes its workflow thread, a second isolate with the same limit.
+  const budget = memoryBudget({ separateWorker });
+  console.log(`  • Memory budget: ${budget.limitMb} MiB; gateway heap ${budget.gatewayHeapMb} MiB`
+    + (separateWorker ? `, worker heaps ${budget.workerHeapMb} MiB each` : ''));
   const workerManager = separateWorker ? new WorkerProcessManager({
     entrypoint: fileURLToPath(new URL('./temporal/activity-worker-main.ts', import.meta.url)),
     env: workerEnvironment,
+    execArgv: ['--import', 'tsx', `--max-old-space-size=${budget.workerHeapMb}`],
     onFailure: terminateOnWorkerFailure,
     // Deliver the child's events to browsers now, not on the relay's next poll (LT-15).
     onEvents: () => { void eventRelay?.wake(); },
@@ -349,6 +356,10 @@ async function main() {
   const remoteAccess = new RemoteAccessController({ port: () => gatewayPort });
   const gateway = (await Gateway.create({
     runtimeReady: () => startupReady && !workerManager.failure,
+    // A child report older than a few heartbeats is unknown, not current.
+    memory: () => workerManager instanceof WorkerProcessManager
+      ? (workerManager.memory && Date.now() - (workerManager.memoryAt ?? 0) < 60_000 ? { worker: workerManager.memory } : {})
+      : { inProcess: workerManager.status() },
     api,
     store,
     bus,

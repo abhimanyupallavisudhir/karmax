@@ -6,7 +6,7 @@ import { ExecutionOutput } from './execution-output.js';
 import { TaskSecrets, handleRef, paymentCardDetails, recordSecretRefs, secretScope } from '../autonomy/task-secrets.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
-import { GatewayMetrics } from './metrics.js';
+import { GatewayMetrics, type MemorySource } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
 import { SwrCache } from '../util/swr-cache.js';
@@ -114,6 +114,9 @@ import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
 export interface GatewayDeps {
   /** Primary startup/recovery and worker liveness, independent of DB health. */
   runtimeReady?: () => boolean;
+  /** The worker's memory for /api/metrics (RT-35): its child's last report,
+   * or the in-process worker's workflow heap and cache. */
+  memory?: MemorySource;
   serviceConnections?: ServiceConnections;
   api: KarmaxApi;
   store: Store;
@@ -1276,7 +1279,7 @@ export class Gateway {
   async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; internalUrl: string; port: number; close: () => Promise<void> }> {
     const port = await findFreePortFrom(preferredPort);
     const bindHost = process.env.KARMAX_HOST?.trim() || '127.0.0.1';
-    this.operationalMetrics = new GatewayMetrics();
+    this.operationalMetrics = new GatewayMetrics(this.deps.memory);
     const server = http.createServer((req, res) => {
       const finish = this.operationalMetrics!.begin(req.url ?? '/');
       res.once('finish', () => finish(res.statusCode));

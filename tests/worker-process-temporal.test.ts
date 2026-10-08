@@ -52,3 +52,48 @@ test('resumes durable workflow history in a replacement supervised worker proces
     fs.rmSync(home, { recursive: true, force: true });
   }
 }, 90_000);
+
+// RT-35: the child reports its workflow thread's heap and cache, and under
+// pressure on that heap it rolls to a smaller cache instead of aborting; the
+// evicted workflows replay on their next task and carry on.
+test('shrinks the workflow cache under workflow-heap pressure and keeps every workflow running', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-worker-process-home-'));
+  const server = await startDevServer({ headless: true, logLevel: 'never' });
+  const { client, close } = await makeClient({ address: server.address, namespace: server.namespace });
+  const queue = `governed-worker-${crypto.randomUUID()}`;
+  const worker = new WorkerProcessManager({
+    entrypoint: fileURLToPath(new URL('./fixtures/temporal-worker-process.ts', import.meta.url)),
+    execArgv: ['--import', 'tsx', '--max-old-space-size=512'],
+    heartbeatIntervalMs: 100,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, KARMAX_HOME: home,
+      KARMAX_TASK_QUEUE: queue, WORKER_FIXTURE_TEMPORAL_ADDRESS: server.address,
+      // Any heap use counts as pressure, so the governor acts at its first chance.
+      KARMAX_MAX_CACHED_WORKFLOWS: '40', KARMAX_HEAP_CHECK_MS: '100', KARMAX_HEAP_HIGH_WATERMARK: '0.0001' },
+  });
+  try {
+    await worker.start();
+    const handles = await Promise.all(['a', 'b', 'c'].map(name => client.workflow.start(pingWorkflow, {
+      taskQueue: queue, workflowId: `${name}-${crypto.randomUUID()}`, args: [name] })));
+    for (const handle of handles) await handle.signal(bump, 2);
+    for (const handle of handles) await expect.poll(() => handle.query(countQuery), { timeout: 10_000 }).toBe(2);
+    await expect.poll(() => worker.memory?.workflowCache, { timeout: 15_000 })
+      .toEqual({ cached: expect.any(Number), limit: 10, shrinks: 1 });
+    const memory = worker.memory!;
+    // The thread is its own isolate, sized by the same flag as its process.
+    expect(memory.workflowHeap!.heapLimit).toBeGreaterThan(500 * 2 ** 20);
+    expect(memory.workflowHeap!.heapLimit).toBeLessThan(640 * 2 ** 20);
+    expect(memory.workflowHeap!.heapUsed).toBeGreaterThan(0);
+    // At the floor it stops shrinking, and the evicted workflows still work.
+    for (const handle of handles) await handle.signal(bump, 3);
+    for (const handle of handles) await handle.signal(finish);
+    for (const handle of handles) expect(await handle.result()).toMatchObject({ count: 5 });
+    expect(worker.memory!.workflowCache).toMatchObject({ limit: 10, shrinks: 1 });
+    await worker.stop();
+    expect(worker.failure).toBeUndefined();
+  } finally {
+    await worker.stop();
+    await close();
+    await server.stop();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}, 90_000);

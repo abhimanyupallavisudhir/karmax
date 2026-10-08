@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import { Worker as Guardian } from 'node:worker_threads';
 import type { WorkerManager } from './worker-pool.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
+import { processMemory, type ProcessMemory } from '../runtime/memory-budget.js';
 import type { WorkerProcessRequest, WorkerProcessReply, WorkerProcessNotice } from './worker-process.js';
 
 export interface WorkerProcessRuntime {
-  worker: Pick<WorkerManager, 'start' | 'refresh' | 'stop'>;
+  worker: Pick<WorkerManager, 'start' | 'refresh' | 'stop'> & { status?(): Pick<ProcessMemory, 'workflowHeap' | 'workflowCache'> };
   close(): Promise<void>;
 }
 
@@ -69,9 +70,9 @@ export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, 
   let pending = 0;
   let queue = Promise.resolve();
   let shutdown: Promise<void> | undefined;
-  const reply = (id: number, ok: boolean, error?: string): Promise<void> => new Promise(resolve => {
+  const reply = (id: number, ok: boolean, error?: string, memory?: WorkerProcessReply['memory']): Promise<void> => new Promise(resolve => {
     if (!process.connected) return resolve();
-    const response: WorkerProcessReply = { type: 'worker.reply', id, ok, ...(error ? { error } : {}) };
+    const response: WorkerProcessReply = { type: 'worker.reply', id, ok, ...(error ? { error } : {}), ...(memory ? { memory } : {}) };
     process.send!(response, () => resolve());
   });
   const drain = () => shutdown ??= (async () => {
@@ -101,7 +102,8 @@ export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, 
     const id = request.id!;
     if (closing || (pending >= 16 && request.action !== 'stop')) { void reply(id, false, 'worker is not accepting commands'); return; }
     if (request.action === 'ping') {
-      void reply(id, !!runtime, runtime ? undefined : 'worker is not started');
+      void reply(id, !!runtime, runtime ? undefined : 'worker is not started',
+        processMemory(runtime?.worker.status?.()));
       return;
     }
     if (request.action !== 'stop' && (!Array.isArray(request.packages) || request.packages.some(ref =>

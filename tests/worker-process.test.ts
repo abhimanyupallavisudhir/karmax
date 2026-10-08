@@ -192,3 +192,20 @@ test('survives an isolated unhandled asynchronous callback rejection', async () 
   await worker.refresh([]);
   expect(worker.failure).toBeUndefined();
 });
+
+test('reports the child heap and workflow cache with each heartbeat (RT-35)', async () => {
+  const worker = manager('cache-status', { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 500 });
+  expect(worker.memory).toBeUndefined();
+  await worker.start();
+  await expect.poll(() => worker.memory, { timeout: 2_000 }).toBeDefined();
+  const memory = worker.memory!;
+  // The fixture runs with --max-old-space-size=64: the child's own limit, not the parent's.
+  expect(memory.heapLimit).toBeGreaterThan(60 * 2 ** 20);
+  expect(memory.heapLimit).toBeLessThan(128 * 2 ** 20);
+  expect(memory.heapUsed).toBeGreaterThan(0);
+  expect(memory.heapUsed).toBeLessThan(memory.heapLimit);
+  expect(memory.rss).toBeGreaterThan(memory.heapUsed);
+  expect(memory.workflowCache).toEqual({ cached: 3, limit: 250, shrinks: 1 });
+  expect(memory.workflowHeap).toEqual({ heapUsed: 10, heapLimit: 20 });
+  expect(worker.memoryAt).toBeLessThanOrEqual(Date.now());
+});
