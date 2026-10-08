@@ -6591,35 +6591,24 @@ function triggersSection(values, selfId) {
   const gridCells = CRON_FIELDS.map(
     (f, i) => `<label class="cron-cell">${f.label}<input id="${f.id}" placeholder="*" value="${esc(cronVal(i))}"><small>${f.hint}</small></label>`,
   ).join('');
+  // One block like the agent and computer blocks: when the task starts, and
+  // whether each start is a fresh run (a schedule forces that on).
   return `
-    <details class="advanced" style="margin-top:10px" ${existing.length ? 'open' : ''}>
-      <summary>Triggers ${policyTip('Start this task after other tasks finish, on a schedule, or both (it waits for all of them). Leave empty to start now.')}</summary>
-      <div class="form-row">
-        <div class="label-row"><label>Task dependencies</label></div>
+    <div class="form-row" data-row="__triggers">
+      <div class="label-row"><label>Triggers</label>${policyTip('Start this task after other tasks finish, on a schedule, or both (it waits for all of them). Leave empty to start now.')}<span class="label-row-fill"></span></div>
+      <div class="triggers-block">
+        <span class="tb-label">After</span>
         <div class="chip-input" id="dep-box">
           <span class="chips" id="dep-chips"></span>
           <button type="button" class="btn sm" id="dep-add">＋ Add a task…</button>
         </div>
-      </div>
-      <div class="form-row">
-        <div class="label-row"><label>On a schedule <span class="hint" title="Cron, in UTC. Each field: * = every, */5 = every 5, 1-5 = range, 1,3 = list.">cron, UTC ⓘ</span></div>
+        <span class="tb-label">Schedule ${policyTip('Cron, in UTC. Each field: * = every, */5 = every 5, 1-5 = range, 1,3 = list.')}</span>
         <div class="cron-grid">${gridCells}</div>
+        <label class="tb-label" for="trig-at">Once at</label>
+        <input id="trig-at" type="datetime-local" value="${atVal}">
+        <label class="tb-repeat"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
+          Repeatable ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</label>
       </div>
-      <div class="form-row">
-        <div class="label-row"><label>Or run once at</label></div>
-        <input id="trig-at" type="datetime-local" value="${atVal}" style="width:100%">
-      </div>
-    </details>`;
-}
-
-// A prominent, always-visible task-level toggle (repeatable is a lifecycle choice,
-// not a trigger — so it lives outside the collapsible Triggers section).
-function repeatableToggleHtml(values) {
-  return `
-    <div class="form-row repeat-row">
-      <label class="repeat-toggle"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
-        <span><b>Repeatable</b> ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</span>
-      </label>
     </div>`;
 }
 
@@ -7059,8 +7048,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               <label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>
               <span style="color:var(--ink-3);font-size:12px">Drop files into a text field above, or choose up to 8 files (25 MB each, 50 MB total).</span>
             </div>`}
-            ${triggersSection(values, draft?.id)}
-            ${repeatableToggleHtml(values)}
+            <section class="tf-section tf-triggers">${triggersSection(values, draft?.id)}</section>
           </div>
           <aside class="tf-side">
             <div class="form-row" data-row="__org">
@@ -7786,7 +7774,6 @@ async function renderSeriesPage(rec) {
             <div id="cred-editor-newtask">Loading…</div>
           </details>
           ${triggersSection(values, rec.id)}
-          ${repeatableToggleHtml(values)}
         </div>
         <div class="series-runs">
           <div class="series-runs-h">Runs</div>

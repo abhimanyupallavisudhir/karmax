@@ -58,9 +58,15 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
     await expect.poll(() => body.locator('.tf-main > *').evaluateAll((elements) => elements.map((el) =>
       el.matches('[data-row="prompt"]') ? 'prompt' : el.classList.contains('tf-agent') ? 'agent'
         : el.classList.contains('tf-responder') ? 'responder' : el.classList.contains('tf-confirmer') ? 'review'
-          : el.classList.contains('tf-computer') ? 'computer' : el.classList.contains('tf-where') ? 'where' : el.matches('details.advanced') ? 'triggers'
-            : el.classList.contains('repeat-row') ? 'repeatable' : 'other'))).toEqual(
-      ['prompt', 'agent', 'responder', 'review', 'computer', 'where', 'triggers', 'repeatable']);
+          : el.classList.contains('tf-computer') ? 'computer' : el.classList.contains('tf-where') ? 'where'
+            : el.classList.contains('tf-triggers') ? 'triggers' : 'other'))).toEqual(
+      ['prompt', 'agent', 'responder', 'review', 'computer', 'where', 'triggers']);
+    // Triggers is an open block like the others, with Repeatable inside it.
+    const triggers = body.locator('.tf-triggers');
+    expect(await triggers.locator('details').count()).toBe(0);
+    expect(await triggers.locator('.triggers-block').evaluate((el) => getComputedStyle(el).borderTopStyle)).toBe('solid');
+    await expect.poll(() => triggers.locator('#dep-add, #cron-min, #trig-at, #trig-repeatable').evaluateAll((els) =>
+      els.map((el) => (el as HTMLElement).offsetParent !== null))).toEqual([true, true, true, true]);
     // The task's own authority lives in the main Agent block, collapsed; the
     // sidebar keeps only organization metadata and logins.
     const main = body.locator('.tf-agent .agent-authority');
