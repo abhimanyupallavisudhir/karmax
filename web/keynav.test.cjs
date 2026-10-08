@@ -73,6 +73,11 @@ for (const effective of [false, true]) {
   ok(tabs.includes('tasks') && tabs.includes('settings'), 'project navigation retains tasks and settings');
 }
 ok(!src.includes("id: 'nav.activity'"), 'Activity has no user-facing navigation command');
+// Home is a global destination, so it takes a shifted letter like g W / g S / g N.
+const registry = fs.readFileSync(path.join(__dirname, '..', 'src', 'contrib', 'registry.ts'), 'utf8');
+ok(src.includes("{ id: 'nav.home', title: 'Go home', key: 'g H',"), 'the console binds Go home to g H');
+ok(registry.includes("{ id: 'nav.home', title: 'Go home', keybinding: 'g H' }"), 'the server registry declares g H for Go home');
+ok(!/'g h'/.test(src + registry), 'g h is no longer bound');
 
 // ── parseKeybinding ──
 ok(JSON.stringify(parseKeybinding('n')) === JSON.stringify([{ key: 'n' }]), 'single key');
@@ -274,7 +279,7 @@ global.document = {
   addEventListener: (name, handler) => { attemptKeydown = handler; },
 };
 global.CHORD = { pending: [], timer: null };
-for (const name of ['cycleAttempt', 'allCommands', 'resetChord', 'dispatchKey', 'bindKeys']) eval(extractFn(name));
+for (const name of ['cycleAttempt', 'allCommands', 'echoKeys', 'clearPendingEcho', 'resetChord', 'dispatchKey', 'bindKeys']) eval(extractFn(name));
 bindKeys();
 const press = (key, typing = false) => attemptKeydown({
   ...ev(key), preventDefault() {},

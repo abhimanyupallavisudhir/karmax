@@ -51,6 +51,7 @@ export const CORE_COMMANDS: CommandDecl[] = [
   { id: 'nav.newTask', title: 'New task (quick add)', keybinding: 'n' },
   { id: 'nav.newTaskForm', title: 'New task (full form)', keybinding: 'N' },
   { id: 'nav.search', title: 'Search', keybinding: '/' },
+  { id: 'nav.home', title: 'Go home', keybinding: 'g H' },
   { id: 'nav.tasks', title: 'Go to tasks', keybinding: 'g t' },
   { id: 'nav.queue', title: 'Go to queues', keybinding: 'g q' },
   { id: 'nav.insights', title: 'Go to insights', keybinding: 'g i' },
