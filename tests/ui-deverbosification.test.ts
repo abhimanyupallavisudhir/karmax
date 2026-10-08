@@ -30,7 +30,9 @@ describe('concise settings UI', () => {
     ];
     for (const path of ['/org/settings', '/org/workspace/settings']) {
       const ui = await settings(path);
-      expect(await ui.page.locator('.settings-nav a').allTextContents()).toEqual(expect.arrayContaining(['Where tasks run', 'Codex/Claude']));
+      const nav = await ui.page.locator('.settings-nav a').allTextContents();
+      expect(nav).toEqual(expect.arrayContaining(['Agents', 'Task defaults']));
+      expect(nav).not.toEqual(expect.arrayContaining(['Where tasks run']));
       const text = await everySection(ui);
       for (const copy of removed) expect(text, path).not.toContain(copy);
       await ui.close();

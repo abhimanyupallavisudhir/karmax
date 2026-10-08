@@ -48,12 +48,11 @@ describe('task messages, mentions, notify and escalation (real Temporal + git, m
     const v = await view(handle);
     expect(v.stage).toBe('review');
     // The caller is told the agent answered. They are already asked to review
-    // this task, and a mention never displaces that stronger ask.
+    // this task, and a mention never displaces that stronger ask. The agent's
+    // turn lifted the Review wait and the mention is recorded before the view
+    // restoring it is published, so the inbox settles a moment after the event.
     await expect.poll(async () => (await h.store.eventsOfType(task.id, ['task.mentioned'])).map((e: any) => e.payload.recipients), { timeout: 10_000 })
       .toContainEqual(['user:a']);
-    // While agent-1 ran, the task was not waiting on a person, so its review ask
-    // was withdrawn and the mention may be recorded in that window; the review
-    // ask raised again when the task waits on a person replaces it.
     await expect.poll(() => inbox('a', task.id), { timeout: 10_000 }).toEqual([{ kind: 'review-requested', actionable: true }]);
   });
 

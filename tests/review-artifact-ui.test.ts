@@ -50,7 +50,7 @@ describe('review artifact reader', () => {
     });
     vm.runInContext(source + '\n' + app.slice(app.indexOf('function closeTopOverlay()'),
       app.indexOf('// -- the dispatcher')) + '\n' + app.slice(app.indexOf('function bindKeys()'),
-      app.indexOf('// -- global search:')), context);
+      app.indexOf('// -- the ⌘K palette')), context);
     const fullscreenStart = app.indexOf('function setConversationFullscreen(');
     vm.runInContext(app.slice(fullscreenStart, app.indexOf('\n}', fullscreenStart) + 2), context);
     context.showArtifactReader('report', 'markdown', 'report.md', {});

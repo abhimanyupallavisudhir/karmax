@@ -26,7 +26,20 @@ function fakeProc(availableMb: number, processes: Array<{ pid: number; ppid: num
   return root;
 }
 
-const pick = (proc: string) => spawnSync('sh', [guard, 'pick'], { env: { ...process.env, KARMAX_GUARD_PROC: proc }, encoding: 'utf8' });
+// Tests never read this machine's own cgroup unless they pass a fake one.
+const noCgroup = path.join(os.tmpdir(), 'karmax-guard-no-cgroup');
+const pick = (proc: string, cgroup = noCgroup) => spawnSync('sh', [guard, 'pick'],
+  { env: { ...process.env, KARMAX_GUARD_PROC: proc, KARMAX_GUARD_CGROUP: cgroup }, encoding: 'utf8' });
+
+/** A fake cgroup v2 directory: a container's limit, usage and reclaimable cache. */
+function fakeCgroup(maxMb: number | 'max', currentMb: number, inactiveFileMb = 0) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-guard-cgroup-'));
+  roots.push(root);
+  fs.writeFileSync(path.join(root, 'memory.max'), `${maxMb === 'max' ? 'max' : maxMb * 2 ** 20}\n`);
+  fs.writeFileSync(path.join(root, 'memory.current'), `${currentMb * 2 ** 20}\n`);
+  fs.writeFileSync(path.join(root, 'memory.stat'), `anon ${currentMb * 2 ** 20}\ninactive_file ${inactiveFileMb * 2 ** 20}\nactive_file 0\n`);
+  return root;
+}
 
 // Task 348/349 process tree: envd → relay (node) → npm exec → claude → bash → tsc.
 const sandbox = [
@@ -51,6 +64,19 @@ describe('sandbox memory guard', () => {
     expect(pick(fakeProc(400, sandbox)).stdout.trim()).toBe('');
   });
 
+  // Daytona sandboxes are containers: /proc/meminfo shows the host's memory,
+  // so only the cgroup shows how close the sandbox is to its own limit.
+  it('uses the container memory limit when it is smaller than the host memory', () => {
+    // The fake host has 2 GB with 1.9 GB free; the container is limited to 1 GiB.
+    const hostHasRoom = fakeProc(1900, sandbox);
+    expect(pick(hostHasRoom, fakeCgroup(1024, 1000)).stdout.trim()).toBe('2001');
+    expect(pick(hostHasRoom, fakeCgroup(1024, 500)).stdout.trim()).toBe('');
+    expect(pick(hostHasRoom, fakeCgroup(1024, 1000, 400)).stdout.trim()).toBe('');
+    expect(pick(hostHasRoom, fakeCgroup('max', 1000)).stdout.trim()).toBe('');
+    expect(pick(hostHasRoom, fakeCgroup(4096, 4000)).stdout.trim()).toBe('');
+    expect(pick(fakeProc(80, sandbox), fakeCgroup('max', 1000)).stdout.trim()).toBe('2001');
+  });
+
   it('never selects processes it cannot signal or the kernel exempts', () => {
     const protectedOnly = [
       { pid: 318, ppid: 1, comm: 'envd', score: 900, uid: uid === '0' ? '1' : '0' },
@@ -66,7 +92,7 @@ describe('sandbox memory guard', () => {
     roots.push(dir);
     fs.copyFileSync(guard, path.join(dir, 'memory-guard.sh'));
     const hog = spawn('sleep', ['30']);
-    const env = { ...process.env, KARMAX_GUARD_PROC: proc, KARMAX_GUARD_INTERVAL: '0.05' };
+    const env = { ...process.env, KARMAX_GUARD_PROC: proc, KARMAX_GUARD_CGROUP: noCgroup, KARMAX_GUARD_INTERVAL: '0.05' };
     try {
       for (let i = 0; i < 2; i++) expect(spawnSync('sh', [path.join(dir, 'memory-guard.sh'), 'start'], { env }).status).toBe(0);
       const pidFile = path.join(dir, 'memory-guard.pid');

@@ -1,3 +1,4 @@
+import { applyComputer, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -1581,9 +1582,9 @@ export class Store {
   /** One organization-level execution policy. Provider-specific template/image
    * details stay with the provider connection; this is the provider-neutral
    * policy every project inherits. */
-  async getOrganizationExecutionPolicy(organizationId: string): Promise<OrganizationExecutionPolicy> {
-    if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
-    const fallback: OrganizationExecutionPolicy = {
+  /** The execution policy an organization has before it changes anything. */
+  defaultOrganizationExecutionPolicy(): OrganizationExecutionPolicy {
+    return {
       worldProvider: process.env.KARMAX_DEPLOYMENT === 'hosted'
         ? process.env.KARMAX_CLOUD_WORLD_PROVIDER ?? 'e2b'
         : 'worktree',
@@ -1594,6 +1595,11 @@ export class Store {
       environment: { flavor: 'headless' },
       hibernateAfterMs: 7 * 24 * 60 * 60 * 1000,
     };
+  }
+
+  async getOrganizationExecutionPolicy(organizationId: string): Promise<OrganizationExecutionPolicy> {
+    if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
+    const fallback = this.defaultOrganizationExecutionPolicy();
     const raw = (await this.kvGet(`organization-execution:${organizationId}`));
     if (!raw) return fallback;
     const saved = JSON.parse(raw) as OrganizationExecutionPolicy;
@@ -1745,6 +1751,18 @@ export class Store {
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && (config.remote === undefined || config.remote === 'none'))
       config.remote = 'pr';
     return config;
+  }
+
+  /** A task's effective execution config: its project's, with the task's own
+   * Computer (`params.computer`) layered on. Every world creation, restore and
+   * lifecycle decision for the task reads this. */
+  async effectiveTaskConfig(project: Project | string, taskId: string): Promise<ProjectConfig> {
+    const config = (await this.effectiveProjectConfig(project));
+    const params = (await this.getTask(taskId))?.params;
+    let computer: ComputerSpec | undefined;
+    // Validated when stored; a value that predates validation is ignored, never fatal.
+    try { computer = normalizeComputer(params?.computer); } catch { computer = undefined; }
+    return applyComputer(config, computer);
   }
 
   async setProjectExecutionPolicy(id: string, override: Partial<Record<keyof OrganizationExecutionPolicy, unknown>>): Promise<Project> {
@@ -6683,6 +6701,14 @@ export class Store {
     });
   }
 
+  /** A sub-task's pending output, handed to its parent: the parent's world
+   * holds it from now on, and the parent's Review adopts or excludes it. */
+  async reassignResourceCandidate(id: string, from: string, to: { taskId: string; worldId: string; worldGeneration: number }): Promise<void> {
+    const result = (await this.db.prepare(`UPDATE resource_candidates SET taskId=?, worldId=?, worldGeneration=?
+      WHERE id=? AND taskId=? AND state='pending'`).run(to.taskId, to.worldId, to.worldGeneration, id, from));
+    if (!Number(result.changes)) throw new Error('resource candidate is no longer pending for this task');
+  }
+
   async adoptResourceCandidate(id: string, taskId: string, resolvedBy: string): Promise<{ candidate: ResourceCandidate; attachment: ResourceAttachment }> {
     return this.db.transaction(async () => {
 
@@ -7253,6 +7279,13 @@ export class Store {
     for (const entry of (await this.kvEntries('resource-checkpoint:'))) {
       try { const revisionId = JSON.parse(entry.value)?.revisionId; if (revisionId) ids.add(String(revisionId)); } catch {}
     }
+    // A sub-task's output waiting for its parent's world, and the version it is relative to.
+    for (const entry of (await this.kvEntries('resource-delivery:'))) {
+      try {
+        const delivery = JSON.parse(entry.value);
+        for (const id of [delivery?.revisionId, delivery?.baseRevisionId]) if (id) ids.add(String(id));
+      } catch {}
+    }
     return ids;
   }
 
@@ -7292,7 +7325,8 @@ export class Store {
   private async resourceRevisionReferencedBesidesCurrent(id: string): Promise<boolean> {
     if ((await this.db.prepare("SELECT 1 FROM resource_leases WHERE state<>'released' AND revisionId=?").get(id))) return true;
     if ((await this.db.prepare('SELECT 1 FROM world_checkpoints WHERE manifest LIKE ?').get(`%"revisionId":"${id}"%`))) return true;
-    return (await this.kvEntries('resource-checkpoint:')).some((entry) => entry.value.includes(`"revisionId":"${id}"`));
+    if ((await this.kvEntries('resource-checkpoint:')).some((entry) => entry.value.includes(`"revisionId":"${id}"`))) return true;
+    return (await this.kvEntries('resource-delivery:')).some((entry) => entry.value.includes(`"${id}"`));
   }
 
   /** Everything an organization keeps in storage, for the storage page and the
@@ -9401,7 +9435,9 @@ async function uniqueSlug(value: string, used: (candidate: string) => boolean | 
 const RESERVED_ROUTE_SLUGS = new Set([
   'mcp-callback',
   // gateway-owned top-level prefixes
-  'api', 'ws',
+  'api', 'ws', 'mcp', 'oauth',
+  // app sign-in approval (web/app.js renderDeviceApproval)
+  'device',
   // top-level routes / legacy org paths (an org slug is the first URL segment)
   'invite', 'projects', 'organization', 'organizations', 'installation',
   // `for:me` is the signed-in person in every search (and /me is kept free)
@@ -9429,6 +9465,7 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
   };
   positive(raw.resources?.cpu, 'CPU', 1);
   positive(raw.resources?.memoryMb, 'memory', 128);
+  positive(raw.resources?.diskGb, 'disk', 1);
   positive(raw.resources?.gpu, 'GPU', 0);
   positive(raw.monthlyBudgetMicros, 'monthly budget', 0);
   if (raw.environment?.flavor != null && !['headless', 'desktop'].includes(raw.environment.flavor))

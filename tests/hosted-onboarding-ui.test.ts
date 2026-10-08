@@ -49,7 +49,7 @@ describe('hosted onboarding UI', () => {
     const actions = await guide(ui).locator('.onboarding-step a.btn').evaluateAll((links) =>
       links.map((link) => [link.textContent?.trim(), link.getAttribute('href')]));
     expect(actions.map(([, href]) => href)).toEqual(['/org/settings#settings-code', '/org/settings#settings-agents',
-      '/org/settings#settings-compute', '/org/settings#settings-payments', '/org/settings#settings-plan']);
+      '/org/settings#settings-computers', '/org/settings#settings-payments', '/org/settings#settings-plan']);
     expect(actions[2]![0]).toBe('Manage E2B/Daytona'); // a completed step offers management, not setup
     await guide(ui).locator('.onboarding-step a[href$="#settings-agents"]').click();
     await expect.poll(() => ui.run<string>('location.pathname + location.hash')).toBe('/org/settings#settings-agents');

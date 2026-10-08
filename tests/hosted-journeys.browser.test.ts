@@ -118,9 +118,9 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
 
       await page.locator('#onboarding-expand').click();
       await guide.getByRole('link', { name: 'Set up E2B/Daytona' }).click();
-      const e2b = page.locator('.provider-connection[data-provider="e2b"]');
-      await e2b.locator('.provider-key').fill('e2b_journey');
-      await e2b.locator('.provider-save').click();
+      await page.locator('#org-computers [data-provider="e2b"] .computer-connect').click();
+      await page.locator('.computer-dialog .computer-key').fill('e2b_journey');
+      await page.locator('.computer-dialog .computer-save').click();
       await step('the E2B key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 4 required steps'));
 
       // GitHub is connected on github.com: its installation callback records

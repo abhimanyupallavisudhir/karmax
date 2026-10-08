@@ -584,9 +584,10 @@ export interface ProjectConfig {
   worldProvider?: string;
   /** Resume provider-backed worlds after a parked wait (§11.3). */
   resumeWorlds?: boolean;
-  /** Hosted execution pool and declared resources. */
+  /** Hosted execution pool and declared resources. `diskGb` is the free space
+   * the task's files get (E2B: template `minFreeDiskMb`; Daytona: disk size). */
   runnerPoolId?: string;
-  resources?: { cpu?: number; memoryMb?: number; gpu?: number };
+  resources?: { cpu?: number; memoryMb?: number; diskGb?: number; gpu?: number };
   /** Remote-world egress policy. Normal coding uses unrestricted internet;
    * allowlists are an explicit organization-level hardening mode. */
   network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
@@ -1313,7 +1314,8 @@ export interface AgentActivity {
   /** Provider item/tool id. Repeated updates with the same id replace in-place. */
   id: string;
   kind: 'message' | 'reasoning' | 'command' | 'file' | 'tool' | 'search' | 'subagent' | 'status' | 'turn' | 'error';
-  phase: 'started' | 'updated' | 'completed' | 'failed';
+  /** `stopped`: a turn someone stopped (or whose task was cancelled). */
+  phase: 'started' | 'updated' | 'completed' | 'failed' | 'stopped';
   /** Compact human-facing label, e.g. "Read package.json" or "npm test". */
   title: string;
   /** Optional bounded detail (command output, tool arguments/result, progress). */
@@ -1395,11 +1397,11 @@ export interface ActionArg {
 
 // ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
 
-export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer' | 'responder';
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer' | 'responder' | 'computer';
 /** Which surfaces a field appears on. */
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
-export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm' | 'responder';
+export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm' | 'responder' | 'computer';
 /**
  * When a param may be edited after the task is queued (SPEC §4.5/§5.5). This is
  * the single declaration that drives in-flight edits: the workflow validator
@@ -1461,8 +1463,11 @@ export interface TaskParticipant {
   role: AgentRole;
   /** Effective harness selection (authority is projected separately). */
   spec?: Partial<AgentSpec>;
-  /** queued: called and waiting for the running agent's turn to end. */
-  state: 'idle' | 'queued' | 'running';
+  /** running: working now. waiting: in its turn but waiting (for a
+   * credential, host capacity, a retry, people, its pause, or another agent).
+   * queued: called and waiting for the running agent's turn to end. Every
+   * state but idle can be stopped. */
+  state: 'idle' | 'queued' | 'running' | 'waiting';
   /** Messages this agent has authored. */
   messages: number;
 }
@@ -1865,6 +1870,9 @@ export interface TaskRecoveryCheckpoint {
   /** The preserved intent-authorized proposal changed in Do and needs an
    * automatic integration review before provider re-admission. */
   repairValidationPending?: boolean;
+  /** Part of the proposal already landed: the replacement must never offer
+   * cancellation or a discarding reset, and must reconcile the rest. */
+  pointOfNoReturnPassed?: boolean;
   /** Set when the run continued as new to bound its history. */
   continued?: TaskContinuation;
 }

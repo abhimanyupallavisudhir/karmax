@@ -36,6 +36,7 @@ import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, T
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
+import { assertInFlightComputerEdit, computerOf, machineShape, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
@@ -232,7 +233,9 @@ function assertInMergeDomain(task: TaskRecord, domain: string): void {
 const RETRY_ACTION = (): TaskView['actions'][number] =>
   ({ name: 'retry', kind: 'signal', label: 'Retry', enabled: true });
 
-const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
+/** Past the point of no return a failed task keeps Retry and follow-ups, but
+ * not Cancel: part of its proposal already landed. */
+const FAILED_RECOVERY_ACTIONS = (pointOfNoReturnPassed?: boolean): TaskView['actions'] => [
   RETRY_ACTION(),
   {
     name: 'followUp',
@@ -241,7 +244,7 @@ const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
     enabled: true,
     args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
   },
-  { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true },
+  ...(pointOfNoReturnPassed ? [] : [{ name: 'cancel', kind: 'signal' as const, label: 'Cancel', enabled: true, danger: true }]),
 ];
 
 const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
@@ -1001,6 +1004,35 @@ export class KarmaxApi {
     }
   }
 
+  /** A task's own Computer, validated: sizes in range, and a provider this
+   * deployment can run and the organization has connected. */
+  private async taskComputer(project: Project, overrides: ValueMap): Promise<ComputerSpec | undefined> {
+    let computer: ComputerSpec | undefined;
+    try {
+      computer = normalizeComputer(overrides.computer);
+      if (!computer?.provider && typeof overrides.worldProvider === 'string' && overrides.worldProvider)
+        computer = normalizeComputer({ ...computer, provider: overrides.worldProvider });
+    } catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+    const provider = computer?.provider;
+    if (provider) {
+      const local = ['worktree', 'container', 'memory'].includes(provider);
+      if (local && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B or Daytona)');
+      if (!local && this.deps.providerConnections
+        && !(await this.deps.providerConnections.available(project.organizationId ?? 'org_personal', provider)))
+        throw new ValidationError(`${provider} is not connected. Connect it under Settings → Computers first.`);
+    }
+    return computer;
+  }
+
+  /** Store a task's Computer in its one canonical, validated form. */
+  private async normalizeTaskComputer(project: Project, params: ValueMap): Promise<void> {
+    if (params.computer === undefined && params.worldProvider === undefined) return;
+    const computer = (await this.taskComputer(project, params));
+    delete params.worldProvider;
+    if (computer) params.computer = computer;
+    else delete params.computer;
+  }
+
   private async assertRepositoriesValid(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
     if (!needsRepo) return;
@@ -1194,6 +1226,7 @@ export class KarmaxApi {
     }
     taskOverrides.paymentPolicy ??= paymentDefaults;
     this.assertBranchParams(taskOverrides);
+    (await this.normalizeTaskComputer(project, taskOverrides));
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
     (await this.validateAndAuthorizeResumeSources(token, taskOverrides));
@@ -1529,6 +1562,12 @@ export class KarmaxApi {
       ? [taskOverrides, (await quickProjectSettingsFor(getSettings, project.id, manifest.name)), (await quickGlobalSettingsFor(getSettings, manifest.name, project.organizationId)), projectVals, globalVals]
       : [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
+    // The Computer's defaults are the execution policy (already in the project's
+    // effective config); only the task's own override is a param. A legacy
+    // `worldProvider` param (older drafts and API callers) is its provider.
+    const computer = (await this.taskComputer(project, taskOverrides));
+    if (computer) resolved.computer = computer;
+    else delete resolved.computer;
     // `none` means a completed merge may remain only in its local world. That is
     // a valid self-hosted choice, but never a valid outcome for a disposable
     // hosted GitHub world. Coerce legacy settings rows here so every newly
@@ -2625,6 +2664,7 @@ export class KarmaxApi {
     params = stripPlatformMetadata({ ...params });
     const project = (await this.deps.store.getProject(task.projectId));
     if (project) this.assertProfilesVisible(params.profiles, project);
+    if (project) (await this.normalizeTaskComputer(project, params));
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
     (await this.validateAndAuthorizeResumeSources(token, params));
@@ -2763,8 +2803,8 @@ export class KarmaxApi {
         notes: task?.notes,
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
-        ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow) && !view.pointOfNoReturnPassed
-          ? { actions: FAILED_RECOVERY_ACTIONS() }
+        ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow)
+          ? { actions: FAILED_RECOVERY_ACTIONS(view.pointOfNoReturnPassed) }
           : { actions: this.lifecycleActions(view) }),
         ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
           ? { actions: [], stageTransitions: [] } : {}),
@@ -3095,7 +3135,9 @@ export class KarmaxApi {
       return result;
     }
     if (view.status === 'failed') {
-      if (resumable && !view.pointOfNoReturnPassed)
+      // Past the point of no return, Retry is how the rest of a partly landed
+      // proposal still lands; only discarding it is unsafe.
+      if (resumable)
         add({ target: 'do', label: 'Retry', description: 'Recover the preserved work and retry the task.' });
       if (!jayadratha && !view.pointOfNoReturnPassed)
         add({ target: 'draft', label: 'Draft', description: 'Discard failed progress and start over later.', danger: true });
@@ -3210,6 +3252,7 @@ export class KarmaxApi {
       // refs so a recovered Review/Merge can authorize the exact opened heads.
       prs: (view.prs ?? source.prs)?.map((pr) => ({ ...pr })),
       ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
+      ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
       resumeStage,
       // A deliberate Landing → Do move is an integration repair, not a fresh
       // proposal. Keep intent authorization but require automated review of the
@@ -3305,7 +3348,16 @@ export class KarmaxApi {
       if (attempt === 3)
         throw new Error(`${task.title} kept continuing as new while it was being stopped; try again.`);
     }
+    await this.withdrawCoordinatorClaims(task, view);
+    return attempted;
+  }
 
+  /** Withdraw what a stopped run still holds in the coordinators: queued or
+   * granted agent turns, account leases and merge-queue places. A run that
+   * ended without running its own cleanup (terminated, failed) leaves them
+   * behind, and the merge queue's dead-holder check cannot tell that run from
+   * its replacement, which shares the task id. */
+  private async withdrawCoordinatorClaims(task: TaskRecord, view: TaskView): Promise<void> {
     // Do not trust only the projected turn: pre-1.7 account waits did not expose
     // their turnId, and a stale snapshot can lag a just-enqueued agent request.
     // Query both coordinators and withdraw every request owned by this task.
@@ -3331,13 +3383,18 @@ export class KarmaxApi {
     }
     const world = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
     const rememberedDomain = typeof view.state?.mergeDomain === 'string' ? view.state.mergeDomain : undefined;
-    const domains = world
-      ? mergeQueueDomains(world, view.targetBranch ?? world.target ?? 'main', task.projectId)
+    // A GitHub landing leases one domain per participant repository, which the
+    // world alone does not name; the run publishes every domain it holds.
+    const publishedDomains = Array.isArray(view.state?.mergeDomains)
+      ? view.state.mergeDomains.filter((domain): domain is string => typeof domain === 'string')
+      : [];
+    const domains = [...publishedDomains, ...(world
+      ? [...mergeQueueDomains(world, view.targetBranch ?? world.target ?? 'main', task.projectId), ...(rememberedDomain ? [rememberedDomain] : [])]
       : view.stage === 'merge'
         ? [rememberedDomain ?? mergeQueueDomains(undefined, view.targetBranch ?? 'main', task.projectId)[0]!]
         : rememberedDomain
           ? [rememberedDomain]
-          : [];
+          : [])];
     for (const domain of [...new Set(domains)]) {
       signals.push(this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
         workflowId: mergeQueueId(domain),
@@ -3348,7 +3405,6 @@ export class KarmaxApi {
       }));
     }
     await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
-    return attempted;
   }
 
   /** Setup can be terminated before a WorldHandle containing `worldLeaseId` is
@@ -3567,6 +3623,11 @@ export class KarmaxApi {
     if (view.state?.humanPauseOrigin === target) {
       await (await this.workflowHandle(taskId)).signal(SIG.retry);
       return (await this.getTaskView(token, taskId, { live: true }))!;
+    }
+
+    if (view.status === 'failed' && target === 'do') {
+      await this.recoverFailedTask(taskId);
+      return (await this.getTaskView(token, taskId))!;
     }
 
     if (!['done', 'cancelled', 'failed'].includes(view.status))
@@ -4680,8 +4741,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return this.searchAuthorizedOrganization(readable, query, caller.principal, page, now);
   }
 
-  /** Evaluate one query across already-authorized projects of an organization:
-   *  one sort and grouping over all of them, then a page of the result. */
+  /** Evaluate one query across already-authorized projects — an organization's,
+   *  or every organization's: one sort and grouping over all of them, then a
+   *  page of the result. */
   async searchAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string,
     page: { limit?: number; offset?: number } = {}, now = Date.now()) {
     const { result, tags } = await this.evaluateProjects(projects, query, principalId, now);
@@ -4698,7 +4760,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       ...result, tasks, total: result.total, offset, limit,
       ...(result.groups ? { groups: prune(result.groups) } : {}),
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
-      projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name) })),
+      projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
       tags,
     };
   }
@@ -4903,7 +4965,6 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!task || !view) throw new Error(`no failed task ${taskId}`);
     if (!RECOVERABLE_WORKFLOWS.has(task.workflow) || view.status !== 'failed')
       throw new Error(`only a failed ${[...RECOVERABLE_WORKFLOWS].join(' or ')} task can be recovered`);
-    if (view.pointOfNoReturnPassed) throw new Error('cannot recover a task after its merge point of no return');
 
     // Recovery is an explicit migration boundary. Replaying a replacement with
     // the same obsolete implementation can reproduce the exact incompatibility
@@ -4939,33 +5000,22 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       };
     }
     if (world.kind === 'worktree' && !fs.existsSync(world.root)) throw new Error(`preserved worktree no longer exists: ${world.root}`);
+    await this.withdrawCoordinatorClaims(task, view);
 
-    const messages = view.messages.map((m) => ({ ...m }));
-    const seen = typeof view.state?.turnsSeen === 'number' ? view.state.turnsSeen : messages.length;
-    messages.push({
+    // Resume in Do whatever stage failed: a run that died mid-Landing may have
+    // been stopped inside a merge whose outcome only the provider knows, so the
+    // agent and the landing both re-read the live PRs rather than trusting the
+    // checkpoint. The PR set, landing and point of no return carry over, so an
+    // authorized landing that failed resumes as an integration repair.
+    const failedFrom = view.state?.failedFrom as Stage | undefined;
+    const checkpoint = (await this.transitionCheckpoint({ ...view, stage: failedFrom ?? view.stage }, 'do'));
+    const messages = [...checkpoint.messages, {
       id: `recovery-${Date.now()}`,
-      role: 'user',
+      role: 'user' as const,
       text: `${BRAND} recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
-      ts: messages.length,
-    });
-    const session = (await this.deps.store.kvGet(`session:${taskId}:do`)) || undefined;
-    let sessionHome: string | undefined;
-    try {
-      const meta = JSON.parse((await this.deps.store.kvGet(`sessionmeta:${taskId}:do`)) ?? '{}');
-      sessionHome = typeof meta.home === 'string' ? meta.home || '(profile)' : undefined;
-    } catch {
-      /* malformed legacy metadata: conversation still recovers without session resume */
-    }
-    input.recovery = {
-      world,
-      messages,
-      transcripts: view.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) })),
-      reviewInfo: view.reviewInfo,
-      session,
-      sessionHome,
-      seen,
-      target: view.targetBranch,
-    };
+      ts: checkpoint.messages.length,
+    }];
+    input.recovery = { ...checkpoint, world, messages };
 
     const execution = await withTimeout(
       this.deps.client.workflow.start(startType, {
@@ -4998,6 +5048,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (started) (await this.saveAgentSnapshot(taskId, started.manifest, input));
     // Close the short acceptance→first-publish window so the UI cannot offer a
     // second recovery while the replacement run is already starting.
+    const { failedFrom: _failedFrom, ...recoveredState } = view.state;
     (await this.deps.store.saveView(taskId, {
       ...view,
       stage: 'do',
@@ -5005,8 +5056,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       messages,
       error: undefined,
       waitingFor: undefined,
-      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
-      state: { ...view.state, recoveryWorld: world },
+      actions: view.pointOfNoReturnPassed ? [] : [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
+      state: { ...recoveredState, recoveryWorld: world },
     }));
   }
 
@@ -5178,6 +5229,31 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     return this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
   }
 
+  /**
+   * Stop one of a task's agents, like Ctrl+C in a terminal (software-dev ≥1.27):
+   * its turn ends now — working, or still waiting for a credential, host
+   * capacity, a retry or people — and an agent only queued does not run. The
+   * task goes on: the next agent runs, the stage it interrupted resumes, and a
+   * stopped main agent waits for the next message.
+   */
+  async stopAgent(token: string, taskId: string, key: string): Promise<{ stopped: string }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'stop_agent', { projectId: task.projectId, taskId }));
+    if (!this.sharedConversation(task)) throw new ValidationError('this task predates stopping one agent; cancel the task instead');
+    const participant = task.lastView?.participants?.find((candidate) => candidate.key === key);
+    if (!participant) throw new ValidationError(`${key} is not an agent on this task`);
+    if (participant.state === 'idle') throw new ValidationError(`${participantLabel(key)} is not working`);
+    const userId = caller.humanSubject?.userId;
+    const ownAgent = caller.kind === 'agent' && caller.taskId === taskId ? (caller.participant ?? MAIN_AGENT) : undefined;
+    const by = userId ? `user:${userId}` : ownAgent ? `agent:${ownAgent}` : caller.principal;
+    const byLabel = userId ? ((await this.deps.store.userDisplayName(userId)) ?? undefined)
+      : ownAgent ? participantLabel(ownAgent) : undefined;
+    await (await this.workflowHandle(taskId, task)).signal('stopAgent', { key, by, ...(byLabel ? { byLabel } : {}) });
+    (await this.deps.store.appendEvent({ taskId, type: 'task.agent-stopped', ts: Date.now(), payload: { participant: key, state: participant.state, by } }));
+    return { stopped: key };
+  }
+
   private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number },
     /** Shared-conversation fields of a follow-up: who says it and to whom. */
     addressed?: Partial<Pick<Message, 'role' | 'author' | 'authorLabel' | 'to'>>): Promise<Message | undefined> {
@@ -5308,7 +5384,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     }
 
     const terminal = (await this.deps.store.getTask(taskId))?.lastView;
-    if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow) && !terminal.pointOfNoReturnPassed) {
+    if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow)) {
       if (signal === SIG.retry) {
         await this.recoverFailedTask(taskId);
         return;
@@ -5320,11 +5396,12 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
         (target ?? messages).push(msg);
-        (await this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() }));
+        (await this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS(terminal.pointOfNoReturnPassed) }));
         (await this.publishConversationMessage(taskId, role, msg));
         return msg;
       }
       if (signal === SIG.cancel) {
+        if (terminal.pointOfNoReturnPassed) throw new Error('cannot cancel a task after its merge point of no return');
         (await this.saveSettledView(taskId, {
           ...terminal,
           stage: 'cancelled',
@@ -5697,6 +5774,15 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     if ('paymentPolicy' in patch) throw new Error('Use the task payments endpoint to change cards or budget');
     patch = stripPlatformMetadata({ ...patch });
     this.assertBranchParams(patch);
+    // A running task may resize its computer, not swap it for another one.
+    const project = (await this.deps.store.getProject(task.projectId));
+    const computerBefore = project && Object.prototype.hasOwnProperty.call(patch, 'computer')
+      ? (await this.deps.store.effectiveTaskConfig(project, taskId)) : undefined;
+    if (project && computerBefore) {
+      try { assertInFlightComputerEdit(computerOf(computerBefore), normalizeComputer(patch.computer) ?? {}); }
+      catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+      patch.computer = (await this.taskComputer(project, { computer: patch.computer })) ?? null;
+    }
     // An in-flight edit can introduce a `resumeFrom` pointer at another task —
     // the same source-side conversation check as createTask/updateArmedParams.
     (await this.validateAndAuthorizeResumeSources(token, patch));
@@ -5742,6 +5828,17 @@ Act according to your Avatar instructions. When ready, call platform_request POS
           else delete current[key];
         }
         (await this.deps.store.patchTaskParams(taskId, { _agentAuthorization: current }));
+      }
+      // The workflow accepted the edit window; the Computer itself is read from
+      // the task's params by whatever makes its next machine (runners.ts sweep,
+      // checkpoint restore, a retry's world). A world made before machines were
+      // recorded learns the size it was made at, so the sweep can see the change.
+      if (computerBefore) {
+        (await this.deps.store.patchTaskParams(taskId, { computer: patch.computer }));
+        const world = (await this.deps.store.currentWorld(taskId));
+        if (world && !world.meta?.computer && !['worktree', 'container', 'memory'].includes(world.kind))
+          (await this.deps.store.updateWorldMeta(world, { computer: machineShape(computerBefore) }).catch(() => undefined));
+        result.applied = [...new Set([...result.applied, 'computer'])];
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')

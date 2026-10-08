@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
+import { EXPLANATIONS_ENABLED } from '../src/config/features.js';
 
 describe('profile + account management settings backend', () => {
   let h: Harness;
@@ -73,7 +74,8 @@ describe('profile + account management settings backend', () => {
     expect(credentials.credentials.find((credential: any) => credential.key === nextKey)).toMatchObject({
       provider: 'openrouter', account: 'explain-new', kind: 'key',
     });
-    expect(credentials.global.modes[nextKey]).toBe('explainer-only');
+    // The policy keeps the key's mode; while explanations are off it reads as Off.
+    expect(credentials.global.modes[nextKey]).toBe(EXPLANATIONS_ENABLED ? 'explainer-only' : 'off');
     expect(credentials.global.enabled).not.toContain(nextKey);
 
     const deleted = await fetch(`${base}/api/accounts/keys/openrouter/explain-new`, { method: 'DELETE', headers: auth() });

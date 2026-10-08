@@ -1,5 +1,6 @@
 import { FieldSpec, FieldMutable, TaskInput, AgentSpec, ConfirmConfig, ResponderConfig, ProjectConfig, Project } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
+import { applyComputer, normalizeComputer } from '../domain/computer.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { expandPath } from '../util/expand.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -170,6 +171,9 @@ export function assembleTaskInput(
       case 'project':
         (input.project as any)[f.name] = f.type === 'list' ? expandList(f.name, toList(v)) : v;
         break;
+      case 'computer':
+        input.project = applyComputer(input.project, normalizeComputer(v));
+        break;
       case 'profile':
         if (f.role && v && typeof v === 'object' && (v as AgentSpec).provider) agents[f.role] = v as AgentSpec;
         break;
@@ -287,7 +291,6 @@ export async function projectSettingsFor(
   if (c.defaultTarget) derived.target = c.defaultTarget;
   if (c.repos?.length) derived.repos = c.repos;
   if (c.copyGlobs?.length) derived.copyGlobs = c.copyGlobs;
-  if (c.worldProvider) derived.worldProvider = c.worldProvider;
   // The deprecated openGithubPr flag surfaces as its successor (PLAN-git-config §5).
   if (c.remote ?? c.openGithubPr) derived.remote = c.remote ?? 'pr';
   if (c.gitProfile) derived.gitProfile = c.gitProfile;

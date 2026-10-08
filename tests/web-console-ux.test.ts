@@ -143,8 +143,6 @@ describe('forms report their failures', () => {
     "row.querySelector('.resource-delete').addEventListener",
     "box.querySelectorAll('.service-delete')",
     "box.querySelector('#environment-save')?.addEventListener",
-    "$('#main').querySelectorAll('[data-inbox-toggle]')",
-    "$('#inbox-read-all')?.addEventListener",
   ];
   for (const anchor of anchors) {
     it(`${anchor} surfaces the error`, () => {

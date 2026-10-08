@@ -4,7 +4,8 @@ import { ProjectEnvironment } from '../store/project-environment.js';
 import { ProjectServices } from '../store/project-services.js';
 import { bootCommands, setupCommands } from './environment-build.js';
 import type { ProjectResourceService } from './resources.js';
-import { e2bTemplate } from './e2b-template.js';
+import { e2bTemplate, e2bWorldTemplate } from './e2b-template.js';
+import { machineShape } from '../domain/computer.js';
 import { launchWorldServices } from './services.js';
 import { worldRepos, type World, type WorldHandle } from './types.js';
 
@@ -19,12 +20,15 @@ export interface ProjectEnvironmentSelection {
  * world. The recipe may be checkpoint-pinned; provider images/snapshots remain
  * disposable accelerators selected by its stable digest. */
 export async function selectProjectEnvironment(store: Store, projectId: string, provider: string,
-  base: ProjectConfig['environment'], pinnedSpec?: ProjectEnvironmentSpec): Promise<ProjectEnvironmentSelection> {
+  base: ProjectConfig['environment'], pinnedSpec?: ProjectEnvironmentSpec,
+  resources?: ProjectConfig['resources']): Promise<ProjectEnvironmentSelection> {
   const environments = new ProjectEnvironment(store);
   const spec = pinnedSpec ?? (await environments.spec(projectId));
   if (!spec) return { built: false, environment: base };
   const digest = environments.digest(spec);
-  const build = (await environments.readyBuild(projectId, provider, digest, await environmentBase(store, projectId, provider)));
+  // A build made at another size is skipped like one made on another template:
+  // the world boots at its own size and runs setup live.
+  const build = (await environments.readyBuild(projectId, provider, digest, await environmentBase(store, projectId, provider, resources)));
   if (build?.ref && build.ref !== 'host') return {
     spec, digest, built: true,
     environment: { ...base, ...(provider === 'container' ? { image: build.ref } : { snapshot: build.ref }) },
@@ -37,11 +41,16 @@ export async function selectProjectEnvironment(store: Store, projectId: string, 
 }
 
 /** The provider template a new environment build for this project would start
- * from (E2B only): the one its task worlds boot from without an environment. */
-export async function environmentBase(store: Store, projectId: string, provider: string): Promise<string | undefined> {
+ * from (E2B only): the one its task worlds boot from without an environment, at
+ * the size they run at — the project's Computer unless `resources` says otherwise. */
+export async function environmentBase(store: Store, projectId: string, provider: string,
+  resources?: ProjectConfig['resources']): Promise<string | undefined> {
   if (provider !== 'e2b') return undefined;
-  const organizationId = (await store.getProject(projectId))?.organizationId;
-  return e2bTemplate(organizationId ? (await store.getWorldProviderConnection(organizationId, 'e2b'))?.config.template : undefined);
+  const project = (await store.getProject(projectId));
+  const organizationId = project?.organizationId;
+  const base = e2bTemplate(organizationId ? (await store.getWorldProviderConnection(organizationId, 'e2b'))?.config.template : undefined);
+  const size = resources ?? (project ? (await store.effectiveProjectConfig(project)).resources : undefined);
+  return e2bWorldTemplate(base, machineShape({ resources: size }));
 }
 
 export async function snapshotProjectRuntime(store: Store, projectId: string): Promise<{

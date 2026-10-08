@@ -18,6 +18,7 @@ import { AuthorizationService } from '../src/platform/authorization.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { GitHubAppService, GITHUB_APP_CLIENT_SECRET_HANDLE } from '../src/integrations/github-app.js';
 import { INSTALLATION_SCOPE, userScope } from '../src/autonomy/vault-keys.js';
+import { AppGrants } from '../src/auth/app-grants.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -98,6 +99,11 @@ it('cleans only personal access/settings and preserves shared work, history and 
   const other = await tokens.mintPrincipal('user:uX1', ['*']);
   const delegation = await tokens.delegateHuman(human.token, { taskId: task.id, projectId: project.id });
   const agent = await tokens.mint({ taskId: task.id, profileId: 'test', principal: 'user:u_1', ceiling: ['*'], grantorCaps: ['*'], delegationId: delegation!.id, projectId: project.id });
+  // App grants (CLI login, personal token) go with the account; another person's stay.
+  const appGrants = new AppGrants(store);
+  const cliLogin = await appGrants.issue(await appGrants.create({ userId: 'u_1', kind: 'cli', clientId: 'tavya-cli', name: 'laptop' }));
+  const otherLogin = await appGrants.issue(await appGrants.create({ userId: 'uX1', kind: 'cli', clientId: 'tavya-cli', name: 'laptop' }));
+  await appGrants.create({ userId: 'u_1', kind: 'token', clientId: 'personal-token', name: 'CI', expiresAt: Date.now() + 60_000 });
   await store.kvSet('account-deletion:u_1', JSON.stringify({ userId: 'u_1', email: 'person@example.test' }));
   await broker.registerHandle('user-owned:unlisted', 'no cleanup step names this handle', userScope('u_1'));
   const record = await close();
@@ -125,6 +131,10 @@ it('cleans only personal access/settings and preserves shared work, history and 
   expect(await tokens.verify(human.token)).toBeUndefined();
   expect(await tokens.verify(agent.token)).toBeUndefined();
   expect(await tokens.verify(other.token)).toBeDefined();
+  expect(await appGrants.list('u_1')).toEqual([]);
+  expect(await store.kvEntries('app-grant-user:u_1:')).toEqual([]);
+  expect(await appGrants.authenticate(cliLogin.accessToken)).toBeUndefined();
+  expect(await appGrants.authenticate(otherLogin.accessToken)).toBeDefined();
   expect((await service.list()).requests).toEqual([]);
   expect(JSON.stringify(record)).not.toContain('person@example.test');
   expect(identity.removeUser).toHaveBeenCalledWith('u_1');

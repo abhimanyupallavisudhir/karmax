@@ -77,6 +77,7 @@ global.S = {
 
 eval(extractFn('applyRoute'));
 eval(extractFn('applyHomeRoute'));
+eval(extractFn('applyListRoute'));
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };

@@ -179,13 +179,18 @@ describe('project resources', () => {
     await resources.promote(consumer.id, volume.id);
     expect((await resources.summarize(task.id, volume.id)).promoted).toBe(true);
 
-    // This generation is still pinned to its original lease. A second publish
-    // cannot overwrite a baseline that moved since the task forked.
-    await expect(resources.promote(task.id, volume.id)).rejects.toThrow(/baseline changed/);
+    // This generation is still pinned to its original lease. With nothing of
+    // its own since its publication, publishing again changes nothing: it
+    // neither reverts the newer baseline nor pulls it into this world.
+    const newer = (await store.getResourceAttachment(volume.id))!.currentRevisionId;
+    expect((await resources.promote(task.id, volume.id)).revision.id).toBe(newer);
+    expect((await store.getResourceAttachment(volume.id))!.currentRevisionId).toBe(newer);
+    expect(await world.readFileBuffer('resources/model/model.bin')).toEqual(tunedBytes);
 
+    // A file both tasks changed differently is a conflict, never overwritten.
     await world.writeFileBuffer!('resources/model/model.bin', Buffer.from('conflicting task edit'));
     await resources.beginReview(task.id, 'second-review');
-    await expect(resources.settleReview(task.id)).rejects.toThrow(/baseline changed/);
+    await expect(resources.settleReview(task.id)).rejects.toThrow(/model\.bin\).*rename or remove/);
     await expect(resources.setReviewExcluded(task.id, volume.id, true)).rejects.toThrow(/confirmed/);
     // A revised proposal can exclude the conflict without changing the other task's baseline.
     const headBeforeExclude = (await store.getResourceAttachment(volume.id))!.currentRevisionId;
@@ -259,7 +264,7 @@ describe('project resources', () => {
     await resources.promote(other.id, ledger.id);
     await world.writeFileBuffer!('resources/ledger/spend.txt', Buffer.from('30'));
     await resources.beginReview(task.id, 'third');
-    await expect(resources.settleReview(task.id)).rejects.toThrow(/baseline changed/);
+    await expect(resources.settleReview(task.id)).rejects.toThrow(/changed both by this task and in a newer published version \(spend\.txt\)/);
 
     await resources.release(otherWorld.handle); await otherWorld.destroy();
     await resources.release(world.handle); await world.destroy();

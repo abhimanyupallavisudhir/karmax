@@ -338,4 +338,56 @@ describe('credential Retry end to end', () => {
     }
   });
 
+  // Task #515: an agent waiting for a credential nobody can provide must not
+  // hold the task. Stopping it, like Ctrl+C, gives up its place in the
+  // credential queue, and the task goes on where it was.
+  it('stops an agent waiting for a credential, and the task goes on in Review', async () => {
+    const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await coordinator.registerAccounts([{ id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 }]);
+    await coordinator.setAccountAvailability({ accountId, status: 'available' });
+    healthy = true;
+    expectedHome = home;
+    const repo = await h.makeRepo('stop-waiting');
+    const project = (await h.store.createProject('Stop waiting', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }));
+    const task = await h.api.createTask((await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token, { projectId: project.id,
+      title: 'Stop waiting', prompt: '@write stop.txt :: STOP\n@run git add stop.txt && git commit -m stop\n@review Stop',
+      params: { 'agent:do': { provider: 'claude', model: 'claude-fable-5-1' } },
+    });
+    const view = () => h.client.workflow.getHandle(task.id).query('view') as Promise<any>;
+    const agent = async (key: string) => (await view()).participants?.find((p: any) => p.key === key);
+    await expect.poll(async () => (await view()).stage, { timeout: 30_000 }).toBe('review');
+    const post = (path: string, body?: unknown) => fetch(`${base}/api/tasks/${task.id}${path}`, {
+      method: 'POST', headers, ...(body ? { body: JSON.stringify(body) } : {}) });
+
+    // No credential works any more; an agent called in now waits for one.
+    await coordinator.setAccountAvailability({ accountId, status: 'needs-attention' });
+    // Agent 2's harness has no credential at all; it says so.
+    expect((await post('/messages', { text: 'Check it.', to: ['agent:agent-1', 'agent:agent-2'], agents: {
+      'agent-1': { provider: 'claude', model: 'claude-fable-5-1' }, 'agent-2': { provider: 'codex', model: 'gpt-5.5' } } })).status).toBe(200);
+    await expect.poll(async () => (await view()).waitingFor?.kind, { timeout: 30_000 }).toBe('account');
+    expect(await agent('agent-1')).toMatchObject({ state: 'waiting' });
+    expect(await agent('agent-2')).toMatchObject({ state: 'queued' });
+    expect((await accounts()).waiting).toBe(1);
+
+    expect((await post('/agents/agent-1/stop')).status).toBe(200);
+    await expect.poll(async () => (await agent('agent-1'))?.state, { timeout: 10_000 }).toBe('idle');
+    // The next agent runs; with no codex credential it waits too, until stopped.
+    await expect.poll(async () => (await view()).waitingFor?.detail, { timeout: 30_000 }).toBe('No codex credential — add one, or stop this agent');
+    expect(await agent('agent-2')).toMatchObject({ state: 'waiting' });
+    expect((await post('/agents/agent-2/stop')).status).toBe(200);
+    await expect.poll(async () => (await agent('agent-2'))?.state, { timeout: 10_000 }).toBe('idle');
+    await expect.poll(async () => (await view()).waitingFor?.kind, { timeout: 10_000 }).toBe('human');
+    const v = await view();
+    expect(v.stage).toBe('review');
+    expect(v.messages.at(-1)).toMatchObject({ role: 'system', to: [] });
+    expect(v.messages.filter((m: any) => m.role === 'system').map((m: any) => m.text.replace(/^.* stopped/, 'Stopped')))
+      .toEqual(['Stopped Agent 1.', 'Stopped Agent 2.']);
+    expect((await accounts()).waiting).toBe(0);
+    // Nothing to stop now.
+    const again = await post('/agents/agent-1/stop');
+    expect(again.status).toBe(400);
+    expect(((await again.json()) as { error: string }).error).toMatch(/Agent 1 is not working/);
+    expect((await h.store.eventsOfType(task.id, ['task.agent-stopped'])).map((e: any) => e.payload.participant)).toEqual(['agent-1', 'agent-2']);
+    await post('/signal', { signal: 'cancel' });
+  }, 90_000);
 });

@@ -31,11 +31,11 @@ for (const entry of ['footer', 'command', 'form', 'scheduled']) {
         taskActionLabel: () => 'Cancel', taskRecord: () => ({ title: 'Scheduled task' }),
         toast() {}, setTimeout() {}, refreshTask() {}, refreshTasks() {},
         wireOrgControls() {}, wirePromptAttachments() {}, wireAttachmentPicker() {},
-        renderAttachmentChips() {}, requestTaskFormDefaults() {}, applyCursor() {}, wireQuickComposer() {},
+        renderAttachmentChips() {}, requestTaskFormDefaults() {}, applyCursor() {}, wireQuickComposer() {}, wireInboxNotices() {},
         esc: text => text,
       });
       vm.runInContext(['confirmTaskAction', 'hasOpenPullRequest', 'confirmMergeRights', 'otherAttemptsConfirmation', 'actionToast',
-        'wireActions', 'runDeclaredAction', 'openActionForm', 'wireTasksView'].map(fn).join('\n'), context);
+        'wireActions', 'runDeclaredAction', 'openActionForm', 'wireTasksView', 'isCrossProjectList'].map(fn).join('\n'), context);
       if (entry === 'footer') {
         context.wireActions(context.S.view);
         await element('button').click();

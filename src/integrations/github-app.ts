@@ -1268,6 +1268,27 @@ export class GitHubAppService {
     return { httpsToken: token, env: { GH_TOKEN: token }, mirrorScope: repository.id };
   }
 
+  /** A token for one repository with only `contents` read or write: what
+   * `tavya git-credential` hands Git on a member's machine when the
+   * organization allows it. Cached like other tokens, per access. */
+  async repositoryCredential(repository: Repository, access: 'read' | 'write'): Promise<{ token: string; expiresAt: number }> {
+    if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
+    const connection = (await this.store.getGitConnection(repository.gitConnectionId));
+    if (!connection || connection.organizationId !== repository.organizationId) throw new Error('repository GitHub App connection is missing');
+    if (connection.suspendedAt) throw new Error('GitHub App installation is suspended');
+    if (!/^\d+$/.test(repository.providerId ?? '')) throw new Error('invalid GitHub repository scope');
+    const cacheKey = `${connection.id}:${repository.providerId}:contents-${access}`;
+    const cached = this.tokenCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now() + 5 * 60_000) return cached;
+    const created = await this.appRequest<{ token: string; expires_at: string }>(
+      `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`,
+      { method: 'POST', body: JSON.stringify({ repository_ids: [Number(repository.providerId)], permissions: { contents: access, metadata: 'read' } }) });
+    const parsed = Date.parse(created.expires_at ?? '');
+    const value = { token: created.token, expiresAt: Number.isFinite(parsed) ? parsed : Date.now() + 3600_000 };
+    this.tokenCache.set(cacheKey, value);
+    return value;
+  }
+
   /** Repository-bound Actions client. Tokens remain inside this service and a
    * 401 forces the cached installation token to be minted again once. */
   async actions(repository: Repository): Promise<GithubActionsApi> {

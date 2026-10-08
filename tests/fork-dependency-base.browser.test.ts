@@ -60,7 +60,6 @@ it('resets a fork’s base branch when its source becomes a dependency', async (
     expect(await chips.count()).toBe(1);
     expect(await base.inputValue()).toBe('main');
     // Dropping the dependency (here from its chip) restores the fork's branch.
-    await page.locator('#tf-body summary', { hasText: 'Triggers' }).click();
     await page.locator(`#dep-chips [data-depx="${source.id}"]`).click();
     expect(await dependency.isChecked()).toBe(false);
     expect(await base.inputValue()).toBe('tavya/source');
