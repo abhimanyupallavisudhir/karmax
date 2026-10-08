@@ -20,7 +20,7 @@ import { openStore } from './store/db.js';
 import { defaultProvider } from './agent/adapters.js';
 import { KarmaxBus } from './contrib/bus.js';
 import { CredentialBroker } from './autonomy/broker.js';
-import { Vault, recordQuarantine, recordScopeMigration } from './autonomy/vault.js';
+import { openSecretVault } from './autonomy/vault-backend.js';
 import { resolveVaultScopes } from './autonomy/vault-scopes.js';
 import { INSTALLATION_SCOPE } from './autonomy/vault-keys.js';
 import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
@@ -175,16 +175,14 @@ async function main() {
         .map((value) => value?.trim()).find(Boolean)! }
       : {}),
   }));
-  const vault = new Vault(p.vault);
-  // Data epoch 4 (SS-1): every secret moves under its owner's data key; the database knows the owners.
-  const scoped = await recordScopeMigration(vault, (handles) => resolveVaultScopes(store, handles), (report) => store.appendAudit({
-    principalId: 'system:vault', action: 'vault.scopes.migrated', detail: { migrated: report.migrated, byScope: report.byScope,
-      unresolved: report.unresolved.length, unresolvedHandles: report.unresolved.slice(0, 500) } }));
-  if (scoped?.migrated) console.log(`  • Vault: ${scoped.migrated} secrets moved under per-owner data keys`
-    + (scoped.unresolved.length ? `; ${scoped.unresolved.length} with no owner found stay under the installation key (audit log: vault.scopes.migrated)` : ''));
-  // Binds ciphertext written before AU-27 to its handle; what will not open is quarantined, loudly.
-  // Reported until audited, so a crash between quarantine and audit still reaches the log.
-  await recordQuarantine(vault, (entry) => store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
+  // The vault's one-way migrations run here, each audited before it is acknowledged: binding
+  // (AU-27), per-owner data keys (data epoch 4; the database knows the owners) and, on
+  // PostgreSQL, the move into the database (data epoch 5; wiki planned/host-local-state).
+  const vault = await openSecretVault(p.vault, store.db, {
+    resolveScopes: (handles) => resolveVaultScopes(store, handles),
+    audit: (action, detail) => store.appendAudit({ principalId: 'system:vault', action, detail }),
+    log: (line) => console.log(`  • ${line}`),
+  });
   const broker = new CredentialBroker(vault);
   await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker); // AU-31
   (await import('./autonomy/vault-items.js')).removeLegacyKeyCopies(p.state); // AU-33

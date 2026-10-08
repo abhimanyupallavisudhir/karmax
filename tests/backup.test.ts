@@ -8,7 +8,8 @@ import { createBackup, restoreBackup, verifyBackup, recordRestores, signChecksum
 import { localSigningFingerprint } from '../src/ops/backup-signing.js';
 import crypto from 'node:crypto';
 import { Vault } from '../src/autonomy/vault.js';
-import { organizationScope } from '../src/autonomy/vault-keys.js';
+import { LocalKek, organizationScope } from '../src/autonomy/vault-keys.js';
+import { moveVaultToDatabase } from '../src/autonomy/vault-backend.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -760,6 +761,23 @@ describe('backups without the vault key (SS-2)', () => {
     const opted = await createBackup({ home, destination: path.join(root, 'opted'), externalTemporal: true, includeVaultKey: true });
     expect(opted.manifest).toMatchObject({ vaultKeyIncluded: true, vaultKeyIds: [kek] });
     expect(fs.existsSync(path.join(root, 'opted', 'payload', 'vault', 'vault.key'))).toBe(true);
+  });
+
+  it('names the key of a vault that moved into the database, whose directory holds no canaries', async () => {
+    const key = 'hosted-deployment-key-material-0123456789';
+    vi.stubEnv('KARMAX_VAULT_KEY', key);
+    const { root, home, kek } = await vaultHome('moved');
+    const store = await Store.create(':memory:');
+    try {
+      await moveVaultToDatabase(path.join(home, 'vault'), store.db, { current: LocalKek.fromText(key), others: [] },
+        { resolveScopes: async () => new Map(), audit: async () => undefined });
+    } finally { await store.close(); }
+    const made = await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    // The ciphertext is in the database dump now; the key it needs is still named, and still left out.
+    expect(made.manifest.files.some((file) => file.path.startsWith('vault/keys/') || file.path.startsWith('vault/entries/0'))).toBe(false);
+    expect(made.manifest).toMatchObject({ vaultKeyIncluded: false, vaultKeyIds: [kek] });
+    vi.stubEnv('KARMAX_VAULT_KEY', 'a-different-deployment-key-material-000');
+    expect(() => verifyBackup(made.directory, { home, trustKeys: [made.signedBy], checkVaultKey: true })).toThrow(new RegExp(`encrypted under ${kek}`));
   });
 
   it('records the id of a KARMAX_VAULT_KEY, and restores with it', async () => {

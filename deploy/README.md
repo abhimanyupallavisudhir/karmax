@@ -430,6 +430,24 @@ release with the previous release's code, copy the key into it first:
 `cp deploy/.secrets/vault_key BACKUP/deployment-secrets/` (the checksums list
 only the files they cover, so this does not fail verification).
 
+Epoch 5 moves the vault into the application database when that database is
+PostgreSQL (wiki planned/host-local-state), so every process and host shares
+one vault without a host-local file lock. The first boot finishes the epoch 3
+and 4 steps, copies every entry, keyring and key canary into the
+`vault_entries`, `vault_keyrings` and `vault_kek_canaries` tables exactly as
+stored (ciphertext and wrapped data keys; nothing is decrypted to copy it),
+reads every secret back through the database and compares it with the file,
+and only then records the move (`vault.moved-to-database` in the audit log).
+It then replaces `vault/secrets.json` with a marker the epoch 4 release refuses
+("not a secret map") and deletes the vault's files, keeping `vault/vault.key`
+if there is one: that is the vault key, not the vault. An interrupted first
+boot repeats the copy; one interrupted after the move only finishes the
+cleanup. The vault key is unchanged, `karmax.dump` now carries the encrypted
+vault, and backups still leave the key out. `npm run vault-key` and
+`vault-preflight` work on the database once the move is recorded. **The way
+back is the pre-update backup with its code**, whose `control-plane/vault/`
+still holds the files. A self-host on SQLite keeps the file vault.
+
 Recover a failed epoch transition by repairing forward, or restore the pre-update
 backup with its matching application revision **and Temporal history**. Restoring
 a snapshot can discard work performed after it was taken. Do not run an older

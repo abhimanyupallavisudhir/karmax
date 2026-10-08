@@ -58,7 +58,7 @@ Layers around that core:
 - `src/world/` — world provider interface; worktree (isolated git worktree per task), container (Docker), E2B and Daytona (remote sandboxes; the only kinds hosted allows), memory backends. Merges land through `src/world/merge.ts` and the merge-queue coordinator.
 - `src/platform/` — capability model, workflow-minted scoped tokens, the `KarmaxApi` service layer, and the permission-checked platform MCP server (the single API agents use to act on the system).
 - `src/packages/` — trusted self-hosted workflow packages: git repo → data-only `manifest.json` → code bundled into the worker; installed versions are pinned by commit SHA. Installation is global authority, not organization authority. Hosted install and restore are disabled; merging an edit never activates code automatically.
-- `src/autonomy/` — credential broker + AES-GCM vault (secrets move as handles, never plaintext), config homes per (account × profile), logins, payments.
+- `src/autonomy/` — credential broker + AES-GCM vault (secrets move as handles, never plaintext; files under `vault/` on SQLite installs, rows of the application database on PostgreSQL — wiki planned/host-local-state), config homes per (account × profile), logins, payments.
 - `src/gateway/` — HTTP/WebSocket gateway translating requests into Temporal signal/query/update calls; the **only** thing the UI talks to.
 - `src/store/` — metadata store (SQLite; PostgreSQL when hosted). `overlays.ts` is the SPEC §9 overlay-resolution library; nothing reads it yet.
 - `web/` — single-page console with **no build step**; edit `app.js`/`index.html`/`styles.css` directly.
