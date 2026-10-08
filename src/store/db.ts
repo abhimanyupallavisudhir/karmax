@@ -886,6 +886,11 @@ export class Store {
         reason TEXT NOT NULL, createdAt INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_vault_entries_scope ON vault_entries(scope);
+      -- Who may refresh a stored OAuth credential now (autonomy/refresh-lease.ts):
+      -- refresh tokens are single-use, so one refresh at a time across processes.
+      CREATE TABLE IF NOT EXISTS credential_refresh_leases (
+        credential TEXT PRIMARY KEY, holder TEXT NOT NULL, expiresAt INTEGER NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
       CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parentTaskId);
       CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_memberships(userId, organizationId);

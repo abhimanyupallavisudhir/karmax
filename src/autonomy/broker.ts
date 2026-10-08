@@ -60,6 +60,12 @@ export class CredentialBroker {
     return this.vault.deleteIfEqual(handle, observed);
   }
 
+  /** Write a handle only if its secret is still `observed` (undefined: only if
+   * it has none), as one compare-and-set; false if another writer got there first. */
+  replaceHandleIfUnchanged(handle: string, observed: string | undefined, secret: string, scope: VaultScope, options?: { history?: boolean }) {
+    return this.vault.replaceIfEqual(handle, observed, secret, scope, options);
+  }
+
   /** Rename and/or rotate a handle without revealing its current secret to the
    * gateway. Supplying no replacement keeps the existing secret. */
   updateHandle(handle: string, nextHandle: string, scope: VaultScope, replacement?: string) {

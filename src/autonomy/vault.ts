@@ -46,7 +46,17 @@ const QUARANTINE_RETENTION_MS = 30 * 86_400_000;
  * instead of starting on an empty vault and writing secrets this one ignores. */
 const MOVED = ['karmax-vault-moved-to-entries',
   'The secrets moved to vault/entries/ (data epoch 3). To run an earlier release, restore the pre-update backup with its code.'];
-const isMoved = (parsed: unknown) => Array.isArray(parsed) && parsed[0] === MOVED[0];
+/** `secrets.json` of a file vault from data epoch 6: the same as `MOVED` to
+ * this release, but not to the epoch 5 release, which then finds no secret
+ * map ("not a secret map") and refuses to start instead of reading model
+ * logins from files that are now only a cache (`model-logins.ts`). */
+const MOVED_EPOCH6 = ['karmax-vault-moved-to-entries:epoch6',
+  'The secrets are in vault/entries/, and model logins moved into the vault (data epoch 6). To run an earlier release, restore the pre-update backup with its code.'];
+/** What `vault/entries` becomes on PostgreSQL from data epoch 6: a file, so the
+ * epoch 5 release, which creates that directory at every boot, refuses to start. */
+const EPOCH6_ENTRIES_NOTE = 'The vault is in the application database, and model logins moved into it (data epoch 6). '
+  + 'This file stops an earlier release from starting: to run one, restore the pre-update backup with its code.\n';
+const isMoved = (parsed: unknown) => Array.isArray(parsed) && (parsed[0] === MOVED[0] || parsed[0] === MOVED_EPOCH6[0]);
 /** What `secrets.json` holds once the vault has moved into the application
  * database (data epoch 5, `vault-backend.ts`): neither a map nor the epoch 3
  * sentinel, so the epoch 3 and 4 releases refuse the vault ("not a secret
@@ -152,14 +162,17 @@ export async function recordQuarantine(vault: Vault, append: (entry: Quarantined
 
 /** Write `data` to a synced temporary beside `file` and rename it into place;
  * `syncDir` (default) also makes the rename durable. */
-function writeDurably(file: string, data: string | Buffer, syncDir = true): void {
+function isFile(file: string): boolean {
+  try { return fs.lstatSync(file).isFile(); } catch { return false; }
+}
+export function writeDurably(file: string, data: string | Buffer, syncDir = true): void {
   const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
   const fd = fs.openSync(temporary, 'wx', 0o600);
   try { fs.writeFileSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   try { fs.renameSync(temporary, file); } catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
   if (syncDir) syncDirectory(path.dirname(file));
 }
-function syncDirectory(dir: string): void {
+export function syncDirectory(dir: string): void {
   const fd = fs.openSync(dir, 'r');
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
@@ -999,6 +1012,19 @@ export class Vault implements SecretVault {
     });
   }
 
+  async replaceIfEqual(handle: string, observed: string | undefined, secret: string, scope: VaultScope, options: { history?: boolean } = {}): Promise<boolean> {
+    this.validateScope(scope);
+    this.validateSecret(secret);
+    return this.mutate(() => {
+      const stored = this.readEntry(handle);
+      if ((stored === undefined ? undefined : this.revealNow(handle)) !== observed) return false;
+      const prior = this.claim(stored, scope);
+      const previous = options.history === false || prior === undefined ? [] : [prior.blob, ...prior.previous].slice(0, 5);
+      this.writeEntry({ handle, scope, blob: this.encrypt(secret, handle, scope), previous });
+      return true;
+    });
+  }
+
   // ── Rotation and shredding ──
 
   /** Entries of one scope, parsed (the unreadable are skipped). */
@@ -1161,9 +1187,11 @@ export class Vault implements SecretVault {
     if (!fs.existsSync(dir)) return;
     if (!movedToDatabase(dir)) writeDurably(path.join(dir, 'secrets.json'), `${JSON.stringify(MOVED_TO_DATABASE)}\n`);
     const entries = path.join(dir, 'entries');
-    fs.mkdirSync(entries, { recursive: true, mode: 0o700 });
+    // From data epoch 6 `entries` is the note that refuses earlier releases (`sealForEpoch6`).
+    const sealed = isFile(entries);
+    if (!sealed) fs.mkdirSync(entries, { recursive: true, mode: 0o700 });
     // Without it, an epoch 3 or 4 release would not read secrets.json, and would start on an empty vault.
-    if (!fs.existsSync(path.join(entries, '.migrated'))) writeDurably(path.join(entries, '.migrated'), '');
+    if (!sealed && !fs.existsSync(path.join(entries, '.migrated'))) writeDurably(path.join(entries, '.migrated'), '');
     const retired = path.join(dir, RETIRED_VAULT);
     const move = (sub: string, keep: (name: string) => boolean = () => false) => {
       let names: string[] = [];
@@ -1177,15 +1205,54 @@ export class Vault implements SecretVault {
       if (fs.existsSync(target)) syncDirectory(target);
       syncDirectory(path.join(dir, sub));
     };
-    move(path.join('entries', 'quarantine'));
-    move('entries', (name) => name === '.migrated');
+    if (!sealed) {
+      move(path.join('entries', 'quarantine'));
+      move('entries', (name) => name === '.migrated');
+    }
     move('keys');
     if (fs.existsSync(path.join(dir, 'scope-migration.json'))) {
       fs.mkdirSync(retired, { recursive: true, mode: 0o700 });
       fs.renameSync(path.join(dir, 'scope-migration.json'), path.join(retired, 'scope-migration.json'));
     }
-    for (const name of [path.join('entries', 'quarantine'), 'keys', 'secrets.json.lock']) fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+    for (const name of [...(sealed ? [] : [path.join('entries', 'quarantine')]), 'keys', 'secrets.json.lock'])
+      fs.rmSync(path.join(dir, name), { recursive: true, force: true });
     syncDirectory(dir);
+  }
+
+  /**
+   * Data epoch 6: mark the vault directory so the epoch 5 release refuses to
+   * start (it would read model logins from files that are now a cache, and
+   * refresh tokens the vault has already spent). A database vault's
+   * `entries/` (by now only the epoch 3 marker) becomes a note the epoch 5
+   * release cannot create its directory over; a file vault's `secrets.json`
+   * becomes a sentinel it does not know. Repeatable.
+   */
+  static sealForEpoch6(dir: string, database: boolean): void {
+    if (!fs.existsSync(dir)) return;
+    if (database) {
+      const entries = path.join(dir, 'entries');
+      if (isFile(entries)) return;
+      if (fs.existsSync(entries)) {
+        // Anything but the marker went to the retired copy at the move; keep a stray file there too.
+        for (const name of fs.readdirSync(entries, { recursive: true }).map(String)) {
+          const file = path.join(entries, name);
+          if (name === '.migrated' || !isFile(file)) continue;
+          const target = path.join(dir, RETIRED_VAULT, 'entries', name);
+          fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+          fs.renameSync(file, target);
+        }
+        fs.rmSync(entries, { recursive: true, force: true });
+      }
+      writeDurably(entries, EPOCH6_ENTRIES_NOTE);
+      return;
+    }
+    const secrets = path.join(dir, 'secrets.json');
+    let parsed: unknown;
+    try { parsed = JSON.parse(fs.readFileSync(secrets, 'utf8')); } catch { parsed = undefined; }
+    if (Array.isArray(parsed) && parsed[0] === MOVED_EPOCH6[0]) return;
+    // Only over the moved sentinel (or none): a secret map is never overwritten.
+    if (parsed === undefined ? fs.existsSync(secrets) : !isMoved(parsed)) return;
+    writeDurably(secrets, `${JSON.stringify(MOVED_EPOCH6)}\n`);
   }
 
   /** Crypto-shred a scope from a retired copy (`retire`) as well: its keyring,

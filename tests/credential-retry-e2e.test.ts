@@ -157,7 +157,7 @@ describe('credential Retry end to end', () => {
     expect(turns).toBe(before + 1);
     await h.api.signalTask(token, task.id, 'cancel');
     expectedHome = home;
-    homes.remove('claude', 'fresh');
+    await homes.remove('claude', 'fresh');
     await coordinator.registerAccounts([{ id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 }]);
   }, 90_000);
 
@@ -193,7 +193,7 @@ describe('credential Retry end to end', () => {
     expect(await status(accountId)).toBe('exhausted');
     await h.api.signalTask(token, task.id, 'cancel');
     expectedHome = home;
-    homes.remove('claude', 'second');
+    await homes.remove('claude', 'second');
     await coordinator.registerAccounts([{ id: accountId, provider: 'claude', kind: 'login', configHome: home, maxConcurrent: 1 }]);
     await coordinator.setAccountAvailability({ accountId, status: 'available' });
   }, 90_000);
@@ -281,7 +281,7 @@ describe('credential Retry end to end', () => {
     });
     expect(listed.global.enabled).not.toContain('login:claude:expired');
     expect(listed.credentials.find((c: any) => c.key === accountId)?.signedOut).toBeUndefined();
-    homes.remove('claude', 'expired');
+    await homes.remove('claude', 'expired');
 
     // A healthy Claude sign-in reports when it lapses, so it can be renewed first.
     const lapsing = homes.ensure('claude', 'lapsing');
@@ -291,7 +291,7 @@ describe('credential Retry end to end', () => {
     } }));
     const renewing: any = await fetch(`${base}/api/organizations/org_personal/credentials`, { headers }).then(r => r.json());
     expect(renewing.credentials.find((c: any) => c.key === 'login:claude:lapsing')).toMatchObject({ signInExpiresAt });
-    homes.remove('claude', 'lapsing');
+    await homes.remove('claude', 'lapsing');
   });
 
   it('preserves manual disables, known quota waits, task policy, and other providers', async () => {

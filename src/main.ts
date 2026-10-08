@@ -156,6 +156,8 @@ async function main() {
   const openedStore = (await openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL,
     { hosted: deployment.hosted }));
   const store = openedStore.store;
+  // A release older than the data this database holds refuses to start (data epoch 6 on).
+  await (await import('./config/data-epoch.js')).assertDataEpoch(store.db);
   await (await import('./ops/backup.js')).recordRestores(store, p.home); // DB-10
   if (process.env.KARMAX_DATABASE_URL) {
     const migrated = openedStore.migration?.imported

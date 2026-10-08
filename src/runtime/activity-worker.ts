@@ -16,6 +16,7 @@ import { CredentialBroker } from '../autonomy/broker.js';
 import { AuthorizationService } from '../platform/authorization.js';
 import { GitHubAppService } from '../integrations/github-app.js';
 import { createExecutionServices } from './execution-services.js';
+import { assertDataEpoch } from '../config/data-epoch.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
 
 /** Attach to the primary's already-initialized installation. The parent passes
@@ -51,6 +52,7 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
   };
   try {
     store = await Store.create(database);
+    await assertDataEpoch(store.db);
     // The primary relays this process's events to browsers; wake it on every
     // commit rather than leaving delivery to its poll (LT-15).
     const append = store.appendEvent.bind(store);

@@ -2093,6 +2093,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
       if (args.accountConfigHome) {
+        // The login's credential is in the vault; the home caches it (data epoch 6).
+        await deps.configHomes?.sync(args.accountConfigHome);
         const tok = tokenToInject(args.accountConfigHome);
         resolvedAuth = { ...resolvedAuth, configHome: args.accountConfigHome, ...(tok ? { oauthToken: tok } : {}) };
       }
