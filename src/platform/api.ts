@@ -5227,6 +5227,31 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     return this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
   }
 
+  /**
+   * Stop one of a task's agents, like Ctrl+C in a terminal (software-dev ≥1.27):
+   * its turn ends now — working, or still waiting for a credential, host
+   * capacity, a retry or people — and an agent only queued does not run. The
+   * task goes on: the next agent runs, the stage it interrupted resumes, and a
+   * stopped main agent waits for the next message.
+   */
+  async stopAgent(token: string, taskId: string, key: string): Promise<{ stopped: string }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'stop_agent', { projectId: task.projectId, taskId }));
+    if (!this.sharedConversation(task)) throw new ValidationError('this task predates stopping one agent; cancel the task instead');
+    const participant = task.lastView?.participants?.find((candidate) => candidate.key === key);
+    if (!participant) throw new ValidationError(`${key} is not an agent on this task`);
+    if (participant.state === 'idle') throw new ValidationError(`${participantLabel(key)} is not working`);
+    const userId = caller.humanSubject?.userId;
+    const ownAgent = caller.kind === 'agent' && caller.taskId === taskId ? (caller.participant ?? MAIN_AGENT) : undefined;
+    const by = userId ? `user:${userId}` : ownAgent ? `agent:${ownAgent}` : caller.principal;
+    const byLabel = userId ? ((await this.deps.store.userDisplayName(userId)) ?? undefined)
+      : ownAgent ? participantLabel(ownAgent) : undefined;
+    await (await this.workflowHandle(taskId, task)).signal('stopAgent', { key, by, ...(byLabel ? { byLabel } : {}) });
+    (await this.deps.store.appendEvent({ taskId, type: 'task.agent-stopped', ts: Date.now(), payload: { participant: key, state: participant.state, by } }));
+    return { stopped: key };
+  }
+
   private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number },
     /** Shared-conversation fields of a follow-up: who says it and to whom. */
     addressed?: Partial<Pick<Message, 'role' | 'author' | 'authorLabel' | 'to'>>): Promise<Message | undefined> {

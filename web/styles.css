@@ -1102,6 +1102,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .agent-activity.running .activity-icon, .agent-activity.started .activity-icon, .agent-activity.updated .activity-icon { color: var(--working); border-color: color-mix(in srgb, var(--working) 35%, var(--line)); }
 .agent-activity.failed .activity-icon { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); background: var(--danger-weak); }
 .agent-activity.completed .activity-icon { color: var(--merged); }
+.agent-activity.stopped .activity-icon { color: var(--ink-3); }
 .activity-body { min-width: 0; flex: 1; }
 .activity-head { min-height: 20px; display: flex; align-items: center; gap: 8px; }
 .activity-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); color: var(--ink-2); }
@@ -2318,8 +2319,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .cron-cell small { color: var(--ink-3); font-size: 10px; }
 
 /* ── Repeatable series + runs (task list) ─────────────────────────────────── */
-.repeat-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); cursor: pointer; }
-.repeat-toggle input { margin: 0; }
 .series-row .series-caret { margin-right: 2px; color: var(--ink-3); }
 .run-row { padding-left: 34px; background: var(--surface-2); }
 .run-row .task-title { font-size: 13px; }
@@ -2328,12 +2327,23 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 .run-row { position: relative; }
 
-/* ── Repeatable toggle (prominent, task-level) ───────────────────────────── */
-.repeat-row { margin-top: 12px; }
-.repeat-toggle { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; color: var(--ink-2); cursor: pointer;
-  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 9px 11px; background: var(--surface-2); }
-.repeat-toggle input { margin: 2px 0 0; }
-.repeat-toggle b { color: var(--ink); }
+/* ── The Triggers block (task form, series page): framed like the agent and
+   computer blocks; a small label column beside each control. ─────────────── */
+.triggers-block {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: 10px 14px;
+  padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2);
+}
+.triggers-block .tb-label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.triggers-block #trig-at { width: 100%; max-width: 260px; padding: 7px 10px; background: var(--surface); }
+.triggers-block .tb-repeat {
+  grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; width: max-content;
+  font-size: 12px; font-weight: 600; color: var(--ink-2); cursor: pointer;
+}
+.triggers-block .tb-repeat input { width: auto; margin: 0; padding: 0; }
+@media (max-width: 700px) {
+  .triggers-block { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .triggers-block > :not(:first-child):is(.tb-label, .tb-repeat) { margin-top: 8px; }
+}
 
 /* ── Series row + runs (list + series page) ───────────────────────────────────── */
 .series-row .series-caret { margin-right: 2px; color: var(--ink-3); background: transparent; border: 0; cursor: pointer; }
@@ -3143,6 +3153,13 @@ html[data-theme="dark"] .github-signin-btn:active,
 .ck-participant .ck-num { flex: none; width: 16px; font: 11px var(--font-mono); color: var(--ink-3); }
 .ck-participant .ck-queued { margin-left: auto; color: var(--ink-3); font-weight: 700; letter-spacing: .1em; }
 .ck-participant .ck-live { margin-left: auto; }
+.ck-participant .ck-waiting { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--working); flex: none; }
+.ck-participant-row { display: flex; align-items: center; }
+.ck-participant-row .ck-participant { flex: 1; min-width: 0; }
+.ck-stop { flex: none; width: 24px; height: 24px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--ink-3); cursor: pointer; }
+.ck-stop:hover { background: var(--surface); color: var(--danger); }
+.followup-stop { flex: none; display: grid; place-items: center; padding: 0 10px; min-height: 38px; color: var(--ink-2); }
+.followup-stop:hover { color: var(--danger); }
 .agent-mention-menu { min-width: 240px; }
 .agent-mention-menu .am-key { flex: none; width: 26px; font: 11px var(--font-mono); color: var(--ink-3); }
 .agent-mention-menu .am-sep { height: 1px; margin: 4px 6px; background: var(--line); }

@@ -128,7 +128,9 @@ const status = (root: string) => `${ALIVE}
 b=$1; lines=$2; shift 2
 for id in "$@"; do d=${root}/$id
   if [ ! -d "$d" ]; then printf '%s %s missing\\n' "$b" "$id"; continue; fi
-  if [ -f "$d/exit" ]; then s="exited $(cat "$d/exit")"; elif alive "$d"; then s=running; else s=lost; fi
+  # The process first: a job writes its exit record before its leader exits,
+  # so one that ends between the two looks is seen exited, not lost.
+  if alive "$d" && [ ! -f "$d/exit" ]; then s=running; elif [ -f "$d/exit" ]; then s="exited $(cat "$d/exit")"; else s=lost; fi
   printf '%s %s %s %s %s\\n' "$b" "$id" "$s" "$(cat "$d/started" 2>/dev/null)" "$(cat "$d/ended" 2>/dev/null)"
   printf '%s\\n' "$(head -n 1 "$d/name" 2>/dev/null)"
   head -c 300 "$d/command" 2>/dev/null | head -n 1; echo

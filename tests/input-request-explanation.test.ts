@@ -11,9 +11,10 @@ import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
+import { EXPLANATIONS_ENABLED } from '../src/config/features.js';
 // Keep the real explanation client: with isolate:false, a module mock cannot
 // replace the client captured by a Gateway imported by an earlier test file.
-describe('input request explanations over HTTP', () => {
+describe.skipIf(!EXPLANATIONS_ENABLED)('input request explanations over HTTP', () => {
   let home: string;
   let store: Store;
   let base: string;
