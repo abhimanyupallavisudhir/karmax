@@ -192,3 +192,25 @@ test('survives an isolated unhandled asynchronous callback rejection', async () 
   await worker.refresh([]);
   expect(worker.failure).toBeUndefined();
 });
+
+test('reports the child’s V8 heap with each heartbeat (Installation → Service limits)', async () => {
+  const worker = manager('', { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 500 });
+  expect(worker.heap).toBeUndefined();
+  await worker.start();
+  await vi.waitFor(() => expect(worker.heap).toBeDefined(), { timeout: 2_000 });
+  // The child runs with --max-old-space-size=64: the limit is the child's, not ours.
+  expect(worker.heap!.limitBytes).toBeGreaterThan(32 * 1024 ** 2);
+  expect(worker.heap!.limitBytes).toBeLessThan(256 * 1024 ** 2);
+  expect(worker.heap!.usedBytes).toBeGreaterThan(0);
+  expect(worker.heap!.usedBytes).toBeLessThan(worker.heap!.limitBytes);
+});
+
+test('tolerates a worker whose heartbeat carries no heap (a rolling restart from an older build)', async () => {
+  const worker = manager('', { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 500,
+    entrypoint: fileURLToPath(new URL('./fixtures/worker-process-legacy.mjs', import.meta.url)) });
+  await worker.start();
+  await new Promise((resolve) => setTimeout(resolve, 200)); // several heartbeats
+  expect(worker.isReady).toBe(true);
+  expect(worker.failure).toBeUndefined();
+  expect(worker.heap).toBeUndefined();
+});

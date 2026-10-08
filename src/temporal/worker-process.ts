@@ -1,4 +1,5 @@
 import { fork, type ChildProcess } from 'node:child_process';
+import v8 from 'node:v8';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
 
 export interface WorkerProcessRequest {
@@ -7,6 +8,14 @@ export interface WorkerProcessRequest {
 }
 export interface WorkerProcessReply {
   type: 'worker.reply'; id: number; ok: boolean; error?: string;
+  /** On a ping: the worker's V8 heap, for the operator's service-limits page. */
+  heap?: WorkerHeap;
+}
+/** V8 heap in use against the heap limit (`--max-old-space-size` or V8's default). */
+export interface WorkerHeap { usedBytes: number; limitBytes: number; at: number }
+export function heapNow(): WorkerHeap {
+  const heap = v8.getHeapStatistics();
+  return { usedBytes: heap.used_heap_size, limitBytes: heap.heap_size_limit, at: Date.now() };
 }
 /** Unsolicited child → supervisor hint: events were committed to the shared store. */
 export interface WorkerProcessNotice { type: 'worker.events' }
@@ -33,6 +42,8 @@ export class WorkerProcessManager {
   private externals: ExternalWorkflowRef[] = [];
   private pending = new Map<number, { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   failure?: Error;
+  /** The child's heap as of its last heartbeat. */
+  heap?: WorkerHeap;
 
   constructor(private options: {
     entrypoint: string;
@@ -120,6 +131,8 @@ export class WorkerProcessManager {
         }
         const reply = value as Partial<WorkerProcessReply>;
         if (reply.type !== 'worker.reply' || typeof reply.id !== 'number' || typeof reply.ok !== 'boolean') return;
+        if (reply.heap && Number.isFinite(reply.heap.usedBytes) && Number.isFinite(reply.heap.limitBytes))
+          this.heap = { usedBytes: reply.heap.usedBytes, limitBytes: reply.heap.limitBytes, at: Date.now() };
         const request = this.pending.get(reply.id);
         if (!request) return;
         this.pending.delete(reply.id);
