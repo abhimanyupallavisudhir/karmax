@@ -11,7 +11,7 @@
 # Like earlyoom, this polls MemAvailable (or, in a container such as a
 # Daytona sandbox, the cgroup's own limit) and, below 5% of RAM (64–256 MB), sends
 # SIGKILL to the process with the highest kernel oom_score. Unlike earlyoom it
-# needs no package or root, and it never kills the agent (claude/codex) or any
+# needs no package or root, and it never kills the agent (claude/codex/opencode) or any
 # of its ancestors. The victim's stderr gets a one-line explanation first, so
 # the agent sees why its command died.
 #
@@ -75,7 +75,7 @@ protected_pids() {
   protected=" $$ 1 "
   for dir in "$PROC"/[0-9]*; do
     read -r comm < "$dir/comm" 2>/dev/null || continue
-    case $comm in claude|codex) ;; *) continue ;; esac
+    case $comm in claude|codex|opencode|opencode.exe) ;; *) continue ;; esac
     pid=${dir##*/}
     while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
       protected="$protected$pid "
