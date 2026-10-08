@@ -1,8 +1,9 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import type { SqlDatabase } from '../store/sql.js';
-import { Vault, movedToDatabase, recordQuarantine, recordScopeMigration, type QuarantinedEntry, type ScopeMigration } from './vault.js';
+import { RETIRED_VAULT, Vault, movedToDatabase, recordQuarantine, recordScopeMigration, type QuarantinedEntry, type ScopeMigration } from './vault.js';
 import { DatabaseVault, upsertVaultRows } from './vault-database.js';
-import { kekFromEnvironment, type KekSource, type VaultScope } from './vault-keys.js';
+import { isVaultScope, kekFromEnvironment, type KekSource, type VaultScope } from './vault-keys.js';
 import type { SecretVault } from './vault-crypto.js';
 
 /**
@@ -47,9 +48,25 @@ export async function openSecretVault(dir: string, db: SqlDatabase, boot?: Vault
   } else if (!await vaultMoved(db)) {
     throw new Error('the vault has not moved into the database yet: the primary process moves it on its first boot of data epoch 5');
   }
-  const vault = await DatabaseVault.open(db, { kek });
-  if (boot) await vault.sweepQuarantine();
+  const retired = path.join(dir, RETIRED_VAULT);
+  const vault = await DatabaseVault.open(db, { kek, retired });
+  if (boot) {
+    await vault.sweepQuarantine();
+    await sweepRetired(db, retired);
+  }
   return vault;
+}
+
+/** Scopes shredded in the database whose retired files a crash left behind. */
+async function sweepRetired(db: SqlDatabase, retired: string): Promise<void> {
+  let names: string[] = [];
+  try { names = fs.readdirSync(path.join(retired, 'keys')).filter((name) => name.endsWith('.json')); } catch { return; }
+  for (const name of names) {
+    let scope: unknown;
+    try { scope = JSON.parse(fs.readFileSync(path.join(retired, 'keys', name), 'utf8')).scope; } catch { continue; }
+    if (isVaultScope(scope) && !await db.prepare('SELECT 1 AS present FROM vault_keyrings WHERE scope = ?').get(scope))
+      Vault.shredRetired(retired, scope);
+  }
 }
 
 /** The KEK as the app reads it: `KARMAX_VAULT_KEY`, else `vault/vault.key`

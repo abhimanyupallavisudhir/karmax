@@ -8,7 +8,7 @@ import pg from 'pg';
 import { expect, it } from 'vitest';
 import { startDevServer } from '../src/temporal/dev-server.js';
 import { findFreePort } from '../src/util/ports.js';
-import { MOVED_TO_DATABASE, Vault } from '../src/autonomy/vault.js';
+import { MOVED_TO_DATABASE, RETIRED_VAULT, Vault } from '../src/autonomy/vault.js';
 import { LocalKek, organizationScope } from '../src/autonomy/vault-keys.js';
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
@@ -100,6 +100,8 @@ test('boots src/main.ts as a hosted cell on PostgreSQL and Temporal without a su
     expect(JSON.parse(fs.readFileSync(path.join(vaultDir, 'secrets.json'), 'utf8'))).toEqual(MOVED_TO_DATABASE);
     expect(fs.readdirSync(path.join(vaultDir, 'entries'))).toEqual(['.migrated']);
     expect(fs.existsSync(path.join(vaultDir, 'keys'))).toBe(false);
+    // Kept, unchanged and unread, until a later release deletes it.
+    expect(JSON.parse(fs.readFileSync(path.join(vaultDir, RETIRED_VAULT, 'entries', entryFile), 'utf8'))).toEqual(fileEntry);
     expect(logTail()).toContain('Vault: moved 1 secret into the database (data epoch 5)');
     expect((await fetch(`${base}/api/projects`)).status).toBe(401);
 

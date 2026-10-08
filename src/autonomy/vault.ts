@@ -53,6 +53,8 @@ const isMoved = (parsed: unknown) => Array.isArray(parsed) && parsed[0] === MOVE
  * map") instead of starting on an empty one. */
 export const MOVED_TO_DATABASE = ['karmax-vault-moved-to-database',
   'The secrets moved into the application database (data epoch 5). To run an earlier release, restore the pre-update backup with its code.'];
+/** Where `Vault.retire` keeps the vault's files after the move into the database. */
+export const RETIRED_VAULT = 'retired-epoch5';
 /** Has the vault in `dir` moved into the application database? */
 export function movedToDatabase(dir: string): boolean {
   try { return JSON.parse(fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8'))?.[0] === MOVED_TO_DATABASE[0]; } catch { return false; }
@@ -1148,9 +1150,12 @@ export class Vault implements SecretVault {
   /**
    * After the move into the database: retire this directory as a vault. The
    * sentinel goes in first (an earlier release then refuses the directory),
-   * then every entry, keyring, canary and quarantined copy is deleted: a
-   * stale keyring left on disk would outlive crypto-shredding. `vault.key`
-   * stays: it is the KEK, not part of the vault. Repeatable.
+   * then every entry, keyring, canary and quarantined copy moves, unchanged,
+   * into `retired-epoch5/`: the cheapest way back, which no release reads
+   * and a later one deletes once epoch 5 is verified in production. It still
+   * opens as a vault with the same key. One file at a time, so a crash
+   * midway finishes on the next boot. `vault.key` stays: it is the KEK, not
+   * part of the vault. Repeatable.
    */
   static retire(dir: string): void {
     if (!fs.existsSync(dir)) return;
@@ -1159,15 +1164,45 @@ export class Vault implements SecretVault {
     fs.mkdirSync(entries, { recursive: true, mode: 0o700 });
     // Without it, an epoch 3 or 4 release would not read secrets.json, and would start on an empty vault.
     if (!fs.existsSync(path.join(entries, '.migrated'))) writeDurably(path.join(entries, '.migrated'), '');
-    const remove = (sub: string, keep: (name: string) => boolean) => {
+    const retired = path.join(dir, RETIRED_VAULT);
+    const move = (sub: string, keep: (name: string) => boolean = () => false) => {
       let names: string[] = [];
       try { names = fs.readdirSync(path.join(dir, sub)); } catch { return; }
-      for (const name of names) if (!keep(name)) fs.rmSync(path.join(dir, sub, name), { recursive: true, force: true });
+      const target = path.join(retired, sub);
+      for (const name of names) {
+        if (keep(name) || fs.statSync(path.join(dir, sub, name)).isDirectory()) continue;
+        fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+        fs.renameSync(path.join(dir, sub, name), path.join(target, name));
+      }
+      if (fs.existsSync(target)) syncDirectory(target);
       syncDirectory(path.join(dir, sub));
     };
-    remove('entries', (name) => name === '.migrated');
-    for (const name of ['keys', 'scope-migration.json', 'secrets.json.lock']) fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+    move(path.join('entries', 'quarantine'));
+    move('entries', (name) => name === '.migrated');
+    move('keys');
+    if (fs.existsSync(path.join(dir, 'scope-migration.json'))) {
+      fs.mkdirSync(retired, { recursive: true, mode: 0o700 });
+      fs.renameSync(path.join(dir, 'scope-migration.json'), path.join(retired, 'scope-migration.json'));
+    }
+    for (const name of [path.join('entries', 'quarantine'), 'keys', 'secrets.json.lock']) fs.rmSync(path.join(dir, name), { recursive: true, force: true });
     syncDirectory(dir);
+  }
+
+  /** Crypto-shred a scope from a retired copy (`retire`) as well: its keyring,
+   * entries and quarantined copies. A keyring kept there would otherwise let
+   * the copy outlive the database vault's `destroyScope`. */
+  static shredRetired(retired: string, scope: VaultScope): void {
+    const read = (file: string): { scope?: unknown } | undefined => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; } };
+    for (const sub of ['entries', path.join('entries', 'quarantine')]) {
+      let names: string[] = [];
+      try { names = fs.readdirSync(path.join(retired, sub)); } catch { continue; }
+      for (const name of names) {
+        const file = path.join(retired, sub, name);
+        if (!name.endsWith('.why') && fs.statSync(file).isFile() && read(file)?.scope === scope)
+          for (const stale of [file, `${file}.why`]) fs.rmSync(stale, { force: true });
+      }
+    }
+    fs.rmSync(path.join(retired, 'keys', `${crypto.createHash('sha256').update(scope).digest('hex')}.json`), { force: true });
   }
 
   private requireScoped(): void {

@@ -439,10 +439,15 @@ stored (ciphertext and wrapped data keys; nothing is decrypted to copy it),
 reads every secret back through the database and compares it with the file,
 and only then records the move (`vault.moved-to-database` in the audit log).
 It then replaces `vault/secrets.json` with a marker the epoch 4 release refuses
-("not a secret map") and deletes the vault's files, keeping `vault/vault.key`
-if there is one: that is the vault key, not the vault. An interrupted first
-boot repeats the copy; one interrupted after the move only finishes the
-cleanup. The vault key is unchanged, `karmax.dump` now carries the encrypted
+("not a secret map") and moves the vault's files, unchanged, into
+`vault/retired-epoch5/` (`vault/vault.key`, if there is one, stays: it is the
+vault key, not the vault). No release reads that copy; it is the cheapest way
+back, and it still opens with the same key (`npm run vault-key -- --vault
+vault/retired-epoch5 status`). Deleting an organization or closing an account
+shreds its files there too, so the copy cannot outlive crypto-shredding. A
+later release deletes `vault/retired-epoch5/` once epoch 5 is verified in
+production. An interrupted first boot repeats the copy; one interrupted after
+the move only finishes moving the files. The vault key is unchanged, `karmax.dump` now carries the encrypted
 vault, and backups still leave the key out. `npm run vault-key` and
 `vault-preflight` work on the database once the move is recorded. **The way
 back is the pre-update backup with its code**, whose `control-plane/vault/`

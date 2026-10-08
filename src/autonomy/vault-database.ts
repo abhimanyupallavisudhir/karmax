@@ -1,4 +1,5 @@
 import type { SqlDatabase } from '../store/sql.js';
+import { Vault } from './vault.js';
 import { INSTALLATION_SCOPE, isVaultScope, type KekSource, type KeyEncryptionKey, type VaultScope } from './vault-keys.js';
 import { KEK_ID, KEYRING, SECRET_LIMIT, isScoped, kekCanaryRecord, mintDataKey, openEntry, openKekCanary, parseKeyring,
   readableKeyring, refusal, sealEntry, strandedKeys, strandedRefusal, unwrapDataKey, validateScope, validateSecret, wrappedFor,
@@ -37,7 +38,8 @@ export class DatabaseVault implements SecretVault {
   /** Some data keys lack a wrap under the current KEK; wrapped on the first write. */
   private unwrapped = false;
 
-  private constructor(private db: SqlDatabase, private kek: KekSource, private readOnly: boolean) {}
+  private constructor(private db: SqlDatabase, private kek: KekSource, private readOnly: boolean,
+    private shredRetired?: (scope: VaultScope) => void) {}
 
   /**
    * Open the vault, refusing a KEK that is not its own before anything is
@@ -45,8 +47,10 @@ export class DatabaseVault implements SecretVault {
    * carry its wraps), and every data key opens with a key this process knows.
    * A new vault records the KEK's canary; `readOnly` records nothing.
    */
-  static async open(db: SqlDatabase, options: { kek: KekSource; readOnly?: boolean }): Promise<DatabaseVault> {
-    const vault = new DatabaseVault(db, options.kek, options.readOnly === true);
+  static async open(db: SqlDatabase, options: { kek: KekSource; readOnly?: boolean; retired?: string }): Promise<DatabaseVault> {
+    const retired = options.retired;
+    const vault = new DatabaseVault(db, options.kek, options.readOnly === true,
+      retired ? (scope) => Vault.shredRetired(retired, scope) : undefined);
     if (!KEK_ID.test(options.kek.current.id)) throw new Error(`invalid vault key id ${options.kek.current.id}`);
     await vault.checkKek();
     return vault;
@@ -346,6 +350,10 @@ export class DatabaseVault implements SecretVault {
       await this.db.prepare('DELETE FROM vault_keyrings WHERE scope = ?').run(scope);
       this.rings.delete(scope);
       return { entries, quarantined };
+    }).then((result) => {
+      // After the commit: the retired file copy (data epoch 5) goes with the rows.
+      this.shredRetired?.(scope);
+      return result;
     });
   }
 

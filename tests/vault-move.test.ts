@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MOVED_TO_DATABASE, Vault, VaultMovedToDatabase, inspectVault } from '../src/autonomy/vault.js';
+import { MOVED_TO_DATABASE, RETIRED_VAULT, Vault, VaultMovedToDatabase, inspectVault } from '../src/autonomy/vault.js';
 import { DatabaseVault } from '../src/autonomy/vault-database.js';
 import { VAULT_MOVED_MARKER, moveVaultToDatabase, openSecretVault, vaultMoved, type VaultBoot } from '../src/autonomy/vault-backend.js';
 import { INSTALLATION_SCOPE, LocalKek, organizationScope, type KekSource } from '../src/autonomy/vault-keys.js';
@@ -86,12 +86,35 @@ describe.each(storeBackends)('moving the vault into the database ($name)', ({ op
     await vault.put('orphan', 'claimed', A);
     expect(await vault.scopeOf('orphan')).toBe(A);
     expect((await store.db.prepare('SELECT handle, reason FROM vault_quarantine').all())).toEqual([{ handle: 'lost', reason: expect.any(String) }]);
-    // Only the sentinel, the epoch 3 marker and the key file are left on disk.
-    expect(files(dir).filter((name) => !name.startsWith('vault.'))).toEqual(['entries', 'entries/.migrated', 'secrets.json']);
+    // The vault's files are kept, unchanged, beside the sentinel: the cheapest way back. No release reads them.
+    const retired = path.join(dir, RETIRED_VAULT);
+    expect(files(dir).filter((name) => !name.startsWith('vault.') && !name.startsWith(RETIRED_VAULT)))
+      .toEqual(['entries', 'entries/.migrated', 'secrets.json']);
+    for (const [handle, entry] of Object.entries(before))
+      expect(JSON.parse(fs.readFileSync(path.join(retired, 'entries', `${sha(handle)}.json`), 'utf8'))).toEqual(entry);
+    expect(fs.readdirSync(path.join(retired, 'keys')).filter((name) => name.endsWith('.json'))).toHaveLength(3);
+    expect(fs.readdirSync(path.join(retired, 'entries', 'quarantine'))).toEqual([`${sha('lost')}.json.1.x`]);
+    // It still opens as a vault, with the same key: the secrets as the move found them.
+    expect(await new Vault(retired, { readOnly: true }).reveal('org-a:token')).toBe('a3');
     expect(JSON.parse(fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8'))).toEqual(MOVED_TO_DATABASE);
     expect(() => new Vault(dir)).toThrow(VaultMovedToDatabase);
     // A second boot does nothing.
     expect(await moveVaultToDatabase(dir, store.db, kek(), boot)).toBeUndefined();
+  });
+
+  it('shreds a deleted organization from the retired copy too', async () => {
+    const dir = await epoch4Vault();
+    await begin();
+    await moveVaultToDatabase(dir, store.db, kek(), audits().boot);
+    const retired = path.join(dir, RETIRED_VAULT);
+    const vault = await DatabaseVault.open(store.db, { kek: kek(), retired });
+    expect(fs.existsSync(path.join(retired, 'keys', `${sha(A)}.json`))).toBe(true);
+    expect(await vault.destroyScope(A)).toEqual({ entries: 1, quarantined: 1 });
+    // A keyring kept on disk would let the retired copy outlive crypto-shredding.
+    expect(fs.existsSync(path.join(retired, 'keys', `${sha(A)}.json`))).toBe(false);
+    expect(fs.existsSync(path.join(retired, 'entries', `${sha('org-a:token')}.json`))).toBe(false);
+    expect(fs.readdirSync(path.join(retired, 'entries', 'quarantine'))).toEqual([]);
+    expect(await new Vault(retired, { readOnly: true }).reveal('org-b:token')).toBe('b1');
   });
 
   it('leaves the files authoritative until the marker commits, and resumes after a crash at any step', async () => {
@@ -209,6 +232,12 @@ describe('choosing the vault', () => {
     const secondary = await openSecretVault(dir, store.db);
     await primary.put('shared', 'from the primary', A);
     expect(await secondary.reveal('shared')).toBe('from the primary');
+    // Shredded in the database, then a crash before the retired files went: the next boot finishes it.
+    await (await DatabaseVault.open(store.db, { kek: kek() })).destroyScope(B);
+    expect(fs.existsSync(path.join(dir, RETIRED_VAULT, 'keys', `${sha(B)}.json`))).toBe(true);
+    await openSecretVault(dir, store.db, audits().boot);
+    expect(fs.existsSync(path.join(dir, RETIRED_VAULT, 'keys', `${sha(B)}.json`))).toBe(false);
+    expect(fs.existsSync(path.join(dir, RETIRED_VAULT, 'keys', `${sha(A)}.json`))).toBe(true);
     await store.close();
   });
 });
