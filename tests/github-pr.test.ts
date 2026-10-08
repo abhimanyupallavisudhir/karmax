@@ -10,6 +10,7 @@ import { GithubPrApi, githubSlug, taskIdOfBranch, pullRequestWebhookEvent, recon
 import { GithubActionsApiError } from '../src/integrations/github-actions.js';
 import type { TaskPullRequest } from '../src/domain/types.js';
 import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
+import { GitProfiles, userGitScope } from '../src/autonomy/git-profiles.js';
 
 /** The GitHub pull-request integration (SPEC §5.2, wiki plans/PLAN-git-config §5):
  *  the REST client, the PR stage activity, merge/cancel reconciliation, and the
@@ -2315,6 +2316,53 @@ describe('PR stage (remote policy "pr")', () => {
       // A fork that cannot be synced keeps its branch; the world still starts.
       expect((await core.store.eventsOfTypes(task.id, ['repository.fork-synced']))[0]?.payload)
         .toMatchObject({ repository: 'jane/widgets', upstream: 'acme/widgets', branch: 'main', synced: false });
+    } finally {
+      await core.destroyWorld(handle);
+    }
+  });
+
+  it('stops a fork of a private repository at Setup with how to fix it, unless the person saved a token', async () => {
+    const gh = fakeGithub();
+    const app = await repoWithGithubOrigin('private-fork', 'jane/secret');
+    await gitOrThrow(app, ['config', '--unset-all', `url.${path.join(tmp, 'private-fork-origin.git')}.insteadOf`]);
+    const syncs: string[] = [];
+    const content = path.join(tmp, 'private-content');
+    const core = await remoteCoreFor(gh, {
+      async repositoryCloneToken() { return 'clone-token'; },
+      async brokerCredentials() { return { env: {} }; },
+      async activeUserAccountId() { return '7'; },
+      async syncFork(repository: { name: string }) { syncs.push(repository.name); return { synced: true, detail: 'ok' }; },
+    }, content);
+    (await core.store.claimPersonalOrganization('jane'));
+    const project = (await core.store.createProject('Private fork', { repos: [app], worldProvider: 'fake-remote' }));
+    const wikiRoot = ensureProjectWikiRepository(content, project.id);
+    const wikiRemote = 'git@github.com:jane/private-wiki.git';
+    await gitOrThrow(wikiRoot, ['remote', 'add', 'origin', wikiRemote]);
+    const wiki = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      owner: 'jane', name: 'private-wiki', sshUrl: wikiRemote, defaultBranch: 'main', private: true }));
+    (await core.store.setProjectWikiRepository(project.id, wiki.id));
+    const fork = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '9',
+      owner: 'jane', name: 'secret', sshUrl: 'git@github.com:jane/secret.git', defaultBranch: 'main', private: true,
+      upstream: { owner: 'acme', name: 'secret', defaultBranch: 'main', private: true } }));
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: fork.id }));
+    const start = async () => {
+      const task = (await core.store.createTask({ projectId: project.id, title: 'Private fork work', workflow: 'software-dev',
+        workflowVersion: '1.28.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } }));
+      return core.createWorld({ taskId: task.id, projectId: project.id, repo: app, base: 'main', target: 'main', kind: 'fake-remote' });
+    };
+    const refused = await start().then(() => undefined, (error) => error);
+    expect(refused).toMatchObject({ type: 'repository-access', nonRetryable: true });
+    expect(refused.message).toMatch(/acme\/secret is private/);
+    expect(refused.message).toMatch(/install the tavya GitHub App on acme\/secret/);
+    expect(refused.message).toMatch(/token with the repo scope under Profile → GitHub → Token/);
+    expect(syncs).toEqual([]);
+
+    const profiles = new GitProfiles(core.store, broker, path.join(tmp, 'state'), userGitScope('jane'));
+    (await profiles.saveGithubIdentity({ id: '7', login: 'jane' }));
+    (await profiles.saveGithubToken('7', 'ghp_personal'));
+    const handle = await start();
+    try {
+      expect(syncs).toEqual(['secret']);
     } finally {
       await core.destroyWorld(handle);
     }

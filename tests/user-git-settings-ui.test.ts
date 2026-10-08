@@ -49,6 +49,14 @@ describe('personal Git development settings', () => {
     await ui.close();
   });
 
+  it('opens the token dialog for the active account when a task links to it', async () => {
+    const ui = await open('/profile#github-token', ({ path }) => path === '/api/user/github-accounts' ? githubAccounts : undefined, '.github-account-row');
+    const dialog = ui.page.getByRole('dialog', { name: 'GitHub token' });
+    await dialog.waitFor();
+    expect(await ui.run<string>('location.hash')).toBe('');
+    await ui.close();
+  });
+
   it('puts connected GitHub accounts and custom identity controls inside the main profile card', async () => {
     const ui = await open('/profile', ({ method, path }) => path === '/api/user/github-accounts' ? githubAccounts
       : method === 'PUT' && path === '/api/user/github-accounts/a1/identity' ? {} : undefined, '.github-account-row');

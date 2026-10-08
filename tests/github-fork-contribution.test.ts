@@ -174,6 +174,8 @@ describe('software-dev 1.28 on a fork of someone else\'s repository', () => {
     expect(page.pathname).toBe(`/${UPSTREAM}/compare/main...jane:widgets:${branch}`);
     expect(page.searchParams.get('quick_pull')).toBe('1');
     expect(page.searchParams.get('title')).toBe('Fix the widget');
+    // The ask says how to skip it next time.
+    expect(waiting.waitingFor.detail).toContain('[save a GitHub token](/profile#github-token)');
     // tavya tried no write it could not make.
     expect(upstreamWrites()).toEqual([]);
 

@@ -264,6 +264,32 @@ describe('Project settings', () => {
     await ui.close();
   });
 
+  it('explains, before attaching, why a fork of a private repository needs the App or a token', async () => {
+    const fork = { id: 'repo_secret', owner: 'octo', name: 'secret', sshUrl: 'git@github.com:octo/secret.git',
+      upstream: { owner: 'acme', name: 'secret', defaultBranch: 'main', private: true } };
+    const ui = await settings({ api: ({ method, path: route }) => route.endsWith('/github/app') ? { configured: true, userAuthorized: true, appSlug: 'tavya-app' }
+      : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }]
+        : route === '/api/user/github-accounts' ? { accounts: [{ id: 'a1', login: 'octo', active: true, profile: {} }] }
+          : method === 'GET' && route.endsWith('/repositories') ? [fork]
+            : method === 'POST' && route.endsWith('/github/refresh') ? { repositories: [fork], count: 1 }
+              : method === 'POST' && route.endsWith('/repositories') ? { ok: true } : undefined });
+    await ui.page.getByRole('button', { name: 'Fork a repository...' }).click();
+    const dialog = ui.page.getByRole('dialog', { name: 'Fork a repository' });
+    await dialog.locator('#project-fork-source').fill('acme/secret');
+    await dialog.getByRole('button', { name: 'Attach fork' }).click();
+    const note = dialog.locator('.fork-private-note');
+    await note.waitFor();
+    expect(await note.innerText()).toMatch(/acme\/secret is private/);
+    expect(await note.locator('a', { hasText: 'installs the GitHub App' }).getAttribute('href')).toBe('https://github.com/apps/tavya-app/installations/new');
+    expect(await note.locator('a', { hasText: 'save a GitHub token' }).getAttribute('href')).toBe('/profile#github-token');
+    const attachments = () => ui.calls.filter((call) => call.method === 'POST' && /\/api\/projects\/[^/]+\/repositories$/.test(call.path));
+    expect(attachments()).toEqual([]);
+    // The person may still attach it, knowing what it needs.
+    await dialog.getByRole('button', { name: 'Attach anyway' }).click();
+    await expect.poll(() => attachments().map((call) => call.body)).toEqual([{ repositoryId: 'repo_secret' }]);
+    await ui.close();
+  });
+
   it('resets the actual scroll container when switching settings panes', async () => {
     const ui = await settings();
     const scroller = ui.page.locator('.main').first();

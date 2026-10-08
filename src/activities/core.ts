@@ -319,6 +319,16 @@ function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoN
   return bounded + provenance;
 }
 
+/** Why a fork of a private repository cannot be worked on yet, and the two ways
+ * to fix it. */
+export function privateUpstreamGuidance(fork: Repository): string {
+  const upstream = `${fork.upstream!.owner}/${fork.upstream!.name}`;
+  return `${upstream} is private. GitHub shows a private repository to the ${BRAND} GitHub App only where the App is installed, `
+    + `so ${BRAND} cannot open or follow a pull request there from your fork ${fork.owner}/${fork.name}. Either ask an owner of `
+    + `${fork.upstream!.owner} to install the ${BRAND} GitHub App on ${upstream} and attach ${upstream} itself, or save a GitHub `
+    + `token with the repo scope under Profile → GitHub → Token, then retry.`;
+}
+
 /** A proposal to someone else's repository carries only what its maintainers
  * need: the change's description, without this deployment's task references. */
 function upstreamPrBody(details: OpenPrDetails, title: string): string {
@@ -1566,6 +1576,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
             return;
           }
+          // GitHub shows a private repository to an App only where the App is
+          // installed, even through the person's own sign-in: without a token
+          // of theirs the pull request could neither be opened nor followed.
+          if (repository.upstream?.private && gitBinding.userId && !profile?.githubToken)
+            throw ApplicationFailure.create({ type: 'repository-access', nonRetryable: true,
+              message: privateUpstreamGuidance(repository) });
           // A fork starts from its upstream's current state, not from whenever
           // it was last synced. Best effort: a diverged fork keeps its branch.
           if (repository.upstream && typeof deps.githubApp?.syncFork === 'function') {

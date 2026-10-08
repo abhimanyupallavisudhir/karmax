@@ -9657,7 +9657,7 @@ function overviewTab(v) {
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
   const requestedInput = humanWaitDetail(v);
   const waiting = v.waitingFor
-    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${v.waitingFor.kind === 'account' && v.waitingFor.detail ? `<div style="margin-top:8px">${esc(v.waitingFor.detail)}</div>` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${v.waitingFor.kind === 'account' && v.waitingFor.detail ? `<div style="margin-top:8px">${esc(v.waitingFor.detail)}</div>` : ''}${requestedInput ? `<div class="msg-text${markdownEnabled() ? ' md' : ''}" style="margin-top:8px;color:var(--ink-1)">${renderWaitDetail(requestedInput, v)}</div>` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(agentRoleLabel(v.agentTurn.role))} · ${esc(agentTurnStateText(v))}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
@@ -10228,6 +10228,22 @@ function annotateWorldFileLinks(html, v = S.view) {
 
 // Agent message bodies: Markdown (with world-file annotation) when enabled,
 // else the plain path that renders only the file-citation link subset.
+// What a person is asked to do. A landing ask (open the upstream pull request)
+// is tavya's own text: its links are app routes and GitHub pages, never
+// citations of files in the task's world.
+function renderWaitDetail(text, v = S.view, math = mathjaxEnabled()) {
+  if (v?.waitingFor?.reason !== 'merge') return renderAgentMessageBody(text, v, math);
+  if (markdownEnabled()) return renderMessageBody(text, math);
+  const link = /\[([^\]\n]+)\]\(([^\s)]+)\)/g;
+  let html = '';
+  let at = 0;
+  for (const match of String(text).matchAll(link)) {
+    html += esc(text.slice(at, match.index)) + `<a href="${esc(safeHref(match[2]))}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
+    at = match.index + match[0].length;
+  }
+  return html + esc(String(text).slice(at));
+}
+
 function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled()) {
   return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text, math), v) : renderConversationText(text, 'agent', v);
 }
@@ -10261,7 +10277,7 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div><div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
@@ -11775,6 +11791,9 @@ function taskActionLabel(v, action) {
   if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open & Confirm PR';
   if (action.name === 'openPr')
     return hasOpenPullRequest(v) ? 'Return to Review & Confirm' : 'Manually Open & Confirm PR';
+  // Waiting for the person to open the upstream pull request: Confirm checks now.
+  if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human' && v.waitingFor.reason === 'merge')
+    return 'I opened it';
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human')
     return 'Authorize GitHub merge';
   return action.label || action.name;
@@ -15253,11 +15272,12 @@ function githubRepositorySlug(text) {
 
 // Work on someone else's repository: fork it on GitHub (where the App can reach
 // it), then attach the fork. Its pull requests open on the original.
-function openForkRepositoryDialog(proj, opener) {
+function openForkRepositoryDialog(proj, opener, githubApp = {}) {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="fork-repository-title">
     <div class="new-repository-head"><b id="fork-repository-title">Fork a repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
     <label class="form-row"><span>Repository</span><input id="project-fork-source" placeholder="https://github.com/owner/repo" required autocomplete="off"></label>
+    <p class="task-sub fork-private-note" hidden></p>
     <div class="new-repository-actions"><button class="btn new-repository-cancel" type="button">Cancel</button><a class="btn" id="project-fork-github" target="_blank" rel="noopener" aria-disabled="true">Fork on GitHub ↗</a><button class="btn primary" type="submit" title="After forking">Attach fork</button></div>
   </form></div>`;
   const close = () => { document.removeEventListener('keydown', keydown); host.remove(); opener?.focus?.(); };
@@ -15269,7 +15289,9 @@ function openForkRepositoryDialog(proj, opener) {
     if (slug) { forkLink.href = `https://github.com/${slug}/fork`; forkLink.removeAttribute('aria-disabled'); }
     else { forkLink.removeAttribute('href'); forkLink.setAttribute('aria-disabled', 'true'); }
   };
-  source.addEventListener('input', sync);
+  const note = host.querySelector('.fork-private-note');
+  let privateAcknowledged = '';
+  source.addEventListener('input', () => { sync(); note.hidden = true; privateAcknowledged = ''; });
   host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
   host.querySelector('.new-repository-close').addEventListener('click', close);
   host.querySelector('.new-repository-cancel').addEventListener('click', close);
@@ -15286,6 +15308,21 @@ function openForkRepositoryDialog(proj, opener) {
       if (!fork) {
         toast('No fork found yet. Fork it on GitHub and give the GitHub App access to the fork.', true);
         return;
+      }
+      // A private original is visible to the App only where it is installed;
+      // without a token of the person's own, tasks on its fork cannot propose.
+      if (fork.upstream.private && privateAcknowledged !== fork.id) {
+        const { accounts = [] } = await api('/api/user/github-accounts').catch(() => ({}));
+        if (!accounts.some((account) => account.profile?.githubToken)) {
+          const install = githubApp.appSlug ? `https://github.com/apps/${encodeURIComponent(githubApp.appSlug)}/installations/new` : '';
+          note.innerHTML = `<b>${esc(slug)} is private.</b> tavya can only open pull requests there if ${install
+            ? `<a href="${esc(install)}" target="_blank" rel="noopener">an owner installs the GitHub App on it ↗</a>` : 'an owner installs the GitHub App on it'}
+            or you <a href="/profile#github-token" target="_blank" rel="noopener">save a GitHub token</a> with the repo scope.`;
+          note.hidden = false;
+          privateAcknowledged = fork.id;
+          if (button) button.textContent = 'Attach anyway';
+          return;
+        }
       }
       await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: fork.id }) });
       close(); toast('Fork attached'); await loadProjects(); await hydrateProjectAccess(projectById(proj.id) || proj);
@@ -15386,7 +15423,7 @@ async function hydrateProjectAccess(proj) {
     $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
     $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
     $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
-    $('#project-fork-open')?.addEventListener('click', (event) => openForkRepositoryDialog(proj, event.currentTarget));
+    $('#project-fork-open')?.addEventListener('click', (event) => openForkRepositoryDialog(proj, event.currentTarget, githubApp));
     $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, () => hydrateProjectAccess(proj)); } catch (error) { toast(error.message, true); } });
     $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
@@ -18578,6 +18615,12 @@ async function hydrateProfileGithub() {
     row.querySelector('.github-remove')?.addEventListener('click', async () => {
       if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return; try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
   });
+  // Linked from a task waiting for its upstream pull request.
+  if (location.hash === '#github-token') {
+    history.replaceState(history.state, '', `${location.pathname}${location.search}`);
+    const account = accounts.find((candidate) => candidate.active) || accounts[0];
+    if (account) openGithubTokenDialog(account, hydrateProfileGithub);
+  }
 }
 
 // A clean profile page: identity, the browser display preference (theme), and the

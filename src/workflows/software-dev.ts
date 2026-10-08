@@ -4286,7 +4286,8 @@ Inspect the complete current diff and specifically compare its delta from the re
       waitingFor = {
         kind: 'human', audience: ['@creator'], reason: 'merge',
         summary: 'Open the pull request on GitHub',
-        detail: proposal.pending.map((candidate) => `[Open the pull request on ${candidate.slug}](${candidate.url})`).join('\n'),
+        detail: `${proposal.pending.map((candidate) => `[Open the pull request on ${candidate.slug}](${candidate.url})`).join('\n')}`
+          + '\n\nTo skip this step next time, [save a GitHub token](/profile#github-token).',
       };
       // Cleared before the wait is shown, so a Confirm sent the moment it
       // appears ("I opened it") wakes the check instead of being dropped.
