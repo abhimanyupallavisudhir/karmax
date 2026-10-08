@@ -220,7 +220,7 @@ describe('resource repository request budgets', () => {
     expect(Number(refused.headers.get('retry-after'))).toBeGreaterThan(0);
     expect(Number(refused.headers.get('retry-after'))).toBeLessThanOrEqual(60);
     // Looking like the edge, or like another peer, earns the flood nothing.
-    for (const headers of [{ 'x-tavya-edge': 'intent' }, { 'x-forwarded-for': '172.71.146.192' }, { 'cf-connecting-ip': '198.51.100.7' }])
+    for (const headers of [{ 'x-tavya-edge': 'intent' }, { 'x-forwarded-for': '172.71.146.192' }, { 'cf-connecting-ip': '198.51.100.7' }] as Record<string, string>[])
       expect((await as(f.base, f.repository, flood, headers)()).status).toBe(429);
     // Everyone else is untouched, from the same address at the same moment.
     expect((await as(f.base, f.repository, worlds[0]!)()).status).toBe(200);
