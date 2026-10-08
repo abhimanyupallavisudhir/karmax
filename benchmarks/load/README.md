@@ -142,9 +142,13 @@ A dedicated IAM user limited to EC2 in one region. Its inline policy:
   "Condition": {"StringEquals": {"aws:RequestedRegion": "eu-central-1"}}}]}
 ```
 
-Safety: every resource is tagged `Project=tavya-loadtest` and `RunId`; the EXIT
-trap terminates and deletes them even on failure or Ctrl-C (`--keep` skips
-that, for debugging); each VM runs `shutdown -h +MAX_HOURS·60` at boot with
+Safety: before creating anything `run.sh` probes the key (`cloud.sh
+verify-scope`: a dry-run launch in the region must be allowed; EC2 in another
+region, IAM, S3 and Lambda must be refused) and stops if it is broader. Every
+resource is tagged `Project=tavya-loadtest` and `RunId`; the EXIT trap
+terminates and deletes them even on failure or Ctrl-C (`--keep` skips that,
+for debugging); each VM runs `shutdown -h +180` at boot (`--max-minutes`) with
 shutdown behaviour *terminate*, so it disappears even if the operator's machine
-does; SSH is open only to the operator's address(es). Cost at eu-central-1 list
+does, and the driver is stopped 25 minutes before that to collect results. SSH
+is open only to the operator's address(es). Cost at eu-central-1 list
 prices: ~$0.62/h for the pair plus disks, written to `cost.json`.

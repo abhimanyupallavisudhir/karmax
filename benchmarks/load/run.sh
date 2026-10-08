@@ -3,7 +3,7 @@
 #
 #   benchmarks/load/run.sh [--ref REV] [--label NAME] [--steps 4,8,16,...] [--hold SECONDS]
 #                          [--rtt MS] [--sut-type c7i.xlarge] [--world-type c7i.2xlarge]
-#                          [--max-hours 4] [--out DIR] [--keep] [-- DRIVER_ARGS...]
+#                          [--max-minutes 180] [--out DIR] [--keep] [-- DRIVER_ARGS...]
 #
 # The system under test is REV (default origin/master) booted with its own
 # `deploy/karmax up` on a VM sized like tavya.io (4 vCPU / 8 GB, the stack's own
@@ -16,7 +16,8 @@
 # Nothing touches production. Every AWS resource is tagged Project=tavya-loadtest
 # and RunId=<run>; the EXIT trap terminates and deletes all of them, even after a
 # failure or Ctrl-C, and each VM also powers itself off (and so terminates)
-# after --max-hours in case this machine disappears. `cloud.sh sweep` removes
+# --max-minutes after boot in case this machine disappears. Before creating
+# anything it checks that the key can do nothing but EC2 in AWS_REGION. `cloud.sh sweep` removes
 # anything a killed run left behind.
 #
 # Needs: the AWS CLI with credentials for an EC2-only IAM user (README.md),
@@ -25,7 +26,7 @@ set -euo pipefail
 
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
-REF=origin/master LABEL='' STEPS='' HOLD=300 RTT=50 SUT_TYPE=c7i.xlarge WORLD_TYPE=c7i.2xlarge MAX_HOURS=4 OUT='' KEEP=0
+REF=origin/master LABEL='' STEPS='' HOLD=300 RTT=50 SUT_TYPE=c7i.xlarge WORLD_TYPE=c7i.2xlarge MAX_MINUTES=180 OUT='' KEEP=0
 DRIVER_ARGS=()
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
 while [ "$#" -gt 0 ]; do
@@ -37,7 +38,7 @@ while [ "$#" -gt 0 ]; do
     --rtt) RTT=$2; shift 2 ;;
     --sut-type) SUT_TYPE=$2; shift 2 ;;
     --world-type) WORLD_TYPE=$2; shift 2 ;;
-    --max-hours) MAX_HOURS=$2; shift 2 ;;
+    --max-minutes) MAX_MINUTES=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --) shift; DRIVER_ARGS=("$@"); break ;;
@@ -132,11 +133,13 @@ trap 'exit 130' INT TERM
 cat > "$OUT/run.json" <<EOF
 {"runId": "$RUN_ID", "ref": "$REF", "sha": "$SHA", "label": "$LABEL", "region": "$AWS_REGION",
  "sutType": "$SUT_TYPE", "worldType": "$WORLD_TYPE", "worldRttMs": $RTT, "holdSeconds": $HOLD,
- "steps": "${STEPS:-default}", "driverArgs": "${DRIVER_ARGS[*]:-}", "startedAt": "$(date -u +%FT%TZ)"}
+ "maxMinutes": $MAX_MINUTES, "steps": "${STEPS:-default}", "driverArgs": "${DRIVER_ARGS[*]:-}", "startedAt": "$(date -u +%FT%TZ)"}
 EOF
 say "Run $RUN_ID: $REF ($SHA) in $AWS_REGION; results in $OUT"
 
 # ---------------------------------------------------------------- provision
+say "Checking that the key can do nothing but EC2 in $AWS_REGION"
+verify_scope | tee "$OUT/logs/key-scope.log" || die 'the AWS key is broader than EC2 in one region (or cannot launch); refusing to run'
 say 'Network, key and image'
 VPC=$(aws_ ec2 describe-vpcs --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId')
 [ -n "$VPC" ] && [ "$VPC" != None ] || die "no default VPC in $AWS_REGION"
@@ -153,8 +156,8 @@ aws_ ec2 import-key-pair --key-name "$RUN_ID" --public-key-material "fileb://$WO
 AMI=$(aws_ ec2 describe-images --owners 099720109477 \
   --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' Name=state,Values=available \
   --query 'sort_by(Images,&CreationDate)[-1].ImageId')
-# The dead man's switch: power off (= terminate) after MAX_HOURS whatever happens here.
-printf '#!/bin/bash\nshutdown -h +%d "tavya load test: time limit"\n' "$((MAX_HOURS * 60))" > "$WORK/user-data"
+# The dead man's switch: power off (= terminate) MAX_MINUTES after boot, whatever happens here.
+printf '#!/bin/bash\nshutdown -h +%d "tavya load test: time limit"\n' "$MAX_MINUTES" > "$WORK/user-data"
 
 launch() { # launch ROLE TYPE DISK_GB -> instance id
   local id
@@ -211,7 +214,8 @@ driver=(/opt/node/bin/node --max-old-space-size=6144 --experimental-strip-types 
   --hold "$HOLD" ${STEPS:+--steps "$STEPS"} "${DRIVER_ARGS[@]}")
 on "$WORLD" "sudo systemd-run --unit loadtest-driver --uid ubuntu --gid ubuntu --working-directory /opt/loadtest \
   -p LimitNOFILE=1048576 -E NODE_EXTRA_CA_CERTS=/opt/loadtest/edge.crt $(printf '%q ' "${driver[@]}")"
-deadline=$(( $(date +%s) + MAX_HOURS * 3600 - 1800 ))
+# Stop driving 25 minutes before the VMs power themselves off, to collect results.
+deadline=$(( $(python3 -c 'import json,sys; print(min(json.loads(l)["launched"] for l in open(sys.argv[1])))' "$WORK/instances.jsonl") + MAX_MINUTES * 60 - 1500 ))
 while :; do
   sleep 60
   state=$(on "$WORLD" 'systemctl is-active loadtest-driver' 2>/dev/null || true)

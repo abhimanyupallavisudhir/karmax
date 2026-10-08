@@ -4,6 +4,7 @@
 #   benchmarks/load/cloud.sh sweep [RUN_ID]   terminate and delete everything the
 #                                             load test created (one run, or all)
 #   benchmarks/load/cloud.sh list             what exists now, by run
+#   benchmarks/load/cloud.sh verify-scope     prove the key is EC2-only in AWS_REGION
 #
 # Every resource carries Project=tavya-loadtest and RunId=<run>; that tag is
 # the only thing cleanup trusts. Needs the AWS CLI and AWS_* credentials for an
@@ -63,6 +64,33 @@ sweep() { # sweep [RUN_ID]
   [ -z "$left" ] || { echo "cloud: ERROR: instances still alive: $left" >&2; return 1; }
 }
 
+# Probes what the key may do, since an EC2-only user may not read its own IAM
+# policy: EC2 in AWS_REGION must work (a dry-run launch is authorized), and EC2
+# in another region, IAM, S3 and STS role assumption must all be refused.
+verify_scope() {
+  local failed=0 out
+  probe() { # probe EXPECT(allowed|denied) NAME COMMAND...
+    local expect=$1 name=$2; shift 2
+    out=$("$@" 2>&1) && status=allowed || status=denied
+    # A dry run that would have succeeded reports DryRunOperation as an error.
+    case "$out" in *DryRunOperation*) status=allowed ;; *UnauthorizedOperation*|*AccessDenied*|*not\ authorized*|*InvalidClientTokenId*) status=denied ;; esac
+    if [ "$status" = "$expect" ]; then echo "ok    $name: $status"
+    else echo "FAIL  $name: $status, expected $expect: $(echo "$out" | head -c 200)"; failed=1; fi
+  }
+  aws sts get-caller-identity --query Arn --output text | sed 's/^/key   /'
+  probe allowed "describe instances in $AWS_REGION" aws_ ec2 describe-instances --max-items 1
+  local image
+  image=$(aws_ ec2 describe-images --owners 099720109477 --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
+    --query 'sort_by(Images,&CreationDate)[-1].ImageId' 2>/dev/null || echo ami-00000000)
+  probe allowed "dry-run launch in $AWS_REGION" aws_ ec2 run-instances --dry-run --image-id "$image" --instance-type c7i.large
+  local other=eu-west-1; [ "$AWS_REGION" != eu-west-1 ] || other=eu-central-1
+  probe denied "EC2 in $other" aws --region "$other" ec2 describe-instances --max-items 1
+  probe denied 'IAM' aws iam list-users --max-items 1
+  probe denied 'S3' aws s3api list-buckets
+  probe denied 'Lambda' aws --region "$AWS_REGION" lambda list-functions --max-items 1
+  return "$failed"
+}
+
 list() {
   aws_ ec2 describe-instances --filters "$(run_filter)" \
     --query 'Reservations[].Instances[].[Tags[?Key==`RunId`]|[0].Value,InstanceId,InstanceType,State.Name,LaunchTime]'
@@ -97,7 +125,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     sweep) sweep "${2:-}" ;;
     list) list ;;
+    verify-scope) verify_scope ;;
     cost) cost "$2" "${3:-$(date +%s)}" ;;
-    *) echo 'usage: cloud.sh sweep [RUN_ID] | list | cost INSTANCES_JSONL [ENDED_EPOCH]' >&2; exit 2 ;;
+    *) echo 'usage: cloud.sh sweep [RUN_ID] | list | verify-scope | cost INSTANCES_JSONL [ENDED_EPOCH]' >&2; exit 2 ;;
   esac
 fi
