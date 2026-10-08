@@ -51,6 +51,7 @@ import { platformToolHandlers } from './tools.js';
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
  *   @heard                          report the conversation this turn was handed, one
  *                                   `role: first line` entry per message (shared conversations)
+ *   @instructed <text>              report whether this turn's system prompt contains <text>
  *
  * A Responder, Reviewer or called-in agent in a shared conversation (software-dev
  * ≥1.27) reads other agents' messages, not directive-bearing prompts, so it also
@@ -365,6 +366,9 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`shells: ${rest.trim()}`);
           break;
         }
+        case 'instructed':
+          outputs.push(`${input.systemPrompt.includes(rest) ? 'instructed' : 'not instructed'}: ${rest}`);
+          break;
         case 'heard':
           outputs.push(`heard: ${input.messages.map((m) => `${m.role}: ${m.text.split('\n')[0]}`).join(' | ')}`);
           break;

@@ -5606,6 +5606,7 @@ export class Gateway {
           to: Array.isArray(b.to) ? b.to.map(String) : [],
           message: String(b.message ?? ''),
           ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
+          ...(Array.isArray(b.agents) ? { agents: b.agents } : {}),
         }));
       }
       if (p === '/api/agent/permission-requests' && method === 'POST') {

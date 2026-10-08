@@ -37,6 +37,29 @@ export { MAX_REVIEW_TEXT_LENGTH };
 
 /** How loudly an ask asks. One shared parameter across every human-facing tool,
  * so an agent learns the vocabulary once. See `Urgency` in domain/types.ts. */
+/** New agents for notify, in the task form's agent shape. */
+const NEW_AGENTS_PARAMETER = {
+  type: 'array',
+  maxItems: 8,
+  description: 'Agents to call in: {provider, model?, effort?, prompt? (its instructions), resumeFrom? ({taskId, role?}: ' +
+    'fork that task agent, role default do)}.',
+  items: {
+    type: 'object',
+    properties: {
+      provider: { type: 'string' },
+      model: { type: 'string' },
+      effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      prompt: { type: 'string', maxLength: 4_000 },
+      resumeFrom: {
+        type: 'object',
+        properties: { taskId: { type: 'string' }, role: { type: 'string' } },
+        required: ['taskId'],
+      },
+    },
+    required: ['provider'],
+  },
+};
+
 const URGENCY_PARAMETER = {
   type: 'string',
   enum: URGENCY_LEVELS,
@@ -765,15 +788,17 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, @creator, ' +
       '@owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now; agents of this task ' +
       '(agent:do for the main agent, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends, in order. ' +
-      'The message is said in the task conversation.',
+      'The message is said in the task conversation. `agents` calls new agents in, after `to`; each becomes the next ' +
+      'agent:agent-<n> (the returned message\'s `to` names them).',
     parameters: {
       type: 'object',
       properties: {
-        to: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32 },
+        to: { type: 'array', items: { type: 'string' }, maxItems: 32 },
         message: { type: 'string', minLength: 1, maxLength: 4_000 },
         urgency: URGENCY_PARAMETER,
+        agents: NEW_AGENTS_PARAMETER,
       },
-      required: ['to', 'message'],
+      required: ['message'],
     },
   },
   {
@@ -1543,6 +1568,7 @@ export function platformToolHandlers(
         to: Array.isArray(args?.to) ? args.to.map(String) : [],
         message: String(args?.message ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
+        ...(Array.isArray(args?.agents) && args.agents.length ? { agents: args.agents } : {}),
       }));
     },
     async escalate(args) {
