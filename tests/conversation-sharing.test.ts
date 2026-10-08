@@ -149,8 +149,7 @@ describe('public conversation sharing over HTTP', async () => {
       expect(await settingsLink.getAttribute('href')).toBe('/personal/settings#organization-conversation-sharing');
       await settingsLink.click();
       expect(await page.locator('dialog').count()).toBe(0);
-      // The policy saves as soon as it changes; there is no Save button.
-      await page.getByRole('combobox', { name: 'Public conversation links' }).selectOption('enabled');
+      await page.getByRole('combobox', { name: 'Public conversation links' }).selectOption('enabled'); // saves on change
       await expect.poll(async () => (await (await request(endpoint)).json() as any).enabled).toBe(true);
 
       // A project override is identified separately; developers cannot manage it.
