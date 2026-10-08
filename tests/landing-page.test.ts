@@ -87,6 +87,34 @@ describe('public landing page', () => {
     await ui.close();
   });
 
+  it('keeps each analogy sentence on one line at any width, its object in the accent', async () => {
+    for (const width of [1440, 1100, 961, 800, 390, 320]) {
+      const ui = await landing({ viewport: { width, height: 900 } });
+      const lines = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) => {
+        const box = span.getBoundingClientRect(), style = getComputedStyle(span);
+        return { rows: Math.round(box.height / parseFloat(style.lineHeight)), fits: box.right <= document.documentElement.clientWidth };
+      }));
+      expect(lines, `${width}px`).toEqual([{ rows: 1, fits: true }, { rows: 1, fits: true }]);
+      expect(await ui.page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+      await ui.close();
+    }
+    const ui = await landing();
+    const colours = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) =>
+      [getComputedStyle(span).color, getComputedStyle(span.querySelector('b')).color]));
+    expect(await ui.page.locator('#landing-title b').allInnerTexts()).toEqual(['text editor.', 'to-do list.']);
+    for (const [sentence, object] of colours) expect(object).not.toBe(sentence);
+    expect(colours[0]![1]).not.toBe(colours[1]![1]); // the past is a muted accent
+    await ui.close();
+  });
+
+  it('closes on the brand mark', async () => {
+    const ui = await landing();
+    const mark = ui.page.locator('.landing-final-mark .mark');
+    expect(await mark.count()).toBe(1);
+    expect((await mark.boundingBox())!.width).toBeGreaterThanOrEqual(60);
+    await ui.close();
+  });
+
   it('sets type like the console: Inter with its default glyphs and natural tracking', async () => {
     const ui = await landing();
     const type = await ui.page.evaluate(() => [...document.querySelectorAll('.landing-page, .landing-page h1, .landing-page h2, .landing-page h3, .landing-intro')]

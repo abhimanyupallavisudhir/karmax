@@ -20951,7 +20951,7 @@ function renderLanding() {
     <main id="landing-main">
       <section class="landing-hero" aria-labelledby="landing-title">
         <div class="landing-hero-copy">
-          <h1 id="landing-title" class="landing-analogy"><span>vscode was a fancy text editor.</span> <span>${siteNameMarkup()} is a fancy to-do list.</span></h1>
+          <h1 id="landing-title" class="landing-analogy"><span>vscode was a fancy <b>text editor.</b></span> <span>${siteNameMarkup()} is a fancy <b>to-do list.</b></span></h1>
           <p class="landing-intro">The interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
           <div class="landing-hero-actions">
             <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
@@ -21013,6 +21013,7 @@ function renderLanding() {
       </section>
 
       <section class="landing-final" aria-labelledby="final-title">
+        <div class="landing-final-mark" aria-hidden="true">${brandMark()}</div>
         <h2 id="final-title">Leave the permanent<br>underclass today.</h2>
         <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with ${siteNameMarkup()} <span aria-hidden="true">→</span></button>
       </section>
