@@ -342,8 +342,8 @@ function organizationById(id) { return (S.organizations || []).find((o) => o.id 
 // grant is idempotent, so there is no cost to keeping the affordance visible.
 function githubAuthorizeButton(githubApp, id) {
   if (!githubApp?.oauthConfigured) return '';
-  const label = githubApp.userAuthorized ? 'Reconnect my GitHub identity' : 'Connect my GitHub identity';
-  return `<button class="btn sm" id="${id}">${label}</button>`;
+  const [label, tip] = githubApp.userAuthorized ? ['Reconnect', 'Reconnect your GitHub account'] : ['Connect', 'Connect your GitHub account'];
+  return `<button class="btn sm" id="${id}" title="${tip}">${label}</button>`;
 }
 function organizationBySlug(slug) {
   const s = slugify(slug);
@@ -15135,7 +15135,7 @@ function settingsView(proj) {
       <button type="button" data-project-jump="project-computers"><b>Computers</b><span>Where tasks run</span></button>
     </div>
     <div class="project-config-section" id="project-git"><div class="project-config-number">01</div><div><h2>Git &amp; GitHub</h2></div></div>
-    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${profileRoute()}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
+    <div class="card"><div id="project-repositories">Loading…</div></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
     <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data ${policyTip(`Choose Data when ${siteName()} should capture and version the files; Storage only decides where the encrypted revisions live. A live S3 bucket, database or API that tasks call directly belongs under Services, with its access key under Secrets.`)}</h2><p>Files ${siteNameMarkup()} snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
@@ -15609,6 +15609,98 @@ function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
   $('#modal-root').appendChild(host); document.addEventListener('keydown', keydown);
   host.querySelector('#project-new-repo-name').focus();
 }
+// A repository source as people name it: owner/name for GitHub, the path or URL
+// otherwise. The exact source stays on hover.
+function repositorySourceView(source) {
+  const github = /^(?:git@github\.com:|(?:ssh:\/\/git@|https?:\/\/)(?:ssh\.)?github\.com(?::\d+)?\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(source);
+  if (github) return { kind: 'github', owner: github[1], name: github[2], key: `${github[1]}/${github[2]}`.toLowerCase() };
+  return { kind: /^(?:\/|~|\.{1,2}\/)/.test(source) ? 'local' : 'git', name: source, key: source };
+}
+const folderIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M1.5 3.5A1.5 1.5 0 0 1 3 2h3.2l1.5 1.5H13A1.5 1.5 0 0 1 14.5 5v7.5A1.5 1.5 0 0 1 13 14H3a1.5 1.5 0 0 1-1.5-1.5v-9ZM3 3.5v9h10V5H7.1L5.6 3.5H3Z"/></svg>';
+const gitIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M5 2.5a1.5 1.5 0 0 0-.75 2.8v5.4a1.5 1.5 0 1 0 1.5 0V8.6c.4.25.9.4 1.5.4h2.1a1.5 1.5 0 1 0 0-1.5H7.25c-.83 0-1.5-.67-1.5-1.5v-.7A1.5 1.5 0 0 0 5 2.5Z"/></svg>';
+
+// Settings → Project → Git & GitHub: the project's repositories (each add or
+// remove saves at once), then who gives access and who commits.
+function renderProjectRepositories(box, proj, { repositories, gitConnections, githubApp, githubLoadError, githubLogin }) {
+  const sources = proj.config.repos || [];
+  const attached = new Set(sources.map((source) => repositorySourceView(source).key));
+  const choices = repositories.filter((repository) => !attached.has(`${repository.owner}/${repository.name}`.toLowerCase()));
+  // Hosted projects may only use repositories the organization's GitHub reaches.
+  const pickOnly = !!S.meta?.hosted;
+  const canAdd = !pickOnly || repositories.length > 0;
+  const placeholder = !canAdd ? 'Connect GitHub to add repositories'
+    : [repositories.length ? 'owner/repository' : '', pickOnly ? '' : 'Git URL', hostLocal() ? 'local path' : '']
+      .filter(Boolean).join(', ').replace(/, ([^,]*)$/, ' or $1');
+  const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
+  const row = (source) => {
+    const view = repositorySourceView(source);
+    const name = view.kind === 'github'
+      ? `<a class="git-repo-name" href="https://github.com/${esc(view.owner)}/${esc(view.name)}" target="_blank" rel="noopener noreferrer" title="${esc(source)}"><span>${esc(view.owner)}/</span>${esc(view.name)}</a>`
+      : `<span class="git-repo-name mono" title="${esc(source)}">${esc(source)}</span>`;
+    return `<div class="git-repo" data-source="${esc(source)}"><span class="git-repo-icon">${view.kind === 'github' ? githubMark() : view.kind === 'local' ? folderIcon() : gitIcon()}</span>${name}<button class="icon-btn git-repo-remove" type="button" title="Remove" aria-label="Remove ${esc(view.kind === 'github' ? `${view.owner}/${view.name}` : source)}">×</button></div>`;
+  };
+  const organizationLink = `${globalRoute('organization', organizationById(proj.organizationId))}#settings-code`;
+  const needsUpdate = gitConnections.some((connection) => connection.permissionStatus && !connection.permissionStatus.ready);
+  const access = githubLoadError ? { value: '<span id="project-github-error"></span>', actions: '' }
+    : !githubApp.configured ? { value: `<span class="git-fact-muted">Not set up</span>${S.installationAccess ? '' : policyTip('Your administrator needs to set up GitHub first.')}`,
+      actions: S.installationAccess ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up</a>` : '' }
+    : !gitConnections.length ? { value: '<span class="git-fact-muted">Not connected</span>', actions: '<button class="btn sm primary" id="project-connect-github" type="button">Connect GitHub</button>' }
+    : { value: `${gitConnections.map((connection) => `<b>${esc(connection.accountLogin)}</b>`).join('<span class="git-fact-sep">·</span>')}${needsUpdate ? '<span class="chip git-fact-warn" title="Approve GitHub’s updated access in organization settings">needs update</span>' : ''}`,
+      actions: `<button class="icon-btn" id="project-refresh-github" type="button" title="Refresh repository list" aria-label="Refresh repository list">↻</button><a class="btn sm" data-spa href="${organizationLink}">Manage</a>` };
+  const identity = `<b>You</b>${githubLogin && githubApp.userAuthorized ? `<span class="git-fact-sep">·</span><span class="git-fact-muted">${esc(githubLogin)}</span>` : ''}`;
+  box.innerHTML = `<div class="section-h">Repositories</div>
+    <div class="git-repos">
+      <div id="project-repository-fields">${sources.map(row).join('')}</div>
+      <form class="git-repo-add" id="project-repository-add-form">
+        <input id="project-repository-input" list="project-repository-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
+        <button class="btn sm" type="submit" id="project-repository-add" ${canAdd ? '' : 'disabled'}>Add</button>
+        ${canCreate ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository</button>' : ''}
+      </form>
+    </div>
+    <datalist id="project-repository-options">${choices.map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}"></option>`).join('')}</datalist>
+    <div class="git-facts">
+      <div class="git-fact" id="project-github-access"><span class="git-fact-label">GitHub ${policyTip('The GitHub accounts this organization connected. Their repositories can be added above.')}</span><span class="git-fact-value">${access.value}</span><span class="git-fact-actions">${access.actions}</span></div>
+      <div class="git-fact" id="project-github-identity"><span class="git-fact-label">Commits as ${policyTip('Each task commits and opens pull requests as the person who created it.')}</span><span class="git-fact-value">${identity}</span><span class="git-fact-actions">${githubAuthorizeButton(githubApp, 'project-authorize-github')}<a class="btn sm" data-spa href="${profileRoute()}">Manage</a></span></div>
+    </div>`;
+  const rerender = () => hydrateProjectAccess(projectById(proj.id) || proj);
+  if (githubLoadError) paneError($('#project-github-error'), githubLoadError, rerender);
+  const controls = () => box.querySelectorAll('#project-repository-add-form input, #project-repository-add-form button, .git-repo-remove');
+  const save = async (repos) => {
+    controls().forEach((control) => { control.disabled = true; });
+    try {
+      await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) });
+      await loadProjects();
+      await rerender();
+      return true;
+    } catch (error) {
+      toast(error.message, true);
+      controls().forEach((control) => { control.disabled = false; });
+      return false;
+    }
+  };
+  box.querySelectorAll('.git-repo').forEach((item) => item.querySelector('.git-repo-remove').addEventListener('click', () =>
+    save(sources.filter((source) => source !== item.dataset.source))));
+  $('#project-repository-add-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const input = $('#project-repository-input');
+    const typed = input.value.trim();
+    if (!typed) return input.focus();
+    const known = repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === typed.toLowerCase()
+      || repository.sshUrl === typed) || repositories.find((repository) => repositorySourceView(repository.sshUrl).key === repositorySourceView(typed).key);
+    if (pickOnly && !known) return toast('Choose one of the organization’s GitHub repositories', true);
+    const source = known?.sshUrl || typed;
+    if (attached.has(repositorySourceView(source).key)) { input.value = ''; return toast('Already added'); }
+    if (await save([...sources, source])) $('#project-repository-input')?.focus();
+  });
+  $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
+  $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, rerender); } catch (error) { toast(error.message, true); } });
+  $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
+  $('#project-refresh-github')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await rerender(); }
+    catch (error) { toast(error.message, true); button.disabled = false; }
+  });
+}
 async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
   const repositoryBox = $('#project-repositories');
@@ -15620,11 +15712,12 @@ async function hydrateProjectAccess(proj) {
     // Unreadable GitHub state offers Retry; read as "not connected" it would send
     // an organization that is connected into setup.
     let githubLoadError = null;
-    const [repositories, members, gitConnections, githubApp] = await Promise.all([
+    const [repositories, members, gitConnections, githubApp, userGithub] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
       api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch((error) => { githubLoadError = error; return []; }),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch((error) => { githubLoadError = error; return { configured: false }; }),
+      api('/api/user/github-accounts').catch(() => null),
     ]);
     if (!renderIsCurrent()) return;
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
@@ -15635,29 +15728,13 @@ async function hydrateProjectAccess(proj) {
     accessBox.innerHTML = `<div class="section-h">Project access</div>
       ${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span>${esc(principalName(member.principal))}</span>${member.protectedOwner ? '<span class="chip">project creator</span>' : ''}<span class="chip">${esc(member.profileId || 'developer')}</span><button class="btn sm project-member-remove">Remove</button></div>`; }).join('') || '<p class="task-sub">No project access overrides.</p>'}
       <a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-people">Manage people and authorization</a>`;
-    repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Local repo, GitHub, or Git URL</p>
-      <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
-      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
-      <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button>${githubApp.configured && gitConnections.length && githubApp.userAuthorized ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository...</button>' : ''}</div>
-      ${githubLoadError ? '<div id="project-github-error"></div>' : !githubApp.configured ? `<div class="inline-form">${S.installationAccess
-        ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
-        : '<span class="task-sub">The installation operator must set up the shared GitHub App before repositories can be connected.</span>'}</div>`
-        : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
-        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>`}`;
+    renderProjectRepositories(repositoryBox, proj, { repositories, gitConnections, githubApp, githubLoadError,
+      githubLogin: (userGithub?.accounts || []).find((account) => account.active)?.login });
     accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
       if (!confirm('Remove this member’s access to the project?')) return;
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
       catch (error) { toast(error.message, true); }
     }));
-    if (githubLoadError) paneError($('#project-github-error'), githubLoadError, () => hydrateProjectAccess(projectById(proj.id) || proj));
-    const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
-    wireRepositoryRemoves();
-    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
-    $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
-    $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
-    $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, () => hydrateProjectAccess(proj)); } catch (error) { toast(error.message, true); } });
-    $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
-    $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
   } catch (error) {
     if (renderIsCurrent()) accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
   }

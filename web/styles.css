@@ -540,8 +540,34 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .project-empty { margin:8px 0 14px; padding:14px; border:1px dashed var(--line-strong); border-radius:10px; color:var(--ink-3); font-size:12px; line-height:1.5; }
 .project-form-actions { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:12px; }
 .service-fields[hidden] { display:none; }
-.project-repository-field { align-items:flex-end; }
-.project-repository-field .form-row { flex:1; margin:0; }
+.git-repos { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+.git-repo { display:flex; align-items:center; gap:10px; min-height:40px; padding:0 6px 0 12px; border-bottom:1px solid var(--line); }
+.git-repo-icon { flex:none; display:grid; place-items:center; color:var(--ink-3); }
+.git-repo-icon svg { width:15px; height:15px; }
+.git-repo-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink); font-size:13px; font-weight:600; text-decoration:none; }
+.git-repo-name span { color:var(--ink-3); font-weight:400; }
+.git-repo-name.mono { color:var(--ink-2); font-size:12px; font-weight:400; }
+a.git-repo-name:hover { color:var(--accent); }
+.git-repo-remove { flex:none; color:var(--ink-3); font-size:16px; }
+.git-repo-add { display:flex; align-items:center; gap:6px; margin:0; padding:6px; background:var(--surface-2); }
+.git-repo-add input { flex:1; min-width:0; padding:6px 10px; border:1px solid var(--line); border-radius:7px; background:var(--surface); outline:none; }
+.git-repo-add input:focus { border-color:var(--accent); }
+.git-repo-add input:disabled { background:transparent; }
+.git-facts { margin-top:14px; }
+.git-fact { display:flex; align-items:center; gap:12px; min-height:40px; padding:4px 0; border-top:1px solid var(--line); }
+.git-fact:last-child { border-bottom:1px solid var(--line); }
+.git-fact-label { flex:none; display:flex; align-items:center; gap:6px; width:104px; color:var(--ink-3); font-size:12px; }
+.git-fact-value { flex:1; min-width:0; display:flex; align-items:center; flex-wrap:wrap; gap:6px; font-size:13px; }
+.git-fact-muted { color:var(--ink-3); }
+.git-fact-sep { color:var(--ink-3); }
+.git-fact-warn { color:var(--warn); }
+.git-fact-actions { flex:none; display:flex; align-items:center; gap:6px; }
+@media (max-width:560px) {
+  .git-fact { flex-wrap:wrap; gap:4px 12px; padding:8px 0; }
+  .git-fact-label { width:100%; }
+  .git-repo-add { flex-wrap:wrap; }
+  .git-repo-add input { flex-basis:100%; }
+}
 .new-repository-dialog { width:min(470px,calc(100vw - 28px)); }
 .new-repository-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:-4px 0 18px; }
 .new-repository-head b { font-size:16px; letter-spacing:-.01em; }

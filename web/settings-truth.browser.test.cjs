@@ -79,11 +79,11 @@ const { chromium } = require('playwright');
     await page.goto('http://console.test/org/workspace/settings');
     const repositories = page.locator('#project-repositories');
     await repositories.getByRole('button', { name: 'Retry' }).waitFor();
-    assert.equal(await repositories.getByText('Choose GitHub repositories').count(), 0, 'a failed GitHub read is not "no GitHub connection"');
-    assert.ok(await repositories.locator('#project-repository-fields').count(), 'repository sources stay editable while GitHub is unreadable');
+    assert.equal(await repositories.getByText('Connect GitHub').count(), 0, 'a failed GitHub read is not "no GitHub connection"');
+    assert.ok(await repositories.locator('#project-repository-input:not([disabled])').count(), 'repository sources stay editable while GitHub is unreadable');
     fail.delete('GET /api/organizations/o/git-connections');
     await repositories.getByRole('button', { name: 'Retry' }).click();
-    await repositories.getByText('Choose GitHub repositories').waitFor();
+    await repositories.getByText('Connect GitHub').waitFor();
 
     // UI-12: unreadable members are an error with Retry, not "No members."
     fail.add('GET /api/organizations/o/members');
