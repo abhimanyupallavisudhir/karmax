@@ -320,7 +320,7 @@ export interface ServiceLimitsDeps {
   fetch?: typeof fetch;
   now?: () => number;
   providerConnections?: { resolve(organizationId: string | undefined, provider: string): Promise<{ apiKey: string; config: { apiUrl?: string } }> };
-  githubApp?: { configured(): boolean; rateLimit(connection: GitConnection, signal?: AbortSignal): Promise<{ limit: number; remaining: number; resetAt: number }> };
+  githubApp?: { configured(): boolean | Promise<boolean>; rateLimit(connection: GitConnection, signal?: AbortSignal): Promise<{ limit: number; remaining: number; resetAt: number }> };
   /** The activity worker's V8 heap (its own process in process mode). */
   workerHeap?: () => WorkerHeap | undefined;
   /** A directory on the disk that holds tavya's data. */
@@ -381,9 +381,9 @@ export class ServiceLimitsService {
     return this.running ??= this.sample().finally(() => { this.running = undefined; });
   }
 
-  private secret(handle: string | undefined, used?: Set<string>): string | undefined {
-    if (!handle || !this.deps.broker?.hasHandle(handle)) return undefined;
-    const value = this.deps.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
+  private async secret(handle: string | undefined, used?: Set<string>): Promise<string | undefined> {
+    if (!handle || !await this.deps.broker?.hasHandle(handle)) return undefined;
+    const value = await this.deps.broker!.resolve(handle, { caps: [`use-credential:${handle}`] });
     used?.add(value);
     return value;
   }
@@ -408,8 +408,8 @@ export class ServiceLimitsService {
     const day = isoDay(now);
     const month = `${day.slice(0, 7)}-01`;
     const organizationId = this.operatorOrganization(settings);
-    const cloudflare = () => {
-      const token = secret(CLOUDFLARE_TOKEN_HANDLE);
+    const cloudflare = async () => {
+      const token = await secret(CLOUDFLARE_TOKEN_HANDLE);
       const accountId = this.cloudflareAccount(settings);
       if (!token || !accountId) throw new NotConnected();
       return { token, accountId };
@@ -422,10 +422,10 @@ export class ServiceLimitsService {
       return resolved;
     };
     return {
-      'cloudflare-workers': async (fetcher) => cloudflareWorkersUsage({ fetch: fetcher, now, ...cloudflare() }),
-      'cloudflare-r2': async (fetcher) => cloudflareR2Usage({ fetch: fetcher, now, ...cloudflare() }),
+      'cloudflare-workers': async (fetcher) => cloudflareWorkersUsage({ fetch: fetcher, now, ...await cloudflare() }),
+      'cloudflare-r2': async (fetcher) => cloudflareR2Usage({ fetch: fetcher, now, ...await cloudflare() }),
       composio: async (fetcher) => {
-        const apiKey = secret(COMPOSIO_KEY_HANDLE);
+        const apiKey = await secret(COMPOSIO_KEY_HANDLE);
         if (!apiKey) throw new NotConnected();
         return composioUsage({ fetch: fetcher, apiKey, toolCalls: await store.serviceUsageSince('composio.tool-calls', month) });
       },
@@ -443,7 +443,7 @@ export class ServiceLimitsService {
       resend: async () => {
         let config: OutboundEmailConfig = {};
         try { config = JSON.parse((await store.kvGet('email:outbound')) ?? '{}'); } catch { /* not connected */ }
-        if (config.provider !== 'resend' || !secret(config.secretHandle)) throw new NotConnected();
+        if (config.provider !== 'resend' || !await secret(config.secretHandle)) throw new NotConnected();
         const sentToday = await store.serviceUsageSince('email.sent:resend', day);
         const sentMonth = await store.serviceUsageSince('email.sent:resend', month);
         // Resend's own figure covers every sender on the account; ours only tavya.
@@ -458,7 +458,7 @@ export class ServiceLimitsService {
       agentmail: async (fetcher) => {
         let config: MailboxConfig = {};
         try { config = JSON.parse((await store.kvGet(`agent-mail:provider:${organizationId}`)) ?? '{}'); } catch { /* not connected */ }
-        const apiKey = config.provider === 'agentmail' ? secret(`mailbox:agentmail:${organizationId}:auth`) : undefined;
+        const apiKey = config.provider === 'agentmail' ? await secret(`mailbox:agentmail:${organizationId}:auth`) : undefined;
         if (!apiKey) throw new NotConnected();
         return agentMailUsage({ fetch: fetcher, apiKey, base: this.env.KARMAX_AGENTMAIL_BASE,
           received: await store.serviceUsageSince(`agentmail.received:${organizationId}`, month) });
@@ -471,7 +471,7 @@ export class ServiceLimitsService {
       },
       github: async (_fetcher, signal) => {
         const app = this.deps.githubApp;
-        if (!app?.configured()) throw new NotConnected();
+        if (!app || !await app.configured()) throw new NotConnected();
         const connections = new Map<string, GitConnection>();
         for (const organization of await store.listOrganizations())
           for (const connection of await store.listGitConnections(organization.id))
@@ -550,7 +550,7 @@ export class ServiceLimitsService {
     }
     for (const meterId of Object.keys(state.history)) if (!METERS.has(meterId)) delete state.history[meterId];
     state.checkedAt = now;
-    const view = this.render(settings, state);
+    const view = await this.render(settings, state);
     const evaluated = evaluateAlerts(state.alerts, alertInputs(view, state), now);
     // Readings first; the announcements are recorded only once notify has
     // delivered them, so a failed delivery is announced again next run
@@ -567,12 +567,13 @@ export class ServiceLimitsService {
     return this.render(await this.settings(), await this.state());
   }
 
-  private render(settings: ServiceLimitSettings, state: ServiceLimitState): ServiceLimitsView {
+  private async render(settings: ServiceLimitSettings, state: ServiceLimitState): Promise<ServiceLimitsView> {
+    const tokenConfigured = Boolean(await this.deps.broker?.hasHandle(CLOUDFLARE_TOKEN_HANDLE));
     return {
       checkedAt: state.checkedAt,
       thresholds: ALERT_THRESHOLDS,
       operatorOrganizationId: this.operatorOrganization(settings),
-      cloudflare: { accountId: this.cloudflareAccount(settings), tokenConfigured: Boolean(this.deps.broker?.hasHandle(CLOUDFLARE_TOKEN_HANDLE)) },
+      cloudflare: { accountId: this.cloudflareAccount(settings), tokenConfigured },
       services: SERVICE_CATALOG.map((spec) => {
         const entered = settings.services?.[spec.id];
         const stored = state.services[spec.id];

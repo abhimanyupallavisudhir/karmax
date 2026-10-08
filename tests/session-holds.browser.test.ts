@@ -42,7 +42,7 @@ const binSnapshot = () => Object.fromEntries(fs.readdirSync('/usr/local/bin').ma
 }));
 const session = (value: string): SavedSession => ({ version: 1, capturedAt: 1, storage: [],
   cookies: [{ name: 'sid', value, domain: 'app.example.com', path: '/', secure: true, httpOnly: true }] });
-const storedValue = async (vault: VaultItems, id: string) => JSON.parse(vault.readSecret((await vault.get(id))!, 'session')!).cookies[0].value;
+const storedValue = async (vault: VaultItems, id: string) => JSON.parse((await vault.readSecret((await vault.get(id))!, 'session'))!).cookies[0].value;
 /** The site rotated the session in the task's browser. */
 const rotate = async (value: string) => {
   await context.clearCookies();

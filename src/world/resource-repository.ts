@@ -118,9 +118,9 @@ export async function repositoryPassword(broker: CredentialBroker, attachment: P
 }
 
 async function tokenKey(broker: CredentialBroker): Promise<Buffer> {
-  if (!broker.hasHandle(TOKEN_KEY_HANDLE))
+  if (!await broker.hasHandle(TOKEN_KEY_HANDLE))
     await broker.ensureHandle(TOKEN_KEY_HANDLE, crypto.randomBytes(32).toString('base64'), INSTALLATION_SCOPE);
-  return Buffer.from(broker.resolve(TOKEN_KEY_HANDLE, { caps: [`use-credential:${TOKEN_KEY_HANDLE}`] }), 'base64');
+  return Buffer.from(await broker.resolve(TOKEN_KEY_HANDLE, { caps: [`use-credential:${TOKEN_KEY_HANDLE}`] }), 'base64');
 }
 
 /** Stateless signed grants: a world holds one only for the work it was given. */

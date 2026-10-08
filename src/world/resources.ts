@@ -515,7 +515,7 @@ export class ProjectResourceService {
       for (const [name, secretHandle] of Object.entries(serviceHandles as Record<string, unknown>)) {
         if (typeof secretHandle !== 'string') continue;
         (await recordSecretRefs(this.store, handle.id, [handleRef(secretHandle)]));
-        services[name] = this.broker.resolve(secretHandle, {
+        services[name] = await this.broker.resolve(secretHandle, {
           taskId: handle.id,
           caps: [`use-credential:${secretHandle}`],
         });
@@ -1081,7 +1081,7 @@ export class ProjectResourceService {
     name: string; driver: 'secret@1' | 'service@1' | 'database@1'; target: ResourceTarget;
     access?: ResourceAccess; source?: Record<string, unknown> }): Promise<ProposedResourceCandidate> {
     const { task, project, handle } = await this.currentTaskWorld(taskId);
-    if (!this.broker.hasHandle(input.credentialHandle)) throw new Error('vault item field is not stored');
+    if (!await this.broker.hasHandle(input.credentialHandle)) throw new Error('vault item field is not stored');
     const shared = input.driver === 'service@1' || input.driver === 'database@1';
     const attachment = (await this.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: input.name, driver: input.driver, target: input.target, access: input.access ?? 'read',

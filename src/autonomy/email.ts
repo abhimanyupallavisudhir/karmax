@@ -168,7 +168,7 @@ export interface EmailSent { provider: 'resend' | 'smtp'; dailyQuota?: number; m
 export class EmailService {
   constructor(
     private readConfig: () => OutboundEmailConfig | Promise<OutboundEmailConfig>,
-    private readSecret: (handle: string) => string | undefined,
+    private readSecret: (handle: string) => string | undefined | Promise<string | undefined>,
     /** Each accepted message, with the plan quota Resend reports when it does
      * (the operator's service-limits page counts sends from this). */
     private onSent?: (sent: EmailSent) => unknown,
@@ -178,15 +178,15 @@ export class EmailService {
   async configured(): Promise<boolean> {
     const c = (await this.readConfig());
     if (!c.from || !fromAddress(c.from)) return false;
-    if (c.provider === 'smtp') return !!(c.host && c.secretHandle && this.readSecret(c.secretHandle));
-    if (c.provider === 'resend') return !!(c.secretHandle && this.readSecret(c.secretHandle));
+    if (c.provider === 'smtp') return !!(c.host && c.secretHandle && await this.readSecret(c.secretHandle));
+    if (c.provider === 'resend') return !!(c.secretHandle && await this.readSecret(c.secretHandle));
     return false;
   }
 
   async send(msg: EmailMessage): Promise<void> {
     const c = (await this.readConfig());
     if (!(await this.configured())) throw new Error('outbound email is not configured');
-    const secret = c.secretHandle ? this.readSecret(c.secretHandle) : undefined;
+    const secret = c.secretHandle ? await this.readSecret(c.secretHandle) : undefined;
     if (!secret) throw new Error('outbound email secret is missing');
     const sent: EmailSent = c.provider === 'resend' ? (await this.sendResend(c, secret, msg)) : (await this.sendSmtp(c, secret, msg));
     try { await this.onSent?.(sent); } catch { /* counting must never fail a sent message */ }

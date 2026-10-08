@@ -737,7 +737,7 @@ export class Gateway {
       await notifyCredentialAttention({ store: this.deps.store, configHomes: this.deps.configHomes }, Date.now(), [state.organizationId])
         .catch(() => undefined);
       if (!state.loggedIn) return;
-      const credential = enumerateCredentials(gatherCredentialSources({
+      const credential = enumerateCredentials(await gatherCredentialSources({
         configHomes: this.deps.configHomes,
         broker: this.deps.broker,
         organizationId: state.organizationId,
@@ -1043,7 +1043,7 @@ export class Gateway {
 
   private async explanationApiKey(provider: string, organizationId: string, projectId: string, taskId: string): Promise<string | undefined> {
     const aliases = credentialAliases(provider);
-    const credentials = enumerateCredentials(gatherCredentialSources({
+    const credentials = enumerateCredentials(await gatherCredentialSources({
       configHomes: this.deps.configHomes,
       broker: this.deps.broker,
       organizationId,
@@ -1055,7 +1055,7 @@ export class Gateway {
     if (!credential) return undefined;
     if (credential.apiKeyHandle) {
       if (!this.deps.broker) return undefined;
-      return this.deps.broker.resolve(credential.apiKeyHandle, { taskId, caps: ['use-credential:*'] });
+      return await this.deps.broker.resolve(credential.apiKeyHandle, { taskId, caps: ['use-credential:*'] });
     }
     return process.env[apiKeyEnv(credential.provider)];
   }
@@ -1944,14 +1944,14 @@ export class Gateway {
       // App serves every tenant.
       if (!pending || pending.purpose !== 'manifest')
         return (await this.githubCallbackPage(res, 400, 'This GitHub App setup link is invalid, expired, or belongs to another user.'));
-      if (this.deps.githubApp.configured())
+      if (await this.deps.githubApp.configured())
         return (await this.githubCallbackPage(res, 409, 'A GitHub App is already configured.'));
       try {
         await this.deps.githubApp.convertManifest(code);
         const installState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
           pending.returnTo === 'profile' ? { returnTo: 'profile', selectAccount: pending.selectAccount,
             githubAccountId: pending.githubAccountId, githubLogin: pending.githubLogin } : {}));
-        res.writeHead(303, { location: this.deps.githubApp.installationUrl(installState) });
+        res.writeHead(303, { location: await this.deps.githubApp.installationUrl(installState) });
         return void res.end();
       } catch (error) {
         return (await this.githubCallbackPage(res, 502, `GitHub App setup failed: ${error instanceof Error ? error.message : String(error)}`));
@@ -2012,7 +2012,7 @@ export class Gateway {
           // Verify through GitHub first; they then pick the installation they just made.
           const oauthState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
             { returnTo: 'installation' }));
-          res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, (await this.githubPublicUrl(req))) });
+          res.writeHead(303, { location: await this.deps.githubApp.userAuthorizationUrl(oauthState, (await this.githubPublicUrl(req))) });
           return void res.end();
         } else if (this.deps.hosted) {
           return (await this.githubCallbackPage(res, 403, 'Connect your GitHub account first, then install the App.'));
@@ -2030,7 +2030,7 @@ export class Gateway {
             { returnTo: 'profile', selectAccount: pending.selectAccount,
               githubAccountId: pending.githubAccountId, githubLogin: pending.githubLogin }));
           const publicUrl = (await this.githubPublicUrl(req));
-          res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl, {
+          res.writeHead(303, { location: await this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl, {
             login: pending.githubLogin, selectAccount: pending.selectAccount,
           }) });
           return void res.end();
@@ -2388,7 +2388,7 @@ export class Gateway {
           finishReplay = b.finishReplay === true;
           (await store.kvSet(key, JSON.stringify(record)));
         }
-        const credentials = enumerateCredentials(gatherCredentialSources({
+        const credentials = enumerateCredentials(await gatherCredentialSources({
           configHomes: this.deps.configHomes,
           broker: this.deps.broker,
           organizationId,
@@ -2404,8 +2404,8 @@ export class Gateway {
             || (await this.deps.githubApp?.status(subject.userId))?.userAuthorized
             || (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt)),
           agentLogin: enabledCredentials.length > 0,
-          e2b: [e2b, daytona].some(connection => connection?.enabled
-            && this.deps.broker?.hasHandle(connection.credentialHandle)),
+          e2b: (await Promise.all([e2b, daytona].map(async (connection) => !!connection?.enabled
+            && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
           paidPlan: await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false,
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
@@ -2905,7 +2905,7 @@ export class Gateway {
         const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, organizationId);
         for (const profile of (await gitProfiles.list())) (await gitProfiles.delete(profile.name));
         const { agentAccountHandles } = await import('../platform/credential-sources.js');
-        for (const handle of agentAccountHandles(this.deps.broker?.listHandles() ?? [], organizationId))
+        for (const handle of agentAccountHandles(await this.deps.broker?.listHandles() ?? [], organizationId))
           (await this.deps.broker?.deleteHandle(handle));
         this.deps.configHomes?.removeOrganization(organizationId);
         await this.deps.workflows?.removeOrganization(organizationId);
@@ -3119,7 +3119,7 @@ export class Gateway {
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (!(await this.deps.tokens.check(token, 'settings:write')).ok)
           return this.json(res, 403, { error: `Only a ${(await this.siteName)} installation administrator can create the shared GitHub App` });
-        if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
+        if (await this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
         const state = (await store.createGithubInstallState(githubManifest[1]!, subject.userId,
           { purpose: 'manifest', ...(b.returnTo === 'profile' ? { returnTo: 'profile' as const, selectAccount: true } : {}) }));
@@ -3145,7 +3145,7 @@ export class Gateway {
         const state = (await store.createGithubInstallState(githubAuthorize[1]!, subject.userId,
           b.returnTo === 'profile' || b.returnTo === 'installation' ? { returnTo: b.returnTo, githubAccountId: reconnectAccountId,
             githubLogin: reconnectLogin, selectAccount: b.mode === 'add' } : {}));
-        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, (await this.githubPublicUrl(req)), {
+        try { return this.json(res, 200, { url: await this.deps.githubApp.userAuthorizationUrl(state, (await this.githubPublicUrl(req)), {
           login: reconnectLogin, selectAccount: b.mode === 'add',
         }) }); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
@@ -3154,17 +3154,17 @@ export class Gateway {
       if (githubInstallUrl && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
         const githubApp = this.deps.githubApp;
-        if (!githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
+        if (!githubApp || !await githubApp.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
         const state = (await store.createGithubInstallState(githubInstallUrl[1]!, subject.userId));
         const status = await githubApp.status(subject.userId);
         const authorize = async () => {
           const oauthState = await store.createGithubInstallState(githubInstallUrl[1]!, subject.userId, { returnTo: 'installation' });
-          return this.json(res, 200, { url: githubApp.userAuthorizationUrl(oauthState, await this.githubPublicUrl(req)) });
+          return this.json(res, 200, { url: await githubApp.userAuthorizationUrl(oauthState, await this.githubPublicUrl(req)) });
         };
         if (!status.userAuthorized && status.oauthConfigured) return authorize();
         try {
           const installations = status.userAuthorized ? await githubApp.connectableInstallations(subject.userId) : [];
-          return this.json(res, 200, { url: githubApp.installationUrl(state), installations, canAuthorize: status.oauthConfigured });
+          return this.json(res, 200, { url: await githubApp.installationUrl(state), installations, canAuthorize: status.oauthConfigured });
         } catch (error) {
           // A revoked/expired user token may be removed during discovery. Resume
           // authorization instead of sending an existing installation to GitHub's dead end.
@@ -3175,7 +3175,7 @@ export class Gateway {
       const githubConnectExisting = p.match(/^\/api\/organizations\/([^/]+)\/github\/connect-existing$/);
       if (githubConnectExisting && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
-        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
+        if (!this.deps.githubApp || !await this.deps.githubApp.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
         if (!(await store.organizationMembership(githubConnectExisting[1]!, subject.userId)))
           return this.json(res, 403, { error: 'user is not an organization member' });
         const body = await this.body(req);
@@ -3186,7 +3186,7 @@ export class Gateway {
       }
       const githubRefresh = p.match(/^\/api\/organizations\/([^/]+)\/github\/refresh$/);
       if (githubRefresh && method === 'POST') {
-        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
+        if (!this.deps.githubApp || !await this.deps.githubApp.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
         try {
           const repositories: import('../domain/types.js').Repository[] = [];
           for (const connection of (await store.listGitConnections(githubRefresh[1]!)))
@@ -3213,7 +3213,7 @@ export class Gateway {
       const createOrganizationRepository = p.match(/^\/api\/organizations\/([^/]+)\/repositories\/create$/);
       if (createOrganizationRepository && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
-        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
+        if (!this.deps.githubApp || !await this.deps.githubApp.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
         const b = await this.body(req);
         const connection = (await store.getGitConnection(String(b.gitConnectionId ?? '')));
         if (!connection || connection.organizationId !== createOrganizationRepository[1])
@@ -6255,8 +6255,8 @@ export class Gateway {
           }
           if (p === '/api/mcp/registry' && method === 'GET')
             return this.json(res, 200, await registrySearch(url.searchParams.get('search') ?? '', url.searchParams.get('cursor') ?? ''));
-          if (p === '/api/mcp' && method === 'GET') return this.json(res, 200, (await connections.list(projectId)).map((c) => ({ ...c,
-            connected: c.auth === 'none' || (c.auth === 'secrets' ? c.secretNames.length > 0 : !!connections.secret(c).tokens?.access_token) })));
+          if (p === '/api/mcp' && method === 'GET') return this.json(res, 200, await Promise.all((await connections.list(projectId)).map(async (c) => ({ ...c,
+            connected: c.auth === 'none' || (c.auth === 'secrets' ? c.secretNames.length > 0 : !!(await connections.secret(c)).tokens?.access_token) }))));
           if (p === '/api/mcp' && method === 'POST') {
             const saved = (await connections.save(await this.body(req), projectId));
             (await store.appendAudit({ principalId: actor, action: 'mcp.connection.saved', scopeKey: auditScope, detail: { id: saved.id, revision: saved.revision } }));
@@ -6567,7 +6567,7 @@ export class Gateway {
         try {
           if (p === '/api/connections/config') {
             if (method === 'PUT') await service.configure(String(b.apiKey ?? ''));
-            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: service.configured(), canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
+            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: await service.configured(), canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
           }
           if (p === '/api/connections/catalog' && method === 'GET')
             return this.json(res, 200, await service.catalog(url.searchParams.get('search') ?? ''));
@@ -7059,7 +7059,7 @@ export class Gateway {
               }
               if (connName[1] === 'pass-git') {
                 if (action === 'check') {
-                  const secret = connectors.secretFor('pass-git');
+                  const secret = await connectors.secretFor('pass-git');
                   if (!secret) throw new Error('Connect a password store first');
                   return this.json(res, 200, await connectors.get('pass-git')!.validateSecret!(secret));
                 }
@@ -7164,7 +7164,7 @@ export class Gateway {
               : `sign in again (or ask a person to, through this task's desktop), then call save_session with itemId ${item.id}`;
             const checked = (await vault.access(caps, callerTaskId, item, 'use'));
             if (checked.status !== 'granted') return this.json(res, 200, await raise(checked, item));
-            const stored = vault.readSecret(item, 'session');
+            const stored = await vault.readSecret(item, 'session');
             if (!stored || !sessionState(parseSavedSession(stored), domains).usable)
               return this.json(res, 200, { status: 'expired', itemId: item.id, ...(fallback.length ? { fallback } : {}), next: `the saved session has expired: ${signInAgain}` });
             const opener = await this.taskPageOpener(callerTaskId, 'saved sessions');
@@ -7509,7 +7509,7 @@ export class Gateway {
       if (resourcePath === '/api/accounts' && method === 'GET') {
         const { agentAccountHandles } = await import('../platform/credential-sources.js');
         return this.json(res, 200, {
-          handles: agentAccountHandles(this.deps.broker?.listHandles() ?? [], resourceOrganizationId),
+          handles: agentAccountHandles(await this.deps.broker?.listHandles() ?? [], resourceOrganizationId),
           // never expose the home's absolute path to the browser
           logins: (this.deps.configHomes?.list(resourceOrganizationId) ?? []).map((a) => ({
             provider: a.provider,
@@ -7554,7 +7554,7 @@ export class Gateway {
           ? `${provider}:${name}`
           : `${provider}:${resourceOrganizationId}:${name}`;
         const handle = handleFor(account);
-        if (!this.deps.broker.hasHandle(handle)) return this.json(res, 404, { error: 'API key not found' });
+        if (!await this.deps.broker.hasHandle(handle)) return this.json(res, 404, { error: 'API key not found' });
         const credentialKey = `key:handle:${handle}`;
         if (method === 'DELETE') {
           (await this.deps.broker.deleteHandle(handle));
@@ -7566,7 +7566,7 @@ export class Gateway {
         const nextAccount = b.account === undefined ? account : String(b.account);
         if (!simpleId.test(nextAccount)) return this.json(res, 400, { error: 'account must be a simple id' });
         const nextHandle = handleFor(nextAccount);
-        if (nextHandle !== handle && this.deps.broker.hasHandle(nextHandle))
+        if (nextHandle !== handle && await this.deps.broker.hasHandle(nextHandle))
           return this.json(res, 409, { error: `API key ${provider}:${nextAccount} already exists` });
         const replacement = b.apiKey === undefined || b.apiKey === '' ? undefined : String(b.apiKey);
         (await this.deps.broker.updateHandle(handle, nextHandle, organizationScope(resourceOrganizationId), replacement));
@@ -7626,7 +7626,7 @@ export class Gateway {
         }
         await this.refreshLoginPool();
         if (result.status === 'logged_in') {
-          const credential = enumerateCredentials(gatherCredentialSources({
+          const credential = enumerateCredentials(await gatherCredentialSources({
             configHomes: this.deps.configHomes,
             broker: this.deps.broker,
             organizationId: resourceOrganizationId,
@@ -7802,7 +7802,7 @@ export class Gateway {
         if (!this.deps.client) return this.json(res, 400, { error: 'no temporal client' });
         const b = await this.body(req);
         if (!b.accountId || !b.status) return this.json(res, 400, { error: 'accountId and status required' });
-        if (!this.organizationCredentialKeys(resourceOrganizationId).includes(String(b.accountId)))
+        if (!(await this.organizationCredentialKeys(resourceOrganizationId)).includes(String(b.accountId)))
           return this.json(res, 404, { error: 'credential not found in this organization' });
         const status = ['available', 'manual-off', 'needs-attention', 'exhausted'].includes(b.status) ? b.status : 'exhausted';
         const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
@@ -7820,7 +7820,7 @@ export class Gateway {
       if (resourcePath === '/api/accounts/concurrency' && method === 'POST') {
         const b = await this.body(req);
         if (!b.accountId) return this.json(res, 400, { error: 'accountId required' });
-        if (!this.organizationCredentialKeys(resourceOrganizationId).includes(String(b.accountId)))
+        if (!(await this.organizationCredentialKeys(resourceOrganizationId)).includes(String(b.accountId)))
           return this.json(res, 404, { error: 'credential not found in this organization' });
         const { concurrencyKey } = await import('../platform/credential-sources.js');
         const { UNLIMITED_CONCURRENCY } = await import('../coordinators/names.js');
@@ -7838,7 +7838,7 @@ export class Gateway {
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
         const { isUsagePollable, isUsageStale } = await import('../agent/usage.js');
-        const creds = enumerateCredentials(gatherCredentialSources({
+        const creds = enumerateCredentials(await gatherCredentialSources({
           configHomes: this.deps.configHomes,
           broker: this.deps.broker,
           organizationId: resourceOrganizationId,
@@ -7890,7 +7890,7 @@ export class Gateway {
           : resourceOrganizationId;
         if (scopedOrganizationId !== resourceOrganizationId)
           return this.json(res, 400, { error: 'credential scope does not belong to this organization' });
-        const creds = enumerateCredentials(gatherCredentialSources({
+        const creds = enumerateCredentials(await gatherCredentialSources({
           configHomes: this.deps.configHomes,
           broker: this.deps.broker,
           organizationId: scopedOrganizationId,
@@ -8370,7 +8370,7 @@ export class Gateway {
   private async discoverModels(organizationId: string): Promise<ModelCatalog> {
     const { gatherCredentialSources } = await import('../platform/credential-sources.js');
     const { enumerateCredentials } = await import('../platform/credentials.js');
-    const creds = enumerateCredentials(gatherCredentialSources({
+    const creds = enumerateCredentials(await gatherCredentialSources({
       configHomes: this.deps.configHomes,
       broker: this.deps.broker,
       organizationId,
@@ -8434,13 +8434,12 @@ export class Gateway {
     this.modelCatalog.invalidate();
     if (!this.deps.configHomes || !this.deps.client) return;
     const { concurrencyFor } = await import('../platform/credential-sources.js');
-    const creds = (await this.deps.store.listOrganizations()).flatMap((organization) =>
-      enumerateCredentials(gatherCredentialSources({
+    const creds = (await Promise.all((await this.deps.store.listOrganizations()).map(async (organization) =>
+      enumerateCredentials(await gatherCredentialSources({
         configHomes: this.deps.configHomes,
         broker: this.deps.broker,
         organizationId: organization.id,
-      })),
-    );
+      }))))).flat();
     const pool = (await __asyncCollections.map(creds, async (c) => {
       const maxConcurrent = (await concurrencyFor(async (k) => (await this.deps.store.kvGet(k)), c.key));
       const credentialProvider = c.kind === 'key' ? c.provider : c.modelProvider;
@@ -8474,7 +8473,7 @@ export class Gateway {
   }
 
   private async organizationAccountStatus(organizationId: string): Promise<Array<Record<string, any>>> {
-    const keys = new Set(this.organizationCredentialKeys(organizationId));
+    const keys = new Set(await this.organizationCredentialKeys(organizationId));
     let view: { accounts?: Array<Record<string, any>> } = {};
     try {
       view = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId()).query('accounts'), 3000) as typeof view;
@@ -8496,8 +8495,8 @@ export class Gateway {
     });
   }
 
-  private organizationCredentialKeys(organizationId: string): string[] {
-    return enumerateCredentials(gatherCredentialSources({
+  private async organizationCredentialKeys(organizationId: string): Promise<string[]> {
+    return enumerateCredentials(await gatherCredentialSources({
       configHomes: this.deps.configHomes,
       broker: this.deps.broker,
       organizationId,
@@ -9261,7 +9260,7 @@ export class Gateway {
     try {
       const installationId = (await githubApp.ownInstallation(userId, account.id));
       if (!installationId) {
-        return install ? githubApp.installationUrl((await this.deps.store.createGithubInstallState(personal.id, userId,
+        return install ? await githubApp.installationUrl((await this.deps.store.createGithubInstallState(personal.id, userId,
           { returnTo: 'profile', githubAccountId: account.id, githubLogin: account.login }))) : undefined;
       }
       await githubApp.connectInstallation(personal.id, installationId);

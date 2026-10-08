@@ -21,7 +21,7 @@ import { openStore } from './store/db.js';
 import { defaultProvider } from './agent/adapters.js';
 import { KarmaxBus } from './contrib/bus.js';
 import { CredentialBroker } from './autonomy/broker.js';
-import { Vault, recordQuarantine, recordScopeMigration } from './autonomy/vault.js';
+import { openSecretVault } from './autonomy/vault-backend.js';
 import { resolveVaultScopes } from './autonomy/vault-scopes.js';
 import { INSTALLATION_SCOPE } from './autonomy/vault-keys.js';
 import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
@@ -176,27 +176,25 @@ async function main() {
         .map((value) => value?.trim()).find(Boolean)! }
       : {}),
   }));
-  const vault = new Vault(p.vault);
-  // Data epoch 4 (SS-1): every secret moves under its owner's data key; the database knows the owners.
-  const scoped = await recordScopeMigration(vault, (handles) => resolveVaultScopes(store, handles), (report) => store.appendAudit({
-    principalId: 'system:vault', action: 'vault.scopes.migrated', detail: { migrated: report.migrated, byScope: report.byScope,
-      unresolved: report.unresolved.length, unresolvedHandles: report.unresolved.slice(0, 500) } }));
-  if (scoped?.migrated) console.log(`  • Vault: ${scoped.migrated} secrets moved under per-owner data keys`
-    + (scoped.unresolved.length ? `; ${scoped.unresolved.length} with no owner found stay under the installation key (audit log: vault.scopes.migrated)` : ''));
-  // Binds ciphertext written before AU-27 to its handle; what will not open is quarantined, loudly.
-  // Reported until audited, so a crash between quarantine and audit still reaches the log.
-  await recordQuarantine(vault, (entry) => store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
+  // The vault's one-way migrations run here, each audited before it is acknowledged: binding
+  // (AU-27), per-owner data keys (data epoch 4; the database knows the owners) and, on
+  // PostgreSQL, the move into the database (data epoch 5; wiki planned/host-local-state).
+  const vault = await openSecretVault(p.vault, store.db, {
+    resolveScopes: (handles) => resolveVaultScopes(store, handles),
+    audit: (action, detail) => store.appendAudit({ principalId: 'system:vault', action, detail }),
+    log: (line) => console.log(`  • ${line}`),
+  });
   const broker = new CredentialBroker(vault);
   await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker); // AU-31
   (await import('./autonomy/vault-items.js')).removeLegacyKeyCopies(p.state); // AU-33
   (await import('./autonomy/vault-items.js')).sweepTurnKeys(); // key files a crashed turn left behind
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');
   const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
-  if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
+  if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !await broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
     (await broker.ensureHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'), INSTALLATION_SCOPE));
-  if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
+  if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !await broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
     (await broker.ensureHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET, INSTALLATION_SCOPE));
-  if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
+  if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !await broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
     (await broker.ensureHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET, INSTALLATION_SCOPE));
   // One deployment App owns repository installations and user OAuth. Environment
   // values remain an upgrade/enterprise bootstrap path; the normal path is the
@@ -204,7 +202,7 @@ async function main() {
   const githubApp = (await GitHubAppService.create(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
     appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID,
     publicApp: deployment.hosted }));
-  const sharedGithubOauth = githubApp.oauthCredentials();
+  const sharedGithubOauth = await githubApp.oauthCredentials();
   // A separately managed OAuth App remains a compatibility fallback only. Once
   // the deployment GitHub App exists, it is the single OAuth client.
   const legacyGithubOauth = process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID?.trim()
@@ -264,7 +262,7 @@ async function main() {
     try { return JSON.parse((await store.kvGet('email:outbound')) ?? '{}'); } catch { return {}; }
   };
   const emailService = new EmailService(emailConfig,
-    (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
+    async (handle) => (await broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
     async (sent) => {
       (await store.countServiceUsage(`email.sent:${sent.provider}`));
       if (sent.provider === 'resend') (await serviceLimits.recordResendQuota({ daily: sent.dailyQuota, monthly: sent.monthlyQuota }));
@@ -590,9 +588,8 @@ async function main() {
   // so the coordinator can lease/track any of them (SPEC §6.2/§7).
   const { gatherCredentialSources, concurrencyFor } = await import('./platform/credential-sources.js');
   const { enumerateCredentials } = await import('./platform/credentials.js');
-  const creds = (await store.listOrganizations()).flatMap((organization) =>
-    enumerateCredentials(gatherCredentialSources({ configHomes, broker, organizationId: organization.id })),
-  );
+  const creds = (await Promise.all((await store.listOrganizations()).map(async (organization) =>
+    enumerateCredentials(await gatherCredentialSources({ configHomes, broker, organizationId: organization.id }))))).flat();
   const pool = (await __asyncCollections.map(creds, async (c) => {
     const maxConcurrent = (await concurrencyFor(async (k) => (await store.kvGet(k)), c.key));
     const credentialProvider = c.kind === 'key' ? c.provider : c.modelProvider;
@@ -646,7 +643,7 @@ async function main() {
       organizationId,
       config: (await readMailboxConfig(organizationId)),
     }))),
-    resolveSecret: (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
+    resolveSecret: async (handle) => (await broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
     makeIngest: (organizationId, config) => {
       const domain = config.domain || config.hostedDomain || config.agentmailDomain || config.fixedAddress?.split('@')[1];
       const fixedLocal = config.fixedAddress?.split('@')[0];

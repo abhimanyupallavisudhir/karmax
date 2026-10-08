@@ -8,7 +8,8 @@ import { createBackup, restoreBackup, verifyBackup, recordRestores, signChecksum
 import { localSigningFingerprint } from '../src/ops/backup-signing.js';
 import crypto from 'node:crypto';
 import { Vault } from '../src/autonomy/vault.js';
-import { organizationScope } from '../src/autonomy/vault-keys.js';
+import { LocalKek, organizationScope } from '../src/autonomy/vault-keys.js';
+import { moveVaultToDatabase } from '../src/autonomy/vault-backend.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -44,8 +45,8 @@ describe('control-plane backup', () => {
       try {
         const restoredHandle = await restored.kvGet('recovery-handle');
         expect(restoredHandle).toBe(handle);
-        expect(new Vault(path.join(recovered, 'vault')).reveal(restoredHandle!)).toBe(secret);
-        expect(vault.reveal(handle)).toBe('changed-after-backup');
+        expect(await new Vault(path.join(recovered, 'vault')).reveal(restoredHandle!)).toBe(secret);
+        expect(await vault.reveal(handle)).toBe('changed-after-backup');
         for (const file of fs.readdirSync(path.join(recovered, 'vault'), { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile()))
           expect(fs.readFileSync(path.join(file.parentPath, file.name), 'utf8')).not.toContain(secret);
       } finally { await restored.close(); }
@@ -744,7 +745,7 @@ describe('backups without the vault key (SS-2)', () => {
     fs.mkdirSync(path.join(home, 'state'), { recursive: true });
     const vault = new Vault(path.join(home, 'vault'));
     await vault.put('item:1:password', secret, organizationScope('org_a'));
-    return { root, home, kek: vault.keyStatus().kek };
+    return { root, home, kek: (await vault.keyStatus()).kek };
   }
   afterEach(() => vi.unstubAllEnvs());
 
@@ -762,6 +763,23 @@ describe('backups without the vault key (SS-2)', () => {
     expect(fs.existsSync(path.join(root, 'opted', 'payload', 'vault', 'vault.key'))).toBe(true);
   });
 
+  it('names the key of a vault that moved into the database, whose directory holds no canaries', async () => {
+    const key = 'hosted-deployment-key-material-0123456789';
+    vi.stubEnv('KARMAX_VAULT_KEY', key);
+    const { root, home, kek } = await vaultHome('moved');
+    const store = await Store.create(':memory:');
+    try {
+      await moveVaultToDatabase(path.join(home, 'vault'), store.db, { current: LocalKek.fromText(key), others: [] },
+        { resolveScopes: async () => new Map(), audit: async () => undefined });
+    } finally { await store.close(); }
+    const made = await createBackup({ home, destination: path.join(root, 'snapshot'), externalTemporal: true });
+    // The ciphertext is in the database dump now; the key it needs is still named, and still left out.
+    expect(made.manifest.files.some((file) => file.path.startsWith('vault/keys/') || file.path.startsWith('vault/entries/0'))).toBe(false);
+    expect(made.manifest).toMatchObject({ vaultKeyIncluded: false, vaultKeyIds: [kek] });
+    vi.stubEnv('KARMAX_VAULT_KEY', 'a-different-deployment-key-material-000');
+    expect(() => verifyBackup(made.directory, { home, trustKeys: [made.signedBy], checkVaultKey: true })).toThrow(new RegExp(`encrypted under ${kek}`));
+  });
+
   it('records the id of a KARMAX_VAULT_KEY, and restores with it', async () => {
     vi.stubEnv('KARMAX_VAULT_KEY', 'hosted-deployment-key-material-0123456789');
     const { root, home, kek } = await vaultHome('env');
@@ -769,7 +787,7 @@ describe('backups without the vault key (SS-2)', () => {
     expect(made.manifest.vaultKeyIds).toEqual([kek]);
     const target = path.join(root, 'target');
     await restoreBackup(made.directory, { home: target, trustKeys: [made.signedBy] });
-    expect(new Vault(path.join(target, 'vault')).reveal('item:1:password')).toBe('tenant-secret');
+    expect(await new Vault(path.join(target, 'vault')).reveal('item:1:password')).toBe('tenant-secret');
   });
 
   it('refuses to restore under a different key before changing anything, and restores with the supplied one', async () => {
@@ -779,7 +797,7 @@ describe('backups without the vault key (SS-2)', () => {
     const target = await vaultHome('target', 'target-secret');
     await expect(restoreBackup(made.directory, { home: target.home, trustKeys: [made.signedBy] }))
       .rejects.toThrow(new RegExp(`vault is encrypted under ${source.kek}.*the vault key here is ${target.kek}`));
-    expect(new Vault(path.join(target.home, 'vault')).reveal('item:1:password')).toBe('target-secret');
+    expect(await new Vault(path.join(target.home, 'vault')).reveal('item:1:password')).toBe('target-secret');
     // A wrong KARMAX_VAULT_KEY is refused the same way.
     vi.stubEnv('KARMAX_VAULT_KEY', 'some-other-deployment-key-material-000000');
     await expect(restoreBackup(made.directory, { home: target.home, trustKeys: [made.signedBy] })).rejects.toThrow(/vault key here is vk-/);
@@ -792,10 +810,10 @@ describe('backups without the vault key (SS-2)', () => {
     const kept = path.join(source.root, 'kept-vault.key');
     fs.copyFileSync(path.join(source.home, 'vault', 'vault.key'), kept);
     await restoreBackup(made.directory, { home: target.home, trustKeys: [made.signedBy], vaultKeyFile: kept });
-    expect(new Vault(path.join(target.home, 'vault')).reveal('item:1:password')).toBe('source-secret');
+    expect(await new Vault(path.join(target.home, 'vault')).reveal('item:1:password')).toBe('source-secret');
     // And onto the home it came from, the live key is kept.
     await restoreBackup(made.directory, { home: source.home });
-    expect(new Vault(path.join(source.home, 'vault')).reveal('item:1:password')).toBe('source-secret');
+    expect(await new Vault(path.join(source.home, 'vault')).reveal('item:1:password')).toBe('source-secret');
   });
 
   it('checks the key when verifying, through npm run restore', async () => {

@@ -322,10 +322,10 @@ for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe
     // The token stays in the vault: never in the view, the settings or the state.
     const everything = JSON.stringify(raised) + (await store.kvGet(SERVICE_LIMIT_SETTINGS_KEY)) + (await store.kvGet(SERVICE_LIMIT_STATE_KEY));
     expect(everything).not.toContain('cf-secret-token');
-    expect(broker.hasHandle(CLOUDFLARE_TOKEN_HANDLE)).toBe(true);
+    expect(await broker.hasHandle(CLOUDFLARE_TOKEN_HANDLE)).toBe(true);
     expect(raised.cloudflare).toEqual({ accountId: ACCOUNT, tokenConfigured: true });
     await service.configure({ cloudflare: { apiToken: null } });
-    expect(broker.hasHandle(CLOUDFLARE_TOKEN_HANDLE)).toBe(false);
+    expect(await broker.hasHandle(CLOUDFLARE_TOKEN_HANDLE)).toBe(false);
   });
 
   it('counts tavya’s own sends, calls and certificates', async () => {

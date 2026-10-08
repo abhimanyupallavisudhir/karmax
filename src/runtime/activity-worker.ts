@@ -10,7 +10,7 @@ import { announceEventsAppended, type WorkerProcessRuntime } from '../temporal/w
 import { TASK_QUEUE } from '../temporal/config.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { KarmaxBus } from '../contrib/bus.js';
-import { Vault } from '../autonomy/vault.js';
+import { openSecretVault } from '../autonomy/vault-backend.js';
 import { sweepTurnKeys } from '../autonomy/vault-items.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { AuthorizationService } from '../platform/authorization.js';
@@ -58,7 +58,8 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
     const connection = await makeClient(conn);
     closeClient = connection.close;
     const client = connection.client;
-    const broker = new CredentialBroker(new Vault(p.vault));
+    // Attaches only: the primary process ran the vault's migrations on its boot.
+    const broker = new CredentialBroker(await openSecretVault(p.vault, store.db));
     sweepTurnKeys(); // key files a crashed turn of an earlier worker left behind
     const authorization = await AuthorizationService.create(store);
     const githubApp = await GitHubAppService.create(store, broker, {

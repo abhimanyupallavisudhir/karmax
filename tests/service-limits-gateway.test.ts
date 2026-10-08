@@ -113,7 +113,7 @@ describe('service limits API authorization', () => {
     const text = await response.text();
     expect(text).not.toContain('cfut_secret_value');
     expect(JSON.parse(text).cloudflare).toEqual({ accountId: '35e42bcea7b0b9f09dce2860d587d418', tokenConfigured: true });
-    expect(broker.resolve(CLOUDFLARE_TOKEN_HANDLE, { caps: [`use-credential:${CLOUDFLARE_TOKEN_HANDLE}`] })).toBe('cfut_secret_value');
+    expect(await broker.resolve(CLOUDFLARE_TOKEN_HANDLE, { caps: [`use-credential:${CLOUDFLARE_TOKEN_HANDLE}`] })).toBe('cfut_secret_value');
     // The stubbed provider is down: the row says so, without echoing the request.
     const workers = JSON.parse(text).services.find((service: any) => service.id === 'cloudflare-workers');
     expect(workers).toMatchObject({ status: 'failed', error: 'Cloudflare answered 503' });

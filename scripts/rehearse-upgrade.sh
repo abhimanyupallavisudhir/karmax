@@ -416,6 +416,21 @@ background_jobs() {
   fi
   echo "No background job failed in app container ${id:0:12}."
 }
+# From data epoch 5 the vault is rows of PostgreSQL: the volume keeps only the
+# marker the previous release refuses and the retired copy of the files, and
+# vault-key reads the keyrings from the database.
+vault_in_database() {
+  local id status; id=$(app_container)
+  docker exec "$id" grep -q karmax-vault-moved-to-database /var/lib/karmax/vault/secrets.json \
+    || { echo 'rehearse: vault/secrets.json is not the moved-to-database marker'; return 1; }
+  [ "$(docker exec "$id" ls -A /var/lib/karmax/vault/entries)" = .migrated ] \
+    || { echo 'rehearse: vault/entries/ still holds secrets'; return 1; }
+  echo "Retired copy: $(docker exec "$id" sh -c 'ls /var/lib/karmax/vault/retired-epoch5/entries | grep -c json') entry files"
+  status=$(docker exec "$id" npm run --silent vault-key -- status) || { echo "$status"; return 1; }
+  echo "$status"
+  echo "$status" | grep -Eq '^[1-9][0-9]* keyrings' || { echo 'rehearse: the database vault holds no keyrings'; return 1; }
+}
+moves_vault() { [ "$(git -C "$WORK/origin.git" show "$DEPLOY_SHA:deploy/data-epoch" 2>/dev/null || echo 1)" -ge 5 ]; }
 if [ "$updated" -eq 0 ]; then
   record FAIL 'e. skipped: the update did not complete, so there is no TO to verify'
 elif [ -z "$(app_container)" ]; then
@@ -424,6 +439,7 @@ else
   step 'e. Verify every record through the TO API' verify-to.log client verify --phase upgraded --resume || true
   step '   doctor: the app connects as its own role' doctor.log doctor_role || true
   step "   The app's background jobs run cleanly" jobs-to.log background_jobs || true
+  ! moves_vault || step '   The vault moved into PostgreSQL (data epoch 5)' vault-to.log vault_in_database || true
   judge_edge 'e. Edge: HTTPS through Caddy reaches the app' edge-to-reach.log edge_probe reach to
   if promises_client_addresses; then
     judge_edge 'e. Edge: each client keeps its address' edge-to-addresses.log edge_probe addresses to
@@ -469,6 +485,7 @@ if step 'f. Install a fresh TO stack (deploy/karmax up)' up-fresh.log ./deploy/k
   step 'f. Verify every record after the restore' verify-restore.log client verify --phase restored --resume || true
   step '   doctor after the restore' doctor-restore.log doctor_role || true
   step "   The restored app's background jobs run cleanly" jobs-restore.log background_jobs || true
+  ! moves_vault || step '   The restored vault moved into PostgreSQL again' vault-restore.log vault_in_database || true
 fi
 
 summary

@@ -42,7 +42,7 @@ describe('MCP OAuth authorization', () => {
       await finishOAuth(service, c, 'user:alice', state, 'code');
       await expect(finishOAuth(service, c, 'user:alice', state, 'code')).rejects.toThrow(/expired/);
       expect(await connectionHeaders(service, c, 'task')).toEqual({ Authorization: 'Bearer access-secret' });
-      (await service.setSecret(c, { ...service.secret(c), expiresAt: 0 }));
+      (await service.setSecret(c, { ...(await service.secret(c)), expiresAt: 0 }));
       expect(await connectionHeaders(service, c, 'task')).toEqual({ Authorization: 'Bearer access-secret' });
       expect(calls.filter((r) => r.url.endsWith('/token'))).toHaveLength(2);
       expect(JSON.stringify((await service.list()))).not.toContain('access-secret');

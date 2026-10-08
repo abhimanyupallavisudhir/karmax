@@ -1,4 +1,4 @@
-import { Vault } from './vault.js';
+import type { SecretVault } from './vault-crypto.js';
 import type { VaultScope } from './vault-keys.js';
 import { Capability, allows } from '../platform/capabilities.js';
 
@@ -29,7 +29,7 @@ export class CredentialBroker {
   private auditNext = 0;
   private static readonly AUDIT_LIMIT = 1000;
 
-  constructor(private vault: Vault) {}
+  constructor(private vault: SecretVault) {}
 
   /** Write back a (possibly newly created) secret under a handle, encrypted
    * under the data key of the `scope` that owns it (SS-1). A handle stays in
@@ -43,12 +43,12 @@ export class CredentialBroker {
     return this.vault.putIfAbsent(handle, secret, scope);
   }
 
-  hasHandle(handle: string): boolean {
+  hasHandle(handle: string): Promise<boolean> {
     return this.vault.has(handle);
   }
 
   /** The scope recorded on a handle's entry. */
-  scopeOf(handle: string): VaultScope | undefined {
+  scopeOf(handle: string): Promise<VaultScope | undefined> {
     return this.vault.scopeOf(handle);
   }
 
@@ -71,7 +71,7 @@ export class CredentialBroker {
     return this.vault.destroyScope(scope);
   }
 
-  listHandles(): string[] {
+  listHandles(): Promise<string[]> {
     return this.vault.list();
   }
 
@@ -79,13 +79,13 @@ export class CredentialBroker {
    * JIT-resolve a handle to its secret. The requester must hold
    * `use-credential:<handle>` (or a covering wildcard). Every attempt is audited.
    */
-  resolve(handle: string, ctx: ResolveContext): string {
+  async resolve(handle: string, ctx: ResolveContext): Promise<string> {
     const permitted = allows(ctx.caps, `use-credential:${handle}`);
     if (!permitted) {
       this.audit({ ts: Date.now(), handle, taskId: ctx.taskId, profileId: ctx.profileId, granted: false, reason: 'capability denied' });
       throw new Error(`credential broker: not permitted to use ${handle}`);
     }
-    const secret = this.vault.reveal(handle);
+    const secret = await this.vault.reveal(handle);
     if (secret === undefined) {
       this.audit({ ts: Date.now(), handle, taskId: ctx.taskId, profileId: ctx.profileId, granted: false, reason: 'no such handle' });
       throw new Error(`credential broker: no secret for handle ${handle}`);
