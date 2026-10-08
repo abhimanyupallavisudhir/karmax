@@ -46,7 +46,7 @@ async function presigning(objects: LocalObjectStore): Promise<ObjectStore & { ge
   return wrapped;
 }
 
-async function fixture(options: { presign?: boolean; quotaBytes?: number } = {}) {
+async function fixture(options: { presign?: boolean; quotaBytes?: number; grantRequestsPerMinute?: number } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-repository-'));
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const store = await Store.create(':memory:');
@@ -61,7 +61,8 @@ async function fixture(options: { presign?: boolean; quotaBytes?: number } = {})
     name: 'raw', driver: 'volume@1', target: { kind: 'path', path: 'raw' }, access: 'write', isolation: 'fork', source: {},
     credentialHandles: [], storageLocationId: managed.id, publish: 'review' });
   const tokens = new RepositoryTokens(broker);
-  const repositories = new ResourceRepositoryServer({ store, tokens, objects: async () => objects });
+  const repositories = new ResourceRepositoryServer({ store, tokens, objects: async () => objects,
+    ...(options.grantRequestsPerMinute ? { grantRequestsPerMinute: options.grantRequestsPerMinute } : {}) });
   const repository = repositoryName(attachment.id, managed.id);
   const server = http.createServer((req, res) => {
     const url = new URL(req.url!, 'http://x');
@@ -207,14 +208,16 @@ describe('resource repository request budgets', () => {
     fetch(`${base}${repository}/locks/`, { headers: { authorization: `Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`, ...headers } });
 
   it('serves many worlds saving at once from one address, and refuses only the grant that floods', async () => {
-    const f = await fixture();
-    // A 1.27 GB save made 228 edge subrequests in a minute; 20 such saves at once.
-    const worlds = await Promise.all(Array.from({ length: 20 }, () => f.grant('append')));
-    const served = (await Promise.all(worlds.map((token) => burst(250, 25, as(f.base, f.repository, token))))).flat();
+    // A budget of 100 stands in for 3,000 so the burst stays cheap; the next
+    // test holds the real budget against measured saves.
+    const budget = 100;
+    const f = await fixture({ grantRequestsPerMinute: budget });
+    const worlds = await Promise.all(Array.from({ length: 10 }, () => f.grant('append')));
+    const served = (await Promise.all(worlds.map((token) => burst(budget - 1, 25, as(f.base, f.repository, token))))).flat();
     expect(served.filter((status) => status !== 200)).toEqual([]);
 
     const flood = await f.grant('append');
-    expect(new Set(await burst(GRANT_REQUESTS_PER_MINUTE, 50, as(f.base, f.repository, flood)))).toEqual(new Set([200]));
+    expect(new Set(await burst(budget, 25, as(f.base, f.repository, flood)))).toEqual(new Set([200]));
     const refused = await as(f.base, f.repository, flood)();
     expect(refused.status).toBe(429);
     expect(Number(refused.headers.get('retry-after'))).toBeGreaterThan(0);
@@ -225,6 +228,19 @@ describe('resource repository request budgets', () => {
     // Everyone else is untouched, from the same address at the same moment.
     expect((await as(f.base, f.repository, worlds[0]!)()).status).toBe(200);
     expect((await as(f.base, f.repository, await f.grant('read'))()).status).toBe(200);
+  });
+
+  it('gives every world room for the fastest measured save, and stops a flood', () => {
+    // The 1.27 GB probe made 228 edge subrequests in a minute, 152 of them to
+    // tavya; the fastest save measured (~85 MiB/s, 2 requests per 16 MiB pack)
+    // is ~650 requests a minute. Each world has a budget of its own.
+    const limits = new GrantLimits();
+    let refused = 0;
+    for (let world = 0; world < 50; world++)
+      for (let i = 0; i < 4 * 650; i++) if (limits.take(`world-${world}`, 1_000 + i)) refused++;
+    for (let i = 0; i < GRANT_REQUESTS_PER_MINUTE; i++) if (limits.take('flood', 1_000)) refused++;
+    expect(refused).toBe(0);
+    expect(limits.take('flood', 1_000)).toBeGreaterThan(0);
   });
 
   it('serves the restic binary only to a grant', async () => {

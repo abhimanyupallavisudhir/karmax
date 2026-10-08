@@ -164,6 +164,8 @@ export interface RepositoryServerDeps {
   /** Whether an edge is deployed (src/edge/resource-repository-worker.ts): it
    * may then upload files straight into stores that verify checksums. */
   edge?: () => boolean;
+  /** Requests one grant may make a minute ({@link GRANT_REQUESTS_PER_MINUTE}). */
+  grantRequestsPerMinute?: number;
 }
 
 interface RepositoryPlace { attachment: ResourceAttachment; repository: string; storageLocationId?: string; objects(): Promise<ObjectStore> }
@@ -172,12 +174,14 @@ class HttpError extends Error { constructor(readonly status: number, message: st
 
 export class ResourceRepositoryServer {
   private slots = UPLOAD_SLOTS;
-  private limits = new GrantLimits();
+  private limits: GrantLimits;
   private waiting: Array<() => void> = [];
   /** Per storage location: does its store refuse content that does not match a signed checksum? */
   private checksums = new Map<string, { verified: Promise<boolean>; until: number }>();
 
-  constructor(private deps: RepositoryServerDeps) {}
+  constructor(private deps: RepositoryServerDeps) {
+    this.limits = new GrantLimits(deps.grantRequestsPerMinute);
+  }
 
   /** Whether the edge uploads this repository's files straight into its store.
    * Only a store that refuses content not matching the checksum signed into
