@@ -79,6 +79,7 @@ const remoteField = (): FieldSpec => ({
   label: 'Remote policy',
   help: 'What leaves a local machine: none — merges stay local; push — push the target after merge; pr — open the exact GitHub proposal before Review, then merge it under a confirming human’s GitHub authorization. In E2B, the SSH repository is necessarily the durable source of truth, so confirmed merges are broker-pushed even when this is none.',
   options: ['none', 'push', 'pr'],
+  optionLabels: { none: 'Keep merges local', push: 'Push after merging', pr: 'Open a pull request' },
   default: 'none',
   scopes: ['project', 'global'],
   bind: 'project',
@@ -86,7 +87,8 @@ const remoteField = (): FieldSpec => ({
 const otherAttemptsField = (): FieldSpec => ({
   name: 'otherAttempts', type: 'select', label: 'Other task attempts',
   help: 'ask — the human or agent reviewer chooses Keep or Cancel; without a reviewer, keep. Keep allows other proposals to continue and merge. The first attempt entering Merge fixes the choice for its group.',
-  options: ['ask', 'keep', 'cancel'], default: 'ask', scopes: ['project'], bind: 'project',
+  options: ['ask', 'keep', 'cancel'], optionLabels: { ask: 'Reviewer decides', keep: 'Keep them', cancel: 'Cancel them' },
+  default: 'ask', scopes: ['project'], bind: 'project',
 });
 const landingAuthorityField = (): FieldSpec => ({
   name: 'landingAuthority',
@@ -95,7 +97,7 @@ const landingAuthorityField = (): FieldSpec => ({
   help: `auto — prefer the provider queue/auto-merge and use ${BRAND} admission only when strict freshness needs it; external — a repository-triggered third-party system owns landing and ${BRAND} only observes; ${BRAND} — always use ${BRAND} fair fallback admission.`,
   options: ['auto', 'external', 'karmax'],
   // The stored value predates the product name.
-  optionLabels: { karmax: BRAND },
+  optionLabels: { auto: 'Automatic', external: 'External system', karmax: BRAND },
   default: 'auto',
   scopes: ['project', 'global'],
   bind: 'project',
