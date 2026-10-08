@@ -204,3 +204,13 @@ test('reports the child’s V8 heap with each heartbeat (Installation → Servic
   expect(worker.heap!.usedBytes).toBeGreaterThan(0);
   expect(worker.heap!.usedBytes).toBeLessThan(worker.heap!.limitBytes);
 });
+
+test('tolerates a worker whose heartbeat carries no heap (a rolling restart from an older build)', async () => {
+  const worker = manager('', { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 500,
+    entrypoint: fileURLToPath(new URL('./fixtures/worker-process-legacy.mjs', import.meta.url)) });
+  await worker.start();
+  await new Promise((resolve) => setTimeout(resolve, 200)); // several heartbeats
+  expect(worker.isReady).toBe(true);
+  expect(worker.failure).toBeUndefined();
+  expect(worker.heap).toBeUndefined();
+});

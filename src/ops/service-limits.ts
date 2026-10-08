@@ -318,7 +318,7 @@ export interface ServiceLimitsDeps {
   fetch?: typeof fetch;
   now?: () => number;
   providerConnections?: { resolve(organizationId: string | undefined, provider: string): Promise<{ apiKey: string; config: { apiUrl?: string } }> };
-  githubApp?: { configured(): boolean; rateLimit(connection: GitConnection): Promise<{ limit: number; remaining: number; resetAt: number }> };
+  githubApp?: { configured(): boolean; rateLimit(connection: GitConnection, signal?: AbortSignal): Promise<{ limit: number; remaining: number; resetAt: number }> };
   /** The activity worker's V8 heap (its own process in process mode). */
   workerHeap?: () => WorkerHeap | undefined;
   /** A directory on the disk that holds tavya's data. */
@@ -331,7 +331,9 @@ export interface ServiceLimitsDeps {
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
+/** History: one point per hour for 7 days, at most 168 per meter. */
 const HISTORY_MS = 7 * DAY;
+const HEAP_FRESH_MS = 2 * 60_000;
 
 export class ServiceLimitsService {
   private running?: Promise<ServiceLimitsView>;
@@ -377,9 +379,11 @@ export class ServiceLimitsService {
     return this.running ??= this.sample().finally(() => { this.running = undefined; });
   }
 
-  private secret(handle: string | undefined): string | undefined {
+  private secret(handle: string | undefined, used?: Set<string>): string | undefined {
     if (!handle || !this.deps.broker?.hasHandle(handle)) return undefined;
-    return this.deps.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
+    const value = this.deps.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
+    used?.add(value);
+    return value;
   }
 
   private operatorOrganization(settings: ServiceLimitSettings): string {
@@ -392,37 +396,44 @@ export class ServiceLimitsService {
     return /^https:\/\/([0-9a-f]{32})\.(?:[a-z]+\.)?r2\.cloudflarestorage\.com/i.exec(this.env.KARMAX_S3_ENDPOINT ?? '')?.[1]?.toLowerCase();
   }
 
-  private probes(settings: ServiceLimitSettings, now: number): Record<string, () => Promise<ProbeResult>> {
+  /** Each probe gets a `fetch` (and `signal`) bound to its own deadline, so a
+   * provider that never answers is cancelled, not just abandoned. Every secret
+   * a probe resolves goes into `secrets`, to be redacted from its errors. */
+  private probes(settings: ServiceLimitSettings, now: number, secrets: Set<string>):
+    Record<string, (fetcher: typeof fetch, signal: AbortSignal) => Promise<ProbeResult>> {
     const { store } = this.deps;
-    const fetcher = this.deps.fetch ?? fetch;
+    const secret = (handle: string | undefined) => this.secret(handle, secrets);
     const day = isoDay(now);
     const month = `${day.slice(0, 7)}-01`;
     const organizationId = this.operatorOrganization(settings);
     const cloudflare = () => {
-      const token = this.secret(CLOUDFLARE_TOKEN_HANDLE);
+      const token = secret(CLOUDFLARE_TOKEN_HANDLE);
       const accountId = this.cloudflareAccount(settings);
       if (!token || !accountId) throw new NotConnected();
       return { token, accountId };
     };
     const connection = async (provider: string) => {
-      try { return await this.deps.providerConnections!.resolve(organizationId, provider); }
+      let resolved;
+      try { resolved = await this.deps.providerConnections!.resolve(organizationId, provider); }
       catch { throw new NotConnected(); }
+      secrets.add(resolved.apiKey);
+      return resolved;
     };
     return {
-      'cloudflare-workers': async () => cloudflareWorkersUsage({ fetch: fetcher, now, ...cloudflare() }),
-      'cloudflare-r2': async () => cloudflareR2Usage({ fetch: fetcher, now, ...cloudflare() }),
-      composio: async () => {
-        const apiKey = this.secret(COMPOSIO_KEY_HANDLE);
+      'cloudflare-workers': async (fetcher) => cloudflareWorkersUsage({ fetch: fetcher, now, ...cloudflare() }),
+      'cloudflare-r2': async (fetcher) => cloudflareR2Usage({ fetch: fetcher, now, ...cloudflare() }),
+      composio: async (fetcher) => {
+        const apiKey = secret(COMPOSIO_KEY_HANDLE);
         if (!apiKey) throw new NotConnected();
         return composioUsage({ fetch: fetcher, apiKey, toolCalls: await store.serviceUsageSince('composio.tool-calls', month) });
       },
-      e2b: async () => {
+      e2b: async (fetcher) => {
         if (!this.deps.providerConnections) throw new NotConnected();
         const { apiKey } = await connection('e2b');
         const seconds = await store.worldActiveSeconds(organizationId, 'e2b', Date.parse(`${month}T00:00:00Z`));
         return e2bUsage({ fetch: fetcher, apiKey, hours: seconds / 3600 });
       },
-      daytona: async () => {
+      daytona: async (fetcher) => {
         if (!this.deps.providerConnections) throw new NotConnected();
         const { apiKey, config } = await connection('daytona');
         return daytonaUsage({ fetch: fetcher, apiKey, apiUrl: config.apiUrl ?? this.env.DAYTONA_API_URL });
@@ -430,7 +441,7 @@ export class ServiceLimitsService {
       resend: async () => {
         let config: OutboundEmailConfig = {};
         try { config = JSON.parse((await store.kvGet('email:outbound')) ?? '{}'); } catch { /* not connected */ }
-        if (config.provider !== 'resend' || !this.secret(config.secretHandle)) throw new NotConnected();
+        if (config.provider !== 'resend' || !secret(config.secretHandle)) throw new NotConnected();
         const sentToday = await store.serviceUsageSince('email.sent:resend', day);
         const sentMonth = await store.serviceUsageSince('email.sent:resend', month);
         // Resend's own figure covers every sender on the account; ours only tavya.
@@ -442,10 +453,10 @@ export class ServiceLimitsService {
           ? { used: reported, source: 'api' } : { used: counted, source: 'count' };
         return { readings: { 'resend.day': pick(sentToday, daily), 'resend.month': pick(sentMonth, monthly) } };
       },
-      agentmail: async () => {
+      agentmail: async (fetcher) => {
         let config: MailboxConfig = {};
         try { config = JSON.parse((await store.kvGet(`agent-mail:provider:${organizationId}`)) ?? '{}'); } catch { /* not connected */ }
-        const apiKey = config.provider === 'agentmail' ? this.secret(`mailbox:agentmail:${organizationId}:auth`) : undefined;
+        const apiKey = config.provider === 'agentmail' ? secret(`mailbox:agentmail:${organizationId}:auth`) : undefined;
         if (!apiKey) throw new NotConnected();
         return agentMailUsage({ fetch: fetcher, apiKey, base: this.env.KARMAX_AGENTMAIL_BASE,
           received: await store.serviceUsageSince(`agentmail.received:${organizationId}`, month) });
@@ -456,25 +467,29 @@ export class ServiceLimitsService {
         const certificates = await store.serviceUsageSince('letsencrypt.certificates', isoDay(now - 7 * DAY));
         return { readings: { 'letsencrypt.certificates': { used: certificates } } };
       },
-      github: async () => {
+      github: async (_fetcher, signal) => {
         const app = this.deps.githubApp;
         if (!app?.configured()) throw new NotConnected();
         const connections = new Map<string, GitConnection>();
         for (const organization of await store.listOrganizations())
           for (const connection of await store.listGitConnections(organization.id))
             if (!connection.suspendedAt && !connections.has(connection.installationId)) connections.set(connection.installationId, connection);
-        return githubUsage({ connections: [...connections.values()].slice(0, 50), rateLimit: (c) => app.rateLimit(c) });
+        return githubUsage({ connections: [...connections.values()].slice(0, 50), rateLimit: (c) => app.rateLimit(c, signal) });
       },
       host: async () => {
         let disk: { used: number; total: number } | undefined;
         try {
-          const stats = fs.statfsSync(this.deps.dataDir ?? os.homedir());
+          const stats = await fs.promises.statfs(this.deps.dataDir ?? os.homedir());
           disk = { total: stats.blocks * stats.bsize, used: (stats.blocks - stats.bavail) * stats.bsize };
         } catch { /* reported as absent */ }
         let available: number | undefined;
-        try { available = Number(/^MemAvailable:\s+(\d+)/m.exec(fs.readFileSync('/proc/meminfo', 'utf8'))?.[1]) * 1024 || undefined; } catch { /* not Linux */ }
+        try { available = Number(/^MemAvailable:\s+(\d+)/m.exec(await fs.promises.readFile('/proc/meminfo', 'utf8'))?.[1]) * 1024 || undefined; } catch { /* not Linux */ }
+        // The heartbeat refreshes it every 10 s; an old one means the worker
+        // isn't answering (or predates the field), which is not a reading.
+        const heap = this.deps.workerHeap?.();
         return hostUsage({ disk, memory: { total: os.totalmem(), available: available ?? os.freemem() },
-          heap: this.deps.workerHeap?.(), database: await store.databaseConnections().catch(() => undefined) });
+          heap: heap && now - heap.at < HEAP_FRESH_MS ? heap : undefined,
+          database: await store.databaseConnections().catch(() => undefined) });
       },
     };
   }
@@ -483,13 +498,23 @@ export class ServiceLimitsService {
     const now = this.now();
     const settings = await this.settings();
     const state = await this.state();
-    const probes = this.probes(settings, now);
+    const secrets = new Set<string>();
+    const probes = this.probes(settings, now, secrets);
     const timeout = this.deps.probeTimeoutMs ?? 30_000;
+    const fetcher = this.deps.fetch ?? fetch;
+    // Probes run concurrently, each against its own deadline: at the deadline
+    // its requests are aborted and the run goes on without it.
     const results = await Promise.all(SERVICE_CATALOG.map(async (spec) => {
+      const deadline = new AbortController();
       let timer: NodeJS.Timeout | undefined;
+      const bounded: typeof fetch = (input, init) => fetcher(input, { ...init,
+        signal: init?.signal ? AbortSignal.any([init.signal, deadline.signal]) : deadline.signal });
       try {
-        const result = await Promise.race([probes[spec.id]!(), new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error('no answer within 30 seconds')), timeout);
+        const result = await Promise.race([probes[spec.id]!(bounded, deadline.signal), new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`no answer within ${Math.ceil(timeout / 1000)} s`));
+            deadline.abort();
+          }, timeout);
         })]);
         return { spec, result };
       } catch (error) {
@@ -505,7 +530,7 @@ export class ServiceLimitsService {
       }
       if (error || !result) {
         state.services[spec.id] = { ...previous, status: 'failed', checkedAt: now,
-          error: probeError(error), failures: (previous?.status === 'failed' ? previous.failures ?? 1 : 0) + 1 };
+          error: probeError(error, secrets), failures: (previous?.status === 'failed' ? previous.failures ?? 1 : 0) + 1 };
         continue;
       }
       state.services[spec.id] = { status: 'ok', checkedAt: now, ...(result.plan ? { plan: result.plan } : {}) };
@@ -525,10 +550,14 @@ export class ServiceLimitsService {
     state.checkedAt = now;
     const view = this.render(settings, state);
     const evaluated = evaluateAlerts(state.alerts, alertInputs(view, state), now);
-    state.alerts = evaluated.memory;
+    // Readings first; the announcements are recorded only once notify has
+    // delivered them, so a failed delivery is announced again next run
+    // (at least once) and a restart never forgets what was already sent.
     (await this.deps.store.kvSet(SERVICE_LIMIT_STATE_KEY, JSON.stringify(state)));
     (await this.deps.store.pruneServiceUsage(isoDay(now - 62 * DAY)));
     if (this.deps.notify) await this.deps.notify(evaluated.alerts);
+    state.alerts = evaluated.memory;
+    (await this.deps.store.kvSet(SERVICE_LIMIT_STATE_KEY, JSON.stringify(state)));
     return view;
   }
 
@@ -593,8 +622,13 @@ function alertInputs(view: ServiceLimitsView, state: ServiceLimitState): AlertIn
   });
 }
 
-/** Provider errors can echo request details; keep a short, secret-free reason. */
-function probeError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/\b(?:Bearer\s+)?[A-Za-z0-9_-]{32,}\b/g, '…').slice(0, 200) || 'no answer';
+/** Provider errors can echo the request: every credential the run resolved is
+ * cut out verbatim (as world-provider `test()` does), then anything that looks
+ * like a token, and the reason is kept short. */
+export function probeError(error: unknown, secrets: Iterable<string> = []): string {
+  let message = error instanceof Error ? error.message : String(error);
+  for (const secret of [...secrets].filter((value) => value.length >= 4).sort((a, b) => b.length - a.length))
+    message = message.split(secret).join('[redacted]');
+  message = message.replace(/\b(?:Bearer\s+)?[A-Za-z0-9_-]{32,}\b/g, '[redacted]');
+  return message.slice(0, 200) || 'no answer';
 }

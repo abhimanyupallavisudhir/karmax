@@ -15,7 +15,7 @@ import {
 import { installationOperators, serviceLimitEmail, serviceLimitNotifier } from '../src/ops/service-limit-notices.js';
 import {
   CLOUDFLARE_TOKEN_HANDLE, evaluateAlerts, mergeServiceLimitSettings, SERVICE_LIMIT_SETTINGS_KEY, SERVICE_LIMIT_STATE_KEY,
-  ServiceLimitsInputError, ServiceLimitsService, type AlertInput, type ServiceLimitAlert,
+  probeError, ServiceLimitsInputError, ServiceLimitsService, type AlertInput, type ServiceLimitAlert,
 } from '../src/ops/service-limits.js';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
@@ -101,6 +101,16 @@ describe('alerts at 80% and 95%', () => {
     const both = serviceLimitEmail([alert({}), alert({ level: 'failed', serviceName: 'E2B', error: 'E2B answered 502' })], 'tavya');
     expect(both.subject).toBe('tavya: 2 service limits need attention');
     expect(both.text).toContain("Can't read E2B usage: E2B answered 502.");
+  });
+});
+
+describe('probe errors', () => {
+  it('cut every resolved credential and anything token-shaped, and stay short', () => {
+    expect(probeError(new Error('401 for key abc123secret and abc123secret-longer'), ['abc123secret', 'abc123secret-longer']))
+      .toBe('401 for key [redacted] and [redacted]');
+    expect(probeError(new Error(`Bearer ${'x'.repeat(40)} refused`))).toBe('[redacted] refused');
+    expect(probeError(new Error('no answer '.repeat(50)), []).length).toBe(200);
+    expect(probeError('')).toBe('no answer');
   });
 });
 
@@ -242,7 +252,8 @@ afterEach(async () => {
 afterAll(async () => { await admin?.end(); });
 
 for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe(`service limits on ${backend}`, () => {
-  async function fixture(options: { fetch?: typeof fetch } = {}) {
+  async function fixture(options: { fetch?: typeof fetch; probeTimeoutMs?: number; heapAge?: number;
+    notify?: (alerts: ServiceLimitAlert[]) => Promise<void> } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-service-limits-')); dirs.push(dir);
     if (backend === 'postgres') await admin!.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
     const store = await Store.create(backend === 'postgres' ? postgresUrl! : ':memory:');
@@ -250,11 +261,13 @@ for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     let now = NOW;
     const notices: ServiceLimitAlert[][] = [];
-    const service = new ServiceLimitsService({ store, broker, now: () => now, dataDir: dir, env: {},
-      fetch: options.fetch ?? stubFetch(() => reply({}, 500)).fetch,
-      workerHeap: () => ({ usedBytes: 100e6, limitBytes: 2e9, at: now }),
-      notify: async (alerts) => { notices.push(alerts); } });
-    return { store, broker, service, notices, dir, setNow: (value: number) => { now = value; } };
+    /** A new instance on the same database and vault: what a restart sees. */
+    const make = () => new ServiceLimitsService({ store, broker, now: () => now, dataDir: dir, env: {},
+      fetch: options.fetch ?? stubFetch(() => reply({}, 500)).fetch, probeTimeoutMs: options.probeTimeoutMs,
+      workerHeap: () => ({ usedBytes: 100e6, limitBytes: 2e9, at: now - (options.heapAge ?? 0) }),
+      notify: options.notify ?? (async (alerts) => { notices.push(alerts); }) });
+    const service = make();
+    return { store, broker, service, notices, dir, make, setNow: (value: number) => { now = value; } };
   }
 
   it('samples the connected accounts, keeps a history and announces each level once', async () => {
@@ -365,6 +378,80 @@ for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe
     setNow(NOW + 2_700_000);
     await service.run();
     expect(notices.at(-1)!.filter((a) => a.level === 'failed')).toEqual([]);
+  });
+
+  /** A Cloudflare stub answering `requests` for Workers and nothing for R2. */
+  const cloudflareAt = (requests: () => number) => stubFetch(() => reply({ data: { viewer: { accounts: [{
+    workersInvocationsAdaptive: [{ sum: { requests: requests() } }], operations: [], storage: [] }] } } }));
+
+  it('a provider that never answers is cancelled at its deadline; the others are read', async () => {
+    const aborted: string[] = [];
+    const stub = stubFetch((url, init) => url.hostname === 'api.e2b.app'
+      ? new Promise<Response>((_, reject) => init!.signal!.addEventListener('abort', () => { aborted.push(url.hostname); reject(new Error('aborted')); }))
+      : reply({ data: { viewer: { accounts: [{ workersInvocationsAdaptive: [{ sum: { requests: 5 } }], operations: [], storage: [] }] } } }));
+    const { service, store, broker, dir } = await fixture({ fetch: stub.fetch, probeTimeoutMs: 200 });
+    await service.configure({ cloudflare: { accountId: ACCOUNT, apiToken: 'cf' } });
+    const hung = new ServiceLimitsService({ store, broker, dataDir: dir, env: {}, now: () => NOW, fetch: stub.fetch, probeTimeoutMs: 200,
+      providerConnections: { resolve: async () => ({ apiKey: 'e2b_key', config: {} }) } });
+    const started = Date.now();
+    const view = await hung.run();
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(view.services.find((s) => s.id === 'e2b')).toMatchObject({ status: 'failed', error: 'no answer within 1 s' });
+    expect(view.services.find((s) => s.id === 'cloudflare-workers')).toMatchObject({ status: 'ok' });
+    expect(aborted).toEqual(['api.e2b.app']);
+  });
+
+  it('never stores, returns or announces a credential, even when a provider echoes it', async () => {
+    const echo = stubFetch((url, init) => {
+      const token = new Headers(init?.headers).get('authorization') ?? new Headers(init?.headers).get('x-api-key');
+      return reply({ data: null, errors: [{ message: `token ${token} is not valid for ${url.hostname}` }] });
+    });
+    const { service, store, notices, setNow } = await fixture({ fetch: echo.fetch });
+    await service.configure({ cloudflare: { accountId: ACCOUNT, apiToken: 'cf-short-secret' } });
+    await service.run();
+    setNow(NOW + 900_000);
+    const view = await service.run();
+    expect(view.services.find((s) => s.id === 'cloudflare-workers')!.error)
+      .toBe('Cloudflare: token Bearer [redacted] is not valid for api.cloudflare.com');
+    const everything = JSON.stringify(view) + JSON.stringify(notices) + (await store.kvGet(SERVICE_LIMIT_STATE_KEY));
+    expect(everything).not.toContain('cf-short-secret');
+    expect(notices.at(-1)!.some((alert) => alert.level === 'failed')).toBe(true);
+  });
+
+  it('remembers what it announced across a restart, and announces again if delivery failed', async () => {
+    let failDelivery = true;
+    const delivered: ServiceLimitAlert[][] = [];
+    const { service, make, setNow } = await fixture({ fetch: cloudflareAt(() => 90_000).fetch,
+      notify: async (alerts) => { if (failDelivery) throw new Error('inbox unavailable'); delivered.push(alerts); } });
+    await service.configure({ cloudflare: { accountId: ACCOUNT, apiToken: 'cf' } });
+    await expect(service.run()).rejects.toThrow('inbox unavailable');
+    failDelivery = false;
+    setNow(NOW + 900_000);
+    await make().run(); // a restarted process
+    expect(delivered.at(-1)!.map((a) => [a.key, a.fresh])).toEqual([['cloudflare-workers.requests', true]]);
+    setNow(NOW + 1_800_000);
+    await make().run();
+    expect(delivered.at(-1)!.map((a) => [a.key, a.fresh])).toEqual([['cloudflare-workers.requests', false]]);
+  });
+
+  it('keeps at most 7 days of hourly history', async () => {
+    let requests = 0;
+    const { service, store, setNow } = await fixture({ fetch: cloudflareAt(() => ++requests).fetch });
+    await service.configure({ cloudflare: { accountId: ACCOUNT, apiToken: 'cf' } });
+    let view;
+    for (let at = NOW; at < NOW + 10 * DAY; at += 2 * 3600_000) { setNow(at); view = await service.run(); }
+    for (const meter of view!.services.flatMap((s) => s.meters)) {
+      expect(meter.history.length).toBeLessThanOrEqual(7 * 24);
+      expect(meter.history.every(([at]) => at > NOW + 10 * DAY - 2 * 3600_000 - 7 * DAY)).toBe(true);
+    }
+    expect(view!.services.find((s) => s.id === 'cloudflare-workers')!.meters[0]!.history).toHaveLength(84);
+    expect((await store.kvGet(SERVICE_LIMIT_STATE_KEY))!.length).toBeLessThan(64_000);
+  });
+
+  it('shows no worker heap when the worker has not reported recently', async () => {
+    const { service } = await fixture({ heapAge: 5 * 60_000 });
+    const host = (await service.run()).services.find((s) => s.id === 'host')!;
+    expect(host.meters.map((m) => m.id)).not.toContain('host.heap');
   });
 
   it('notifies installation operators: an inbox item each, withdrawn when clear, and an email once', async () => {

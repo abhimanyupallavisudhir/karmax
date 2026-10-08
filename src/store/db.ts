@@ -7344,11 +7344,12 @@ export class Store {
     });
   }
 
-  /** Seconds of `world.active` metered for one organization and provider since `since`. */
+  /** Seconds of `world.active` metered for one organization and provider that
+   * started since `since` (by start time, so idx_usage_org_time serves it). */
   async worldActiveSeconds(organizationId: string, provider: string, since: number): Promise<number> {
     const row = (await this.db.prepare(`SELECT SUM(quantity) AS seconds FROM usage_events
-      WHERE organizationId=? AND provider=? AND kind='world.active' AND endedAt>=?`)
-      .get(organizationId, provider, since)) as { seconds: number | null } | undefined;
+      WHERE organizationId=? AND startedAt>=? AND provider=? AND kind='world.active'`)
+      .get(organizationId, since, provider)) as { seconds: number | null } | undefined;
     return Number(row?.seconds ?? 0);
   }
 
