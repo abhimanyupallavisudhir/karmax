@@ -229,6 +229,8 @@ export function hostUsage(input: {
   };
   if (input.disk) readings['host.disk'] = { used: input.disk.used, limit: input.disk.total };
   if (input.heap) readings['host.heap'] = { used: input.heap.usedBytes, limit: input.heap.limitBytes };
+  // The workflow thread is its own V8 heap with its own limit (RT-35).
+  if (input.heap?.workflows) readings['host.workflow-heap'] = { used: input.heap.workflows.usedBytes, limit: input.heap.workflows.limitBytes };
   if (input.database) readings['host.database'] = { used: input.database.used, limit: input.database.max };
   return { readings };
 }

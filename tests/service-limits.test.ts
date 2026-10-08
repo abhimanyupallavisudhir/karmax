@@ -236,6 +236,9 @@ describe('probes against provider responses', () => {
       heap: { usedBytes: 1.2e9, limitBytes: 2e9, at: NOW }, database: { used: 18, max: 100 } }).readings).toEqual({
       'host.disk': { used: 85e9, limit: 193e9 }, 'host.memory': { used: 5e9, limit: 8e9 },
       'host.heap': { used: 1.2e9, limit: 2e9 }, 'host.database': { used: 18, limit: 100 } });
+    // The workflow thread's heap, where open tasks live, is its own meter (RT-35).
+    expect(hostUsage({ memory: { total: 8e9, available: 3e9 }, heap: { usedBytes: 1, limitBytes: 2, at: NOW,
+      workflows: { usedBytes: 0.9e9, limitBytes: 1.2e9 } } }).readings['host.workflow-heap']).toEqual({ used: 0.9e9, limit: 1.2e9 });
   });
 });
 
