@@ -352,8 +352,8 @@ function organizationById(id) { return (S.organizations || []).find((o) => o.id 
 // grant is idempotent, so there is no cost to keeping the affordance visible.
 function githubAuthorizeButton(githubApp, id) {
   if (!githubApp?.oauthConfigured) return '';
-  const label = githubApp.userAuthorized ? 'Reconnect my GitHub identity' : 'Connect my GitHub identity';
-  return `<button class="btn sm" id="${id}">${label}</button>`;
+  const [label, tip] = githubApp.userAuthorized ? ['Reconnect', 'Reconnect your GitHub account'] : ['Connect', 'Connect your GitHub account'];
+  return `<button class="btn sm" id="${id}" title="${tip}">${label}</button>`;
 }
 function organizationBySlug(slug) {
   const s = slugify(slug);
@@ -384,6 +384,7 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
  *  the rail highlights the project, the main pane shows its tab bar). One list
  *  so they never drift apart again. */
 const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
+const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', wiki: 'nav.wiki', settings: 'nav.settings' };
 // The query a task list opens with: what needs the signed-in person.
 const DEFAULT_LIST_QUERY = 'for:me';
 // Second-segment words that name an organization-level view rather than a project.
@@ -3543,6 +3544,7 @@ function installShellListeners() {
   if (installShellListeners.installed) return;
   installShellListeners.installed = true;
   bindKeys();
+  document.addEventListener('click', echoClickedShortcut, true);
   installLinkRouter();
   installTagRouter();
   installInfoDotTips();
@@ -4539,25 +4541,26 @@ function renderShell() {
   app.innerHTML = `
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">☰</button>
-      <a class="brand" id="brand-home" data-spa href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
+      <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <a class="topbar-user" id="topbar-user" data-spa href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
-      <a class="icon-btn has-badge" id="bell" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
+      <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
+      <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
+      <a class="icon-btn has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
     <div class="body">
       <div class="rail" id="rail">
         <div class="rail-top">
           ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
-          <nav class="rail-icons rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon]) =>
-            `<a class="rail-icon" id="${id}" data-spa href="#" aria-label="${label}">${ICON[icon]}</a>`).join('')}</nav>
+          <nav class="rail-icons rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
+            `<a class="rail-icon" id="${id}" data-spa data-shortcut="${command}" href="#" aria-label="${label}">${ICON[icon]}</a>`).join('')}</nav>
         </div>
         <div class="rail-list" id="rail-list"></div>
         <div class="rail-icons rail-foot">
           <a class="rail-icon" id="rail-docs" href="/docs" target="_blank" rel="noopener" aria-label="Docs" title="Docs">${ICON.docs}</a>
-          <button class="rail-icon" id="rail-palette" type="button" aria-label="Command palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">${ICON.palette}</button>
-          <button class="rail-icon" id="rail-help" type="button" aria-label="Keyboard shortcuts" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">${ICON.keyboard}</button>
+          <button class="rail-icon" id="rail-palette" type="button" data-shortcut="nav.commandPalette" aria-label="Command palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">${ICON.palette}</button>
+          <button class="rail-icon" id="rail-help" type="button" data-shortcut="help.keyboard" aria-label="Keyboard shortcuts" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">${ICON.keyboard}</button>
         </div>
       </div>
       <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
@@ -4566,6 +4569,7 @@ function renderShell() {
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   $('#rail-palette').addEventListener('click', openPalette);
   $('#rail-help').addEventListener('click', openHelp);
+  $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
   const closeMobileNav = () => {
     $('#rail')?.classList.remove('mobile-open');
@@ -4903,10 +4907,10 @@ function renderRail() {
     rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
     $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
   } else rail.innerHTML = `
-    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
+    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" data-shortcut="nav.projects rail.newProject" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
     <label class="rail-search-box">
       <svg class="rail-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
-    <input id="project-search" class="rail-search" type="search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
+    <input id="project-search" class="rail-search" type="search" data-shortcut="nav.projects rail.search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
     </label>
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>`;
@@ -5163,7 +5167,7 @@ function renderMain() {
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
-        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
+        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}"${PROJECT_TAB_COMMANDS[t] ? ` data-shortcut="${PROJECT_TAB_COMMANDS[t]}"` : ''}>${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
         .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
     : '';
 
@@ -5438,12 +5442,12 @@ function tasksView() {
     <div class="composer">
       <div class="quick-task-field">
         ${home ? projectPickerHtml('new-task-project', newTaskProjectId()) : ''}
-        <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
+        <input class="title-in" id="new-task" data-shortcut="nav.newTask" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
         <label class="btn soft icon-only attach-composer quick-task-attach" tabindex="0" title="Attach files (25 MB each)" aria-label="Attach files">${ICON.attach}<input id="new-task-files" type="file" multiple hidden></label>
       </div>
       <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.save}</button>
-      <button class="btn icon-only" id="expand-task" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
-      <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
+      <button class="btn icon-only" id="expand-task" data-shortcut="nav.newTaskForm" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
+      <button class="btn primary icon-only" id="add-task" data-shortcut="list.quickAdd" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
     <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>`;
   const trailing = everywhere ? '' : home ? projectFilterHtml()
@@ -5452,7 +5456,7 @@ function tasksView() {
     <div class="organizer">
       <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
-        <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
+        <input id="task-search" class="task-search" data-shortcut="nav.search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
         ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
         ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : ''}
@@ -5774,8 +5778,8 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
-    ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
-    : `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
+    ? `<button class="icon-btn" data-unarchive="${t.id}" data-shortcut="list.archive" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
+    : `<button class="icon-btn" data-archive="${t.id}" data-shortcut="list.archive" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
   return `
     <div class="task-row ${archived ? 'archived' : ''}${taskHasUnreadAsk(t.id) ? ' unread' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
@@ -6655,7 +6659,7 @@ function triggersSection(values, selfId) {
         </div>
         <span class="tb-label">Schedule ${policyTip('Cron, in UTC. Each field: * = every, */5 = every 5, 1-5 = range, 1,3 = list.')}</span>
         <div class="cron-grid">${gridCells}</div>
-        <label class="tb-label" for="trig-at">Once at</label>
+        <label class="tb-label" for="trig-at">Or once at</label>
         <input id="trig-at" type="datetime-local" value="${atVal}">
         <label class="tb-repeat"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
           Repeatable ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</label>
@@ -6965,7 +6969,7 @@ function taskFormTitle(draft) {
 function taskFormLoadingPage(project, draft) {
   return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
     <div class="tf-head"><div class="tf-head-inner">
-      <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
+      <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
       <h2>${taskFormTitle(draft)}</h2>
       ${project ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', project.id, false)}` : ''}
     </div></div>
@@ -7077,7 +7081,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     <div class="task-form-page" id="tf-page" tabindex="-1">
       <div class="tf-head">
         <div class="tf-head-inner">
-          <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
+          <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
           <h2>${taskFormTitle(draft)}</h2>
           ${proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
@@ -7772,7 +7776,7 @@ function renderTaskLoadingPage(rec, error) {
   const title = rec?.title || 'Task';
   main.innerHTML = `<div class="task-page" aria-busy="${error ? 'false' : 'true'}">
     <div class="tp-head"><div class="row1">
-      <button class="icon-btn" id="tp-back" title="Back (Esc)">←</button>
+      <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
       ${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
       <h2>${esc(title)}</h2>
     </div></div>
@@ -7802,7 +7806,7 @@ async function renderSeriesPage(rec) {
     <div class="task-page">
       <div class="tp-head">
         <div class="row1">
-          <button class="icon-btn" id="tp-back" title="Back (Esc)">←</button>
+          <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
           ${rec.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
           <h2>${esc(rec.title)}</h2>
           <span class="chip">repeatable</span>
@@ -7906,7 +7910,7 @@ function attemptCard(a, g, v, { tab = '', form = false } = {}) {
 
 function addAttemptButton(cls = '') {
   const g = S.attemptGroup;
-  return `<button type="button" class="btn tool attempt-add ${cls}" id="add-attempt" ${g?.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g?.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>`;
+  return `<button type="button" class="btn tool attempt-add ${cls}" id="add-attempt" data-shortcut="task.attempt.new" ${g?.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g?.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>`;
 }
 
 // Follow the rendered links so keyboard navigation uses the same pinned routes
@@ -8751,7 +8755,7 @@ function renderTaskPage() {
       <div class="tp-head">
         ${parentTaskContext(v)}
         <div class="row1">
-          <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
+          <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
           ${stageIndicator(v, v.taskId)}
@@ -10143,7 +10147,7 @@ function conversationPane(v, t) {
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         </div>
         ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
-        <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
+        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}>Send</button>
       </div></div>`
     : '';
   return `
@@ -13238,36 +13242,36 @@ async function renderAccountStatus(organizationId = S.organizationId || 'org_per
   const pollable = new Set(u.pollable || []);
   if (!accounts.length) { box.innerHTML = ''; return; }
   box.innerHTML = `
-    <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
-      <span>Availability &amp; quota</span>
-      ${pollable.size ? `<button class="btn sm usage-recheck-all" title="Check usage with each provider now">↻ Re-check</button>` : ''}
+    <div class="section-h section-h-action">
+      <span>Availability</span>
+      ${pollable.size ? `<button class="btn sm ghost usage-recheck-all" title="Check usage with each provider now">↻ Re-check all</button>` : ''}
     </div>
     ${accounts.map((a) => {
       const status = a.status || 'available';
-      const badge = status === 'available'
-        ? '🟢 available'
+      const [tone, badge] = status === 'available'
+        ? ['ok', 'available']
         : status === 'manual-off'
-          ? '⏸ off (manual)'
+          ? ['off', 'off (manual)']
           : status === 'needs-attention'
-            ? '🔴 needs attention (funding or re-authentication)'
-            : `🟠 ${esc(a.window || 'quota exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`;
-      const weekly = a.weeklyResetAt ? `<span style="color:var(--ink-3)"> · weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
+            ? ['bad', 'needs attention (funding or re-authentication)']
+            : ['warn', `${esc(a.window || 'quota exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`];
+      const weekly = a.weeklyResetAt ? `<span class="setting-muted">weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
       return `<div class="account-status">
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <div class="account-status-head">
           <b class="mono">${esc(a.id)}</b>
-          <span>${badge}</span>${weekly}
-          <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent >= 1000000 ? '∞' : a.maxConcurrent}</span>
+          <span class="status-dot ${tone}" aria-hidden="true"></span><span>${badge}</span>${weekly}
+          <span class="setting-muted" title="Agent turns running on this account now">${a.inUse}/${a.maxConcurrent >= 1000000 ? '∞' : a.maxConcurrent} in use</span>
+          <span class="account-status-actions">
+          <label class="account-conc" title="How many agent turns may run on this account at once; empty means unlimited">Max <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" aria-label="Max concurrent turns" /></label>
+          ${pollable.has(a.id) ? `<button class="icon-btn usage-recheck" data-id="${esc(a.id)}" title="Re-check usage" aria-label="Re-check usage">↻</button>` : ''}
+          <button class="btn sm ghost acct-reset" data-id="${esc(a.id)}" title="Set when this account’s quota resets">Reset time…</button>
+          ${status === 'available'
+            ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off" title="Stop using this account until you turn it back on">Pause</button>`
+            : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available</button>`}
+          </span>
         </div>
         ${usageBlock(a.id, usage[a.id], pollable.has(a.id))}
         ${accountIncidentHtml(a)}
-        <div class="task-sub" style="gap:6px;margin-top:6px;align-items:center">
-          ${status === 'available'
-            ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off">Mark unavailable</button>`
-            : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available now</button>`}
-          <button class="btn sm acct-reset" data-id="${esc(a.id)}">Set reset time…</button>
-          ${pollable.has(a.id) ? `<button class="btn sm usage-recheck" data-id="${esc(a.id)}">↻ Re-check usage</button>` : ''}
-          <label style="display:inline-flex;align-items:center;gap:4px;color:var(--ink-3);font-size:12px">max concurrent <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" title="How many agent turns may run on this login at once; leave empty = unlimited" style="width:52px;padding:2px 6px" /></label>
-        </div>
       </div>`;
     }).join('')}`;
   const recheck = async (btn, body) => {
@@ -15210,27 +15214,27 @@ function settingsView(proj) {
     <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-agents">Agents</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
-      <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
-      <button type="button" data-project-jump="project-secrets"><b>Secret</b><span>A sensitive value</span></button>
-      <button type="button" data-project-jump="project-data"><b>Data</b><span>Files ${siteNameMarkup()} versions</span></button>
-      <button type="button" data-project-jump="project-services"><b>Service</b><span>A live system tasks call</span></button>
-      <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools tasks run with</span></button>
+      <button type="button" data-project-jump="project-git"><b>Git &amp; GitHub</b><span>Repositories</span></button>
+      <button type="button" data-project-jump="project-secrets"><b>Secrets</b><span>Keys and tokens</span></button>
+      <button type="button" data-project-jump="project-data"><b>Data</b><span>Versioned files</span></button>
+      <button type="button" data-project-jump="project-services"><b>Services</b><span>Live systems</span></button>
+      <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools and setup</span></button>
       <button type="button" data-project-jump="project-computers"><b>Computers</b><span>Where tasks run</span></button>
     </div>
     <div class="project-config-section" id="project-git"><div class="project-config-number">01</div><div><h2>Git &amp; GitHub</h2></div></div>
-    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${profileRoute()}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
+    <div class="card"><div id="project-repositories">Loading…</div></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data ${policyTip(`Choose Data when ${siteName()} should capture and version the files; Storage only decides where the encrypted revisions live. A live S3 bucket, database or API that tasks call directly belongs under Services, with its access key under Secrets.`)}</h2><p>Files ${siteNameMarkup()} snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
+    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data ${policyTip(`Files ${siteName()} snapshots and versions: datasets, model weights, fixtures, development databases. Choose Data when ${siteName()} should capture and version the files; Storage only decides where the encrypted revisions live. A live S3 bucket, database or API that tasks call directly belongs under Services, with its access key under Secrets.`)}</h2></div></div>
     <div class="card"><div id="project-data-box">Loading…</div></div>
-    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services ${policyTip('Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
+    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services ${policyTip('Live systems tasks connect to. Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
-    <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
+    <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment ${policyTip('The base image, tools, setup and boot commands every task starts with.')}</h2></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
     <div class="project-config-section" id="project-computers"><div class="project-config-number">06</div><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
     <div class="card"><div id="project-computers-box">Loading…</div></div>
     <div class="settings-section-title" id="project-agents"><div>Agents</div></div>
-    <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Organization agent accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
+    <div class="card"><div class="section-h section-h-action"><span>Account order ${policyTip('Tasks in this project use the first available account. Drag to reorder; switch one off to skip it here.')}</span><a class="btn sm ghost organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage accounts</a></div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
     <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
@@ -15239,13 +15243,20 @@ function settingsView(proj) {
     <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
-      <div class="section-h">Workflow versions</div>
-      <div id="wf-pins-list">Loading…</div></div>
+      <div class="section-h">Versions ${policyTip('New tasks start on the version chosen here; running tasks keep the version they started on. Latest follows platform releases.')}</div>
+      <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
-    <div class="card" data-settings-advanced hidden>
-      <div class="section-h" data-settings-access="project" hidden>Project name</div>
-      <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm" id="move-project" data-settings-access="projectTransfer" hidden>Move to organization…</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
-    </div>
+    <div class="card" data-settings-advanced hidden><div class="setting-rows">
+      <div class="setting-row" data-settings-access="project" hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
+        <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-project">Save</button></span></div>
+      <div class="setting-row" data-settings-access="projectTransfer" hidden><span class="setting-label">Organization</span>
+        <span class="setting-value">${esc(organizationById(proj.organizationId)?.name || '')}</span>
+        <span class="setting-actions"><button class="btn sm" id="move-project">Move…</button></span></div>
+      <div class="setting-row danger" data-settings-access="projectDelete" hidden><span class="setting-label">Delete project</span>
+        <span class="setting-value setting-muted">Removes the project and all its tasks</span>
+        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>
+    </div></div>
     <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
     <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;
@@ -15264,22 +15275,24 @@ async function hydrateConversationSharing(scope, id) {
   const url = `/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/conversation-sharing`;
   try {
     const policy = await api(url);
-    box.innerHTML = `<div class="section-h">Public conversation links</div><p class="task-sub">Allow developers to create public snapshots of agent conversations. Anyone with a link can read its message text. Disabling sharing makes existing links unavailable until re-enabled.</p>
-      <label class="form-row"><span>${scope === 'organization' ? 'Organization policy' : `Project policy · organization ${policy.organization ? 'allows' : 'disallows'} sharing`}</span><select ${policy.canManage ? '' : 'disabled'}>
-        ${scope === 'organization' ? `<option value="disabled" ${!policy.enabled ? 'selected' : ''}>Disabled</option><option value="enabled" ${policy.enabled ? 'selected' : ''}>Allow developers to share</option>` : `<option value="inherit" ${policy.value === 'inherit' ? 'selected' : ''}>Use organization policy</option><option value="disabled" ${policy.value === 'disabled' ? 'selected' : ''}>Disable for this project</option>`}
-      </select></label><button class="btn sm" data-save ${policy.canManage ? '' : 'disabled'}>Save</button>`;
+    const options = scope === 'organization'
+      ? [['disabled', 'Off'], ['enabled', 'Allowed']]
+      : [['inherit', `Organization default (${policy.organization ? 'allowed' : 'off'})`], ['disabled', 'Off for this project']];
+    const current = scope === 'organization' ? (policy.enabled ? 'enabled' : 'disabled') : policy.value;
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Public links ${policyTip('Lets developers publish a read-only snapshot of an agent conversation; anyone with the link can read it. Turning this off hides existing links until it is back on.')}</span>
+      <span class="setting-value"><select aria-label="Public conversation links" ${policy.canManage ? '' : 'disabled'}>${options.map(([value, label]) =>
+        `<option value="${value}" ${current === value ? 'selected' : ''}>${esc(label)}</option>`).join('')}</select></span></div>`;
     const select = box.querySelector('select');
     let saved = select.value;
-    box.querySelector('[data-save]').onclick = async (event) => {
-      const button = event.currentTarget;
-      button.disabled = select.disabled = true;
+    select.onchange = async () => {
+      select.disabled = true;
       try {
         const value = select.value;
         await api(url, { method: 'PUT', body: JSON.stringify(scope === 'organization' ? { enabled: value === 'enabled' } : { value }) });
         saved = value;
         toast('Public sharing policy saved');
       } catch (error) { select.value = saved; toast(error.message, true); }
-      finally { button.disabled = select.disabled = false; }
+      finally { select.disabled = false; }
     };
   } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
 }
@@ -15293,8 +15306,11 @@ async function hydrateAvatarAvailability(scope, id) {
   try {
     const policy = await api(url);
     const enabled = scope === 'organization' ? policy.enabled : policy.effective;
-    box.innerHTML = `<div class="section-h">Avatars</div><p class="task-sub">Trusted agents with delegated authority. Disabled by default. ${scope === 'organization' ? 'Projects can override this default in either direction.' : `Organization default: ${policy.organization ? 'enabled' : 'disabled'}. This project ${policy.project === 'inherit' ? 'inherits the default' : 'overrides the default'}.`} Existing Avatars and their history are retained when disabled.</p>
-      <div class="inline-form"><button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatars</button>${scope === 'project' ? `<button type="button" class="btn sm avatar-availability-inherit" ${policy.project === 'inherit' ? 'disabled' : ''}>Use organization default</button>` : ''}</div>`;
+    const state = scope === 'organization' ? (enabled ? 'On' : 'Off')
+      : `${enabled ? 'On' : 'Off'} · ${policy.project === 'inherit' ? 'organization default' : 'set for this project'}`;
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Avatars ${policyTip(`Trusted agents with delegated authority. Disabled by default. ${scope === 'organization' ? 'Projects can override this.' : ''} Turning them off keeps existing Avatars and their history.`)}</span>
+      <span class="setting-value setting-muted">${state}</span>
+      <span class="setting-actions">${scope === 'project' && policy.project !== 'inherit' ? '<button type="button" class="btn sm ghost avatar-availability-inherit">Use organization default</button>' : ''}<button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatars</button></span></div>`;
     const save = async (button, body) => {
       button.disabled = true;
       try {
@@ -15368,7 +15384,6 @@ async function hydrateProjectData(proj) {
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
     if (!renderIsCurrent()) return;
     box.innerHTML = `      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
-      ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="data-name" placeholder="Training data"></label>
@@ -15383,7 +15398,8 @@ async function hydrateProjectData(proj) {
           <label class="form-row wide"><span>Upload files <small>(optional)</small></span><input id="data-files" type="file" multiple></label>
           <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-folder" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
-      </details>`;
+      </details>
+      ${hostLocal() ? '<button class="action-row" type="button" id="data-discover"><b>Discover from repo</b><span>Finds ignored data files</span></button><div id="data-proposals"></div>' : ''}`;
     box.querySelectorAll('[data-data-resource]').forEach((row) => {
       const resource = resources.find((item) => item.id === row.dataset.dataResource);
       row.querySelector('.resource-toggle').addEventListener('click', async () => {
@@ -15448,8 +15464,7 @@ async function hydrateProjectServices(proj) {
     const data = resources.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver) && resource.target.kind === 'path');
     if (!renderIsCurrent()) return;
     box.innerHTML = `      ${services.map((service) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(service.name)}</b><div class="project-resource-meta"><span class="chip">${service.kind === 'per-world' ? 'private per task' : 'shared external'}</span>${service.image ? `<span class="project-resource-location"><span>Image</span><code>${esc(service.image)}</code></span>` : ''}${service.urlEnv ? `<span class="project-resource-location"><span>Connection variable</span><code>${esc(service.urlEnv)}</code></span>` : ''}</div></div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')}
-      <div class="inline-form"><button class="btn sm" id="service-discover">Discover from Compose/devcontainer</button></div><div id="service-proposals"></div>
-      <details class="settings-disclosure compact"><summary><b>Add a service manually</b></summary>
+      <details class="settings-disclosure compact" id="service-add-panel"><summary><b>Add a service</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="service-name" placeholder="Postgres development database"></label>
           <label class="form-row"><span>How tasks reach it</span><select id="service-kind"><option value="per-world">Start a private container for every task</option><option value="external">Connect to an existing external service</option></select></label>
@@ -15466,7 +15481,8 @@ async function hydrateProjectServices(proj) {
           <label class="form-row wide"><span>Connection secret</span><select id="service-connection"><option value="">Choose a configured secret…</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select><small class="field-help">Create the bucket URL, database URL, API key, or connection JSON under Secrets first. ${siteNameMarkup()} passes only an opaque credential handle to the task world.</small></label>
         </div></div>
         <div class="project-form-actions"><button class="btn sm primary" id="service-save">Save service</button></div>
-      </details>`;
+      </details>
+      <button class="action-row" type="button" id="service-discover"><b>Discover from repo</b><span>Reads Compose and devcontainer files</span></button><div id="service-proposals"></div>`;
     const syncServiceFields = () => box.querySelectorAll('[data-service-kind]').forEach((fields) => {
       fields.hidden = fields.dataset.serviceKind !== box.querySelector('#service-kind').value;
     });
@@ -15519,7 +15535,7 @@ async function hydrateProjectEnvironment(proj) {
     const installRepos = [...new Set([...repositories, ...Object.keys(spec?.install || {})])];
     const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip"${record.stale ? ' title="Built on an older base image. Rebuild to use it."' : ''}>${esc(record.digest.slice(0, 8))}${(digest && record.digest !== digest) || record.stale ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div>${record.status === 'building' ? `<button class="btn sm" data-environment-recover="${esc(record.recoveryRevision)}">Recover abandoned build…</button>` : ''}</div>`;
     if (!renderIsCurrent()) return;
-    box.innerHTML = `<div class="inline-form"><button class="btn sm" id="environment-propose">Discover from repo</button><div id="environment-evidence"></div></div>
+    box.innerHTML = `<button class="action-row" type="button" id="environment-propose"><b>Discover from repo</b><span>Suggests a recipe from your repository</span></button><div id="environment-evidence"></div>
       <datalist id="environment-image-options">
         <option value="node:22-bookworm">Node.js 22 · Debian</option>
         <option value="node:22-slim">Node.js 22 · slim</option>
@@ -15692,6 +15708,98 @@ function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
   $('#modal-root').appendChild(host); document.addEventListener('keydown', keydown);
   host.querySelector('#project-new-repo-name').focus();
 }
+// A repository source as people name it: owner/name for GitHub, the path or URL
+// otherwise. The exact source stays on hover.
+function repositorySourceView(source) {
+  const github = /^(?:git@github\.com:|(?:ssh:\/\/git@|https?:\/\/)(?:ssh\.)?github\.com(?::\d+)?\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(source);
+  if (github) return { kind: 'github', owner: github[1], name: github[2], key: `${github[1]}/${github[2]}`.toLowerCase() };
+  return { kind: /^(?:\/|~|\.{1,2}\/)/.test(source) ? 'local' : 'git', name: source, key: source };
+}
+const folderIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M1.5 3.5A1.5 1.5 0 0 1 3 2h3.2l1.5 1.5H13A1.5 1.5 0 0 1 14.5 5v7.5A1.5 1.5 0 0 1 13 14H3a1.5 1.5 0 0 1-1.5-1.5v-9ZM3 3.5v9h10V5H7.1L5.6 3.5H3Z"/></svg>';
+const gitIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M5 2.5a1.5 1.5 0 0 0-.75 2.8v5.4a1.5 1.5 0 1 0 1.5 0V8.6c.4.25.9.4 1.5.4h2.1a1.5 1.5 0 1 0 0-1.5H7.25c-.83 0-1.5-.67-1.5-1.5v-.7A1.5 1.5 0 0 0 5 2.5Z"/></svg>';
+
+// Settings → Project → Git & GitHub: the project's repositories (each add or
+// remove saves at once), then who gives access and who commits.
+function renderProjectRepositories(box, proj, { repositories, gitConnections, githubApp, githubLoadError, githubLogin }) {
+  const sources = proj.config.repos || [];
+  const attached = new Set(sources.map((source) => repositorySourceView(source).key));
+  const choices = repositories.filter((repository) => !attached.has(`${repository.owner}/${repository.name}`.toLowerCase()));
+  // Hosted projects may only use repositories the organization's GitHub reaches.
+  const pickOnly = !!S.meta?.hosted;
+  const canAdd = !pickOnly || repositories.length > 0;
+  const placeholder = !canAdd ? 'Connect GitHub to add repositories'
+    : [repositories.length ? 'owner/repository' : '', pickOnly ? '' : 'Git URL', hostLocal() ? 'local path' : '']
+      .filter(Boolean).join(', ').replace(/, ([^,]*)$/, ' or $1');
+  const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
+  const row = (source) => {
+    const view = repositorySourceView(source);
+    const name = view.kind === 'github'
+      ? `<a class="git-repo-name" href="https://github.com/${esc(view.owner)}/${esc(view.name)}" target="_blank" rel="noopener noreferrer" title="${esc(source)}"><span>${esc(view.owner)}/</span>${esc(view.name)}</a>`
+      : `<span class="git-repo-name mono" title="${esc(source)}">${esc(source)}</span>`;
+    return `<div class="git-repo" data-source="${esc(source)}"><span class="git-repo-icon">${view.kind === 'github' ? githubMark() : view.kind === 'local' ? folderIcon() : gitIcon()}</span>${name}<button class="icon-btn git-repo-remove" type="button" title="Remove" aria-label="Remove ${esc(view.kind === 'github' ? `${view.owner}/${view.name}` : source)}">×</button></div>`;
+  };
+  const organizationLink = `${globalRoute('organization', organizationById(proj.organizationId))}#settings-code`;
+  const needsUpdate = gitConnections.some((connection) => connection.permissionStatus && !connection.permissionStatus.ready);
+  const access = githubLoadError ? { value: '<span id="project-github-error"></span>', actions: '' }
+    : !githubApp.configured ? { value: `<span class="setting-muted">Not set up</span>${S.installationAccess ? '' : policyTip('Your administrator needs to set up GitHub first.')}`,
+      actions: S.installationAccess ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up</a>` : '' }
+    : !gitConnections.length ? { value: '<span class="setting-muted">Not connected</span>', actions: '<button class="btn sm primary" id="project-connect-github" type="button">Connect GitHub</button>' }
+    : { value: `${gitConnections.map((connection) => `<b>${esc(connection.accountLogin)}</b>`).join('<span class="setting-sep">·</span>')}${needsUpdate ? '<span class="chip setting-warn" title="Approve GitHub’s updated access in organization settings">needs update</span>' : ''}`,
+      actions: `<button class="icon-btn" id="project-refresh-github" type="button" title="Refresh repository list" aria-label="Refresh repository list">↻</button><a class="btn sm" data-spa href="${organizationLink}">Manage</a>` };
+  const identity = `<b>You</b>${githubLogin && githubApp.userAuthorized ? `<span class="setting-sep">·</span><span class="setting-muted">${esc(githubLogin)}</span>` : ''}`;
+  box.innerHTML = `<div class="section-h">Repositories</div>
+    <div class="git-repos">
+      <div id="project-repository-fields">${sources.map(row).join('')}</div>
+      <form class="git-repo-add" id="project-repository-add-form">
+        <input id="project-repository-input" list="project-repository-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
+        <button class="btn sm" type="submit" id="project-repository-add" ${canAdd ? '' : 'disabled'}>Add</button>
+        ${canCreate ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository</button>' : ''}
+      </form>
+    </div>
+    <datalist id="project-repository-options">${choices.map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}"></option>`).join('')}</datalist>
+    <div class="setting-rows ruled git-facts">
+      <div class="setting-row" id="project-github-access"><span class="setting-label">GitHub ${policyTip('The GitHub accounts this organization connected. Their repositories can be added above.')}</span><span class="setting-value">${access.value}</span><span class="setting-actions">${access.actions}</span></div>
+      <div class="setting-row" id="project-github-identity"><span class="setting-label">Commits as ${policyTip('Each task commits and opens pull requests as the person who created it.')}</span><span class="setting-value">${identity}</span><span class="setting-actions">${githubAuthorizeButton(githubApp, 'project-authorize-github')}<a class="btn sm" data-spa href="${profileRoute()}">Manage</a></span></div>
+    </div>`;
+  const rerender = () => hydrateProjectAccess(projectById(proj.id) || proj);
+  if (githubLoadError) paneError($('#project-github-error'), githubLoadError, rerender);
+  const controls = () => box.querySelectorAll('#project-repository-add-form input, #project-repository-add-form button, .git-repo-remove');
+  const save = async (repos) => {
+    controls().forEach((control) => { control.disabled = true; });
+    try {
+      await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) });
+      await loadProjects();
+      await rerender();
+      return true;
+    } catch (error) {
+      toast(error.message, true);
+      controls().forEach((control) => { control.disabled = false; });
+      return false;
+    }
+  };
+  box.querySelectorAll('.git-repo').forEach((item) => item.querySelector('.git-repo-remove').addEventListener('click', () =>
+    save(sources.filter((source) => source !== item.dataset.source))));
+  $('#project-repository-add-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const input = $('#project-repository-input');
+    const typed = input.value.trim();
+    if (!typed) return input.focus();
+    const known = repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === typed.toLowerCase()
+      || repository.sshUrl === typed) || repositories.find((repository) => repositorySourceView(repository.sshUrl).key === repositorySourceView(typed).key);
+    if (pickOnly && !known) return toast('Choose one of the organization’s GitHub repositories', true);
+    const source = known?.sshUrl || typed;
+    if (attached.has(repositorySourceView(source).key)) { input.value = ''; return toast('Already added'); }
+    if (await save([...sources, source])) $('#project-repository-input')?.focus();
+  });
+  $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
+  $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, rerender); } catch (error) { toast(error.message, true); } });
+  $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
+  $('#project-refresh-github')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await rerender(); }
+    catch (error) { toast(error.message, true); button.disabled = false; }
+  });
+}
 async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
   const repositoryBox = $('#project-repositories');
@@ -15703,11 +15811,12 @@ async function hydrateProjectAccess(proj) {
     // Unreadable GitHub state offers Retry; read as "not connected" it would send
     // an organization that is connected into setup.
     let githubLoadError = null;
-    const [repositories, members, gitConnections, githubApp] = await Promise.all([
+    const [repositories, members, gitConnections, githubApp, userGithub] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
       api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch((error) => { githubLoadError = error; return []; }),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch((error) => { githubLoadError = error; return { configured: false }; }),
+      api('/api/user/github-accounts').catch(() => null),
     ]);
     if (!renderIsCurrent()) return;
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
@@ -15715,32 +15824,15 @@ async function hydrateProjectAccess(proj) {
     const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
       : principal.kind === 'organization' ? '@all'
       : `@team:${S.teams.find((team) => team.id === principal.teamId)?.slug || principal.teamId}`;
-    accessBox.innerHTML = `<div class="section-h">Project access</div>
-      ${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span>${esc(principalName(member.principal))}</span>${member.protectedOwner ? '<span class="chip">project creator</span>' : ''}<span class="chip">${esc(member.profileId || 'developer')}</span><button class="btn sm project-member-remove">Remove</button></div>`; }).join('') || '<p class="task-sub">No project access overrides.</p>'}
-      <a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-people">Manage people and authorization</a>`;
-    repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Local repo, GitHub, or Git URL</p>
-      <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
-      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
-      <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button>${githubApp.configured && gitConnections.length && githubApp.userAuthorized ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository...</button>' : ''}</div>
-      ${githubLoadError ? '<div id="project-github-error"></div>' : !githubApp.configured ? `<div class="inline-form">${S.installationAccess
-        ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
-        : '<span class="task-sub">The installation operator must set up the shared GitHub App before repositories can be connected.</span>'}</div>`
-        : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
-        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>`}`;
+    accessBox.innerHTML = `<div class="section-h section-h-action"><span>Project access ${policyTip('People and teams with a role in this project beyond their organization role.')}</span><a class="btn sm ghost" data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-people">Manage people</a></div>
+      <div class="setting-rows">${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="setting-row member-line" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span class="setting-value"><b>${esc(principalName(member.principal))}</b>${member.protectedOwner ? '<span class="setting-muted">project creator</span>' : ''}</span><span class="chip">${esc(authorizationLevels().find((level) => level.id === (member.profileId || 'developer'))?.name || member.profileId || 'Developer')}</span><span class="setting-actions"><button class="icon-btn project-member-remove" type="button" title="Remove" aria-label="Remove ${esc(principalName(member.principal))}">×</button></span></div>`; }).join('') || '<p class="task-sub">Nobody has a project-specific role.</p>'}</div>`;
+    renderProjectRepositories(repositoryBox, proj, { repositories, gitConnections, githubApp, githubLoadError,
+      githubLogin: (userGithub?.accounts || []).find((account) => account.active)?.login });
     accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
       if (!confirm('Remove this member’s access to the project?')) return;
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
       catch (error) { toast(error.message, true); }
     }));
-    if (githubLoadError) paneError($('#project-github-error'), githubLoadError, () => hydrateProjectAccess(projectById(proj.id) || proj));
-    const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
-    wireRepositoryRemoves();
-    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
-    $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
-    $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
-    $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, () => hydrateProjectAccess(proj)); } catch (error) { toast(error.message, true); } });
-    $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
-    $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
   } catch (error) {
     if (renderIsCurrent()) accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
   }
@@ -15757,20 +15849,22 @@ async function hydrateWorkflowPins(projectId) {
     api(`/api/projects/${projectId}/workflow-pins`),
   ]); }
   catch {
-    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>';
+    if (renderIsCurrent()) paneError(box, new Error('Could not load workflow versions'), () => hydrateWorkflowPins(projectId));
     return;
   }
   if (!renderIsCurrent()) return;
+  // Only a workflow with more than one version has anything to pin.
+  list = list.filter((w) => w.versions.length > 1 || (pins[w.name] && pins[w.name] !== 'latest'));
   box.innerHTML = list.map((w) => {
     const pinned = pins[w.name] ?? 'latest';
     const opts = [`<option value="latest" ${pinned === 'latest' ? 'selected' : ''}>latest (v${esc(w.latest)})</option>`]
       .concat(w.versions.slice().reverse().map((v) => `<option value="${esc(v)}" ${pinned === v ? 'selected' : ''}>v${esc(v)}</option>`))
       .join('');
-    return `<div class="queue-item">
-      <div style="flex:1"><b>${esc(w.name)}</b> <span class="chip">${w.source === 'bundled' ? 'built-in' : 'installed'}</span></div>
-      <select class="wf-pin" data-wf="${esc(w.name)}" data-saved="${esc(pinned)}" ${w.versions.length <= 1 ? 'disabled title="only one version"' : ''}>${opts}</select>
+    return `<div class="setting-row">
+      <span class="setting-value"><b title="${esc(w.description || '')}">${esc(w.name)}</b>${w.source === 'bundled' ? '' : '<span class="chip">installed</span>'}</span>
+      <span class="setting-actions"><select class="wf-pin" aria-label="${esc(w.name)} version" data-wf="${esc(w.name)}" data-saved="${esc(pinned)}">${opts}</select></span>
     </div>`;
-  }).join('');
+  }).join('') || '<p class="task-sub">No workflow has more than one version yet.</p>';
   box.querySelectorAll('.wf-pin').forEach((sel) => sel.addEventListener('change', async () => {
     try {
       await api(`/api/projects/${projectId}/workflow-pins`, { method: 'POST', body: JSON.stringify({ workflow: sel.dataset.wf, version: sel.value }) });
@@ -16062,8 +16156,7 @@ function globalSettingsView(embedded = false) {
     ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
-    <div class="card" id="settings-connections"><div class="section-h">Connected apps</div>
-      <p class="task-sub">List of connected apps. To set defaults, go to <a href="#settings-defaults">Task defaults</a>.</p>
+    <div class="card" id="settings-connections"><div class="section-h">Connected apps ${policyTip('Apps agents can use through MCP or Composio. Choose which ones new tasks get in Task defaults.')}</div>
       <div id="native-connections">Loading connections…</div></div>
     ${passwordsCard()}
     ${vaultRequestsCard()}
@@ -16071,53 +16164,50 @@ function globalSettingsView(embedded = false) {
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agents</div></div>
     <div class="card" id="accounts-card">
-      <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
-      <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
-      <div id="account-status" style="margin-bottom:14px"></div>
-
-      <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
-      <div class="form-row"><label>Connect a login</label>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <select id="login-provider"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select>
+      <div class="section-h">Accounts ${policyTip('Tasks use the first available account, in this order. Drag to reorder; switch one off to skip it. Projects can reorder them for themselves.')}</div>
+      <div id="cred-editor-global">Loading…</div>
+      <div id="account-status"></div>
+      <div class="section-h">Add an account</div>
+      <div class="setting-rows ruled account-add">
+      <div class="setting-row"><span class="setting-label">Subscription ${policyTip('Sign in with a Claude, ChatGPT/Codex or Grok subscription.')}</span>
+        <div class="setting-value">
+          <select id="login-provider" aria-label="Subscription"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select>
           <select id="login-opencode-target" hidden title="Subscription routed through OpenCode">
             <option value="xai|xAI Grok OAuth (Headless / Remote / VPS)">SuperGrok / Grok or X Premium (device code)</option>
             <option value="xai|xAI Grok OAuth (SuperGrok Subscription)">SuperGrok / Grok or X Premium (local browser)</option>
           </select>
-          <input id="login-name" placeholder="account name (e.g. personal)" style="flex:1;min-width:120px" />
-          <button class="btn primary" id="login-connect">Connect</button>
+          <input id="login-name" placeholder="Name, e.g. personal" aria-label="Account name" class="grow" />
         </div>
-        <div id="login-result" style="font-size:12px;margin-top:6px"></div>
-        <div id="login-opencode-note" hidden style="font-size:11px;color:var(--ink-3);margin-top:4px">OpenCode stores this subscription in its isolated home. Kimi and Google consumer subscriptions are not claimed here; use a Kimi/Google API key (or Google Vertex credentials) instead.</div>
+        <span class="setting-actions"><button class="btn sm primary" id="login-connect">Connect</button></span>
       </div>
-
-      <div style="font-weight:600;margin:14px 0 4px">Register an API key</div>
-      <div class="form-row"><label>Register a key</label>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <input id="acct-provider" list="model-provider-options" value="kimi" placeholder="model provider" style="width:150px" />
+      <div id="login-result" class="account-add-note"></div>
+      <div id="login-opencode-note" hidden class="account-add-note">Kimi and Google consumer subscriptions can’t be used here; add a Kimi or Google API key instead.</div>
+      <div class="setting-row"><span class="setting-label">API key</span>
+        <div class="setting-value">
+          <input id="acct-provider" list="model-provider-options" value="kimi" placeholder="Provider" aria-label="Model provider" class="account-provider" />
           <datalist id="model-provider-options">
             <option value="kimi"><option value="xai"><option value="google"><option value="openai"><option value="anthropic">
             <option value="moonshotai"><option value="openrouter"><option value="groq"><option value="mistral"><option value="deepseek">
           </datalist>
-          <input id="acct-name" placeholder="account name (e.g. work)" style="flex:1;min-width:120px" />
-          <input id="acct-key" type="password" placeholder="API key" style="flex:1;min-width:160px" />
-          <button class="btn" id="acct-add">Register</button>
+          <input id="acct-name" placeholder="Name, e.g. work" aria-label="Account name" class="grow" />
+          <input id="acct-key" type="password" placeholder="Key" aria-label="API key" class="grow" />
         </div>
+        <span class="setting-actions"><button class="btn sm" id="acct-add">Add</button></span>
+      </div>
       </div>
     </div>
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
-      <div class="section-h">Workflows <span class="chip">organization resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with ${siteNameMarkup()} and change only with platform releases. Each task pins its workflow version.</p>
-      <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
-      ${S.meta?.hosted ? `<p>Custom workflow code is unavailable on hosted ${siteNameMarkup()}.</p>` : `<div class="form-row"><label>Install from a git repo</label>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <input id="wf-url" placeholder="git URL or path (e.g. https://github.com/you/my-workflow.git)" style="flex:1;min-width:220px" />
-          <input id="wf-ref" placeholder="ref (tag/branch/sha, optional)" style="width:180px" />
-          <button class="btn primary" id="wf-install">Install</button>
+      <div class="section-h">Workflows ${policyTip(`Built-ins ship with ${siteName()} and change only with platform releases. Each task keeps the workflow version it started on.`)}</div>
+      <div id="workflows-list" class="setting-rows" style="margin-bottom:12px">Loading…</div>
+      ${S.meta?.hosted ? `<p class="task-sub">Custom workflow code is unavailable on hosted ${siteNameMarkup()}.</p>` : `<div class="section-h">Install</div>
+        <div class="inline-form">
+          <input id="wf-url" placeholder="Git URL or path" aria-label="Workflow repository" style="flex:2;min-width:200px" />
+          <input id="wf-ref" placeholder="Tag, branch or commit" aria-label="Version (optional)" style="flex:1;min-width:140px" />
+          <button class="btn sm primary" id="wf-install">Install</button>
         </div>
         <div id="wf-install-result" style="font-size:12px;margin-top:6px"></div>
-        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Install only code you trust with this server. External workflows share the platform worker; manifest validation and version pins do not isolate them. Packages must supply manifest.json. Merging an edit does not activate it; install the reviewed commit explicitly.</div>
-      </div>`}
+        <p class="field-help" style="margin:6px 0 0">Only install code you trust: it runs inside this server. ${policyTip('External workflows share the platform worker; manifest validation and version pins do not isolate them. Packages must supply manifest.json. Merging an edit does not activate it; install the reviewed commit explicitly.')}</p>`}
     </div>`;
 }
 
@@ -16376,13 +16466,9 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
   }
   if (!renderIsCurrent()) return;
   if (!list.length) { box.innerHTML = '<span style="color:var(--ink-3)">No workflows registered.</span>'; return; }
-  box.innerHTML = list.map((w) => `<div class="queue-item">
-      <div style="flex:1"><b>${esc(w.name)}</b>
-        <span class="chip">${w.source === 'bundled' ? 'built-in' : 'installed'}</span>
-        <span class="chip">v${esc(w.latest)}</span>
-        ${w.versions.length > 1 ? `<span class="task-sub" style="color:var(--ink-3)">versions: ${w.versions.map(esc).join(', ')}</span>` : ''}
-        <div class="task-sub" style="color:var(--ink-3)">${esc(w.description || '')}</div>
-      </div></div>`).join('');
+  box.innerHTML = list.map((w) => `<div class="setting-row workflow-line">
+      <span class="setting-value"><b>${esc(w.name)}</b>${w.source === 'bundled' ? '' : '<span class="chip">installed</span>'}<span class="workflow-description" title="${esc(w.description || '')}">${esc(w.description || '')}</span></span>
+      <span class="setting-actions"><span class="chip" title="${esc(`${w.versions.length} version${w.versions.length === 1 ? '' : 's'}: ${w.versions.join(', ')}`)}">v${esc(w.latest)}</span></span></div>`).join('');
 }
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
@@ -16406,12 +16492,12 @@ function paymentsCard(scope) {
     </div>
     <button class="btn primary" data-addcard="${scope}">Add card</button>
     </details>
-    <details class="pay-stripe" style="margin-top:16px">
-      <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
+    <details class="pay-stripe">
+      <summary>Stripe Issuing</summary>
       <p class="task-sub">For registered businesses. Lets ${siteNameMarkup()} issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
       ${scope === 'global' ? `<div class="pay-providers-list"></div>
       <div class="pay-balance" style="margin:8px 0"></div>
-      <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
+      <details class="pay-cardholder hidden"><summary>Cardholder</summary>
         <p class="task-sub">Stripe’s compliance record for the person or company legally authorized to use the card. Stripe may require verification.</p>
         <div class="settings-grid">
           <label class="form-row">Type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
@@ -17460,7 +17546,7 @@ async function openConnectorEditor(query, changed, app, existing) {
 
 function passwordsCard() {
   return `<div class="card" id="vault-card">
-    <div class="section-h">Passwords <span class="chip">organization resource</span></div>
+    <div class="section-h">Passwords</div>
     <div class="vault-risk" role="note">
       <span class="vault-risk-mark" aria-hidden="true">!</span>
       <div><b>Connect your passwords and secrets at your own risk.</b>
@@ -17486,7 +17572,7 @@ function passwordsCard() {
     </div>
     <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
 
-    <details class="vault-custom" open><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
+    <details class="vault-custom" open><summary>Add one by hand</summary>
       <div style="margin-top:8px">
       <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap">
         <select class="vi-type">${Object.keys(VAULT_SECRET_LABELS).map((t) => `<option>${t}</option>`).join('')}</select>
@@ -18078,7 +18164,7 @@ let refreshVaultRequests = null;
 function agentMailCard() {
   return `<div class="card" id="agent-mail-card">
     <div class="section-h">Agent email</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Email for agents to receive confirmation codes. <a href="https://www.agentmail.to/" target="_blank" rel="noopener">Create an AgentMail account here.</a></p>
+    <p class="task-sub">An inbox where agents receive confirmation codes. <a href="https://www.agentmail.to/" target="_blank" rel="noopener">Get an AgentMail account ↗</a></p>
     <div class="inline-form">
       <input id="agentmail-address" type="email" placeholder="AgentMail address" />
       <input id="agentmail-key" type="password" placeholder="AgentMail API key" />
@@ -18761,11 +18847,11 @@ async function hydrateProfileGithub() {
     <div class="task-sub" style="margin-top:4px">${esc(failure.summary)} <span class="chip">${esc(failure.code)}</span></div>
     <div class="task-sub" style="margin-top:3px">Recorded ${esc(new Date(failure.occurredAt).toLocaleString())}. The diagnostic is secret-free and is also preserved in the audit log.</div>
   </div>` : '';
-  box.innerHTML = `${failureDetail}<div class="github-account-list">${accounts.map((account) => `<div class="github-account-row" data-account="${esc(account.id)}">
+  box.innerHTML = `${failureDetail}${accounts.length ? '' : '<span class="setting-muted">Not connected</span>'}<div class="github-account-list">${accounts.map((account) => `<div class="github-account-row" data-account="${esc(account.id)}">
     <span class="github-account-label">${githubMark()}<b>${esc(account.login)}</b>${account.active ? '<span class="chip">Active</span>' : ''}</span>
     <span class="github-account-actions">${account.active ? '' : '<button class="btn sm github-use" type="button">Use</button>'}<button class="btn sm github-reconnect" type="button">Reconnect</button><button class="btn sm github-custom" type="button">Custom identity</button><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub account">${trashIcon()}</button></span>
   </div>`).join('')}</div>
-  <button class="btn ${accounts.length ? '' : 'primary'} github-add" type="button">${githubMark()}${accounts.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>`;
+  <button class="btn sm ${accounts.length ? 'ghost' : 'primary'} github-add" type="button">${githubMark()}${accounts.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>`;
   box.querySelector('.github-add')?.addEventListener('click', () => startUserGithubConnection(data.githubApp, 'add').catch((error) => toast(error.message, true)));
   box.querySelectorAll('.github-account-row').forEach((row) => {
     const account = accounts.find((candidate) => candidate.id === row.dataset.account);
@@ -18782,9 +18868,8 @@ async function hydrateProfileGithub() {
 // one place to end the session. Sign out lives here rather than in the top bar.
 function profileWalkthroughCard(userId) {
   if (!S.meta?.hosted || !userId || (!S.installationAccess && userId !== S.user?.id)) return '';
-  return `<div class="card"><div class="section-h">Walkthrough</div>
-    <p class="task-sub">Restart the setup walkthrough in each organization. Existing work and connections are preserved.</p>
-    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Restart walkthrough</button></div>`;
+  return `<div class="card"><div class="setting-row"><span class="setting-label">Walkthrough</span><span class="setting-value setting-muted">Setup guide in each organization</span>
+    <span class="setting-actions"><button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}" title="Existing work and connections are kept">Restart walkthrough</button></span></div></div>`;
 }
 
 function profileView() {
@@ -18805,77 +18890,53 @@ function profileView() {
   const orgList = orgs.length
     ? organizationComboHtml('default-organization', S.defaultOrganizationId, 'Default organization')
     : '<p class="task-sub">You are not a member of any organization yet.</p>';
+  const theme = document.documentElement.getAttribute('data-theme') || '';
+  const incident = S.launch?.contacts?.incident;
   return `<div class="profile-page">
-    <h1 class="page-title">Profile</h1>
+    <div class="profile-identity">
+      <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
+      <div class="profile-meta"><h1 class="page-title">${esc(name)}</h1><div class="profile-email">${email ? esc(email) : 'Profile'}</div></div>
+    </div>
     ${profileWalkthroughCard(u?.id)}
-    <div class="card profile-card">
-      <div class="profile-identity">
-        <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
-        <div class="profile-meta">
-          <div class="profile-name">${esc(name)}</div>
-          <div class="profile-email">Your ${siteNameMarkup()} profile</div>
-        </div>
-      </div>
-      <div class="profile-rows">
-        ${u?.name ? `<div class="profile-row">
-          <span class="profile-row-label">Name</span>
-          <span class="profile-row-value">${esc(u.name)}</span>
-        </div>` : ''}
-        ${u ? `<div class="profile-row profile-row-action">
-          <span class="profile-row-label">Email</span>
-          <div class="profile-row-control">
-            <span class="profile-row-value">${esc(email)}</span>
-            ${u.emailVerified
-              ? '<span class="chip success">verified</span>'
-              : S.emailDelivery ? '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation email</button>' : ''}
-            <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
-              aria-expanded="false" aria-controls="profile-email-panel">Edit</button>
-          </div>
+    ${u ? `<div class="card profile-card">
+      <div class="section-h">Account</div>
+      <div class="setting-rows">
+        <div class="setting-row">
+          <span class="setting-label">Email</span>
+          <span class="setting-value"><span>${esc(email)}</span>${u.emailVerified ? '<span class="chip success">verified</span>' : ''}</span>
+          <span class="setting-actions">${!u.emailVerified && S.emailDelivery ? '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation</button>' : ''}<button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
+              aria-expanded="false" aria-controls="profile-email-panel">Change</button></span>
         </div>
         <div class="profile-edit-panel" id="profile-email-panel" hidden>
           <form id="profile-email-form">
-            <div class="profile-edit-heading">
-              <div>
-                <div class="section-h">Change email</div>
-                <p class="task-sub">Used to sign in and receive account emails.</p>
-              </div>
-            </div>
             <label class="form-row" for="profile-email">
               <span>New email address</span>
               <input id="profile-email" type="email" autocomplete="email" value="${esc(email)}" required />
             </label>
             <p class="profile-edit-help">${u.emailVerified
-              ? 'Your current address stays active until you confirm the link sent to the new one.'
-              : 'Because this address is not confirmed yet, changing it takes effect immediately and sends a fresh confirmation link.'}</p>
+              ? 'Your current address stays active until you confirm the new one.'
+              : 'This takes effect at once and sends a new confirmation link.'}</p>
             <div class="profile-edit-actions">
               <button class="btn primary" id="profile-email-save" type="submit">Save email</button>
               <button class="btn" type="button" data-profile-cancel>Cancel</button>
             </div>
           </form>
         </div>
-        <div class="profile-row profile-row-action">
-          <span class="profile-row-label">Password</span>
-          <div class="profile-row-control">
-            <span class="profile-row-value profile-password-mask" aria-label="Password is set">********</span>
-            <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="password"
-              aria-expanded="false" aria-controls="profile-password-panel">Edit</button>
-          </div>
+        <div class="setting-row">
+          <span class="setting-label">Password</span>
+          <span class="setting-value"><span class="profile-password-mask" aria-label="Password is set">••••••••</span></span>
+          <span class="setting-actions"><button class="btn sm profile-edit-toggle" type="button" data-profile-edit="password"
+              aria-expanded="false" aria-controls="profile-password-panel">Change</button></span>
         </div>
         <div class="profile-edit-panel" id="profile-password-panel" hidden>
           <form id="profile-password-form">
-            <div class="profile-edit-heading">
-              <div>
-                <div class="section-h">Change password</div>
-                <p class="task-sub">Use at least 10 characters. Other signed-in sessions will be closed.</p>
-              </div>
-            </div>
             <div class="profile-password-fields">
               <label class="form-row" for="profile-current-password">
                 <span>Current password</span>
                 <input id="profile-current-password" type="password" autocomplete="current-password" required />
               </label>
               <label class="form-row" for="profile-new-password">
-                <span>New password</span>
+                <span>New password <span class="field-help">at least 10 characters</span></span>
                 <input id="profile-new-password" type="password" autocomplete="new-password" minlength="10" required />
               </label>
               <label class="form-row" for="profile-confirm-password">
@@ -18887,46 +18948,62 @@ function profileView() {
             <div class="profile-edit-actions">
               <button class="btn primary" id="profile-password-save" type="submit">Update password</button>
               <button class="btn" type="button" data-profile-cancel>Cancel</button>
+              <span class="field-help">Signs out your other sessions.</span>
             </div>
           </form>
-        </div>` : ''}
+        </div>
+        <div class="setting-row profile-github-row">
+          <span class="setting-label">GitHub ${policyTip('Tasks you create commit and open pull requests as your active GitHub account.')}</span>
+          ${profileGithubFields()}
+        </div>
       </div>
-      <div class="settings-divider"></div>
-      ${profileGithubFields()}
-    </div>
-    <div class="card">
-      <div class="section-h">Default organization</div>
-      <p class="task-sub">Select your default organization. It opens when you sign in.</p><div class="profile-orgs">${orgList}</div>
+    </div>` : ''}
+    <div class="card" id="profile-preferences">
+      <div class="section-h">Preferences</div>
+      <div class="setting-rows">
+        <div class="setting-row">
+          <span class="setting-label">Default organization ${policyTip('Opens when you sign in.')}</span>
+          <span class="setting-value">${orgs.length ? orgList : '<span class="setting-muted">No organizations yet</span>'}</span>
+        </div>
+        <div class="setting-row">
+          <span class="setting-label">Theme</span>
+          <span class="setting-value"><span class="segmented" id="profile-theme" role="group" aria-label="Theme">${[['', 'System'], ['light', 'Light'], ['dark', 'Dark']].map(([value, label]) =>
+            `<button type="button" data-theme-choice="${value}" aria-pressed="${theme === value}">${label}</button>`).join('')}</span></span>
+        </div>
+        <label class="setting-row" for="profile-md-render">
+          <span class="setting-label">Markdown</span>
+          <span class="setting-value setting-muted">Format agent messages</span>
+          <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /></span>
+        </label>
+        <label class="setting-row" for="profile-mathjax">
+          <span class="setting-label">Math ${policyTip('Typesets LaTeX with MathJax, loaded from a CDN. Needs Markdown.')}</span>
+          <span class="setting-value setting-muted">Typeset LaTeX</span>
+          <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /></span>
+        </label>
+      </div>
     </div>
     ${notificationsCard()}
-    <div class="card">
-      <div class="section-h">Appearance</div>
-      <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
-      <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
-      <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
-      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">Per-browser display choices.</p>
-    </div>
-    ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><p class="task-sub">Paid-plan subscriptions started through your account. Organization owners can change or cancel them in Plans &amp; billing.</p><div id="profile-paid-subscriptions" aria-live="polite">Loading subscriptions…</div></div>' : ''}
+    ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><div id="profile-paid-subscriptions" aria-live="polite">Loading subscriptions…</div></div>' : ''}
     ${u ? appGrantsCard() : ''}
-    <div class="card data-export-card">
-      <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
-      <div class="data-export-copy">
-        <div class="section-h">Your data</div>
-        <p class="task-sub">Download a readable JSON archive of your profile and the ${siteNameMarkup()} records directly linked to you across organizations.</p>
-        <p class="data-export-note">Passwords, session tokens, OAuth tokens, and stored credentials are never included.</p>
-      </div>
-      <button class="btn" id="export-user-data" type="button">Export your data</button>
-    </div>
     <div class="card" id="data-account">
       <div class="section-h">Data &amp; account</div>
-      <p class="task-sub">Request account deletion online. We’ll verify ownership and any organization or resource transfer, then confirm what will be removed or retained and why.</p>
-      <p class="data-export-note">Cancel an active subscription first. Urgent compromise: ${S.launch?.contacts?.incident ? `<a href="mailto:${esc(S.launch.contacts.incident)}">${esc(S.launch.contacts.incident)}</a>` : '<a href="/legal/security">security contact</a>'}.</p>
-      <button class="btn danger" id="request-account-deletion" type="button">Request account deletion</button>
-    </div>
-    <div class="card">
-      <div class="section-h">Session</div>
-      <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
-      <button class="btn danger" id="profile-logout">Sign out</button>
+      <div class="setting-rows">
+        <div class="setting-row">
+          <span class="setting-label">Your data ${policyTip(`A readable JSON archive of your profile and the ${siteName()} records linked to you. Passwords, tokens and stored credentials are never included.`)}</span>
+          <span class="setting-value setting-muted">JSON archive</span>
+          <span class="setting-actions"><button class="btn sm" id="export-user-data" type="button">Export</button></span>
+        </div>
+        ${u ? `<div class="setting-row">
+          <span class="setting-label">Session</span>
+          <span class="setting-value setting-muted">This browser</span>
+          <span class="setting-actions"><button class="btn sm" id="profile-logout">Sign out</button></span>
+        </div>` : ''}
+        <div class="setting-row danger">
+          <span class="setting-label">Delete account ${policyTip(`We verify ownership and any organization or resource transfer, then confirm what is removed or kept. Cancel active subscriptions first. Account compromised? Contact ${incident || 'security'}.`)}</span>
+          <span class="setting-value setting-muted">Permanent</span>
+          <span class="setting-actions"><button class="btn sm danger" id="request-account-deletion" type="button">Request deletion</button></span>
+        </div>
+      </div>
     </div>
   </div>`;
 }
@@ -18939,31 +19016,38 @@ function notificationsCard() {
   const emailReady = S.meta?.deliveryChannels?.includes('email');
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
-    granted: '<p class="task-sub">This browser may show system notifications.</p>',
-    denied: '<p class="task-sub">This browser is blocking system notifications. Allow them in its site settings; in-app alerts and sounds still work.</p>',
-    unsupported: '<p class="task-sub">This browser cannot show system notifications; in-app alerts and sounds still work.</p>',
+    denied: '<p class="notify-note">System notifications are blocked in this browser’s site settings.</p>',
     default: '<button class="btn sm" id="notify-permission" type="button">Allow system notifications</button>',
   }[permission] ?? '';
+  const headTip = {
+    notify: 'Shown by your device, even when this tab is in the background. Do Not Disturb still applies.',
+    sound: 'Plays in this browser while the app is open.',
+    visual: 'A banner inside the app.',
+    email: emailReady ? 'Sent to your account email for this organization, even when the app is closed.' : 'Your administrator hasn’t set up email.',
+  };
   // Loudest first, the same order the inbox itself is in.
   const levels = [...URGENCY_LEVELS].reverse();
   return `<div class="card" id="notifications">
-    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive high by default. Higher urgency always sorts first in your inbox; here you choose what else each level does.')}</div>
+    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive as high. Choose what each level does. Everything except email applies to this browser only.')}</div>
     <div class="notify-grid">
       <div class="notify-row notify-head"><span>Urgency</span>${NOTIFY_BEHAVIOURS.map((behaviour) =>
-    `<span>${behaviour.label}</span>`).join('')}<span></span></div>
+    `<span title="${esc(headTip[behaviour.key])}">${behaviour.label}</span>`).join('')}<span></span></div>
       ${levels.map((level) => `<div class="notify-row" data-notify-level="${level}">
         <span class="urgency-chip ${level}">${level}</span>
         ${NOTIFY_BEHAVIOURS.map((behaviour) => `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
           aria-label="${behaviour.label} for ${level} urgency" ${(behaviour.key === 'email' ? S.deliveryPreferences?.emailUrgencies?.[level] ?? S.deliveryPreferences?.email : prefs[level][behaviour.key]) ? 'checked' : ''} ${behaviour.key === 'email' && (!emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`).join('')}
-        <span><button class="btn sm" type="button" data-notify-test="${level}" title="Test browser alerts">Test</button></span>
+        <span><button class="btn sm ghost" type="button" data-notify-test="${level}" title="Send a test ${level} notification">Test</button></span>
       </div>`).join('')}
     </div>
-    <div class="notify-sound-options"><label>Sound <select id="notify-tone">${['bell', 'chime', 'soft'].map((tone) => `<option value="${tone}" ${sound.tone === tone ? 'selected' : ''}>${tone[0].toUpperCase() + tone.slice(1)}</option>`).join('')}</select></label>
-      <label>Duration <select id="notify-duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : `${duration} second${duration === 1 ? '' : 's'}`}</option>`).join('')}</select></label>
-      <button class="btn sm" id="notify-preview">Preview sound</button></div>
-    <p class="task-sub">Email choices apply to your account in this organization, even when the app is closed.${emailReady ? '' : ' Email delivery has not been configured by your administrator.'}</p>
+    <div class="setting-rows ruled">
+      <div class="setting-row">
+        <span class="setting-label">Sound</span>
+        <span class="setting-value notify-sound-options"><select id="notify-tone" aria-label="Sound">${['bell', 'chime', 'soft'].map((tone) => `<option value="${tone}" ${sound.tone === tone ? 'selected' : ''}>${tone[0].toUpperCase() + tone.slice(1)}</option>`).join('')}</select>
+          <select id="notify-duration" aria-label="Duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : `${duration} second${duration === 1 ? '' : 's'}`}</option>`).join('')}</select></span>
+        <span class="setting-actions"><button class="btn sm" id="notify-preview" type="button" title="Play the sound">▶ Preview</button></span>
+      </div>
+    </div>
     ${permissionNote}
-    <p class="task-sub">System notifications, in-app alerts, and sounds apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
   </div>`;
 }
 
@@ -19189,7 +19273,10 @@ function wireProfileView() {
       finishActionFeedback(feedback, actionSucceeded);
     }
   });
-  $('#profile-theme')?.addEventListener('click', toggleTheme);
+  $('#profile-theme')?.querySelectorAll('[data-theme-choice]').forEach((button) => button.addEventListener('click', () => {
+    setTheme(button.dataset.themeChoice);
+    $('#profile-theme').querySelectorAll('[data-theme-choice]').forEach((other) => other.setAttribute('aria-pressed', String(other === button)));
+  }));
   $('#profile-md-render')?.addEventListener('change', (e) => {
     try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
     if (S.taskTab === 'checkin') renderTaskPage();
@@ -19446,11 +19533,15 @@ async function hydrateOrganizationSubscription(organizationId) {
   try { state = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/status`); }
   catch (error) { box.innerHTML = `<p class="task-sub" style="color:var(--danger)">${esc(error.message)}</p>`; return; }
   if (!$('#org-subscription') || S.organizationId !== organizationId) return;
+  // A private installation has no hosted subscription to show.
   if (!state.managed) {
-    box.innerHTML = `<div class="section-h">Self-hosted <span class="chip">unmetered</span></div>
-      <p class="task-sub">Hosted subscription billing does not apply to this private installation. Your organization plans and agent payment cards remain locally managed.</p>`;
+    box.hidden = true;
+    const heading = $('#settings-billing');
+    if (heading) heading.hidden = true;
     return;
   }
+  box.hidden = false;
+  if ($('#settings-billing')) $('#settings-billing').hidden = false;
   const catalog = Object.fromEntries((state.catalog || []).map((plan) => [plan.id, plan]));
   const names = Object.fromEntries(Object.values(catalog).map((plan) => [plan.id, plan.name]));
   const price = (cents) => `$${(Number(cents || 0) / 100).toLocaleString(undefined,
@@ -19781,13 +19872,13 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
-      <div class="authz-invite-row"><input id="invite-email" placeholder="teammate@company.com">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
-      <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
-    <div class="card"><label class="form-row">Organization name visibility
-      <select id="organization-name-visibility" disabled>
-        <option value="members" ${org?.nameVisibility !== 'public' ? 'selected' : ''}>Only people added to this organization</option>
-        <option value="public" ${org?.nameVisibility === 'public' ? 'selected' : ''}>All users</option>
-      </select></label><p class="task-sub">Controls whether your organization’s name appears in organization search. Access to projects and settings still requires authorization. The operator can always find every organization.</p></div>
+      <div class="authz-invite-row"><input id="invite-email" type="email" placeholder="teammate@company.com" aria-label="Email to invite">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm primary" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div></div>
+    <div class="card"><div class="section-h">Teams ${policyTip('Teams are reusable review routes: a team named Leaders is available to workflows as @team:leaders.')}</div><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form team-create"><input id="team-name" placeholder="New team name" aria-label="New team name"><button class="btn sm" id="create-team">Create team</button></div></div>
+    <div class="card"><div class="setting-row"><span class="setting-label">Name visibility ${policyTip('Whether this organization’s name appears in organization search. Joining still needs an invitation, and the operator can always find every organization.')}</span>
+      <span class="setting-value"><select id="organization-name-visibility" aria-label="Organization name visibility" disabled>
+        <option value="members" ${org?.nameVisibility !== 'public' ? 'selected' : ''}>Members only</option>
+        <option value="public" ${org?.nameVisibility === 'public' ? 'selected' : ''}>Everyone signed in</option>
+      </select></span></div></div>
     <div class="card" id="organization-roles">Loading roles…</div>
     <div class="card"><div id="organization-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repositories, computers and storage shared by this organization’s projects</small></div></div>
@@ -19798,22 +19889,22 @@ function organizationView() {
     ${globalSettingsView(true)}
 
     <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="card" data-settings-access="organization" hidden><div class="setting-rows">
+      <div class="setting-row"><span class="setting-label">Name</span>
+        <span class="setting-value"><input id="organization-name" class="setting-input" value="${esc(org?.name || '')}" aria-label="Organization name"></span>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-organization">Save</button></span></div>
+      <div class="setting-row"><span class="setting-label">Data ${policyTip('A readable JSON archive of this organization, grouped into complete record collections. Passwords, tokens and stored credentials are never included.')}</span>
+        <span class="setting-value setting-muted">JSON archive</span>
+        <span class="setting-actions"><button class="btn sm" id="export-organization" type="button">Export</button></span></div>
+      ${org?.kind === 'team' ? `<div class="setting-row danger"><span class="setting-label">Delete organization</span>
+        <span class="setting-value setting-muted">Permanent</span>
+        <span class="setting-actions"><button class="btn sm danger" id="delete-organization">Delete…</button></span></div>` : ''}
+    </div></div>
+    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity">Loading…</div></details>
     <div class="settings-section-title" id="settings-experimental"><div>Experimental<small>Optional features for this organization</small></div></div>
     ${AVATAR_RISK_NOTE}
     <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
     <div id="org-misc-slot"></div>
-    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
-    <div class="card data-export-card" data-settings-access="organization" hidden>
-      <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
-      <div class="data-export-copy"><div class="section-h">Export organization data</div>
-        <p class="task-sub">Download a readable JSON archive of this organization, grouped into complete record collections.</p>
-        <p class="data-export-note">Passwords, tokens, and stored credentials are never included.</p></div>
-      <button class="btn sm" id="export-organization" type="button">Export organization data</button>
-    </div>
-    <div class="card" data-settings-access="organization" hidden>
-      <div class="section-h">Organization name</div>
-      <div class="inline-form"><input id="organization-name" value="${esc(org?.name || '')}" aria-label="Organization name"><button class="btn sm primary" id="rename-organization">Save name</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div>
-    </div>
     </div></div></div>`;
 }
 
@@ -19824,8 +19915,9 @@ function pendingInvitationRow(invitation, projects) {
 
 function organizationPlanMarkup(entitlements) {
   if (!entitlements) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
-  if (entitlements.deployment === 'private') return `<div class="section-h">Private installation</div>
-    <p class="task-sub">Hosted plan restrictions are not applied. Users, projects, and active agent runs are limited only by this installation’s own capacity settings.</p>`;
+  if (entitlements.deployment === 'private') return `<div class="setting-row"><span class="setting-label">Plan</span>
+    <span class="setting-value"><b>Private installation</b> ${policyTip('Hosted plan restrictions are not applied. Users, projects and agent runs are limited only by this installation’s own capacity settings.')}</span>
+    <span class="setting-actions"><span class="chip">unmetered</span></span></div>`;
   const memberCount = Number(entitlements.currentMemberCount ?? entitlements.activeUsers ?? 0);
   const users = entitlements.maxMembers == null
     ? `${memberCount} active user${memberCount === 1 ? '' : 's'} · unlimited`
@@ -19883,8 +19975,7 @@ function renderOrganizationRoles() {
   const catalog = S.authorizationCatalog;
   if (!catalog) { root.textContent = 'Could not load roles. Reload this page to try again.'; return; }
   const levels = authorizationLevels();
-  root.innerHTML = `<div class="section-h">Roles &amp; capabilities</div>
-    <p class="task-sub">Expand a role, then a category to inspect its exact capabilities. Access is limited by the selected projects or organization and by the person granting it. Task actions also depend on workflow state.</p>
+  root.innerHTML = `<div class="section-h">Roles &amp; capabilities ${policyTip('Expand a role, then a category, to see its exact capabilities. Access is limited by the selected projects or organization and by the person granting it; task actions also depend on workflow state.')}</div>
     ${catalog.profiles.slice().sort((a, b) => levels.findIndex((level) => level.id === a.id) - levels.findIndex((level) => level.id === b.id)).map((role) => `<details class="authorization-role">
       <summary><b>${esc(role.name)}</b><span class="chip">${role.builtin ? 'Built-in' : 'Custom'}</span></summary>
       <p class="task-sub">${esc(role.description)}</p>
@@ -20018,7 +20109,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       renderOrganizationRoles();
       $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
         const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
-        return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
+        return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="icon-btn org-member-remove" type="button" title="Remove from organization" aria-label="Remove ${esc(userName(m.userId, m.user))}">×</button></div>`;
       }).join('') : '<span class="task-sub">No members.</span>';
       const [teamMembers, invitationList] = await Promise.all([
         Promise.all(S.teams.map((team) => read(`teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
@@ -20028,7 +20119,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       const pendingInvitations = invitationList.filter((invitation) => !invitation.acceptedAt);
       $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
       $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
-      $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
+      $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '';
       $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
         const editor = row.querySelector('.authz-editor');
         wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {
@@ -20226,9 +20317,8 @@ async function createOrganization() {
 }
 
 // ── theme ────────────────────────────────────────────────────────────────────
-function toggleTheme() {
-  const cur = document.documentElement.getAttribute('data-theme');
-  const next = cur === 'dark' ? 'light' : cur === 'light' ? '' : 'dark';
+/** 'light', 'dark', or '' to follow the system. */
+function setTheme(next) {
   if (next) document.documentElement.setAttribute('data-theme', next);
   else document.documentElement.removeAttribute('data-theme');
   localStorage.setItem('karmax-theme', next);
@@ -20395,7 +20485,7 @@ const HOST_COMMANDS = [
     openTaskForm(QUICK_TASK_WORKFLOW);
   } },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
-  { id: 'nav.home', title: 'Go home', key: 'g h', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
+  { id: 'nav.home', title: 'Go home', key: 'g H', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
   { id: 'nav.insights', title: 'Go to insights', key: 'g i', run: () => switchTab('insights') },
@@ -20643,9 +20733,47 @@ function closeTopOverlay() {
   if (S.selected) return closeTask();
 }
 
+// -- the shortcut echo: what you just did, as keys ---------------------------
+// Every action with a shortcut — clicked, run from the palette or typed — shows
+// its keys in the topbar for a moment, so the console teaches its own keyboard.
+// A chord prefix ('g') shows until the chord completes or lapses. The keys come
+// from the same registry as dispatch: clickable controls name their command in
+// `data-shortcut` (space-separated ids form a sequence: 'nav.projects
+// rail.newProject' is g P then n), or a raw binding in `data-keys`.
+function echoKeys(keys, title = '', pending = false) {
+  const el = $('#key-echo');
+  if (!el) return;
+  el.textContent = keys || '';
+  el.title = title;
+  el.classList.toggle('pending', pending);
+  el.style.animation = 'none'; void el.offsetWidth; el.style.animation = ''; // restart the fade
+}
+function clearPendingEcho() { if ($('#key-echo.pending')) echoKeys(''); }
+function controlShortcut(control) {
+  if (control.disabled) return null;
+  if (control.dataset.keys) return { keys: fmtKeys(control.dataset.keys), title: control.getAttribute('aria-label') || control.textContent.trim() };
+  const cmds = allCommands();
+  if (control.dataset.act) { // a task action: its workflow's binding, else the digit it shows
+    const bound = cmds.find((c) => c.id === `task.${control.dataset.act}` && c.available && c.keybinding);
+    const keys = bound ? fmtKeys(bound.keybinding) : control.querySelector('.kbd')?.textContent;
+    return keys ? { keys, title: control.dataset.label } : null;
+  }
+  const steps = control.dataset.shortcut.split(' ').map((id) => cmds.find((c) => c.id === id));
+  if (!steps.every((c) => c?.keybinding)) return null;
+  return { keys: steps.map((c) => fmtKeys(c.keybinding)).join(' '), title: steps.at(-1).title };
+}
+function echoClickedShortcut(e) {
+  // Clicks a command fires itself (digits press action buttons) are untrusted;
+  // the keys that fired it are already showing.
+  if (!e.isTrusted || !e.target?.closest) return;
+  const control = e.target.closest('[data-shortcut], [data-keys], #tp-foot [data-act]');
+  const hint = control && controlShortcut(control);
+  if (hint) echoKeys(hint.keys, hint.title);
+}
+
 // -- the dispatcher ------------------------------------------------------------
 const CHORD = { pending: [], timer: 0 };
-function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
+function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); clearPendingEcho(); }
 // A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires on its own before the key
 // it modifies. It must be transparent to the chord buffer — otherwise pressing
 // Shift for the second step of a shifted chord (`g P`, `g W`, `g D`, `g S`, …)
@@ -20671,8 +20799,9 @@ function dispatchKey(e) {
   e.preventDefault();
   const exact = candidates.find((c) => c.keys.length === CHORD.pending.length + 1);
   const longer = candidates.some((c) => c.keys.length > CHORD.pending.length + 1);
-  if (exact && !longer) { resetChord(); exact.run(); return true; }
+  if (exact && !longer) { resetChord(); echoKeys(fmtKeys(exact.keybinding), exact.title); exact.run(); return true; }
   CHORD.pending.push(snap); // a chord prefix ('g' …) — wait briefly for the rest
+  echoKeys(fmtKeys(candidates[0].keybinding).split(' ').slice(0, CHORD.pending.length).join(' '), '', true);
   clearTimeout(CHORD.timer);
   CHORD.timer = setTimeout(resetChord, 900);
   return true;
@@ -20762,7 +20891,7 @@ function openPalette() {
     }).join('') || `<div class="pal-empty">No matches</div>`;
     list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
   };
-  const run = (i) => { const it = items[i]; if (!it) return; close(); it.run(); };
+  const run = (i) => { const it = items[i]; if (!it) return; close(); if (it.kbd) echoKeys(fmtKeys(it.kbd), it.title); it.run(); };
   input.addEventListener('input', build);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
@@ -21116,17 +21245,14 @@ function renderLanding() {
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
         <button class="landing-theme" id="landing-theme" type="button" aria-label="Switch theme"><svg class="sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 12.6A6.8 6.8 0 0 1 7.4 3.6a6.8 6.8 0 1 0 9 9z"/></svg></button>
         <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
-        <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
+        <button class="landing-start" id="landing-start" type="button">Get started</button>
       </div>
     </div></header>
 
     <main id="landing-main">
       <section class="landing-hero" aria-labelledby="landing-title">
         <div class="landing-hero-copy">
-          <h1 id="landing-title" class="landing-analogy">
-            <span><strong>vscode</strong><span>was a fancy <b>text editor.</b></span></span>
-            <span><strong>${siteNameMarkup()}</strong><span>is a fancy <b>to-do list.</b></span></span>
-          </h1>
+          <h1 id="landing-title" class="landing-analogy"><span>vscode was a fancy <b>text editor.</b></span> <span>${siteNameMarkup()} is a fancy <b>to-do list.</b></span></h1>
           <p class="landing-intro">The interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
           <div class="landing-hero-actions">
             <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
@@ -22175,10 +22301,9 @@ async function renderOAuthConsent() {
 
 function appGrantsCard() {
   return `<div class="card" id="app-grants-card">
-    <div class="section-h">Apps and tokens ${policyTip('Devices, apps and tokens that act as you. Revoking one signs it out everywhere at once.')}</div>
-    <div id="profile-app-grants" aria-live="polite"><p class="task-sub">Loading…</p></div>
+    <div class="section-h section-h-action"><span>Apps and tokens ${policyTip('Devices, apps and tokens that act as you. Revoking one signs it out everywhere at once.')}</span><button class="btn sm" type="button" id="app-token-open">New token</button></div>
     <div class="app-token-new" id="app-token-new"></div>
-    <button class="btn sm" type="button" id="app-token-open">New token</button>
+    <div id="profile-app-grants" aria-live="polite"><p class="task-sub">Loading…</p></div>
   </div>`;
 }
 
@@ -22197,7 +22322,7 @@ async function hydrateAppGrants() {
           · ${grant.lastUsedAt ? `used ${esc(fmtAgo(grant.lastUsedAt))}` : 'never used'}
           · <span title="${esc(`Created ${new Date(grant.createdAt).toLocaleString()}`)}">${grant.kind === 'token' ? 'expires' : 'expires if unused by'} ${esc(day(grant.expiresAt))}</span></p></div>
       <button class="btn sm danger" type="button" data-revoke-grant="${esc(grant.id)}">Revoke</button></div>`).join('')
-    : '<p class="task-sub">Nothing signed in. <code>npx @tavya/cli login</code> signs in a terminal.</p>';
+    : '<p class="task-sub app-grants-empty">Nothing signed in yet. Sign in a terminal with <code>npx @tavya/cli login</code>.</p>';
   box.querySelectorAll('[data-revoke-grant]').forEach((button) => button.addEventListener('click', async () => {
     const name = button.closest('.app-grant-row')?.querySelector('b')?.textContent || 'this';
     if (!confirm(`Revoke ${name}? It is signed out at once.`)) return;

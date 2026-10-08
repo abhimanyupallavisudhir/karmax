@@ -184,6 +184,42 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.result();
   }, 60_000);
 
+  /** #533: a person answered a sub-task's question, and its answer went only to
+   * its parent, which relayed it back. A reply goes to who spoke to the agent. */
+  it("a sub-task's reply to a person goes to that person, and its parent is told it did", async () => {
+    const repo = await h.makeRepo('subtask-reply');
+    const taskId = newId('task');
+    const handle = await start(taskId, { ...input({ taskId, repo, title: 'SubReply', prompt: 'Set it up.\n@incomplete' }),
+      parentTaskId: newId('task') });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('parent');
+    const first = (await view(handle)).messages.find((m: any) => m.role === 'agent');
+    expect(first.to).toBeUndefined();
+    await handle.signal('followUp', { id: 'u-bea', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(),
+      text: 'A. Give me exact steps.\n@incomplete' });
+    await expect.poll(async () => (await view(handle)).messages.at(-1), { timeout: 20_000 })
+      .toMatchObject({ role: 'agent', to: ['user:bea'] });
+    await expect.poll(async () => (await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload.recipients), { timeout: 10_000 })
+      .toEqual([['user:bea']]);
+    // Still the parent's to manage: the sub-task waits on it, as before.
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 10_000 }).toBe('parent');
+    await handle.signal('cancel');
+    await handle.result();
+  });
+
+  it('a question answering a person is asked of them too, not only of the task’s usual audience', async () => {
+    const repo = await h.makeRepo('ask-speaker');
+    const taskId = newId('task');
+    const handle = await start(taskId, input({ taskId, repo, title: 'AskSpeaker', prompt: 'Which colour?\n@incomplete' }));
+    await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 20_000 }).toMatchObject({ kind: 'human', audience: ['@creator'] });
+    await handle.signal('followUp', { id: 'u-bea', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(),
+      text: 'Blue, if it is for the launch?\n@incomplete' });
+    await expect.poll(async () => (await view(handle)).waitingFor?.audience, { timeout: 20_000 }).toEqual(['@creator', 'user:bea']);
+    // Bea is asked by the wait itself; no separate mention.
+    expect(await h.store.eventsOfType(taskId, ['task.mentioned'])).toEqual([]);
+    await handle.signal('cancel');
+    await handle.result();
+  });
+
   it('escalating a pending request redirects it to other people without interrupting the task', async () => {
     const repo = await h.makeRepo('redirect');
     const taskId = newId('task');
