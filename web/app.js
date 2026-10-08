@@ -12362,12 +12362,24 @@ function countMentions(selectors) {
   for (const selector of selectors) if (!selector.startsWith('agent:')) counts[selector] = (counts[selector] || 0) + 1;
   try { localStorage.setItem(`tavya.mentions.${S.organizationId}`, JSON.stringify(counts)); } catch { /* private mode */ }
 }
+// Groups and teams are written as their selectors (@maintainers, @team:leaders),
+// the identifiers agents use too; a person or Avatar has no handle, so by name.
 function mentionPeople() {
   return [
-    ...humanAudienceOptions().map((o) => ({ selector: o.value, label: o.label.replace(/^(Person|Team) · /, ''),
-      kind: o.value.startsWith('user:') ? 'person' : o.value.startsWith('@team:') ? 'team' : 'group' })),
-    ...(S.avatars || []).filter((a) => a.enabled !== false).map((a) => ({ selector: `avatar:${a.id}`, label: a.name, kind: 'avatar' })),
+    ...humanAudienceOptions().map((o) => {
+      const label = o.label.replace(/^(Person|Team) · /, '');
+      const kind = o.value.startsWith('user:') ? 'person' : o.value.startsWith('@team:') ? 'team' : 'group';
+      return { selector: o.value, label, kind, token: kind === 'person' ? `@${label}` : o.value };
+    }),
+    ...(S.avatars || []).filter((a) => a.enabled !== false).map((a) => ({ selector: `avatar:${a.id}`, label: a.name, kind: 'avatar', token: `@${a.name}` })),
   ];
+}
+// Group and team selectors typed by hand address their people just as picking
+// them from the @ menu does: [{ token, selector, index }].
+function typedMentions(text) {
+  const known = new Set(mentionPeople().filter((p) => p.kind === 'group' || p.kind === 'team').map((p) => p.selector));
+  return [...text.matchAll(/(^|[\s(])(@[\w:-]*\w)/g)].filter((m) => known.has(m[2]))
+    .map((m) => ({ token: m[2], selector: m[2], index: m.index + m[1].length }));
 }
 
 // Mentions typed into a box, by box key: [{ token, selector, newAgent? }].
@@ -12464,27 +12476,30 @@ function wireAgentMention(ta, box, v, key) {
       insert(`@${participantLabelOf(agentKey, v)}`, `agent:${agentKey}`, { newAgent: true });
       return renderTaskPage();
     }
-    insert(`@${item.label}`, item.selector);
+    insert(item.token || `@${item.label}`, item.selector);
   };
   const render = () => {
     if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu agent-mention-menu'; menu.setAttribute('role', 'listbox'); document.body.appendChild(menu); }
+    const scrolled = menu.scrollTop;
     let sawAgent = false;
     menu.innerHTML = items.length ? items.map((item, i) => {
       const sep = (item.kind !== 'agent' && item.kind !== 'new' && sawAgent) ? (sawAgent = false, '<div class="am-sep" role="separator"></div>') : '';
       if (item.kind === 'agent' || item.kind === 'new') sawAgent = true;
       const key = item.kind === 'agent' ? `[${item.index}]` : item.kind === 'new' ? '[+]' : '';
       const hint = item.kind === 'agent' ? (item.state === 'running' ? 'working' : item.state === 'queued' ? 'queued' : item.state === 'new' ? 'new' : '')
-        : item.kind === 'people' ? '›' : item.kind === 'avatar' ? 'Avatar' : item.kind === 'team' ? 'Team' : item.kind === 'group' ? '' : '';
+        : item.kind === 'people' ? '›' : item.kind === 'avatar' ? 'Avatar' : '';
+      const named = item.kind === 'group' || item.kind === 'team';
       return `${sep}<div class="wm-opt am-opt ${i === active ? 'active' : ''}" data-i="${i}" role="option">
-        <span class="am-key">${key}</span><span class="wm-main"><span class="wm-ref">${esc(item.label)}</span></span><span class="wm-scope">${esc(hint)}</span></div>`;
+        <span class="am-key">${key}</span><span class="wm-main"><span class="wm-ref">${esc(named ? item.token : item.label)}</span>${
+          named ? `<span class="wm-desc">${esc(item.label)}</span>` : ''}</span><span class="wm-scope">${esc(hint)}</span></div>`;
     }).join('') : '<div class="wm-empty">No one matches</div>';
     menu.querySelectorAll('.am-opt').forEach((el) => {
       el.addEventListener('mousedown', (ev) => { ev.preventDefault(); choose(items[+el.dataset.i]); });
       el.addEventListener('mouseenter', () => { active = +el.dataset.i; menu.querySelectorAll('.am-opt').forEach((o, j) => o.classList.toggle('active', j === active)); });
     });
-    const xy = textareaCaretXY(ta, token.start);
-    menu.style.left = `${Math.min(xy.left, window.innerWidth - 300)}px`;
-    menu.style.top = `${xy.top}px`;
+    placeCaretMenu(menu, ta, token.start);
+    menu.scrollTop = scrolled;
+    revealActiveOption(menu);
   };
   const update = () => {
     token = tokenAt();
@@ -12583,7 +12598,8 @@ function wireFollowups(v) {
       try {
         // A shared conversation addresses whoever was mentioned, in order;
         // new agents travel with the message that calls them.
-        const mentions = shared ? followupMentions(key).map((m) => ({ ...m, index: text.indexOf(m.token) })).filter((m) => m.index >= 0) : [];
+        const picked = shared ? followupMentions(key).map((m) => ({ ...m, index: text.indexOf(m.token) })).filter((m) => m.index >= 0) : [];
+        const mentions = shared ? [...picked, ...typedMentions(text).filter((t) => !picked.some((m) => m.index === t.index))] : [];
         const newAgents = shared ? Object.fromEntries(Object.entries(followupNewAgents(key))
           .filter(([agentKey]) => mentions.some((m) => m.selector === `agent:${agentKey}`))) : {};
         const to = shared ? composeRecipients(text, mentions, defaultRecipientFor(v)) : undefined;
@@ -14753,12 +14769,31 @@ function textareaCaretXY(ta, pos) {
   mirror.appendChild(marker);
   document.body.appendChild(mirror);
   const lineH = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.4;
-  const xy = {
-    top: rect.top + marker.offsetTop - ta.scrollTop + lineH,
-    left: rect.left + marker.offsetLeft - ta.scrollLeft,
-  };
+  const lineTop = rect.top + marker.offsetTop - ta.scrollTop;
+  const xy = { lineTop, top: lineTop + lineH, left: rect.left + marker.offsetLeft - ta.scrollLeft };
   mirror.remove();
   return xy;
+}
+// A caret menu opens below the caret's line, or above it when there is more room
+// there, and stays inside the viewport — scrolling rather than running off it.
+function placeCaretMenu(menu, ta, pos) {
+  const edge = 8, xy = textareaCaretXY(ta, pos);
+  const below = window.innerHeight - xy.top - edge, above = xy.lineTop - edge;
+  menu.style.maxHeight = '';
+  const natural = menu.offsetHeight;
+  const up = natural > below && above > below;
+  const room = Math.max(0, up ? above : below);
+  if (natural > room) menu.style.maxHeight = `${room}px`;
+  menu.style.top = up ? 'auto' : `${xy.top}px`;
+  menu.style.bottom = up ? `${window.innerHeight - xy.lineTop}px` : 'auto';
+  menu.style.left = `${Math.max(edge, Math.min(xy.left, window.innerWidth - menu.offsetWidth - edge))}px`;
+}
+// Keeps a scrolling menu's highlighted option in view.
+function revealActiveOption(menu) {
+  const opt = menu.querySelector('.active');
+  if (!opt) return;
+  if (opt.offsetTop < menu.scrollTop) menu.scrollTop = opt.offsetTop;
+  else if (opt.offsetTop + opt.offsetHeight > menu.scrollTop + menu.clientHeight) menu.scrollTop = opt.offsetTop + opt.offsetHeight - menu.clientHeight;
 }
 
 // Every wiring holds a window-level `resize` listener, and renders replace
@@ -14847,9 +14882,7 @@ function wireWikiMention(ta, projectId) {
       el.addEventListener('mousedown', (ev) => { ev.preventDefault(); choose(items[+el.dataset.i]); });
       el.addEventListener('mouseenter', () => { active = +el.dataset.i; highlight(); });
     });
-    const xy = textareaCaretXY(ta, token.start);
-    menu.style.left = `${Math.min(xy.left, window.innerWidth - 380)}px`;
-    menu.style.top = `${xy.top}px`;
+    placeCaretMenu(menu, ta, token.start);
   };
   const update = async () => {
     token = tokenAt();
@@ -14872,8 +14905,8 @@ function wireWikiMention(ta, projectId) {
     if (!menu) return;
     if (ev.key === 'Escape') { ev.preventDefault(); ev.stopImmediatePropagation(); close(); }
     else if (!items.length) return;
-    else if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active + 1) % items.length; highlight(); }
-    else if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active - 1 + items.length) % items.length; highlight(); }
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active + 1) % items.length; highlight(); revealActiveOption(menu); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active - 1 + items.length) % items.length; highlight(); revealActiveOption(menu); }
     else if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopImmediatePropagation(); choose(items[active]); }
   }, { signal });
   ta.addEventListener('blur', () => setTimeout(close, 150), { signal });

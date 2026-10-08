@@ -3163,6 +3163,9 @@ html[data-theme="dark"] .github-signin-btn:active,
 .agent-mention-menu { min-width: 240px; }
 .agent-mention-menu .am-key { flex: none; width: 26px; font: 11px var(--font-mono); color: var(--ink-3); }
 .agent-mention-menu .am-sep { height: 1px; margin: 4px 6px; background: var(--line); }
+.agent-mention-menu .wm-main { flex-direction: row; align-items: baseline; gap: 8px; }
+.agent-mention-menu .wm-ref { flex: none; max-width: 100%; }
+.agent-mention-menu .wm-desc { flex: 1; min-width: 0; }
 .followup-new-agent { margin-top: 8px; padding: 8px 10px; border: 1px dashed color-mix(in srgb, var(--accent) 40%, var(--line)); border-radius: 8px; background: var(--surface); }
 .followup-new-agent .parameter-fields .agent-field { margin: 0; }
 .followup-new-agent .fna-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12.5px; }
