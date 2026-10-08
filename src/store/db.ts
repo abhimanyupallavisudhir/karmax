@@ -8925,8 +8925,6 @@ const RESERVED_ROUTE_SLUGS = new Set([
   'api', 'ws', 'mcp', 'oauth',
   // app sign-in approval (web/app.js renderDeviceApproval)
   'device',
-  // public pages (web/app.js boot: renderDocsPage, renderPricing, renderLegal*)
-  'docs', 'pricing', 'legal',
   // top-level routes / legacy org paths (an org slug is the first URL segment)
   'invite', 'projects', 'organization', 'organizations', 'installation',
   // `for:me` is the signed-in person in every search (and /me is kept free)
@@ -8937,12 +8935,17 @@ const RESERVED_ROUTE_SLUGS = new Set([
   'tasks', 'queue', 'activity',
 ]);
 
+/** Top-level public pages (web/app.js boot: renderDocsPage, renderPricing,
+ *  renderLegal*). Only an organization owns the first URL segment, so only an
+ *  organization can be shadowed by them; a project at /<org>/docs is fine. */
+const RESERVED_ORGANIZATION_SLUGS = new Set(['docs', 'pricing', 'legal']);
+
 /** Throw a user-facing error if `name` (or an explicit `slug`) resolves to a
  *  reserved routing word. Applied at the single creation choke points for
  *  projects and organizations. */
 function assertRoutableName(kind: 'project' | 'organization', name: string, slug?: string): void {
   const s = slugify(slug ?? name);
-  if (RESERVED_ROUTE_SLUGS.has(s))
+  if (RESERVED_ROUTE_SLUGS.has(s) || (kind === 'organization' && RESERVED_ORGANIZATION_SLUGS.has(s)))
     throw new Error(`"${s}" is a reserved name and can't be used for a ${kind}. Please choose a different name.`);
 }
 

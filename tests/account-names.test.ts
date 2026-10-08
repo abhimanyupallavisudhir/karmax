@@ -43,6 +43,9 @@ describe('canonicalAccountName (CI-38b)', () => {
     const store = await Store.create(':memory:');
     try {
       for (const name of ['Docs', 'Pricing', 'Legal']) await expect(store.createOrganization({ name })).rejects.toThrow(/reserved/);
+      // A project lives under its organization (/<org>/docs), so the name stays free there.
+      const acme = await store.createOrganization({ name: 'Acme' });
+      for (const name of ['docs', 'pricing', 'legal']) expect((await store.createProject(name, {}, acme.id)).name).toBe(name);
     } finally {
       await store.close();
     }
@@ -79,6 +82,9 @@ describe('reserved account names', () => {
     const store = await Store.create(':memory:');
     try {
       for (const name of ['Docs', 'Pricing', 'Legal']) await expect(store.createOrganization({ name })).rejects.toThrow(/reserved/);
+      // A project lives under its organization (/<org>/docs), so the name stays free there.
+      const acme = await store.createOrganization({ name: 'Acme' });
+      for (const name of ['docs', 'pricing', 'legal']) expect((await store.createProject(name, {}, acme.id)).name).toBe(name);
     } finally {
       await store.close();
     }
