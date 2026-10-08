@@ -207,7 +207,7 @@ describe.each(storeBackends)('model logins in the vault ($name)', ({ open }) => 
     const manager = new LoginManager(homes, (provider, home) => ({
       cmd: process.execPath,
       args: ['-e', `require('fs').writeFileSync(require('path').join(${JSON.stringify(home)}, '.credentials.json'), ${JSON.stringify(claudeCredential('fresh', 'fresh-r'))}); console.log('https://claude.ai/oauth/authorize?code=1')`],
-      env: { ...process.env },
+      env: { ...process.env } as Record<string, string>,
     }));
     const states: boolean[] = [];
     manager.onStateChange((state) => { states.push(state.loggedIn); });
