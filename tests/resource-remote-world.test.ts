@@ -71,6 +71,10 @@ async function fixture() {
   return { dir, store, project, resources, attachment, sandbox, worlds, gatewayUrl };
 }
 
+// Each test runs real restic jobs in simulated worlds: ~8–27 s locally, and a
+// loaded CI runner is up to 2× slower (CI #1586 timed out the merge test at 30 s).
+const REMOTE_WORLD_TIMEOUT_MS = 120_000;
+
 it('restores into and saves from a remote world with restic running there as a durable job', async () => {
   const f = await fixture();
   const corpus = Array.from({ length: 50 }, (_, i) => ({ path: `pages/${i}.txt`, data: crypto.randomBytes(1000 + i) }));
@@ -104,7 +108,7 @@ it('restores into and saves from a remote world with restic running there as a d
   expect(fs.readdirSync(path.join(world.handle.root, SYSTEM_JOB_ROOT)).length).toBeGreaterThan(0);
   expect(await listJobs(world)).toEqual([]);
   void progress;
-});
+}, REMOTE_WORLD_TIMEOUT_MS);
 
 it('reattaches to its save still running in the world instead of starting another', async () => {
   const f = await fixture();
@@ -127,7 +131,7 @@ it('reattaches to its save still running in the world instead of starting anothe
   expect(b.snapshot).toBe(a.snapshot);
   // One save ran, not two: a single snapshot in the repository besides the seed's.
   expect(await f.store.listRepositoryFiles(repository.name, 'snapshots')).toHaveLength(2);
-});
+}, REMOTE_WORLD_TIMEOUT_MS);
 
 it('merges a newer publication into a remote world, restoring only what changed there', async () => {
   const f = await fixture();
@@ -158,4 +162,4 @@ it('merges a newer publication into a remote world, restoring only what changed 
   const restores = fs.readdirSync(path.join(root, SYSTEM_JOB_ROOT))
     .map((id) => fs.readFileSync(path.join(root, SYSTEM_JOB_ROOT, id, 'command'), 'utf8')).filter((command) => /\brestore\b/.test(command));
   expect(restores.filter((command) => command.includes('--include-file'))).toHaveLength(1);
-});
+}, REMOTE_WORLD_TIMEOUT_MS);
