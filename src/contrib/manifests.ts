@@ -62,6 +62,10 @@ const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base
 // opened against it or the merge enqueue). software-dev re-reads `target` at
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
+// Per-repository exceptions to base/target (src/platform/repo-branches.ts). The
+// form draws it under base/target as "Different branches per repo"; it is not
+// global because only a project knows its repositories.
+const repoBranchesField = (): FieldSpec => ({ name: 'repoBranches', type: 'repoBranches', label: 'Different branches per repo', help: 'Give each repository its own base and target branch. Otherwise every repository uses the same ones.', scopes: ['task', 'project'], bind: 'top' });
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repositories', help: 'One per line. Local worlds accept filesystem paths; E2B accepts SSH Git URLs (git@github.com:org/repo.git). Multiple repos are checked out in separate world subdirectories.', scopes: ['project'], bind: 'project' });
 // Wire compatibility for old settings and version-pinned tasks. The browser no
 // longer renders this retired host-file-copy control; typed project resources
@@ -472,6 +476,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       agentField('do', 'Agent', 'always'),
       baseField(),
       targetField(),
+      repoBranchesField(),
       agentEnvironmentField(),
       reposField(),
       multiPrField(),
@@ -549,7 +554,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Review machinery.
     roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), RESPONDER_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), repoBranchesField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
   },
   {
     name: 'merge-only',

@@ -49,6 +49,7 @@ import { validCodexSessionId } from '../agent/codex-history.js';
 import { conversionWarningsHeader, exportConversationWithPanagent, type PanagentWarning } from '../agent/panagent.js';
 import { DEFAULT_MCP_CONNECTIONS, defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
+import { assertRepoBranches, effectiveRepoBranches, repoBranchRows, REPO_BRANCHES_PARAM, type RepoBranches } from '../platform/repo-branches.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { QRY_AGENT_QUEUE, accountCoordinatorId, agentQueueId } from '../coordinators/names.js';
 import { hostedMonthlyPriceCents } from '../domain/entitlements.js';
@@ -8001,15 +8002,29 @@ export class Gateway {
         if (project?.config.worldProvider !== undefined) projectVals.worldProvider = project.config.worldProvider;
         // Detect the effective repository policy so placeholders agree with the
         // branch provisioning and pull requests will actually use.
-        const repo0 = project
-          ? effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config)[0]
-          : undefined;
-        const branches = project ? await repositoryBranchDefaults(store, project, repo0) : undefined;
-        const enrich = async (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
+        const repos = project
+          ? effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config)
+          : [];
+        const branches = project ? await repositoryBranchDefaults(store, project, repos[0]) : undefined;
+        const hasRepoBranches = m.params.some((field) => field.name === REPO_BRANCHES_PARAM);
+        const enrich = async (vals: Record<string, unknown>, lower: Record<string, unknown>, repoRows = false) => {
           const out = (await this.enrichAgentDefaults(m, vals, projectId, organizationId ?? undefined));
+          const explicit = {
+            base: !(lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined),
+            target: !(lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined),
+          };
           if (branches) {
-            if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = branches.base;
-            if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = branches.target;
+            if (!explicit.base) out.base = branches.base;
+            if (!explicit.target) out.target = branches.target;
+          }
+          // Every repository's inherited pair, in project order: the form draws
+          // the per-repository rows from it (the first row is base/target).
+          delete out[REPO_BRANCHES_PARAM];
+          if (repoRows && project && hasRepoBranches && repos.length > 1 && typeof out.base === 'string' && out.base) {
+            const common = { base: out.base, target: typeof out.target === 'string' && out.target ? out.target : out.base };
+            const perRepo = await effectiveRepoBranches(store, project, vals[REPO_BRANCHES_PARAM] as RepoBranches | undefined,
+              repos, common, explicit);
+            out[REPO_BRANCHES_PARAM] = repoBranchRows(repos, common, perRepo);
           }
           return out;
         };
@@ -8019,8 +8034,8 @@ export class Gateway {
         const globalQuickVals = (await quickGlobalSettingsFor(gs, wf, organizationId ?? undefined));
         const projectQuickVals = project ? (await quickProjectSettingsFor(gs, project.id, wf)) : {};
         return this.json(res, 200, {
-          task: { own: {}, inherited: (await enrich(resolveParams(m, { project: projectVals, global: globalVals }), {})) },
-          project: { own: projectVals, inherited: (await enrich(resolveParams(m, { global: globalVals }), projectVals)) },
+          task: { own: {}, inherited: (await enrich(resolveParams(m, { project: projectVals, global: globalVals }), {}, true)) },
+          project: { own: projectVals, inherited: (await enrich(resolveParams(m, { global: globalVals }), projectVals, true)) },
           global: { own: globalVals, inherited: (await enrich(resolveParams(m, {}), { ...projectVals, ...globalVals })) },
           globalQuick: { own: globalQuickVals, inherited: (await enrich(resolveParams(m, { global: globalVals }), globalQuickVals)) },
           projectQuick: {
@@ -9787,6 +9802,8 @@ function normalizeConfig(
 function hostedSettingsValues(values: Record<string, unknown>, hosted: boolean): Record<string, unknown> {
   if (hosted && values.remote === 'none')
     throw new ValidationError('Hosted GitHub projects cannot use remote policy "none"; use "pr" or the advanced direct-push policy.');
+  try { assertRepoBranches(values[REPO_BRANCHES_PARAM]); }
+  catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
   return values;
 }
 

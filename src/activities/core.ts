@@ -120,6 +120,7 @@ import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { forkDevelopmentSources, forkRecordedAuthority, type ForkWorldSource } from '../world/fork.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
+import { completeRepoBranch, repoBranchEntry, REPO_BRANCHES_PARAM, type RepoBranches } from '../platform/repo-branches.js';
 import { syncLocalTarget, type LocalTargetSyncResult } from '../world/target-sync.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import { activateProjectRuntime, selectProjectEnvironment } from '../world/project-runtime.js';
@@ -1464,6 +1465,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ?? (candidate.baseBranch ? base : commonBranchesResolved ? args.target ?? base : candidate.repository.defaultBranch);
         return [[source, { base, target }]];
       }));
+      // The task's own per-repository branches ("Different branches per repo")
+      // were resolved to complete pairs at queue time; they outrank catalog
+      // policy. Never for a child stack, which follows its parent everywhere.
+      if (!childStack) {
+        const perRepo = taskRecord?.params[REPO_BRANCHES_PARAM] as RepoBranches | undefined;
+        developmentSources.forEach((requested, index) => {
+          const entry = repoBranchEntry(perRepo, requested) ?? repoBranchEntry(perRepo, transportSources[index]!);
+          if (entry) repositoryBranches[worldSources[index]!] = completeRepoBranch(entry, {
+            base: args.base, target: args.target ?? args.base });
+        });
+      }
       const repositoryAuthorities: Record<string, 'project' | 'origin'> = Object.fromEntries(worldSources.flatMap((source, index) =>
         githubIsAuthority && githubSlug(transportSources[index]!) ? [[source, 'origin' as const]] : []));
       forkRecordedAuthority(forkCheckpoint, requestedSources).forEach((authority, index) => {

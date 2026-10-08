@@ -38,6 +38,7 @@ import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGr
 import { parseQuery } from '../domain/query-language.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, repositoryBranchDefaults } from './branch-defaults.js';
+import { assertRepoBranches, effectiveRepoBranches, REPO_BRANCHES_PARAM, type RepoBranches } from './repo-branches.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -196,6 +197,14 @@ const RECOVERABLE_WORKFLOWS = new Set(['software-dev', 'goal']);
 function stripPlatformMetadata<T extends Record<string, unknown>>(params: T): T {
   for (const key of Object.keys(params)) if (key.startsWith('_')) delete params[key];
   return params;
+}
+
+/** A queued task's per-repository branches are execution state, like base and
+ * target: persist the resolved pairs (or `{}` over a stale own value). */
+function repoBranchesSnapshot(resolved: ValueMap, own: Record<string, unknown>): ValueMap {
+  const value = resolved[REPO_BRANCHES_PARAM];
+  if (value && typeof value === 'object' && Object.keys(value).length) return { [REPO_BRANCHES_PARAM]: value };
+  return own[REPO_BRANCHES_PARAM] !== undefined ? { [REPO_BRANCHES_PARAM]: {} } : {};
 }
 
 /** The `agent:agent-N` specs of agents called into a task with `@`. */
@@ -999,6 +1008,8 @@ export class KarmaxApi {
       if (value === undefined || value === null || value === '') continue;
       if (typeof value !== 'string' || !validGitBranch(value.trim())) throw new Error(`invalid ${key} branch name`);
     }
+    try { assertRepoBranches(values[REPO_BRANCHES_PARAM]); }
+    catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
   }
 
   private async assertRepositoriesValid(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
@@ -1263,6 +1274,7 @@ export class KarmaxApi {
           // different base from changed project settings.
           ...(!args.draft && typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
           ...(!args.draft && typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
+          ...(!args.draft ? repoBranchesSnapshot(resolved, taskOverrides) : {}),
           [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
           profiles: args.profiles,
           draft: !!args.draft,
@@ -1542,13 +1554,25 @@ export class KarmaxApi {
     const firstSet = (name: string) => layers.map((l) => l?.[name]).find((v) => v !== undefined && v !== null && v !== '');
     const explicitBase = firstSet('base');
     const explicitTarget = firstSet('target');
-    const repo0 = effectiveRepos(resolved, project.config)[0];
+    const repos = effectiveRepos(resolved, project.config);
+    const repo0 = repos[0];
     if (repo0 && (!explicitBase || !explicitTarget)) {
       const branches = await repositoryBranchDefaults(this.deps.store, project, repo0);
       if (branches) {
         if (!explicitBase) resolved.base = branches.base;
         if (!explicitTarget) resolved.target = branches.target;
       }
+    }
+    // Base/target are the first repository's; the others either have their own
+    // (a layer chose them) or follow their own defaults where nobody chose one.
+    // Resolved to complete pairs so provisioning never re-derives them.
+    delete resolved[REPO_BRANCHES_PARAM];
+    if (repos.length > 1 && typeof resolved.base === 'string' && resolved.base) {
+      const layered = layers.map((l) => l?.[REPO_BRANCHES_PARAM]).find((v) => v !== undefined && v !== null) as RepoBranches | undefined;
+      const common = { base: resolved.base, target: typeof resolved.target === 'string' && resolved.target ? resolved.target : resolved.base };
+      const perRepo = await effectiveRepoBranches(this.deps.store, project, layered, repos, common,
+        { base: !!explicitBase, target: !!explicitTarget });
+      if (Object.keys(perRepo).length) resolved[REPO_BRANCHES_PARAM] = perRepo;
     }
     return resolved;
   }
@@ -1742,6 +1766,7 @@ export class KarmaxApi {
     (await this.deps.store.patchTaskParams(task.id, {
       ...(typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
       ...(typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
+      ...repoBranchesSnapshot(resolved, overrides),
       [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
     }));
     // The confirmer belongs to the logical task, not an attempt. Snapshotting it

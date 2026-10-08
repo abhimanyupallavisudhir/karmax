@@ -1395,7 +1395,7 @@ export interface ActionArg {
 
 // ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
 
-export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer' | 'responder';
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'repoBranches' | 'agent' | 'confirmer' | 'responder';
 /** Which surfaces a field appears on. */
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
@@ -1785,6 +1785,9 @@ export interface TaskInput {
   files?: FileRef[];
   base?: string;
   target?: string;
+  /** Repositories whose branches differ from base/target (src/platform/repo-branches.ts).
+   *  Provisioning reads the task record's copy; this records the policy in history. */
+  repoBranches?: Record<string, { base: string; target: string }>;
   /** Existing branch to merge (merge-only workflow). */
   branch?: string;
   command?: string;

@@ -1135,19 +1135,151 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   // of them present, in this order); the rest are skipped where they'd fall.
   const inlineRow = ['base', 'target', 'worldProvider'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
   const inlineNames = new Set(inlineRow.map((f) => f.name));
+  const perRepo = repoBranchesModel(fields, own, inherited);
+  if (perRepo) inlineNames.add('repoBranches');
   let inlineDrawn = false;
   const html = [];
   for (const f of fields) {
     if (inlineNames.has(f.name) && inlineRow.length > 1) {
       if (!inlineDrawn) {
         inlineDrawn = true;
-        html.push(`<div class="branch-pair${inlineRow.length === 3 ? ' cols-3' : ''}">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`);
+        const columns = inlineRow.map((g) => perRepo && (g.name === 'base' || g.name === 'target')
+          ? repoBranchColumnHtml(g, own[g.name], inherited[g.name], altFor?.(g), perRepo)
+          : renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('');
+        const pair = `<div class="branch-pair${inlineRow.length === 3 ? ' cols-3' : ''}">${columns}</div>`;
+        html.push(perRepo ? repoBranchesHtml(perRepo, pair) : pair);
       }
       continue;
     }
+    if (f.type === 'repoBranches') continue; // drawn with base/target, or not at all (one repository)
     html.push(renderField(f, own[f.name], inherited[f.name], withPromptChips && f.name === 'prompt', altFor?.(f)));
   }
   return html.join('');
+}
+
+// ── "Different branches per repo" (src/platform/repo-branches.ts) ────────────
+// Base and target are the first repository's and every other repository's
+// default. Ticking the box gives the Base and Target columns one input per
+// repository; the Agent environment stays one. The inherited value lists every
+// repository's pair in project order, which is also the list of rows to draw.
+const repoBranchLabel = (repo) => String(repo).replace(/\.git$/i, '').split(/[/:]/).filter(Boolean).pop() || repo;
+function completeRepoBranch(entry, common) {
+  const base = (entry?.base || '').trim() || common.base;
+  return { base, target: (entry?.target || '').trim() || ((entry?.base || '').trim() ? base : common.target) };
+}
+function repoBranchEntry(map, repo) {
+  if (!map || typeof map !== 'object') return undefined;
+  const key = Object.keys(map).find((candidate) => candidate === repo || sameRepoSpelling(candidate, repo));
+  return key === undefined ? undefined : map[key];
+}
+// Spelling-tolerant identity, like the server's sameRepository: scheme, user,
+// "host:path" vs "host/path", ".git" and case.
+function sameRepoSpelling(a, b) {
+  const norm = (value) => String(value).trim().toLowerCase().replace(/\.git$/, '').replace(/\/+$/, '')
+    .replace(/^[a-z+]+:\/\//, '').replace(/^[^@/]+@/, '').replace(/^([^/:]+)(?::\d+)?[:/]/, '$1/');
+  return norm(a) === norm(b);
+}
+function repoBranchesModel(fields, own, inherited) {
+  const field = fields.find((f) => f.type === 'repoBranches');
+  const rows = inherited?.repoBranches;
+  const repos = rows && typeof rows === 'object' ? Object.keys(rows) : [];
+  if (!field || repos.length < 2 || !fields.some((f) => f.name === 'base')) return null;
+  const inheritedCommon = completeRepoBranch(rows[repos[0]], { base: 'main', target: 'main' });
+  const common = {
+    base: eff(own?.base, inherited?.base) || inheritedCommon.base,
+    target: eff(own?.target, inherited?.target) || inheritedCommon.target,
+  };
+  const value = own?.repoBranches !== undefined && own?.repoBranches !== null ? own.repoBranches : rows;
+  const pairs = repos.map((repo, index) => {
+    const entry = index === 0 ? undefined : repoBranchEntry(value, repo);
+    const pair = entry ? completeRepoBranch(entry, common) : common;
+    return { repo, ...pair, own: !!entry && (pair.base !== common.base || pair.target !== common.target) };
+  });
+  return { field, repos, rows, pairs, checked: pairs.some((pair) => pair.own) };
+}
+function repoBranchColumnHtml(f, own, inherited, alt, model) {
+  const key = f.name;
+  const tag = (repo) => `<span class="rb-repo" title="${esc(repo)}">${esc(repoBranchLabel(repo))}</span>`;
+  const primary = renderField(f, own, inherited, false, alt)
+    .replace(/<input [^>]*\/>/, (input) => `<div class="rb-row">${tag(model.repos[0])}${input}</div>`);
+  const extra = model.pairs.slice(1).map((pair) => `<div class="rb-row rb-extra">${tag(pair.repo)}<input type="text" class="rb-input"
+    data-rb-repo="${esc(pair.repo)}" data-rb-key="${key}" ${pair.own ? 'data-rb-own="1"' : ''} value="${esc(pair[key])}"
+    aria-label="${esc(`${repoBranchLabel(pair.repo)} ${key}`)}" /></div>`).join('');
+  return primary.replace(/<\/div>$/, `${extra}</div>`);
+}
+function repoBranchesHtml(model, pair) {
+  const tagWidth = Math.max(...model.repos.map((repo) => repoBranchLabel(repo).length)) + 3;
+  return `<div class="repo-branches${model.checked ? ' per-repo' : ''}" style="--rb-tag:${tagWidth}ch">${pair}
+    <div class="rb-toggle" data-row="repoBranches"><label><input type="checkbox" data-field="repoBranches" data-ftype="repoBranches"
+      ${inhAttr(model.rows)} ${model.checked ? 'checked' : ''} /> ${esc(model.field.label)}</label>${model.field.help ? policyTip(model.field.help) : ''}</div>
+  </div>`;
+}
+// The common pair a form currently shows, and the one it inherited.
+function repoBranchCommon(box, attr) {
+  const read = (name) => {
+    const el = box.querySelector(`[data-field="${name}"]`);
+    const inherited = JSON.parse(el?.getAttribute('data-inherit') || 'null');
+    return attr === 'value' ? (el?.value || '').trim() || inherited || '' : inherited || '';
+  };
+  const base = read('base');
+  return { base, target: read('target') || base };
+}
+// Rows the user has not given their own branches follow the first repository
+// (an untouched target follows its row's own base once that base is changed).
+function syncRepoBranchRows(box) {
+  const common = repoBranchCommon(box, 'value');
+  for (const row of box.querySelectorAll('[data-rb-key="base"]')) {
+    const repo = row.dataset.rbRepo;
+    const target = box.querySelector(`[data-rb-key="target"][data-rb-repo="${CSS.escape(repo)}"]`);
+    if (!row.dataset.rbOwn) row.value = common.base;
+    if (target && !target.dataset.rbOwn) target.value = row.dataset.rbOwn ? row.value : common.target;
+  }
+}
+function installRepoBranchSync() {
+  const handle = (event) => {
+    const box = event.target.closest?.('.repo-branches');
+    if (!box) return;
+    if (event.target.matches('[data-ftype="repoBranches"]')) {
+      box.classList.toggle('per-repo', event.target.checked);
+      return;
+    }
+    if (event.target.matches('.rb-input')) event.target.dataset.rbOwn = '1';
+    syncRepoBranchRows(box);
+  };
+  document.addEventListener('input', handle);
+  document.addEventListener('change', handle);
+}
+// Only repositories whose pair differs from the first's; `{}` when unticked.
+function readRepoBranches(box) {
+  if (!box.querySelector('[data-ftype="repoBranches"]')?.checked) return {};
+  const common = repoBranchCommon(box, 'value');
+  const out = {};
+  for (const row of box.querySelectorAll('[data-rb-key="base"]')) {
+    const repo = row.dataset.rbRepo;
+    const target = box.querySelector(`[data-rb-key="target"][data-rb-repo="${CSS.escape(repo)}"]`);
+    const pair = completeRepoBranch({ base: row.value, target: target?.value }, common);
+    if (pair.base !== common.base || pair.target !== common.target) out[repo] = pair;
+  }
+  return out;
+}
+// The value to store, or undefined to keep inheriting. A changed common pair
+// stores the rows as shown: inherited rows were worked out for the old pair.
+function collectRepoBranches(root) {
+  const toggle = root.querySelector('[data-ftype="repoBranches"]');
+  const box = toggle?.closest('.repo-branches');
+  if (!box) return undefined;
+  const rows = JSON.parse(toggle.getAttribute('data-inherit') || 'null') || {};
+  const repos = Object.keys(rows);
+  const inheritedCommon = completeRepoBranch(rows[repos[0]], repoBranchCommon(box, 'inherit'));
+  const inherited = {};
+  for (const repo of repos.slice(1)) {
+    const pair = completeRepoBranch(rows[repo], inheritedCommon);
+    if (pair.base !== inheritedCommon.base || pair.target !== inheritedCommon.target) inherited[repo] = pair;
+  }
+  const value = readRepoBranches(box);
+  const common = repoBranchCommon(box, 'value');
+  const commonChanged = common.base !== inheritedCommon.base || common.target !== inheritedCommon.target;
+  return commonChanged || !sameJson(value, inherited) ? value : undefined;
 }
 
 function renderAgentField(f, spec, inherited, opts) {
@@ -1750,6 +1882,11 @@ function collectForm(root, fields) {
       const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
       const route = readResponder(box);
       if (f.required || !sameJson(normResponder(route), normResponder(responderOf(inh)))) out[f.name] = route;
+      continue;
+    }
+    if (f.type === 'repoBranches') {
+      const value = collectRepoBranches(root);
+      if (value !== undefined) out[f.name] = value;
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -3425,6 +3562,7 @@ function installShellListeners() {
   installLinkRouter();
   installTagRouter();
   installInfoDotTips();
+  installRepoBranchSync();
   // A background repaint deferred to protect an open menu / text-selection gets
   // flushed once that interaction releases (setTimeout lets focus + selection
   // settle first). selectionchange fires constantly, so it only pokes the flush
@@ -11531,7 +11669,10 @@ function paramsSection(v) {
   const rank = (f) => (f.bind === 'prompt' ? -1 : f.type === 'agent' && !f.calledAgent ? 0 : f.type === 'responder' ? 1
     : f.type === 'confirmer' ? 2 : f.calledAgent ? 3 : 4);
   const agentFields = fields.filter((f) => rank(f) < 4).sort((a, b) => rank(a) - rank(b));
-  const whereFields = fields.filter((f) => rank(f) === 4);
+  // Per-repository branches show only where a task has them (a queued task
+  // stores the resolved pairs; the defaults' rows describe new tasks).
+  const whereFields = fields.filter((f) => rank(f) === 4
+    && (f.type !== 'repoBranches' || Object.keys(rec?.params?.repoBranches || {}).length));
   // Base, target and environment share one row, as in the task form.
   const pair = ['base', 'target', 'worldProvider'].map((name) => whereFields.find((f) => f.name === name)).filter(Boolean);
   const where = [
@@ -11613,6 +11754,8 @@ function displayParam(f, val) {
       ? `agent (${[route.provider, route.model].filter(Boolean).join(' · ') || 'default'})`
       : `human (${(route.audience || ['@creator']).join(', ')})`;
   }
+  if (f.type === 'repoBranches') return Object.entries(val).map(([repo, pair]) =>
+    `${repoBranchLabel(repo)}: ${pair?.base || ''}${pair?.target && pair.target !== pair.base ? ` → ${pair.target}` : ''}`).join(', ') || '(none)';
   if (Array.isArray(val)) return val.join(', ') || '(none)';
   if (typeof val === 'boolean') return val ? 'on' : 'off';
   return String(val);
@@ -13524,7 +13667,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'worldProvider', 'multiPr', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'repoBranches', 'worldProvider', 'multiPr', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // Review route and Responder stay shared/common values on the wire, but their
 // controls live in the Agent card.
 const agentRouteSettingsFields = (scope) => ['responder', 'confirm']

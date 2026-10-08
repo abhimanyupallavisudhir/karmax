@@ -2303,6 +2303,25 @@ html[data-theme="dark"] .github-signin-btn:active,
 .branch-pair.cols-3 { grid-template-columns: 1fr 1fr 1fr; }
 .branch-pair .form-row { min-width: 0; }
 @media (max-width: 700px) { .branch-pair, .branch-pair.cols-3 { grid-template-columns: 1fr; } }
+/* "Different branches per repo": one input per repository in Base and Target. */
+.rb-row { display: flex; min-width: 0; }
+.rb-row input { flex: 1; min-width: 0; }
+.rb-repo, .rb-extra { display: none; }
+.per-repo .rb-extra { display: flex; }
+.per-repo .rb-repo {
+  display: flex; align-items: center; flex: 0 0 auto; width: var(--rb-tag, auto); max-width: 45%; padding: 0 9px; box-sizing: border-box;
+  border: 1px solid var(--line); border-right: 0; border-radius: 8px 0 0 8px; background: var(--surface);
+  color: var(--ink-3); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.per-repo .rb-repo + input { border-radius: 0 8px 8px 0; }
+/* Side by side, the Base column already names each row's repository. */
+@media (min-width: 701px) {
+  .per-repo [data-row="target"] .rb-repo { display: none; }
+  .per-repo [data-row="target"] .rb-repo + input { border-radius: 8px; }
+}
+.rb-toggle { display: flex; align-items: center; gap: 6px; margin: -6px 0 14px; color: var(--ink-3); font-size: 12px; }
+.rb-toggle label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.rb-toggle input { width: auto; margin: 0; }
 
 /* ── 5-field cron grid (task form) ─────────────────────── */
 /* Cron field values are a few characters — compact cells, and minmax(0,1fr) +
