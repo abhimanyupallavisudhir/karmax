@@ -13903,7 +13903,7 @@ function settingsForms(scope, projectId) {
       <section class="td-section td-agent"><div id="profiles-list-${scope}">Loading…</div></section>
       <section class="td-section td-routes"><div id="review-route-${scope}">Loading…</div></section>
       <section class="td-section td-computer" data-wf="__common__" data-schema-wf="software-dev" data-part="computer">
-        <div class="wf-form parameter-fields">${renderFields(computerSettingsFields(scope))}</div>
+        <div class="wf-form parameter-fields">Loading…</div>
       </section>
       <section class="td-section td-where" data-wf="__common__" data-schema-wf="software-dev">
         <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
