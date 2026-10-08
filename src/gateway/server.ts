@@ -4242,7 +4242,8 @@ export class Gateway {
             const spec = (await environments.spec(project.id));
             if (!spec) return this.json(res, 400, { error: 'accept or configure an environment proposal first' });
             const body = await this.body(req);
-            const provider = String(body.provider ?? (await store.effectiveProjectConfig(project)).worldProvider ?? 'worktree');
+            const executionConfig = (await store.effectiveProjectConfig(project));
+            const provider = String(body.provider ?? executionConfig.worldProvider ?? 'worktree');
             const digest = environments.digest(spec);
             const connection = ['e2b', 'daytona'].includes(provider)
               ? (await this.deps.providerConnections?.resolve(project.organizationId, provider)) : undefined;
