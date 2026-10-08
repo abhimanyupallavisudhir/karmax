@@ -21,11 +21,14 @@ import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 import { exposeRemoteNodeCommand, installRemoteNodeCommand, PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from './remote-node.js';
 import { collectStartupProbe, StartupProtocolTrace } from './startup-diagnostics.js';
 import { BRAND } from '../domain/brand.js';
+import { acpHomeEnv, isAcpProvider } from './provider-registry.js';
+import { OPENCODE_PACKAGE as PINNED_OPENCODE_PACKAGE } from './acp-packages.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
 const REMOTE_ROOT = '.karmax-injection/agent';
 const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? PINNED_CODEX_PACKAGE;
+const opencodePackage = () => process.env.KARMAX_REMOTE_OPENCODE_PACKAGE ?? PINNED_OPENCODE_PACKAGE;
 const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? PINNED_REMOTE_NODE_VERSION;
 const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? PINNED_REMOTE_NPM_VERSION;
 const READY = '\u001eKARMAX_AGENT_READY\u001e';
@@ -40,6 +43,10 @@ export async function installMemoryGuard(world: World): Promise<void> {
  * even with fresh ID/access tokens. Remote worlds receive this inert value so
  * the real rotating credential remains exclusively host-owned. */
 export const CODEX_REMOTE_REFRESH_SENTINEL = 'karmax-host-managed-refresh';
+/** The same withholding for an OpenCode login's OAuth entries (`auth.json`
+ * `{ type: 'oauth', refresh, access, expires }`): the sandbox gets the access
+ * token only, so it can never rotate and revoke the host's refresh token. */
+export const OPENCODE_REMOTE_REFRESH_SENTINEL = 'karmax-host-managed-refresh';
 
 /** A V2 provider world is the execution boundary: native agent subprocesses must
  * run there, not on the control-plane host against a virtual cwd. */
@@ -152,15 +159,19 @@ export function prewarmRemoteAgentHome(world: World, provider: Provider, localHo
   const runtimeWorld = world.withoutProjectEnvironment?.() ?? world;
   if (!isRemoteAgentWorld(runtimeWorld) || bootstraps.has(runtimeWorld)) return;
   const browser = mcpConnections ? mcpConnections.some((id) => id.startsWith('browser:')) : !!localHome && !!configuredBrowser(localHome, provider);
-  if (!localHome && !browser) return;
+  // An ACP harness always has a sandbox home, with or without a login.
+  const acp = isAcpProvider(provider);
+  if (!localHome && !browser && !acp) return;
   try {
-    const request: BootstrapRequest = localHome
+    const request: BootstrapRequest = acp
+      ? acpBootstrapRequest(runtimeWorld, provider, path.posix.join(runtimeWorld.handle.root, remoteAcpHomeRelative(provider, localHome)), session)
+      : localHome
       ? bootstrapRequest(runtimeWorld, provider, path.posix.join(runtimeWorld.handle.root, remoteAgentHomeRelative(provider, localHome)),
         session, hostHistoryFiles(localHome, provider, session))
       : { key: '' };
     const bootstrap = runBootstrap(runtimeWorld, { ...request, browser });
     bootstrap.catch(() => undefined);
-    const entry: WorldBootstrap = { ...(localHome ? { key: request.key } : {}), bootstrap };
+    const entry: WorldBootstrap = { ...(localHome || acp ? { key: request.key } : {}), bootstrap };
     if (browser) {
       entry.browser = bootstrap.then((prepared) => readyBrowser(runtimeWorld, prepared.runtimeBin, prepared.browser).catch((error) => {
         if (error && typeof error === 'object') browserFailures.add(error);
@@ -228,6 +239,8 @@ interface RemoteBootstrap {
   workDirectory: boolean;
   /** Undefined when the probe did not run; readyBrowser then probes step by step. */
   browser?: BrowserProbe;
+  /** Digest of the ACP session export the sandbox last confirmed it holds. */
+  acpSession?: string;
 }
 
 interface BootstrapRequest {
@@ -239,6 +252,11 @@ interface BootstrapRequest {
   systemCodexConfig?: boolean;
   /** Probe the browser tools' readiness (LT-22). */
   browser?: boolean;
+  /** Report which export of this ACP session the sandbox holds (remote-acp.ts). */
+  acpSession?: { home: string; session: string };
+  /** An npm package whose CLI the turn will run: fetched into npx's cache now,
+   * beside prompt preparation, unless the template bakes that version. */
+  warm?: { spec: string; bin: string; version: string };
 }
 
 interface HistoryInventoryRequest { home: string; provider: Provider; session: string; known: Record<string, number> }
@@ -302,6 +320,7 @@ function sandboxLock(file: string, seconds: number): string {
 const HISTORY_MARKER = 'KARMAX_HISTORY_INVENTORY ';
 const BROWSER_MARKER = 'KARMAX_BROWSER_PROBE ';
 const SYSTEM_CODEX_CONFIG = 'KARMAX_SYSTEM_CODEX_CONFIG';
+const ACP_SESSION_MARKER = 'KARMAX_ACP_SESSION ';
 const WORK_DIRECTORY_READY = 'KARMAX_WORK_DIRECTORY_READY';
 
 async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>): Promise<RemoteBootstrap> {
@@ -326,6 +345,10 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
     ...(request.inventory ? [`${historyInventoryCommand(node, request.inventory)} || true`] : []),
     ...(request.browser ? [`${browserProbeCommand(world, node)} || true`] : []),
     ...(request.systemCodexConfig ? [`if [ -e '/etc/codex' ]; then printf '\\n%s\\n' ${SYSTEM_CODEX_CONFIG}; fi`] : []),
+    ...(request.acpSession ? [`if [ -r ${quote(acpSessionDigestFile(request.acpSession.home, request.acpSession.session))} ]; then printf '\\n%s%s\\n' ${quote(ACP_SESSION_MARKER)} "$(head -c 64 ${quote(acpSessionDigestFile(request.acpSession.home, request.acpSession.session))})"; fi`] : []),
+    // Never fails the bootstrap: the launcher resolves the package again and reports.
+    ...(request.warm ? [`if ! ${quote(`/opt/karmax/bin/${request.warm.bin}`)} --version 2>/dev/null | grep -Fq -- ${quote(request.warm.version)}; then `
+      + `( export PATH=${quote(runtime.bin)}:"$PATH"; npx --yes --package=${quote(request.warm.spec)} -c true ) >/dev/null 2>&1 || true; fi`] : []),
     'exit 0',
   ].join('\n');
   const result = await world.exec('bash', ['-lc', command], { timeoutMs: 5 * 60_000 });
@@ -342,6 +365,7 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
   const lines = result.stdout.split('\n').map((line) => line.trim());
   return { runtimeBin: runtime.bin, systemCodexConfig: lines.includes(SYSTEM_CODEX_CONFIG), workDirectory: lines.includes(WORK_DIRECTORY_READY),
     ...(request.inventory ? { history: parseHistoryInventory(result.stdout) } : {}),
+    ...(request.acpSession ? { acpSession: lines.find((line) => line.startsWith(ACP_SESSION_MARKER.trim()))?.slice(ACP_SESSION_MARKER.length).match(/^[0-9a-f]{64}$/)?.[0] } : {}),
     ...(request.browser ? { browser: parseBrowserProbe(result.stdout) } : {}) };
 }
 
@@ -453,6 +477,56 @@ async function remoteHistoryInventory(world: World, home: RemoteAgentHome, provi
 export function remoteAgentHomeRelative(provider: Provider, localHome: string): string {
   const identity = crypto.createHash('sha256').update(path.resolve(localHome)).digest('hex').slice(0, 20);
   return `${REMOTE_ROOT}/${provider}/${identity}`;
+}
+
+/** An ACP harness's sandbox home: one per login, like Claude's and Codex's,
+ * and one shared home for API-key turns (a key is not a native credential). */
+export function remoteAcpHomeRelative(provider: Provider, localHome?: string): string {
+  return localHome ? remoteAgentHomeRelative(provider, localHome) : `${REMOTE_ROOT}/${provider}/api`;
+}
+
+/** An ACP session id, safe as one path segment and one shell word. */
+export const validAcpSessionId = (session: string) => /^[A-Za-z0-9_-]{1,128}$/.test(session);
+
+/** The sandbox's record of the session export it holds (its sha256), written
+ * only after the host has stored that export. */
+export function acpSessionDigestFile(home: string, session: string): string {
+  if (!validAcpSessionId(session)) throw new Error('invalid ACP session id');
+  return path.posix.join(home, 'karmax-sessions', `${session}.sha256`);
+}
+
+function acpBootstrapRequest(world: World, provider: Provider, absolute: string, session?: string): BootstrapRequest {
+  const spec = remoteAgentCommand(provider, provider, []).args[1]!;
+  return {
+    key: JSON.stringify([world.handle.root, provider, absolute, session ?? null, 'acp']),
+    home: absolute,
+    ...(session && validAcpSessionId(session) ? { acpSession: { home: absolute, session } } : {}),
+    warm: { spec, bin: provider, version: spec.slice(spec.lastIndexOf('@') + 1) },
+  };
+}
+
+export interface RemoteAcpHome {
+  absolute: string;
+  relative: string;
+  runtimeBin: string;
+  /** The world's private work-environment directory exists (AD-12). */
+  workDirectory: boolean;
+  /** Digest of the session export the sandbox holds, when it holds one. */
+  sessionDigest?: string;
+}
+
+/** Bootstrap the sandbox for an ACP harness (runtime, private home, the
+ * session it holds, its CLI fetched), reusing a prewarm for the same request. */
+export async function prepareRemoteAcpHome(world: World, provider: Provider, relative: string, session?: string): Promise<RemoteAcpHome> {
+  const absolute = path.posix.join(world.handle.root, relative);
+  const request = acpBootstrapRequest(world, provider, absolute, session);
+  const early = bootstraps.get(world);
+  const reused = early?.key === request.key ? early!.bootstrap.catch(() => undefined) : undefined;
+  const own = (async () => (await reused) ?? runBootstrap(world, request))();
+  bootstraps.set(world, { bootstrap: own, ...(early?.browser ? { browser: early.browser } : {}) });
+  const bootstrap = await timed('bootstrap.prepare', () => own);
+  return { absolute, relative, runtimeBin: bootstrap.runtimeBin, workDirectory: bootstrap.workDirectory,
+    ...(bootstrap.acpSession ? { sessionDigest: bootstrap.acpSession } : {}) };
 }
 
 /** The most one verified terminal read carries; longer reads are split. */
@@ -693,12 +767,13 @@ function hostCodexLineage(localHome: string, session: string): string[] {
   try { return (codexSessionFiles({ session, forkHome: localHome }) ?? []).map(codexFileIdentity); } catch { return []; }
 }
 
-function isControlPlaneAuth(provider: Provider, relative: string): boolean {
+export function isControlPlaneAuth(provider: Provider, relative: string): boolean {
   const normalized = relative.split(path.sep).join('/');
   // The captured setup token is injected into every later turn of this login
   // (`CLAUDE_CODE_OAUTH_TOKEN`); a sandbox that could replace it would make
   // those turns authenticate as whoever it chose.
   if (normalized === KARMAX_TOKEN_FILE) return true;
+  if (provider === 'opencode') return normalized === 'data/opencode/auth.json';
   return provider === 'codex'
     ? normalized === 'auth.json'
     : provider === 'claude'
@@ -709,7 +784,7 @@ function isControlPlaneAuth(provider: Provider, relative: string): boolean {
  * Codex needs an inert presence marker or current app-server silently discards
  * its otherwise-valid access token. Claude's SDK has an explicit host refresh
  * callback, so its refresh token is removed completely. */
-function remoteAuthProjection(provider: Provider, relative: string, content: Buffer): Buffer {
+export function remoteAuthProjection(provider: Provider, relative: string, content: Buffer): Buffer {
   try {
     const parsed = JSON.parse(content.toString('utf8'));
     if (provider === 'codex' && isControlPlaneAuth(provider, relative)) {
@@ -719,6 +794,14 @@ function remoteAuthProjection(provider: Provider, relative: string, content: Buf
       }
       delete parsed.refresh_token;
       delete parsed.refreshToken;
+    } else if (provider === 'opencode' && isControlPlaneAuth(provider, relative)) {
+      // API-key and well-known entries carry no rotating secret.
+      for (const entry of Object.values<Record<string, unknown> | null>(parsed && typeof parsed === 'object' ? parsed : {})) {
+        if (!entry || typeof entry !== 'object' || entry.type !== 'oauth') continue;
+        entry.refresh = OPENCODE_REMOTE_REFRESH_SENTINEL;
+        delete entry.refreshToken;
+        delete entry.refresh_token;
+      }
     } else if (provider === 'claude' && isControlPlaneAuth(provider, relative)) {
       for (const oauth of [parsed?.claudeAiOauth, parsed?.oauthAccount]) {
         if (!oauth || typeof oauth !== 'object') continue;
@@ -755,10 +838,10 @@ export async function syncRemoteAgentHomeBestEffort(world: World, provider: Prov
  * `forward` is the caller-vouched allowlist of project secret/service names. */
 export function remoteAgentEnv(provider: Provider, home: string, source: Record<string, string | undefined>,
   forward: readonly string[] = []): Record<string, string> {
-  const out: Record<string, string> = {
-    ...(provider === 'claude' ? { CLAUDE_CONFIG_DIR: home } : { CODEX_HOME: home }),
-  };
-  const homeKey = provider === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME';
+  const homeEnv: Record<string, string> = isAcpProvider(provider)
+    ? Object.fromEntries(Object.entries(acpHomeEnv(provider, home)).map(([key, value]) => [key, value.split(path.sep).join('/')]))
+    : provider === 'claude' ? { CLAUDE_CONFIG_DIR: home } : { CODEX_HOME: home };
+  const out: Record<string, string> = { ...homeEnv };
   for (const key of new Set([
     'KARMAX_TOKEN', 'KARMAX_GATEWAY_URL', 'CLAUDE_CODE_OAUTH_TOKEN',
     // Agent SDK ↔ Claude Code protocol negotiation. Dropping ENTRYPOINT makes
@@ -769,9 +852,11 @@ export function remoteAgentEnv(provider: Provider, home: string, source: Record<
     'CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH', 'CLAUDE_CODE_QUESTION_PREVIEW_FORMAT',
     'CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS',
     'ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+    // OpenCode's turn configuration (system prompt by `{file:}` reference).
+    ...(provider === 'opencode' ? ['OPENCODE_CONFIG_CONTENT', 'OPENCODE_DISABLE_AUTOUPDATE'] : []),
     ...forward.filter((name) => /^[A-Z_][A-Z0-9_]*$/.test(name)),
   ])) {
-    if (key === homeKey) continue;
+    if (key in homeEnv) continue;
     const value = source[key];
     if (value) out[key] = value;
   }
@@ -794,6 +879,8 @@ export function remoteAgentCommand(provider: Provider, command: string, args: st
       ?? `@anthropic-ai/claude-code@${installedClaudeCodeVersion()}`;
     return { command: 'npx', args: ['--yes', packageSpec, ...forwarded] };
   }
+  if (provider === 'opencode') return { command: 'npx', args: ['--yes', opencodePackage(), ...args] };
+  if (provider !== 'codex') throw new Error(`the ${provider} agent has no remote (cloud sandbox) package`);
   return { command: 'npx', args: ['--yes', CODEX_PACKAGE, ...args] };
 }
 
@@ -826,9 +913,17 @@ export function spawnRemoteAgentProcess(opts: {
   cwd: string;
   env: Record<string, string>;
   signal?: AbortSignal;
+  /** The agent's home in the sandbox, for its pidfile and logs. Claude and
+   * Codex name it in their environment already. */
+  home?: string;
+  /** ACP harnesses run under the relay (`acp-relay.mjs`), which also serves
+   * the turn's control socket over this PTY. Absolute sandbox paths. */
+  relay?: { script: string; socket: string };
+  /** Shell run once the CLI is resolved (as "$bin"), before it is started. */
+  prelude?: string;
 }): RemoteSpawnedProcess {
   const executable = remoteAgentCommand(opts.provider, opts.command, opts.args);
-  const home = opts.env[opts.provider === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR']!;
+  const home = opts.home ?? opts.env[opts.provider === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR']!;
   const pidFile = path.posix.join(home, 'karmax-agent.pid');
   const stderr = path.posix.join(home, 'agent-stderr.log');
   const startupTrace = path.posix.join(home, `startup-${crypto.randomUUID()}.log`);
@@ -845,6 +940,7 @@ export function spawnRemoteAgentProcess(opts: {
   const bakedMatches = `[ -x ${quote(bakedExecutable)} ] && ${quote(bakedExecutable)} --version 2>/dev/null | grep -Fq -- ${quote(expectedVersion)}`;
   // `command` is a shell expression (the resolved "$bin"); args are quoted.
   const invocation = (command: string, args: string[]) => {
+    if (opts.relay) return ['node', opts.relay.script, opts.relay.socket].map(quote).concat(command, args.map(quote)).join(' ');
     if (opts.provider !== 'claude') return [command, ...args.map(quote)].join(' ');
     // World transports are PTYs, but Claude's stream-json/print mode requires
     // non-interactive stdin. This foreground relay gives the CLI a real pipe,
@@ -859,7 +955,9 @@ export function spawnRemoteAgentProcess(opts: {
       "process.stdin.on('end', () => child.stdin.end())",
       "for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal))",
       "child.on('error', (error) => { trace('child-error', process.pid, { code: error.code }); console.error(error); process.exitCode = 1 })",
-      "child.on('exit', (code, signal) => { trace('child-exited', child.pid, { exitCode: code }); if (signal) process.kill(process.pid, signal); else process.exit(code ?? 1) })",
+      // Re-raising with the forwarding handlers installed only forwarded the
+      // signal to the dead child again, and the relay outlived the CLI.
+      "child.on('exit', (code, signal) => { trace('child-exited', child.pid, { exitCode: code }); if (!signal) process.exit(code ?? 1); for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.removeAllListeners(name); process.kill(process.pid, signal) })",
     ].join('; ');
     return [...['node', '-e', relay].map(quote), command, ...args.map(quote)].join(' ');
   };
@@ -867,7 +965,10 @@ export function spawnRemoteAgentProcess(opts: {
   // it *under* npx kept a ~150 MB npm process alive for the whole session.
   const resolved = `npx --yes --package=${quote(packageSpec)} -c ${quote(`command -v ${opts.provider}`)}`;
   const selectedCommand = `${trace('cli-version-check')}; if ${bakedMatches}; then bin=${quote(bakedExecutable)}; else ${trace('cli-resolve')}; bin=$(${resolved}) || exit 127; fi; `
-    + `${trace('cli-exec')}; exec ${invocation('"$bin"', forwardedArgs)}`;
+    // Later commands of this turn (an ACP session export) run the same CLI.
+    + `printf '%s' "$bin" > ${quote(path.posix.join(home, 'karmax-agent-bin'))}; `
+    + (opts.prelude ? `${trace('cli-prelude')}; ${opts.prelude}; ` : '')
+    + `${trace('cli-exec')}; ${opts.relay ? `KARMAX_RELAY_TRACE=${quote(startupTrace)} ` : ''}exec ${invocation('"$bin"', forwardedArgs)}`;
   const commandLine = `sh -c ${quote(selectedCommand)}`;
   // Raw mode is required for the line-oriented JSON protocols: canonical PTYs
   // truncate single lines around MAX_CANON (~4 KiB). The sandbox-local pidfile

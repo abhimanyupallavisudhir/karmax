@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { Template, defaultBuildLogger } from 'e2b';
 import { CODEX_VERSION } from '../../src/agent/codex-history.js';
+import { OPENCODE_PACKAGE } from '../../src/agent/acp-packages.js';
 import { installedClaudeCodeVersion } from '../../src/agent/remote-process.js';
 import { PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from '../../src/agent/remote-node.js';
 import { PLAYWRIGHT_VERSION, PLAYWRIGHT_MCP_VERSION, CHROME_DEVTOOLS_MCP_VERSION } from '../../src/autonomy/config-homes.js';
@@ -26,8 +27,9 @@ const command = [
   `npm install --prefix /opt/karmax/agents --no-audit --no-fund --omit=dev ${[
     process.env.KARMAX_REMOTE_CLAUDE_PACKAGE ?? `@anthropic-ai/claude-code@${installedClaudeCodeVersion()}`,
     process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? `@openai/codex@${CODEX_VERSION}`,
+    process.env.KARMAX_REMOTE_OPENCODE_PACKAGE ?? OPENCODE_PACKAGE,
   ].map(quote).join(' ')}`,
-  ...['claude', 'codex'].map(name => `ln -sfn /opt/karmax/agents/node_modules/.bin/${name} /opt/karmax/bin/${name}`),
+  ...['claude', 'codex', 'opencode'].map(name => `ln -sfn /opt/karmax/agents/node_modules/.bin/${name} /opt/karmax/bin/${name}`),
   `printf %s ${quote(smoke)} > /opt/karmax/smoke.mjs`,
   'chmod -R a+rX /opt/karmax',
   'PLAYWRIGHT_BROWSERS_PATH=/opt/karmax/browsers node /opt/karmax/smoke.mjs',

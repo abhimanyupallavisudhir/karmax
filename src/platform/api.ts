@@ -74,7 +74,7 @@ import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, 
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 import { assertAgentSpec } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
-import { AGENT_SELECTOR, MAIN_AGENT, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
+import { AGENT_SELECTOR, MAIN_AGENT, agentSelector, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
@@ -5137,8 +5137,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       : [...new Set(input.to.map((selector) => String(selector).trim()).filter(Boolean))];
     if (to && to.length > 32) throw new ValidationError('at most 32 recipients');
     const newAgents = Object.entries(input.agents ?? {});
-    const listed = new Set((task.lastView?.participants ?? []).map((participant) => participant.key));
-    listed.add(MAIN_AGENT);
+    const listed = new Set(this.taskAgentKeys(task));
     if (!shared && (newAgents.length || (to ?? []).some((selector) => selector.startsWith(AGENT_SELECTOR) && selectorAgent(selector) !== MAIN_AGENT)))
       throw new ValidationError('this task predates conversations with several agents; send a follow-up to its agent');
     // New agents join the task as parameters first, so the workflow knows them
@@ -5214,12 +5213,31 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   /** `notify`: a task's agent tells or calls people and agents without ending
-   * its turn — people are notified now, agents are called when it ends. */
-  async notify(token: string, args: { to: string[]; message: string; urgency?: Urgency }): Promise<{ message?: Message; notified: string[] }> {
+   * its turn — people are notified now, agents are called when it ends.
+   * `agents` calls new agents in (each the next `agent-N`, called after `to`);
+   * the returned message's `to` names the keys they were given. */
+  async notify(token: string, args: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<{ message?: Message; notified: string[] }> {
     const caller = (await this.require(token, 'notify'));
     if (!caller.taskId || caller.taskId === '*') throw new ValidationError('notify is for a task agent; use POST /api/tasks/:id/messages');
-    if (!args.to?.length) throw new ValidationError('notify needs at least one recipient');
-    return this.postTaskMessage(token, caller.taskId, { text: args.message, to: args.to, ...(args.urgency ? { urgency: args.urgency } : {}) });
+    if (!args.to?.length && !args.agents?.length) throw new ValidationError('notify needs at least one recipient');
+    const agents: Record<string, AgentSpec> = {};
+    if (args.agents?.length) {
+      const task = (await this.deps.store.getTask(caller.taskId));
+      const known = task ? this.taskAgentKeys(task) : [MAIN_AGENT];
+      for (const spec of args.agents) {
+        const key = nextAgentKey(known);
+        known.push(key);
+        agents[key] = spec;
+      }
+    }
+    const to = [...(args.to ?? []), ...Object.keys(agents).map(agentSelector)];
+    return this.postTaskMessage(token, caller.taskId, { text: args.message, to,
+      ...(args.agents?.length ? { agents } : {}), ...(args.urgency ? { urgency: args.urgency } : {}) });
+  }
+
+  /** The agents a task lists, its main agent first. */
+  private taskAgentKeys(task: TaskRecord): string[] {
+    return [...new Set([MAIN_AGENT, ...(task.lastView?.participants ?? []).map((participant) => participant.key)])];
   }
 
   /** Ask Avatars to respond to a task: each runs as its own small task that
@@ -5265,6 +5283,31 @@ Act according to your Avatar instructions. When ready, call platform_request POS
 
   async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<Message | undefined> {
     return this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
+  }
+
+  /**
+   * Stop one of a task's agents, like Ctrl+C in a terminal (software-dev ≥1.27):
+   * its turn ends now — working, or still waiting for a credential, host
+   * capacity, a retry or people — and an agent only queued does not run. The
+   * task goes on: the next agent runs, the stage it interrupted resumes, and a
+   * stopped main agent waits for the next message.
+   */
+  async stopAgent(token: string, taskId: string, key: string): Promise<{ stopped: string }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'stop_agent', { projectId: task.projectId, taskId }));
+    if (!this.sharedConversation(task)) throw new ValidationError('this task predates stopping one agent; cancel the task instead');
+    const participant = task.lastView?.participants?.find((candidate) => candidate.key === key);
+    if (!participant) throw new ValidationError(`${key} is not an agent on this task`);
+    if (participant.state === 'idle') throw new ValidationError(`${participantLabel(key)} is not working`);
+    const userId = caller.humanSubject?.userId;
+    const ownAgent = caller.kind === 'agent' && caller.taskId === taskId ? (caller.participant ?? MAIN_AGENT) : undefined;
+    const by = userId ? `user:${userId}` : ownAgent ? `agent:${ownAgent}` : caller.principal;
+    const byLabel = userId ? ((await this.deps.store.userDisplayName(userId)) ?? undefined)
+      : ownAgent ? participantLabel(ownAgent) : undefined;
+    await (await this.workflowHandle(taskId, task)).signal('stopAgent', { key, by, ...(byLabel ? { byLabel } : {}) });
+    (await this.deps.store.appendEvent({ taskId, type: 'task.agent-stopped', ts: Date.now(), payload: { participant: key, state: participant.state, by } }));
+    return { stopped: key };
   }
 
   private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number },

@@ -16,7 +16,7 @@ import { BRAND } from '../domain/brand.js';
  */
 export const REMOTE_MCP_TOOLS: ReadonlySet<string> = new Set([
   'create_task', 'list_tasks', 'get_task', 'search_tasks', 'find_task', 'list_tags', 'tag_task', 'set_task_priority',
-  'signal_task', 'message_agent', 'get_conversation', 'list_agents', 'fork_agent', 'list_events', 'reorder_queue',
+  'signal_task', 'stop_agent', 'message_agent', 'get_conversation', 'list_agents', 'fork_agent', 'list_events', 'reorder_queue',
   'read_wiki', 'search_wiki', 'describe_platform', 'platform_request', 'list_connections', 'verify_resource_revision',
   'list_world_providers', 'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
   'get_execution_policy', 'set_execution_policy',

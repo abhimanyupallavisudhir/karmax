@@ -157,6 +157,11 @@ export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 /** Escalate: redirect the request this task is waiting on to other people
  * (v1.27). A Responder agent's own escalation takes effect when its turn ends. */
 export const rerouteSignal = defineSignal<[{ audience: string[]; detail?: string }]>('reroute');
+/** Stop one agent, like Ctrl+C (v1.27): its turn ends now — working, or still
+ * waiting for a credential, host capacity, a retry or people — or, if it is
+ * only queued, it does not run. The task goes on; a stopped main agent waits
+ * for the next message. `by` names who stopped it, for the conversation. */
+export const stopAgentSignal = defineSignal<[{ key: string; by?: string; byLabel?: string }]>('stopAgent');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
@@ -878,6 +883,13 @@ async function softwareDevImpl(
   // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
   // signal aborts the in-flight agent turn instead of waiting for it to finish.
   let activeTurn: CancellationScope | undefined;
+  // The agents in a turn right now, innermost last (v1.27): a called agent can
+  // run inside the main agent's wait. `stopping` is a stop not yet honoured.
+  const turnOwners: string[] = [];
+  let stopping: { key: string; by?: string; byLabel?: string } | undefined;
+  let lastStoppedBy: string | undefined;
+  /** Whether the innermost turn was asked to stop: its waits end and it throws. */
+  const halted = (): boolean => !!stopping && stopping.key === turnOwners[turnOwners.length - 1];
   let activeSetup: CancellationScope | undefined;
   let activeStaging: CancellationScope | undefined;
 
@@ -1163,13 +1175,15 @@ async function softwareDevImpl(
     return participantKeys().map((key) => {
       const spec = key === MAIN_AGENT ? liveInput.agents?.do : participantSpec(key);
       const { kind: _kind, audience: _audience, prompt: _prompt, ...harness } = (spec ?? {}) as Partial<ConfirmLayer>;
-      const running = key === MAIN_AGENT
-        ? !runningParticipant && agentTurn?.role === 'do'
-        : runningParticipant === key;
+      // In a turn: working, or waiting in it (for a credential, capacity, a
+      // retry, people, its own pause, or an agent it is waiting on).
+      const innermost = turnOwners[turnOwners.length - 1] === key;
+      const state: TaskParticipant['state'] = !turnOwners.includes(key) ? (agentQueue.includes(key) ? 'queued' : 'idle')
+        : innermost && (agentTurn ? agentTurn.state === 'running' : status === 'active') ? 'running' : 'waiting';
       return {
         key, label: participantLabel(key), role: participantRole(key),
         ...(Object.keys(harness).length ? { spec: harness } : {}),
-        state: running ? 'running' : agentQueue.includes(key) ? 'queued' : 'idle',
+        state,
         messages: authored.get(key) ?? 0,
       };
     });
@@ -1698,6 +1712,18 @@ async function softwareDevImpl(
     waitingFor = { ...waitingFor, kind: 'human', audience: [...audience], ...(detail ? { detail } : {}) };
     await publish();
   });
+  setHandler(stopAgentSignal, async ({ key, by, byLabel }) => {
+    if (!multiAgent || cancelled || typeof key !== 'string') return;
+    if (turnOwners.includes(key)) {
+      stopping = { key, ...(by ? { by } : {}), ...(byLabel ? { byLabel } : {}) };
+      if (halted()) activeTurn?.cancel();
+    } else if (agentQueue.includes(key)) {
+      agentQueue = agentQueue.filter((queued) => queued !== key);
+      delete calledBy[key];
+      whenLoaded(() => noteStopped(key, { by, byLabel }));
+      await publish();
+    }
+  });
   // The "requested" and "settled" signals are sent by two independent code paths
   // over two concurrent RPCs, so they can arrive in either order: a target that
   // publishes while our request signal is still in flight settles it first. A
@@ -1946,7 +1972,7 @@ async function softwareDevImpl(
         try {
           return await fn();
         } catch (err) {
-          if (cancelled || isCancellation(err)) throw err; // mid-turn cancel: don't resolve/retry
+          if (cancelled || halted() || isCancellation(err)) throw err; // mid-turn cancel or stop: don't resolve/retry
           // This new failure type has no historical command sequence. A safety
           // decision is task-local: never rotate accounts or ask Resolve to retry.
           if (failureHasType(err, 'agent-policy')) {
@@ -2017,9 +2043,9 @@ async function softwareDevImpl(
                 waitingFor = { kind: 'retry', detail: `Retry ${infraRetries} of ${INFRA_BACKOFF_MS.length}`, until: Date.now() + wait };
               }
               await publish();
-              await condition(() => cancelled || retryRequested, wait);
+              await condition(() => cancelled || retryRequested || halted(), wait);
               if (visibleWait) { waitingFor = undefined; status = resumeStatus; }
-              if (cancelled) throw new Cancelled();
+              if (cancelled || halted()) throw new Cancelled();
               retryRequested = false;
               error = undefined;
               continue;
@@ -2063,8 +2089,9 @@ async function softwareDevImpl(
                 status = 'waiting';
                 waitingFor = { kind: 'account', ...(providerLimit.provider ? { provider: providerLimit.provider } : {}), earliestResetAt: until };
                 await publish();
-                await condition(() => cancelled || retryRequested, Math.max(1_000, until - Date.now()));
+                await condition(() => cancelled || retryRequested || halted(), Math.max(1_000, until - Date.now()));
                 if (cancelled) throw new Cancelled();
+                if (halted()) { waitingFor = undefined; status = resumeStatus; throw new Cancelled(); }
                 retryRequested = false;
                 waitingFor = undefined;
                 status = resumeStatus;
@@ -2194,7 +2221,7 @@ async function softwareDevImpl(
       await publish();
       for (;;) {
         await waitServing(() =>
-          retryRequested || cancelled || manualEscalationRequested
+          retryRequested || cancelled || manualEscalationRequested || halted()
           || (followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
         if (!manualEscalationRequested || cancelled || !manual) break;
         manualEscalationRequested = false;
@@ -2217,6 +2244,7 @@ async function softwareDevImpl(
       waitingFor = undefined;
       escalatedFrom = undefined;
       if (cancelled) throw new Cancelled();
+      if (halted()) { stage = resumeStage; status = 'active'; error = undefined; throw new Cancelled(); }
       // A human/parent retry resumes the stage that failed. Leaving this as
       // `escalated` made the live view claim the task was still escalated while
       // its replacement agent turn was already running (task #240). This is a
@@ -2311,8 +2339,8 @@ async function softwareDevImpl(
                 if (!admission.blocked) break;
                 waitingFor = { kind: 'agentSlot', provider, detail: admission.detail };
                 await publish();
-                await condition(() => cancelled, '30 seconds');
-                if (cancelled) throw new Cancelled();
+                await condition(() => cancelled || halted(), '30 seconds');
+                if (cancelled || halted()) throw new Cancelled();
               }
               slotHeld = admission.granted || agentSlotGrants.delete(turnId);
               if (!slotHeld) {
@@ -2322,21 +2350,21 @@ async function softwareDevImpl(
                   detail: admission.detail ?? 'Waiting for host capacity to start agent',
                 };
                 await publish();
-                await condition(() => agentSlotGrants.has(turnId) || cancelled);
+                await condition(() => agentSlotGrants.has(turnId) || cancelled || halted());
                 slotHeld = agentSlotGrants.delete(turnId);
               }
-              if (cancelled && !slotHeld) throw new Cancelled();
+              if ((cancelled || halted()) && !slotHeld) throw new Cancelled();
               waitingFor = { kind: 'agentSlot', provider, detail: 'Starting agent' };
               if (!compactStart) await publish();
             }
           }
-          if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
+          if (patched('agent-turn-cancel-before-start-v1') && (cancelled || halted())) throw new Cancelled();
           if (compactStart && liveAgentStates) {
             waitingFor = { kind: 'agentSlot', provider, detail: 'Starting agent' };
             await publish();
             // A cancel delivered while that view was being published must still
             // stop the turn before it starts (WF-11).
-            if (cancelled) throw new Cancelled();
+            if (cancelled || halted()) throw new Cancelled();
           }
           return await fn(
             home,
@@ -2430,28 +2458,30 @@ async function softwareDevImpl(
         // The coordinator owns refresh timers and signals every grant. An arbitrary
         // workflow-side timeout used to fall through with no grant and accidentally
         // run on the profile credential, bypassing the exhausted account policy.
-        await condition(() => accountGrants.has(turnId) || cancelled);
+        await condition(() => accountGrants.has(turnId) || cancelled || halted());
       } else {
         // Immutable v1 command history: extant executions recorded this timer.
         await condition(() => accountGrants.has(turnId) || cancelled, '6 hours');
       }
       grant = accountGrants.get(turnId);
       accountGrants.delete(turnId);
-      if (grant?.accountId !== RELIST_ACCOUNT_GRANT || cancelled) break;
+      if (grant?.accountId !== RELIST_ACCOUNT_GRANT || cancelled || halted()) break;
     }
-    if (liveAgentStates && cancelled && !grant) await coordinator.cancelAccount(taskId, turnId).catch(() => undefined);
+    // A stopped agent gives up its place in the credential queue, as a cancel does.
+    const stopped = cancelled || halted();
+    if (liveAgentStates && stopped && !grant) await coordinator.cancelAccount(taskId, turnId).catch(() => undefined);
     if (!liveAgentStates) {
       // Preserve v1's in-memory transition. It intentionally did not publish here;
       // changing that command sequence would break every extant v1 history.
       waitingFor = undefined;
       if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
-    } else if (cancelled || grant?.accountId === '(denied)') {
+    } else if (stopped || grant?.accountId === '(denied)') {
       // No model turn follows these paths, so explicitly clear the account wait.
       waitingFor = undefined;
       if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
       await publish();
     }
-    if (liveAgentStates && cancelled) {
+    if (liveAgentStates && stopped) {
       if (grant && grant.accountId !== '(passthrough)' && grant.accountId !== '(denied)'
         && grant.accountId !== RELIST_ACCOUNT_GRANT && patched('software-dev-return-cancelled-grant-v1'))
         await coordinator.returnAccount(grant.accountId, { taskId, turnId }).catch(() => undefined);
@@ -2539,7 +2569,7 @@ async function softwareDevImpl(
     activeTurn = scope;
     try {
       return await scope.run(async () => {
-        if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
+        if (patched('agent-turn-cancel-before-start-v1') && (cancelled || halted())) throw new Cancelled();
         return await fn();
       });
     } finally {
@@ -2560,7 +2590,7 @@ async function softwareDevImpl(
     // never reached the agent (SPEC §5.6 — a queued follow-up must reach the agent).
     let deliveredNow = seen;
     const answeredFrom = seen;
-    const turn = await withResolve('do', () =>
+    const ran = await stoppableTurn(MAIN_AGENT, () => withResolve('do', () =>
       leasedTurn('do', (
         accountConfigHome,
         accountApiKeyHandle,
@@ -2609,7 +2639,13 @@ async function softwareDevImpl(
           return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
         },
       } : undefined,
-    );
+    ));
+    // Stopped: nothing it did this turn is folded in; it waits for a message.
+    if (!ran) {
+      speakers = [];
+      return { completed: false, providerCompleted: false, output: '', stopped: true } as AgentTurnResult & { stopped?: true };
+    }
+    const turn: AgentTurnResult & { stopped?: true } = ran.value;
     session = turn.session ?? session;
     sessionHome = doHome ?? sessionHome;
     // The turn reports how many `msgs` it actually delivered — the batch captured at
@@ -2893,7 +2929,7 @@ async function softwareDevImpl(
     runningParticipant = key;
     let turn: AgentTurnResult | undefined;
     try {
-      turn = await withResolve(role, () => leasedTurn(role, (
+      const ran = await stoppableTurn(key, () => withResolve(role, () => leasedTurn(role, (
         accountConfigHome,
         accountApiKeyHandle,
         agentTurnId,
@@ -2926,7 +2962,9 @@ async function softwareDevImpl(
           ...(agentTurnId ? { agentTurnId } : {}),
           ...admission,
         });
-      }));
+      })));
+      if (!ran) return undefined;
+      turn = ran.value;
     } catch (e) {
       if (isCancellation(e)) throw e;
       log.warn('agent turn failed', { participant: key, e: String(e) });
@@ -2949,6 +2987,33 @@ async function softwareDevImpl(
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
     return { ...turn, ...(reply ? { reply } : {}) };
+  }
+
+  /** Run agent `key`'s turn so `stopAgent` can end it (v1.27), including the
+   * waits before and around it. Undefined when it was stopped: the
+   * conversation says so and the stage it ran in is restored. */
+  async function stoppableTurn<T>(key: string, fn: () => Promise<T>): Promise<{ value: T } | undefined> {
+    const at = stage;
+    turnOwners.push(key);
+    try {
+      return { value: await fn() };
+    } catch (e) {
+      if (cancelled || !halted()) throw e;
+      stage = at;
+      noteStopped(key, stopping);
+      return undefined;
+    } finally {
+      turnOwners.pop();
+      if (stopping?.key === key && !turnOwners.includes(key)) stopping = undefined;
+    }
+  }
+
+  /** Say in the conversation that agent `key` was stopped. It is addressed to
+   * no one: it calls no agent. */
+  function noteStopped(key: string, stop?: { by?: string; byLabel?: string }): void {
+    lastStoppedBy = stop?.by;
+    msgs.push({ id: `stop-${msgs.length}`, role: 'system', to: [], ts: msgs.length,
+      text: `${stop?.byLabel ? `${stop.byLabel} stopped` : 'Stopped'} ${participantLabel(key)}.` });
   }
 
   /** Address `reply` and act on it: agents it names are called, people it names
@@ -2986,6 +3051,22 @@ async function softwareDevImpl(
       waitingFor = resume.waitingFor;
       await publish();
     }
+  }
+
+  /** After the main agent was stopped: it waits, like a terminal after Ctrl+C,
+   * for the next message to it (or Open PR). True when the task was cancelled. */
+  async function waitAfterStop(): Promise<boolean> {
+    const mark = msgs.length;
+    stage = 'do';
+    status = 'waiting';
+    // Whoever stopped it is at the keyboard; an agent's stop asks the creator.
+    const audience = lastStoppedBy?.startsWith('user:') ? [lastStoppedBy] : ['@creator'];
+    waitingFor = { kind: 'human', audience, detail: 'Stopped. Send a message to continue.' };
+    await publish();
+    await waitServing(() => cancelled || prRequested || mainUnreadSince(mark));
+    waitingFor = undefined;
+    status = 'active';
+    return cancelled;
   }
 
   /** Wait for `ready` while staying responsive to agents called meanwhile:
@@ -3607,6 +3688,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     )
       ? { completed: true, providerCompleted: true, output: '', openPrRequested: true }
       : await doTurn();
+    if ('stopped' in turn && turn.stopped) {
+      if (await waitAfterStop()) return await abort();
+      continue;
+    }
     // Sub-tasks run in the BACKGROUND: spawn is non-blocking, and answers go straight
     // down to the children they target (SPEC §5.3).
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
@@ -3650,6 +3735,8 @@ Inspect the complete current diff and specifically compare its delta from the re
       }
       const rerouted = pendingReroute;
       pendingReroute = undefined;
+      // A paused agent can be stopped too: its pause ends without resuming it.
+      if (multiAgent) turnOwners.push(MAIN_AGENT);
       const note = await waitForAgent(turn.wait, {
         world,
         ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
@@ -3665,12 +3752,18 @@ Inspect the complete current diff and specifically compare its delta from the re
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
         // A Needs input hold offers Open PR, like any input hold in Do (and a parent may send it).
         interrupted: () => cancelled || mainUnread() || raises.length > 0 || settled.length > 0
-          || (!!needsInput && prRequested),
+          || (!!needsInput && prRequested) || halted(),
         // Agents called while the main agent is paused run now; its pause goes
         // on unless what they say is for it.
         ...(multiAgent ? { serveable: () => agentQueue.length > 0 && !cancelled, serve: runCalledAgents } : {}),
-      });
+      }).finally(() => { if (multiAgent) turnOwners.pop(); });
       if (cancelled) return await abort();
+      if (multiAgent && stopping?.key === MAIN_AGENT) {
+        noteStopped(MAIN_AGENT, stopping);
+        stopping = undefined;
+        if (await waitAfterStop()) return await abort();
+        continue;
+      }
       if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
       continue;
     }

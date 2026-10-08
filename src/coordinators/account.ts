@@ -493,6 +493,8 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       earliestResetAt: Math.min(...resets),
       detail: 'Provider usage limit reached; the task resumes automatically when quota resets',
     };
+    // None at all is not "needs attention": nothing will recover by itself.
+    if (!compatible.length) return { waiting: true, detail: `No ${req.provider ?? 'allowed'} credential — add one, or stop this agent` };
     return { waiting: true, detail: 'Every allowed credential needs attention — sign in again or add one' };
   });
   // Every turn of `taskId` this coordinator still owes something for — queued

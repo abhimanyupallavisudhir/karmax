@@ -460,7 +460,11 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     if (observerFailed) throw observerError;
   } catch (error) {
     output.discard();
-    await observe(() => deps.onActivity?.({
+    // Someone stopped the agent or cancelled the task (not a worker shutdown,
+    // which resumes the turn): that is not a failure.
+    const reason = deps.signal?.aborted ? deps.signal.reason : undefined;
+    const stopped = reason instanceof Error && reason.message === 'CANCELLED';
+    await observe(() => deps.onActivity?.(stopped ? { id: 'turn', kind: 'turn', phase: 'stopped', title: 'Agent stopped' } : {
       id: 'turn',
       kind: 'turn',
       phase: 'failed',

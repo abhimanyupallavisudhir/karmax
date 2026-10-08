@@ -84,7 +84,10 @@ describe('Git-backed unix pass connector', () => {
 
     expect(await connector.describe()).toMatchObject({ available: true, canPush: true });
     expect((await connector.list()).map((item) => item.externalId)).toEqual(['sites/example.com']);
-    const first = (await connector.pull(['sites/example.com'])).items[0]!;
+    // Assert the whole result: a failed pull reports its reason only in `failures`.
+    const pulled = await connector.pull(['sites/example.com']);
+    expect(pulled).toMatchObject({ failures: [], items: [{ externalId: 'sites/example.com' }] });
+    const first = pulled.items[0]!;
     expect(first.revision).toMatch(/^[a-f0-9]{64}$/);
     // A fresh checkout has new mtimes but identical encrypted source content.
     const fresh = new GitPassConnector(() => fixture.secret, 'org_test', () => ({}),
@@ -110,9 +113,9 @@ describe('Git-backed unix pass connector', () => {
 
     expect(fs.readdirSync(connectorRoot).filter((name) => name.startsWith('.git-auth-'))).toEqual([]);
     await connector.updateSecret('sites/example.com', 'note', 'Username: administrator\r\n  free text  ');
-    expect((await connector.pull(['sites/example.com'])).items[0]!.secrets).toMatchObject({
+    expect(await connector.pull(['sites/example.com'])).toMatchObject({ failures: [], items: [{ secrets: {
       password: 'rotated-password', note: 'Username: administrator\r\n  free text  \notpauth://totp/example?secret=OLDSEED\n', totp: 'otpauth://totp/example?secret=OLDSEED',
-    });
+    } }] });
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }, 30_000);
 

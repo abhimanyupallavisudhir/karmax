@@ -50,8 +50,9 @@ export interface PlatformOps {
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
   messageAgent(taskId: string, text: string, role?: string): Promise<void>;
+  stopAgent(taskId: string, agent: string): Promise<unknown>;
   escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
-  notify(a: { to: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
+  notify(a: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
@@ -125,6 +126,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await api.signalTask(getToken(), id, sig as any, text, role, undefined, undefined, { otherAttempts, saveOtherAttemptsDefault })),
     messageAgent: async (id, text, role) => void (await api.messageAgent(getToken(), id, text, role)),
+    stopAgent: (id, agent) => api.stopAgent(getToken(), id, agent),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
     notify: (a) => api.notify(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
@@ -223,6 +225,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role, otherAttempts, saveOtherAttemptsDefault }) })),
     messageAgent: async (id, text, role) => void (await req(`/api/tasks/${id}/messages`, { method: 'POST', body: JSON.stringify({ text, role }) })),
+    stopAgent: (id, agent) => req(`/api/tasks/${id}/agents/${encodeURIComponent(agent)}/stop`, { method: 'POST' }),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
     notify: (a) => req('/api/agent/notify', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
@@ -493,14 +496,23 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, ' +
         '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now and keep ' +
         'their own pace; agents of this task (agent:do for the main agent, agent:responder, agent:confirm, ' +
-        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation.',
+        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation. ' +
+        '`agents` calls new agents in, after `to`; each becomes the next agent:agent-<n> (the returned message\'s `to` names them).',
       inputSchema: {
-        to: z.array(z.string()).min(1).max(32),
+        to: z.array(z.string()).max(32).optional(),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
+        agents: z.array(z.object({
+          provider: z.string().min(1),
+          model: z.string().optional(),
+          effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+          prompt: z.string().max(4_000).optional().describe('Its instructions.'),
+          resumeFrom: z.object({ taskId: z.string().min(1), role: z.string().optional() }).optional()
+            .describe('Fork that task agent (role default do).'),
+        })).max(8).optional(),
       },
     },
-    async (a) => wrap(async () => (await ops.notify(a))),
+    async (a) => wrap(async () => (await ops.notify(a as Parameters<typeof ops.notify>[0]))),
   );
   server.registerTool(
     'escalate',
@@ -857,6 +869,14 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       },
     },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role, a.otherAttempts, a.saveOtherAttemptsDefault); return 'signalled'; }),
+  );
+  server.registerTool(
+    'stop_agent',
+    {
+      description: 'Stop one agent of a task, like Ctrl+C: its turn ends now — working, or waiting for a credential, capacity or people — or, if queued, it does not run. The task goes on. `agent` is its key: do, responder, confirm, confirm-<n> or agent-<n> (list_agents).',
+      inputSchema: { taskId: z.string(), agent: z.string() },
+    },
+    async (a) => wrap(async () => { await ops.stopAgent(a.taskId, a.agent); return `stopped ${a.agent}`; }),
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', {

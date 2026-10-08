@@ -67,16 +67,16 @@ import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
 import { WorkspaceConflict } from '../world/resources.js';
-import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, mergeModels,
+import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
-import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
-import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
+import { apiKeyEnv, canonicalModelProvider, credentialAliases, isAgentProvider, isLoginProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
@@ -370,7 +370,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
-  if (/\/signal$/.test(p)) return 'task:signal';
+  if (/\/signal$/.test(p) || /^\/api\/tasks\/[^/]+\/agents\/[^/]+\/stop$/.test(p)) return 'task:signal';
   if (/^\/api\/tasks\/[^/]+\/messages$/.test(p)) return 'task:conversation:message';
   if (/\/escalate$/.test(p)) return 'task:escalate';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
@@ -620,6 +620,7 @@ const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
 const WATCHED_TASK_EVENTS = new Set(['agent.output', 'timing']);
 /** …and these only from its own project; lifecycle events still reach inbox and insights. */
 const TASK_DETAIL_EVENTS = new Set([...WATCHED_TASK_EVENTS, 'agent.activity', 'conversation.message', 'conversation.explanation']);
+const EXPLANATIONS_OFF = 'Explanations are turned off';
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -2167,6 +2168,7 @@ export class Gateway {
         ...(consoleRevision ? { consoleRevision } : {}),
         timingEnabled: (await this.cachedTimingEnabled()),
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
+        explanationsEnabled: EXPLANATIONS_ENABLED,
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
         hostLocal: this.hostLocal,
@@ -5310,6 +5312,9 @@ export class Gateway {
         const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files, { otherAttempts: b.otherAttempts, saveOtherAttemptsDefault: b.saveOtherAttemptsDefault }, receivedAt);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
+      const stopAgentMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents\/([^/]+)\/stop$/);
+      if (stopAgentMatch && method === 'POST')
+        return this.json(res, 200, { ok: true, ...(await api.stopAgent(token, stopAgentMatch[1]!, decodeURIComponent(stopAgentMatch[2]!))) });
       const messageMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages$/);
       if (messageMatch && method === 'POST') {
         const b = await this.body(req);
@@ -5601,6 +5606,7 @@ export class Gateway {
           to: Array.isArray(b.to) ? b.to.map(String) : [],
           message: String(b.message ?? ''),
           ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
+          ...(Array.isArray(b.agents) ? { agents: b.agents } : {}),
         }));
       }
       if (p === '/api/agent/permission-requests' && method === 'POST') {
@@ -6082,6 +6088,7 @@ export class Gateway {
           return this.json(res, 200, explanations);
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        if (!EXPLANATIONS_ENABLED) return this.json(res, 404, { error: EXPLANATIONS_OFF });
         const project = (await store.getProject(task.projectId));
         if (!project) return this.json(res, 404, { error: 'task project not found' });
         const body = await this.body(req);
@@ -8060,7 +8067,7 @@ export class Gateway {
             enabled,
             modes: Object.fromEntries(creds.map((credential) => [credential.key,
               enabled.includes(credential.key) ? 'on'
-                : credential.kind === 'key' && explanationEnabled.has(credential.key) ? 'explainer-only'
+                : EXPLANATIONS_ENABLED && credential.kind === 'key' && explanationEnabled.has(credential.key) ? 'explainer-only'
                   : 'off',
             ])),
           };
@@ -8135,6 +8142,9 @@ export class Gateway {
       // annotations, so their defaults inherit organization → project without
       // becoming workflow params or agent-session input.
       const organizationExplanation = p.match(/^\/api\/organizations\/([^/]+)\/explanation-settings$/);
+      const projectExplanation = p.match(/^\/api\/projects\/([^/]+)\/explanation-settings$/);
+      if (!EXPLANATIONS_ENABLED && (organizationExplanation || projectExplanation))
+        return this.json(res, 404, { error: EXPLANATIONS_OFF });
       if (organizationExplanation) {
         const organizationId = organizationExplanation[1]!;
         const settings = (await this.explanationSettings(undefined, organizationId));
@@ -8150,7 +8160,6 @@ export class Gateway {
           return this.json(res, 200, { own, effective: normalizeExplanationSettings(own) });
         }
       }
-      const projectExplanation = p.match(/^\/api\/projects\/([^/]+)\/explanation-settings$/);
       if (projectExplanation) {
         const projectId = projectExplanation[1]!;
         const project = (await store.getProject(projectId));
@@ -8554,9 +8563,14 @@ export class Gateway {
       })));
       return mergeModels(results);
     };
-    const [claude, codex, opencode] = await Promise.all([
-      settled('claude'), settled('codex'), settled('opencode'),
+    // OpenCode runs on a model vendor's API key, so it lists that vendor's
+    // models whether or not an `opencode` binary exists here (hosted: none).
+    const keyVendors = [...new Set(creds.filter((c) => c.kind === 'key').map((c) => canonicalModelProvider(c.provider)))]
+      .filter((vendor) => (MODEL_PROVIDERS as readonly string[]).includes(vendor));
+    const [claude, codex, opencodeLogins, opencodeKeys] = await Promise.all([
+      settled('claude'), settled('codex'), settled('opencode'), openCodeKeyModels(keyVendors).catch(() => []),
     ]);
+    const opencode = mergeModels([opencodeLogins, opencodeKeys]);
     // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
@@ -8564,11 +8578,13 @@ export class Gateway {
       // metadata to add to the stable selections, not an exhaustive allowlist.
       claude: claudeModelCatalog(claude),
       codex: codexModelCatalog(codex),
+      // With no OpenCode credential at all, a few real models show what a key
+      // would unlock; a task on one waits for that key (Credentials).
       opencode: opencode.length ? opencode : [
         { id: 'kimi/kimi-for-coding' },
         { id: 'kimi/k3', effort: ['low', 'high', 'max'] },
-        { id: 'google/gemini-3.6-pro' },
-        { id: 'xai/grok-4.5' },
+        { id: 'anthropic/claude-sonnet-5' },
+        { id: 'openrouter/anthropic/claude-sonnet-5' },
       ],
       // Retained only for stored-profile/backward-compatible typing. The native
       // Kimi harness is disabled until its ACP server supports session/fork.
