@@ -64,9 +64,9 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
     // Triggers is an open block like the others, with Repeatable inside it.
     const triggers = body.locator('.tf-triggers');
     expect(await triggers.locator('details').count()).toBe(0);
-    expect(await triggers.locator('.triggers-block').evaluate((el) => getComputedStyle(el).borderTopStyle)).toBe('solid');
+    expect(await triggers.locator('.triggers-block').evaluate((el) => (globalThis as any).getComputedStyle(el).borderTopStyle)).toBe('solid');
     await expect.poll(() => triggers.locator('#dep-add, #cron-min, #trig-at, #trig-repeatable').evaluateAll((els) =>
-      els.map((el) => (el as HTMLElement).offsetParent !== null))).toEqual([true, true, true, true]);
+      els.map((el) => (el as unknown as { offsetParent: unknown }).offsetParent !== null))).toEqual([true, true, true, true]);
     // The task's own authority lives in the main Agent block, collapsed; the
     // sidebar keeps only organization metadata and logins.
     const main = body.locator('.tf-agent .agent-authority');
