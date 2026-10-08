@@ -425,6 +425,8 @@ export class VaultItems {
     replaceSecrets?: boolean;
     provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; connectorFormatVersion?: number; syncedAt?: number; sourceRevision?: string };
   }): Promise<VaultItem> {
+    // Chosen once: a re-run transaction must write the same handles, not orphan the first attempt's.
+    const freshId = newId('vi');
     return this.store.transaction(async () => {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
     await this.lockVault();
@@ -448,7 +450,7 @@ export class VaultItems {
     const envVar = args.envVar !== undefined ? args.envVar.trim() : prior?.envVar;
     if (envVar && envVar !== prior?.envVar && !isEnvName(envVar))
       throw new Error('The env var name may contain only letters, digits and _, and cannot start with a digit (e.g. DEPLOY_KEY)');
-    const id = prior?.id ?? newId('vi');
+    const id = prior?.id ?? freshId;
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     if (args.replaceSecrets) for (const field of fields) {
       if (args.secrets?.[field] === undefined || (field !== 'note' && !args.secrets[field]?.trim())) {
@@ -714,10 +716,11 @@ export class VaultItems {
 
   /** Resolve a secret field AFTER an access decision granted it. Audited. */
   async resolveField(item: VaultItem, field: VaultFieldName, ctx: { taskId?: string; principal?: string; mode: AccessMode }): Promise<string> {
-    return this.store.transaction(async () => {
     if (!item.fields.includes(field)) throw new Error(`item "${item.label}" has no ${field}`);
     const handle = itemHandle(item.id, field);
+    // Resolved (and audited by the broker) once, outside the re-runnable transaction.
     const secret = this.requireBroker().resolve(handle, { taskId: ctx.taskId, caps: [`use-credential:${handle}`] });
+    return this.store.transaction(async () => {
     // Read fresh usage: callers may reuse an item across several fields. An item
     // without its own usage key yet reads the index, which also migrates legacy
     // history before this access is audited, so it is counted only once.

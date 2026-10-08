@@ -88,5 +88,13 @@ function storeLines(processes: Record<string, StoreMetricsSnapshot>): string[] {
   for (const [process, snapshot] of Object.entries(processes))
     for (const [reason, count] of Object.entries(snapshot.failures))
       lines.push(`karmax_store_transaction_failures_total{process="${process}",reason="${reason}"} ${count}`);
+  for (const [outcome, name] of [['retried', 'karmax_store_transaction_retries_total'],
+    ['exhausted', 'karmax_store_transaction_retries_exhausted_total'],
+    ['unsafe', 'karmax_store_transaction_retries_refused_total']] as const) {
+    lines.push(`# TYPE ${name} counter`);
+    // A worker child on an older build reports no retries.
+    for (const [process, snapshot] of Object.entries(processes))
+      lines.push(`${name}{process="${process}"} ${snapshot.retries?.[outcome] ?? 0}`);
+  }
   return lines;
 }

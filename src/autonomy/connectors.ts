@@ -1946,13 +1946,15 @@ export class Connectors {
       .digest('hex');
   }
   private async queueWrite(name: string, itemId: string, externalId: string, field?: VaultFieldName): Promise<PendingConnectorWrite> {
+    // Chosen once: a re-run transaction must reuse the same snapshot handle.
+    const writeId = randomUUID();
     return this.store.transaction(async () => {
     await this.lockVault();
     const existing = (await this.pendingWrites()).find(
       (entry) => entry.connector === name && entry.itemId === itemId && entry.field === field,
     );
     const write: PendingConnectorWrite = {
-      id: randomUUID(),
+      id: writeId,
       connector: name,
       itemId,
       externalId: existing?.externalId ?? externalId,

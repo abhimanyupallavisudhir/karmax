@@ -140,10 +140,10 @@ export async function settleTaskSessions(args: {
       for (const hold of holds) {
         const lease = await read<Lease>(store, kvLease(hold.organizationId, hold.itemId));
         if (lease?.taskId === taskId) await store.kvDelete?.(kvLease(hold.organizationId, hold.itemId));
-        released.push(hold.itemId);
       }
       await store.kvDelete?.(kvHolds(taskId));
     });
+    released.push(...holds.map((hold) => hold.itemId));
   }
   return { refreshed, released };
 }

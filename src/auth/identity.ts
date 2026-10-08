@@ -1,3 +1,4 @@
+import { noteExternalEffect } from '../store/transaction-effects.js';
 import { identitySqliteDatabase } from '../store/identity-sqlite.js';
 import { betterAuth } from 'better-auth';
 import { admin, genericOAuth } from 'better-auth/plugins';
@@ -503,12 +504,12 @@ export class IdentityService {
   }
 
   async revokeUserSessions(userId: string): Promise<void> {
-    return this.db.transaction(async () => {
-
-    (await this.db.prepare('DELETE FROM session WHERE userId=?').run(userId));
+    (await this.db.transaction(async () => {
+      (await this.db.prepare('DELETE FROM session WHERE userId=?').run(userId));
+    }));
+    // After the commit: the listener clears in-memory tokens, which a re-run
+    // (deadlock retry) of the transaction would not see again.
     await this.sessionsRevoked?.(userId);
-  
-    });
   }
 
   /** First-account setup. The route calling this is available only while empty. */
@@ -518,6 +519,9 @@ export class IdentityService {
     // Concurrent bootstraps take turns: the second sees the first's account.
     (await this.db.lock('account-names'));
     if ((await this.hasUsers())) throw new Error(`${BRAND} has already been set up`);
+    // Better Auth commits the account on its own pool and may send mail: a
+    // rollback cannot undo that, so this attempt is never re-run.
+    noteExternalEffect();
     const response = await this.auth.api.signUpEmail({
       body: { ...input, name: (await this.assertUserNameAvailable(input.name)) }, headers, asResponse: true });
     if (!response.ok) throw new Error((await response.clone().json().catch(() => ({})) as any)?.message ?? 'could not create account');

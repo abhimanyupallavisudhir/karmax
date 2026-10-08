@@ -238,6 +238,9 @@ export const STORE_LOCK_ORDER = [
   'kv:<key>', 'wiki:<orgId>:<path>', 'permission-requests:<orgId>:<taskId>', 'service-connections:<orgId>:<taskId>', // one value rewritten from its previous value
 ] as const;
 
+/** Advisory lock namespace registering in-flight event seqs (PostgreSQL); see migrate(). */
+const EVENT_SEQ_KEY = 1802661240;
+
 export class Store {
   /** Compound service mutations must include their reads in this boundary. */
   transaction<T>(operation: () => Promise<T>): Promise<T> {
@@ -1016,8 +1019,47 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_subscription_billing_requests_org
         ON subscription_billing_requests(organizationId, createdAt);
     `));
-    if (this.db.dialect === 'postgres')
+    if (this.db.dialect === 'postgres') {
       await this.db.exec('CREATE INDEX IF NOT EXISTS idx_kv_key_c ON kv (k COLLATE "C")');
+      // Event seqs are handed out at insert but become visible at commit, so a
+      // lower seq can commit after a higher one. Every seq (whoever inserts the
+      // row) is registered as a transaction lock in pg_locks until its
+      // transaction ends: (EVENT_SEQ_KEY + seq >> 31, seq & 0x7fffffff), taken
+      // while holding the shared gate (EVENT_SEQ_KEY - 1, 0). The watermark is
+      // the newest seq allocated before the read, capped below the lowest
+      // registered one; a gate holder without a registration is mid-allocation,
+      // and the read retries (NULL after 200 ms). Bodies are single-quoted:
+      // the statement splitter does not know dollar quotes.
+      await this.db.exec(`CREATE OR REPLACE FUNCTION karmax_event_seq() RETURNS bigint LANGUAGE plpgsql VOLATILE AS '
+        DECLARE s bigint;
+        BEGIN
+          PERFORM pg_advisory_xact_lock_shared(${EVENT_SEQ_KEY - 1}, 0);
+          s := nextval(pg_get_serial_sequence(''events'', ''seq''));
+          PERFORM pg_advisory_xact_lock_shared(${EVENT_SEQ_KEY} + (s >> 31)::int, (s & 2147483647)::int);
+          RETURN s;
+        END'`);
+      await this.db.exec(`CREATE OR REPLACE FUNCTION karmax_event_watermark() RETURNS bigint LANGUAGE plpgsql VOLATILE AS '
+        DECLARE latest bigint; called boolean; inflight bigint; pending bigint;
+        BEGIN
+          FOR attempt IN 1..200 LOOP
+            EXECUTE ''SELECT last_value, is_called FROM '' || pg_get_serial_sequence(''events'', ''seq'') INTO latest, called;
+            IF NOT called THEN latest := latest - 1; END IF;
+            WITH held AS MATERIALIZED (
+              SELECT pid, classid::bigint AS k1, objid::bigint AS k2 FROM pg_locks
+              WHERE locktype = ''advisory'' AND objsubid = 2 AND granted
+                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                AND classid::bigint BETWEEN ${EVENT_SEQ_KEY - 1} AND ${EVENT_SEQ_KEY + 64})
+            SELECT min(((k1 - ${EVENT_SEQ_KEY}) << 31) + k2) FILTER (WHERE k1 >= ${EVENT_SEQ_KEY}),
+              count(*) FILTER (WHERE k1 = ${EVENT_SEQ_KEY - 1}
+                AND NOT EXISTS (SELECT 1 FROM held r WHERE r.pid = held.pid AND r.k1 >= ${EVENT_SEQ_KEY}))
+            INTO inflight, pending FROM held;
+            IF pending = 0 THEN RETURN least(latest, coalesce(inflight - 1, latest)); END IF;
+            PERFORM pg_sleep(0.001);
+          END LOOP;
+          RETURN NULL;
+        END'`);
+      await this.db.exec('ALTER TABLE events ALTER COLUMN seq SET DEFAULT karmax_event_seq()');
+    }
     if (!(await this.kvGet('migration:github-pr-observations'))) {
       await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
         .run('github:pr-observation:v1:', 'github:pr-observation:v1;');
@@ -1320,7 +1362,7 @@ export class Store {
 
   // ─── Projects ──────────────────────────────────────────────────────────────
 
-  async createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Promise<Project> {
+  async createProject(name: string, requested: ProjectConfig = {}, organizationId = 'org_personal'): Promise<Project> {
     return this.db.transaction(async () => {
     // Slugs are unique per organization; transfers hold both organizations.
     (await this.lockOrganization(organizationId));
@@ -1329,7 +1371,7 @@ export class Store {
     const path = parseProjectPath(name);
     assertRoutableName('project', path.name);
     (await this.assertUniqueProjectName(organizationId, path.name));
-    config = writableProjectConfig(config);
+    const config = writableProjectConfig(requested);
     validateProjectExecutionConfig(config);
     const ord = ((await this.db
       .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM projects WHERE organizationId = ?')
@@ -4241,9 +4283,11 @@ export class Store {
    * Only a caller that records the event itself passes `lifecycleEvent: false`.
    * The recorded event reaches this process's bus through `onEventRecorded`.
    */
-  async saveView(taskId: string, view: TaskView, conversationReference?: string, order?: ViewPublicationOrder,
+  async saveView(taskId: string, published: TaskView, conversationReference?: string, order?: ViewPublicationOrder,
     retain?: string[], options?: { lifecycleEvent?: boolean }): Promise<boolean> {
     return this.db.transaction(async () => {
+    // A retried transaction re-runs this callback: start from the published view each time.
+    let view = published;
     // Publication order, the previous view and its transitions are decided under the task's row.
     (await this.lockTask(taskId));
     if (order && !(await this.admitViewPublication(taskId, order))) return false;
@@ -6160,7 +6204,21 @@ export class Store {
     });
   }
 
+  /** The highest seq at and below which every event is final: no open
+   * transaction can still commit one. PostgreSQL hands a seq out at insert,
+   * so a lower one can commit after a higher one; every `seq > cursor` reader
+   * reads only up to here, and a cursor never passes an event that is still
+   * to come. (`karmax_event_seq` registers each seq until its transaction
+   * ends; `karmax_event_watermark` reads them.) -1 while an allocation is
+   * mid-registration: nothing new is visible yet. SQLite commits in seq order. */
+  async eventWatermark(): Promise<number> {
+    if (this.db.dialect !== 'postgres') return Number.MAX_SAFE_INTEGER;
+    const row = (await this.db.prepare('SELECT karmax_event_watermark() AS w').get()) as { w: number | null } | undefined;
+    return row?.w == null ? -1 : Number(row.w);
+  }
+
   async eventsSince(taskId: string, seq: number, limit?: number, excludeTiming = false): Promise<(KarmaxEvent & { seq: number })[]> {
+    const final = await this.eventWatermark();
     // Initial task-page loads ask for the newest bounded window. Do the bound in
     // SQLite: materializing every historical event and slicing in JS is precisely
     // the allocation spike this API is meant to avoid. Incremental consumers omit
@@ -6169,15 +6227,15 @@ export class Store {
       // Streamed text never counts against the bound; each agent's latest
       // partial rides along so a page opened mid-stream still shows it.
       const rows = (await this.db
-        .prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? AND type != 'agent.output' ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
-        .all(taskId, seq, limit)) as any[];
+        .prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? AND seq <= ? AND type != 'agent.output' ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
+        .all(taskId, seq, final, limit)) as any[];
       rows.push(...(await this.db.prepare(`SELECT * FROM events WHERE seq IN (SELECT MAX(seq) FROM events
-        WHERE type = 'agent.output' AND taskId = ? AND seq > ? AND json_extract(payload, '$.source') = 'assistant'
-        GROUP BY json_extract(payload, '$.role'))`).all(taskId, seq)) as any[]);
+        WHERE type = 'agent.output' AND taskId = ? AND seq > ? AND seq <= ? AND json_extract(payload, '$.source') = 'assistant'
+        GROUP BY json_extract(payload, '$.role'))`).all(taskId, seq, final)) as any[]);
       rows.sort((a, b) => Number(a.seq) - Number(b.seq));
       return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
     }
-    return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq`).all(taskId, seq)) as any[])
+    return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND seq > ? AND seq <= ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq`).all(taskId, seq, final)) as any[])
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
@@ -6190,8 +6248,8 @@ export class Store {
    *  more live activity rows than the UI's bounded event window. */
   async eventsOfType(taskId: string, type: string | readonly string[], afterSeq = 0): Promise<(KarmaxEvent & { seq: number })[]> {
     const types = typeof type === 'string' ? [type] : [...type];
-    return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND type IN (${types.map(() => '?').join(', ')}) AND seq > ? ORDER BY seq`)
-      .all(taskId, ...types, afterSeq)) as any[])
+    return ((await this.db.prepare(`SELECT * FROM events WHERE taskId = ? AND type IN (${types.map(() => '?').join(', ')}) AND seq > ? AND seq <= ? ORDER BY seq`)
+      .all(taskId, ...types, afterSeq, await this.eventWatermark())) as any[])
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
@@ -6208,12 +6266,16 @@ export class Store {
     return row ? { seq: row.seq, type: row.type, taskId: row.taskId, ts: row.ts, payload: JSON.parse(row.payload) } : undefined;
   }
 
-  /** Current durable event cursor without materializing or parsing the event log. */
+  /** Current durable event cursor without materializing or parsing the event
+   * log: the newest final event, so a reader starting here misses nothing. */
   async latestEventSeq(): Promise<number> {
-    return Number(((await this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get()) as any)?.seq ?? 0);
+    const final = await this.eventWatermark();
+    return Number(((await this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE seq <= ?').get(Math.max(final, 0))) as
+      { seq?: number } | undefined)?.seq ?? 0);
   }
 
   async allEventsSince(seq: number, limit?: number, excludeTiming = false): Promise<(KarmaxEvent & { seq: number })[]> {
+    const final = await this.eventWatermark();
     // Bound the read in SQL. Callers that want "the last N" would otherwise
     // materialize the ENTIRE append-only table before slicing — the events table
     // is the largest in the DB, so that is the dominant read-path allocation.
@@ -6221,19 +6283,20 @@ export class Store {
     // The bounded window is the Activity feed's, which never shows streamed text.
     if (limit && limit > 0) {
       const rows = (await this.db
-        .prepare(`SELECT * FROM events WHERE seq > ? AND type != 'agent.output' ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
-        .all(seq, limit)) as any[];
+        .prepare(`SELECT * FROM events WHERE seq > ? AND seq <= ? AND type != 'agent.output' ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq DESC LIMIT ?`)
+        .all(seq, final, limit)) as any[];
       rows.reverse();
       return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
     }
-    return ((await this.db.prepare(`SELECT * FROM events WHERE seq > ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq`).all(seq)) as any[]).map(
+    return ((await this.db.prepare(`SELECT * FROM events WHERE seq > ? AND seq <= ? ${excludeTiming ? "AND type != 'timing'" : ''} ORDER BY seq`).all(seq, final)) as any[]).map(
       (r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }),
     );
   }
 
   /** Oldest bounded page after a cursor, for lossless forward consumers. */
   async nextEventsSince(seq: number, limit: number): Promise<(KarmaxEvent & { seq: number })[]> {
-    const rows = await this.readRows<any>('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?', [seq, limit]);
+    const rows = await this.readRows<any>('SELECT * FROM events WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?',
+      [seq, await this.eventWatermark(), limit]);
     return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
@@ -6243,25 +6306,9 @@ export class Store {
   async nextForeignEventPage(seq: number, limit = 128): Promise<{
     cursor: number; scanned: number; seqs: number[]; events: Array<KarmaxEvent & { seq: number }>;
   }> {
-    const rows = await this.readRows<any>('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?',
-      [seq, Math.max(1, Math.min(500, Math.floor(limit)))]);
+    const rows = await this.readRows<any>('SELECT * FROM events WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?',
+      [seq, await this.eventWatermark(), Math.max(1, Math.min(500, Math.floor(limit)))]);
     return { cursor: rows.length ? Number(rows[rows.length - 1].seq) : seq, scanned: rows.length, ...foreignRows(rows) };
-  }
-
-  /** The rows among `seqs` that exist now, and the other processes' events
-   *  among them: how the relay finds rows that committed after it read past. */
-  async foreignEventsAt(seqs: readonly number[]): Promise<{ seqs: number[]; events: Array<KarmaxEvent & { seq: number }> }> {
-    if (!seqs.length) return { seqs: [], events: [] };
-    return foreignRows(await this.readRows<any>(
-      `SELECT * FROM events WHERE seq IN (${seqs.map(() => '?').join(',')}) ORDER BY seq`, [...seqs]));
-  }
-
-  /** The rows among `seqs` that exist now: how a forward reader finds rows
-   *  that committed after it read past their seq. */
-  async eventsAt(seqs: readonly number[]): Promise<Array<KarmaxEvent & { seq: number }>> {
-    if (!seqs.length) return [];
-    return (await this.readRows<any>(`SELECT * FROM events WHERE seq IN (${seqs.map(() => '?').join(',')}) ORDER BY seq`, [...seqs]))
-      .map((r) => ({ seq: Number(r.seq), type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
   /** Event routing needs ownership, never a conversation or reviewer expansion. */
@@ -6307,8 +6354,9 @@ export class Store {
     return r ? (JSON.parse(r.json) as Record<string, unknown>) : undefined;
   }
 
-  async setSettings(scopeKey: string, workflow: string, values: Record<string, unknown>) {
+  async setSettings(scopeKey: string, workflow: string, requested: Record<string, unknown>) {
     return this.db.transaction(async () => {
+    let values = requested; // per attempt: a retried transaction re-runs this callback
 
     if (workflow === 'vault') {
       const grants = values.credentialGrants;
@@ -7094,7 +7142,9 @@ export class Store {
       .map((row) => String(row.worldId));
     if (!worlds.length) return 0;
     let queued = 0;
-    for (const worldId of worlds) await this.db.transaction(async () => {
+    // Counted per committed world: a retried transaction re-runs its callback.
+    for (const worldId of worlds) queued += await this.db.transaction(async () => {
+      let queuedHere = 0;
       // Pins are added under the world's lock (pinWorldCheckpointForFork).
       (await this.db.lock(`world:${worldId}`));
       const pinned = new Set((await this.kvEntries('fork-checkpoint:')).map((row) => row.value));
@@ -7106,8 +7156,9 @@ export class Store {
           if (await this.kvGet(`checkpoint-gc:${checkpoint.id}`)) continue;
           await this.kvSet(`checkpoint-gc:${checkpoint.id}`, checkpointGcEntry(worldId, checkpoint));
         } else await this.db.prepare('DELETE FROM world_checkpoints WHERE id=?').run(checkpoint.id);
-        queued++;
+        queuedHere++;
       }
+      return queuedHere;
     });
     return queued;
   }
@@ -8167,14 +8218,14 @@ export class Store {
   // ─── Cards (payment resources; SPEC §7.6) ────────────────────────────────────
 
   /** Keep policy accounting and reservation insertion atomic across workers. */
-  async paymentTransaction<T>(fn: () => T): Promise<T> {
+  async paymentTransaction<T>(fn: () => T | Promise<T>): Promise<T> {
     return this.db.transaction(async () => {
 
     const nested = this.db.inTransaction();
     if (!nested) (await this.db.exec('BEGIN IMMEDIATE'));
     try {
       if (this.db.dialect === 'postgres') (await this.db.exec('LOCK TABLE cards, payment_spend_requests IN SHARE ROW EXCLUSIVE MODE'));
-      const result = fn();
+      const result = await fn();
       if (!nested) (await this.db.exec('COMMIT'));
       return result;
     } catch (error) {

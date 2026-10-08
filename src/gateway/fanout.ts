@@ -2,15 +2,13 @@ import type { Store } from '../store/db.js';
 import type { KarmaxEvent } from '../domain/types.js';
 import type { KarmaxBus } from '../contrib/bus.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
-import { EventGaps } from '../contrib/event-gaps.js';
 
 /**
  * Durable gateway fan-out. The event table, not an in-process emitter, is the
  * cursor source, so another worker/gateway replica can append an event and all
  * connected browsers still observe it. The local bus only wakes the poller to
- * reduce latency. Seqs increase, but concurrent transactions commit out of seq
- * order, so a seq the cursor passes without a row is re-read until it commits
- * (`EventGaps`); subscribers may receive such an event after a higher seq.
+ * reduce latency. Pages end at the event watermark, so the cursor never passes
+ * an event whose transaction is still to commit.
  */
 type RoutedEvent = { event: KarmaxEvent & { seq?: number }; projectId?: string; siblingAttempt?: boolean; bytes: number };
 interface Subscriber {
@@ -25,7 +23,6 @@ interface Subscriber {
 export class DurableEventFanout {
   private listeners = new Set<Subscriber>();
   private cursor!: number;
-  private readonly gaps = new EventGaps();
   private timer!: NodeJS.Timeout;
   private offBus?: () => void;
   private draining = false;
@@ -127,19 +124,12 @@ export class DurableEventFanout {
     if (this.draining || this.closed) return;
     this.draining = true;
     try {
-      for (const batch of this.gaps.pending()) {
-        if (this.closed) break;
-        const rows = await this.store.eventsAt(batch);
-        this.gaps.fill(rows.map(row => row.seq));
-        await this.route(rows);
-      }
       while (!this.closed) {
         // Consume the oldest page after the cursor. allEventsSince(..., limit)
         // intentionally returns the newest page for activity/history views; using
         // it here would skip the middle of bursts larger than one page.
         const rows = await this.store.nextEventsSince(this.cursor, 500);
         if (!rows.length) break;
-        this.gaps.note(this.cursor, rows.map(row => row.seq));
         await this.route(rows);
         if (rows.length < 500) break;
         await yieldTurn();

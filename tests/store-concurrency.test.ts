@@ -3,6 +3,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { BudgetService, MockPaymentProvider } from '../src/autonomy/payments.js';
 import { DurableEventFanout } from '../src/gateway/fanout.js';
 import { Store } from '../src/store/db.js';
+import { noteExternalEffect } from '../src/store/sql.js';
+import { storeMetricsSnapshot } from '../src/store/transaction-metrics.js';
 
 /**
  * Store invariants under concurrent PostgreSQL transactions. Two Stores on
@@ -199,6 +201,41 @@ describe.skipIf(!url).each([
     }
   });
 
+  it('pages `since` past an event that commits after a later one, exactly once', async () => {
+    const [a, b] = await pair();
+    const project = await a.createProject('Since');
+    // Two tasks: one task's events already commit in seq order under its row.
+    const [first, second] = await taskList(a, project.id, 2);
+    let cursor = await b.latestEventSeq();
+    const seen: string[] = [];
+    const poll = async () => {
+      for (const event of await b.allEventsSince(cursor)) {
+        if (event.type.startsWith('test.')) seen.push(event.type);
+        cursor = event.seq;
+      }
+    };
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let appended!: () => void;
+    const inserted = new Promise<void>(resolve => { appended = resolve; });
+    const early = a.transaction(async () => {
+      await a.appendEvent({ type: 'test.early', taskId: first!.id, ts: Date.now(), payload: {} });
+      appended();
+      await held;
+    });
+    await inserted;
+    const late = b.appendEvent({ type: 'test.late', taskId: second!.id, ts: Date.now(), payload: {} });
+    // Concurrently the higher seq commits now; under the global lock it waits.
+    await Promise.race([late, new Promise(resolve => setTimeout(resolve, 300))]);
+    await poll();
+    expect(seen).toEqual([]);
+    release();
+    await Promise.all([early, late]);
+    await poll();
+    await poll();
+    expect(seen).toEqual(['test.early', 'test.late']);
+  });
+
   it('delivers an event that commits after a later one to live subscribers', async () => {
     const [a, b] = await pair();
     const project = await a.createProject('Events');
@@ -227,5 +264,54 @@ describe.skipIf(!url).each([
       await Promise.all([early, late]);
       await vi.waitFor(() => expect(seen.sort()).toEqual(['test.early', 'test.late']), { timeout: 5_000 });
     } finally { off(); fanout.close(); }
+  });
+});
+
+describe.skipIf(!url)('deadlocks between concurrent PostgreSQL transactions', () => {
+  /** Two transactions on independent pools take the same two task rows in
+   * opposite orders: PostgreSQL aborts one of them with 40P01. */
+  async function deadlock(sideEffect: boolean) {
+    const [a, b] = await pair();
+    const project = await a.createProject('Deadlock');
+    const [one, two] = await taskList(a, project.id, 2);
+    let aHolds!: () => void, bHolds!: () => void;
+    const aLocked = new Promise<void>(resolve => { aHolds = resolve; });
+    const bLocked = new Promise<void>(resolve => { bHolds = resolve; });
+    const runs = { a: 0, b: 0 };
+    const side = (store: Store, mine: string, theirs: string, key: 'a' | 'b', holds: () => void, other: Promise<void>) =>
+      store.transaction(async () => {
+        runs[key]++;
+        await store.lockTask(mine);
+        holds();
+        await other;
+        if (sideEffect) noteExternalEffect();
+        await store.lockTask(theirs);
+        await store.kvSet(`deadlock:${key}`, String(runs[key]));
+      });
+    const results = await Promise.allSettled([side(a, one!.id, two!.id, 'a', aHolds, bLocked),
+      side(b, two!.id, one!.id, 'b', bHolds, aLocked)]);
+    return { a, results, runs };
+  }
+
+  it('re-runs the side PostgreSQL aborted, so both complete', async () => {
+    const before = storeMetricsSnapshot();
+    const { a, results, runs } = await deadlock(false);
+    expect(results.map(result => result.status)).toEqual(['fulfilled', 'fulfilled']);
+    expect(runs.a + runs.b).toBeGreaterThanOrEqual(3);
+    expect(await a.kvGet('deadlock:a')).toBe(String(runs.a));
+    expect(await a.kvGet('deadlock:b')).toBe(String(runs.b));
+    const after = storeMetricsSnapshot();
+    expect(after.failures.deadlock).toBeGreaterThan(before.failures.deadlock);
+    expect(after.retries.retried).toBeGreaterThan(before.retries.retried);
+  });
+
+  it('reports the deadlock instead of re-running an attempt that wrote outside the database', async () => {
+    const before = storeMetricsSnapshot();
+    const { results, runs } = await deadlock(true);
+    const failed = results.filter(result => result.status === 'rejected');
+    expect(failed).toHaveLength(1);
+    expect((failed[0] as PromiseRejectedResult).reason).toMatchObject({ code: '40P01' });
+    expect(runs.a + runs.b).toBe(2);
+    expect(storeMetricsSnapshot().retries.unsafe).toBe(before.retries.unsafe + 1);
   });
 });

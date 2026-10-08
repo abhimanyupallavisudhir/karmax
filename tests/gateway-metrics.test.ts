@@ -40,6 +40,9 @@ it('times Store transactions and lock waits per process without naming what was 
     expect(output).toContain('karmax_store_global_lock_wait_seconds_count{process="worker"} 7');
     expect(output).toMatch(/karmax_store_entity_lock_wait_seconds_bucket\{process="gateway",le="0\.001"\} \d+/);
     expect(output).toContain(`karmax_store_transaction_failures_total{process="gateway",reason="deadlock"} ${after.failures.deadlock}`);
+    expect(output).toContain(`karmax_store_transaction_retries_total{process="gateway"} ${after.retries.retried}`);
+    expect(output).toContain(`karmax_store_transaction_retries_exhausted_total{process="gateway"} ${after.retries.exhausted}`);
+    expect(output).toContain(`karmax_store_transaction_retries_refused_total{process="gateway"} ${after.retries.unsafe}`);
     expect(output).not.toMatch(/secret-tenant|NaN|Infinity/);
   } finally { await store.close(); metrics.close(); }
 });

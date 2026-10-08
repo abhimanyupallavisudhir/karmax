@@ -6,7 +6,9 @@ import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { AsyncPostgres } from './async-sql.js';
 import { DatabaseQueue } from './database-queue.js';
 import { splitStatements } from './postgres-sql.mjs';
-import { countStoreFailure, observeStore } from './transaction-metrics.js';
+import { countStoreFailure, countStoreRetry, observeStore } from './transaction-metrics.js';
+import { transactionAttempts } from './transaction-effects.js';
+export { noteExternalEffect } from './transaction-effects.js';
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 export interface SqlRunResult { changes: number | bigint; lastInsertRowid: number | bigint }
 export interface SqlStatement {
@@ -34,7 +36,13 @@ export interface SqlDatabase {
   afterCommit(operation: () => unknown): void;
   close(): Promise<void>;
 }
-interface Scope { active: boolean; rollback: boolean; afterCommit: Array<() => unknown>; locks: Set<string> }
+interface Scope { active: boolean; rollback: boolean; afterCommit: Array<() => unknown>; locks: Set<string>; external: boolean }
+/** Re-runs of an outermost PostgreSQL transaction aborted by a deadlock
+ * (40P01) or serialization failure (40001); the rolled-back attempt left
+ * nothing behind, and afterCommit callbacks run only for the one that commits. */
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 10;
+const retryable = (error: unknown) => ['40P01', '40001'].includes(String((error as { code?: unknown })?.code));
 /** The former installation-wide write lock, kept as a kill switch for one
  * release: `KARMAX_STORE_GLOBAL_LOCK=1` serializes every PostgreSQL Store
  * transaction again (in-process queue plus one advisory key across processes),
@@ -151,8 +159,7 @@ class AsyncDatabase implements SqlDatabase {
       return operation();
     }
     const requested = performance.now();
-    const run = async () => {
-      const scope: Scope = { active: true, rollback: false, afterCommit: [], locks: new Set() };
+    const attempt = async (scope: Scope) => {
       const rollback = new Error('transaction requested rollback');
       let result!: T;
       let opened = 0;
@@ -160,7 +167,7 @@ class AsyncDatabase implements SqlDatabase {
         opened = performance.now();
         observeStore('admission', requested);
         try {
-          result = await this.scope.run(scope, operation);
+          result = await transactionAttempts.run(scope, () => this.scope.run(scope, operation));
           if (scope.rollback) throw rollback;
           return result;
         } finally { scope.active = false; }
@@ -187,6 +194,20 @@ class AsyncDatabase implements SqlDatabase {
         if (error === rollback) return result;
         countStoreFailure(error);
         throw error;
+      }
+    };
+    const run = async () => {
+      for (let retry = 0; ; retry++) {
+        const scope: Scope = { active: true, rollback: false, afterCommit: [], locks: new Set(), external: false };
+        try { return await attempt(scope); }
+        catch (error) {
+          if (!this.postgres || !retryable(error)) throw error;
+          if (scope.external) { countStoreRetry('unsafe'); throw error; }
+          if (retry >= MAX_RETRIES) { countStoreRetry('exhausted'); throw error; }
+          countStoreRetry('retried');
+          // Jittered exponential backoff, so the two sides of a deadlock do not meet again.
+          await new Promise(resolve => setTimeout(resolve, Math.random() * RETRY_BASE_MS * 2 ** retry));
+        }
       }
     };
     return this.enqueue(run);

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { acquireFileLock } from '../util/file-lock.js';
+import { noteExternalEffect } from '../store/transaction-effects.js';
 import { INSTALLATION_SCOPE, LocalKek, isVaultScope, kekFromEnvironment, type KekSource, type KeyEncryptionKey, type VaultScope } from './vault-keys.js';
 
 /**
@@ -665,6 +666,9 @@ export class Vault {
 
   private async mutate<T>(operation: () => T): Promise<T> {
     if (this.readOnly) throw new Error('this vault was opened read-only');
+    // A Store transaction rolled back after this write cannot undo it, so it
+    // must not be re-run (a deadlock is reported to its caller instead).
+    noteExternalEffect();
     const release = process.platform === 'linux'
       ? await acquireFileLock(`${this.dbPath}.lock`) : undefined;
     try {

@@ -9025,8 +9025,9 @@ export class Gateway {
   private async withDeletionFence<T>(projectIds: string[], organizationId: string | undefined, work: (projectIds: string[]) => Promise<T>): Promise<T> {
     const store = this.deps.store;
     const value = JSON.stringify({ id: crypto.randomUUID(), kind: 'delete', expiresAt: Number.MAX_SAFE_INTEGER });
-    const keys: string[] = [];
-    await store.transaction(async () => {
+    const keys = await store.transaction(async () => {
+      // Built per attempt: a re-run transaction starts over.
+      const keys: string[] = [];
       if (organizationId) {
         if (store.db.dialect === 'postgres') await store.db.prepare('SELECT id FROM organizations WHERE id=? FOR UPDATE').get(organizationId);
         projectIds = (await store.listProjects()).filter(p => p.organizationId === organizationId).map(p => p.id);
@@ -9040,6 +9041,7 @@ export class Gateway {
           throw new ProjectTransferError('A project move is in progress. Retry deletion when it finishes.');
       }
       for (const key of keys) await store.kvSet(key, value);
+      return keys;
     });
     try { return await work(projectIds); }
     finally { for (const key of keys) await store.db.prepare('DELETE FROM kv WHERE k=? AND v=?').run(key, value); }

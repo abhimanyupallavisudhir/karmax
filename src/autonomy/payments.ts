@@ -1295,6 +1295,7 @@ export class BudgetService {
     const refreshed = await provider.getCard(card.id) ?? card;
     let wonClaim = false;
     const claimed = (await this.store.paymentTransaction(async () => {
+      wonClaim = false; // per attempt: a deadlocked transaction re-runs this callback
       const current = (await this.store.getPaymentSpendRequest(requestId))!;
       if (!['pending_approval', 'needs_funding'].includes(current.status)) return current;
       if (await ended())
