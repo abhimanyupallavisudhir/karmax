@@ -74,7 +74,7 @@ import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
-import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
 import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -620,6 +620,7 @@ const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
 const WATCHED_TASK_EVENTS = new Set(['agent.output', 'timing']);
 /** …and these only from its own project; lifecycle events still reach inbox and insights. */
 const TASK_DETAIL_EVENTS = new Set([...WATCHED_TASK_EVENTS, 'agent.activity', 'conversation.message', 'conversation.explanation']);
+const EXPLANATIONS_OFF = 'Explanations are turned off';
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -2167,6 +2168,7 @@ export class Gateway {
         ...(consoleRevision ? { consoleRevision } : {}),
         timingEnabled: (await this.cachedTimingEnabled()),
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
+        explanationsEnabled: EXPLANATIONS_ENABLED,
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
         hostLocal: this.hostLocal,
@@ -6082,6 +6084,7 @@ export class Gateway {
           return this.json(res, 200, explanations);
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        if (!EXPLANATIONS_ENABLED) return this.json(res, 404, { error: EXPLANATIONS_OFF });
         const project = (await store.getProject(task.projectId));
         if (!project) return this.json(res, 404, { error: 'task project not found' });
         const body = await this.body(req);
@@ -8060,7 +8063,7 @@ export class Gateway {
             enabled,
             modes: Object.fromEntries(creds.map((credential) => [credential.key,
               enabled.includes(credential.key) ? 'on'
-                : credential.kind === 'key' && explanationEnabled.has(credential.key) ? 'explainer-only'
+                : EXPLANATIONS_ENABLED && credential.kind === 'key' && explanationEnabled.has(credential.key) ? 'explainer-only'
                   : 'off',
             ])),
           };
@@ -8135,6 +8138,9 @@ export class Gateway {
       // annotations, so their defaults inherit organization → project without
       // becoming workflow params or agent-session input.
       const organizationExplanation = p.match(/^\/api\/organizations\/([^/]+)\/explanation-settings$/);
+      const projectExplanation = p.match(/^\/api\/projects\/([^/]+)\/explanation-settings$/);
+      if (!EXPLANATIONS_ENABLED && (organizationExplanation || projectExplanation))
+        return this.json(res, 404, { error: EXPLANATIONS_OFF });
       if (organizationExplanation) {
         const organizationId = organizationExplanation[1]!;
         const settings = (await this.explanationSettings(undefined, organizationId));
@@ -8150,7 +8156,6 @@ export class Gateway {
           return this.json(res, 200, { own, effective: normalizeExplanationSettings(own) });
         }
       }
-      const projectExplanation = p.match(/^\/api\/projects\/([^/]+)\/explanation-settings$/);
       if (projectExplanation) {
         const projectId = projectExplanation[1]!;
         const project = (await store.getProject(projectId));
