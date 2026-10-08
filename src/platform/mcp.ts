@@ -470,14 +470,16 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     'escalate_to_human',
     {
       description:
-        'Pause your current task at its exact stage and request input from selected people, teams, or Avatars. ' +
+        'Ask named people, teams, or Avatars for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
+        'For anything an agent could answer, end your turn with the question instead; it goes to your task\'s usual input route (a sub-task\'s parent, else its Responder). ' +
+        'This pauses your task at its exact stage and ends your turn. A reply resumes you, and the answer or question you end that turn with reaches them too. ' +
         'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Calling this stops the current turn; the task resumes when a selected principal responds. ' +
         'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
         'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
       inputSchema: {
-        audience: z.array(z.string()).max(32).optional(),
+        // Required, but checked by the platform, whose refusal lists who can be asked.
+        audience: z.array(z.string()).max(32).optional().describe('Required. Who to ask: person/team/Avatar selectors; any of them may answer.'),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },

@@ -194,6 +194,7 @@ export const agentTurnStateSignal = defineSignal<[{
   detail?: string;
 }]>(SIG_AGENT_TURN_STATE);
 /** A child raises UP to its parent when it reaches a decision point (SPEC §5.3). */
+const REPLY_TO_SPEAKERS = 'software-dev-reply-to-speakers-v1';
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
 /** A parent answers a child that raised to it — maps onto the same confirm/retry/
  *  cancel/follow-up transitions a human would drive (SPEC §5.3). */
@@ -900,6 +901,9 @@ async function softwareDevImpl(
   // `agentQueue` and run, in call order, at the next turn boundary or at once
   // while the task is parked. The main agent keeps `session`/`sessionHome`/`seen`.
   const multiAgent = minor >= 27;
+  /** People (`user:<id>`) who spoke to the main agent in what its last turn
+   * answered (v1.27). */
+  let speakers: string[] = [];
   const participantSessions: Record<string, { session?: string; home?: string; seen: number }> =
     Object.fromEntries(Object.entries(continued?.participants?.sessions ?? {}).map(([key, value]) => [key, { ...value }]));
   let agentQueue: string[] = [...(continued?.participants?.queue ?? [])];
@@ -2555,6 +2559,7 @@ async function softwareDevImpl(
     // a mid-turn follow-up landed in `msgs` but got marked consumed, so it silently
     // never reached the agent (SPEC §5.6 — a queued follow-up must reach the agent).
     let deliveredNow = seen;
+    const answeredFrom = seen;
     const turn = await withResolve('do', () =>
       leasedTurn('do', (
         accountConfigHome,
@@ -2617,11 +2622,20 @@ async function softwareDevImpl(
     // any follow-up that arrived after the last poll. This keeps the transcript honest
     // and leaves that follow-up AFTER `seen`, so the NEXT turn delivers it.
     if (turn.output?.trim()) {
-      msgs.splice(delivered, 0, { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered,
-        ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) });
+      const reply: Message = { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered,
+        ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) };
+      msgs.splice(delivered, 0, reply);
       seen = delivered + 1;
+      // The people who spoke to the agent hear its answer. A sub-task's turn
+      // ends with its parent, so it goes back to them now (#533); a top-level
+      // question also asks them (`askOf`).
+      speakers = multiAgent ? [...new Set(msgs.slice(answeredFrom, delivered)
+        .filter((m) => m.role === 'user' && m.author?.startsWith('user:') && addressedTo(m, MAIN_AGENT))
+        .map((m) => m.author!))] : [];
+      if (input.parentTaskId && speakers.length && patched(REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers);
     } else {
       seen = delivered;
+      speakers = [];
     }
     if (turn.reviewInfo) {
       // A proposal-readiness/landing refusal resumes the SAME Do conversation.
@@ -3321,6 +3335,22 @@ Inspect the complete current diff and specifically compare its delta from the re
     runStart = { events: workflowInfo().historyLength, bytes: workflowInfo().historySize };
   }
 
+  /** A question ending the agent's turn asks the task's usual people and,
+   * since software-dev 1.27, whoever spoke to the agent in what it answered. */
+  function askOf(route: string[]): string[] {
+    return speakers.length && patched(REPLY_TO_SPEAKERS) ? [...new Set([...route, ...speakers])] : route;
+  }
+
+  /** ` (already sent to Bea, who spoke to it)` when the agent's last reply also
+   * went to people, so a parent does not relay it to them again. */
+  function alsoSentTo(): string {
+    const reply = msgs[seen - 1];
+    const people = reply?.role === 'agent' && messageAuthor(reply) === MAIN_AGENT ? reply.to ?? [] : [];
+    if (!people.length) return '';
+    const label = (selector: string) => msgs.find((m) => m.author === selector && m.authorLabel)?.authorLabel ?? selector;
+    return ` (already sent to ${people.map(label).join(', ')}, who spoke to it)`;
+  }
+
   /** Tell our parent (if any) we need a decision (SPEC §5.3). Best effort — if the
    *  parent is gone the child stays human-resolvable via its own retry/confirm. */
   /** Raise to the parent; false when there is none (or it is gone). */
@@ -3920,7 +3950,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             // own last words (its question, or what it says it finished).
             await notifyParent(turn.raise?.type ?? 'needs_confirmation', turn.raise?.detail
               ?? `Its Do turn ended without opening a PR. Confirm to open the PR if the work is truly complete; otherwise comment.${turn.output?.trim()
-                ? `\n\nIts last message:\n${clip(turn.output.trim(), PARENT_RAISE_OUTPUT_CHARS)}` : ''}`);
+                ? `\n\nIts last message${alsoSentTo()}:\n${clip(turn.output.trim(), PARENT_RAISE_OUTPUT_CHARS)}` : ''}`);
             await publish();
             await waitServing(() => prRequested || cancelled || mainUnread());
           } else {
@@ -3963,9 +3993,9 @@ Inspect the complete current diff and specifically compare its delta from the re
               } else {
                 waitingFor = {
                   kind: 'human',
-                  audience: routedInputResponder && route?.kind === 'human' && route.audience?.length
+                  audience: askOf(routedInputResponder && route?.kind === 'human' && route.audience?.length
                     ? route.audience
-                    : ['@creator'],
+                    : ['@creator']),
                   detail: boundedResponses && route?.kind === 'agent' && responderRounds >= 3
                     ? `Three automated responses have not resolved this pause. ${question}` : question,
                 };
