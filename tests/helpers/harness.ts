@@ -30,6 +30,7 @@ import { ObjectSnapshotEngine, ProjectResourceService } from '../../src/world/re
 import { WorldCheckpointService } from '../../src/world/checkpoint.js';
 import { WorldHandoffService } from '../../src/world/handoff.js';
 import { AuthorizationService } from '../../src/platform/authorization.js';
+import { ArtificialAnalysis } from '../../src/agent/model-benchmarks.js';
 
 /** How long a teardown step may run before it is worth saying so out loud. Well
  *  clear of the ~1s a healthy teardown takes, so a normal run stays silent. */
@@ -68,7 +69,8 @@ export interface Harness {
     runtimeReady?: () => boolean;
     serviceConnections?: import('../../src/integrations/service-connections.js').ServiceConnections;
     loginCommand?: LoginCommand;
-    githubApp?: import('../../src/integrations/github-app.js').GitHubAppService }): Promise<{
+    githubApp?: import('../../src/integrations/github-app.js').GitHubAppService;
+    artificialAnalysis?: import('../../src/agent/model-benchmarks.js').ArtificialAnalysis }): Promise<{
       url: string; internalUrl: string; close: () => Promise<void>; gateway: Gateway }>;
 }
 
@@ -226,6 +228,8 @@ export async function bootHarness(
         objects,
         resources,
         handoffs,
+        // Never the operator's key: a test must not spend its daily allowance.
+        artificialAnalysis: opts?.artificialAnalysis ?? new ArtificialAnalysis({}),
       }));
       const started = await gw.listen(opts?.port);
       gateways.push(started.close);

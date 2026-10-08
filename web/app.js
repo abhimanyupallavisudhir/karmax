@@ -972,15 +972,14 @@ const NODES = [
   { key: 'done', label: 'End' },
 ];
 
-// Provider → model choices for the agent field (free-text also allowed).
-// `mock` is a hermetic test adapter, not a user-selectable agent.
-const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok'];
+// Harness → model choices for the model field (free text also allowed).
+// `mock` is a hermetic test adapter, not a user-selectable agent; Kimi Code and
+// Grok Build are not admitted by the server, so their models run through OpenCode.
+const AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
 const MODELS = {
   claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
   codex: ['gpt-5.6-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
-  kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
-  grok: ['grok-build', 'grok-code-fast-1'],
 };
 const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
 const agentProviderLabel = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : '';
@@ -1008,14 +1007,14 @@ function effortLevelsFor(provider, model) {
   // task schema. Do not offer a choice that the runtime would silently drop.
   if (advertised) return provider === 'codex' ? advertised.filter((level) => EFFORT_ORDER.includes(level)) : advertised;
   if (provider === 'claude') {
-    if (!/opus-(?:4-(5|6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
+    if (!/opus-(?:4-(5|6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5|haiku-5/.test(m)) return [];
     const ok = new Set(['low', 'medium', 'high']);
-    if (/opus-(?:4-(7|8)|5)|sonnet-5|fable-5|mythos-5/.test(m)) ok.add('xhigh');
-    if (/opus-(?:4-(6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) ok.add('max');
+    if (/opus-(?:4-(7|8)|5)|sonnet-5|fable-5|mythos-5|haiku-5/.test(m)) ok.add('xhigh');
+    if (/opus-(?:4-(6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5|haiku-5/.test(m)) ok.add('max');
     return EFFORT_ORDER.filter((l) => ok.has(l));
   }
   if (provider === 'codex') {
-    if (/^gpt-6(?:-|$)/.test(m)) return EFFORT_ORDER;
+    if (/^gpt-(?:[6-9]|\d{2,})(?:[.-]|$)/.test(m)) return EFFORT_ORDER;
     // gpt-5.x (5.5, 5.4-mini) accept up to xhigh; older reasoning models top out at high.
     if (/^gpt-5/.test(m)) return ['low', 'medium', 'high', 'xhigh'];
     if (/^(o1|o3|o4|codex)/.test(m) || m.includes('reasoning')) return ['low', 'medium', 'high'];
@@ -1023,23 +1022,411 @@ function effortLevelsFor(provider, model) {
   }
   return [];
 }
-// A <select> listing only the levels this model supports; disabled (greyed) when none.
-function effortSelectHtml(cls, provider, model, current) {
-  const levels = effortLevelsFor(provider, model);
-  if (!levels.length) {
-    return `<select class="${esc(cls)}" disabled title="This model has no reasoning-effort control"><option value="">no effort control</option></select>`;
-  }
-  const cur = levels.includes(current) ? current : '';
-  const opts = ['', ...levels].map((e) => `<option value="${e}" ${e === cur ? 'selected' : ''}>${e || 'provider default'}</option>`).join('');
-  return `<select class="${esc(cls)}">${opts}</select>`;
+
+// ── The model field ──────────────────────────────────────────────────────────
+// One field for what an agent runs on: harness, model and reasoning effort,
+// written `harness:model:effort` (claude:claude-opus-5-5:high). It is typed or
+// picked; every part but the harness is optional (claude:high, codex:gpt-6-sol)
+// and the harness follows from a bare model id (gpt-6-sol:high → codex). The
+// stored AgentSpec stays {provider, model, effort}: this is only how it is shown.
+const modelIdOf = (option) => typeof option === 'string' ? option : option.id;
+function inferHarness(model) {
+  const m = (model || '').toLowerCase();
+  if (!m) return '';
+  if (m.includes('/')) return 'opencode';
+  if (/^(?:claude-|opus|sonnet|haiku|fable|mythos|default$)/.test(m)) return 'claude';
+  if (/^(?:gpt-|o\d|codex)/.test(m)) return 'codex';
+  return AGENT_PROVIDERS.find((provider) => modelOptions(provider).some((option) => modelIdOf(option) === model)) || '';
 }
-// Re-render an effort <select> in place after its provider/model changes.
-function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
-  const el = box.querySelector('.' + effortCls);
-  if (!el) return;
-  const provider = box.querySelector('.' + providerCls)?.value;
-  const model = box.querySelector('.' + modelCls)?.value.trim();
-  el.outerHTML = effortSelectHtml(effortCls, provider, model, el.value || '');
+function parseModelRef(text, fallbackProvider) {
+  const parts = String(text || '').trim().split(':').map((part) => part.trim());
+  let provider = '';
+  if (AGENT_PROVIDERS.includes(parts[0].toLowerCase())) provider = parts.shift().toLowerCase();
+  let effort = '';
+  const last = (parts[parts.length - 1] || '').toLowerCase();
+  if (EFFORT_ORDER.includes(last) && (parts.length > 1 || provider)) { effort = last; parts.pop(); }
+  const model = parts.join(':');
+  return { provider: provider || inferHarness(model) || agentProviderChoice(fallbackProvider), model, effort };
+}
+const formatModelRef = (spec) => [spec?.provider, spec?.model, spec?.effort].filter(Boolean).join(':');
+const modelRefKey = (spec) => `${spec.provider}:${spec.model || ''}:${spec.effort || ''}`;
+function modelLabel(provider, model) {
+  if (!model) return 'default model';
+  const option = modelOptions(provider).find((candidate) => modelIdOf(candidate) === model);
+  return (option && typeof option !== 'string' && option.displayName) || model;
+}
+function modelFaceHtml(spec) {
+  if (!spec?.provider) return '';
+  return `<span class="mf-harness" data-harness="${esc(spec.provider)}">${esc(spec.provider)}</span>`
+    + `<span class="mf-name">${esc(modelLabel(spec.provider, spec.model))}</span>`
+    + (spec.effort ? `<span class="mf-effort">${esc(spec.effort)}</span>` : '');
+}
+
+// Models someone picks, most frequent and recent first (per browser, like the
+// @-mention order): each pick's weight halves every two weeks.
+const MODEL_FRECENCY_KEY = 'tavya.models';
+const FRECENCY_HALF_LIFE_MS = 14 * 24 * 60 * 60_000;
+function modelUses() {
+  try { return JSON.parse(localStorage.getItem(MODEL_FRECENCY_KEY) || '{}') || {}; } catch { return {}; }
+}
+function recordModelUse(spec, now = Date.now()) {
+  if (!spec?.provider) return;
+  const uses = modelUses();
+  const key = modelRefKey(spec);
+  uses[key] = [now, ...(uses[key] || [])].slice(0, 10);
+  try { localStorage.setItem(MODEL_FRECENCY_KEY, JSON.stringify(uses)); } catch { /* private mode */ }
+}
+function modelFrecency(now = Date.now()) {
+  const scores = new Map();
+  for (const [key, times] of Object.entries(modelUses())) {
+    if (!Array.isArray(times)) continue;
+    scores.set(key, times.reduce((sum, at) => sum + 0.5 ** (Math.max(0, now - at) / FRECENCY_HALF_LIFE_MS), 0));
+  }
+  return scores;
+}
+// The picker's rows: one per (harness, model), most used first, each with its
+// effort levels and the effort it is usually picked with.
+function modelPickerRows(now = Date.now()) {
+  const scores = modelFrecency(now);
+  const rows = [];
+  for (const provider of AGENT_PROVIDERS) {
+    for (const option of modelOptions(provider)) {
+      const model = modelIdOf(option);
+      if (!model || rows.some((row) => row.provider === provider && row.model === model)) continue;
+      const efforts = effortLevelsFor(provider, model);
+      let score = 0;
+      let usual = '';
+      let usualScore = 0;
+      for (const effort of ['', ...efforts]) {
+        const value = scores.get(`${provider}:${model}:${effort}`) || 0;
+        score += value;
+        if (value > usualScore) { usual = effort; usualScore = value; }
+      }
+      const normalized = normalizeComboOption(option);
+      rows.push({ provider, model, label: normalized.label, description: normalized.description, efforts, usual, score, order: rows.length });
+    }
+  }
+  // A model typed by hand that the catalog does not list is still offered once picked.
+  for (const [key, score] of scores) {
+    const provider = key.slice(0, key.indexOf(':'));
+    const model = key.slice(key.indexOf(':') + 1, key.lastIndexOf(':'));
+    const effort = key.slice(key.lastIndexOf(':') + 1);
+    if (!AGENT_PROVIDERS.includes(provider) || !model) continue;
+    const row = rows.find((candidate) => candidate.provider === provider && candidate.model === model);
+    if (row?.typed) {
+      row.score += score;
+      if (score > row.usualScore) Object.assign(row, { usual: effort, usualScore: score });
+    } else if (!row) {
+      const efforts = effortLevelsFor(provider, model);
+      rows.push({ provider, model, label: model, description: '', efforts, usual: efforts.includes(effort) ? effort : '', usualScore: score, score, order: rows.length, typed: true });
+    }
+  }
+  return rows.sort((a, b) => b.score - a.score || a.order - b.order);
+}
+// Rows matching a typed query: every word is part of the harness, id or name,
+// or names (a prefix of) an effort the model takes, which it then selects.
+function filterModelRows(rows, query) {
+  const words = String(query || '').toLowerCase().split(/[\s:]+/).filter(Boolean);
+  if (!words.length) return rows.map((row) => ({ ...row, effort: row.usual }));
+  return rows.flatMap((row) => {
+    const haystack = `${row.provider} ${row.model} ${row.label}`.toLowerCase();
+    let effort = row.usual;
+    for (const word of words) {
+      if (haystack.includes(word)) continue;
+      const level = row.efforts.find((candidate) => candidate === word) || row.efforts.find((candidate) => candidate.startsWith(word));
+      if (!level) return [];
+      effort = level;
+    }
+    return [{ ...row, effort }];
+  });
+}
+
+const CHART_ICON = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M2 2v12h12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="6" cy="10" r="1.3" fill="currentColor"/><circle cx="9" cy="6.5" r="1.3" fill="currentColor"/><circle cx="12.5" cy="4.5" r="1.3" fill="currentColor"/><circle cx="11" cy="10.5" r="1.3" fill="currentColor"/></svg>';
+function modelFieldHtml(cls, spec, { placeholder = 'harness:model:effort' } = {}) {
+  return `<div class="combo model-field">
+    <input class="${esc(cls)}" value="${esc(formatModelRef(spec))}" aria-label="Model" placeholder="${esc(placeholder)}" autocomplete="off" spellcheck="false" />
+    <div class="mf-face" aria-hidden="true">${spec?.provider ? modelFaceHtml(spec) : ''}</div>
+    ${S.meta?.modelBenchmarks ? `<button type="button" class="mf-chart" title="Compare models by intelligence, cost and time" aria-label="Compare models">${CHART_ICON}</button>` : ''}
+    <button type="button" class="combo-caret" tabindex="-1" aria-label="Show models">▾</button>
+    <div class="combo-menu mf-menu" role="listbox" hidden></div>
+  </div>`;
+}
+const modelFieldInput = (root) => root?.querySelector('.model-field > input');
+function readModelField(root, fallbackProvider) {
+  return parseModelRef(modelFieldInput(root)?.value, fallbackProvider);
+}
+// Set the field without counting it as a pick (an Avatar's runtime, a reset).
+function setModelField(root, spec) {
+  const input = modelFieldInput(root);
+  if (!input) return;
+  input.value = formatModelRef(spec);
+  const face = root.querySelector('.mf-face');
+  if (face) face.innerHTML = spec?.provider ? modelFaceHtml(spec) : '';
+}
+function wireModelField(field, { fallbackProvider } = {}) {
+  const input = field?.querySelector('input');
+  const menu = field?.querySelector('.mf-menu');
+  if (!input || !menu || field._modelFieldWired) return;
+  field._modelFieldWired = true;
+  let rows = [];
+  let active = -1;
+  let typed = false; // the menu shows every model until the user types
+  const current = () => parseModelRef(input.value, fallbackProvider);
+  const draw = () => {
+    const value = current();
+    rows = filterModelRows(modelPickerRows(), typed ? input.value : '').map((row) =>
+      !typed && row.provider === value.provider && row.model === value.model ? { ...row, effort: value.effort, isCurrent: true } : row);
+    menu.innerHTML = rows.length ? rows.map((row, index) => `<div class="combo-opt mf-row${index === active ? ' active' : ''}" role="option" data-index="${index}">
+        <span class="mf-harness" data-harness="${esc(row.provider)}">${esc(row.provider)}</span>
+        <span class="mf-row-name" title="${esc(row.description || row.model)}">${esc(row.label)}${row.label !== row.model ? ` <code>${esc(row.model)}</code>` : ''}</span>
+        <span class="mf-efforts">${row.efforts.length ? ['', ...EFFORT_ORDER].map((effort) => effort && !row.efforts.includes(effort)
+          ? `<span class="mf-effort-chip mf-effort-gap" aria-hidden="true">${esc(effort)}</span>`
+          : `<button type="button" tabindex="-1" class="mf-effort-chip${effort === (row.effort || '') && (effort || row.isCurrent) ? ' on' : ''}" data-effort="${esc(effort)}"${effort ? '' : ' title="Provider default"'}>${esc(effort || 'auto')}</button>`).join('') : ''}</span>
+      </div>`).join('')
+      : '<div class="combo-empty">No matching models — any harness:model:effort works</div>';
+    menu.querySelector('.mf-row.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  const open = () => { draw(); menu.hidden = false; };
+  const close = () => { menu.hidden = true; active = -1; typed = false; };
+  const commit = (spec) => {
+    setModelField(field, spec);
+    recordModelUse(spec);
+    close();
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  const commitRow = (row, effort = row.effort) => commit({ provider: row.provider, model: row.model, effort: effort || '' });
+  field._pickModel = commit;
+  input.addEventListener('focus', () => { active = -1; typed = false; open(); input.select(); });
+  input.addEventListener('input', () => { typed = true; active = -1; open(); });
+  input.addEventListener('mousedown', () => { if (menu.hidden && document.activeElement === input) { typed = false; open(); } });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') { if (!menu.hidden) { event.stopPropagation(); close(); } input.blur(); return; }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (menu.hidden) open();
+      if (!rows.length) return;
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      active = active === -1 ? (step === 1 ? 0 : rows.length - 1) : (active + step + rows.length) % rows.length;
+      draw();
+    } else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && active >= 0 && rows[active]?.efforts.length) {
+      // Within the list, left/right step the highlighted model's effort.
+      event.preventDefault();
+      const row = rows[active];
+      const levels = ['', ...row.efforts];
+      const at = levels.indexOf(row.effort || '');
+      row.effort = levels[Math.max(0, Math.min(levels.length - 1, at + (event.key === 'ArrowRight' ? 1 : -1)))];
+      rows[active] = row;
+      menu.querySelectorAll('.mf-row.active button.mf-effort-chip').forEach((chip) => chip.classList.toggle('on', chip.dataset.effort === (row.effort || '')));
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      if (active >= 0 && rows[active]) return commitRow(rows[active]);
+      // A complete harness:model:effort is taken as typed; a partial one picks the best match.
+      const value = current();
+      const known = modelOptions(value.provider).some((option) => modelIdOf(option) === value.model);
+      if (typed && !known && rows.length) return commitRow(rows[0]);
+      commit(value);
+    }
+  });
+  // Menu clicks never take focus (mousedown is cancelled), so a blur is the user leaving.
+  input.addEventListener('blur', (event) => {
+    if (field.contains(event.relatedTarget)) return;
+    const wasTyped = typed;
+    close();
+    if (wasTyped) commit(current());
+    else setModelField(field, current());
+  });
+  menu.addEventListener('mousedown', (event) => {
+    event.preventDefault(); // keep focus in the input
+    const element = event.target.closest('.mf-row');
+    const row = element && rows[Number(element.dataset.index)];
+    if (!row) return;
+    const chip = event.target.closest('.mf-effort-chip');
+    commitRow(row, chip ? chip.dataset.effort : row.effort);
+  });
+  menu.addEventListener('mousemove', (event) => {
+    const element = event.target.closest('.mf-row');
+    if (!element || Number(element.dataset.index) === active) return;
+    menu.querySelector('.mf-row.active')?.classList.remove('active');
+    element.classList.add('active');
+    active = Number(element.dataset.index);
+  });
+  field.querySelector('.combo-caret')?.addEventListener('mousedown', (event) => {
+    event.preventDefault();
+    if (!menu.hidden) close();
+    else { input.focus(); open(); }
+  });
+  field.querySelector('.mf-chart')?.addEventListener('click', () => {
+    close();
+    openModelChart(current(), commit, field.querySelector('.mf-chart'));
+  });
+}
+
+// ── Compare models: intelligence against cost or time ────────────────────────
+// Artificial Analysis benchmarks (fetched and cached by the server, which holds
+// the key) of the models a harness here can run, one point per
+// harness:model:effort. The staircase is the Pareto frontier: nothing is both
+// cheaper (or faster) and smarter than a point on it. Picking a point fills the field.
+const MODEL_CHART_METRICS = {
+  cost: { label: 'Cost', axis: '$ per answer', ticks: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5], format: (v) => `$${Number(v.toPrecision(2))}` },
+  seconds: { label: 'Time', axis: 'seconds per answer', ticks: [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000], format: (v) => `${v < 10 ? Math.round(v * 10) / 10 : Math.round(v)} s` },
+};
+function loadModelBenchmarks() {
+  const organizationId = S.organizationId || '';
+  if (S.modelBenchmarks?.organizationId !== organizationId) {
+    const query = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+    const promise = api(`/api/models/benchmarks${query}`);
+    S.modelBenchmarks = { organizationId, promise };
+    promise.catch(() => { if (S.modelBenchmarks?.promise === promise) S.modelBenchmarks = null; });
+  }
+  return S.modelBenchmarks.promise;
+}
+// "Claude Opus 5.5 (High, Default Fallback)" → "Claude Opus 5.5 · high"
+const benchmarkLabel = (model) => `${model.name.replace(/\s*\([^()]*\)\s*$/, '')}${model.ref.effort ? ` · ${model.ref.effort}` : ''}`;
+// Cheapest-or-fastest first; a point is on the frontier when it beats every point to its left.
+function paretoFrontier(points, metric) {
+  const sorted = [...points].sort((a, b) => a[metric] - b[metric] || b.intelligence - a.intelligence);
+  const frontier = [];
+  for (const point of sorted) if (!frontier.length || point.intelligence > frontier[frontier.length - 1].intelligence) frontier.push(point);
+  return frontier;
+}
+function modelChartSvg(models, metric, current, hidden) {
+  const spec = MODEL_CHART_METRICS[metric];
+  const W = 680, H = 400, L = 46, R = 18, T = 16, B = 34;
+  const points = models.filter((model) => model[metric] && !hidden.has(model.ref.provider));
+  if (!points.length) return { svg: `<div class="mc-empty">No ${spec.label.toLowerCase()} data for these models</div>`, points };
+  const xs = points.map((point) => point[metric]);
+  const ys = points.map((point) => point.intelligence);
+  const x0 = Math.log10(Math.min(...xs) / 1.25), x1 = Math.log10(Math.max(...xs) * 1.25);
+  const y0 = Math.floor((Math.min(...ys) - 2) / 10) * 10, y1 = Math.ceil((Math.max(...ys) + 2) / 10) * 10;
+  const x = (v) => L + ((Math.log10(v) - x0) / (x1 - x0 || 1)) * (W - L - R);
+  const y = (v) => T + (1 - (v - y0) / (y1 - y0 || 1)) * (H - T - B);
+  const grid = [];
+  for (let v = y0; v <= y1; v += 10) grid.push(`<line class="mc-grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="mc-tick" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${v}</text>`);
+  for (const v of spec.ticks.filter((tick) => Math.log10(tick) >= x0 && Math.log10(tick) <= x1)) {
+    grid.push(`<line class="mc-grid" x1="${x(v)}" x2="${x(v)}" y1="${T}" y2="${H - B}"/><text class="mc-tick" x="${x(v)}" y="${H - B + 16}" text-anchor="middle">${esc(spec.format(v))}</text>`);
+  }
+  // Each model's effort levels, joined: how much intelligence more effort buys.
+  const ladders = new Map();
+  for (const point of points) {
+    const key = `${point.ref.provider}:${point.ref.model}`;
+    ladders.set(key, [...(ladders.get(key) || []), point]);
+  }
+  const ladderPaths = [...ladders.values()].filter((ladder) => ladder.length > 1).map((ladder) => {
+    const ordered = ladder.sort((a, b) => EFFORT_ORDER.indexOf(a.ref.effort) - EFFORT_ORDER.indexOf(b.ref.effort));
+    return `<polyline class="mc-ladder" data-harness="${esc(ordered[0].ref.provider)}" points="${ordered.map((point) => `${x(point[metric]).toFixed(1)},${y(point.intelligence).toFixed(1)}`).join(' ')}"/>`;
+  });
+  const frontier = paretoFrontier(points, metric);
+  const stairs = frontier.map((point, index) => `${index ? `H${x(point[metric]).toFixed(1)}V` : `M${x(point[metric]).toFixed(1)},`}${y(point.intelligence).toFixed(1)}`).join('');
+  const onFrontier = new Set(frontier);
+  const isCurrent = (point) => current && point.ref.provider === current.provider && point.ref.model === current.model && (point.ref.effort || '') === (current.effort || '');
+  const dots = [...points].sort((a, b) => Number(onFrontier.has(a)) - Number(onFrontier.has(b))).map((point) => {
+    const index = models.indexOf(point);
+    return `<g class="mc-point${isCurrent(point) ? ' current' : ''}" data-index="${index}" tabindex="0" role="button" aria-label="${esc(`${benchmarkLabel(point)}, intelligence ${point.intelligence}, ${spec.format(point[metric])}`)}">
+      <circle class="mc-hit" cx="${x(point[metric])}" cy="${y(point.intelligence)}" r="11"/>
+      ${isCurrent(point) ? `<circle class="mc-current" cx="${x(point[metric])}" cy="${y(point.intelligence)}" r="9"/>` : ''}
+      <circle class="mc-dot" data-harness="${esc(point.ref.provider)}" cx="${x(point[metric])}" cy="${y(point.intelligence)}" r="5"/></g>`;
+  });
+  // Name only the frontier, skipping any label that would cover another label or a point.
+  const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  const dotBoxes = points.map((point) => ({ point, x: x(point[metric]) - 5, y: y(point.intelligence) - 5, w: 10, h: 10 }));
+  const placed = [];
+  const labels = frontier.flatMap((point) => {
+    const text = benchmarkLabel(point);
+    const width = text.length * 5.6;
+    // Above and to the left, clear of the staircase, which leaves each point rightwards.
+    const px = x(point[metric]), py = y(point.intelligence);
+    const left = px - 8 - width >= L;
+    const box = { x: left ? px - 8 - width : px + 8, y: py - 17, w: width, h: 12 };
+    if (placed.some((other) => overlaps(box, other)) || dotBoxes.some((dot) => dot.point !== point && overlaps(box, dot))) return [];
+    placed.push(box);
+    return [`<text class="mc-label" x="${left ? px - 8 : px + 8}" y="${py - 8}" text-anchor="${left ? 'end' : 'start'}">${esc(text)}</text>`];
+  });
+  return { points, svg: `<svg class="mc-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Intelligence against ${esc(spec.label.toLowerCase())}">
+    ${grid.join('')}
+    <text class="mc-axis" x="${L}" y="${T - 4}" >Intelligence</text>
+    <text class="mc-axis" x="${W - R}" y="${H - 4}" text-anchor="end">${esc(spec.label)} · ${esc(spec.axis)} →</text>
+    ${ladderPaths.join('')}
+    <path class="mc-frontier" d="${stairs}"/>
+    ${dots.join('')}
+    ${labels.join('')}
+  </svg>` };
+}
+function openModelChart(current, onPick, opener) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  let metric = localStorage.getItem('tavya.modelChart') === 'seconds' ? 'seconds' : 'cost';
+  const hidden = new Set();
+  let data = null;
+  overlay.innerHTML = `<div class="modal-card model-chart" role="dialog" aria-modal="true" aria-labelledby="mc-title">
+    <div class="mc-head">
+      <div class="section-h" id="mc-title">Compare models</div>
+      <div class="mc-metric" role="group" aria-label="Horizontal axis">${Object.entries(MODEL_CHART_METRICS).map(([key, value]) => `<button type="button" data-metric="${key}">${value.label}</button>`).join('')}</div>
+      <button type="button" class="icon-btn mc-close" aria-label="Close">✕</button>
+    </div>
+    <div class="mc-plot"><div class="mc-empty">Loading…</div></div>
+    <div class="mc-foot">
+      <div class="mc-legend"></div>
+      <span class="mc-source">${policyTip('Intelligence is the Artificial Analysis Intelligence Index. Cost and time are for a 500-token answer to a short prompt, thinking included, as Artificial Analysis measures them. Lines join one model\'s effort levels; the staircase is the most intelligence you can get for the cost or time.')} Data: <a href="https://artificialanalysis.ai/" target="_blank" rel="noopener">Artificial Analysis</a></span>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => { overlay.remove(); opener?.focus?.(); };
+  const plot = overlay.querySelector('.mc-plot');
+  const tip = document.createElement('div');
+  tip.className = 'mc-tip';
+  tip.hidden = true;
+  const showTip = (group) => {
+    const model = data?.models[Number(group.dataset.index)];
+    if (!model) return;
+    const ref = formatModelRef(model.ref);
+    tip.innerHTML = `<b>${esc(benchmarkLabel(model))}</b><code>${esc(ref)}</code>
+      <span>Intelligence ${esc(String(model.intelligence))}${model.cost ? ` · ${esc(MODEL_CHART_METRICS.cost.format(model.cost))} per answer` : ''}${model.seconds ? ` · ${esc(MODEL_CHART_METRICS.seconds.format(model.seconds))}` : ''}</span>`;
+    tip.hidden = false;
+    const dot = group.querySelector('.mc-dot').getBoundingClientRect();
+    const box = plot.getBoundingClientRect();
+    const left = Math.min(dot.left - box.left + 12, box.width - tip.offsetWidth - 4);
+    tip.style.left = `${Math.max(4, left)}px`;
+    tip.style.top = `${Math.max(4, dot.top - box.top - tip.offsetHeight - 6)}px`;
+  };
+  const draw = () => {
+    overlay.querySelectorAll('[data-metric]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.metric === metric)));
+    if (!data) return;
+    const { svg, points } = modelChartSvg(data.models, metric, current, hidden);
+    plot.innerHTML = svg;
+    plot.appendChild(tip);
+    tip.hidden = true;
+    const harnesses = AGENT_PROVIDERS.filter((provider) => data.models.some((model) => model.ref.provider === provider));
+    const missing = data.models.filter((model) => !hidden.has(model.ref.provider) && !model[metric]).length;
+    overlay.querySelector('.mc-legend').innerHTML = harnesses.map((provider) => `<button type="button" class="mc-key" data-harness="${esc(provider)}" aria-pressed="${!hidden.has(provider)}"><i></i>${esc(provider)}</button>`).join('')
+      + '<span class="mc-key-frontier"><i></i>Pareto frontier</span>'
+      + (missing && points.length ? `<span class="mc-missing" title="Artificial Analysis has not measured these yet">${missing} without ${MODEL_CHART_METRICS[metric].label.toLowerCase()} data</span>` : '');
+  };
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay || event.target.closest('.mc-close')) return close();
+    const metricButton = event.target.closest('[data-metric]');
+    if (metricButton) { metric = metricButton.dataset.metric; try { localStorage.setItem('tavya.modelChart', metric); } catch {} return draw(); }
+    const key = event.target.closest('.mc-key');
+    if (key) { hidden.has(key.dataset.harness) ? hidden.delete(key.dataset.harness) : hidden.add(key.dataset.harness); return draw(); }
+    const point = event.target.closest('.mc-point');
+    if (point && data) { const model = data.models[Number(point.dataset.index)]; close(); onPick({ provider: model.ref.provider, model: model.ref.model, effort: model.ref.effort || '' }); }
+  });
+  overlay.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); }
+    else if ((event.key === 'Enter' || event.key === ' ') && event.target.closest?.('.mc-point')) { event.preventDefault(); event.target.closest('.mc-point').dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+  });
+  plot.addEventListener('mouseover', (event) => { const point = event.target.closest('.mc-point'); if (point) showTip(point); });
+  plot.addEventListener('mouseout', (event) => { if (event.target.closest('.mc-point') && !event.relatedTarget?.closest?.('.mc-point')) tip.hidden = true; });
+  plot.addEventListener('focusin', (event) => { const point = event.target.closest('.mc-point'); if (point) showTip(point); });
+  draw();
+  overlay.querySelector(`[data-metric="${metric}"]`).focus();
+  loadModelBenchmarks().then((loaded) => {
+    if (!overlay.isConnected) return;
+    data = loaded;
+    if (!data.models?.length) { plot.innerHTML = '<div class="mc-empty">No benchmarked models to compare</div>'; return; }
+    draw();
+  }).catch((error) => {
+    if (overlay.isConnected) plot.innerHTML = `<div class="mc-empty">${esc(error.message || 'Model benchmarks are unavailable right now')}</div>`;
+  });
 }
 
 // Whether the browser and the karmax host are the same computer. Host-machine
@@ -1303,13 +1690,7 @@ function agentBlockHtml(prefix, spec, opts) {
     </select>` : ''}
     <div class="af-avatar-note" ${selectedAvatar ? '' : 'hidden'}>${selectedAvatar ? `${esc(selectedAvatar.purpose || 'Owner-controlled prompt and delegated authority')} · owned by ${esc(avatarOwnerName(selectedAvatar))}` : ''}</div>
     <div class="agent-controls" ${selectedAvatar ? 'hidden' : ''}>
-      <select class="af-provider" aria-label="Agent harness">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
-      <div class="combo af-model-combo" style="flex:1;min-width:140px">
-        <input class="af-model" placeholder="model" aria-label="Model" value="${esc(model || '')}" autocomplete="off" />
-        <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
-        <div class="combo-menu" hidden></div>
-      </div>
-      ${effortSelectHtml('af-effort', provider, model, effort || '')}
+      ${modelFieldHtml('af-ref', { provider, model, effort })}
       ${opts.extraControls || ''}
     </div>
     ${mcpPickerHtml(spec?.mcpConnections, inh.mcpConnections)}
@@ -1658,10 +2039,11 @@ function readResume(box) {
 function readAgentSpec(box) {
   const avatarId = box.querySelector('.af-avatar')?.value || '';
   const avatar = (S.avatars || []).find((candidate) => candidate.id === avatarId);
-  const spec = { provider: avatar?.runtime?.provider || box.querySelector('.af-provider').value };
+  const chosen = readModelField(box.querySelector('.agent-controls'));
+  const spec = { provider: avatar?.runtime?.provider || chosen.provider };
   if (avatarId) spec.avatarId = avatarId;
-  const model = avatar?.runtime?.model || box.querySelector('.af-model').value.trim();
-  const effort = avatar?.runtime?.effort || box.querySelector('.af-effort').value;
+  const model = avatar?.runtime?.model || chosen.model;
+  const effort = avatar?.runtime?.effort || chosen.effort;
   if (model) spec.model = model;
   if (effort) spec.effort = effort;
   const mcpConnections = readMcpPicker(box);
@@ -2497,20 +2879,14 @@ function wireCombo(combo, getOptions, onChange, { multiple = false } = {}) {
   });
 }
 
-// Wire one agent box's controls: provider→model combobox + one fork source.
+// Wire one agent box's controls: the model field + one fork source.
 function wireAgentBox(box) {
   wireMcpPicker(box.querySelector('.mcp-picker'), box.closest?.('[data-mcp-scope]')?.dataset.mcpScope);
-  const combo = box.querySelector('.af-model-combo');
-  const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
-  if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
-  box.querySelector('.af-provider')?.addEventListener('change', () => {
-    box.querySelector('.af-model').value = ''; // model choices are provider-specific
-    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-  });
+  const controls = box.querySelector('.agent-controls');
+  wireModelField(controls?.querySelector('.model-field'));
   const avatarSelect = box.querySelector('.af-avatar');
   const syncAvatar = () => {
     const avatar = (S.avatars || []).find((candidate) => candidate.id === avatarSelect?.value);
-    const controls = box.querySelector('.agent-controls');
     const note = box.querySelector('.af-avatar-note');
     if (controls) controls.hidden = !!avatar;
     // An Avatar acts with the authority its owner delegated to it.
@@ -2520,13 +2896,7 @@ function wireAgentBox(box) {
       note.hidden = !avatar;
       note.textContent = avatar ? `${avatar.purpose || 'Owner-controlled prompt and delegated authority'} · owned by ${avatarOwnerName(avatar)}` : '';
     }
-    if (avatar) {
-      box.querySelector('.af-provider').value = avatar.runtime.provider;
-      box.querySelector('.af-model').value = avatar.runtime.model || '';
-      refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-      const effort = box.querySelector('.af-effort');
-      if (effort && avatar.runtime.effort && [...effort.options].some((option) => option.value === avatar.runtime.effort)) effort.value = avatar.runtime.effort;
-    }
+    if (avatar) setModelField(controls, avatar.runtime);
   };
   avatarSelect?.addEventListener('change', () => {
     syncAvatar();
@@ -2570,18 +2940,10 @@ function wireAgentBox(box) {
   // only until the source is withdrawn or the user customizes these controls.
   let modelStash = null;
   let modelRequest = 0;
-  const modelSelection = () => ({
-    avatarId: avatarSelect?.value || '',
-    provider: providerOf(),
-    model: box.querySelector('.af-model').value,
-    effort: box.querySelector('.af-effort').value,
-  });
+  const modelSelection = () => ({ avatarId: avatarSelect?.value || '', ...readModelField(controls) });
   const applyModelSelection = (spec) => {
     if (avatarSelect) avatarSelect.value = spec.avatarId || '';
-    box.querySelector('.af-provider').value = spec.provider;
-    box.querySelector('.af-model').value = spec.model || '';
-    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-    box.querySelector('.af-effort').value = spec.effort || '';
+    setModelField(controls, { provider: spec.provider, model: spec.model || '', effort: spec.effort || '' });
     syncAvatar();
   };
   const withdrawModel = () => {
@@ -2607,7 +2969,7 @@ function wireAgentBox(box) {
     }
   };
   const releaseModel = (event) => {
-    if (!event.target.matches('.af-provider, .af-model, .af-effort, .af-avatar')) return;
+    if (!event.target.matches('.af-ref, .af-avatar')) return;
     modelRequest++;
     modelStash = null;
     const option = chosen?.querySelector('.af-resume-reuse-model');
@@ -2881,12 +3243,7 @@ function resetAgentField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
   const avatar = box.querySelector('.af-avatar');
   if (avatar) avatar.value = inh.avatarId || '';
-  const prov = box.querySelector('.af-provider');
-  prov.value = inh.provider || 'claude';
-  box.querySelector('.af-model').value = inh.model || '';
-  refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-  const eff = box.querySelector('.af-effort');
-  if (eff && inh.effort) eff.value = inh.effort;
+  setModelField(box.querySelector('.agent-controls'), { provider: agentProviderChoice(inh.provider), model: inh.model || '', effort: inh.effort || '' });
   const picker = box.querySelector('.mcp-picker');
   if (picker) {
     picker.dataset.value = 'null';
@@ -7677,6 +8034,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       return;
     }
     if (e.key === 'Escape' && e.target.closest?.('.task-payments')?.querySelector('[aria-expanded="true"]')) return;
+    // Escape in an open dropdown (the model field, people pickers) closes just the dropdown.
+    if (e.key === 'Escape' && e.target.closest?.('.combo')?.querySelector(':scope > .combo-menu:not([hidden])')) return;
     const action = taskFormKeyAction(e, secondaryModalOpen);
     if (!action) return;
     e.preventDefault();
@@ -14247,15 +14606,16 @@ async function fillAvatarEditor(overlay, close, proj, avatar) {
   const runtime = avatar?.runtime || { provider: agentProviderChoice(), model: '', effort: '' };
   overlay.querySelector('.avatar-editor').innerHTML = `<div class="avatar-editor-head"><div><h2>${avatar ? 'Edit Avatar' : 'New Avatar'}</h2><p>Create a named autonomous principal. Only you can edit its instructions.</p></div><button class="icon-btn avatar-editor-close" type="button" aria-label="Close">✕</button></div><div class="avatar-editor-scroll">
     <label class="form-row"><span>Name</span><input id="avatar-name" maxlength="80" value="${esc(avatar?.name || '')}" placeholder="Atlas"></label><label class="form-row"><span>Purpose</span><input id="avatar-purpose" maxlength="240" value="${esc(avatar?.purpose || '')}" placeholder="Handles implementation and routine approvals"></label><label class="form-row"><span>Instructions</span><textarea id="avatar-prompt" rows="12" placeholder="You are my trusted engineering delegate…">${esc(avatar?.prompt || '')}</textarea></label>
-    <div class="avatar-defaults"><div><span>Authority</span><b id="avatar-authority-summary">${avatar?.authorityMode === 'restricted' ? esc(avatar.authorization.level) : 'Full delegation from you'}</b></div><div><span>Callable by</span><b>${callMode === 'me' ? 'Only you' : callMode === 'project' ? 'Everyone in this project' : 'Specific people and teams'}</b></div><div><span>Roles</span><b>${avatar ? esc(avatarRoleSummary(avatar)) : 'Any role'}</b></div><div><span>Runtime</span><b>${esc(`${runtime.provider}${runtime.model ? ` · ${runtime.model}` : ''}`)}</b></div></div>
+    <div class="avatar-defaults"><div><span>Authority</span><b id="avatar-authority-summary">${avatar?.authorityMode === 'restricted' ? esc(avatar.authorization.level) : 'Full delegation from you'}</b></div><div><span>Callable by</span><b>${callMode === 'me' ? 'Only you' : callMode === 'project' ? 'Everyone in this project' : 'Specific people and teams'}</b></div><div><span>Roles</span><b>${avatar ? esc(avatarRoleSummary(avatar)) : 'Any role'}</b></div><div><span>Runtime</span><b>${esc(formatModelRef(runtime))}</b></div></div>
     <details class="settings-disclosure avatar-customize" ${avatar && (avatar.authorityMode === 'restricted' || callMode !== 'me' || roles.size) ? 'open' : ''}><summary><b>Customize…</b></summary><div class="avatar-custom-section"><div class="section-h">Authority</div>
       <label class="choice-row"><input type="radio" name="avatar-authority" value="full" ${avatar?.authorityMode !== 'restricted' ? 'checked' : ''}><span><b>Full delegation</b><small>All ${siteNameMarkup()}, GitHub, and Vault authority you can delegate.</small></span></label><label class="choice-row"><input type="radio" name="avatar-authority" value="restricted" ${avatar?.authorityMode === 'restricted' ? 'checked' : ''}><span><b>Restricted delegation</b><small>Choose an authorization level and credentials.</small></span></label>
       <div id="avatar-restricted" ${avatar?.authorityMode === 'restricted' ? '' : 'hidden'}>${authorizationEditorHtml('avatar-authorization', selectedAuth, S.projects.filter((item) => item.organizationId === proj.organizationId), proj.id)}<button class="btn tf-vault-button" id="avatar-vault" type="button"><span>Vault credentials</span><span id="avatar-vault-count">${selectedCredentialIds.size} selected</span></button></div>${activeGithub ? `<label class="choice-row compact"><input id="avatar-github" type="checkbox" ${avatar?.githubAccountId ? 'checked' : ''}><span><b>Use GitHub account ${esc(activeGithub.login)}</b><small>Delegate this connected account to the Avatar.</small></span></label>` : ''}</div>
       <div class="avatar-custom-section"><div class="section-h">Callable by</div><select id="avatar-call-mode"><option value="me" ${callMode === 'me' ? 'selected' : ''}>Only me</option><option value="project" ${callMode === 'project' ? 'selected' : ''}>Everyone in this project</option><option value="specific" ${callMode === 'specific' ? 'selected' : ''}>Specific people and teams</option></select><input id="avatar-callers" value="${esc(callMode === 'specific' ? avatar.callableBy.join(', ') : '')}" placeholder="user:id, @team:engineering" ${callMode === 'specific' ? '' : 'hidden'}></div>
       <div class="avatar-custom-section"><div class="section-h">Roles</div><label class="choice-row compact"><input id="avatar-any-role" type="checkbox" ${roles.size ? '' : 'checked'}><span><b>Any role</b></span></label><div class="avatar-role-grid" ${roles.size ? '' : 'hidden'}>${[['do','Working'],['confirm','Review'],['respond','Response'],['resolve','Resolve'],['merge','Merge'],['authorize','Authorize']].map(([id,label]) => `<label><input type="checkbox" value="${id}" ${roles.has(id) ? 'checked' : ''}> ${label}</label>`).join('')}</div></div>
-      <div class="avatar-custom-section"><div class="section-h">Runtime</div><div class="agent-controls"><select id="avatar-provider">${AGENT_PROVIDERS.map((provider) => `<option value="${provider}" ${provider === runtime.provider ? 'selected' : ''}>${provider}</option>`).join('')}</select><input id="avatar-model" value="${esc(runtime.model || '')}" placeholder="Project default model"><select id="avatar-effort"><option value="">Default effort</option>${['low','medium','high','xhigh','max'].map((effort) => `<option ${runtime.effort === effort ? 'selected' : ''}>${effort}</option>`).join('')}</select></div></div></details></div>
+      <div class="avatar-custom-section"><div class="section-h">Runtime</div><div class="agent-controls" id="avatar-runtime">${modelFieldHtml('avatar-ref', runtime)}</div></div></details></div>
     <div class="avatar-editor-actions"><button class="btn avatar-editor-cancel" type="button">Cancel</button><button class="btn primary avatar-editor-save" type="button">${avatar ? 'Save Avatar' : 'Create Avatar'}</button></div>`;
   overlay.querySelector('.avatar-editor-close').addEventListener('click', close); overlay.querySelector('.avatar-editor-cancel').addEventListener('click', close);
+  wireModelField(overlay.querySelector('#avatar-runtime .model-field'));
   const authorityInputs = [...overlay.querySelectorAll('[name="avatar-authority"]')];
   const syncAuthority = () => { const mode = authorityInputs.find((input) => input.checked)?.value || 'full'; overlay.querySelector('#avatar-restricted').hidden = mode !== 'restricted'; overlay.querySelector('#avatar-authority-summary').textContent = mode === 'full' ? 'Full delegation from you' : 'Restricted delegation'; };
   authorityInputs.forEach((input) => input.addEventListener('change', syncAuthority)); wireAuthorizationEditor(overlay.querySelector('#avatar-authorization'), S.projects.filter((item) => item.organizationId === proj.organizationId));
@@ -14272,9 +14632,7 @@ async function fillAvatarEditor(overlay, close, proj, avatar) {
       ...(requestedAuthorization ? { authorization: requestedAuthorization, credentialIds: [...selectedCredentialIds], credentialPolicies } : {}),
       githubAccountId: overlay.querySelector('#avatar-github')?.checked ? activeGithub?.id : null, callableBy,
       roles: anyRole.checked ? [] : [...roleGrid.querySelectorAll('input:checked')].map((input) => input.value),
-      runtime: { provider: overlay.querySelector('#avatar-provider').value,
-        model: overlay.querySelector('#avatar-model').value.trim() || undefined,
-        effort: overlay.querySelector('#avatar-effort').value || undefined } };
+      runtime: (({ provider, model, effort }) => ({ provider, model: model || undefined, effort: effort || undefined }))(readModelField(overlay.querySelector('#avatar-runtime'))) };
     const save = (body, current = avatar) => api(`/api/projects/${proj.id}/avatars${current ? `/${current.id}` : ''}`, {
       method: current ? 'PUT' : 'POST', body: JSON.stringify(body),
     });

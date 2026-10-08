@@ -143,8 +143,8 @@ export function claudeMessagesEffort(model: string | undefined, effort?: string)
 export function codexReasoningEffort(model: string | undefined, effort?: string): Effort | undefined {
   if (!effort || !model) return undefined;
   const m = model.toLowerCase();
-  // GPT-6 supports max without the downgrade required by older Codex models.
-  if (/^gpt-6(?:-|$)/.test(m)) {
+  // GPT-6 and later (gpt-6.1-sol) support max without the downgrade required by older Codex models.
+  if (/^gpt-(?:[6-9]|\d{2,})(?:[.-]|$)/.test(m)) {
     return ['low', 'medium', 'high', 'xhigh', 'max'].includes(effort) ? effort as Effort : undefined;
   }
   const isReasoning = /^(o1|o3|o4|gpt-5|codex)/.test(m) || m.includes('reasoning');

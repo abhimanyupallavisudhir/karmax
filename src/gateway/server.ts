@@ -69,6 +69,7 @@ import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
 import { WorkspaceConflict } from '../world/resources.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
+import { ARTIFICIAL_ANALYSIS_KEY_ENV, ArtificialAnalysis, toBenchmarks, type ModelBenchmarks } from '../agent/model-benchmarks.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
@@ -165,6 +166,8 @@ export interface GatewayDeps {
   remoteAccess?: RemoteAccessController;
   /** Fetches OAuth client ID metadata documents (default: the outbound SSRF guard). */
   oauthMetadataFetch?: typeof fetch;
+  /** Model benchmarks for the model picker (default: ARTIFICIAL_ANALYSIS_API_KEY). */
+  artificialAnalysis?: ArtificialAnalysis;
 }
 
 /** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
@@ -306,7 +309,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     const scoped = Boolean(url?.searchParams.get('projectId') || url?.searchParams.get('organizationId'));
     return scoped ? (read ? 'profile:read' : 'profile:write') : (read ? 'settings:read' : 'settings:write');
   }
-  if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
+  if (p === '/api/models' || p === '/api/models/benchmarks' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
   if (p === '/api/search' && read) return 'none'; // each project is authorized in searchEverywhere
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments' || p === '/api/files') return 'task:create';
@@ -696,6 +699,9 @@ export class Gateway {
   /** Discovery spawns provider CLIs (seconds): pages read the last catalog while
    *  one background load per organization refreshes it. */
   private modelCatalog = new SwrCache<string, ModelCatalog>((organizationId) => this.discoverModels(organizationId), 5 * 60_000);
+  private get artificialAnalysis(): ArtificialAnalysis {
+    return this.deps.artificialAnalysis ??= new ArtificialAnalysis({ apiKey: process.env[ARTIFICIAL_ANALYSIS_KEY_ENV] });
+  }
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string; expiresAt: number; userId: string }>();
   private fanout!: DurableEventFanout;
   /** Remotes verified during this gateway process. Persisted links are retried
@@ -2185,6 +2191,7 @@ export class Gateway {
         sso: ssoSession(this.deps.identity),
         google: this.deps.identity?.googleEnabled ?? false,
         github: this.deps.identity?.githubEnabled ?? false,
+        modelBenchmarks: this.artificialAnalysis.configured,
       });
     }
     if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
@@ -6509,6 +6516,25 @@ export class Gateway {
           url.searchParams.get('refresh') === '1',
           requestedScope.organizationId ?? 'org_personal',
         ));
+      }
+      // Intelligence, price and speed of the runnable models, for the picker's chart.
+      if (p === '/api/models/benchmarks' && method === 'GET') {
+        if (!this.artificialAnalysis.configured) return this.json(res, 404, { error: 'Model benchmarks are not configured' });
+        const organizationId = requestedScope.organizationId ?? 'org_personal';
+        try {
+          const [{ at, data }, catalog] = await Promise.all([
+            this.artificialAnalysis.models(),
+            this.modelCatalog.get(organizationId),
+          ]);
+          return this.json(res, 200, {
+            source: { name: 'Artificial Analysis', url: 'https://artificialanalysis.ai/' },
+            fetchedAt: at,
+            models: toBenchmarks(data, catalog.value),
+          } satisfies ModelBenchmarks);
+        } catch (error) {
+          console.warn(`[karmax] model benchmarks unavailable: ${error instanceof Error ? error.message : 'unknown error'}`);
+          return this.json(res, 502, { error: 'Model benchmarks are unavailable right now' });
+        }
       }
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);

@@ -27,10 +27,16 @@ global.S = {
   },
 };
 eval(src.slice(src.indexOf('const MODELS ='), src.indexOf('const agentProviderChoice')).replace('const MODELS =', 'global.MODELS ='));
+global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
+global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
+global.modelIdOf = (option) => typeof option === 'string' ? option : option.id;
 global.EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
 eval(extractFn('effortLevelsFor'));
 eval(extractFn('modelOptions'));
 eval(extractFn('normalizeComboOption'));
+eval(extractFn('inferHarness'));
+eval(extractFn('parseModelRef'));
+eval(src.slice(src.indexOf('const formatModelRef ='), src.indexOf('const modelRefKey')).replace('const formatModelRef =', 'global.formatModelRef ='));
 
 let pass = 0;
 let fail = 0;
@@ -58,6 +64,21 @@ for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']) {
 }
 S.modelCatalog = { codex: [{ id: 'gpt-6-sol', effort: [...EFFORT_ORDER, 'ultra'] }] };
 ok(effortLevelsFor('codex', 'gpt-6-sol').join() === EFFORT_ORDER.join(), 'does not offer upstream effort levels the task schema cannot execute');
+
+// One harness:model:effort value: the harness and effort are recognized only
+// where they stand, so a model id may itself contain colons.
+const parsed = (text, fallback) => JSON.stringify(parseModelRef(text, fallback));
+const spec = (provider, model = '', effort = '') => JSON.stringify({ provider, model, effort });
+ok(parsed('claude:claude-opus-5-5:high') === spec('claude', 'claude-opus-5-5', 'high'), 'reads all three parts');
+ok(parsed('gpt-6-sol:max') === spec('codex', 'gpt-6-sol', 'max'), 'infers Codex from a GPT model');
+ok(parsed('google/gemini-3-pro') === spec('opencode', 'google/gemini-3-pro'), 'infers OpenCode from a vendor/model id');
+ok(parsed('codex:high') === spec('codex', '', 'high'), 'a harness with an effort keeps the default model');
+ok(parsed('opencode:ollama/qwen3:8b') === spec('opencode', 'ollama/qwen3:8b'), 'a colon inside a model id stays in the model');
+ok(parsed('opencode:ollama/qwen3:8b:low') === spec('opencode', 'ollama/qwen3:8b', 'low'), 'an effort after a colon-bearing model id');
+ok(parsed('high') === spec('claude', 'high'), 'a lone word is a model, not an effort');
+ok(parsed('', 'codex') === spec('codex'), 'an empty field keeps the inherited harness');
+ok(formatModelRef({ provider: 'codex', model: '', effort: 'high' }) === 'codex:high', 'formats without empty parts');
+ok(parsed(formatModelRef({ provider: 'claude', model: 'opus[1m]', effort: 'max' })) === spec('claude', 'opus[1m]', 'max'), 'format and parse round-trip');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

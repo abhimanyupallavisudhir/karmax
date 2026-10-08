@@ -164,6 +164,8 @@ services:
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_CLIENT_ID: ${STRIPE_CLIENT_ID:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      # Model benchmarks for the model picker's chart (artificialanalysis.ai); empty hides it.
+      ARTIFICIAL_ANALYSIS_API_KEY: ${ARTIFICIAL_ANALYSIS_API_KEY:-}
     secrets:
       - auth_secret
       - vault_key

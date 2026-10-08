@@ -42,6 +42,7 @@ async function main() {
     schemaFor: () => [{ name: 'target', label: 'Target', type: 'string', scopes: ['task'] }],
     api: (_path, options) => { requests.push(JSON.parse(options.body)); return new Promise((resolve) => { complete = resolve; }); },
     toast() {}, setTimeout() {}, refreshTask() {}, refreshTasks() {},
+    readModelField: () => ({ provider: 'claude', model: '', effort: '' }),
   });
   vm.runInContext(['collectParamEdits', 'paramDirtyNames', 'setParamSaveState', 'wireParams', 'readMcpPicker', 'readAgentSpec', 'readAgentBlock',
     'paramFields', 'agentParticipantLabel', 'taskAuthorityOf'].map(fn).join('\n'), context);
@@ -80,7 +81,7 @@ async function main() {
   context.readResume = () => undefined;
   state.avatars = [{ id: 'one', runtime: { provider: 'codex', model: 'same' } }, { id: 'two', runtime: { provider: 'codex', model: 'same' } }];
   const avatar = { value: 'one' };
-  const agent = { querySelector: (selector) => ({ '.af-avatar': avatar, '.af-effort': { value: '' } })[selector] };
+  const agent = { querySelector: (selector) => ({ '.af-avatar': avatar, '.agent-controls': {} })[selector] };
   const root = { querySelector: () => agent };
   const fields = [{ name: 'agent:do', role: 'do', type: 'agent' }];
   const before = context.collectParamEdits(root, fields);
