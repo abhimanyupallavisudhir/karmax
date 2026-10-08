@@ -40,7 +40,7 @@ for (const marker of ['appearance-card', 'resilience-card', 'outbound-email-card
   ok(!organization.includes(`id="${marker}"`), `Organization omits #${marker}`);
 ok(!organization.includes('pay-stripe-platform'), 'Organization omits shared Stripe platform setup');
 ok(!project.includes('project-setup-github'), 'Project settings never bootstrap the shared GitHub App');
-ok(src.includes("${S.installationAccess ? `<div class=\"label\">Installation</div><a class=\"nav-item"), 'rail renders Installation only after an authorized probe');
+ok(src.includes("if (foot && S.installationAccess && !installation)") && src.includes("else if (installation && !S.installationAccess) { installation.remove();"), 'rail renders Installation only after an authorized probe');
 ok(src.includes("api('/api/settings/installation')"), 'boot probes an installation-scoped endpoint');
 ok(src.includes("if (!S.installationAccess) return go(globalRoute('insights')"), 'a direct non-operator route is redirected');
 
