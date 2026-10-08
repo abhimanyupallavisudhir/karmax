@@ -159,15 +159,19 @@ export function prewarmRemoteAgentHome(world: World, provider: Provider, localHo
   const runtimeWorld = world.withoutProjectEnvironment?.() ?? world;
   if (!isRemoteAgentWorld(runtimeWorld) || bootstraps.has(runtimeWorld)) return;
   const browser = mcpConnections ? mcpConnections.some((id) => id.startsWith('browser:')) : !!localHome && !!configuredBrowser(localHome, provider);
-  if (!localHome && !browser) return;
+  // An ACP harness always has a sandbox home, with or without a login.
+  const acp = isAcpProvider(provider);
+  if (!localHome && !browser && !acp) return;
   try {
-    const request: BootstrapRequest = localHome
+    const request: BootstrapRequest = acp
+      ? acpBootstrapRequest(runtimeWorld, provider, path.posix.join(runtimeWorld.handle.root, remoteAcpHomeRelative(provider, localHome)), session)
+      : localHome
       ? bootstrapRequest(runtimeWorld, provider, path.posix.join(runtimeWorld.handle.root, remoteAgentHomeRelative(provider, localHome)),
         session, hostHistoryFiles(localHome, provider, session))
       : { key: '' };
     const bootstrap = runBootstrap(runtimeWorld, { ...request, browser });
     bootstrap.catch(() => undefined);
-    const entry: WorldBootstrap = { ...(localHome ? { key: request.key } : {}), bootstrap };
+    const entry: WorldBootstrap = { ...(localHome || acp ? { key: request.key } : {}), bootstrap };
     if (browser) {
       entry.browser = bootstrap.then((prepared) => readyBrowser(runtimeWorld, prepared.runtimeBin, prepared.browser).catch((error) => {
         if (error && typeof error === 'object') browserFailures.add(error);
@@ -235,6 +239,8 @@ interface RemoteBootstrap {
   workDirectory: boolean;
   /** Undefined when the probe did not run; readyBrowser then probes step by step. */
   browser?: BrowserProbe;
+  /** Digest of the ACP session export the sandbox last confirmed it holds. */
+  acpSession?: string;
 }
 
 interface BootstrapRequest {
@@ -246,6 +252,11 @@ interface BootstrapRequest {
   systemCodexConfig?: boolean;
   /** Probe the browser tools' readiness (LT-22). */
   browser?: boolean;
+  /** Report which export of this ACP session the sandbox holds (remote-acp.ts). */
+  acpSession?: { home: string; session: string };
+  /** An npm package whose CLI the turn will run: fetched into npx's cache now,
+   * beside prompt preparation, unless the template bakes that version. */
+  warm?: { spec: string; bin: string; version: string };
 }
 
 interface HistoryInventoryRequest { home: string; provider: Provider; session: string; known: Record<string, number> }
@@ -309,6 +320,7 @@ function sandboxLock(file: string, seconds: number): string {
 const HISTORY_MARKER = 'KARMAX_HISTORY_INVENTORY ';
 const BROWSER_MARKER = 'KARMAX_BROWSER_PROBE ';
 const SYSTEM_CODEX_CONFIG = 'KARMAX_SYSTEM_CODEX_CONFIG';
+const ACP_SESSION_MARKER = 'KARMAX_ACP_SESSION ';
 const WORK_DIRECTORY_READY = 'KARMAX_WORK_DIRECTORY_READY';
 
 async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>): Promise<RemoteBootstrap> {
@@ -333,6 +345,10 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
     ...(request.inventory ? [`${historyInventoryCommand(node, request.inventory)} || true`] : []),
     ...(request.browser ? [`${browserProbeCommand(world, node)} || true`] : []),
     ...(request.systemCodexConfig ? [`if [ -e '/etc/codex' ]; then printf '\\n%s\\n' ${SYSTEM_CODEX_CONFIG}; fi`] : []),
+    ...(request.acpSession ? [`if [ -r ${quote(acpSessionDigestFile(request.acpSession.home, request.acpSession.session))} ]; then printf '\\n%s%s\\n' ${quote(ACP_SESSION_MARKER)} "$(head -c 64 ${quote(acpSessionDigestFile(request.acpSession.home, request.acpSession.session))})"; fi`] : []),
+    // Never fails the bootstrap: the launcher resolves the package again and reports.
+    ...(request.warm ? [`if ! ${quote(`/opt/karmax/bin/${request.warm.bin}`)} --version 2>/dev/null | grep -Fq -- ${quote(request.warm.version)}; then `
+      + `( export PATH=${quote(runtime.bin)}:"$PATH"; npx --yes --package=${quote(request.warm.spec)} -c true ) >/dev/null 2>&1 || true; fi`] : []),
     'exit 0',
   ].join('\n');
   const result = await world.exec('bash', ['-lc', command], { timeoutMs: 5 * 60_000 });
@@ -349,6 +365,7 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
   const lines = result.stdout.split('\n').map((line) => line.trim());
   return { runtimeBin: runtime.bin, systemCodexConfig: lines.includes(SYSTEM_CODEX_CONFIG), workDirectory: lines.includes(WORK_DIRECTORY_READY),
     ...(request.inventory ? { history: parseHistoryInventory(result.stdout) } : {}),
+    ...(request.acpSession ? { acpSession: lines.find((line) => line.startsWith(ACP_SESSION_MARKER.trim()))?.slice(ACP_SESSION_MARKER.length).match(/^[0-9a-f]{64}$/)?.[0] } : {}),
     ...(request.browser ? { browser: parseBrowserProbe(result.stdout) } : {}) };
 }
 
@@ -460,6 +477,56 @@ async function remoteHistoryInventory(world: World, home: RemoteAgentHome, provi
 export function remoteAgentHomeRelative(provider: Provider, localHome: string): string {
   const identity = crypto.createHash('sha256').update(path.resolve(localHome)).digest('hex').slice(0, 20);
   return `${REMOTE_ROOT}/${provider}/${identity}`;
+}
+
+/** An ACP harness's sandbox home: one per login, like Claude's and Codex's,
+ * and one shared home for API-key turns (a key is not a native credential). */
+export function remoteAcpHomeRelative(provider: Provider, localHome?: string): string {
+  return localHome ? remoteAgentHomeRelative(provider, localHome) : `${REMOTE_ROOT}/${provider}/api`;
+}
+
+/** An ACP session id, safe as one path segment and one shell word. */
+export const validAcpSessionId = (session: string) => /^[A-Za-z0-9_-]{1,128}$/.test(session);
+
+/** The sandbox's record of the session export it holds (its sha256), written
+ * only after the host has stored that export. */
+export function acpSessionDigestFile(home: string, session: string): string {
+  if (!validAcpSessionId(session)) throw new Error('invalid ACP session id');
+  return path.posix.join(home, 'karmax-sessions', `${session}.sha256`);
+}
+
+function acpBootstrapRequest(world: World, provider: Provider, absolute: string, session?: string): BootstrapRequest {
+  const spec = remoteAgentCommand(provider, provider, []).args[1]!;
+  return {
+    key: JSON.stringify([world.handle.root, provider, absolute, session ?? null, 'acp']),
+    home: absolute,
+    ...(session && validAcpSessionId(session) ? { acpSession: { home: absolute, session } } : {}),
+    warm: { spec, bin: provider, version: spec.slice(spec.lastIndexOf('@') + 1) },
+  };
+}
+
+export interface RemoteAcpHome {
+  absolute: string;
+  relative: string;
+  runtimeBin: string;
+  /** The world's private work-environment directory exists (AD-12). */
+  workDirectory: boolean;
+  /** Digest of the session export the sandbox holds, when it holds one. */
+  sessionDigest?: string;
+}
+
+/** Bootstrap the sandbox for an ACP harness (runtime, private home, the
+ * session it holds, its CLI fetched), reusing a prewarm for the same request. */
+export async function prepareRemoteAcpHome(world: World, provider: Provider, relative: string, session?: string): Promise<RemoteAcpHome> {
+  const absolute = path.posix.join(world.handle.root, relative);
+  const request = acpBootstrapRequest(world, provider, absolute, session);
+  const early = bootstraps.get(world);
+  const reused = early?.key === request.key ? early!.bootstrap.catch(() => undefined) : undefined;
+  const own = (async () => (await reused) ?? runBootstrap(world, request))();
+  bootstraps.set(world, { bootstrap: own, ...(early?.browser ? { browser: early.browser } : {}) });
+  const bootstrap = await timed('bootstrap.prepare', () => own);
+  return { absolute, relative, runtimeBin: bootstrap.runtimeBin, workDirectory: bootstrap.workDirectory,
+    ...(bootstrap.acpSession ? { sessionDigest: bootstrap.acpSession } : {}) };
 }
 
 /** The most one verified terminal read carries; longer reads are split. */
@@ -888,7 +955,9 @@ export function spawnRemoteAgentProcess(opts: {
       "process.stdin.on('end', () => child.stdin.end())",
       "for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal))",
       "child.on('error', (error) => { trace('child-error', process.pid, { code: error.code }); console.error(error); process.exitCode = 1 })",
-      "child.on('exit', (code, signal) => { trace('child-exited', child.pid, { exitCode: code }); if (signal) process.kill(process.pid, signal); else process.exit(code ?? 1) })",
+      // Re-raising with the forwarding handlers installed only forwarded the
+      // signal to the dead child again, and the relay outlived the CLI.
+      "child.on('exit', (code, signal) => { trace('child-exited', child.pid, { exitCode: code }); if (!signal) process.exit(code ?? 1); for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.removeAllListeners(name); process.kill(process.pid, signal) })",
     ].join('; ');
     return [...['node', '-e', relay].map(quote), command, ...args.map(quote)].join(' ');
   };

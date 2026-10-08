@@ -130,13 +130,21 @@ process.stdin.on('data', (chunk) => {
 });
 process.stdin.on('end', endInput);
 
-for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
+const SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+for (const signal of SIGNALS) process.on(signal, () => child.kill(signal));
 child.on('exit', (code, signal) => {
   trace('child-exited', { exitCode: code });
   for (const socket of connections.values()) socket.destroy();
   try { server?.close(); } catch {}
   try { if (socketPath) fs.rmSync(socketPath, { force: true }); } catch {}
-  const finish = () => { if (signal) process.kill(process.pid, signal); else process.exit(code ?? 1); };
+  // Re-raise the child's signal on the relay itself: with the forwarding
+  // handlers still installed it would only be forwarded again, and the relay
+  // would outlive its agent.
+  const finish = () => {
+    if (!signal) process.exit(code ?? 1);
+    for (const name of SIGNALS) process.removeAllListeners(name);
+    process.kill(process.pid, signal);
+  };
   // Let the last protocol lines reach the PTY before the relay exits.
   if (process.stdout.writableLength) process.stdout.once('drain', finish); else finish();
 });

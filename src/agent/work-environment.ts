@@ -145,33 +145,59 @@ export function sweepWorkProfiles(homes: Pick<ConfigHomeManager, 'allHomes'>): n
   return removed;
 }
 
-/** OpenCode can run its Bash tool inside the server instead of calling ACP
- * terminal/create. Its documented shell.env hook covers that path too, and
- * re-reads env.json per command, so `update()` reaches the running agent. */
-export async function openCodeWorkEnvironment(input: TurnInput, live = false) {
-  if (input.profile.provider !== 'opencode' || (!live && !Object.keys(workEnvironment(input)).length))
-    return { plugin: undefined, update: async () => {}, cleanup() {} };
-  const world = input.world.withoutProjectEnvironment?.() ?? input.world;
-  const directory = path.join(world.handle.root, '.karmax-injection', 'work-env', crypto.randomUUID());
-  if (typeof world.exec === 'function') await ensureWorldExcluded(world, '.karmax-injection');
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const write = async () => {
-    const next = path.join(directory, `env.json.${crypto.randomUUID()}`);
-    fs.writeFileSync(next, JSON.stringify(workEnvironment(input)), { mode: 0o600, flag: 'wx' });
-    fs.renameSync(next, path.join(directory, 'env.json'));
-  };
-  const writes = liveFile(write);
-  const cleanup = () => { void writes.close(); fs.rmSync(directory, { recursive: true, force: true }); };
-  try {
-    await write();
-    const file = path.join(directory, 'plugin.mjs');
-    fs.writeFileSync(file, `import { readFileSync } from 'node:fs';
+const OPENCODE_WORK_PLUGIN = `import { readFileSync } from 'node:fs';
 export default async () => ({
   'shell.env': async (_input, output) => {
     Object.assign(output.env, JSON.parse(readFileSync(new URL('./env.json', import.meta.url), 'utf8')));
   },
 });
-`, { mode: 0o600, flag: 'wx' });
+`;
+
+/** OpenCode can run its Bash tool inside the server instead of calling ACP
+ * terminal/create. Its documented shell.env hook covers that path too, and
+ * re-reads env.json per command, so `update()` reaches the running agent. In a
+ * cloud sandbox the plugin and env.json live in the world's private injection
+ * directory, written through the world API like Claude's env file. */
+export async function openCodeWorkEnvironment(input: TurnInput, live = false) {
+  if (input.profile.provider !== 'opencode' || (!live && !Object.keys(workEnvironment(input)).length))
+    return { plugin: undefined, update: async () => {}, cleanup() {} };
+  const world = input.world.withoutProjectEnvironment?.() ?? input.world;
+  const relative = `.karmax-injection/work-env/${crypto.randomUUID()}`;
+  const directory = path.posix.join(world.handle.root, relative);
+  const remote = isRemoteAgentWorld(world);
+  const write = async () => {
+    const name = `env.json.${crypto.randomUUID()}`;
+    if (remote) {
+      await world.writeFile(`${relative}/${name}`, JSON.stringify(workEnvironment(input)));
+      const moved = await world.exec('bash', ['-c', 'chmod 600 "$1" && mv -f "$1" "$2"', 'karmax-work-env',
+        path.posix.join(directory, name), path.posix.join(directory, 'env.json')]);
+      if (moved.code !== 0) throw new Error('Could not protect work environment');
+    } else {
+      const next = path.join(directory, name);
+      fs.writeFileSync(next, JSON.stringify(workEnvironment(input)), { mode: 0o600, flag: 'wx' });
+      fs.renameSync(next, path.join(directory, 'env.json'));
+    }
+  };
+  const writes = liveFile(write);
+  const cleanup = () => {
+    void writes.close();
+    if (remote) void world.exec('rm', ['-rf', '--', directory]).catch(() => undefined);
+    else fs.rmSync(directory, { recursive: true, force: true });
+  };
+  try {
+    const prepared = remote && await preparedRemoteWorkDirectory(world);
+    if (!prepared && typeof world.exec === 'function') await ensureWorldExcluded(world, '.karmax-injection');
+    if (remote) {
+      const created = await world.exec('mkdir', ['-p', '-m', '700', directory]);
+      if (created.code !== 0) throw new Error('Could not prepare private work environment');
+    } else fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    await write();
+    if (remote) {
+      await world.writeFile(`${relative}/plugin.mjs`, OPENCODE_WORK_PLUGIN);
+      return { plugin: `file://${path.posix.join(directory, 'plugin.mjs')}`, update: writes.update, cleanup };
+    }
+    const file = path.join(directory, 'plugin.mjs');
+    fs.writeFileSync(file, OPENCODE_WORK_PLUGIN, { mode: 0o600, flag: 'wx' });
     return { plugin: pathToFileURL(file).href, update: writes.update, cleanup };
   } catch (error) { cleanup(); throw error; }
 }

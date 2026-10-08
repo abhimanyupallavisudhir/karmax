@@ -1,6 +1,7 @@
 import { workEnvironment, openCodeWorkEnvironment } from './work-environment.js';
 import { currentTiming } from '../timing/index.js';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
@@ -31,10 +32,13 @@ import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { collectAcpImageBlocks } from './images.js';
 import { activityDetail, toolActivityDetail } from './activity.js';
 import { createCustodyEnv, registerAgent, unregisterAgent, killAgent } from './custody.js';
-import { platformToolHandlers } from './tools.js';
-import { CONTROL_SERVER_NAME, controlMcpServerSpec, startControlBridge, type ControlBridge } from './control-bridge.js';
+import { PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { CONTROL_SERVER_NAME, CONTROL_SOCKET_ENV, CONTROL_TOKEN_ENV, controlMcpServerSpec, remoteControlBridge,
+  startControlBridge, type ControlBridge, type RemoteControlBridge } from './control-bridge.js';
 import { trackProcess } from '../util/processes.js';
-import { isRemoteAgentWorld } from './remote-process.js';
+import { isRemoteAgentWorld, remoteAgentEnv, spawnRemoteAgentProcess, type RemoteSpawnedProcess } from './remote-process.js';
+import { exportRemoteAcpSession, multiplexAcpChannel, prepareRemoteAcpTurn, remoteAcpSupported, type RemoteAcpTurn } from './remote-acp.js';
+import { worldWorkingDirectory } from '../world/types.js';
 import type { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 import { BRAND } from '../domain/brand.js';
 
@@ -152,7 +156,12 @@ function openCodeConfig(profile: AgentProfile, hasApiKey: boolean, systemPrompt:
   return config;
 }
 
-function harnessSpec(input: TurnInput): HarnessSpec {
+/** Above this, OpenCode reads the system prompt from a file (`{file:…}`): an
+ * environment variable such as OPENCODE_CONFIG_CONTENT is capped at 128 KiB by
+ * Linux (MAX_ARG_STRLEN), and the whole spawn fails with E2BIG past it. */
+const INLINE_PROMPT_BYTES = 32 * 1024;
+
+function harnessSpec(input: TurnInput, systemPrompt = input.systemPrompt): HarnessSpec {
   const provider = input.profile.provider;
   if (!isAcpProvider(provider)) throw new Error(`ACP does not support harness "${provider}"`);
   // The same scrub as the Claude and Codex rails: the vault key, auth secret and
@@ -172,7 +181,7 @@ function harnessSpec(input: TurnInput): HarnessSpec {
 
   if (provider === 'opencode') {
     env.OPENCODE_DISABLE_AUTOUPDATE = '1';
-    env.OPENCODE_CONFIG_CONTENT = JSON.stringify(openCodeConfig(input.profile, !!env[credentialEnv], input.systemPrompt));
+    env.OPENCODE_CONFIG_CONTENT = JSON.stringify(openCodeConfig(input.profile, !!env[credentialEnv], systemPrompt));
     return { command: process.env.KARMAX_OPENCODE_CMD ?? 'opencode', args: ['acp'], env };
   }
   if (provider === 'kimi') {
@@ -223,7 +232,23 @@ function executable(command: string, env: Record<string, string>): string {
  *                        tools (see control-bridge.ts).
  *   · workflow-declared `agentMcp` servers.
  */
-function mcpServers(input: TurnInput, control?: ControlBridge): McpServer[] {
+function mcpServers(input: TurnInput, control?: ControlBridge, remote?: { turn: RemoteAcpTurn; bridge?: RemoteControlBridge }): McpServer[] {
+  if (remote) {
+    // In a sandbox every command is a sandbox path. The durable platform tools
+    // are not a separate gateway MCP there (the host's `karmax-mcp` cannot run
+    // in it): like remote Claude and Codex, they travel with the turn-local
+    // controls over the agent's own channel (remote-acp.ts).
+    return [
+      ...(remote.bridge ? [{
+        name: CONTROL_SERVER_NAME,
+        command: remote.turn.control.command,
+        args: remote.turn.control.args,
+        env: [{ name: CONTROL_SOCKET_ENV, value: remote.turn.relay.socket }, { name: CONTROL_TOKEN_ENV, value: remote.bridge.token }],
+      }] : []),
+      ...(input.agentMcp ?? []).map((s) => ({ name: s.name, command: s.command, args: s.args ?? [],
+        env: Object.entries(s.env ?? {}).map(([name, value]) => ({ name, value })) })),
+    ];
+  }
   const gateway = platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505');
   const declared = [
     { name: 'karmax', ...gateway },
@@ -317,23 +342,14 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    // ACP harnesses run ONLY on the control-plane host: unlike claude.ts and
-    // codex.ts, this adapter has no `spawnRemoteAgentProcess` path, and
-    // `remote-process.ts` is hardcoded to those two providers' config-home
-    // variables and CLI packages, so it cannot serve an ACP provider as-is.
-    //
-    // Without this guard the `spawn` below ran on the HOST with `cwd` set to a path
-    // that only exists inside the sandbox: Node raised ENOENT, the `child.on
-    // ('error')` handler swallowed it, and the turn hung on the ACP `initialize`
-    // handshake with no stated cause. Worse, if that path happened to exist on the
-    // host, the agent operated on the host's files — which on a hosted deployment
-    // violates the invariant `createWorld` enforces ("hosted deployments cannot run
-    // task code in the control plane"). Hosted forces remote worlds, so an ACP
-    // provider is simply unavailable there until remote-process.ts grows support.
-    if (isRemoteAgentWorld(input.world))
+    // A remote world is the execution boundary: the harness must run in the
+    // sandbox (remote-acp.ts), never on this host against a sandbox path.
+    // Kimi Code and Grok Build have no remote implementation and are not
+    // admitted (AGENT_PROVIDERS); say so rather than hang on a host spawn.
+    if (isRemoteAgentWorld(input.world) && !remoteAcpSupported(this.provider))
       throw new Error(
-        `the ${this.provider} agent cannot run in a remote (cloud sandbox) world yet — it only runs where ${BRAND} itself runs. `
-        + 'Choose a Claude or Codex agent for this task, or give the project a local worktree world.');
+        `the ${this.provider} agent cannot run in a remote (cloud sandbox) world — it only runs where ${BRAND} itself runs. `
+        + 'Choose a Claude, Codex or OpenCode agent for this task, or give the project a local worktree world.');
     const work = await openCodeWorkEnvironment(input, !!ctx.onSecretEnvChange);
     const unsubscribe = ctx.onSecretEnvChange?.(work.update);
     try { return await this.runAcpTurn(input, ctx, work.plugin); }
@@ -341,41 +357,106 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private async runAcpTurn(input: TurnInput, ctx: PlatformToolContext, workPlugin?: string): Promise<AdapterTurn> {
-    const spec = harnessSpec(input);
-    if (workPlugin) {
-      const config = JSON.parse(spec.env.OPENCODE_CONFIG_CONTENT!);
-      config.plugin = [...(config.plugin ?? []), workPlugin];
-      spec.env.OPENCODE_CONFIG_CONTENT = JSON.stringify(config);
+    const remote = isRemoteAgentWorld(input.world);
+    const runtimeWorld = input.world.withoutProjectEnvironment?.() ?? input.world;
+    // The world's working directory is the session's, as for remote Claude and
+    // Codex; a local harness keeps the world root it has always used.
+    const cwd = remote ? worldWorkingDirectory(runtimeWorld.handle) : input.world.handle.root;
+    const handlers = platformToolHandlers(input.world, ctx, () => workEnvironment(input));
+    let remoteTurn: RemoteAcpTurn | undefined;
+    let remoteBridge: RemoteControlBridge | undefined;
+    let remoteProcess: RemoteSpawnedProcess | undefined;
+    let remoteEnv: Record<string, string> | undefined;
+    let control: ControlBridge | undefined;
+    let promptDirectory: string | undefined;
+    const release = async () => {
+      (await control?.close());
+      remoteBridge?.close();
+      if (promptDirectory) fs.rmSync(promptDirectory, { recursive: true, force: true });
+      await remoteTurn?.cleanup();
+    };
+    let spec: HarnessSpec;
+    try {
+      let systemPrompt = input.systemPrompt;
+      if (remote) {
+        // A login's home seeds the sandbox; an API-key turn uses the shared one.
+        const localHome = input.resolvedAuth?.apiKey ? undefined : input.resolvedAuth?.configHome;
+        remoteTurn = await prepareRemoteAcpTurn(runtimeWorld, { provider: this.provider, localHome, session: input.session,
+          systemPrompt: input.systemPrompt });
+        systemPrompt = `{file:${remoteTurn.promptFile}}`;
+      } else if (this.provider === 'opencode' && Buffer.byteLength(input.systemPrompt) > INLINE_PROMPT_BYTES) {
+        promptDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-acp-prompt-'));
+        fs.chmodSync(promptDirectory, 0o700);
+        const file = path.join(promptDirectory, 'system-prompt.md');
+        fs.writeFileSync(file, input.systemPrompt, { mode: 0o600 });
+        systemPrompt = `{file:${file}}`;
+      }
+      spec = harnessSpec(input, systemPrompt);
+      if (workPlugin) {
+        const config = JSON.parse(spec.env.OPENCODE_CONFIG_CONTENT!);
+        config.plugin = [...(config.plugin ?? []), workPlugin];
+        spec.env.OPENCODE_CONFIG_CONTENT = JSON.stringify(config);
+      }
+      // Turn-local controls, served for exactly this turn and torn down in
+      // `finally` below — they must never outlive the activity whose result
+      // they mutate (control-bridge.ts). In a sandbox they also carry the
+      // durable platform tools, as remote Claude and Codex do.
+      if (remote) remoteBridge = remoteControlBridge(handlers, PLATFORM_TOOL_SCHEMAS);
+      else control = await startControlBridge(handlers);
+    } catch (error) {
+      await release();
+      throw error;
     }
-    // Turn-local controls, served over a socket for exactly this turn and torn
-    // down in `finally` below — it must never outlive the activity whose result
-    // it mutates (control-bridge.ts). Started after `harnessSpec`, which throws
-    // for an unsupported provider before there is anything to clean up.
-    const control = await startControlBridge(platformToolHandlers(input.world, ctx, () => workEnvironment(input)));
-    const custody = createCustodyEnv(spec.env);
-    spec.env = custody.env;
     const startupEnd = (await (await currentTiming())?.start('process.acp-startup'));
-    const child = spawn(spec.command, spec.args, {
-      cwd: input.world.handle.root,
-      env: spec.env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-      detached: true,
-    });
-    let stderr = '';
-    child.stderr?.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-4000); });
-    child.on('error', () => {});
-    if (child.pid) {
-      registerAgent({ pid: child.pid, cmd: path.basename(spec.command), provider: this.provider, taskId: input.world.handle.id, role: input.role, owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
-      child.once('exit', trackProcess({
-        pid: child.pid,
-        kind: 'agent',
-        label: `${this.provider} agent (${input.role})`,
-        taskId: input.world.handle.id,
-        startedAt: Date.now(),
-        kill: (signal) => void killAgent(child.pid, signal === 'SIGKILL' ? 0 : 2500, custody.custodyId),
-      }));
+    let child: ChildProcess | RemoteSpawnedProcess;
+    let io: { stdin: Writable; stdout: Readable };
+    let custody: ReturnType<typeof createCustodyEnv> | undefined;
+    if (remote) {
+      const credentialEnv = apiKeyEnv(credentialProvider(input.profile));
+      remoteEnv = remoteAgentEnv(this.provider, remoteTurn!.home.absolute, {
+        ...spec.env,
+        KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
+      }, credentialEnv ? [credentialEnv] : []);
+      remoteEnv.PATH = `${remoteTurn!.home.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+      remoteProcess = spawnRemoteAgentProcess({ world: runtimeWorld, provider: this.provider, command: this.provider,
+        args: spec.args, cwd, env: remoteEnv, home: remoteTurn!.home.absolute, relay: remoteTurn!.relay,
+        ...(remoteTurn!.prelude ? { prelude: remoteTurn!.prelude } : {}), signal: ctx.signal });
+      remoteProcess.on('error', () => {});
+      const channel = multiplexAcpChannel(remoteProcess, (frame) => remoteBridge?.serve(frame, (reply) => channel.sendControl(reply)));
+      child = remoteProcess;
+      io = channel;
+    } else {
+      custody = createCustodyEnv(spec.env);
+      spec.env = custody.env as Record<string, string>;
+      const local = spawn(spec.command, spec.args, {
+        cwd,
+        env: spec.env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        detached: true,
+      });
+      child = local;
+      io = { stdin: local.stdin!, stdout: local.stdout! };
+      local.on('error', () => {});
+      if (local.pid) {
+        registerAgent({ pid: local.pid, cmd: path.basename(spec.command), provider: this.provider, taskId: input.world.handle.id, role: input.role, owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
+        local.once('exit', trackProcess({
+          pid: local.pid,
+          kind: 'agent',
+          label: `${this.provider} agent (${input.role})`,
+          taskId: input.world.handle.id,
+          startedAt: Date.now(),
+          kill: (signal) => void killAgent(local.pid, signal === 'SIGKILL' ? 0 : 2500, custody!.custodyId),
+        }));
+      }
     }
+    let stderr = '';
+    child.stderr?.on('data', (chunk: Buffer | string) => { stderr = `${stderr}${chunk}`.slice(-4000); });
+    const stopChild = async () => {
+      if (remoteProcess) { await remoteProcess.stop().catch(() => undefined); return; }
+      const pid = (child as ChildProcess).pid;
+      if (pid) await killAgent(pid, 2500, custody?.custodyId);
+    };
 
     let sessionId: string | undefined;
     // One turn streams many messages. The live text is the current message's
@@ -398,6 +479,7 @@ export class AcpAdapter implements AgentAdapter {
     };
     const finalText = () => { endThought(); endMessage(); return messages.join('\n\n'); };
     let delivered = input.messages.length;
+    let replayAll = false; // the stored session could not be continued (see `continued`)
     let steered = false; // a mid-turn follow-up cancelled this prompt to hand it to the next turn
     let clientContext: any;
     const tools = new Map<string, ToolCall>();
@@ -522,23 +604,28 @@ export class AcpAdapter implements AgentAdapter {
 
     const abort = () => {
       if (sessionId && clientContext) void clientContext.notify(methods.agent.session.cancel, { sessionId }).catch(() => undefined);
-      if (child.pid) void killAgent(child.pid, 2500, custody.custodyId);
+      if (remoteProcess) remoteProcess.kill();
+      else if ((child as ChildProcess).pid) void killAgent((child as ChildProcess).pid, 2500, custody?.custodyId);
     };
     if (ctx.signal?.aborted) abort();
     ctx.signal?.addEventListener('abort', abort, { once: true });
     const heartbeat = ctx.heartbeat ? setInterval(() => { try { ctx.heartbeat!(); } catch { /* cancellation arrives through signal */ } }, 10_000) : undefined;
 
     try {
-      if (!child.stdin || !child.stdout) throw new Error(`${this.provider} ACP process has no stdio`);
+      if (!io.stdin || !io.stdout) throw new Error(`${this.provider} ACP process has no stdio`);
       const stream = ndJsonStream(
-        Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
-        Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
+        Writable.toWeb(io.stdin) as WritableStream<Uint8Array>,
+        Readable.toWeb(io.stdout) as ReadableStream<Uint8Array>,
       );
       const response = await app.connectWith(stream, async (agent) => {
         clientContext = agent;
         const init = await agent.request(methods.agent.initialize, {
           protocolVersion: PROTOCOL_VERSION,
-          clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+          // In a sandbox the agent's own tools already run where its files are;
+          // client fs/terminal requests would run on this host instead.
+          clientCapabilities: remote
+            ? { fs: { readTextFile: false, writeTextFile: false }, terminal: false }
+            : { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
           clientInfo: { name: BRAND, version: '1.0.0' },
         });
         (await startupEnd?.());
@@ -569,40 +656,56 @@ export class AcpAdapter implements AgentAdapter {
           if (!auth) throw new Error(`${this.provider} ACP agent requires an interactive login; connect the account first`);
           await agent.request(methods.agent.authenticate, { methodId: auth.id });
         }
-        const servers = mcpServers(input, control);
+        const servers = mcpServers(input, control, remote ? { turn: remoteTurn!, ...(remoteBridge ? { bridge: remoteBridge } : {}) } : undefined);
         let configOptions: SessionConfigOption[] | null | undefined;
+        // The agent refused to continue a stored session — a world that holds
+        // neither it nor its export (a fork across worlds from a session the
+        // host never saw, a corrupted store). Losing the turn to that would
+        // repeat on every retry; a new session given the whole conversation
+        // continues the work, as a non-native fork does.
+        const continued = async <T,>(request: () => Promise<T>): Promise<T | undefined> => {
+          try { return await request(); } catch (error) {
+            if (!remote || ctx.signal?.aborted) throw error;
+            ctx.emitActivity({ id: 'acp-session-recovery', kind: 'status', phase: 'completed',
+              title: 'Continuing in a new session with the conversation so far',
+              ...(activityDetail(error instanceof Error ? error.message : error) ? { detail: activityDetail(error instanceof Error ? error.message : error) } : {}) });
+            replayAll = true;
+            return undefined;
+          }
+        };
         if (input.session && input.fork) {
           if (!capabilities.sessionCapabilities?.fork) throw new Error(`${this.provider} ACP agent does not support native session fork`);
-          const forked = await agent.request(methods.agent.session.fork, {
-            sessionId: input.session,
-            cwd: input.world.handle.root,
+          const forked = await continued(() => agent.request(methods.agent.session.fork, {
+            sessionId: input.session!,
+            cwd,
             mcpServers: servers,
-          });
-          sessionId = forked.sessionId;
-          configOptions = forked.configOptions;
+          }));
+          sessionId = forked?.sessionId;
+          configOptions = forked?.configOptions;
         } else if (input.session) {
           if (capabilities.sessionCapabilities?.resume) {
-            const resumed = await agent.request(methods.agent.session.resume, {
-              sessionId: input.session,
-              cwd: input.world.handle.root,
+            const resumed = await continued(() => agent.request(methods.agent.session.resume, {
+              sessionId: input.session!,
+              cwd,
               mcpServers: servers,
-            });
-            sessionId = input.session;
-            configOptions = resumed.configOptions;
+            }));
+            sessionId = resumed ? input.session : undefined;
+            configOptions = resumed?.configOptions;
           } else if (capabilities.loadSession) {
-            const loaded = await agent.request(methods.agent.session.load, {
-              sessionId: input.session,
-              cwd: input.world.handle.root,
+            const loaded = await continued(() => agent.request(methods.agent.session.load, {
+              sessionId: input.session!,
+              cwd,
               mcpServers: servers,
-            });
-            sessionId = input.session;
-            configOptions = loaded.configOptions;
+            }));
+            sessionId = loaded ? input.session : undefined;
+            configOptions = loaded?.configOptions;
           } else {
             throw new Error(`${this.provider} ACP agent cannot resume sessions`);
           }
-        } else {
+        }
+        if (!sessionId) {
           const created = await agent.request(methods.agent.session.new, {
-            cwd: input.world.handle.root,
+            cwd,
             mcpServers: servers,
           });
           sessionId = created.sessionId;
@@ -611,9 +714,9 @@ export class AcpAdapter implements AgentAdapter {
         ctx.onSession?.(sessionId);
         await configureSession(agent, sessionId, configOptions, input.profile);
 
-        const delta = messagesToDeliver(input).filter((m) => m.role !== 'system');
+        const delta = (replayAll ? input.messages : messagesToDeliver(input)).filter((m) => m.role !== 'system');
         let prompt = conversationToPromptText(delta);
-        if ((!input.session || input.fork) && this.provider !== 'opencode') {
+        if ((!input.session || input.fork || replayAll) && this.provider !== 'opencode') {
           prompt = `<${BRAND}_instructions>\n${input.systemPrompt}\n</${BRAND}_instructions>\n\n${prompt || 'Begin the task.'}`;
         }
         const promptBlocks: ContentBlock[] = [{ type: 'text', text: prompt || 'Continue.' }];
@@ -683,19 +786,32 @@ export class AcpAdapter implements AgentAdapter {
         delivered,
       };
     } catch (error) {
+      // A dropped sandbox stream is the cause, not the closed ACP connection
+      // it produced; the retry resumes the session (task 348).
+      if (remoteProcess?.lost) throw remoteProcess.lost;
       const detail = stderr.trim();
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`${this.provider} ACP turn failed: ${message}${detail ? `: ${detail.slice(-800)}` : ''}`, { cause: error });
     } finally {
       if (heartbeat) clearInterval(heartbeat);
       (await control?.close());
+      remoteBridge?.close();
       ctx.signal?.removeEventListener('abort', abort);
-      try { child.stdin?.end(); } catch { /* closed */ }
+      try { io.stdin?.end(); } catch { /* closed */ }
       for (const terminal of terminals.values()) {
         if (terminal.child.pid) await killAgent(terminal.child.pid, 2500, terminal.custodyId);
       }
       terminals.clear();
-      if (child.pid) await killAgent(child.pid, 2500, custody.custodyId);
+      await stopChild();
+      // Keep the session where a retry, a later turn or a fork in another
+      // world can continue it — whatever this turn's outcome (remote-acp.ts).
+      if (remoteTurn && sessionId && !remoteProcess?.lost) {
+        const failure = await exportRemoteAcpSession(runtimeWorld, this.provider, remoteTurn.home, sessionId, { cwd, env: remoteEnv! });
+        if (failure) ctx.emitActivity({ id: 'acp-session-export', kind: 'status', phase: 'failed',
+          title: 'Could not save the agent session for a later turn',
+          ...(activityDetail(failure.message) ? { detail: activityDetail(failure.message) } : {}) });
+      }
+      await release();
     }
   }
 }

@@ -163,6 +163,7 @@ describe('generic ACP agent adapter', () => {
     model?: string;
     modelProvider?: string;
     pullFollowUps?: (from: number) => Promise<any[]>;
+    systemPrompt?: string;
   } = {}) {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-acp-'));
     const stub = path.join(dir, 'agent.cjs');
@@ -187,7 +188,7 @@ describe('generic ACP agent adapter', () => {
       },
       world: { handle: { id: 'w', root: dir, branch: 'task', base: 'main' } },
       messages: [{ id: 'm', role: 'user', text: 'make it beautiful', ts: 0, ...(image ? { images: [image] } : {}) }],
-      systemPrompt: 'Work carefully.',
+      systemPrompt: opts.systemPrompt ?? 'Work carefully.',
       role: 'do',
       resolvedAuth: { ...(opts.subscription ? {} : { apiKey: 'secret-kimi-key' }), configHome: path.join(dir, 'home') },
       secretEnv: opts.secretEnv,
@@ -216,6 +217,18 @@ describe('generic ACP agent adapter', () => {
     expect(activities.filter((a) => a.kind === 'reasoning').map((a) => a.detail)).toEqual(['Reading the parser.', 'Summarize.']);
     expect(new Set(activities.filter((a) => a.kind === 'reasoning').map((a) => a.id)).size).toBe(2);
     expect(turn.output).toBe('Found the bug.\n\nTests pass.\n\nAll done.');
+  });
+
+  // Linux caps one environment string at 128 KiB (MAX_ARG_STRLEN): a role
+  // prompt inlined in OPENCODE_CONFIG_CONTENT failed the whole spawn (E2BIG).
+  it('hands OpenCode a large system prompt as a private file it reads, removed after the turn', async () => {
+    const systemPrompt = 'Role instructions.\n'.repeat(10_000);
+    const { records } = await run({ systemPrompt });
+    const config = JSON.parse(records.find((record) => record.env)!.env.OPENCODE_CONFIG_CONTENT);
+    const file = /^\{file:(.+)\}$/.exec(config.agent.build.prompt)?.[1];
+    expect(file).toBeTruthy();
+    expect(fs.existsSync(file!)).toBe(false);
+    expect(Buffer.byteLength(records.find((record) => record.env)!.env.OPENCODE_CONFIG_CONTENT)).toBeLessThan(4096);
   });
 
   it('caps provider-requested terminal output retention', async () => {
@@ -362,22 +375,18 @@ describe('generic ACP agent adapter', () => {
 
 describe('ACP adapters and remote worlds', () => {
   /**
-   * ACP harnesses run only where krmax runs. `claude.ts`/`codex.ts` branch to
-   * `spawnRemoteAgentProcess` for a cloud world; `acp.ts` has no such path, and
-   * `remote-process.ts` is hardcoded to those two providers' config-home variables
-   * and CLI packages. Before this guard the host `spawn` ran with a cwd that exists
-   * only inside the sandbox: ENOENT was swallowed by the adapter's `error` handler
-   * and the turn hung on the ACP `initialize` handshake with no stated cause.
-   * Hosted deployments force remote worlds, so this is the path every hosted
-   * OpenCode task took.
+   * OpenCode runs inside a cloud world (tests/remote-acp.test.ts). Kimi Code
+   * and Grok Build have no remote implementation; before the guard, a host
+   * `spawn` with a cwd that exists only inside the sandbox failed with a
+   * swallowed ENOENT and the turn hung on the ACP `initialize` handshake.
    */
-  it('refuses a remote world with an actionable message instead of hanging', async () => {
+  it.each(['kimi', 'grok'] as const)('refuses to run %s in a remote world with an actionable message instead of hanging', async (provider) => {
     const remoteWorld = {
       handle: { id: 'w', root: '/home/user/karmax', branch: 'task', base: 'main',
         version: 2, sealedProviderRef: 'sealed:e2b:abc' },
     };
-    await expect(new AcpAdapter('opencode').runTurn({
-      profile: { id: 'p', name: 'Agent', provider: 'opencode', modelProvider: 'kimi',
+    await expect(new AcpAdapter(provider).runTurn({
+      profile: { id: 'p', name: 'Agent', provider, modelProvider: 'kimi',
         model: 'kimi/k3', effort: 'high', maxTurns: 7, role: 'do', capabilities: [] },
       world: remoteWorld,
       messages: [{ id: 'm', role: 'user', text: 'hi', ts: 0 }],
