@@ -30,6 +30,7 @@
     "vault-preflight": "tsx src/scripts/vault-preflight.ts",
     "audit-check": "tsx scripts/audit.ts",
     "vault-key": "tsx src/scripts/vault-key.ts",
+    "model-logins": "tsx src/scripts/model-logins.ts",
     "migrate-objects": "tsx src/scripts/object-store-migrate.ts",
     "object-store-check": "tsx src/scripts/object-store-check.ts",
     "replay-check": "tsx src/scripts/replay-check.ts",

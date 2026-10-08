@@ -263,9 +263,11 @@ export class ModelLogins {
   async forget(home: string): Promise<void> {
     const login = this.identify(home);
     if (!login) return;
+    // The cached files go under the same lease: left behind, another
+    // process's sync would take them for a new sign-in and restore the login.
     await this.leases.hold(login.handle, async () => {
       await this.broker.deleteHandle(login.handle);
-      writeBase(login.home, undefined);
+      if (fs.existsSync(login.home)) this.materialize(login, undefined);
     });
     fs.rmSync(this.retiredPath(login.home), { recursive: true, force: true });
   }

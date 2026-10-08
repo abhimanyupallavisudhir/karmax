@@ -436,6 +436,39 @@ describe('GitHub App integration', () => {
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('refreshes once across processes, and the waiting process takes the new token', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-refresh-lease-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret', INSTALLATION_SCOPE));
+    const handle = 'github-app:user:owner:authorization';
+    (await broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
+      refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 }), userScope('owner')));
+    // GitHub's refresh tokens are single-use.
+    let live = 'refresh-1';
+    const spent: string[] = [];
+    const fakeFetch = async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/login/oauth/access_token') {
+        const token = new URLSearchParams(String(init?.body ?? '')).get('refresh_token') ?? JSON.parse(String(init?.body ?? '{}')).refresh_token;
+        spent.push(token);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        if (token !== live) return Response.json({ error: 'bad_refresh_token' });
+        live = 'refresh-2';
+        return Response.json({ access_token: 'fresh-token', expires_in: 28_800, refresh_token: live, refresh_token_expires_in: 15_552_000 });
+      }
+      return new Response('not found', { status: 404 });
+    };
+    // Two processes: their own services (and in-process single-flight maps) on one database and vault.
+    const first = (await GitHubAppService.create(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
+    const second = (await GitHubAppService.create(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
+    await expect(Promise.all([first.userAccessToken('owner'), second.userAccessToken('owner')])).resolves.toEqual(['fresh-token', 'fresh-token']);
+    expect(spent).toEqual(['refresh-1']);
+    expect(JSON.parse(await broker.resolve(handle, { caps: [`use-credential:${handle}`] }))).toMatchObject({ refreshToken: 'refresh-2' });
+    expect((await first.status('owner')).lastAuthorizationFailure).toBeUndefined();
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('keeps a newer token when a stale concurrent refresh is rejected', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-refresh-contention-'));
     const store = (await Store.create(':memory:'));

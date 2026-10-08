@@ -55,7 +55,7 @@ describe('disconnecting a login preserves task history', () => {
     expect((await snapshot())?.content).toEqual(before?.content);
   });
 
-  it('preserves Claude native history and subagents, while deleting both credential locations', () => {
+  it('preserves Claude native history and subagents, while deleting both credential locations', async () => {
     const homes = new ConfigHomeManager(temp());
     const home = homes.ensure('claude', 'personal');
     const session = crypto.randomUUID(), slug = claudeCwdSlug('/old');
@@ -72,7 +72,7 @@ describe('disconnecting a login preserves task history', () => {
     expect(materializeFork({ provider: 'claude', session, srcHome: home, forkHome: temp(), worldPath: '/new' })).toBe(true);
   });
 
-  it('preserves OpenCode storage but removes its colocated auth, without touching another organization', () => {
+  it('preserves OpenCode storage but removes its colocated auth, without touching another organization', async () => {
     const homes = new ConfigHomeManager(temp());
     const home = homes.ensure('opencode', 'work', 'org_a');
     const other = homes.ensure('opencode', 'work', 'org_b');
@@ -90,7 +90,7 @@ describe('disconnecting a login preserves task history', () => {
     expect(fs.existsSync(home)).toBe(false);
   });
 
-  it('unlinks history symlinks without following them into another home', () => {
+  it('unlinks history symlinks without following them into another home', async () => {
     const homes = new ConfigHomeManager(temp());
     const home = homes.ensure('codex', 'personal');
     const outside = temp();

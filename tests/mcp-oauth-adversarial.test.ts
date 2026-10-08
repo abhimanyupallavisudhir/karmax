@@ -55,6 +55,33 @@ describe('MCP OAuth hostile inputs and concurrency', () => {
     expect(exchanges.filter((e) => e.get('grant_type') === 'refresh_token')).toHaveLength(1);
     expect(JSON.stringify((await service.list()))).not.toMatch(/scoped-access|vault-only-refresh|registered-client/);
   });
+  it('refreshes once across processes, and a waiter takes the winner\'s tokens', async () => {
+    await finishOAuth(service, connection, 'user:alice', state, 'code');
+    const stale = { ...(await service.secret(connection)), expiresAt: 0 };
+    await service.setSecret(connection, stale);
+    // Another process: its own service, broker and vault on the same database (refresh-lease.ts).
+    const other = new McpConnections(store, new CredentialBroker(new Vault(dir)), 'org_personal');
+    let live = 'vault-only-refresh';
+    const spent: string[] = [];
+    // The server's token endpoint: each refresh token works once.
+    const run = async (data: any) => {
+      spent.push(data.tokens.refresh_token);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      if (data.tokens.refresh_token !== live) throw new Error('invalid_grant');
+      live = 'rotated-refresh';
+      data.tokens = { ...data.tokens, access_token: 'fresh-access', refresh_token: live };
+      data.expiresAt = Date.now() + 3_600_000;
+      return data;
+    };
+    const [first, second] = await Promise.all([service.refresh(connection, 'task', stale, run), other.refresh(connection, 'task', stale, run)]);
+    expect(spent).toEqual(['vault-only-refresh']);
+    expect(first.tokens).toMatchObject({ access_token: 'fresh-access', refresh_token: 'rotated-refresh' });
+    expect(second.tokens).toMatchObject({ access_token: 'fresh-access', refresh_token: 'rotated-refresh' });
+    expect((await other.secret(connection)).tokens.refresh_token).toBe('rotated-refresh');
+    // A refresh whose connection changed meanwhile is discarded, not written.
+    const edited = (await service.save({ ...connection, label: 'Edited' }));
+    expect(edited.revision).not.toBe(connection.revision);
+  });
   it('a second authorization invalidates the previous state', async () => {
     await beginOAuth(service, connection, 'user:alice', 'https://tavya.example/mcp-callback');
     await expect(finishOAuth(service, connection, 'user:alice', state, 'code')).rejects.toThrow(/Authorization/);

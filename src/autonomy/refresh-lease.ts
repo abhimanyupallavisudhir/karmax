@@ -130,7 +130,7 @@ export class RefreshLeases {
   /** A refresh under the lease, with the write-back compare-and-set (above). */
   async refresh<T>(spec: LeasedRefresh<T>): Promise<{ outcome: RefreshOutcome; stored: string | undefined; result?: T }> {
     const changed = (stored: string | undefined) => spec.since !== undefined && stored !== spec.since.value;
-    return this.hold(spec.credential, async (lease) => {
+    return this.hold<{ outcome: RefreshOutcome; stored: string | undefined; result?: T }>(spec.credential, async (lease) => {
       const finish = async (outcome: RefreshOutcome, stored: string | undefined, result?: T) => {
         await spec.settled?.(stored);
         return { outcome, stored, ...(result === undefined ? {} : { result }) };
@@ -151,7 +151,7 @@ export class RefreshLeases {
     }, async () => {
       if (spec.since === undefined) return undefined;
       const stored = await spec.read();
-      return changed(stored) ? { value: { outcome: 'raced' as const, stored } } : undefined;
+      return changed(stored) ? { value: { outcome: 'raced', stored } } : undefined;
     });
   }
 }

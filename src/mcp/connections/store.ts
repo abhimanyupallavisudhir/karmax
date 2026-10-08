@@ -4,6 +4,8 @@ import type { Store } from '../../store/db.js';
 import type { CredentialBroker } from '../../autonomy/broker.js';
 import { organizationScope } from '../../autonomy/vault-keys.js';
 import { publicUrl } from './http.js';
+import { leasedOAuthRefresh } from './oauth.js';
+import { RefreshLeases } from '../../autonomy/refresh-lease.js';
 import { handleRef, recordSecretRefs } from '../../autonomy/task-secrets.js';
 
 export type McpTransport = { type: 'http' | 'sse'; url: string }
@@ -139,6 +141,15 @@ export class McpConnections {
     const handle = this.handle(c.id);
     if (!await this.broker.hasHandle(handle)) return {};
     return JSON.parse(await this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }));
+  }
+  /** An OAuth refresh, one at a time across processes (`OAuthVault.refresh`). */
+  async refresh(c: McpConnection, taskId: string | undefined, observed: any, run: (data: any) => Promise<any>): Promise<any> {
+    const handle = this.handle(c.id);
+    return leasedOAuthRefresh(new RefreshLeases(this.store.db), handle, observed,
+      async () => await this.broker.hasHandle(handle) ? this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }) : undefined,
+      (current, next) => this.store.transaction(async () => (await this.get(c.id, c.projectId)).revision === c.revision
+        && this.broker.replaceHandleIfUnchanged(handle, current, next, organizationScope(this.organizationId))),
+      run);
   }
   async setSecret(c: McpConnection, value: unknown) {
     await this.store.transaction(async () => {

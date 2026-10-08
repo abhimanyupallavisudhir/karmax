@@ -1228,8 +1228,9 @@ export class Vault implements SecretVault {
    * becomes a sentinel it does not know. Repeatable.
    */
   static sealForEpoch6(dir: string, database: boolean): void {
-    if (!fs.existsSync(dir)) return;
     if (database) {
+      // Also where no file vault ever was (a fresh install on PostgreSQL): the epoch 5 release creates it.
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       const entries = path.join(dir, 'entries');
       if (isFile(entries)) return;
       if (fs.existsSync(entries)) {
@@ -1246,6 +1247,7 @@ export class Vault implements SecretVault {
       writeDurably(entries, EPOCH6_ENTRIES_NOTE);
       return;
     }
+    if (!fs.existsSync(dir)) return;
     const secrets = path.join(dir, 'secrets.json');
     let parsed: unknown;
     try { parsed = JSON.parse(fs.readFileSync(secrets, 'utf8')); } catch { parsed = undefined; }
