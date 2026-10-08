@@ -55,6 +55,40 @@ const REDIRECT_SECONDS = 15 * 60;
 const UPLOAD_URL_SECONDS = 15 * 60;
 const TOKEN_KEY_HANDLE = 'resource-repositories:token-key';
 export const REPOSITORY_ROUTE = '/resource-repositories/';
+/** Requests one grant may make a minute. A save makes about two per 16 MiB
+ * pack through the edge (one through the relay), a restore one per pack: the
+ * fastest measured save, ~85 MiB/s, is ~650 a minute. */
+export const GRANT_REQUESTS_PER_MINUTE = 3_000;
+
+/**
+ * Each grant's own request budget, in one-minute windows.
+ *
+ * Remote worlds reach this server through the edge, so their peer is one of a
+ * few Cloudflare addresses that every customer shares, and a budget per address
+ * would make them refuse each other. Anyone can send a header claiming to be
+ * the edge, or run a Worker of their own from those addresses. The grant is the
+ * one thing a request proves, so it is what is metered, after its signature is
+ * checked: a request without a valid grant is refused before it costs more than
+ * that check, and makes no entry here.
+ */
+export class GrantLimits {
+  private windows = new Map<string, { count: number; until: number }>();
+  private sweepAt = 0;
+  constructor(private perMinute = GRANT_REQUESTS_PER_MINUTE) {}
+
+  get size(): number { return this.windows.size; }
+
+  /** 0 when the request may proceed, else the milliseconds until the grant may ask again. */
+  take(grant: string, now = Date.now()): number {
+    if (now >= this.sweepAt) {
+      for (const [key, window] of this.windows) if (window.until <= now) this.windows.delete(key);
+      this.sweepAt = now + 60_000;
+    }
+    let window = this.windows.get(grant);
+    if (!window || window.until <= now) this.windows.set(grant, window = { count: 0, until: now + 60_000 });
+    return ++window.count > this.perMinute ? window.until - now : 0;
+  }
+}
 
 /** A repository is a resource's in one storage location: a resource moved to
  * another location starts a repository there, and its earlier versions stay
@@ -95,7 +129,9 @@ export class RepositoryTokens {
   constructor(private broker: CredentialBroker) {}
 
   async mint(grant: RepositoryGrant): Promise<string> {
-    const body = Buffer.from(JSON.stringify(grant)).toString('base64url');
+    // Each grant is its own (two minted alike in one millisecond would
+    // otherwise be one token), since each has its own request budget.
+    const body = Buffer.from(JSON.stringify({ ...grant, nonce: crypto.randomBytes(12).toString('base64url') })).toString('base64url');
     return `${body}.${this.sign(await this.secret(), body)}`;
   }
 
@@ -132,10 +168,11 @@ export interface RepositoryServerDeps {
 
 interface RepositoryPlace { attachment: ResourceAttachment; repository: string; storageLocationId?: string; objects(): Promise<ObjectStore> }
 
-class HttpError extends Error { constructor(readonly status: number, message: string) { super(message); } }
+class HttpError extends Error { constructor(readonly status: number, message: string, readonly retryAfter?: number) { super(message); } }
 
 export class ResourceRepositoryServer {
   private slots = UPLOAD_SLOTS;
+  private limits = new GrantLimits();
   private waiting: Array<() => void> = [];
   /** Per storage location: does its store refuse content that does not match a signed checksum? */
   private checksums = new Map<string, { verified: Promise<boolean>; until: number }>();
@@ -162,24 +199,29 @@ export class ResourceRepositoryServer {
     return verified;
   }
 
-  /** `path` is everything after {@link REPOSITORY_ROUTE}: `<attachment>/<restic path>`. */
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string): Promise<void> {
+  /** `path` is everything after {@link REPOSITORY_ROUTE}: `<attachment>/<restic path>`.
+   * Each grant has its own request budget ({@link GrantLimits}), except for
+   * restic run by this process (`unmetered`). */
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, options: { unmetered?: boolean } = {}): Promise<void> {
     try {
-      await this.serve(req, res, path);
+      await this.serve(req, res, path, !options.unmetered);
     } catch (error) {
       const status = error instanceof HttpError ? error.status : 500;
       if (status === 500) console.warn(`resource repository: ${req.method} ${path}: ${error instanceof Error ? error.message : String(error)}`);
-      if (!res.headersSent) res.writeHead(status, { 'content-type': 'text/plain' });
+      if (!res.headersSent) res.writeHead(status, { 'content-type': 'text/plain',
+        ...(error instanceof HttpError && error.retryAfter ? { 'retry-after': String(error.retryAfter) } : {}) });
       // A store's own errors may name URLs or keys: they stay in the log.
       res.end(status === 500 ? 'internal error' : error instanceof Error ? error.message : String(error));
     }
   }
 
-  private async serve(req: http.IncomingMessage, res: http.ServerResponse, path: string): Promise<void> {
+  private async serve(req: http.IncomingMessage, res: http.ServerResponse, path: string, metered: boolean): Promise<void> {
     const method = req.method ?? 'GET';
-    // The pinned restic for worlds that have none; they check its digest.
+    // The pinned restic for worlds that have none (they check its digest), for
+    // any grant: 31 MB must not be free to whoever asks.
     const binary = new RegExp(`^restic/${RESTIC_VERSION.replace(/\./g, '\\.')}/linux-(amd64|arm64)$`).exec(path);
     if (binary && method === 'GET') {
+      await this.authorize(req, undefined, metered);
       const file = worldResticBinary(binary[1]!);
       if (!file) throw new HttpError(404, 'not found');
       res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(fs.statSync(file.file).size),
@@ -188,7 +230,7 @@ export class ResourceRepositoryServer {
       return;
     }
     const [repository = '', ...rest] = path.split('/');
-    const grant = await this.authorize(req, repository);
+    const grant = await this.authorize(req, repository, metered);
     const parsed = parseRepositoryName(repository);
     const attachment = parsed && await this.deps.store.getResourceAttachment(parsed.attachmentId);
     if (!parsed || !attachment) throw new HttpError(404, 'no such repository');
@@ -222,12 +264,15 @@ export class ResourceRepositoryServer {
     throw new HttpError(405, 'method not allowed');
   }
 
-  private async authorize(req: http.IncomingMessage, repository: string): Promise<RepositoryGrant> {
+  /** The request's grant, for `repository` (any, when undefined), charged to its budget. */
+  private async authorize(req: http.IncomingMessage, repository: string | undefined, metered: boolean): Promise<RepositoryGrant> {
     const header = req.headers.authorization ?? '';
     const basic = /^Basic\s+(.+)$/i.exec(header)?.[1];
     const token = basic ? Buffer.from(basic, 'base64').toString('utf8').split(':').slice(1).join(':') : undefined;
     const grant = token ? await this.deps.tokens.verify(token) : undefined;
-    if (!grant || grant.repository !== repository) throw new HttpError(401, 'unauthorized');
+    if (!token || !grant || (repository !== undefined && grant.repository !== repository)) throw new HttpError(401, 'unauthorized');
+    const wait = metered ? this.limits.take(token) : 0;
+    if (wait) { req.resume(); throw new HttpError(429, 'too many requests for this grant', Math.ceil(wait / 1000)); }
     return grant;
   }
 

@@ -12,7 +12,13 @@ COMPOSE_FILE="$DEPLOY_DIR/compose.turnkey.yml"
 
 die() { echo "karmax: $*" >&2; exit 1; }
 note() { echo "• $*"; }
-dc() { docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+# Compose recreates a container when its configuration changes, not when a file
+# it mounts does, and Caddy's admin API is off: the Caddyfile's digest is a
+# label on Caddy, so every `up` restarts it onto a changed Caddyfile.
+dc() {
+  KARMAX_CADDYFILE_SHA256=$(sha256sum "$DEPLOY_DIR/Caddyfile" 2>/dev/null | cut -d' ' -f1) \
+    docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+}
 
 # The checksums cover the dumps and secrets outside the signed control-plane
 # manifest, and the manifest itself, so the two signatures vouch for one backup.

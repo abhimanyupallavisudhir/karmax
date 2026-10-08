@@ -163,7 +163,12 @@ runs only inside its HTTP router, which those routes never enter. Without the
 edge they are unmetered.
 
 Zones are independent: exhausting the signup budget does not affect the rest of
-the site. Preview origins are deliberately unmetered — they serve someone's
+the site. Resource repositories (`/resource-repositories/*`, restic in task
+worlds) are in none of them: remote worlds reach them through a Cloudflare
+Worker, so every customer's sandboxes share a few Cloudflare addresses. The app
+gives each verified repository grant its own budget instead (3,000 requests a
+minute, `GrantLimits` in `src/world/resource-repository.ts`); a request without
+a valid grant is refused after one signature check. Preview origins are deliberately unmetered — they serve someone's
 running app behind a lease, and a shared control-plane budget would throttle
 legitimate traffic.
 

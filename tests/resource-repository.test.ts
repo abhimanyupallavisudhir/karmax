@@ -10,9 +10,9 @@ import { LocalObjectStore, type ObjectStore } from '../src/store/objects.js';
 import { StorageLocationService } from '../src/store/storage-locations.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { REPOSITORY_ROUTE, RepositoryTokens, ResourceRepositoryServer, repositoryName, repositoryPassword,
-  type RepositoryAccess } from '../src/world/resource-repository.js';
-import { runHostRestic } from '../src/world/restic.js';
+import { GRANT_REQUESTS_PER_MINUTE, GrantLimits, REPOSITORY_ROUTE, RepositoryTokens, ResourceRepositoryServer, repositoryName,
+  repositoryPassword, type RepositoryAccess } from '../src/world/resource-repository.js';
+import { RESTIC_VERSION, runHostRestic, worldResticBinary } from '../src/world/restic.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -187,5 +187,63 @@ describe('resource repository server (restic REST protocol)', () => {
     expect(over.stdout + over.stderr).toMatch(/507/);
     // Work in progress (a parked task's private copy) is counted, never refused.
     expect((await f.restic('append', ['backup', '--host', 'tavya', '.'], f.source)).code).toBe(0);
+  });
+});
+
+/** `count` calls of `call`, `width` at a time; their statuses. */
+async function burst(count: number, width: number, call: () => Promise<Response>): Promise<number[]> {
+  const statuses: number[] = [];
+  for (let i = 0; i < count; i += width)
+    statuses.push(...await Promise.all(Array.from({ length: Math.min(width, count - i) }, async () => {
+      const response = await call(); await response.arrayBuffer(); return response.status;
+    })));
+  return statuses;
+}
+
+describe('resource repository request budgets', () => {
+  // Every remote world reaches the server through the Cloudflare edge, so all
+  // of them arrive from a few shared addresses: the budget follows the grant.
+  const as = (base: string, repository: string, token: string, headers: Record<string, string> = {}) => () =>
+    fetch(`${base}${repository}/locks/`, { headers: { authorization: `Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`, ...headers } });
+
+  it('serves many worlds saving at once from one address, and refuses only the grant that floods', async () => {
+    const f = await fixture();
+    // A 1.27 GB save made 228 edge subrequests in a minute; 20 such saves at once.
+    const worlds = await Promise.all(Array.from({ length: 20 }, () => f.grant('append')));
+    const served = (await Promise.all(worlds.map((token) => burst(250, 25, as(f.base, f.repository, token))))).flat();
+    expect(served.filter((status) => status !== 200)).toEqual([]);
+
+    const flood = await f.grant('append');
+    expect(new Set(await burst(GRANT_REQUESTS_PER_MINUTE, 50, as(f.base, f.repository, flood)))).toEqual(new Set([200]));
+    const refused = await as(f.base, f.repository, flood)();
+    expect(refused.status).toBe(429);
+    expect(Number(refused.headers.get('retry-after'))).toBeGreaterThan(0);
+    expect(Number(refused.headers.get('retry-after'))).toBeLessThanOrEqual(60);
+    // Looking like the edge, or like another peer, earns the flood nothing.
+    for (const headers of [{ 'x-tavya-edge': 'intent' }, { 'x-forwarded-for': '172.71.146.192' }, { 'cf-connecting-ip': '198.51.100.7' }])
+      expect((await as(f.base, f.repository, flood, headers)()).status).toBe(429);
+    // Everyone else is untouched, from the same address at the same moment.
+    expect((await as(f.base, f.repository, worlds[0]!)()).status).toBe(200);
+    expect((await as(f.base, f.repository, await f.grant('read'))()).status).toBe(200);
+  });
+
+  it('serves the restic binary only to a grant', async () => {
+    const f = await fixture();
+    const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+    const url = `${f.base}restic/${RESTIC_VERSION}/linux-${arch}`;
+    expect((await fetch(url)).status).toBe(401);
+    const granted = await fetch(url, { headers: { authorization: `Basic ${Buffer.from(`tavya:${await f.grant('read')}`).toString('base64')}` } });
+    expect(granted.status).toBe(worldResticBinary(arch) ? 200 : 404);
+    await granted.arrayBuffer();
+  });
+
+  it("starts a grant's budget again each minute and forgets idle grants", () => {
+    const limits = new GrantLimits(3);
+    expect([0, 1, 2].map((i) => limits.take('a', 1_000 + i))).toEqual([0, 0, 0]);
+    expect(limits.take('a', 31_000)).toBe(30_000);
+    expect(limits.take('b', 31_000)).toBe(0);
+    expect(limits.take('a', 61_000)).toBe(0);
+    limits.take('c', 200_000);
+    expect(limits.size).toBe(1);
   });
 });

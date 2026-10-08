@@ -1623,7 +1623,8 @@ export class Gateway {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
     // Resource repositories: restic in task worlds (and the worker), with
-    // grants of their own, never a session; not the browser API's limits.
+    // grants of their own, never a session; each grant is metered on its own
+    // (GrantLimits), not by the address it came from.
     if (p.startsWith(REPOSITORY_ROUTE) && this.deps.resources?.repositoryServer)
       return this.deps.resources.repositoryServer.handle(req, res, p.slice(REPOSITORY_ROUTE.length) + url.search);
     const sensitiveNavigation = /^\/api\/tasks\/[^/]+\/(desktop|preview\/)/.test(p);

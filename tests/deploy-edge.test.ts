@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -89,12 +90,16 @@ describe('public edge (Caddy) rate limiting', () => {
     for (const key of keys) expect(key).toBe('{http.request.remote.host}');
   });
 
-  it('meters resource repositories in a zone of their own, not the console budget', () => {
+  it('leaves resource repositories to a budget per grant, which no peer address or header can imitate', () => {
+    // Every remote world reaches them through the Cloudflare edge, so they all
+    // share a few Cloudflare addresses: the app meters each verified grant.
     const site = read('Caddyfile').split('{$KARMAX_DOMAIN} {')[1]?.split('\n}')[0] ?? '';
     const repositories = site.split('handle /resource-repositories/* {')[1]?.split('\n\t}')[0] ?? '';
-    expect(repositories).toContain('zone repositories');
+    expect(repositories).toContain('reverse_proxy 127.0.0.1:4505');
+    expect(repositories).not.toContain('rate_limit');
     expect(repositories).not.toContain('import karmax_ratelimit');
-    // Everything else still goes through the catch-all budget.
+    expect(read('Caddyfile')).not.toMatch(/key\s+\{http\.request\.header\./);
+    // Everything else still goes through the per-address budgets.
     expect(site.split('handle {')[1] ?? '').toContain('import karmax_ratelimit');
   });
 
@@ -103,6 +108,35 @@ describe('public edge (Caddy) rate limiting', () => {
     // shared control-plane budget there would throttle legitimate traffic.
     const previewBlock = read('Caddyfile').split('handle @preview {')[1]?.split('\n\t\t}')[0] ?? '';
     expect(previewBlock).not.toContain('rate_limit');
+  });
+});
+
+describe('public edge (Caddy) configuration changes', () => {
+  // Caddy's admin API is off, and Compose recreates a container when its
+  // configuration changes, not when a file it mounts does. Without this a
+  // release's Caddyfile waited for a manual restart: tavya.io kept the console's
+  // per-address budget on resource repositories for days after 2026-10-04.
+  it('labels Caddy with the Caddyfile digest in both deployment profiles', () => {
+    for (const file of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+      const caddy = (parse(read(file)) as { services: Record<string, { labels?: Record<string, string> }> }).services.caddy;
+      expect(caddy?.labels?.['karmax.caddyfile-sha256'], file).toBe('${KARMAX_CADDYFILE_SHA256:-}');
+    }
+  });
+
+  it('passes the current Caddyfile digest to every Compose call, so `up` recreates Caddy when it changes', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-caddyfile-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'bin'));
+      fs.writeFileSync(path.join(dir, 'bin', 'docker'), '#!/bin/sh\nprintf %s "$KARMAX_CADDYFILE_SHA256"\n', { mode: 0o755 });
+      const up = () => execFileSync('sh', ['-c',
+        `. "${path.join(deployDir, 'karmax')}" >/dev/null 2>&1 || true\nDEPLOY_DIR="${dir}"\ndc up -d`,
+      ], { encoding: 'utf8', env: { ...process.env, PATH: `${path.join(dir, 'bin')}:${process.env.PATH}` } });
+      const digest = (text: string) => crypto.createHash('sha256').update(text).digest('hex');
+      fs.writeFileSync(path.join(dir, 'Caddyfile'), 'before\n');
+      expect(up()).toBe(digest('before\n'));
+      fs.writeFileSync(path.join(dir, 'Caddyfile'), 'after\n');
+      expect(up()).toBe(digest('after\n'));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
