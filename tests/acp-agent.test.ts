@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { AcpAdapter } from '../src/agent/acp.js';
 import { AttachmentStore } from '../src/store/attachments.js';
+import { ProviderStreamError, classifyProviderTurnError } from '../src/agent/limits.js';
 
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
@@ -104,6 +105,9 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     // Steer-driven cancellation: resolve the in-flight prompt as cancelled.
     if (pendingPrompt) { send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: 'cancelled' } }); pendingPrompt = undefined; }
   }
+  else if (msg.method === 'session/prompt' && process.env.STUB_PROMPT_ERROR) {
+    send({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: process.env.STUB_PROMPT_ERROR } });
+  }
   else if (msg.method === 'session/prompt') {
     pendingPrompt = msg.id;
     if (process.env.STUB_AWAIT_CANCEL) return; // run long; wait for a steer-driven session/cancel
@@ -147,6 +151,7 @@ describe('generic ACP agent adapter', () => {
     delete process.env.STUB_STOP_REASON;
     delete process.env.STUB_AWAIT_CANCEL;
     delete process.env.STUB_MESSAGES;
+    delete process.env.STUB_PROMPT_ERROR;
     delete process.env.KARMAX_HOME;
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
     dir = undefined;
@@ -229,6 +234,15 @@ describe('generic ACP agent adapter', () => {
     expect(file).toBeTruthy();
     expect(fs.existsSync(file!)).toBe(false);
     expect(Buffer.byteLength(records.find((record) => record.env)!.env.OPENCODE_CONFIG_CONTENT)).toBeLessThan(4096);
+  });
+
+  // Live 2026-10-08: an exhausted Anthropic workspace failed an OpenCode task
+  // outright, where a Claude or Codex turn would have waited for the reset.
+  it('reports the agent\'s error answer to a prompt as the model provider\'s failure', async () => {
+    process.env.STUB_PROMPT_ERROR = 'Internal error: You have reached your specified workspace API usage limits. You will regain access on 2026-11-01 at 00:00 UTC.';
+    const failure = await run().catch((error) => error);
+    expect(failure).toBeInstanceOf(ProviderStreamError);
+    expect(classifyProviderTurnError(failure, 'opencode').classification).toMatchObject({ limited: true });
   });
 
   it('caps provider-requested terminal output retention', async () => {

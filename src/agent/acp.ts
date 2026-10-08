@@ -7,6 +7,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import {
   PROTOCOL_VERSION,
+  RequestError,
   client,
   methods,
   ndJsonStream,
@@ -41,6 +42,7 @@ import { exportRemoteAcpSession, multiplexAcpChannel, prepareRemoteAcpTurn, remo
 import { worldWorkingDirectory } from '../world/types.js';
 import type { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 import { BRAND } from '../domain/brand.js';
+import { ProviderStreamError, SandboxProviderFailure } from './limits.js';
 
 interface HarnessSpec {
   command: string;
@@ -748,6 +750,13 @@ export class AcpAdapter implements AgentAdapter {
             sessionId,
             prompt: promptBlocks,
           }, { cancellationSignal: ctx.signal });
+        } catch (error) {
+          // The agent's own error answer to the prompt carries the model
+          // provider's failure (a quota, a revoked key): tag it as the provider's,
+          // so it parks on its reset like a Claude or Codex limit instead of
+          // failing the task (live 2026-10-08: an exhausted Anthropic workspace).
+          if (error instanceof RequestError && !ctx.signal?.aborted) throw new ProviderStreamError(error.message);
+          throw error;
         } finally {
           (await roundEnd?.(ctx.signal?.aborted || result?.stopReason === 'cancelled' ? 'cancelled' : result?.stopReason === 'end_turn' ? 'ok' : 'failed'));
           if (followPoll) clearInterval(followPoll);
@@ -791,6 +800,12 @@ export class AcpAdapter implements AgentAdapter {
       if (remoteProcess?.lost) throw remoteProcess.lost;
       const detail = stderr.trim();
       const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof ProviderStreamError) {
+        const failure = new ProviderStreamError(`${this.provider} ACP turn failed: ${message}`);
+        // A sandbox controls the bytes of that answer: it may end this turn,
+        // but only a host-side check may change a shared credential (AD-7).
+        throw remote ? new SandboxProviderFailure(failure) : failure;
+      }
       throw new Error(`${this.provider} ACP turn failed: ${message}${detail ? `: ${detail.slice(-800)}` : ''}`, { cause: error });
     } finally {
       (await control?.close());

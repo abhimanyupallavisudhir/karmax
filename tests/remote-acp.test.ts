@@ -12,6 +12,7 @@ import { OPENCODE_PACKAGE, OPENCODE_VERSION } from '../src/agent/acp-packages.js
 import { OPENCODE_REMOTE_REFRESH_SENTINEL, isControlPlaneAuth, prewarmRemoteAgentHome, remoteAgentCommand, remoteAgentEnv,
   remoteAuthProjection } from '../src/agent/remote-process.js';
 import { PINNED_REMOTE_NODE_VERSION } from '../src/agent/remote-node.js';
+import { ProviderStreamError, SandboxProviderFailure } from '../src/agent/limits.js';
 import type { World, WorldPty } from '../src/world/types.js';
 
 /**
@@ -107,6 +108,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
   } else if (msg.method === 'session/prompt') {
     const id = msg.params.sessionId;
     const text = msg.params.prompt.filter((b) => b.type === 'text').map((b) => b.text).join('');
+    if (text.includes('STUB_QUOTA')) { send({ id: msg.id, error: { code: -32603, message: 'Internal error: You have reached your specified workspace API usage limits.' } }); return; }
     const session = load(id);
     session.messages.push({ role: 'user', text: text.slice(0, 200) }, { role: 'assistant', text: 'done' });
     save(session);
@@ -345,6 +347,14 @@ describe('remote OpenCode (ACP in a cloud sandbox)', () => {
     expect(world.bootstraps).toHaveLength(1);
     expect(world.bootstraps[0]).toContain(`npx --yes --package='${process.env.KARMAX_REMOTE_OPENCODE_PACKAGE}' -c true`);
     expect(world.bootstraps[0]).toContain(`'${world.handle.root}/.karmax-injection/agent/opencode/api'`);
+  }, 60_000);
+
+  it('leaves a provider limit reported from the sandbox for the host to confirm', async () => {
+    setup();
+    const failure = await turn(sandbox('quota'), { text: 'STUB_QUOTA' }).catch((error) => error);
+    expect(failure).toBeInstanceOf(SandboxProviderFailure);
+    expect(failure.failure).toBeInstanceOf(ProviderStreamError);
+    expect(failure.message).toContain('workspace API usage limits');
   }, 60_000);
 
   it('refuses ACP harnesses without a remote implementation instead of running them on the host', async () => {

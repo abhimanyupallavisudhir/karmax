@@ -10,6 +10,7 @@ import { DaytonaWorldProvider } from '../src/world/daytona.js';
 import { E2BWorldProvider } from '../src/world/e2b.js';
 import type { World } from '../src/world/types.js';
 import { liveEnabled } from './helpers/live-gate.js';
+import { apiKeyEnv } from '../src/agent/provider-registry.js';
 
 /**
  * OpenCode in real cloud worlds (remote-acp.ts), end to end through the ACP
@@ -20,11 +21,14 @@ import { liveEnabled } from './helpers/live-gate.js';
  * by this process, and the session continued after the sandbox lost it.
  *
  * Opt in with KARMAX_RUN_LIVE=1, E2B_API_KEY and/or DAYTONA_API_KEY, and
- * ANTHROPIC_API_KEY (a metered key: never a subscription login, whose refresh
- * tokens are single-use). Each provider spends one sandbox, deleted at the
+ * the model vendor's metered key (ANTHROPIC_API_KEY by default; never a
+ * subscription login, whose refresh tokens are single-use). Each provider spends one sandbox, deleted at the
  * end, and about 0.3 USD of Claude Haiku.
  */
 const model = process.env.KARMAX_LIVE_OPENCODE_MODEL ?? 'anthropic/claude-haiku-4-5';
+// The model vendor's metered key, e.g. ANTHROPIC_API_KEY, or OPENAI_API_KEY for
+// KARMAX_LIVE_OPENCODE_MODEL=openai/gpt-5-mini.
+const modelKey = process.env[apiKeyEnv(model.split('/')[0]!)];
 const providers = [
   { name: 'E2B', enabled: !!process.env.E2B_API_KEY, create: (taskId: string) => new E2BWorldProvider().create({ taskId, base: 'main' }) },
   { name: 'Daytona', enabled: !!process.env.DAYTONA_API_KEY, create: (taskId: string) => new DaytonaWorldProvider().create({ taskId, base: 'main',
@@ -32,7 +36,7 @@ const providers = [
 ];
 
 describe.each(providers)('OpenCode in a live $name world', ({ name, enabled, create }) => {
-  const live = liveEnabled() && enabled && !!process.env.ANTHROPIC_API_KEY;
+  const live = liveEnabled() && enabled && !!modelKey;
   let world: World;
   let home: string;
   let previousHome: string | undefined;
@@ -51,7 +55,7 @@ describe.each(providers)('OpenCode in a live $name world', ({ name, enabled, cre
       messages: [{ id: 'm', role: 'user', text, ts: Date.now() }],
       systemPrompt: opts.systemPrompt ?? 'You are a careful assistant. Follow the user exactly.',
       role: 'do',
-      resolvedAuth: { apiKey: process.env.ANTHROPIC_API_KEY },
+      resolvedAuth: { apiKey: modelKey },
       extraEnv: { KARMAX_TOKEN: 'live-test-token' },
       ...(opts.session ? { session: opts.session } : {}),
       ...(opts.agentMcp ? { agentMcp: opts.agentMcp } : {}),
