@@ -56,11 +56,12 @@ jobs:
           fetch-depth: 0
       - name: Fetch the two branches
         run: git fetch --no-tags origin "+refs/heads/$FROM:refs/remotes/origin/$FROM" "+refs/heads/$TO:refs/remotes/origin/$TO"
-      - name: Free disk space
-        # The rehearsal builds two app images and runs a whole stack (~10 GB).
+      - name: Git identity
+        # When TO does not descend from FROM, the harness deploys a commit it
+        # makes with `git commit-tree`, which needs an author.
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          git config --global user.name 'karmax rehearsal'
+          git config --global user.email 'rehearsal@karmax.invalid'
       - name: Rehearse
         run: |
           set -o pipefail
