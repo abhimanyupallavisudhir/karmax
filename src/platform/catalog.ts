@@ -206,6 +206,8 @@ export const PLATFORM_API_CATALOG = {
   installation: [
     'GET|PUT /api/settings/paid-launch (installation operator: legal operator, billingProvider stripe|paddle, provider catalog and encrypted secrets, checkout gate, founder checklist)',
     'POST /api/settings/paid-launch/paddle/provision (settings:write; discover/create monthly prices, client token, and signed webhook; does not enable live checkout)',
+    'GET|PUT /api/settings/service-limits (installation operator: shared provider accounts and this host against plan limits — services[].meters[] with used, usedSource api|count|host, limit, limitSource published|api|entered, level 0|80|95, 7-day hourly history; GET needs settings:read, PUT settings:write with {services: {<id>: {plan, link, limits: {<meterId>: number|null}}}, operatorOrganizationId, cloudflare: {accountId, apiToken}}; null restores a default; the token is write-only)',
+    'POST /api/settings/service-limits/check (settings:write; sample every account now and raise or clear alerts)',
     'GET|PUT /api/organizations/:organizationId/payments/stripe/platform',
     'GET /api/email', 'POST /api/email/connect|test',
     'GET|POST /api/remote-access',

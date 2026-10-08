@@ -6,7 +6,7 @@ import { ExecutionOutput } from './execution-output.js';
 import { TaskSecrets, handleRef, paymentCardDetails, recordSecretRefs, secretScope } from '../autonomy/task-secrets.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
-import { GatewayMetrics } from './metrics.js';
+import { GatewayMetrics, type MemorySource } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
 import { SwrCache } from '../util/swr-cache.js';
@@ -114,6 +114,9 @@ import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
 export interface GatewayDeps {
   /** Primary startup/recovery and worker liveness, independent of DB health. */
   runtimeReady?: () => boolean;
+  /** The worker's memory for /api/metrics (RT-35): its child's last report,
+   * or the in-process worker's workflow heap and cache. */
+  memory?: MemorySource;
   serviceConnections?: ServiceConnections;
   api: KarmaxApi;
   store: Store;
@@ -149,6 +152,8 @@ export interface GatewayDeps {
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
   subscriptions?: import('../billing/subscriptions.js').SubscriptionBillingService;
   paidLaunchSettings?: import('../launch/settings.js').PaidLaunchSettingsService;
+  /** Installation → Service limits (operator accounts and this host against their plans). */
+  serviceLimits?: import('../ops/service-limits.js').ServiceLimitsService;
   cellId?: string;
   hosted?: boolean;
   /** Whether the browser and the host are the same machine (see `hostLocal`).
@@ -1276,7 +1281,7 @@ export class Gateway {
   async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; internalUrl: string; port: number; close: () => Promise<void> }> {
     const port = await findFreePortFrom(preferredPort);
     const bindHost = process.env.KARMAX_HOST?.trim() || '127.0.0.1';
-    this.operationalMetrics = new GatewayMetrics();
+    this.operationalMetrics = new GatewayMetrics(this.deps.memory);
     const server = http.createServer((req, res) => {
       const finish = this.operationalMetrics!.begin(req.url ?? '/');
       res.once('finish', () => finish(res.statusCode));
@@ -1649,8 +1654,10 @@ export class Gateway {
     // preventing arbitrary public certificate issuance through the catch-all.
     if (p === '/api/tls/preview-allow' && req.method === 'GET') {
       const domain = (url.searchParams.get('domain') ?? '').trim().toLowerCase();
-      res.writeHead((await this.deps.store.previewHostnameAllowed(domain)) ? 204 : 403,
-        { 'cache-control': 'no-store', 'content-length': '0' });
+      const allowed = (await this.deps.store.previewHostnameAllowed(domain));
+      // Counted toward Let's Encrypt's weekly limit (Installation → Service limits).
+      if (allowed) await this.deps.store.recordPreviewCertificateRequest(domain).catch(() => {});
+      res.writeHead(allowed ? 204 : 403, { 'cache-control': 'no-store', 'content-length': '0' });
       return void res.end();
     }
     if (this.deps.hosted && !p.startsWith('/api/health/') && !this.requestLimits.allow(this.clientAddress(req), p))
@@ -2498,6 +2505,27 @@ export class Gateway {
         const siteName = String(b.siteName).trim();
         (await store.setSettings('global', 'appearance', { ...appearance, siteName }));
         return this.json(res, 200, { ok: true, siteName });
+      }
+      // Installation-wide: operator accounts' usage is never an organization's
+      // business, so the checks carry no organization or project scope.
+      if (p === '/api/settings/service-limits' || p === '/api/settings/service-limits/check') {
+        const service = this.deps.serviceLimits;
+        if (!service) return this.json(res, 503, { error: 'service limits are unavailable' });
+        const write = method !== 'GET';
+        if (!['GET', 'PUT', 'POST'].includes(method) || (p.endsWith('/check') ? method !== 'POST' : method === 'POST'))
+          return this.json(res, 405, { error: 'method not allowed' });
+        if (!(await this.deps.tokens.check(token, write ? 'settings:write' : 'settings:read')).ok)
+          return this.json(res, 403, { error: `Only a ${(await this.siteName)} installation operator can ${write ? 'change' : 'see'} service limits` });
+        if (method === 'PUT') {
+          const { ServiceLimitsInputError } = await import('../ops/service-limits.js');
+          try { (await service.configure(await this.body(req))); }
+          catch (error) {
+            if (error instanceof ServiceLimitsInputError) return this.json(res, 400, { error: error.message });
+            throw error;
+          }
+        }
+        const view = method === 'GET' ? (await service.view()) : (await service.run());
+        return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
       }
       if (p === '/api/settings/paid-launch/paddle/provision' && method === 'POST') {
         if (!(await this.deps.tokens.check(token, 'settings:write')).ok)

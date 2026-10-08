@@ -393,7 +393,11 @@ export class ServiceConnections {
       // Membership may have changed while checking the provider account.
       (await this.authorized(org, id, taskId, projectId));
       (await this.audit(c, `task:${taskId}`, 'execute', slug));
-      return timed('service.action.remote', () => this.remote(async () => (await (await this.backend()).execute(c.sessionId!, slug, args))), undefined, toolFailed);
+      // Composio's plan caps tool calls for the whole installation; the
+      // operator's service-limits page counts them here (failed ones too).
+      try {
+        return await timed('service.action.remote', () => this.remote(async () => (await (await this.backend()).execute(c.sessionId!, slug, args))), undefined, toolFailed);
+      } finally { await this.store.countServiceUsage('composio.tool-calls').catch(() => {}); }
     });
   }
   /** One bounded MCP session with the account's current credentials. Never retried. */

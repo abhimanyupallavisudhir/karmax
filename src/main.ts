@@ -12,6 +12,7 @@ import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager, terminateOnWorkerFailure } from './temporal/worker-pool.js';
 import { WorkerProcessManager } from './temporal/worker-process.js';
+import { memoryBudget } from './runtime/memory-budget.js';
 import { ForeignEventRelay } from './contrib/foreign-event-relay.js';
 import { TASK_QUEUE } from './temporal/config.js';
 import { WorkflowManager } from './packages/manager.js';
@@ -261,8 +262,22 @@ async function main() {
     try { return JSON.parse((await store.kvGet('email:outbound')) ?? '{}'); } catch { return {}; }
   };
   const emailService = new EmailService(emailConfig,
-    async (handle) => (await broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined));
+    async (handle) => (await broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
+    async (sent) => {
+      (await store.countServiceUsage(`email.sent:${sent.provider}`));
+      if (sent.provider === 'resend') (await serviceLimits.recordResendQuota({ daily: sent.dailyQuota, monthly: sent.monthlyQuota }));
+    });
   identity.mailer = emailService;
+  // Installation → Service limits: the operator's shared accounts and this
+  // host against their plans, with alerts to the operators (sampled below).
+  const { ServiceLimitsService } = await import('./ops/service-limits.js');
+  const { serviceLimitNotifier } = await import('./ops/service-limit-notices.js');
+  const serviceLimits = new ServiceLimitsService({ store, broker, providerConnections, githubApp, dataDir: p.home,
+    workerHeap: () => workerManager.heap,
+    notify: serviceLimitNotifier({ store, email: emailService, publicUrl: process.env.KARMAX_PUBLIC_URL,
+      capabilities: (principalId) => authorization.capabilities(principalId),
+      userEmail: async (userId) => (await identity.userById(userId))?.email ?? undefined,
+      siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))) }) });
   // Managed storage lifecycle: retention, the over-quota policy and the
   // storage page (scheduled hourly below).
   const { ManagedStorageService } = await import('./world/managed-storage.js');
@@ -298,9 +313,15 @@ async function main() {
   // rolling the worker without a restart (§21d/§21e).
   const workerEnvironment: NodeJS.ProcessEnv = { ...process.env, KARMAX_TEMPORAL_ADDRESS: conn.address,
     KARMAX_TEMPORAL_NAMESPACE: conn.namespace };
+  // One budget for the container (RT-35): the worker child's heap flag also
+  // sizes its workflow thread, a second isolate with the same limit.
+  const budget = memoryBudget({ separateWorker });
+  console.log(`  • Memory budget: ${budget.limitMb} MiB; gateway heap ${budget.gatewayHeapMb} MiB`
+    + (separateWorker ? `, worker heaps ${budget.workerHeapMb} MiB each` : ''));
   const workerManager = separateWorker ? new WorkerProcessManager({
     entrypoint: fileURLToPath(new URL('./temporal/activity-worker-main.ts', import.meta.url)),
     env: workerEnvironment,
+    execArgv: ['--import', 'tsx', `--max-old-space-size=${budget.workerHeapMb}`],
     onFailure: terminateOnWorkerFailure,
     // Deliver the child's events to browsers now, not on the relay's next poll (LT-15).
     onEvents: () => { void eventRelay?.wake(); },
@@ -347,6 +368,7 @@ async function main() {
   const remoteAccess = new RemoteAccessController({ port: () => gatewayPort });
   const gateway = (await Gateway.create({
     runtimeReady: () => startupReady && !workerManager.failure,
+    memory: () => ({ heap: workerManager.heap, separate: workerManager instanceof WorkerProcessManager }),
     api,
     store,
     bus,
@@ -380,6 +402,7 @@ async function main() {
     checkpoints,
     subscriptions: subscriptionBilling,
     paidLaunchSettings,
+    serviceLimits,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
     hostLocal: deployment.hostLocal,
@@ -465,6 +488,11 @@ async function main() {
   }, 3600_000);
   managedStorageTimer.unref();
   startupJobs.push(() => managedStorageTimer.run());
+  // Service limits: sample the operator's accounts every 15 minutes, so a
+  // daily allowance is caught well before it runs out.
+  const serviceLimitsTimer = new AsyncInterval(() => serviceLimits.run(), 15 * 60_000);
+  serviceLimitsTimer.unref();
+  startupJobs.push(() => serviceLimitsTimer.run());
   // Reconcile missed notification close events without delaying the first API response.
   const inboxCleanup = new AsyncInterval(() => store.pruneStaleInbox().then(() => undefined), 3600_000);
   inboxCleanup.unref();
@@ -710,7 +738,7 @@ async function main() {
     // process-exit backstop bounds shutdown; do not close Store under these jobs.
     const maintenanceDrain = Promise.allSettled([
       startupMaintenance,
-      retentionTimer.stop(), inboxCleanup.stop(), credentialAttentionTimer.stop(), subscriptionEntitlementTimer.stop(),
+      retentionTimer.stop(), serviceLimitsTimer.stop(), inboxCleanup.stop(), credentialAttentionTimer.stop(), subscriptionEntitlementTimer.stop(),
       subscriptionSeatTimer.stop(),
       reconcileSweep.stop(), deploymentSweep.stop(),
       triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(),

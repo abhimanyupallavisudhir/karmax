@@ -1220,6 +1220,16 @@ export class GitHubAppService {
     return mint;
   }
 
+  /** An installation's REST rate limit. Reading it does not count against the
+   * limit, and the token comes from the same cache every other call uses. */
+  async rateLimit(connection: GitConnection, signal?: AbortSignal): Promise<{ limit: number; remaining: number; resetAt: number }> {
+    const body = await this.request<{ resources?: { core?: { limit?: number; remaining?: number; reset?: number } } }>(
+      '/rate_limit', await this.installationToken(connection), signal ? { signal } : {});
+    const core = body?.resources?.core;
+    if (!core || !Number.isFinite(core.limit) || !Number.isFinite(core.remaining)) throw new Error('GitHub returned no rate limit');
+    return { limit: Number(core.limit), remaining: Number(core.remaining), resetAt: Number(core.reset ?? 0) * 1000 };
+  }
+
   private clearInstallationTokens(connectionId: string): void {
     for (const cache of [this.tokenCache, this.tokenMints]) {
       for (const key of cache.keys()) if (key === connectionId || key.startsWith(`${connectionId}:`)) cache.delete(key);
