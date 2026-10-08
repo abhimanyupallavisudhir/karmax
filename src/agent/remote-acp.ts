@@ -8,6 +8,7 @@ import type { World } from '../world/types.js';
 import { mapBatches } from '../util/async-batch.js';
 import { timed } from '../timing/index.js';
 import { karmaxHome } from '../config/paths.js';
+import { BRAND } from '../domain/brand.js';
 import { atomicPrivateWrite } from './codex-history-files.js';
 import type { ControlFrame } from './control-bridge.js';
 import { acpSessionDigestFile, installMemoryGuard, isControlPlaneAuth, prepareRemoteAcpHome, remoteAcpHomeRelative,
@@ -147,7 +148,7 @@ export async function prepareRemoteAcpTurn(world: World, opts: { provider: Provi
       uploads.push({ relative: `${relative}/karmax-import/${opts.session}.json`, content: stored });
       // A sandbox that still holds the session (newer than the host's copy,
       // after an interrupted turn) keeps it: an import never replaces it.
-      prelude = `if ! "$bin" export ${quote(opts.session)} >/dev/null 2>&1; then "$bin" import ${quote(importFile)} >/dev/null || echo 'karmax: could not import the session' >&2; fi; rm -f -- ${quote(importFile)}`;
+      prelude = `if ! "$bin" export ${quote(opts.session)} >/dev/null 2>&1; then "$bin" import ${quote(importFile)} >/dev/null || echo '${BRAND}: could not import the session' >&2; fi; rm -f -- ${quote(importFile)}`;
     }
   }
   await Promise.all([
