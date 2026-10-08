@@ -52,7 +52,7 @@ export interface PlatformOps {
   messageAgent(taskId: string, text: string, role?: string): Promise<void>;
   stopAgent(taskId: string, agent: string): Promise<unknown>;
   escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
-  notify(a: { to: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
+  notify(a: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
@@ -494,14 +494,23 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, ' +
         '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now and keep ' +
         'their own pace; agents of this task (agent:do for the main agent, agent:responder, agent:confirm, ' +
-        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation.',
+        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation. ' +
+        '`agents` calls new agents in, after `to`; each becomes the next agent:agent-<n> (the returned message\'s `to` names them).',
       inputSchema: {
-        to: z.array(z.string()).min(1).max(32),
+        to: z.array(z.string()).max(32).optional(),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
+        agents: z.array(z.object({
+          provider: z.string().min(1),
+          model: z.string().optional(),
+          effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+          prompt: z.string().max(4_000).optional().describe('Its instructions.'),
+          resumeFrom: z.object({ taskId: z.string().min(1), role: z.string().optional() }).optional()
+            .describe('Fork that task agent (role default do).'),
+        })).max(8).optional(),
       },
     },
-    async (a) => wrap(async () => (await ops.notify(a))),
+    async (a) => wrap(async () => (await ops.notify(a as Parameters<typeof ops.notify>[0]))),
   );
   server.registerTool(
     'escalate',

@@ -1,6 +1,7 @@
 import { machineShape } from '../domain/computer.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
-import { conversationFor, workDigest } from '../domain/participants.js';
+import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
+import { forkSourceRole } from '../domain/forks.js';
 import { createHash } from 'node:crypto';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
@@ -1800,7 +1801,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // another. Ambient/API-key sessions have no stored source home.
       const resume = args.role ? args.task?.agents?.[args.role]?.resumeFrom : undefined;
       if (profile?.provider === 'opencode' && resume?.taskId) {
-        const srcRole = resume.role ?? args.role!;
+        const srcRole = forkSourceRole(resume, args.role!);
         const raw = (await store.kvGet(`sessionmeta:${resume.taskId}:${srcRole}`));
         if (raw) {
           try {
@@ -2179,7 +2180,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // provider histories, uploads, and public shares go through panagent; API rails
       // and unsupported native targets receive a guarded context message instead.
       if (!session && spec?.resumeFrom) {
-        const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
+        const srcRole = forkSourceRole(spec.resumeFrom, args.role); // a task has many agents; pick the source's
         // A task fork reads the source's conversation, native session and world.
         // The API authorizes the pointer when it is set, but a pointer can
         // outlive that check (an old template's spawned run, a task created
@@ -2476,6 +2477,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : forkOrigin.unpublished
             ? 'This independent world includes the source checkpoint’s unpublished work. Shared external services retain their configured sharing behavior.'
             : 'The source task landed. This world starts from its merge destination with the normal promoted project resources, rather than its old unpublished state.') : '';
+      // Any other forked agent — one called into this conversation, or a main
+      // agent whose world was not forked — remembers work done somewhere else.
+      const agentFork = spec?.resumeFrom && !(forkOrigin && speaker === 'do') ? spec.resumeFrom : undefined;
+      const agentForkSource = agentFork?.taskId ? (await store.getTask(agentFork.taskId)) : undefined;
+      const agentForkContext = !agentFork ? ''
+        : agentFork.taskId
+          ? `\n\nYour earlier conversation is forked from task #${agentForkSource?.num ?? agentFork.taskId}'s ${participantLabel(forkSourceRole(agentFork, args.role))}, which worked in its own world. You now work in this task's world: check the files, branches and processes you remember before relying on them.`
+          : '\n\nYour earlier conversation was imported from outside this task; that work did not happen in this world. Check the files, branches and processes it mentions before relying on them.';
       const attemptGroup = (await store.attemptSummary(args.taskId));
       const attemptContext = attemptGroup && attemptGroup.attempts > 1
         ? `\n\nThis task has ${attemptGroup.attempts} attempts. Other attempts: ${attemptGroup.otherAttempts ?? (await store.otherAttemptsDefault(args.taskId))}. `
@@ -2497,7 +2506,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         role: args.role,
         task: promptTask,
         world: args.worldHandle,
-        globalInstructions: (globalInstructions ?? '') + forkContext + attemptContext + paymentContext,
+        globalInstructions: (globalInstructions ?? '') + forkContext + agentForkContext + attemptContext + paymentContext,
         projectInstructions,
         bindings,
       });

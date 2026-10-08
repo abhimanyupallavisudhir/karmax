@@ -89,6 +89,41 @@ describe('task messages, mentions, notify and escalation (real Temporal + git, m
       .toMatchObject({ role: 'agent', author: 'do', to: ['user:b'] });
   });
 
+  it("an agent's notify calls in a new agent forked from another task's agent, which hears both conversations", async () => {
+    const p = await project('messages-notify-fork');
+    const source = await h.api.createTask(human, { projectId: p.id, workflow: 'software-dev', prompt: 'The codeword is heron.\n@write a.txt :: x' });
+    await expect.poll(async () => (await view(h.client.workflow.getHandle(source.id))).stage, { timeout: 20_000 }).toBe('review');
+    const task = await h.api.createTask(human, { projectId: p.id, workflow: 'software-dev', prompt: 'Do.\n@write b.txt :: y' });
+    const handle = h.client.workflow.getHandle(task.id);
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    const agent = (await h.tokens.mint({ taskId: task.id, profileId: 'do', role: 'do', participant: 'do', principal: 'user:a',
+      projectId: p.id, ceiling: ['*'], grantorCaps: ['*'] })).token;
+    await expect(h.api.notify(agent, { message: 'Anyone?' })).rejects.toThrow(/at least one recipient/);
+
+    const sourceNum = (await h.store.getTask(source.id))?.num;
+    const sent = await h.api.notify(agent, {
+      message: `What was the codeword?\n@heard\n@instructed forked from task #${sourceNum}'s Agent`,
+      agents: [{ provider: 'mock', resumeFrom: { taskId: source.id } }],
+    });
+    expect(sent.message).toMatchObject({ role: 'agent', author: 'do', to: ['agent:agent-1'] });
+    expect((await h.store.getTask(task.id))?.params['agent:agent-1']).toMatchObject({ provider: 'mock', resumeFrom: { taskId: source.id } });
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.author === 'agent-1'), { timeout: 20_000 }).toBe(true);
+    const reply = (await view(handle)).messages.find((m: any) => m.author === 'agent-1');
+    // Its own past (the source agent's conversation) first, then this task's
+    // conversation as it happened, the other speakers labelled.
+    expect(reply.text).toMatch(/heard: user: The codeword is heron\..* \| agent: .*\| user: .*Do\..*\| user: Agent: What was the codeword\?/);
+    expect(reply.text).toContain(`instructed: forked from task #${sourceNum}'s Agent`);
+    await expect.poll(async () => (await h.store.eventsOfType(task.id, ['session.forked'])).map((e: any) => e.payload.from), { timeout: 10_000 })
+      .toContainEqual({ taskId: source.id });
+    // It answers its caller, which wakes the main agent.
+    expect(reply).toMatchObject({ role: 'agent', to: ['agent:do'] });
+
+    // A second call resumes its own session rather than forking the source again.
+    await h.api.notify(agent, { message: 'And now?', to: ['agent:agent-1'] });
+    await expect.poll(async () => (await view(handle)).messages.filter((m: any) => m.author === 'agent-1').length, { timeout: 20_000 }).toBe(2);
+    expect(await h.store.eventsOfType(task.id, ['session.forked'])).toHaveLength(1);
+  });
+
   it("a helper agent's escalate_to_human asks people in the thread instead of holding the task", async () => {
     const p = await project('messages-helper-ask');
     const task = await h.api.createTask(human, { projectId: p.id, workflow: 'software-dev', prompt: 'Do.\n@write a.txt :: x' });
