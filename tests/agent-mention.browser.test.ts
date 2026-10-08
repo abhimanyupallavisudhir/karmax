@@ -64,6 +64,31 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
     expect(await menu.locator('.am-key').first().innerText()).toBe('[0]');
   });
   if (shots) await page.screenshot({ path: path.join(shots, 'mention-menu.png') });
+  // In a short window the expanded People list still fits on screen.
+  await page.setViewportSize({ width: 1280, height: 420 });
+  await box.fill('');
+  await box.type('@');
+  await menu.locator('.am-opt').filter({ hasText: 'People' }).dispatchEvent('mousedown');
+  await step('People stays inside the window', async () => {
+    await menu.getByText('@maintainers').waitFor();
+    const r = (await menu.boundingBox())!;
+    expect(r.y).toBeGreaterThanOrEqual(0);
+    expect(r.y + r.height).toBeLessThanOrEqual(420);
+  });
+  if (shots) await page.screenshot({ path: path.join(shots, 'mention-people.png') });
+  await step('the last person is reachable by keyboard', async () => {
+    for (let i = (await menu.locator('.am-opt').count()) - 1; i > 0; i--) await box.press('ArrowDown');
+    const active = (await menu.locator('.am-opt.active').boundingBox())!, r = (await menu.boundingBox())!;
+    expect(active.y + active.height).toBeLessThanOrEqual(r.y + r.height + 1);
+  });
+  await box.fill('');
+  await box.type('@maint');
+  await box.press('Enter');
+  await step('a group is written as its identifier', () => expect.poll(() => box.inputValue()).toBe('@maintainers '));
+  await page.setViewportSize({ width: 1280, height: 860 });
+  await box.fill('');
+  await box.type('@');
+  await menu.getByText('New agent…').waitFor();
   await box.type('+');
   await step('+ adds Agent 1 with an inline form', async () => {
     await page.locator('.followup-new-agent').filter({ hasText: 'Agent 1' }).waitFor();
@@ -96,6 +121,14 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
   expect(after.stage).toBe('review');
   expect(after.participants.map((p: any) => p.state)).toEqual(['idle', 'idle']);
   if (shots) await page.screenshot({ path: path.join(shots, 'stopped.png'), fullPage: false });
+
+  // A group typed by hand addresses its people, as picking it does.
+  await box.fill('@maintainers have a look');
+  await page.locator('.followup-box[data-role="do"] .followup-send').click();
+  await step('a typed identifier addresses that group', () => expect.poll(async () => {
+    const events = await consoleRequest(context, app!.url, 'GET', `/api/tasks/${task.id}/events?since=0&limit=300`);
+    return (events.events ?? events).map((e: any) => e.payload?.message).find((m: any) => m?.text === '@maintainers have a look')?.to;
+  }, { timeout: 15_000 }).toEqual(['@maintainers']));
   expect(errors).toEqual([]);
   await context.close();
 }, 240_000);
