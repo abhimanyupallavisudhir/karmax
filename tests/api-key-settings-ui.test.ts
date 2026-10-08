@@ -7,7 +7,7 @@ const KEY = 'key:handle:anthropic-work';
 const credential = { key: KEY, kind: 'key', provider: 'anthropic', account: 'work', label: 'anthropic:work' };
 
 /** Render the credential editor for `scope` against a scripted credentials API. */
-async function editor(scope: 'global' | 'project' | 'task', policy: Record<string, unknown>) {
+async function editor(scope: 'global' | 'project' | 'task', policy: Record<string, unknown>, explanationsEnabled = false) {
   const ui = await consolePage({ api: ({ method, path }: ApiCall) => {
     if (method === 'GET' && /^\/api\/organizations\/org\/credentials(\?|$)/.test(path)) return { credentials: [credential], [scope]: policy };
     if (method === 'GET' && path === '/api/organizations/org/accounts') return { logins: [] };
@@ -16,6 +16,7 @@ async function editor(scope: 'global' | 'project' | 'task', policy: Record<strin
   const opts = scope === 'task' ? { organizationId: 'org', projectId: 'p', taskId: 't' }
     : scope === 'project' ? { organizationId: 'org', projectId: 'p' } : { organizationId: 'org' };
   await ui.run(`S.organizationId = 'org'; window.confirm = () => true;
+    S.meta = { ...S.meta, explanationsEnabled: ${explanationsEnabled} };
     renderCredentialEditor(document.getElementById('main'), ${JSON.stringify(scope)}, ${JSON.stringify(opts)})`);
   await ui.page.locator('.cred-row').waitFor();
   const saved = () => ui.calls.filter((call) => call.method === 'POST' && call.path.includes('/credentials/policy'))
@@ -24,8 +25,15 @@ async function editor(scope: 'global' | 'project' | 'task', policy: Record<strin
 }
 
 describe('API key settings UI', () => {
+  it('offers only On and Off while explanations are turned off', async () => {
+    const { ui, row } = await editor('project', { own: { on: [KEY] }, enabled: [KEY], modes: { [KEY]: 'on' } });
+    const mode = row.getByRole('combobox', { name: 'API key availability' });
+    expect(await mode.locator('option').allTextContents()).toEqual(['On', 'Off']);
+    await ui.close();
+  });
+
   it('offers all three API-key availability modes and persists them exclusively', async () => {
-    const { ui, row, saved } = await editor('project', { own: { on: [KEY] }, enabled: [KEY], modes: { [KEY]: 'on' } });
+    const { ui, row, saved } = await editor('project', { own: { on: [KEY] }, enabled: [KEY], modes: { [KEY]: 'on' } }, true);
     const mode = row.getByRole('combobox', { name: 'API key availability' });
     expect(await mode.locator('option').allTextContents()).toEqual(['On', 'Off', 'Explainer-only']);
     expect(await mode.inputValue()).toBe('on');
