@@ -24,6 +24,8 @@ import { SDK_CONTROL_TOOL_SCHEMAS, type ToolSchema } from './tools.js';
  *   Codex app-server         `dynamicTools` + `item/tool/call`      codex.ts
  *   Codex exec ────┐
  *   ACP (OpenCode) ┴─────────  THIS BRIDGE (stdio MCP over a socket)
+ *   ACP in a cloud sandbox   the same bridge, its socket in the     remote-acp.ts
+ *                            sandbox, frames over the agent's PTY   (remoteControlBridge)
  *
  * The last two rails run the harness as a subprocess that owns its own model
  * loop; the only tool surface they accept is *stdio MCP servers they spawn

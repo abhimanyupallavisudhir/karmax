@@ -796,7 +796,7 @@ export function remoteAuthProjection(provider: Provider, relative: string, conte
       delete parsed.refreshToken;
     } else if (provider === 'opencode' && isControlPlaneAuth(provider, relative)) {
       // API-key and well-known entries carry no rotating secret.
-      for (const entry of Object.values(parsed && typeof parsed === 'object' ? parsed : {}) as any[]) {
+      for (const entry of Object.values<Record<string, unknown> | null>(parsed && typeof parsed === 'object' ? parsed : {})) {
         if (!entry || typeof entry !== 'object' || entry.type !== 'oauth') continue;
         entry.refresh = OPENCODE_REMOTE_REFRESH_SENTINEL;
         delete entry.refreshToken;

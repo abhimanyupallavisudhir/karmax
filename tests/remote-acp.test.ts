@@ -157,7 +157,7 @@ function sandboxWorld(root: string): World & { ptys: number; bootstraps: string[
         const marker = digest && fs.existsSync(digest) ? `\nKARMAX_ACP_SESSION ${fs.readFileSync(digest, 'utf8').slice(0, 64)}\n` : '';
         return { code: 0, stdout: `\nKARMAX_WORK_DIRECTORY_READY\n${marker}`, stderr: '' };
       }
-      const result = spawnSync(command, args, { cwd: opts.cwd ?? root, env: { ...process.env, ...(opts.env ?? {}) },
+      const result = spawnSync(command, args, { cwd: opts.cwd ?? root, env: { ...process.env, ...opts.env },
         input: opts.input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       return { code: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
     },
@@ -174,7 +174,7 @@ function sandboxWorld(root: string): World & { ptys: number; bootstraps: string[
     async openPty(spec = {}) {
       world.ptys++;
       const child = spawn('bash', ['-c', spec.command ?? 'bash'], { cwd: spec.cwd ?? root,
-        env: { ...process.env, ...(spec.env ?? {}) }, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+        env: { ...process.env, ...spec.env }, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
       live.add(child);
       child.stdin!.on('error', () => {});
       const exits = new Set<(code: number | null) => void>();

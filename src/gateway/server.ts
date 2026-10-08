@@ -67,7 +67,7 @@ import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
 import { WorkspaceConflict } from '../world/resources.js';
-import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, mergeModels,
+import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { RepositoryFiles } from '../store/project-environment.js';
@@ -76,7 +76,7 @@ import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
-import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
+import { apiKeyEnv, canonicalModelProvider, credentialAliases, isAgentProvider, isLoginProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
@@ -8554,9 +8554,14 @@ export class Gateway {
       })));
       return mergeModels(results);
     };
-    const [claude, codex, opencode] = await Promise.all([
-      settled('claude'), settled('codex'), settled('opencode'),
+    // OpenCode runs on a model vendor's API key, so it lists that vendor's
+    // models whether or not an `opencode` binary exists here (hosted: none).
+    const keyVendors = [...new Set(creds.filter((c) => c.kind === 'key').map((c) => canonicalModelProvider(c.provider)))]
+      .filter((vendor) => (MODEL_PROVIDERS as readonly string[]).includes(vendor));
+    const [claude, codex, opencodeLogins, opencodeKeys] = await Promise.all([
+      settled('claude'), settled('codex'), settled('opencode'), openCodeKeyModels(keyVendors).catch(() => []),
     ]);
+    const opencode = mergeModels([opencodeLogins, opencodeKeys]);
     // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
@@ -8564,11 +8569,13 @@ export class Gateway {
       // metadata to add to the stable selections, not an exhaustive allowlist.
       claude: claudeModelCatalog(claude),
       codex: codexModelCatalog(codex),
+      // With no OpenCode credential at all, a few real models show what a key
+      // would unlock; a task on one waits for that key (Credentials).
       opencode: opencode.length ? opencode : [
         { id: 'kimi/kimi-for-coding' },
         { id: 'kimi/k3', effort: ['low', 'high', 'max'] },
-        { id: 'google/gemini-3.6-pro' },
-        { id: 'xai/grok-4.5' },
+        { id: 'anthropic/claude-sonnet-5' },
+        { id: 'openrouter/anthropic/claude-sonnet-5' },
       ],
       // Retained only for stored-profile/backward-compatible typing. The native
       // Kimi harness is disabled until its ACP server supports session/fork.

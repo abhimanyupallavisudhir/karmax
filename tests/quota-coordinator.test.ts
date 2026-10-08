@@ -252,6 +252,19 @@ describe('account coordinator — quota engine', () => {
   // Every allowed credential needing a person used to DENY the turn, which
   // escalated the task with an error. A credential wall is a wait like quota:
   // the request parks and is granted the moment a credential recovers.
+  // Task #515: no credential of the model's vendor at all is something to
+  // add, not something that "needs attention".
+  it('names the missing vendor when no allowed credential exists', async () => {
+    const coord = await startCoord([A({ id: 'A' })]);
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', provider: 'google', allowed: ['key:handle:google:removed'] });
+    await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 }).toEqual({
+      waiting: true, detail: 'No Google credential — add one in Credentials',
+    });
+    expect(await grants(g.id)).toEqual([]);
+    await coord.terminate('done');
+  });
+
   it('parks a request whose only allowed credential needs attention, then grants it on recovery', async () => {
     const coord = await startCoord([A({ id: 'A' })]);
     await coord.signal('setAccountAvailability', { accountId: 'A', status: 'needs-attention' });

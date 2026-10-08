@@ -50,6 +50,16 @@ import {
  * that PRODUCES a reset instant lives in the reporting activity (SPEC §3.1).
  */
 export type AccountProvider = string;
+
+const CREDENTIAL_LABELS: Record<string, string> = {
+  claude: 'Claude', anthropic: 'Anthropic', codex: 'Codex', openai: 'OpenAI', opencode: 'OpenCode', google: 'Google',
+  openrouter: 'OpenRouter', xai: 'xAI', grok: 'xAI', kimi: 'Kimi', moonshotai: 'Moonshot', groq: 'Groq',
+  mistral: 'Mistral', deepseek: 'DeepSeek',
+};
+/** The vendor a person recognises, for a credential-pool provider id. */
+export function credentialLabel(provider: AccountProvider | undefined): string {
+  return (provider && CREDENTIAL_LABELS[provider]) || 'usable';
+}
 /** available → leasable; exhausted → auto-refreshes at resetAt; manual-off → user
  *  turned it off; needs-attention → a HARD failure (billing/auth) that needs a human. */
 export type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';
@@ -484,6 +494,10 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       return { waiting: true, detail: 'Couldn\'t read this task\'s credential policy — Retry reads it again' };
     const compatible = accounts.filter((a) => req.allowed !== undefined
       ? req.allowed.includes(a.id) : a.provider === req.provider);
+    // Nothing to fix, only something to add (task #515: an OpenCode model of a
+    // vendor the organization held no key for read "needs attention" forever).
+    if (!compatible.length)
+      return { waiting: true, detail: `No ${credentialLabel(req.provider)} credential — add one in Credentials` };
     if (compatible.some((a) => a.status === 'available'))
       return { waiting: true, detail: 'Waiting for a free slot on an allowed account' };
     const resets = compatible.filter((a) => a.status === 'exhausted' && a.resetAt != null)
