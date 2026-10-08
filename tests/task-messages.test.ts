@@ -51,7 +51,10 @@ describe('task messages, mentions, notify and escalation (real Temporal + git, m
     // this task, and a mention never displaces that stronger ask.
     await expect.poll(async () => (await h.store.eventsOfType(task.id, ['task.mentioned'])).map((e: any) => e.payload.recipients), { timeout: 10_000 })
       .toContainEqual(['user:a']);
-    expect(await inbox('a', task.id)).toEqual([{ kind: 'review-requested', actionable: true }]);
+    // While agent-1 ran, the task was not waiting on a person, so its review ask
+    // was withdrawn and the mention may be recorded in that window; the review
+    // ask raised again when the task waits on a person replaces it.
+    await expect.poll(() => inbox('a', task.id), { timeout: 10_000 }).toEqual([{ kind: 'review-requested', actionable: true }]);
   });
 
   it('mentions people without waking the agent, and answering a mention discharges it', async () => {

@@ -388,7 +388,7 @@ export class ProjectResourceService {
       const server = http.createServer((req, res) => {
         const url = new URL(req.url ?? '/', 'http://localhost');
         if (!url.pathname.startsWith(REPOSITORY_ROUTE)) { res.writeHead(404).end(); return; }
-        void this.repositoryServer.handle(req, res, url.pathname.slice(REPOSITORY_ROUTE.length) + url.search);
+        void this.repositoryServer.handle(req, res, url.pathname.slice(REPOSITORY_ROUTE.length) + url.search, { unmetered: true });
       });
       server.on('error', reject);
       server.listen(0, '127.0.0.1', () => { server.unref(); resolve(`http://127.0.0.1:${(server.address() as AddressInfo).port}`); });

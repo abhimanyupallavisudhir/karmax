@@ -398,7 +398,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     options: ResticRunOptions & { cwd?: string; prefix?: string; suffix?: string }): Promise<ResticRun> {
     const base = this.deps.endpoints.world(world.handle);
     if (!base) throw new Error('this world cannot reach the resource store (no public URL is configured)');
-    const binary = await this.worldBinary(world, base);
+    const binary = await this.worldBinary(world, base, attachment);
     const command = `set -e\n${options.prefix ? `${options.prefix}\n` : ''}${options.cwd ? `cd -- ${quote(options.cwd)}\n` : ''}`
       + `${quote(binary)} ${args.map(quote).join(' ')}${options.suffix ?? ''}`;
     const recordKey = `restic-job:${world.handle.id}:${options.key}`;
@@ -445,8 +445,9 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     }
   }
 
-  /** restic in a remote world: fetched once from this server and checked against its pinned digest. */
-  private async worldBinary(world: World, base: string): Promise<string> {
+  /** restic in a remote world: fetched once from this server, with a grant for
+   * the repository it is fetched to use, and checked against its pinned digest. */
+  private async worldBinary(world: World, base: string, repository: Repository): Promise<string> {
     const relative = `${BIN_DIR}/restic-${RESTIC_VERSION}`;
     const absolute = path.posix.join(world.handle.root, relative);
     // Finished platform jobs are kept a day (another waiter may still read one).
@@ -458,13 +459,15 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     if (!binary) throw new Error(`restic is not available for this world (${probe.stdout.trim() || probe.stderr.trim() || 'unknown architecture'})`);
     await ensureWorldExcluded(world, '.karmax-injection').catch(() => undefined);
     const url = `${base.replace(/\/+$/, '')}${REPOSITORY_ROUTE}restic/${RESTIC_VERSION}/linux-${arch}`;
+    const token = await this.deps.tokens.mint({ repository: repository.name, access: 'read', quota: false, expiresAt: Date.now() + 10 * 60_000 });
+    const authorization = `authorization: Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`;
     const fetched = await world.exec('bash', ['-c', `set -e; mkdir -p ${BIN_DIR}; t=${BIN_DIR}/.restic-$$
-if command -v curl >/dev/null; then curl -fsSL --retry 3 "$1" -o "$t"
-elif command -v wget >/dev/null; then wget -q -O "$t" "$1"
-else node -e 'fetch(process.argv[1]).then(async r=>{if(!r.ok)throw new Error(r.status);require("fs").writeFileSync(process.argv[2],Buffer.from(await r.arrayBuffer()))})' "$1" "$t"; fi
+if command -v curl >/dev/null; then curl -fsSL --retry 3 -H "$3" "$1" -o "$t"
+elif command -v wget >/dev/null; then wget -q --header="$3" -O "$t" "$1"
+else node -e 'const [u,f,h]=process.argv.slice(1);fetch(u,{headers:{authorization:h.slice(h.indexOf(":")+1).trim()}}).then(async r=>{if(!r.ok)throw new Error(r.status);require("fs").writeFileSync(f,Buffer.from(await r.arrayBuffer()))})' "$1" "$t" "$3"; fi
 got=$(sha256sum "$t" 2>/dev/null | cut -d' ' -f1 || node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' "$t")
 [ "$got" = "$2" ] || { rm -f "$t"; echo "restic download does not match its digest" >&2; exit 1; }
-chmod +x "$t"; mv -f "$t" ${quote(relative)}`, 'restic-fetch', url, binary.sha256], { cwd: world.handle.root, timeoutMs: 5 * 60_000 });
+chmod +x "$t"; mv -f "$t" ${quote(relative)}`, 'restic-fetch', url, binary.sha256, authorization], { cwd: world.handle.root, timeoutMs: 5 * 60_000 });
     if (fetched.code !== 0) throw new Error(`could not install restic in the world: ${(fetched.stderr || fetched.stdout).trim().slice(0, 300)}`);
     return absolute;
   }

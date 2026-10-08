@@ -235,6 +235,10 @@ services:
       KARMAX_LEGACY_WWW_DOMAIN: ${KARMAX_LEGACY_WWW_DOMAIN:-http://127.0.0.1:65534}
     # Host ingress preserves IPv6 peers instead of Docker userland-proxy NAT.
     network_mode: host
+    # Its admin API is off, so a changed Caddyfile applies when Caddy is
+    # recreated, which a changed digest makes `up` do (deploy/karmax sets it).
+    labels:
+      karmax.caddyfile-sha256: ${KARMAX_CADDYFILE_SHA256:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
