@@ -6,9 +6,19 @@ name: Rehearse upgrade
 # GitHub's hosted runners, which have the Docker a task world lacks. Nothing
 # reaches production or spends credit: the stack is its own Compose project
 # with the mock agent and a local E2B stand-in. Dispatch it with `to` set to
-# the branch to upgrade to; the summary is the run's job summary, and the
-# summary, the full output and every step's logs are the `rehearsal` artifact.
+# the branch to upgrade to (GitHub dispatches only workflows on the default
+# branch); a push to a task branch that changes the data epoch or the
+# rehearsal itself rehearses that branch from master on its own. The summary
+# is the run's job summary, and the summary, the full output and every step's
+# logs are the `rehearsal` artifact.
 on:
+  push:
+    branches: ['tavya/**']
+    paths:
+      - deploy/data-epoch
+      - scripts/rehearse-upgrade.sh
+      - scripts/rehearsal/**
+      - .github/workflows/rehearse.yml
   workflow_dispatch:
     inputs:
       from:
@@ -22,25 +32,29 @@ on:
 permissions:
   contents: read
 
+# A push carries no inputs: it rehearses master → the pushed branch.
+env:
+  FROM: ${{ github.event.inputs.from || 'master' }}
+  TO: ${{ github.event.inputs.to || github.ref_name }}
+
 concurrency:
-  group: rehearse-${{ github.event.inputs.to }}
-  cancel-in-progress: false
+  group: rehearse-${{ github.event.inputs.to || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   rehearse:
-    name: rehearse ${{ github.event.inputs.from }} → ${{ github.event.inputs.to }}
+    name: rehearse ${{ github.event.inputs.from || 'master' }} → ${{ github.event.inputs.to || github.ref_name }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # TO's own harness: a release's new rehearsal checks run on it.
+          ref: ${{ github.event.inputs.to || github.ref }}
           # The harness pushes both revisions into a scratch origin and may
           # deploy a merge of them, so it needs their history.
           fetch-depth: 0
       - name: Fetch the two branches
-        env:
-          FROM: ${{ github.event.inputs.from }}
-          TO: ${{ github.event.inputs.to }}
         run: git fetch --no-tags origin "+refs/heads/$FROM:refs/remotes/origin/$FROM" "+refs/heads/$TO:refs/remotes/origin/$TO"
       - name: Free disk space
         # The rehearsal builds two app images and runs a whole stack (~10 GB).
@@ -48,9 +62,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
       - name: Rehearse
-        env:
-          FROM: ${{ github.event.inputs.from }}
-          TO: ${{ github.event.inputs.to }}
         run: |
           set -o pipefail
           scripts/rehearse-upgrade.sh --from "origin/$FROM" --to "origin/$TO" --work "$RUNNER_TEMP/rehearsal" \
