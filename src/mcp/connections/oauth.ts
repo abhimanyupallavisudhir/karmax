@@ -5,7 +5,7 @@ import type { McpConnection } from './store.js';
 
 /** Credential storage for an OAuth-authorized remote MCP server: project/organization
  * Tools connections and personal app connections share the same OAuth flow. */
-export interface OAuthVault { secret(c: OAuthTarget, taskId?: string): any; setSecret(c: OAuthTarget, value: unknown): Promise<void> }
+export interface OAuthVault { secret(c: OAuthTarget, taskId?: string): Promise<any>; setSecret(c: OAuthTarget, value: unknown): Promise<void> }
 export type OAuthTarget = Pick<McpConnection, 'id' | 'organizationId' | 'label' | 'auth' | 'transport' | 'revision'>;
 
 export const MCP_CLIENT_METADATA_PATH = '/api/mcp-client-metadata';
@@ -54,7 +54,7 @@ function provider(service: OAuthVault, connection: OAuthTarget, data: any, redir
 export async function beginOAuth(service: OAuthVault, c: OAuthTarget, actor: string, redirect: string) {
   if (c.auth !== 'oauth' || c.transport.type === 'stdio') throw new Error('This connection does not use OAuth');
   return exclusive(`${c.organizationId}:${c.id}`, async () => {
-    const data = service.secret(c);
+    const data = await service.secret(c);
     // Dynamic registration is tied to its redirect URI. Do not reuse it after
     // the installation's public origin changes.
     if (data.redirect && data.redirect !== redirect) { delete data.client; delete data.discovery; }
@@ -72,7 +72,7 @@ export async function beginOAuth(service: OAuthVault, c: OAuthTarget, actor: str
 }
 export async function finishOAuth(service: OAuthVault, c: OAuthTarget, actor: string, state: string, code: string) {
   return exclusive(`${c.organizationId}:${c.id}`, async () => {
-    const data = service.secret(c);
+    const data = await service.secret(c);
     const pending = data.pending;
     if (!pending || pending.actor !== actor || pending.revision !== c.revision || pending.expires < Date.now()
       || typeof state !== 'string' || !/^[a-f0-9]{64}$/.test(state) || !crypto.timingSafeEqual(Buffer.from(state), Buffer.from(pending.state))) throw new Error('Authorization expired or belongs to another session. Connect again.');
@@ -89,7 +89,7 @@ export async function connectionHeaders(service: OAuthVault, c: OAuthTarget, tas
   if (c.auth === 'none') return {};
   if (c.auth === 'secrets') return service.secret(c, taskId);
   return exclusive(`${c.organizationId}:${c.id}`, async () => {
-    const data = service.secret(c, taskId);
+    const data = await service.secret(c, taskId);
     if (!data.tokens?.access_token) throw new Error(`Connect “${c.label}” in MCP settings before running this task`);
     if (data.expiresAt < Date.now() + 60_000) {
       await authorize(provider(service, c, data, data.redirect, () => { throw new Error(`Reconnect “${c.label}” in MCP settings`); }),

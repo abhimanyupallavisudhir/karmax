@@ -463,8 +463,8 @@ it('refuses a release that cannot replay a running workflow, leaving production 
   const calls = h.calls().map(args => args.join(' '));
   const check = calls.findIndex(call => call.includes('replay-check'));
   expect(calls.some(call => call.includes('pg_dump') || call.includes('up -d'))).toBe(false);
-  // The Compose tag points at the running code again for the next restart.
-  expect(calls.slice(check + 1).some(call => call.endsWith(' build app'))).toBe(true);
+  // The Compose tags (app and PostgreSQL) point at the running code again for the next restart.
+  expect(calls.slice(check + 1).some(call => call.endsWith(' build app postgresql'))).toBe(true);
 });
 
 // The two gates in the real updater: replay check before the backup, vault
@@ -534,4 +534,82 @@ it('restores a backup without its vault key using the live key, or the one suppl
   // The supplied key is what the verification checked, before anything stopped.
   const calls = h.calls().map(args => args.join(' '));
   expect(calls.findIndex(call => call.includes('--check-vault-key'))).toBeLessThan(calls.findIndex(call => call.endsWith(' down')));
+});
+
+// Off-host PostgreSQL backups (deploy/postgres/pg-backup.sh, wiki ops/production-tavya).
+const PUBLIC_KEY = '-----BEGIN PGP PUBLIC KEY BLOCK-----\nfixture\n-----END PGP PUBLIC KEY BLOCK-----\n';
+const PRIVATE_KEY = '-----BEGIN PGP PRIVATE KEY BLOCK-----\nfixture\n-----END PGP PRIVATE KEY BLOCK-----\n';
+const BUCKET_KEY = { KARMAX_PG_BACKUP_ACCESS_KEY_ID: 'backup-id', KARMAX_PG_BACKUP_SECRET_ACCESS_KEY: 'backup-secret' };
+
+it('doctor says backups are off until configured, then fails while they are not current', () => {
+  const h = deployment();
+  const off = h.run(['doctor'], '', '', { FAKE_SESSIONS: 'karmax|f\n' });
+  expect(off.status, off.stderr).toBe(0);
+  expect(off.stdout).toContain('Off-host PostgreSQL backups are off');
+  expect(h.calls().some(args => args.includes('pg-backup'))).toBe(false);
+  fs.appendFileSync(path.join(h.deploy, '.turnkey.env'), 'KARMAX_PG_BACKUP_PREFIX=s3://tavya-db-backups/tavya.io\n');
+  const current = h.run(['doctor'], '', '', { FAKE_SESSIONS: 'karmax|f\n' });
+  expect(current.status, current.stderr).toBe(0);
+  expect(h.calls().some(args => args.join(' ').includes('exec -T pg-backup karmax-pg-backup status'))).toBe(true);
+  const stale = h.run(['doctor'], 'karmax-pg-backup status', '', { FAKE_SESSIONS: 'karmax|f\n' });
+  expect(stale.status).not.toBe(0);
+  expect(stale.stderr).toContain('off-host PostgreSQL backups are not current');
+});
+
+it('configure-backups writes the bucket key and public key, never a private key, and restarts PostgreSQL', () => {
+  const h = deployment();
+  const key = path.join(h.root, 'backup.asc');
+  fs.writeFileSync(key, PRIVATE_KEY);
+  const args = ['configure-backups', 's3://tavya-db-backups/tavya.io', 'https://acct.eu.r2.cloudflarestorage.com', key];
+  const leaked = h.run(args, '', '', BUCKET_KEY);
+  expect(leaked.status).not.toBe(0);
+  expect(leaked.stderr).toMatch(/not an armored OpenPGP public key|holds a private key/);
+  fs.writeFileSync(key, PUBLIC_KEY);
+  expect(h.run(args, '', '', {}).stderr).toContain('KARMAX_PG_BACKUP_ACCESS_KEY_ID');
+  expect(h.run(['configure-backups', 's3://Bad Bucket', 'https://x', key], '', '', BUCKET_KEY).stderr).toContain('prefix');
+  expect(h.calls().some(args => args.includes('up'))).toBe(false);
+
+  const ok = h.run(args, '', '', BUCKET_KEY);
+  expect(ok.status, ok.stderr).toBe(0);
+  const secret = (name: string) => fs.readFileSync(path.join(h.deploy, '.secrets', name), 'utf8');
+  expect(secret('pg_backup_access_key_id')).toBe('backup-id\n');
+  expect(secret('pg_backup_secret_access_key')).toBe('backup-secret\n');
+  expect(secret('pg_backup_public_key')).toBe(PUBLIC_KEY);
+  const env = fs.readFileSync(path.join(h.deploy, '.turnkey.env'), 'utf8');
+  expect(env).toContain('KARMAX_PG_BACKUP_PREFIX=s3://tavya-db-backups/tavya.io\n');
+  expect(env).toContain('KARMAX_PG_BACKUP_ENDPOINT=https://acct.eu.r2.cloudflarestorage.com\n');
+  expect(env).toContain('KEEP_SETTING=retained');
+  expect(h.calls().some(args => args.join(' ').endsWith('up -d --remove-orphans'))).toBe(true);
+  // Never on a command line, where any user on the host could read it.
+  expect(h.calls().flat().join(' ')).not.toContain('backup-secret');
+  // Reconfiguring replaces the settings instead of repeating them.
+  h.run(['configure-backups', 's3://tavya-db-backups/other', 'https://acct.eu.r2.cloudflarestorage.com', key], '', '', BUCKET_KEY);
+  const again = fs.readFileSync(path.join(h.deploy, '.turnkey.env'), 'utf8');
+  expect(again.match(/KARMAX_PG_BACKUP_PREFIX=/g)).toHaveLength(1);
+  expect(again).toContain('KARMAX_PG_BACKUP_PREFIX=s3://tavya-db-backups/other\n');
+});
+
+it('pg-restore restores into a scratch volume with the off-host private key, and removes both afterwards', () => {
+  const h = deployment();
+  const key = path.join(h.root, 'backup.asc');
+  fs.writeFileSync(key, PUBLIC_KEY);
+  expect(h.run(['pg-restore', '--private-key', key]).stderr).toContain('not configured');
+  fs.appendFileSync(path.join(h.deploy, '.turnkey.env'), 'KARMAX_PG_BACKUP_PREFIX=s3://tavya-db-backups/tavya.io\n');
+  expect(h.run(['pg-restore', '--private-key', key]).stderr).toContain('not an armored OpenPGP private key');
+  fs.writeFileSync(key, PRIVATE_KEY);
+  const ok = h.run(['pg-restore', '--private-key', key, '--to', '2026-10-08 12:00:00+00']);
+  expect(ok.status, ok.stderr).toBe(0);
+  const calls = h.calls().map(args => args.join(' '));
+  const volume = calls.find(call => call.startsWith('volume create '))!.split(' ').at(-1)!;
+  expect(volume).toMatch(/^karmax-pitr-\d{8}T\d{6}Z$/);
+  const restore = calls.find(call => call.includes('karmax-pg-backup restore'))!;
+  expect(restore).toContain(`run --rm --no-deps -T --user root -v ${volume}:/restore`);
+  expect(restore).toContain('TARGET=2026-10-08 12:00:00+00');
+  expect(restore).toContain('KARMAX_PG_BACKUP_PRIVATE_KEY=/run/pitr/private.asc');
+  expect(calls.at(-1)).toBe(`volume rm -f ${volume}`);
+  // The staged copy of the private key is gone.
+  const staged = restore.match(/-v (\S+):\/run\/pitr\/private\.asc:ro/)![1]!;
+  expect(fs.existsSync(staged)).toBe(false);
+  const kept = h.run(['pg-restore', '--private-key', key, '--keep']);
+  expect(kept.stdout).toMatch(/Kept the restored data directory in volume karmax-pitr-/);
 });

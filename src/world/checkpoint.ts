@@ -498,9 +498,9 @@ export class WorldCheckpointService {
   }
 
   private async key(): Promise<Buffer> {
-    if (!this.broker.hasHandle(CHECKPOINT_KEY_HANDLE))
+    if (!await this.broker.hasHandle(CHECKPOINT_KEY_HANDLE))
       await this.broker.ensureHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'), INSTALLATION_SCOPE);
-    return Buffer.from(this.broker.resolve(CHECKPOINT_KEY_HANDLE, { caps: [`use-credential:${CHECKPOINT_KEY_HANDLE}`] }), 'base64');
+    return Buffer.from(await this.broker.resolve(CHECKPOINT_KEY_HANDLE, { caps: [`use-credential:${CHECKPOINT_KEY_HANDLE}`] }), 'base64');
   }
 
   private async decrypt(blob: Buffer): Promise<Buffer> {

@@ -399,7 +399,7 @@ export class VaultItems {
   /** Internal: read a stored secret WITHOUT the capability/policy gate — for
    *  trusted host-side machinery only (connector write-back, passkey load).
    *  Never expose the result to an agent; the gated path is `resolveField`. */
-  readSecret(item: VaultItem, field: VaultFieldName): string | undefined {
+  async readSecret(item: VaultItem, field: VaultFieldName): Promise<string | undefined> {
     if (!item.fields.includes(field)) return undefined;
     return this.requireBroker().resolve(itemHandle(item.id, field), { taskId: item.provenance.taskId, caps: [`use-credential:item:${item.id}:${field}`, `use-credential:*`] });
   }
@@ -719,7 +719,7 @@ export class VaultItems {
     if (!item.fields.includes(field)) throw new Error(`item "${item.label}" has no ${field}`);
     const handle = itemHandle(item.id, field);
     // Resolved (and audited by the broker) once, outside the re-runnable transaction.
-    const secret = this.requireBroker().resolve(handle, { taskId: ctx.taskId, caps: [`use-credential:${handle}`] });
+    const secret = await this.requireBroker().resolve(handle, { taskId: ctx.taskId, caps: [`use-credential:${handle}`] });
     return this.store.transaction(async () => {
     // Read fresh usage: callers may reuse an item across several fields. An item
     // without its own usage key yet reads the index, which also migrates legacy

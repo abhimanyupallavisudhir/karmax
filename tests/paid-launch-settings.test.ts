@@ -118,8 +118,8 @@ describe('installation paid-launch settings', () => {
     expect(result.tasks).toHaveLength(FOUNDER_TASKS.length);
     expect((await store.kvGet(PAID_LAUNCH_SETTINGS_KEY))).not.toContain('sk_live_billing');
     expect((await store.kvGet(PAID_LAUNCH_SETTINGS_KEY))).not.toContain('whsec_billing');
-    expect(broker.hasHandle(SUBSCRIPTION_STRIPE_SECRET_HANDLE)).toBe(true);
-    expect(broker.hasHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE)).toBe(true);
+    expect(await broker.hasHandle(SUBSCRIPTION_STRIPE_SECRET_HANDLE)).toBe(true);
+    expect(await broker.hasHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE)).toBe(true);
     expect((await service.publicLaunchInfo())).toMatchObject({ paidLaunch: true, ready: true,
       operator: { name: 'Krmax Labs Ltd', country: 'United Kingdom' } });
     expect((await service.stored()).founderReviewedPolicyVersion).toBe(POLICY_VERSION);

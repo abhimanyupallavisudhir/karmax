@@ -39,7 +39,7 @@ export async function retryCredentials(
   options: { includeExhausted?: boolean } = {},
 ): Promise<void> {
   const organizationId = (await deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
-  const all = enumerateCredentials(gatherCredentialSources({ ...deps, organizationId }));
+  const all = enumerateCredentials(await gatherCredentialSources({ ...deps, organizationId }));
   const layers = (await readPolicyLayers(async (key) => (await deps.store.kvGet(key)), {
     organizationId, projectId: task.projectId, taskId: task.id,
   }));
@@ -69,7 +69,7 @@ export async function refreshCredentialHealth(
   options: { organizationId?: string; only?: string; provider?: string } = {},
 ): Promise<Record<string, UsageResult>> {
   const organizationId = options.organizationId ?? 'org_personal';
-  const credentials = enumerateCredentials(gatherCredentialSources({
+  const credentials = enumerateCredentials(await gatherCredentialSources({
     configHomes: deps.configHomes,
     broker: deps.broker,
     organizationId,

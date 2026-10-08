@@ -2,6 +2,8 @@ import { Pool } from 'pg';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { BudgetService, MockPaymentProvider } from '../src/autonomy/payments.js';
 import { DurableEventFanout } from '../src/gateway/fanout.js';
+import { DatabaseVault } from '../src/autonomy/vault-database.js';
+import { LocalKek, organizationScope } from '../src/autonomy/vault-keys.js';
 import { Store } from '../src/store/db.js';
 import { noteExternalEffect } from '../src/store/sql.js';
 import { storeMetricsSnapshot } from '../src/store/transaction-metrics.js';
@@ -236,6 +238,37 @@ describe.skipIf(!url).each([
     expect(seen).toEqual(['test.early', 'test.late']);
   });
 
+  it('pages the audit log past an entry that commits after a later one, exactly once', async () => {
+    const [a, b] = await pair();
+    let cursor = (await b.auditRecent(1)).at(-1)?.seq ?? 0;
+    const seen: string[] = [];
+    const poll = async () => {
+      for (const entry of await b.auditSince(cursor)) {
+        if (String(entry.action).startsWith('test.')) seen.push(entry.action);
+        cursor = entry.seq;
+      }
+    };
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let appended!: () => void;
+    const inserted = new Promise<void>(resolve => { appended = resolve; });
+    const early = a.transaction(async () => {
+      await a.appendAudit({ principalId: 'system:test', action: 'test.early' });
+      appended();
+      await held;
+    });
+    await inserted;
+    const late = b.appendAudit({ principalId: 'system:test', action: 'test.late' });
+    await Promise.race([late, new Promise(resolve => setTimeout(resolve, 300))]);
+    await poll();
+    expect(seen).toEqual([]);
+    release();
+    await Promise.all([early, late]);
+    await poll();
+    await poll();
+    expect(seen).toEqual(['test.early', 'test.late']);
+  });
+
   it('delivers an event that commits after a later one to live subscribers', async () => {
     const [a, b] = await pair();
     const project = await a.createProject('Events');
@@ -303,6 +336,42 @@ describe.skipIf(!url)('deadlocks between concurrent PostgreSQL transactions', ()
     const after = storeMetricsSnapshot();
     expect(after.failures.deadlock).toBeGreaterThan(before.failures.deadlock);
     expect(after.retries.retried).toBeGreaterThan(before.retries.retried);
+  });
+
+  it('never deadlocks a vault write against rotating or shredding its scope, nor writes under a retired key', async () => {
+    const [a, b] = await pair();
+    const kek = { current: LocalKek.fromText('store-concurrency-vault-key-material-01'), others: [] };
+    const one = await DatabaseVault.open(a.db, { kek });
+    const two = await DatabaseVault.open(b.db, { kek });
+    const scope = organizationScope('org_race');
+    const handles = new Set<string>();
+    // Each surviving entry must open with its scope's current keyring: a write
+    // under a retired (rotated or shredded) data key would not.
+    const assertReadable = async () => {
+      for (const handle of handles) if (await one.has(handle)) expect(await two.reveal(handle)).toMatch(/^v/);
+    };
+    await one.put('seed', 'v0', scope); handles.add('seed');
+    for (let round = 0; round < 6; round++) {
+      handles.add(`rotate-${round}`);
+      const results = await Promise.allSettled([one.put(`rotate-${round}`, `v${round}`, scope), two.rotateDataKey(scope)]);
+      expect(results.map(result => result.status)).toEqual(['fulfilled', 'fulfilled']);
+      await assertReadable();
+    }
+    // Organization deletion shreds the scope while a vault write runs inside a
+    // caller's transaction holding the organization's vault lock (as VaultItems does).
+    for (let round = 0; round < 6; round++) {
+      handles.add(`late-${round}`);
+      const results = await Promise.allSettled([
+        b.transaction(async () => { await b.lock('vault:org_race'); await two.put(`late-${round}`, `v${round}`, scope); }),
+        one.destroyScope(scope),
+      ]);
+      expect(results.map(result => result.status)).toEqual(['fulfilled', 'fulfilled']);
+      const ring = await a.db.prepare('SELECT 1 AS present FROM vault_keyrings WHERE scope=?').get(scope);
+      const entries = Number(((await a.db.prepare('SELECT COUNT(*) AS n FROM vault_entries WHERE scope=?').get(scope)) as { n: number }).n);
+      // Shredded last: nothing left. Written last: a new keyring holds what was written.
+      expect(entries === 0 || !!ring).toBe(true);
+      await assertReadable();
+    }
   });
 
   it('reports the deadlock instead of re-running an attempt that wrote outside the database', async () => {

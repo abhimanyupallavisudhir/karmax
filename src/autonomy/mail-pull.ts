@@ -33,7 +33,7 @@ export interface PullDeps {
   /** Organization whose provider account is being polled. */
   organizationId?: string;
   /** Resolve a vault handle to its secret (IMAP password / AgentMail key). */
-  resolveSecret(handle: string): string | undefined;
+  resolveSecret(handle: string): string | undefined | Promise<string | undefined>;
   /** Inject a fetched message into the per-org inbox (routes by recipient). */
   ingest(msg: PulledMessage): { delivered: boolean } | Promise<{ delivered: boolean }>;
   /** Override the network clients in tests. */
@@ -66,7 +66,7 @@ export class ImapPuller implements Puller {
     const imap = this.config.imap;
     const passHandle = this.config.apiKeyHandle;
     if (!passHandle) return 0;
-    const pass = this.deps.resolveSecret(passHandle);
+    const pass = await this.deps.resolveSecret(passHandle);
     if (!imap || !pass) return 0;
     const open = this.deps.openImap ?? defaultOpenImap;
     let host = imap.host;
@@ -213,11 +213,11 @@ async function readMailResponse(response: Response): Promise<any> {
 
 export class AgentMailPuller implements Puller {
   constructor(private config: MailboxConfig, private deps: PullDeps) {}
-  private key(): string | undefined {
+  private async key(): Promise<string | undefined> {
     return this.config.apiKeyHandle ? this.deps.resolveSecret(this.config.apiKeyHandle) : undefined;
   }
   private async api(path: string, init: RequestInit = {}): Promise<any> {
-    const key = this.key();
+    const key = await this.key();
     const doFetch = this.deps.fetchFn ?? fetch;
     const res = await doFetch(`${AGENTMAIL_BASE}${path}`, {
       ...init, signal: AbortSignal.timeout(15_000),
@@ -236,7 +236,7 @@ export class AgentMailPuller implements Puller {
 
   async poll(): Promise<number> {
     const address = this.config.agentmailAddress;
-    if (!this.key() || !address) return 0;
+    if (!await this.key() || !address) return 0;
     let delivered = 0;
     const cursor = (await this.deps.store.kvGet(amCursorKey(address)));
     const list = await this.api(`/inboxes/${encodeURIComponent(address)}/messages?limit=50&ascending=true${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`);
@@ -282,7 +282,7 @@ export class MailPoller {
   constructor(
     private deps: {
       readConfigs(): { organizationId: string; config: MailboxConfig }[] | Promise<{ organizationId: string; config: MailboxConfig }[]>;
-      resolveSecret(handle: string): string | undefined;
+      resolveSecret(handle: string): string | undefined | Promise<string | undefined>;
       store: PullStore;
       makeIngest(organizationId: string, config: MailboxConfig): (msg: PulledMessage) => { delivered: boolean } | Promise<{ delivered: boolean }>;
     },

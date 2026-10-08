@@ -8,6 +8,8 @@ import pg from 'pg';
 import { expect, it } from 'vitest';
 import { startDevServer } from '../src/temporal/dev-server.js';
 import { findFreePort } from '../src/util/ports.js';
+import { MOVED_TO_DATABASE, RETIRED_VAULT, Vault } from '../src/autonomy/vault.js';
+import { LocalKek, organizationScope } from '../src/autonomy/vault-keys.js';
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 const postgres = process.env.KARMAX_TEST_POSTGRES_URL;
@@ -49,6 +51,13 @@ test('boots src/main.ts as a hosted cell on PostgreSQL and Temporal without a su
       fs.writeFileSync(path.join(secrets, name), `${value}\n`);
       return path.join(secrets, name);
     };
+    // The vault as the epoch 4 release leaves it on the volume; the first boot moves it into PostgreSQL.
+    const vaultKey = crypto.randomBytes(48).toString('hex');
+    const vaultDir = path.join(home, 'data', 'vault');
+    const fileVault = new Vault(vaultDir, { kek: { current: LocalKek.fromText(vaultKey), others: [] } });
+    for (const value of ['e2b-key-1', 'e2b-key-2']) await fileVault.put('world-provider:org_personal:e2b:api-key', value, organizationScope('org_personal'));
+    const entryFile = fs.readdirSync(path.join(vaultDir, 'entries')).find((name) => name.endsWith('.json'))!;
+    const fileEntry = JSON.parse(fs.readFileSync(path.join(vaultDir, 'entries', entryFile), 'utf8'));
     server = await startDevServer({ headless: true, logLevel: 'never' });
     const port = await findFreePort();
     const base = `http://127.0.0.1:${port}`;
@@ -58,7 +67,7 @@ test('boots src/main.ts as a hosted cell on PostgreSQL and Temporal without a su
       KARMAX_PUBLIC_URL: 'https://karmax.example.test', KARMAX_PREVIEW_ORIGIN: 'https://preview.karmax.example.test',
       KARMAX_HOST: '127.0.0.1', KARMAX_PORT: String(port), KARMAX_WORKER_MODE: 'process',
       KARMAX_AUTH_SECRET_FILE: secret('auth_secret', crypto.randomBytes(48).toString('hex')),
-      KARMAX_VAULT_KEY_FILE: secret('vault_key', crypto.randomBytes(48).toString('hex')),
+      KARMAX_VAULT_KEY_FILE: secret('vault_key', vaultKey),
       KARMAX_WORLD_REF_KEY_FILE: secret('world_ref_key', crypto.randomBytes(48).toString('hex')),
       KARMAX_DATABASE_URL_FILE: secret('database_url', url({ name: role, password })),
       KARMAX_TEMPORAL_ADDRESS: server.address, KARMAX_TEMPORAL_NAMESPACE: server.namespace,
@@ -79,6 +88,21 @@ test('boots src/main.ts as a hosted cell on PostgreSQL and Temporal without a su
     await boot();
 
     expect(await (await fetch(`${base}/api/meta`)).json()).toMatchObject({ hosted: true, hostLocal: false, cellId: 'cell-test' });
+    // The vault moved: the same ciphertext is in the database, and only the sentinel is left on the volume.
+    const vaultRows = new pg.Pool({ connectionString: url(), max: 1 });
+    try {
+      const moved = (await vaultRows.query('SELECT scope, blob, previous FROM vault_entries WHERE handle = $1', ['world-provider:org_personal:e2b:api-key'])).rows;
+      expect(moved).toEqual([{ scope: 'organization:org_personal', blob: fileEntry.blob, previous: JSON.stringify(fileEntry.previous) }]);
+      // The boot's own installation keys are written to the database too.
+      expect((await vaultRows.query("SELECT 1 FROM vault_entries WHERE handle = 'world-reference:key:v2'")).rowCount).toBe(1);
+      expect((await vaultRows.query("SELECT 1 FROM audit_log WHERE action = 'vault.moved-to-database'")).rowCount).toBe(1);
+    } finally { await vaultRows.end(); }
+    expect(JSON.parse(fs.readFileSync(path.join(vaultDir, 'secrets.json'), 'utf8'))).toEqual(MOVED_TO_DATABASE);
+    expect(fs.readdirSync(path.join(vaultDir, 'entries'))).toEqual(['.migrated']);
+    expect(fs.existsSync(path.join(vaultDir, 'keys'))).toBe(false);
+    // Kept, unchanged and unread, until a later release deletes it.
+    expect(JSON.parse(fs.readFileSync(path.join(vaultDir, RETIRED_VAULT, 'entries', entryFile), 'utf8'))).toEqual(fileEntry);
+    expect(logTail()).toContain('Vault: moved 1 secret into the database (data epoch 5)');
     expect((await fetch(`${base}/api/projects`)).status).toBe(401);
 
     // Signing up the first administrator writes the identity and authorization
@@ -110,6 +134,7 @@ test('boots src/main.ts as a hosted cell on PostgreSQL and Temporal without a su
     expect(await exit).toBe(0);
     await boot();
     expect((await (await fetch(`${base}/api/session`, { headers: { cookie } })).json() as any).user?.email).toBe('alice@example.com');
+    expect(logTail().match(/Vault: moved/g)).toHaveLength(1); // the second boot only attaches
   } catch (error) {
     console.error(logTail());
     throw error;

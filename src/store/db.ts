@@ -237,9 +237,14 @@ export const STORE_LOCK_ORDER = [
   'vault:<orgId>', // an organization's vault item index, credential requests and connector outbox
   'kv:<key>', 'wiki:<orgId>:<path>', 'permission-requests:<orgId>:<taskId>', 'service-connections:<orgId>:<taskId>', // one value rewritten from its previous value
 ] as const;
+// Row locks follow every advisory key. The vault's (vault-database.ts): a write
+// share-locks its scope's vault_keyrings row, then swaps vault_entries rows;
+// rotating or shredding a scope (key rotation, organization deletion, account
+// erasure) locks that keyring row FOR UPDATE first, so no write lands under a
+// data key being retired.
 
-/** Advisory lock namespace registering in-flight event seqs (PostgreSQL); see migrate(). */
-const EVENT_SEQ_KEY = 1802661240;
+/** Advisory lock namespaces registering in-flight seqs per table (PostgreSQL); see migrate(). */
+const SEQ_KEYS = { events: 1802661240, audit_log: 1802661340 } as const;
 
 export class Store {
   /** Compound service mutations must include their reads in this boundary. */
@@ -746,6 +751,10 @@ export class Store {
         priority INTEGER NOT NULL, state TEXT NOT NULL, createdAt INTEGER NOT NULL,
         acquiredAt INTEGER, releasedAt INTEGER
       );
+      CREATE TABLE IF NOT EXISTS service_usage_counts (
+        meter TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (meter, day)
+      );
       CREATE TABLE IF NOT EXISTS usage_events (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT, taskId TEXT,
         worldId TEXT, provider TEXT NOT NULL, kind TEXT NOT NULL, quantity REAL NOT NULL,
@@ -789,7 +798,7 @@ export class Store {
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, generation INTEGER NOT NULL,
         port INTEGER NOT NULL, public INTEGER NOT NULL, tokenHash TEXT, runnerLeaseId TEXT,
         provider TEXT NOT NULL, createdBy TEXT NOT NULL, createdAt INTEGER NOT NULL,
-        expiresAt INTEGER NOT NULL, revokedAt INTEGER, hostname TEXT
+        expiresAt INTEGER NOT NULL, revokedAt INTEGER, hostname TEXT, tlsRequestedAt INTEGER
       );
       CREATE TABLE IF NOT EXISTS inbox (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT NOT NULL,
@@ -972,6 +981,24 @@ export class Store {
         projectId TEXT NOT NULL,
         PRIMARY KEY(attachmentId, projectId)
       );
+      -- The credential vault on PostgreSQL (autonomy/vault-database.ts): ciphertext
+      -- and wrapped data keys only, never a plaintext secret or the vault key.
+      CREATE TABLE IF NOT EXISTS vault_entries (
+        handle TEXT PRIMARY KEY, scope TEXT NOT NULL, blob TEXT NOT NULL,
+        previous TEXT NOT NULL DEFAULT '[]', unresolved INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS vault_keyrings (
+        scope TEXT PRIMARY KEY, ring TEXT NOT NULL, version INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS vault_kek_canaries (
+        kek TEXT PRIMARY KEY, record TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS vault_quarantine (
+        id TEXT PRIMARY KEY, handle TEXT, scope TEXT, record TEXT NOT NULL,
+        reason TEXT NOT NULL, createdAt INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_vault_entries_scope ON vault_entries(scope);
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
       CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parentTaskId);
       CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_memberships(userId, organizationId);
@@ -1021,44 +1048,44 @@ export class Store {
     `));
     if (this.db.dialect === 'postgres') {
       await this.db.exec('CREATE INDEX IF NOT EXISTS idx_kv_key_c ON kv (k COLLATE "C")');
-      // Event seqs are handed out at insert but become visible at commit, so a
-      // lower seq can commit after a higher one. Every seq (whoever inserts the
-      // row) is registered as a transaction lock in pg_locks until its
-      // transaction ends: (EVENT_SEQ_KEY + seq >> 31, seq & 0x7fffffff), taken
-      // while holding the shared gate (EVENT_SEQ_KEY - 1, 0). The watermark is
-      // the newest seq allocated before the read, capped below the lowest
-      // registered one; a gate holder without a registration is mid-allocation,
-      // and the read retries (NULL after 200 ms). Bodies are single-quoted:
-      // the statement splitter does not know dollar quotes.
-      await this.db.exec(`CREATE OR REPLACE FUNCTION karmax_event_seq() RETURNS bigint LANGUAGE plpgsql VOLATILE AS '
+      // A seq (events, audit_log) is handed out at insert but becomes visible
+      // at commit, so a lower seq can commit after a higher one. Every seq,
+      // whoever inserts the row (the column default), is registered as a
+      // transaction lock in pg_locks until its transaction ends: (ns + seq >> 31,
+      // seq & 0x7fffffff), taken while holding the table's shared gate (ns - 1, 0).
+      // A table's watermark is the newest seq allocated before the read, capped
+      // below the lowest registered one; a gate holder without a registration is
+      // mid-allocation, and the read retries (NULL after 200 ms). Bodies are
+      // single-quoted: the statement splitter does not know dollar quotes.
+      await this.db.exec(`CREATE OR REPLACE FUNCTION karmax_seq(tbl text, ns int) RETURNS bigint LANGUAGE plpgsql VOLATILE AS '
         DECLARE s bigint;
         BEGIN
-          PERFORM pg_advisory_xact_lock_shared(${EVENT_SEQ_KEY - 1}, 0);
-          s := nextval(pg_get_serial_sequence(''events'', ''seq''));
-          PERFORM pg_advisory_xact_lock_shared(${EVENT_SEQ_KEY} + (s >> 31)::int, (s & 2147483647)::int);
+          PERFORM pg_advisory_xact_lock_shared(ns - 1, 0);
+          s := nextval(pg_get_serial_sequence(tbl, ''seq''));
+          PERFORM pg_advisory_xact_lock_shared(ns + (s >> 31)::int, (s & 2147483647)::int);
           RETURN s;
         END'`);
-      await this.db.exec(`CREATE OR REPLACE FUNCTION karmax_event_watermark() RETURNS bigint LANGUAGE plpgsql VOLATILE AS '
+      await this.db.exec(`CREATE OR REPLACE FUNCTION karmax_seq_watermark(tbl text, ns int) RETURNS bigint LANGUAGE plpgsql VOLATILE AS '
         DECLARE latest bigint; called boolean; inflight bigint; pending bigint;
         BEGIN
           FOR attempt IN 1..200 LOOP
-            EXECUTE ''SELECT last_value, is_called FROM '' || pg_get_serial_sequence(''events'', ''seq'') INTO latest, called;
+            EXECUTE ''SELECT last_value, is_called FROM '' || pg_get_serial_sequence(tbl, ''seq'') INTO latest, called;
             IF NOT called THEN latest := latest - 1; END IF;
             WITH held AS MATERIALIZED (
               SELECT pid, classid::bigint AS k1, objid::bigint AS k2 FROM pg_locks
               WHERE locktype = ''advisory'' AND objsubid = 2 AND granted
                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-                AND classid::bigint BETWEEN ${EVENT_SEQ_KEY - 1} AND ${EVENT_SEQ_KEY + 64})
-            SELECT min(((k1 - ${EVENT_SEQ_KEY}) << 31) + k2) FILTER (WHERE k1 >= ${EVENT_SEQ_KEY}),
-              count(*) FILTER (WHERE k1 = ${EVENT_SEQ_KEY - 1}
-                AND NOT EXISTS (SELECT 1 FROM held r WHERE r.pid = held.pid AND r.k1 >= ${EVENT_SEQ_KEY}))
+                AND classid::bigint BETWEEN ns - 1 AND ns + 64)
+            SELECT min(((k1 - ns) << 31) + k2) FILTER (WHERE k1 >= ns),
+              count(*) FILTER (WHERE k1 = ns - 1 AND NOT EXISTS (SELECT 1 FROM held r WHERE r.pid = held.pid AND r.k1 >= ns))
             INTO inflight, pending FROM held;
             IF pending = 0 THEN RETURN least(latest, coalesce(inflight - 1, latest)); END IF;
             PERFORM pg_sleep(0.001);
           END LOOP;
           RETURN NULL;
         END'`);
-      await this.db.exec('ALTER TABLE events ALTER COLUMN seq SET DEFAULT karmax_event_seq()');
+      for (const [table, ns] of Object.entries(SEQ_KEYS))
+        await this.db.exec(`ALTER TABLE ${table} ALTER COLUMN seq SET DEFAULT karmax_seq('${table}', ${ns})`);
     }
     if (!(await this.kvGet('migration:github-pr-observations'))) {
       await this.db.prepare(`DELETE FROM kv WHERE ${this.kvRangeKey()}>=? AND ${this.kvRangeKey()}<?`)
@@ -1180,6 +1207,7 @@ export class Store {
     if (!invitationCols.some((c) => c.name === 'authorizationJson')) (await this.db.exec('ALTER TABLE organization_invitations ADD COLUMN authorizationJson TEXT'));
     const previewCols = (await this.db.prepare('PRAGMA table_info(preview_leases)').all()) as any[];
     if (!previewCols.some((c) => c.name === 'hostname')) (await this.db.exec('ALTER TABLE preview_leases ADD COLUMN hostname TEXT'));
+    if (!previewCols.some((c) => c.name === 'tlsRequestedAt')) (await this.db.exec('ALTER TABLE preview_leases ADD COLUMN tlsRequestedAt INTEGER'));
     const usageCols = (await this.db.prepare('PRAGMA table_info(usage_events)').all()) as { name: string }[];
     if (!usageCols.some((c) => c.name === 'fundingSource'))
       (await this.db.exec("ALTER TABLE usage_events ADD COLUMN fundingSource TEXT NOT NULL DEFAULT 'customer'"));
@@ -4956,6 +4984,40 @@ export class Store {
     });
   }
 
+  /** The installation operators' service-limit alerts, as a whole set: rows
+   * no longer in it are withdrawn (usage dropped, a probe recovered, a new
+   * period began). `deliver` pushes a newly inserted row to the person's
+   * browser/Slack channels; a row re-inserted for a level already announced in
+   * this period (dropping from 95% back to 80%) is shown without a push. */
+  async syncServiceLimitInbox(entries: Array<{ userId: string; organizationId: string; key: string;
+    urgency: 'normal' | 'high' | 'critical'; subject: Record<string, unknown>; deliver: boolean }>, createdAt = Date.now()): Promise<void> {
+    return this.db.transaction(async () => {
+      // The whole set is replaced: one sweep at a time sees the previous one's rows.
+      (await this.db.lock('kv:service-limit-inbox'));
+      const rows = new Map(entries.map((entry) => [`inbox_limit_${crypto.createHash('sha256')
+        .update(JSON.stringify([entry.userId, entry.organizationId, entry.key])).digest('hex').slice(0, 24)}`, entry]));
+      const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE json_extract(subject, '$.kind')='service-limit'`)
+        .all()) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !rows.has(id));
+      if (stale.length) {
+        (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+        (await deleteRows(this.db, 'inbox', 'id', stale));
+      }
+      for (const [id, entry] of rows) {
+        const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+          (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
+          VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
+          id, entry.organizationId, entry.userId, createdAt * 1000, `service-limit:${entry.key}`, urgencyRank(entry.urgency), createdAt,
+          JSON.stringify({ ...entry.subject, kind: 'service-limit' })));
+        if (!Number(inserted.changes) || !entry.deliver) continue;
+        const preferences = (await this.getDeliveryPreferences(entry.userId, entry.organizationId));
+        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
+          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+            .run(newId('delivery'), id, channel, createdAt, createdAt));
+      }
+    });
+  }
+
   async removeAuthorizationInbox(requestId: string): Promise<void> {
     (await this.deleteInbox("kind='approval-requested' AND json_extract(subject, '$.requestId')=?", [requestId]));
   }
@@ -5874,7 +5936,9 @@ export class Store {
   }
 
   async auditSince(seq = 0, limit = 500): Promise<any[]> {
-    return ((await this.db.prepare('SELECT * FROM audit_log WHERE seq > ? ORDER BY seq LIMIT ?').all(seq, Math.max(1, Math.min(limit, 2000)))) as any[])
+    // Paged like events: never past an entry that is still to commit.
+    return ((await this.db.prepare('SELECT * FROM audit_log WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?')
+      .all(seq, await this.seqWatermark('audit_log'), Math.max(1, Math.min(limit, 2000)))) as any[])
       .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
   }
 
@@ -6208,12 +6272,15 @@ export class Store {
    * transaction can still commit one. PostgreSQL hands a seq out at insert,
    * so a lower one can commit after a higher one; every `seq > cursor` reader
    * reads only up to here, and a cursor never passes an event that is still
-   * to come. (`karmax_event_seq` registers each seq until its transaction
-   * ends; `karmax_event_watermark` reads them.) -1 while an allocation is
+   * to come. (`karmax_seq` registers each seq until its transaction ends;
+   * `karmax_seq_watermark` reads them.) -1 while an allocation is
    * mid-registration: nothing new is visible yet. SQLite commits in seq order. */
-  async eventWatermark(): Promise<number> {
+  async eventWatermark(): Promise<number> { return this.seqWatermark('events'); }
+
+  /** The same watermark for a table whose rows are paged by `seq > cursor`. */
+  private async seqWatermark(table: keyof typeof SEQ_KEYS): Promise<number> {
     if (this.db.dialect !== 'postgres') return Number.MAX_SAFE_INTEGER;
-    const row = (await this.db.prepare('SELECT karmax_event_watermark() AS w').get()) as { w: number | null } | undefined;
+    const row = (await this.db.prepare('SELECT karmax_seq_watermark(?, ?) AS w').get(table, SEQ_KEYS[table])) as { w: number | null } | undefined;
     return row?.w == null ? -1 : Number(row.w);
   }
 
@@ -7632,6 +7699,49 @@ export class Store {
       ORDER BY createdAt`).all()) as any[];
   }
 
+  /** Count one use of an operator account that tavya itself drives (an email
+   * sent, a Composio tool call, a preview certificate), in a UTC-day bucket.
+   * These are the service-limits page's own counts where a provider's API
+   * cannot report usage. */
+  async countServiceUsage(meter: string, at = Date.now(), n = 1): Promise<void> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare(`INSERT INTO service_usage_counts (meter, day, count) VALUES (?, ?, ?)
+        ON CONFLICT(meter, day) DO UPDATE SET count = service_usage_counts.count + excluded.count`)
+        .run(meter, new Date(at).toISOString().slice(0, 10), n));
+    });
+  }
+
+  /** The sum of a counted meter's buckets from `fromDay` (YYYY-MM-DD, UTC) on. */
+  async serviceUsageSince(meter: string, fromDay: string): Promise<number> {
+    const row = (await this.db.prepare('SELECT SUM(count) AS n FROM service_usage_counts WHERE meter=? AND day>=?')
+      .get(meter, fromDay)) as { n: number | null } | undefined;
+    return Number(row?.n ?? 0);
+  }
+
+  async pruneServiceUsage(beforeDay: string): Promise<void> {
+    return this.db.transaction(async () => {
+      (await this.db.prepare('DELETE FROM service_usage_counts WHERE day<?').run(beforeDay));
+    });
+  }
+
+  /** Seconds of `world.active` metered for one organization and provider that
+   * started since `since` (by start time, so idx_usage_org_time serves it). */
+  async worldActiveSeconds(organizationId: string, provider: string, since: number): Promise<number> {
+    const row = (await this.db.prepare(`SELECT SUM(quantity) AS seconds FROM usage_events
+      WHERE organizationId=? AND startedAt>=? AND provider=? AND kind='world.active'`)
+      .get(organizationId, since, provider)) as { seconds: number | null } | undefined;
+    return Number(row?.seconds ?? 0);
+  }
+
+  /** PostgreSQL's server-wide connection use against `max_connections`;
+   * undefined on SQLite, which has no connection limit. */
+  async databaseConnections(): Promise<{ used: number; max: number } | undefined> {
+    if (this.db.dialect !== 'postgres') return undefined;
+    const row = (await this.db.prepare(`SELECT COUNT(*) AS used, current_setting('max_connections') AS allowed FROM pg_stat_activity`)
+      .get()) as { used: number | string; allowed: number | string };
+    return { used: Number(row.used), max: Number(row.allowed) };
+  }
+
   async recordedUsageEventIds(ids: string[]): Promise<Set<string>> {
     const recorded = new Set<string>();
     for (let offset = 0; offset < ids.length; offset += 500) {
@@ -8213,6 +8323,18 @@ export class Store {
     if (!hostname) return false;
     return Boolean((await this.db.prepare(`SELECT 1 FROM preview_leases
       WHERE hostname=? AND expiresAt>? LIMIT 1`).get(hostname.toLowerCase(), now - PREVIEW_TLS_GRACE_MS)));
+  }
+
+  /** Caddy asked to issue a certificate for a live preview hostname. Each
+   * hostname is counted once, toward Let's Encrypt's weekly limit of new
+   * certificates per registered domain; a lease's later asks are renewals or
+   * retries of the same request. */
+  async recordPreviewCertificateRequest(hostname: string, now = Date.now()): Promise<void> {
+    return this.db.transaction(async () => {
+      const first = (await this.db.prepare('UPDATE preview_leases SET tlsRequestedAt=? WHERE hostname=? AND tlsRequestedAt IS NULL')
+        .run(now, hostname.toLowerCase()));
+      if (Number(first.changes)) (await this.countServiceUsage('letsencrypt.certificates', now));
+    });
   }
 
   // ─── Cards (payment resources; SPEC §7.6) ────────────────────────────────────

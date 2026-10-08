@@ -256,6 +256,8 @@ release their execution lease when finished.
 ./deploy/karmax down                # preserves all volumes and certificates
 ./deploy/karmax restore BACKUP_DIR  # verified and signature-checked, explicit destructive prompt
 ./deploy/karmax rotate-vault-key    # replace the vault's key encryption key (resumable)
+./deploy/karmax configure-backups … # stream PostgreSQL off-host continuously (below)
+./deploy/karmax pg-restore …        # point-in-time restore of those into a scratch volume
 ```
 
 A backup includes PostgreSQL dumps of Karmax metadata, identity, and Temporal,
@@ -335,6 +337,65 @@ backup into a private directory, refuses symbolic links, and verifies and
 restores only that copy (the backup's size again in free disk space). Every
 restore, signed or not, is written to the audit log at the next boot
 (`backup.restored`, `backup.restored.unsigned`).
+
+### Continuous off-host PostgreSQL backups
+
+The snapshots above are taken at each update, on the same disk. For a lost
+server, PostgreSQL (Karmax's metadata and Temporal's histories, every database
+in the cluster) can also be streamed to an S3 bucket with
+[WAL-G](https://github.com/wal-g/wal-g): every WAL segment within a minute
+(`archive_timeout=60`), and a base backup every 24 hours
+(`KARMAX_PG_BACKUP_INTERVAL_HOURS`) from the `pg-backup` service, which reads
+the data directory read-only. With nothing configured, PostgreSQL archives
+through the same script, which reports success, and `pg-backup` idles.
+
+Set it up so a stolen host cannot destroy the history:
+
+1. A bucket of its own, never the object store's. On Cloudflare R2, add a
+   **bucket lock rule** (every object, age N days): no key can then delete or
+   overwrite a backup for N days. Add a **lifecycle rule** deleting objects
+   after N+1 days. Nothing in Karmax ever deletes from this bucket. A point in
+   time can be restored while its base backup is still in the bucket, so the
+   window is about N days minus the base-backup interval.
+2. A key that can write only that bucket (R2: an Object Read & Write account
+   token restricted to it). WAL-G needs read access to check an existing
+   segment before overwriting it, and the lock refuses the overwrite anyway.
+3. An OpenPGP key pair (RSA). The host gets only the **public** key, so it can
+   encrypt backups but not read them. Keep the private key off-host. It is the
+   only way to restore, and losing it loses every backup.
+
+```bash
+KARMAX_PG_BACKUP_ACCESS_KEY_ID=… KARMAX_PG_BACKUP_SECRET_ACCESS_KEY=… \
+  ./deploy/karmax configure-backups s3://BUCKET/INSTALLATION https://ENDPOINT backup-public.asc
+./deploy/karmax doctor   # passes once the first base backup is in the bucket
+```
+
+`configure-backups` restarts PostgreSQL (seconds) and starts the first base
+backup. `doctor` fails when WAL has been waiting more than 10 minutes to be
+archived, or the newest base backup is older than the interval plus 6 hours;
+`./deploy/karmax logs pg-backup` shows the base backups.
+
+**Point-in-time restore.** `pg-restore` restores into a scratch Docker volume,
+never production. The copy has archiving off and no network listener, so it
+cannot write to the bucket. It replays WAL to the time you name, or to the end,
+and prints what it recovered. The volume is deleted afterwards unless you pass
+`--keep`:
+
+```bash
+./deploy/karmax pg-restore --private-key ~/backup-private.asc --to '2026-10-08 12:00:00+00'
+```
+
+A restored cluster is only PostgreSQL. To serve from it, the installation also
+needs `deploy/.secrets/` (`vault_key`, `auth_secret`, `world_ref_key`), and the
+data volume, which holds config homes and the local object store. From data
+epoch 5 the vault itself is rows of the `karmax` database, so the point-in-time
+restore carries it (as ciphertext, useless without `vault_key`); before epoch 5
+its entries are on the data volume too. The vault key comes from your off-host
+copy (above). The other two
+secrets and the data volume are in the snapshots and the provider's disk image.
+For a lost server, take PostgreSQL from the point-in-time restore (`--keep`,
+then use the volume as `temporal_postgres`) and everything else from the newest
+snapshot or disk image.
 
 ### Recovering on a new server
 
@@ -429,6 +490,29 @@ restore` would generate a new one, so before restoring a backup taken by this
 release with the previous release's code, copy the key into it first:
 `cp deploy/.secrets/vault_key BACKUP/deployment-secrets/` (the checksums list
 only the files they cover, so this does not fail verification).
+
+Epoch 5 moves the vault into the application database when that database is
+PostgreSQL (wiki planned/host-local-state), so every process and host shares
+one vault without a host-local file lock. The first boot finishes the epoch 3
+and 4 steps, copies every entry, keyring and key canary into the
+`vault_entries`, `vault_keyrings` and `vault_kek_canaries` tables exactly as
+stored (ciphertext and wrapped data keys; nothing is decrypted to copy it),
+reads every secret back through the database and compares it with the file,
+and only then records the move (`vault.moved-to-database` in the audit log).
+It then replaces `vault/secrets.json` with a marker the epoch 4 release refuses
+("not a secret map") and moves the vault's files, unchanged, into
+`vault/retired-epoch5/` (`vault/vault.key`, if there is one, stays: it is the
+vault key, not the vault). No release reads that copy; it is the cheapest way
+back, and it still opens with the same key (`npm run vault-key -- --vault
+vault/retired-epoch5 status`). Deleting an organization or closing an account
+shreds its files there too, so the copy cannot outlive crypto-shredding. A
+later release deletes `vault/retired-epoch5/` once epoch 5 is verified in
+production. An interrupted first boot repeats the copy; one interrupted after
+the move only finishes moving the files. The vault key is unchanged, `karmax.dump` now carries the encrypted
+vault, and backups still leave the key out. `npm run vault-key` and
+`vault-preflight` work on the database once the move is recorded. **The way
+back is the pre-update backup with its code**, whose `control-plane/vault/`
+still holds the files. A self-host on SQLite keeps the file vault.
 
 Recover a failed epoch transition by repairing forward, or restore the pre-update
 backup with its matching application revision **and Temporal history**. Restoring
@@ -560,4 +644,8 @@ are per replica. Host-network Caddy binds ports 80 and 443 itself, so a host
 firewall must allow them, including UDP 443 for HTTP/3 (Docker's published ports
 used to bypass it). Its admin API is off, since on the host network it would let
 any local process rewrite the edge, so `caddy reload` is unavailable: a changed
-Caddyfile takes effect when the Caddy container restarts.
+Caddyfile takes effect when the Caddy container is recreated. `deploy/karmax`
+labels Caddy with the Caddyfile's digest, so its `up` and `update` do that
+whenever the Caddyfile changed; with `compose.hosted.yml`, set
+`KARMAX_CADDYFILE_SHA256=$(sha256sum deploy/Caddyfile | cut -d' ' -f1)` for
+`docker compose up`, or restart Caddy yourself.

@@ -145,7 +145,7 @@ describe('project resources', () => {
     const sandboxWorld = Object.assign(Object.create(world), { diagnose: async () => evidence });
     expect(await (await resources.withEnvironment(sandboxWorld)).diagnose?.({ since: 0 })).toBe(evidence);
     const serviceHandle = Object.values(world.handle.meta?.serviceEnvironmentHandles as Record<string, string>)[0]!;
-    expect(broker.hasHandle(serviceHandle)).toBe(true);
+    expect(await broker.hasHandle(serviceHandle)).toBe(true);
 
     const tunedBytes = Buffer.from('fine-tuned-model');
     await world.writeFileBuffer!('resources/model/model.bin', tunedBytes);
@@ -199,7 +199,7 @@ describe('project resources', () => {
     await resources.release(consumerWorld.handle);
     await consumerWorld.destroy();
     await resources.release(world.handle);
-    expect(broker.hasHandle(serviceHandle)).toBe(false);
+    expect(await broker.hasHandle(serviceHandle)).toBe(false);
     await world.destroy();
     await resources.deleteAttachment(volume.id);
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
@@ -637,7 +637,7 @@ describe('project resources', () => {
       driver: 'secret@1', target: { kind: 'environment', name: 'GENERATED_API_KEY' }, access: 'read',
     });
     await resources.discardCandidate(task.id, credential.candidate.id, 'user:reviewer');
-    expect(broker.hasHandle(handle)).toBe(true);
+    expect(await broker.hasHandle(handle)).toBe(true);
     await world.destroy(); (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 

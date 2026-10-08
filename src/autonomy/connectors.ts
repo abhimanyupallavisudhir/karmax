@@ -115,6 +115,8 @@ export interface CredentialConnector {
 
 /** Injectable runner so tests can stub the CLIs. Returns {stdout} or throws. */
 export type Exec = (cmd: string, args: string[], opts?: { env?: Record<string, string>; input?: string }) => Promise<string>;
+/** A connector's secret, read from the vault when it is needed. */
+export type SecretSource = () => string | undefined | Promise<string | undefined>;
 
 const realExec: Exec = async (cmd, args, opts) => {
   const child = pexec(cmd, args, { env: { ...process.env, ...(opts?.env ?? {}) }, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
@@ -126,13 +128,13 @@ const realExec: Exec = async (cmd, args, opts) => {
 
 export class BitwardenConnector implements CredentialConnector {
   readonly name = 'bitwarden';
-  constructor(private sessionKey: () => string | undefined, private exec: Exec = realExec) {}
-  private env(): Record<string, string> {
-    const key = this.sessionKey();
+  constructor(private sessionKey: SecretSource, private exec: Exec = realExec) {}
+  private async env(): Promise<Record<string, string>> {
+    const key = await this.sessionKey();
     return key ? { BW_SESSION: key } : {};
   }
   async describe(): Promise<ConnectorInfo> {
-    if (!this.sessionKey()) return {
+    if (!await this.sessionKey()) return {
       name: this.name,
       label: 'Bitwarden',
       available: false,
@@ -140,7 +142,7 @@ export class BitwardenConnector implements CredentialConnector {
       detail: 'needs the `bw` CLI on this host.',
     };
     try {
-      const status = JSON.parse(await this.exec('bw', ['status'], { env: this.env() }));
+      const status = JSON.parse(await this.exec('bw', ['status'], { env: await this.env() }));
       const unlocked = status?.status === 'unlocked';
       return { name: this.name, label: 'Bitwarden', available: unlocked, canPush: false, canUpdate: true,
         detail: unlocked ? 'ready' : 'The Bitwarden session key is invalid or expired.' };
@@ -151,15 +153,15 @@ export class BitwardenConnector implements CredentialConnector {
   }
   async list(): Promise<ExternalItem[]> {
     const [items, folders] = await Promise.all([
-      this.exec('bw', ['list', 'items'], { env: this.env() }).then((s) => JSON.parse(s) as any[]),
-      this.exec('bw', ['list', 'folders'], { env: this.env() }).then((s) => JSON.parse(s) as any[]).catch(() => []),
+      this.exec('bw', ['list', 'items'], { env: await this.env() }).then((s) => JSON.parse(s) as any[]),
+      this.exec('bw', ['list', 'folders'], { env: await this.env() }).then((s) => JSON.parse(s) as any[]).catch(() => []),
     ]);
     const folderName = new Map<string, string>(folders.map((f: any) => [f.id, f.name]));
     return items.map((it) => normalizeBitwarden(it, folderName.get(it.folderId) ?? '')).filter((x): x is ExternalItem => !!x);
   }
   async pull(externalIds: string[]): Promise<PullResult> {
     const wanted = new Set(externalIds);
-    const items = JSON.parse(await this.exec('bw', ['list', 'items'], { env: this.env() })) as any[];
+    const items = JSON.parse(await this.exec('bw', ['list', 'items'], { env: await this.env() })) as any[];
     const out: ExternalSecretItem[] = [];
     for (const it of items) {
       if (!wanted.has(it.id)) continue;
@@ -176,7 +178,7 @@ export class BitwardenConnector implements CredentialConnector {
   /** Field-level edit: read the item JSON, change one field, `bw edit` it back —
    *  every other field (username, notes, uris, totp) is preserved. */
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
-    const item = JSON.parse(await this.exec('bw', ['get', 'item', externalId], { env: this.env() }));
+    const item = JSON.parse(await this.exec('bw', ['get', 'item', externalId], { env: await this.env() }));
     item.login = item.login ?? {};
     if (field === 'password') item.login.password = value;
     else if (field === 'totp') item.login.totp = value;
@@ -185,7 +187,7 @@ export class BitwardenConnector implements CredentialConnector {
     // The item JSON now carries the new secret: hand it over on stdin, never in
     // argv, where every process of the same user could read it from /proc.
     const encoded = Buffer.from(JSON.stringify(item)).toString('base64');
-    await this.exec('bw', ['edit', 'item', externalId], { env: this.env(), input: encoded });
+    await this.exec('bw', ['edit', 'item', externalId], { env: await this.env(), input: encoded });
   }
 }
 
@@ -211,16 +213,16 @@ function timestampOf(value: unknown): { changedAt?: number } {
 export class OnePasswordConnector implements CredentialConnector {
   readonly name = '1password';
   constructor(
-    private token: () => string | undefined,
+    private token: SecretSource,
     private exec: Exec = realExec,
     private writer: OnePasswordSdkConnector = new OnePasswordSdkConnector(token),
   ) {}
-  private env(): Record<string, string> {
-    const t = this.token();
+  private async env(): Promise<Record<string, string>> {
+    const t = await this.token();
     return t ? { OP_SERVICE_ACCOUNT_TOKEN: t } : {};
   }
   async describe(): Promise<ConnectorInfo> {
-    if (!this.token())
+    if (!await this.token())
       return {
         name: this.name,
         label: '1Password',
@@ -230,7 +232,7 @@ export class OnePasswordConnector implements CredentialConnector {
         detail: 'needs the `op` CLI on this host.',
       };
     try {
-      await this.exec('op', ['whoami', '--format=json'], { env: this.env() });
+      await this.exec('op', ['whoami', '--format=json'], { env: await this.env() });
       return { name: this.name, label: '1Password', available: true, canPush: false, canUpdate: true, detail: 'ready' };
     } catch {
       return {
@@ -244,7 +246,7 @@ export class OnePasswordConnector implements CredentialConnector {
     }
   }
   async list(): Promise<ExternalItem[]> {
-    const items = JSON.parse(await this.exec('op', ['item', 'list', '--format=json'], { env: this.env() })) as any[];
+    const items = JSON.parse(await this.exec('op', ['item', 'list', '--format=json'], { env: await this.env() })) as any[];
     return items.map((it) => ({
       externalId: it.id,
       type: categoryType(it.category),
@@ -261,7 +263,7 @@ export class OnePasswordConnector implements CredentialConnector {
     for (const id of externalIds) {
       let full: any;
       try {
-        full = JSON.parse(await this.exec('op', ['item', 'get', id, '--format=json'], { env: this.env() }));
+        full = JSON.parse(await this.exec('op', ['item', 'get', id, '--format=json'], { env: await this.env() }));
       } catch (e) {
         failures.push({ externalId: id, error: e instanceof Error ? e.message : String(e) });
         continue;
@@ -304,7 +306,7 @@ export class OnePasswordConnector implements CredentialConnector {
    * whole item. An item that may hold one keeps the CLI's in-place assignment:
    * the value is briefly visible in argv, which is better than losing a passkey. */
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
-    const item = JSON.parse(await this.exec('op', ['item', 'get', externalId, '--format=json'], { env: this.env() }));
+    const item = JSON.parse(await this.exec('op', ['item', 'get', externalId, '--format=json'], { env: await this.env() }));
     if (typeof item?.vault?.id !== 'string') throw new Error(`1Password item "${externalId}" has no vault`);
     const inPlace = () => this.assign(externalId, field, value);
     if (mentionsPasskey(item)) return inPlace();
@@ -320,7 +322,7 @@ export class OnePasswordConnector implements CredentialConnector {
               : field === 'privateKey' ? `private_key=${value}`
                 : undefined;
     if (!assignment) throw new Error(`1Password write-back does not support the "${field}" field`);
-    await this.exec('op', ['item', 'edit', externalId, assignment], { env: this.env() });
+    await this.exec('op', ['item', 'edit', externalId, assignment], { env: await this.env() });
   }
 }
 
@@ -362,11 +364,12 @@ export class OnePasswordSdkConnector implements CredentialConnector {
   private catalogPromise?: Promise<Array<{ vault: { id: string; title: string }; item: any }>>;
 
   constructor(
-    private token: () => string | undefined,
+    private token: SecretSource,
     private createClient: OnePasswordClientFactory = createOnePasswordClient,
   ) {}
 
-  private client(token = this.token()): Promise<OnePasswordSdkClient> {
+  private async client(supplied?: string): Promise<OnePasswordSdkClient> {
+    const token = supplied ?? await this.token();
     if (!token) throw new Error('no 1Password service-account token is connected');
     return this.clientPromise ??= this.createClient(token);
   }
@@ -394,7 +397,7 @@ export class OnePasswordSdkConnector implements CredentialConnector {
   }
 
   async describe(): Promise<ConnectorInfo> {
-    const token = this.token();
+    const token = await this.token();
     if (!token) return {
       name: this.name,
       label: '1Password',
@@ -1268,15 +1271,15 @@ class GitPassStoreConnector implements CredentialConnector {
 export class GitPassConnector implements CredentialConnector {
   readonly name = 'pass-git';
   constructor(
-    private secret: () => string | undefined,
+    private secret: SecretSource,
     private organizationId = 'org_personal',
     private gitEnvironment: (profile?: string) => Record<string, string> | Promise<Record<string, string>> = () => ({}),
     private root = path.join(paths().state, 'connectors', 'pass-git'),
     private options: GitPassOptions = {},
   ) {}
 
-  private stores(): { prefix: string; connector: GitPassStoreConnector }[] {
-    const raw = this.secret();
+  private async stores(): Promise<{ prefix: string; connector: GitPassStoreConnector }[]> {
+    const raw = await this.secret();
     let config: any;
     try { config = raw ? JSON.parse(raw) : undefined; }
     catch { throw new Error('Git-backed pass connection is invalid'); }
@@ -1299,7 +1302,7 @@ export class GitPassConnector implements CredentialConnector {
 
   async describe(): Promise<ConnectorInfo> {
     try {
-      const stores = this.stores();
+      const stores = await this.stores();
       const infos = await Promise.all(stores.map(store => store.connector.describe()));
       const unavailable = infos.find(info => !info.available);
       return unavailable ?? { ...infos[0]!, detail: infos[0]!.detail + (stores.length > 1 ? `; ${stores.length - 1} mounted stores` : '') };
@@ -1309,8 +1312,8 @@ export class GitPassConnector implements CredentialConnector {
     }
   }
 
-  matchesRepository(repository: Repository): boolean {
-    try { return this.stores().some(store => store.connector.matchesRepository(repository)); }
+  async matchesRepository(repository: Repository): Promise<boolean> {
+    try { return (await this.stores()).some(store => store.connector.matchesRepository(repository)); }
     catch { return false; }
   }
 
@@ -1319,7 +1322,7 @@ export class GitPassConnector implements CredentialConnector {
     const info = await candidate.describe();
     if (!info.available) throw new Error(info.detail);
     const checks: NonNullable<ConnectorInfo['checks']> = [];
-    for (const store of candidate.stores()) {
+    for (const store of await candidate.stores()) {
       try { checks.push({ ...await store.connector.verify(), store: store.prefix || 'root' }); }
       catch (e) { throw new Error(`Password store ${store.prefix || 'root'}: ${gitPassVerificationError(e)}`); }
     }
@@ -1327,7 +1330,7 @@ export class GitPassConnector implements CredentialConnector {
   }
 
   async catalog(): Promise<{ items: ExternalItem[]; failures: Array<{ store: string; error: string }> }> {
-    const stores = this.stores();
+    const stores = await this.stores();
     const items: ExternalItem[] = []; const failures: Array<{ store: string; error: string }> = [];
     for (const { prefix, connector } of stores) {
       try {
@@ -1350,7 +1353,7 @@ export class GitPassConnector implements CredentialConnector {
   }
 
   async pull(externalIds: string[]): Promise<PullResult> {
-    const stores = this.stores();
+    const stores = await this.stores();
     const result: PullResult = { items: [], failures: [] };
     for (const { prefix, connector } of stores) {
       const ids = externalIds.filter(id => prefix ? id.startsWith(prefix) : !stores.some(store => store.prefix && id.startsWith(store.prefix)));
@@ -1376,13 +1379,13 @@ export class GitPassConnector implements CredentialConnector {
   }
 
   async updateSecrets(externalId: string, values: Partial<Record<VaultFieldName, string>>, expectedRevision?: string): Promise<void> {
-    const stores = this.stores();
+    const stores = await this.stores();
     const store = stores.find(store => store.prefix && externalId.startsWith(store.prefix)) ?? stores[0]!;
     await store.connector.updateSecrets(externalId.slice(store.prefix.length), values, expectedRevision);
   }
 
   async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
-    const stores = this.stores();
+    const stores = await this.stores();
     // A mount named like an export folder would shadow all root exports.
     const shadowing = stores.find(store => isPassExport(store.prefix));
     if (shadowing) throw new Error(`The ${shadowing.prefix.replace(/\/$/, '')} mount reserves the export folder; rename that mount before exporting`);
@@ -1712,7 +1715,7 @@ export class Connectors {
    *  when both its durable subscription and exact repository binding match. */
   async autoSyncGitPush(repository: Repository, revision?: string): Promise<SyncResult | undefined> {
     const connector = this.get('pass-git');
-    if (!(connector instanceof GitPassConnector) || !connector.matchesRepository(repository)) return undefined;
+    if (!(connector instanceof GitPassConnector) || !await connector.matchesRepository(repository)) return undefined;
     return this.autoSync('pass-git', 'github-push', revision);
   }
 
@@ -1734,7 +1737,7 @@ export class Connectors {
     if (!value) throw new Error(required);
 
     const handle = connectorAuthHandle(this.organizationId, name);
-    const previous = this.secretFor(name);
+    const previous = await this.secretFor(name);
     const replacedGitPassStore =
       name === 'pass-git' &&
       previous !== undefined &&
@@ -1767,9 +1770,9 @@ export class Connectors {
       throw error;
     }
   }
-  secretFor(name: string): string | undefined {
+  async secretFor(name: string): Promise<string | undefined> {
     const handle = connectorAuthHandle(this.organizationId, name);
-    return this.broker?.hasHandle(handle) ? this.broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined;
+    return await this.broker?.hasHandle(handle) ? this.broker!.resolve(handle, { caps: ['use-credential:*'] }) : undefined;
   }
 
   async describe(): Promise<(ConnectorInfo & { config: ConnectorConfig; pendingWrites: Array<Partial<Omit<PendingConnectorWrite, 'target' | 'snapshotHandle'>> & { itemId: string; label?: string }> })[]> {
@@ -1936,8 +1939,8 @@ export class Connectors {
       (await this.broker?.deleteHandle(write.snapshotHandle));
       });
   }
-  private writeTarget(name: string): string {
-    const secret = this.secretFor(name);
+  private async writeTarget(name: string): Promise<string> {
+    const secret = await this.secretFor(name);
     const connector = this.get(name);
     const identity = connector instanceof PassConnector ? connector.storeIdentity()
       : name === 'pass-git' && secret ? gitPassRepositoryIdentity(secret) : (secret ?? name);
@@ -1959,7 +1962,7 @@ export class Connectors {
       itemId,
       externalId: existing?.externalId ?? externalId,
       field,
-      target: existing?.target ?? this.writeTarget(name),
+      target: existing?.target ?? await this.writeTarget(name),
       attempts: 0,
       nextAttemptAt: Date.now(),
     };
@@ -1970,7 +1973,7 @@ export class Connectors {
         if (!item || !this.broker) throw new Error('Credential storage is unavailable');
         const secrets: Partial<Record<VaultFieldName, string>> = {};
         for (const field of item.fields) {
-          const value = this.items.readSecret(item, field);
+          const value = await this.items.readSecret(item, field);
           if (value !== undefined) secrets[field] = value;
         }
         (await this.broker.registerHandle(
@@ -2004,7 +2007,7 @@ export class Connectors {
       }
       if (!(await this.config(write.connector)).writeBack) return undefined;
       try {
-        if (write.target !== this.writeTarget(write.connector))
+        if (write.target !== await this.writeTarget(write.connector))
           throw new Error('The connected store changed; the pending write requires review');
         const connector = this.get(write.connector);
         if (!connector) throw new Error('Connector is unavailable');
@@ -2017,7 +2020,7 @@ export class Connectors {
           if (binding !== externalId || item.provenance.source.startsWith('import:'))
             throw new Error('The item binding changed; the pending write requires review');
           if (!connector.updateSecret) throw new Error('Connector cannot update existing items');
-          const value = this.items.readSecret(item, write.field);
+          const value = await this.items.readSecret(item, write.field);
           if (value !== undefined) await connector.updateSecret(externalId, write.field, value);
         } else {
           if (!connector.push) throw new Error('Connector cannot create external items');
@@ -2027,7 +2030,7 @@ export class Connectors {
           if (bound) {
             if (!connector.updateSecret) throw new Error('Connector cannot update an existing export');
             for (const field of item.fields) {
-              const value = this.items.readSecret(item, field);
+              const value = await this.items.readSecret(item, field);
               if (value !== undefined) await connector.updateSecret(bound, field, value);
             }
             (await this.saveWrite(write, true));
@@ -2035,7 +2038,7 @@ export class Connectors {
           }
           if (!write.snapshotHandle || !this.broker) throw new Error('Export snapshot is unavailable');
           const snapshot = JSON.parse(
-            this.broker.resolve(write.snapshotHandle, { caps: ['use-credential:*'] }),
+            await this.broker.resolve(write.snapshotHandle, { caps: ['use-credential:*'] }),
           ) as ExternalSecretItem;
           const result = await connector.push(snapshot);
           externalId = result.externalId;
@@ -2045,7 +2048,7 @@ export class Connectors {
           // after that exact external entry has been acknowledged and bound.
           const current = (await this.items.get(item.id))!;
           for (const field of current.fields) {
-            const value = this.items.readSecret(current, field);
+            const value = await this.items.readSecret(current, field);
             if (value !== undefined && value !== snapshot.secrets[field]) {
               if (!connector.updateSecret) throw new Error('Connector cannot update an existing export');
               await connector.updateSecret(externalId, field, value);
@@ -2098,13 +2101,13 @@ export class Connectors {
     if (name !== 'pass-git') return;
     return this.store.transaction(async () => {
       await this.lockVault();
-      const target = this.writeTarget(name);
+      const target = await this.writeTarget(name);
       const writes = (await this.pendingWrites());
       if (writes.some((write) => write.connector === name && write.target !== target))
         (await this.store.kvSet(connectorOutboxKey(this.organizationId), JSON.stringify(writes.map((write) =>
           write.connector !== name || write.target === target ? write
             : { ...write, target, attempts: 0, nextAttemptAt: Date.now(), error: undefined }))));
-      const binding = gitPassRepositoryIdentity(this.secretFor(name));
+      const binding = gitPassRepositoryIdentity(await this.secretFor(name));
       for (const item of (await this.items.list())) {
         const pending = (await this.pending(item.id));
         if (Object.keys(pending.fields).length && pending.binding !== binding)
@@ -2231,7 +2234,7 @@ export class Connectors {
 
   async acceptRemote(itemId: string) {
     const pending = (await this.pending(itemId));
-    if (!pending.externalId || pending.binding !== gitPassRepositoryIdentity(this.secretFor('pass-git'))) throw new Error('Write-back connection changed; review the current connection');
+    if (!pending.externalId || pending.binding !== gitPassRepositoryIdentity(await this.secretFor('pass-git'))) throw new Error('Write-back connection changed; review the current connection');
     const result = await this.sync('pass-git', [pending.externalId], { acceptRemote: true });
     if (result.count !== 1 || result.failures.length) throw new Error(result.failures[0]?.error ?? 'Remote value was not imported');
     return result;
@@ -2248,12 +2251,12 @@ export class Connectors {
       if (item.provenance.source.startsWith('import:') || bound !== externalId)
         throw new Error('Write-back item binding changed; review the current connection');
       const pending = (await this.pending(itemId));
-      const binding = gitPassRepositoryIdentity(this.secretFor(name));
+      const binding = gitPassRepositoryIdentity(await this.secretFor(name));
       if (Object.keys(pending.fields).length && (pending.binding !== binding || pending.externalId !== externalId)) throw new Error('Write-back connection changed; review the current connection');
       const values: Partial<Record<VaultFieldName, string>> = {};
       for (const field of new Set([...Object.keys(pending.fields) as VaultFieldName[], ...fields])) {
         if (item.fields.includes(field)) {
-          const value = this.items.readSecret(item, field);
+          const value = await this.items.readSecret(item, field);
           if (value !== undefined) values[field] = value;
         }
       }
@@ -2272,7 +2275,7 @@ export class Connectors {
         ?? (item.provenance.source === 'connector:pass-git' ? item.provenance.sourceRevision : undefined)
         ?? 'unverified';
       if (!(await this.items.get(itemId)) || (await this.store.kvGet(this.pendingKey(itemId))) !== queued) return [];
-      if (binding !== gitPassRepositoryIdentity(this.secretFor(name))) throw new Error('Write-back connection changed; review the current connection');
+      if (binding !== gitPassRepositoryIdentity(await this.secretFor(name))) throw new Error('Write-back connection changed; review the current connection');
       if (!(await this.config(name)).writeBack) return [];
       pending.fields = Object.fromEntries(Object.keys(values).map(field => [field, revision]));
       (await this.store.kvSet(this.pendingKey(itemId), JSON.stringify(pending)));
@@ -2334,7 +2337,7 @@ export class Connectors {
         }
       } else for (const field of fields) {
         if (!item.fields.includes(field)) continue;
-        const value = this.items.readSecret(item, field);
+        const value = await this.items.readSecret(item, field);
         if (value === undefined) continue;
         const write = (await this.queueWrite(name, itemId, externalId, field));
         try {

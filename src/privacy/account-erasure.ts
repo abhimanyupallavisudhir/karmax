@@ -179,7 +179,7 @@ export class AccountErasureService {
         for (const name of new Set([...record.scope.gitProfiles, ...(await profiles.list()).map(profile => profile.name)]))
           await profiles.delete(name);
         // Exact colon-delimited user namespace: never touch organization App keys.
-        for (const handle of this.broker.listHandles())
+        for (const handle of await this.broker.listHandles())
           if (handle.startsWith(`github-app:user:${userId}:`) || handle.startsWith(`git:user:${userId}:`))
             await this.broker.deleteHandle(handle);
         for (const row of await this.store.kvEntries(`github-app:user:${userId}:`))
