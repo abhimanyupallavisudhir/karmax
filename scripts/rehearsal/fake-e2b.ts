@@ -17,6 +17,13 @@
  *
  *  It needs the Docker socket and must be on --network, where it reaches each
  *  sandbox's envd; scripts/rehearse-upgrade.sh runs it in a container.
+ *
+ *  --pause-mode freeze (the default) pauses a sandbox's container, keeping its
+ *  processes and memory as E2B's pause does. --pause-mode stop stops it
+ *  instead: the files survive, the processes do not, and the memory is freed.
+ *  The load test (benchmarks/load) parks hundreds of worlds on one host and
+ *  uses it; a stopped container is then a paused sandbox, and connecting
+ *  starts it and hands envd its environment again.
  */
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -36,6 +43,8 @@ const apiPort = Number(option('api-port'));
 const envdPort = Number(option('envd-port'));
 const image = option('image');
 const network = option('network');
+const pauseMode = option('pause-mode', 'freeze');
+if (pauseMode !== 'freeze' && pauseMode !== 'stop') throw new Error('--pause-mode is freeze or stop');
 
 function log(message: string) { console.log(`${new Date().toISOString()} ${message}`); }
 
@@ -62,7 +71,7 @@ function docker(method: string, path: string, body?: unknown): Promise<DockerRep
 
 interface Sandbox {
   sandboxID: string; templateID: string; metadata: Record<string, string>;
-  startedAt: string; state: 'running' | 'paused'; address: string;
+  startedAt: string; state: 'running' | 'paused'; address: string; envVars: Record<string, string>;
 }
 
 const endAt = new Map<string, string>();
@@ -78,19 +87,21 @@ async function inspect(id: string): Promise<Sandbox | undefined> {
   const state = record(container.State);
   const networks = record(record(container.NetworkSettings).Networks);
   const address = String(record(networks[network]).IPAddress ?? '');
-  if (labels[LABEL] !== id || !state.Running) return undefined;
+  // A stopped container is a paused sandbox only when pausing stops them.
+  if (labels[LABEL] !== id || (!state.Running && pauseMode !== 'stop')) return undefined;
   return {
     sandboxID: id,
     templateID: String(labels['karmax.rehearsal.template'] ?? ''),
     metadata: JSON.parse(String(labels['karmax.rehearsal.metadata'] ?? '{}')) as Record<string, string>,
     startedAt: String(labels['karmax.rehearsal.started'] ?? ''),
-    state: state.Paused ? 'paused' : 'running',
+    state: state.Paused || !state.Running ? 'paused' : 'running',
     address,
+    envVars: JSON.parse(String(labels['karmax.rehearsal.env'] ?? '{}')) as Record<string, string>,
   };
 }
 
 async function all(): Promise<Sandbox[]> {
-  const reply = await docker('GET', `/containers/json?filters=${encodeURIComponent(JSON.stringify({ label: [LABEL] }))}`);
+  const reply = await docker('GET', `/containers/json?all=${pauseMode === 'stop' ? 1 : 0}&filters=${encodeURIComponent(JSON.stringify({ label: [LABEL] }))}`);
   const ids = (Array.isArray(reply.body) ? reply.body : [])
     .map((container) => String(record(record(container).Labels)[LABEL] ?? ''));
   return (await Promise.all(ids.map(inspect))).filter((sandbox): sandbox is Sandbox => !!sandbox);
@@ -132,6 +143,7 @@ async function create(body: Record<string, unknown>): Promise<Sandbox> {
       'karmax.rehearsal.template': String(body.templateID ?? ''),
       'karmax.rehearsal.metadata': JSON.stringify(record(body.metadata)),
       'karmax.rehearsal.started': new Date().toISOString(),
+      'karmax.rehearsal.env': JSON.stringify(record(body.envVars)),
     },
     HostConfig: { NetworkMode: network, Memory: 512 * 1024 * 1024 },
   });
@@ -139,16 +151,21 @@ async function create(body: Record<string, unknown>): Promise<Sandbox> {
   const started = await docker('POST', `/containers/rehearsal-sandbox-${id}/start`);
   if (started.status !== 204) throw new Error(`docker start: ${started.status} ${JSON.stringify(started.body)}`);
   endAt.set(id, new Date(Date.now() + timeout * 1000).toISOString());
+  return initialize(id);
+}
+
+/** Waits for a started container's envd and does what E2B's orchestrator does
+ *  for a sandbox: hand envd its environment and the template's user (karmax's
+ *  template runs as `user`). */
+async function initialize(id: string): Promise<Sandbox> {
   const sandbox = await inspect(id);
-  if (!sandbox) throw new Error(`sandbox ${id} did not start`);
+  if (!sandbox || sandbox.state !== 'running') throw new Error(`sandbox ${id} did not start`);
   for (let attempt = 0; ; attempt++) {
     if ((await envd(sandbox.address, 'GET', '/health').catch(() => 0)) === 204) break;
     if (attempt > 100) throw new Error(`envd in ${id} did not become healthy`);
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  // What E2B's orchestrator does for a new sandbox: hand envd its environment
-  // and the template's user (karmax's template runs as `user`).
-  await envd(sandbox.address, 'POST', '/init', { envVars: record(body.envVars), timestamp: new Date().toISOString(),
+  await envd(sandbox.address, 'POST', '/init', { envVars: sandbox.envVars, timestamp: new Date().toISOString(),
     defaultUser: 'user', defaultWorkdir: '/home/user' });
   return sandbox;
 }
@@ -203,13 +220,17 @@ async function api(request: http.IncomingMessage, response: http.ServerResponse)
     return send(response, 204);
   }
   if (method === 'POST' && action === 'connect') {
-    if (sandbox.state === 'paused') { await docker('POST', `${container}/unpause`); log(`resumed ${id}`); }
+    if (sandbox.state === 'paused' && pauseMode === 'stop') {
+      await docker('POST', `${container}/start`);
+      await initialize(id);
+      log(`resumed ${id}`);
+    } else if (sandbox.state === 'paused') { await docker('POST', `${container}/unpause`); log(`resumed ${id}`); }
     endAt.set(id, new Date(Date.now() + Number(body.timeout ?? 300) * 1000).toISOString());
     return send(response, sandbox.state === 'paused' ? 201 : 200, connection(sandbox));
   }
   if (method === 'POST' && action === 'pause') {
     if (sandbox.state === 'paused') return send(response, 409, { code: 409, message: 'sandbox is already paused' });
-    await docker('POST', `${container}/pause`);
+    await docker('POST', pauseMode === 'stop' ? `${container}/stop?t=2` : `${container}/pause`);
     log(`paused ${id}`);
     return send(response, 204);
   }
