@@ -41,12 +41,12 @@ describe('GitHub re-authorization affordance', () => {
   // "App ready" and offered nothing to click.
   it('offers re-authorization even while a stored credential still looks authorized', async () => {
     expect(await button({ oauthConfigured: true, userAuthorized: true }))
-      .toBe('<button class="btn sm" id="authorize-github">Reconnect my GitHub identity</button>');
+      .toBe('<button class="btn sm" id="authorize-github" title="Reconnect your GitHub account">Reconnect</button>');
   });
 
   it('asks for first-time authorization when no credential is stored', async () => {
     expect(await button({ oauthConfigured: true, userAuthorized: false }))
-      .toBe('<button class="btn sm" id="authorize-github">Connect my GitHub identity</button>');
+      .toBe('<button class="btn sm" id="authorize-github" title="Connect your GitHub account">Connect</button>');
   });
 
   it('stays hidden when the App has no OAuth credentials to authorize against', async () => {
@@ -59,7 +59,9 @@ describe('GitHub re-authorization affordance', () => {
       ? { configured: true, oauthConfigured: true, userAuthorized: true }
       : path.endsWith('/git-connections') ? [connection({ ready: true })] : undefined, '.settings-layout');
     const reconnect = ui.page.locator('#project-authorize-github');
-    expect(await reconnect.innerText()).toBe('Reconnect my GitHub identity');
+    expect(await reconnect.innerText()).toBe('Reconnect');
+    // It sits in the "Commits as" row: the personal identity, not the organization's access.
+    expect(await ui.page.locator('#project-github-identity #project-authorize-github').count()).toBe(1);
     await ui.close();
   });
 
