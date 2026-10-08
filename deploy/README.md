@@ -644,4 +644,8 @@ are per replica. Host-network Caddy binds ports 80 and 443 itself, so a host
 firewall must allow them, including UDP 443 for HTTP/3 (Docker's published ports
 used to bypass it). Its admin API is off, since on the host network it would let
 any local process rewrite the edge, so `caddy reload` is unavailable: a changed
-Caddyfile takes effect when the Caddy container restarts.
+Caddyfile takes effect when the Caddy container is recreated. `deploy/karmax`
+labels Caddy with the Caddyfile's digest, so its `up` and `update` do that
+whenever the Caddyfile changed; with `compose.hosted.yml`, set
+`KARMAX_CADDYFILE_SHA256=$(sha256sum deploy/Caddyfile | cut -d' ' -f1)` for
+`docker compose up`, or restart Caddy yourself.

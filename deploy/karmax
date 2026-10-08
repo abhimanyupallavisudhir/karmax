@@ -12,7 +12,17 @@ COMPOSE_FILE="$DEPLOY_DIR/compose.turnkey.yml"
 
 die() { echo "karmax: $*" >&2; exit 1; }
 note() { echo "• $*"; }
-dc() { docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+# Compose recreates a container when its configuration changes, not when a file
+# it mounts does, and Caddy's admin API is off, so it cannot reload. Worse, the
+# Caddyfile is a single-file bind mount: git checkout replaces the file by
+# rename, so a running container keeps the old inode and never even sees the
+# new content (tavya.io served its 2026-10-02 Caddyfile until task #529). The
+# Caddyfile's digest is therefore a label on Caddy: every `up` recreates it,
+# binding the new file, whenever the Caddyfile changed.
+dc() {
+  KARMAX_CADDYFILE_SHA256=$(sha256sum "$DEPLOY_DIR/Caddyfile" 2>/dev/null | cut -d' ' -f1) \
+    docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+}
 
 # The checksums cover the dumps and secrets outside the signed control-plane
 # manifest, and the manifest itself, so the two signatures vouch for one backup.
