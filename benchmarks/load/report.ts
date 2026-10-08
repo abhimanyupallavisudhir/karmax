@@ -230,7 +230,7 @@ function table(rows: Json[]) {
 const { steps, samples, probes, run, cost } = load(dir);
 const rows = steps.map((step) => stepRow(step, samples, probes));
 const wall = rows.find((r) => r.broken.length);
-const restarts = (roleName: string) => [...new Set(probes.filter((p) => p.role === roleName).map((p) => p.pid))].length;
+const restarts = (roleName: string) => new Set(probes.filter((p) => p.role === roleName).map((p) => p.pid)).size;
 fs.writeFileSync(path.join(dir, 'summary.json'), JSON.stringify({ run, cost, steps: rows }, null, 1));
 
 const md: string[] = [];

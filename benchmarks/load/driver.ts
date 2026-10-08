@@ -324,7 +324,7 @@ async function actOnReview(person: Person, task: TaskState) {
  *  refresh would; one stuck for ten minutes is counted and dropped. */
 async function pollStale() {
   const now = Date.now();
-  for (const task of [...tasksById.values()]) {
+  for (const task of tasksById.values()) {
     if (task.phase === 'review' || task.phase === 'closed') continue;
     const quietFor = now - Math.max(task.lastSeen, task.since);
     const expected = task.phase === 'turn' ? task.scriptedMs + 60_000 : 60_000;

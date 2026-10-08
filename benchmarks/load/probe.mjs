@@ -16,7 +16,7 @@ const every = Number(process.env.LOADTEST_PROBE_MS) || 5000;
 const script = process.argv[1] ?? '';
 // npm, npx and the tsx launcher also run src/main.ts by name, but only as an
 // argument; the process whose own script it is, is the gateway.
-const role = /activity-worker-main\.ts$/.test(script) ? 'worker'
+const role = script.endsWith('activity-worker-main.ts') ? 'worker'
   : /src[\\/]main\.ts$/.test(script) ? 'gateway' : 'other';
 
 // Wrappers (npm, the tsx launcher) and helper processes have nothing to report.
