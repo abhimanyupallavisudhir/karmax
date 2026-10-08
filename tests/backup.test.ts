@@ -155,6 +155,30 @@ describe('control-plane backup', () => {
       .rejects.toThrow(/symbolic link/i);
   });
 
+  it('never carries the plaintext logins the data epoch 6 import kept, and drops the cache with the other secrets', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-retired-logins-'));
+    const home = path.join(root, 'home');
+    roots.push(root);
+    const live = path.join(home, 'config-homes', 'claude-work');
+    const retired = path.join(home, 'retired-epoch6', 'config-homes', 'claude-work');
+    for (const dir of [live, retired]) {
+      fs.mkdirSync(path.join(dir, 'projects'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.credentials.json'), '{"claudeAiOauth":{"refreshToken":"plaintext"}}');
+    }
+    fs.writeFileSync(path.join(live, 'projects', 'session.jsonl'), '{}\n');
+    const all = (dir: string) => fs.readdirSync(dir, { recursive: true }).map(String);
+
+    // The retired copy is in no backup: the pre-update backup already holds those files.
+    const full = path.join(root, 'full');
+    await createBackup({ home, destination: full, externalTemporal: true });
+    expect(all(path.join(full, 'payload')).filter((file) => file.includes('retired-epoch6'))).toEqual([]);
+    expect(fs.existsSync(path.join(full, 'payload', 'config-homes', 'claude-work', '.credentials.json'))).toBe(true);
+    // A backup without secrets has no credential at all, cached or retired.
+    const without = path.join(root, 'without');
+    await createBackup({ home, destination: without, externalTemporal: true, excludeSecrets: true });
+    expect(all(path.join(without, 'payload')).filter((file) => file.includes('credentials') || file.includes('retired-epoch6'))).toEqual([]);
+  });
+
   it('online-snapshots provider SQLite databases without copying WAL sidecars', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-provider-db-'));
     const home = path.join(root, 'home');

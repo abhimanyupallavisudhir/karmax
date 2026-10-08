@@ -53,9 +53,13 @@ export interface LeasedRefresh<T> {
   /** The provider call, on the credential as read under the lease. `next`
    * undefined or equal to `current`: nothing to write (the provider declined). */
   refresh(current: string | undefined): Promise<{ next?: string; result?: T }>;
-  /** Compare-and-set: store `next` only if the credential is still `current`.
-   * Runs in a transaction that has checked the lease is still held. */
-  write(current: string | undefined, next: string): Promise<boolean>;
+  /** Compare-and-set: store `next` only if the credential is still `current`,
+   * in the write-back transaction, and only once `held()` says the lease is
+   * still this holder's. Take the caller's own entity locks (`Store.lock`)
+   * first, then `held()` (it locks the lease row), then the vault's rows: the
+   * order of `STORE_LOCK_ORDER`. Database writes only: a deadlock or
+   * serialization failure re-runs the whole transaction. */
+  write(current: string | undefined, next: string, held: () => Promise<boolean>): Promise<boolean>;
   /** Still holding the lease, with whatever is stored at the end. */
   settled?(stored: string | undefined): Promise<void>;
 }
@@ -139,8 +143,13 @@ export class RefreshLeases {
       if (changed(current)) return finish('raced', current);
       const { next, result } = await spec.refresh(current);
       if (next === undefined || next === current) return finish('unchanged', current, result);
-      const written = await this.db.transaction(async () => await this.holds(lease) && await spec.write(current, next))
-        .catch((error) => { console.error(`[refresh-lease] writing back ${spec.credential} failed:`, error); return false; });
+      // Refreshed outside any transaction; written back in a short one of its own.
+      const written = await this.db.transaction(async () => {
+        let checked = false;
+        const wrote = await spec.write(current, next, async () => (checked = await this.holds(lease)));
+        if (wrote && !checked) throw new Error(`the write-back of ${spec.credential} did not check its lease`);
+        return wrote;
+      }).catch((error) => { console.error(`[refresh-lease] writing back ${spec.credential} failed:`, error); return false; });
       if (written) return finish('refreshed', next, result);
       // The credential or the lease changed during the provider call. This
       // refresh may have spent a token another holder also spent: discard it

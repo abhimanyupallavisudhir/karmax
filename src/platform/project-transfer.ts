@@ -172,11 +172,14 @@ export class ProjectTransfers {
         if (Date.now() > JSON.parse(lock).expiresAt) throw new ProjectTransferError('Checking task workflows timed out. Retry the move.');
       }
       return await s.transaction(async () => {
+        // Both organizations' administration (slugs, members, projects), the
+        // source's credential and authorization requests rewritten below, then
+        // the rows: whatever adds to the project holds its row FOR KEY SHARE.
+        const organizations = [preview.sourceOrganizationId, destinationOrganizationId].sort();
+        (await s.lock(...organizations.map(org => `org:${org}`), `vault:${preview.sourceOrganizationId}`,
+          `kv:authorization:requests:${preview.sourceOrganizationId}`));
         if (s.db.dialect === 'postgres') {
-          // Moves are rare administration operations. Briefly serialize project
-          // writes so slug validation also excludes concurrent create/rename.
-          (await s.db.exec('LOCK TABLE projects IN SHARE ROW EXCLUSIVE MODE'));
-          for (const org of [preview.sourceOrganizationId, destinationOrganizationId].sort())
+          for (const org of organizations)
             (await s.db.prepare('SELECT id FROM organizations WHERE id=? FOR UPDATE').get(org));
           (await s.db.prepare('SELECT id FROM projects WHERE id=? FOR UPDATE').get(projectId));
         }
@@ -250,9 +253,13 @@ export class ProjectTransfers {
     const permissions = new PermissionRequests(s, plan.project.organizationId ?? 'org_personal');
     for (const request of (await permissions.requests()))
       if (movedTasks.has(request.taskId) || request.projectId === id) (await permissions.remove(request));
-    for (const entry of (await s.kvEntries('service-connection:'))) {
+    for (const listed of (await s.kvEntries('service-connection:'))) {
+      if (JSON.parse(listed.value).organizationId !== plan.project.organizationId) continue;
+      (await s.lock(`kv:${listed.key}`));
+      const value = (await s.kvGet(listed.key));
+      if (!value) continue;
+      const entry = { key: listed.key, value };
       const connection = JSON.parse(entry.value);
-      if (connection.organizationId !== plan.project.organizationId) continue;
       if (connection.projectIds?.includes(id)) {
         connection.projectIds = connection.projectIds.filter((projectId: string) => projectId !== id);
         (await s.kvSet(entry.key, JSON.stringify(connection)));

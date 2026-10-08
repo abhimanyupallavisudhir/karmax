@@ -218,7 +218,7 @@ export class ModelLogins {
           return { next: readLoginBundle(scratch, login.provider), result };
         } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
       },
-      write: (current, next) => this.write(login, current, next),
+      write: async (current, next, held) => await held() && this.write(login, current, next),
       // The cache follows, unless a CLI on this host changed it meanwhile.
       settled: async () => this.reconcile(login),
     });

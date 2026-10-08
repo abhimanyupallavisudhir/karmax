@@ -523,6 +523,8 @@ export class GitHubAppService {
     if (options.expectedAccountId && identity.id !== options.expectedAccountId)
       throw new Error(`GitHub connected @${identity.login}, but this reconnect belongs to another account`);
     await this.store.transaction(async () => {
+      // The user's linked accounts are rewritten, and closure is checked, under their account lock.
+      await this.store.lock(`account:${userId}`);
       await this.assertUserOpen(userId);
       await this.saveUserToken(userId, identity.id, value);
       (await this.clearUserAuthorizationFailure(userId, identity.id));
@@ -544,6 +546,7 @@ export class GitHubAppService {
     if (identity.id !== expectedAccountId)
       throw new Error(`GitHub signed in as @${identity.login}, but returned a mismatched account id`);
     await this.store.transaction(async () => {
+      await this.store.lock(`account:${userId}`);
       await this.assertUserOpen(userId);
       (await this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), JSON.stringify({
         accessToken: authorization.accessToken,
@@ -982,6 +985,8 @@ export class GitHubAppService {
   private async processPendingWebhook(key: string, dispatch: (result: GithubWebhookResult) => Promise<void>, now: number):
   Promise<GithubWebhookResult | undefined> {
     const job = await this.store.transaction(async () => {
+      // One process leases a pending delivery.
+      await this.store.lock(`kv:${key}`);
       const saved = await this.store.kvGet(key);
       if (!saved) return undefined;
       const pending = JSON.parse(saved);
@@ -1112,6 +1117,7 @@ export class GitHubAppService {
       if (!prEvent || !(await this.ownsTask(connection.organizationId, prEvent.taskId)))
         return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
       return this.store.transaction(async () => {
+        await this.store.lockTask(prEvent.taskId);
         const task = await this.store.getTask(prEvent.taskId);
         const attached = task ? await this.store.listProjectRepositories(task.projectId) : [];
         if (!attached.some(({ repository }) => repository.providerId === String(payload.repository?.id)))
@@ -1697,6 +1703,7 @@ export class GitHubAppService {
     }
     // A compare-and-set: a sign-in that landed meanwhile is newer than this refresh.
     const saved = await this.store.transaction(async () => {
+      await this.store.lock(`account:${userId}`);
       await this.assertUserOpen(userId);
       return this.broker.replaceHandleIfUnchanged(handle, observed, this.tokenRecord(value), userScope(userId));
     });

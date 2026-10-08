@@ -7,6 +7,18 @@ export class DatabaseCapacityError extends Error {
   constructor() { super('database request capacity exceeded'); this.name = 'DatabaseCapacityError'; }
 }
 
+export class DatabaseQueueTimeoutError extends Error {
+  readonly status = 503;
+  constructor() { super('database request expired before execution'); this.name = 'DatabaseQueueTimeoutError'; }
+}
+
+/** A pool checkout that waited out `connectionTimeoutMillis` was never
+ * executed: report it as the same retryable admission timeout as the queue. */
+function admissionTimeout(error: unknown): unknown {
+  return error instanceof Error && /timeout exceeded when trying to connect/i.test(error.message)
+    ? new DatabaseQueueTimeoutError() : error;
+}
+
 interface TransactionScope { client: PoolClient; active: boolean; pending: number; failure?: unknown }
 
 /** Bounded native asynchronous PostgreSQL access. Each transaction has its own
@@ -17,9 +29,11 @@ export class AsyncPostgres {
   private closed = false;
   private pending = 0;
   private readonly maxPending: number;
+  readonly maxConnections: number;
 
   constructor(url: string, options: { max?: number; maxPending?: number; statementTimeoutMs?: number } = {}) {
     this.maxPending = options.maxPending ?? 256;
+    this.maxConnections = options.max ?? 4;
     if (!Number.isSafeInteger(this.maxPending) || this.maxPending < 1
       || !Number.isSafeInteger(options.max ?? 4) || (options.max ?? 4) < 1)
       throw new Error('database pool and admission limits must be positive integers');
@@ -59,10 +73,11 @@ export class AsyncPostgres {
         const result = await (scope?.client ?? this.pool).query<T>(translated.sql!, translated.forcedParams ?? params);
         return result;
       } catch (error) {
+        if (!scope) throw admissionTimeout(error);
         // PostgreSQL aborts the transaction after any statement error, even if
         // application code catches it. Never report a silently rolled-back
         // COMMIT as a successful transaction.
-        if (scope) scope.failure = error;
+        scope.failure = error;
         throw error;
       }
     };
@@ -87,7 +102,7 @@ export class AsyncPostgres {
       return operation();
     }
     return this.admitted(async () => {
-      const client = await this.pool.connect();
+      const client = await this.pool.connect().catch(error => { throw admissionTimeout(error); });
       const scope: TransactionScope = { client, active: true, pending: 0 };
       let broken: Error | undefined;
       try {

@@ -1,4 +1,5 @@
 import type { SqlDatabase } from '../store/sql.js';
+import { noteExternalEffect } from '../store/transaction-effects.js';
 import { Vault } from './vault.js';
 import { INSTALLATION_SCOPE, isVaultScope, type KekSource, type KeyEncryptionKey, type VaultScope } from './vault-keys.js';
 import { KEK_ID, KEYRING, SECRET_LIMIT, isScoped, kekCanaryRecord, mintDataKey, openEntry, openKekCanary, parseKeyring,
@@ -19,7 +20,9 @@ import { KEK_ID, KEYRING, SECRET_LIMIT, isScoped, kekCanaryRecord, mintDataKey, 
  * Concurrency: every entry write is a compare-and-swap on the row's `version`,
  * retried on conflict. A write share-locks its scope's keyring row (PostgreSQL
  * `FOR SHARE`); rotating or shredding a scope locks it exclusively, so no write
- * can land under a data key being retired. SQLite serializes transactions.
+ * can land under a data key being retired. Lock order (STORE_LOCK_ORDER): any
+ * advisory key the caller holds (`vault:<orgId>`), then the keyring row, then
+ * entry rows. SQLite serializes transactions.
  */
 const QUARANTINE_RETENTION_MS = 30 * 86_400_000;
 const ATTEMPTS = 8;
@@ -27,8 +30,10 @@ const ATTEMPTS = 8;
 interface EntryRow { handle: string; scope: string; blob: string; previous: string; unresolved: number | boolean; version: number; ring?: string | null }
 interface EntryRecord { handle: string; scope: VaultScope; blob: string; previous: string[]; unresolved: boolean; version: number }
 
-/** Another writer changed the row between this write's read and its swap. */
-class WriteConflict extends Error {}
+/** Another writer changed the row between this write's read and its swap: a
+ * serialization failure (SQLSTATE 40001), so a caller's Store transaction
+ * that this write joined is re-run like any other. */
+class WriteConflict extends Error { readonly code = '40001'; }
 const retryable = (error: unknown) => error instanceof WriteConflict
   || ['40001', '40P01'].includes(String((error as { code?: unknown })?.code ?? ''));
 
@@ -139,8 +144,8 @@ export class DatabaseVault implements SecretVault {
   /**
    * Run a write: a transaction that reads what it needs, then swaps rows only
    * if they are unchanged, retried from scratch on a conflict. Inside a
-   * caller's transaction it joins that transaction and cannot retry, so a
-   * conflict fails the caller.
+   * caller's transaction it joins that transaction; a conflict (40001) then
+   * re-runs the caller's outermost transaction (`SqlDatabase.transaction`).
    */
   private async write<T>(operation: (tx: WriteContext) => Promise<T>): Promise<T> {
     if (this.readOnly) throw new Error('this vault was opened read-only');
@@ -367,6 +372,9 @@ export class DatabaseVault implements SecretVault {
       return { entries, quarantined };
     }).then((result) => {
       // After the commit: the retired file copy (data epoch 5) goes with the rows.
+      // Joined to a caller's transaction, this file effect precedes its commit:
+      // that transaction must then not be re-run.
+      noteExternalEffect();
       this.shredRetired?.(scope);
       return result;
     });

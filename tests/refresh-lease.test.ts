@@ -32,7 +32,11 @@ function storedCredential(initial: string) {
   return {
     get value() { return value; },
     read: async () => value,
-    write: async (current: string | undefined, next: string) => { if (value !== current) return false; value = next; return true; },
+    write: async (current: string | undefined, next: string, held: () => Promise<boolean>) => {
+      if (!await held() || value !== current) return false;
+      value = next;
+      return true;
+    },
     set(next: string) { value = next; },
   };
 }
@@ -138,6 +142,49 @@ describe.each(storeBackends)('the credential refresh lease ($name)', ({ open }) 
     expect(outcomes.map((outcome) => outcome.outcome)).toEqual(['unchanged', 'unchanged']);
     expect(calls).toBe(2);
     expect(credential.value).toBe('r0');
+  });
+
+  it('re-runs a write-back aborted by a deadlock or serialization failure, re-checking the lease', async () => {
+    const store = await open();
+    const credential = storedCredential('r0');
+    const leases = new RefreshLeases(store.db);
+    let attempts = 0;
+    let checks = 0;
+    const result = await leases.refresh({
+      credential: 'model-login:org_a:claude:work',
+      read: credential.read,
+      refresh: async () => ({ next: 'r1' }),
+      write: async (current, next, held) => {
+        attempts++;
+        if (await held()) checks++;
+        // PostgreSQL aborts the first attempt (the vault reports its own compare-and-set conflicts the same way).
+        if (attempts === 1) throw Object.assign(new Error('deadlock detected'), { code: store.db.dialect === 'postgres' ? '40P01' : 'SQLITE_BUSY' });
+        return credential.write(current, next, held);
+      },
+    });
+    if (store.db.dialect === 'postgres') {
+      expect(attempts).toBe(2);
+      expect(checks).toBe(2);
+      expect(result).toEqual({ outcome: 'refreshed', stored: 'r1' });
+      expect(credential.value).toBe('r1');
+    } else {
+      // SQLite serializes writers and never re-runs: the failure discards the refresh.
+      expect(attempts).toBe(1);
+      expect(result.outcome).toBe('lost');
+      expect(credential.value).toBe('r0');
+    }
+  });
+
+  it('refuses a write-back that does not check its lease', async () => {
+    const store = await open();
+    const credential = storedCredential('r0');
+    const result = await new RefreshLeases(store.db).refresh({
+      credential: 'model-login:org_a:claude:work',
+      read: credential.read,
+      refresh: async () => ({ next: 'r1' }),
+      write: async () => true,
+    });
+    expect(result.outcome).toBe('lost');
   });
 
   it('gives up waiting for a holder that never finishes', async () => {

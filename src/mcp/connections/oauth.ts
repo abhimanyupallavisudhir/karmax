@@ -18,7 +18,7 @@ export interface OAuthVault {
 
 /** A leased OAuth refresh of the JSON stored under `handle`, for an `OAuthVault`. */
 export async function leasedOAuthRefresh(leases: RefreshLeases, handle: string, observed: any,
-  read: () => Promise<string | undefined>, write: (current: string | undefined, next: string) => Promise<boolean>,
+  read: () => Promise<string | undefined>, write: (current: string | undefined, next: string, held: () => Promise<boolean>) => Promise<boolean>,
   run: (data: any) => Promise<any>): Promise<any> {
   const { stored } = await leases.refresh({
     credential: handle,
