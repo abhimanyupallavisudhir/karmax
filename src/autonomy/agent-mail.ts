@@ -39,6 +39,7 @@ export interface AgentMailStore {
   transaction<T>(operation: () => Promise<T>): Promise<T>;
   kvGet(k: string): (string | undefined) | Promise<string | undefined>;
   kvSet(k: string, v: string): (void) | Promise<void>;
+  countServiceUsage?(meter: string, at?: number): Promise<void>;
 }
 
 const kvMessages = (organizationId: string) => `agent-mail:messages:${organizationId}`;
@@ -358,6 +359,8 @@ export class AgentMail {
       bytes = Buffer.byteLength(JSON.stringify(next));
     }
     (await this.store.kvSet(kvMessages(organizationId), JSON.stringify(next)));
+    // Mail plans cap emails per month; the operator's service-limits page reads this.
+    (await this.store.countServiceUsage?.(`agentmail.received:${organizationId}`, record.receivedAt));
     return { delivered: true, message: record };
       });
 }

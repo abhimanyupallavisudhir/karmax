@@ -1,3 +1,4 @@
+import { heapNow, type WorkerHeap } from './worker-process.js';
 import type { WorkflowBundle } from '@temporalio/worker';
 import { TemporalConn } from './config.js';
 import { ActivityDeps } from '../activities/index.js';
@@ -55,6 +56,9 @@ export class WorkerManager {
       this.onFailure(error);
     });
   }
+
+  /** This process hosts the activities, so its own heap is the worker's. */
+  get heap(): WorkerHeap { return heapNow(); }
 
   /** Currently-registered external packages (version-qualified). */
   get packages(): ExternalWorkflowRef[] {

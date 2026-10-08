@@ -149,6 +149,8 @@ export interface GatewayDeps {
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
   subscriptions?: import('../billing/subscriptions.js').SubscriptionBillingService;
   paidLaunchSettings?: import('../launch/settings.js').PaidLaunchSettingsService;
+  /** Installation → Service limits (operator accounts and this host against their plans). */
+  serviceLimits?: import('../ops/service-limits.js').ServiceLimitsService;
   cellId?: string;
   hosted?: boolean;
   /** Whether the browser and the host are the same machine (see `hostLocal`).
@@ -1649,8 +1651,10 @@ export class Gateway {
     // preventing arbitrary public certificate issuance through the catch-all.
     if (p === '/api/tls/preview-allow' && req.method === 'GET') {
       const domain = (url.searchParams.get('domain') ?? '').trim().toLowerCase();
-      res.writeHead((await this.deps.store.previewHostnameAllowed(domain)) ? 204 : 403,
-        { 'cache-control': 'no-store', 'content-length': '0' });
+      const allowed = (await this.deps.store.previewHostnameAllowed(domain));
+      // Counted toward Let's Encrypt's weekly limit (Installation → Service limits).
+      if (allowed) await this.deps.store.recordPreviewCertificateRequest(domain).catch(() => {});
+      res.writeHead(allowed ? 204 : 403, { 'cache-control': 'no-store', 'content-length': '0' });
       return void res.end();
     }
     if (this.deps.hosted && !p.startsWith('/api/health/') && !this.requestLimits.allow(this.clientAddress(req), p))
@@ -2498,6 +2502,27 @@ export class Gateway {
         const siteName = String(b.siteName).trim();
         (await store.setSettings('global', 'appearance', { ...appearance, siteName }));
         return this.json(res, 200, { ok: true, siteName });
+      }
+      // Installation-wide: operator accounts' usage is never an organization's
+      // business, so the checks carry no organization or project scope.
+      if (p === '/api/settings/service-limits' || p === '/api/settings/service-limits/check') {
+        const service = this.deps.serviceLimits;
+        if (!service) return this.json(res, 503, { error: 'service limits are unavailable' });
+        const write = method !== 'GET';
+        if (!['GET', 'PUT', 'POST'].includes(method) || (p.endsWith('/check') ? method !== 'POST' : method === 'POST'))
+          return this.json(res, 405, { error: 'method not allowed' });
+        if (!(await this.deps.tokens.check(token, write ? 'settings:write' : 'settings:read')).ok)
+          return this.json(res, 403, { error: `Only a ${(await this.siteName)} installation operator can ${write ? 'change' : 'see'} service limits` });
+        if (method === 'PUT') {
+          const { ServiceLimitsInputError } = await import('../ops/service-limits.js');
+          try { (await service.configure(await this.body(req))); }
+          catch (error) {
+            if (error instanceof ServiceLimitsInputError) return this.json(res, 400, { error: error.message });
+            throw error;
+          }
+        }
+        const view = method === 'GET' ? (await service.view()) : (await service.run());
+        return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
       }
       if (p === '/api/settings/paid-launch/paddle/provision' && method === 'POST') {
         if (!(await this.deps.tokens.check(token, 'settings:write')).ok)
