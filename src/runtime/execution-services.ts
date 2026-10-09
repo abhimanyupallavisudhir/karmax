@@ -25,6 +25,7 @@ import { WorldAccessService } from '../world/access.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../world/resources.js';
 import { ConfigHomeManager } from '../autonomy/config-homes.js';
 import { TASK_QUEUE } from '../temporal/config.js';
+import { taskEnded } from '../world/task-ended.js';
 
 /** Shared service construction for the gateway and a supervised activity process.
  * Only the installation bootstrap seeds profiles, imports environment credentials,
@@ -98,6 +99,8 @@ export async function createExecutionServices(input: {
   // worktree) return undefined and are therefore never rolled back.
   worlds.setRecoveryHandler(async (handle) => {
     if ((await store.worldState(handle.id)) === 'released') return undefined;
+    // A finished task's world is never rebuilt, whatever state it was left in.
+    if (await taskEnded(store, handle.id)) return undefined;
     const checkpoint = (await store.latestWorldCheckpoint(handle.id));
     if (!checkpoint) return undefined;
     const state = await worlds.probe(handle).catch(() => undefined);

@@ -264,3 +264,20 @@ it('hibernates parked worlds although another world is busy in every earlier ste
   await f.lifecycle.sweep(Date.now() + 2);
   expect(warn.mock.calls.filter(([text]) => String(text).includes('file lock admission timed out'))).toHaveLength(1);
 });
+
+// Task #552 (2026-10-09): released when it finished, then revived by another
+// task's open and left degraded, holding a runner lease. Nothing tore it down
+// again: only worlds marked teardownPending were retried.
+it('tears down a degraded world whose task has finished, marked or not', async () => {
+  const f = await fixture();
+  await f.store.saveView(f.handle.id, { taskId: f.handle.id, title: 'Done', workflow: 'software-dev',
+    stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: Date.now() } as any);
+  await f.store.setWorldState(f.handle, 'degraded');
+  await f.lifecycle.sweep();
+  expect(await f.store.worldState(f.handle.id)).toBe('released');
+  // A running task's degraded world is left to its own recovery.
+  const f2 = await fixture();
+  await f2.store.setWorldState(f2.handle, 'degraded');
+  await f2.lifecycle.sweep();
+  expect(await f2.store.worldState(f2.handle.id)).toBe('degraded');
+});
