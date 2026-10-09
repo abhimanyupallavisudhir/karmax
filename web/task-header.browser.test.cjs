@@ -101,7 +101,7 @@ const attempt = (n, extra = {}) => ({
     // Without a pinned tab a task opens on Check-in, whose toolbar is one quiet row.
     await open(undefined);
     await page.waitForSelector('#fork-task-agent');
-    assert.equal(await page.locator('.tp-tabs .tab.active').innerText(), 'Check-in');
+    assert.equal(await page.locator('.tp-tabs .tab.active').innerText(), 'Chat');
     await shot('task-checkin-toolbar.png', '.task-page .ck-pane-head');
     const tools = await page.evaluate(() => [...document.querySelectorAll('.ck-tools .btn, #local-checkout')]
       .map((el) => Math.round(el.getBoundingClientRect().height)));
