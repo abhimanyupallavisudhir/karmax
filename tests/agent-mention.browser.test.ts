@@ -81,10 +81,18 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
     const active = (await menu.locator('.am-opt.active').boundingBox())!, r = (await menu.boundingBox())!;
     expect(active.y + active.height).toBeLessThanOrEqual(r.y + r.height + 1);
   });
+  // The box is a transparent textarea over a painted copy of its text: a pick
+  // must repaint that copy, or the picked name is invisible until the next key.
+  const painted = page.locator('.followup-box[data-role="do"] .wiki-ref-backdrop');
   await box.fill('');
   await box.type('@maint');
   await box.press('Enter');
   await step('a group is written as its identifier', () => expect.poll(() => box.inputValue()).toBe('@maintainers '));
+  await step('the picked group is visible at once', () => expect.poll(() => painted.textContent()).toBe('@maintainers '));
+  await box.fill('');
+  await box.type('@');
+  await menu.locator('.am-opt').first().dispatchEvent('mousedown');
+  await step('an agent picked with the mouse is visible at once', () => expect.poll(() => painted.textContent()).toBe('@Agent '));
   await page.setViewportSize({ width: 1280, height: 860 });
   await box.fill('');
   await box.type('@');
@@ -93,7 +101,9 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
   await step('+ adds Agent 1 with an inline form', async () => {
     await page.locator('.followup-new-agent').filter({ hasText: 'Agent 1' }).waitFor();
     expect(await box.inputValue()).toBe('@Agent 1 ');
+    expect(await painted.textContent()).toBe('@Agent 1 ');
   });
+  if (shots) await page.locator('.followup-box[data-role="do"]').screenshot({ path: path.join(shots, 'mention-picked.png') });
   await page.locator('.followup-new-agent select').first().selectOption('mock').catch(() => {});
   await box.type('please double-check\n@heard');
   if (shots) await page.screenshot({ path: path.join(shots, 'mention-new-agent.png') });
