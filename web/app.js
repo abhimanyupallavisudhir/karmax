@@ -1235,16 +1235,20 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
 
 function renderFields(fields, own = {}, inherited = {}, withPromptChips = false, altFor) {
   // Base and target share one row (rendered at the first of them present, in
-  // this order); the rest are skipped where they'd fall.
+  // this order), with the per-repository switch under it; the rest are skipped
+  // where they'd fall.
   const inlineRow = ['base', 'target'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
   const inlineNames = new Set(inlineRow.map((f) => f.name));
+  const perRepo = fields.find((f) => f.type === 'repoBranches');
   let inlineDrawn = false;
   const html = [];
   for (const f of fields) {
+    if (f === perRepo) continue;
     if (inlineNames.has(f.name) && inlineRow.length > 1) {
       if (!inlineDrawn) {
         inlineDrawn = true;
-        html.push(`<div class="branch-pair">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`);
+        const pair = `<div class="branch-pair">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`;
+        html.push(perRepo ? repoBranchesHtml(perRepo, own[perRepo.name], inherited[perRepo.name], inherited._repositoryBranches, pair, inlineRow) : pair);
       }
       continue;
     }
@@ -1252,6 +1256,98 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   }
   return html.join('');
 }
+
+// A repository as a short label: owner/name on GitHub, else its last path segment.
+function repositoryShortName(source) {
+  const view = repositorySourceView(source);
+  return view.kind === 'github' ? `${view.owner}/${view.name}` : source.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || source;
+}
+
+// ── Different branches per repo ──────────────────────────────────────────────
+// Under the common Base/Target pair of a multi-repository project, a switch
+// swaps the pair for one Base/Target row per repository. `repos` lists each
+// repository with the branches it starts from (`_repositoryBranches` in the
+// resolved defaults: its own default branch unless a default names one). The
+// stored value maps each repository to its branches; `{}` turns an inherited
+// list off.
+function repoBranchesHtml(f, own, inherited, repos, pair, pairFields) {
+  if (!Array.isArray(repos) || repos.length < 2) return pair;
+  const value = own ?? inherited ?? {};
+  const on = Object.keys(value).length > 0;
+  const rows = repos.map(({ source, base, target }) => {
+    const entry = value[source];
+    const name = repositoryShortName(source);
+    const input = (kind, suggested) => `<input class="rb-${kind}" value="${esc(entry?.[kind] ?? suggested ?? '')}" data-suggest="${esc(suggested ?? '')}"
+      ${entry ? 'data-edited="1"' : ''} aria-label="${kind === 'base' ? 'Base' : 'Target'} branch in ${esc(name)}" autocomplete="off" spellcheck="false">`;
+    return `<div class="rb-row" data-source="${esc(source)}"><span class="rb-repo" title="${esc(source)}">${esc(name)}</span>${input('base', base)}${input('target', target)}</div>`;
+  }).join('');
+  return `<div class="branch-block repo-branches-field" data-repo-branches="${esc(f.name)}" ${inhAttr(inherited ?? {})}>
+    <div class="branch-pair-slot" ${on ? 'hidden' : ''}>${pair}</div>
+    <div class="rb-list" ${on ? '' : 'hidden'}>
+      <div class="rb-row rb-head"><span></span>${pairFields.map((g) => `<label>${esc(g.label)}</label>`).join('')}</div>
+      ${rows}
+    </div>
+    <div class="rb-toggle-row"><label class="switch"><input type="checkbox" class="rb-toggle" ${on ? 'checked' : ''}> ${esc(f.label)}?</label>${f.help ? policyTip(f.help) : ''}<span class="label-row-fill"></span>${resetBtn(f.name)}</div>
+  </div>`;
+}
+// The per-repository branches a block holds: `{}` while it is off.
+function readRepoBranches(box) {
+  if (!box.querySelector('.rb-toggle')?.checked) return {};
+  return Object.fromEntries([...box.querySelectorAll('.rb-row[data-source]')].map((row) => {
+    const base = row.querySelector('.rb-base').value.trim();
+    const target = row.querySelector('.rb-target').value.trim();
+    return [row.dataset.source, { ...(base ? { base } : {}), ...(target ? { target } : {}) }];
+  }).filter(([, entry]) => Object.keys(entry).length));
+}
+// A stored map as this block compares it: only its own repositories, in order.
+function normRepoBranches(box, value) {
+  const map = value && typeof value === 'object' ? value : {};
+  return Object.fromEntries([...box.querySelectorAll('.rb-row[data-source]')].flatMap((row) => {
+    const entry = map[row.dataset.source];
+    const base = entry?.base?.trim?.(), target = entry?.target?.trim?.();
+    return base || target ? [[row.dataset.source, { ...(base ? { base } : {}), ...(target ? { target } : {}) }]] : [];
+  }));
+}
+function syncRepoBranches(box) {
+  const on = box.querySelector('.rb-toggle').checked;
+  box.querySelector('.branch-pair-slot').hidden = on;
+  box.querySelector('.rb-list').hidden = !on;
+}
+// Turning the list on starts each untouched row from the common pair when it
+// was changed here, else from that repository's own branches.
+function fillRepoBranches(box) {
+  for (const kind of ['base', 'target']) {
+    const common = box.querySelector(`.branch-pair-slot [data-field="${kind}"]`);
+    const changed = common && common.value.trim() && !sameJson(common.value.trim(), JSON.parse(common.dataset.inherit || 'null'));
+    box.querySelectorAll(`.rb-row .rb-${kind}:not([data-edited])`).forEach((input) => {
+      input.value = changed ? common.value.trim() : input.dataset.suggest;
+    });
+  }
+}
+function resetRepoBranches(box, attr = 'data-inherit') {
+  const inherited = normRepoBranches(box, JSON.parse(box.getAttribute(attr) || 'null'));
+  box.querySelector('.rb-toggle').checked = Object.keys(inherited).length > 0;
+  box.querySelectorAll('.rb-row[data-source]').forEach((row) => {
+    const entry = inherited[row.dataset.source];
+    for (const kind of ['base', 'target']) {
+      const input = row.querySelector(`.rb-${kind}`);
+      input.value = entry?.[kind] ?? input.dataset.suggest;
+      if (entry) input.dataset.edited = '1'; else delete input.dataset.edited;
+    }
+  });
+  syncRepoBranches(box);
+  box.dispatchEvent(new Event('change', { bubbles: true }));
+}
+document.addEventListener('change', (event) => {
+  const toggle = event.target?.closest?.('.rb-toggle');
+  const box = toggle?.closest('.repo-branches-field');
+  if (!box) return;
+  if (toggle.checked) fillRepoBranches(box);
+  syncRepoBranches(box);
+});
+document.addEventListener('input', (event) => {
+  if (event.target?.matches?.('.rb-row input')) event.target.dataset.edited = '1';
+});
 
 function renderAgentField(f, spec, inherited, opts) {
   return agentBlockHtml(opts?.prefix, spec, { role: f.role || f.name, inherited, ...opts });
@@ -1861,6 +1957,14 @@ function collectForm(root, fields) {
       const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
       const route = readResponder(box);
       if (f.required || !sameJson(normResponder(route), normResponder(responderOf(inh)))) out[f.name] = route;
+      continue;
+    }
+    if (f.type === 'repoBranches') {
+      const box = root.querySelector(`.repo-branches-field[data-repo-branches="${CSS.escape(f.name)}"]`);
+      if (!box) continue;
+      // The whole list is one value; `{}` turns an inherited list off.
+      const value = readRepoBranches(box);
+      if (!sameJson(value, normRepoBranches(box, JSON.parse(box.getAttribute('data-inherit') || 'null')))) out[f.name] = value;
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -2819,6 +2923,7 @@ function wireFieldResets(root, fields) {
     else if (f.type === 'computer') box = root.querySelector(`.computer-field[data-computer="${CSS.escape(f.name)}"]`);
     else if (f.type === 'confirmer') box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
     else if (f.type === 'responder') box = root.querySelector(`.responder-field[data-responder="${CSS.escape(f.role || f.name)}"]`);
+    else if (f.type === 'repoBranches') box = root.querySelector(`.repo-branches-field[data-repo-branches="${CSS.escape(f.name)}"]`);
     else el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
     const target = box || el;
     if (!target) continue;
@@ -2833,6 +2938,7 @@ function wireFieldResets(root, fields) {
         else if (f.type === 'computer') resetComputerBlock(box, attr);
         else if (f.type === 'confirmer') resetConfirmerField(box, attr);
         else if (f.type === 'responder') resetResponderField(box, attr);
+        else if (f.type === 'repoBranches') resetRepoBranches(box, attr);
         else resetPlainField(el, f, attr);
         sync();
       });
@@ -2866,6 +2972,10 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     if (!box) return false;
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
     return !sameJson(normResponder(readResponder(box)), normResponder(responderOf(inh)));
+  }
+  if (f.type === 'repoBranches') {
+    const box = root.querySelector(`.repo-branches-field[data-repo-branches="${CSS.escape(f.name)}"]`);
+    return !!box && !sameJson(readRepoBranches(box), normRepoBranches(box, JSON.parse(box.getAttribute(attr) || 'null')));
   }
   const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
   if (!el) return false;
@@ -11873,11 +11983,14 @@ function paramsSection(v) {
     : f.type === 'confirmer' ? 2 : f.calledAgent ? 3 : f.type === 'computer' ? 3.5 : 4);
   const agentFields = fields.filter((f) => rank(f) < 4).sort((a, b) => rank(a) - rank(b));
   const whereFields = fields.filter((f) => rank(f) === 4);
-  // Base and target share one row, as in the task form.
+  // Base and target share one row, as in the task form; a task with branches
+  // per repository lists them under it.
   const pair = ['base', 'target'].map((name) => whereFields.find((f) => f.name === name)).filter(Boolean);
+  const perRepo = whereFields.find((f) => f.type === 'repoBranches');
   const where = [
     pair.length > 1 ? `<div class="branch-pair">${pair.map(rowFor).join('')}</div>` : '',
-    ...whereFields.filter((f) => pair.length < 2 || !pair.includes(f)).map(rowFor),
+    perRepo ? repoBranchesFrozenRow(perRepo, paramCurrentValue(perRepo, v, rec), lock) : '',
+    ...whereFields.filter((f) => f !== perRepo && (pair.length < 2 || !pair.includes(f))).map(rowFor),
   ].join('');
   const triggers = Array.isArray(rec?.params?.triggers) && rec.params.triggers.length
     ? `<div class="form-row pf-frozen" data-row="__triggers"><div class="label-row"><label>Triggers</label>${lock}<span class="label-row-fill"></span></div>
@@ -11907,6 +12020,16 @@ function paramsSection(v) {
     ${agentFields.map((f) => `<section class="tp-section tp-${esc(f.type)}">${rowFor(f)}</section>`).join('')}
     ${where || triggers ? `<section class="tp-section tp-where">${where}${triggers}</section>` : ''}
     ${footer}</div>`;
+}
+
+// A running task's branches per repository, read-only: "app  main → main".
+function repoBranchesFrozenRow(f, value, lock) {
+  const entries = Object.entries(value && typeof value === 'object' ? value : {});
+  if (!entries.length) return '';
+  return `<div class="form-row pf-frozen" data-row="${esc(f.name)}"><div class="label-row"><label>Branches per repo</label>${lock}<span class="label-row-fill"></span></div>
+    <div class="pf-ro rb-frozen">${entries.map(([source, entry]) => {
+      return `<div><span class="rb-repo" title="${esc(source)}">${esc(repositoryShortName(source))}</span> ${esc(entry?.base || '(default)')} → ${esc(entry?.target || '(default)')}</div>`;
+    }).join('')}</div></div>`;
 }
 
 function isParamDraftField(draft, name) {
@@ -13915,7 +14038,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'computer', 'multiPr', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'repoBranches', 'computer', 'multiPr', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // Review route and Responder stay shared/common values on the wire, but their
 // controls live in the Agent card.
 const agentRouteSettingsFields = (scope) => ['responder', 'confirm']

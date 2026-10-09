@@ -62,6 +62,10 @@ const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base
 // opened against it or the merge enqueue). software-dev re-reads `target` at
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
+// Multi-repository projects whose repositories do not share branch names (one
+// uses main, another master). Off, every repository uses the common base/target.
+// Task and project scopes only: an organization has no repository list.
+const repoBranchesField = (): FieldSpec => ({ name: 'repoBranches', type: 'repoBranches', label: 'Different branches per repo', help: 'Set the base and target branch for each repository separately.', scopes: ['task', 'project'], bind: 'top' });
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repositories', help: 'One per line. Local worlds accept filesystem paths; E2B accepts SSH Git URLs (git@github.com:org/repo.git). Multiple repos are checked out in separate world subdirectories.', scopes: ['project'], bind: 'project' });
 // Wire compatibility for old settings and version-pinned tasks. The browser no
 // longer renders this retired host-file-copy control; typed project resources
@@ -474,6 +478,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       agentField('do', 'Agent', 'always'),
       baseField(),
       targetField(),
+      repoBranchesField(),
       computerField(),
       reposField(),
       multiPrField(),
@@ -551,7 +556,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Review machinery.
     roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), RESPONDER_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), computerField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), repoBranchesField(), computerField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
   },
   {
     name: 'merge-only',
