@@ -10,6 +10,7 @@ import type { WorldCheckpointService } from './checkpoint.js';
 import type { ObjectStore } from '../store/objects.js';
 import { expireConversationExports } from '../store/conversation-exports.js';
 import { DeferredDeleteObjectStore } from '../store/deferred-delete.js';
+import { taskEnded } from './task-ended.js';
 
 // Private/explicit pools retain physical resource totals. Hosted customer-owned
 // pools ignore these totals and derive active worlds from plan concurrency.
@@ -255,7 +256,9 @@ export class WorldLifecycleManager {
       }
     }
     for (const candidate of await this.store.listWorldInstances('degraded')) {
-      if (!candidate.handle.meta?.teardownPending) continue;
+      // A failed teardown is marked; a finished task's world revived and left
+      // degraded (task #552) is not, and is torn down all the same.
+      if (!candidate.handle.meta?.teardownPending && !(await taskEnded(this.store, candidate.handle.id))) continue;
       await this.step(`teardown ${candidate.handle.id}`, () => this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
         const eligible = async () => {
           const current = await this.store.worldStateSnapshot(candidate.handle.id);

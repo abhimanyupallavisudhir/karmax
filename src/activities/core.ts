@@ -1,4 +1,5 @@
 import { applyComputer, machineShape, normalizeComputer } from '../domain/computer.js';
+import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
 import { forkSourceRole } from '../domain/forks.js';
@@ -1041,6 +1042,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   async function ensureRunnerLease(handleInput: WorldHandle, taskId: string): Promise<WorldHandle> {
     const handle = ((await store.currentWorld(handleInput.id)) ?? handleInput) as WorldHandle;
     if (!isRemote(handle.kind) || !deps.runners) return handle;
+    // A finished task's world was torn down on purpose. Leasing it would mark it
+    // ready again and let recovery rebuild it (task #552: about 230 leases an
+    // hour for eleven hours, for another task forking its agent).
+    if ((await store.worldState(handle.id)) === 'released') throw new Error(`task ${handle.id}'s world was released when the task ended`);
     const existing = typeof handle.meta?.worldLeaseId === 'string' ? (await store.worldLease(handle.meta.worldLeaseId)) : undefined;
     if (existing?.state === 'active') return handle;
     const projectId = String(handle.meta?.projectId ?? (await store.taskProjectIdAsync(taskId)) ?? '');
@@ -1056,7 +1061,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return next as WorldHandle;
   }
 
-  async function openWorld(handle: WorldHandle, taskId = handle.id): Promise<World> {
+  /** `recover: false` opens only a sandbox that is still there: a reader such
+   * as a fork copying a session out never rebuilds another task's world. */
+  async function openWorld(handle: WorldHandle, taskId = handle.id, options: { recover?: boolean } = {}): Promise<World> {
+    const recover = options.recover !== false;
     // Pin access before admission, but never wait for capacity while holding a
     // transition lock: the previous owner needs that lock to release its lease.
     const releaseAccess = await worlds.holdAccess?.(handle.id);
@@ -1067,8 +1075,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (typeof leaseId !== 'string' || (await store.worldLease(leaseId))?.state !== 'active') return undefined;
       }
       let world: World;
-      try { world = await worlds.open(current); }
+      try { world = await (recover ? worlds.open(current) : worlds.withoutRecovery(() => worlds.open(current))); }
       catch (e) {
+        if (!recover) throw e;
         const recovered = await recoverVanishedWorld(current, taskId, e);
         if (!recovered) throw e;
         world = recovered;
@@ -1115,7 +1124,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // open on a released handle (a retried activity, a late artifact fetch, an
     // MCP call holding the old handle) would probe 'missing' — correctly, it was
     // destroyed — and re-provision a fresh billable sandbox for a done task.
-    if ((await store.worldState(handle.id)) === 'released') return undefined;
+    if ((await store.worldState(handle.id)) === 'released' || await taskEnded(store, handle.id)) return undefined;
     const checkpointId = handle.checkpointId ?? ((await store.currentWorld(handle.id)) as WorldHandle | undefined)?.checkpointId;
     if (!checkpointId) return undefined;
     const state = await worlds.probe(handle).catch(() => undefined);
@@ -2349,9 +2358,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             } else if (profile.provider !== 'kimi' && profile.provider !== 'grok') {
               if (remoteSubscriptionRail) {
                 const sourceHandle = (await store.currentWorld(spec.resumeFrom.taskId)) as WorldHandle | undefined;
-                if (sourceHandle && isRemote(sourceHandle.kind)) {
+                // Only a sandbox still running or parked is read; a finished,
+                // hibernated or vanished source is never rebuilt for this
+                // (task #557 rebuilt #552's for eleven hours). Its session was
+                // saved when it stopped: the durable home below has it.
+                const sourceState = sourceHandle ? await store.worldState(sourceHandle.id) : undefined;
+                if (sourceHandle && isRemote(sourceHandle.kind) && (sourceState === 'ready' || sourceState === 'parked')) {
                   try {
-                    const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
+                    const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId, { recover: false });
                     prepared = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
                   } catch (error) {
                     if (error instanceof CodexHistoryError) throw error;
