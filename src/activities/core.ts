@@ -4173,12 +4173,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               let inspected = await inspection.actions.inspectFailure(ref.slug, runId);
               // A stale check URL must never cause a rerun or repair of a
               // different revision than the proposal whose landing is held.
-              // pull_request Actions run against refs/pull/N/merge, however,
-              // legitimately carries the synthetic merge SHA rather than the
-              // PR head. The URL came from this current PR's readiness packet,
-              // so that event remains safely correlated to this candidate.
-              if (inspected.run.headSha && ref.headSha && inspected.run.headSha !== ref.headSha
-                && inspected.run.event !== 'pull_request') continue;
+              // A pull_request run's head_sha is the PR head it tested.
+              if (inspected.run.headSha && ref.headSha && inspected.run.headSha !== ref.headSha) continue;
               const check = (readiness.failedChecks ?? [])
                 .find((candidate) => githubActionsRunIdFromUrl(candidate.url) === runId);
               const identity = {

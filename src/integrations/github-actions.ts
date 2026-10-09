@@ -34,9 +34,9 @@ export interface GithubActionsRun {
   updatedAt: string;
   actor?: string;
   triggeringActor?: string;
-  /** Pull-request heads attached by GitHub to this run. `headSha` is the
-   * workflow execution SHA (often a synthetic merge ref for pull_request), so
-   * this is the authoritative exact proposal revision when it is present. */
+  /** Open pull requests GitHub associates with this run's branch. Their
+   * `headSha` is each PR's current head, not the commit this run tested
+   * (that is `headSha` above), so it never proves what a run validated. */
   pullRequests?: Array<{ number: number; headSha: string; headRef?: string }>;
 }
 
@@ -614,7 +614,7 @@ export function reconcileGithubActionsRuns(
   const equivalent = new Map<number, GithubActionsRun>();
   const add = (run: GithubActionsRun) => {
     if (identity.workflowId > 0 && run.workflowId !== identity.workflowId) return;
-    if (run.id !== observed.id && !githubActionsRunMatchesRevision(run, identity)) return;
+    if (!githubActionsRunMatchesRevision(run, identity)) return;
     const previous = equivalent.get(run.id);
     if (!previous || compareGithubActionsRuns(run, previous) > 0) equivalent.set(run.id, run);
   };
@@ -631,7 +631,9 @@ export function reconcileGithubActionsRuns(
     ? terminalFailure
     : successful ?? runs[0] ?? observed;
   if (active && compareGithubActionsRuns(active, current) > 0) current = active;
-  const satisfied = githubActionsRunState(current) === 'success' ? current : undefined;
+  // A run of another commit stays observable but can never satisfy this head.
+  const satisfied = githubActionsRunState(current) === 'success' && githubActionsRunMatchesRevision(current, identity)
+    ? current : undefined;
   return {
     identity,
     key: githubRequiredCheckKey(identity),
@@ -642,10 +644,12 @@ export function reconcileGithubActionsRuns(
   };
 }
 
+/** A run validates exactly the commit it ran on: `head_sha`, which for
+ * `pull_request` runs is the PR head (the merge ref is only `GITHUB_SHA` inside
+ * the job). `pull_requests[].head.sha` is not evidence: GitHub fills it with the
+ * PR's current head, so an earlier head's run would claim the newest one. */
 function githubActionsRunMatchesRevision(run: GithubActionsRun, identity: GithubRequiredCheckIdentity): boolean {
-  if (run.headSha.toLowerCase() === identity.headSha.toLowerCase()) return true;
-  return Boolean(run.pullRequests?.some((pr) => pr.number === identity.pullRequest
-    && pr.headSha.toLowerCase() === identity.headSha.toLowerCase()));
+  return Boolean(run.headSha) && run.headSha.toLowerCase() === identity.headSha.toLowerCase();
 }
 
 const ACTIVE_RUN_STATES = new Set(['requested', 'queued', 'pending', 'waiting', 'in_progress']);

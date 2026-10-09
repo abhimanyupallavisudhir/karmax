@@ -8,9 +8,12 @@ polling, reconciliation, process restart, and a Karmax-requested rerun converge
 on the same validation.
 
 Before Karmax reruns a cancelled or otherwise transient run, it lists the
-workflow's runs and retains only executions GitHub attaches to the exact PR head.
-For `pull_request` workflows this uses the run's `pull_requests[].head.sha`,
-because `head_sha` may be the synthetic `refs/pull/<n>/merge` commit. An
+workflow's runs and retains only executions of the exact PR head: the run's
+`head_sha`, which for `pull_request` runs is the PR head (the synthetic
+`refs/pull/<n>/merge` commit is only the job's `GITHUB_SHA`). A run's
+`pull_requests[].head.sha` is never evidence: GitHub reports the PR's *current*
+head there, so an earlier head's green run would otherwise satisfy a newer head
+whose own run was cancelled (PR #540, 2026-10-08). An
 equivalent queued, waiting, pending, or in-progress run becomes current and is
 followed without starting a competing rerun. An equivalent successful run
 satisfies the validation even while GitHub's aggregate PR rollup still contains

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -595,6 +595,53 @@ describe('gateway request scope for bare-id routes', () => {
     expect(duplicate.status).toBe(200);
     expect((await store.listTasks(mine)).filter((task) => task.title === recovery!.title)).toHaveLength(1);
     webhookProjectEvents = [];
+  });
+
+  // #554 and #555 (2026-10-08) were two tasks for one broken test: each red
+  // merge opened its own repair while the first was still at work.
+  it('tells the open repair task about a workflow that fails again, instead of opening another', async () => {
+    const failure = (runId: number, headSha: string) => ({
+      projectId: mine,
+      type: 'github.workflow.failed',
+      payload: {
+        repository: 'acme/app', repositoryId: 'repo-1', workflow: 'Lint', runId, attempt: 2,
+        conclusion: 'failure', headSha, branch: 'main',
+        url: `https://github.com/acme/app/actions/runs/${runId}`, source: 'workflow_run',
+      },
+    });
+    const deliver = async (delivery: string) => (await (await fetch(`${base}/api/github/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json',
+        'x-github-event': 'workflow_run', 'x-github-delivery': delivery },
+      body: JSON.stringify({ action: 'completed' }),
+    })).json()) as { recoveries?: number };
+    const title = 'Repair failed GitHub workflow: Lint';
+    const repairs = async () => (await store.listTasks(mine)).filter((task) => task.title === title);
+    const told = vi.spyOn(KarmaxApi.prototype, 'postTaskMessage');
+    try {
+      webhookProjectEvents = [failure(710, 'first')];
+      expect(await deliver('lint-1')).toMatchObject({ recoveries: 1 });
+      const [open] = await repairs();
+      expect(open?.params.prompt).toContain('This is attempt 2');
+
+      webhookProjectEvents = [failure(711, 'second')];
+      expect((await deliver('lint-2')).recoveries ?? 0).toBe(0);
+      expect(await repairs()).toHaveLength(1);
+      expect(told).toHaveBeenCalledWith(expect.any(String), open!.id, { text: expect.stringMatching(
+        /Lint failed again on main[\s\S]*Exact revision: second[\s\S]*runs\/711 \(attempt 2\)/) });
+      expect((await store.eventsSince(open!.id, 0)).filter((event) => event.type === 'github.workflow.failed')
+        .map((event) => event.payload.runId)).toEqual([710, 711]);
+      expect(await store.kvGet(`github:workflow-recovery:${mine}:repo-1:711`)).toBe(open!.id);
+
+      // Once that repair has finished, a new failure is new work.
+      (await store.saveView(open!.id, { ...(await store.getTask(open!.id))!.lastView!, status: 'done', stage: 'done' } as any));
+      webhookProjectEvents = [failure(712, 'third')];
+      expect(await deliver('lint-3')).toMatchObject({ recoveries: 1 });
+      expect(await repairs()).toHaveLength(2);
+      expect(told).toHaveBeenCalledTimes(1);
+    } finally {
+      told.mockRestore();
+      webhookProjectEvents = [];
+    }
   });
 
   it('routes a missing deployment run through the same idempotent recovery rail', async () => {
