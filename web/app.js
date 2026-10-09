@@ -11277,10 +11277,10 @@ function wireCheckinSidebar(v) {
     if (!ta.value.includes(token)) {
       ta.value = `${token} ${ta.value}`;
       followupMentions(key).push({ token, selector: `agent:${el.dataset.callAgent}` });
-      S.followupDrafts[key] = ta.value;
     }
     ta.focus();
     ta.setSelectionRange(ta.value.length, ta.value.length);
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
   }));
   $('#main').querySelectorAll('.escalate-request').forEach((el) => el.addEventListener('click', () => openEscalateDialog(v)));
   $('#conversation-fullscreen')?.addEventListener('click', () => setConversationFullscreen(!S.conversationFullscreen));
@@ -12893,14 +12893,19 @@ function wireStopAgents(v) {
   }));
 }
 
-// Whom unaddressed text goes to: the agent that last asked you something (a
-// helper that asked you, say) until you have spoken since — you are replying —
-// else the main agent.
+// Whom unaddressed text goes to: you are replying to the agent that last spoke
+// to you (a helper answering or asking you, or the main agent), until you have
+// spoken since; else the main agent. A group (@creator, @maintainers…) may
+// include you, so a helper asking one is asking you.
 function defaultRecipientFor(v) {
   const me = S.user?.id && `user:${S.user.id}`;
   for (const m of [...(v?.messages || [])].reverse()) {
     if (m.role === 'user' && (!m.author || m.author === me)) break;
-    if (m.role === 'agent' && m.author && m.author !== 'do' && me && (m.to || []).includes(me)) return `agent:${m.author}`;
+    if (m.role !== 'agent') continue;
+    const author = m.author || 'do';
+    // The main agent's own words (no recipients) are for the task's people.
+    const toMe = m.to ? m.to.some((s) => s === me || s.startsWith('@')) : author === 'do';
+    if (toMe) return `agent:${author}`;
   }
   return 'agent:do';
 }
@@ -12948,6 +12953,23 @@ function typedMentions(text) {
     .map((m) => ({ token: m[2], selector: m[2], index: m.index + m[1].length }));
 }
 
+// Where each picked mention still stands in the text: [{ ...mention, index }].
+// Longest first, each on its own span, so a deleted @Agent is not found inside
+// @Agent 1; one no longer in the text is dropped.
+function locateMentions(text, mentions) {
+  const taken = [];
+  const out = [];
+  for (const m of [...mentions].sort((a, b) => b.token.length - a.token.length)) {
+    for (let index = text.indexOf(m.token); index >= 0; index = text.indexOf(m.token, index + 1)) {
+      const end = index + m.token.length;
+      if (taken.some(([a, b]) => index < b && end > a)) continue;
+      taken.push([index, end]);
+      out.push({ ...m, index });
+      break;
+    }
+  }
+  return out;
+}
 // Mentions typed into a box, by box key: [{ token, selector, newAgent? }].
 function followupMentions(key) { return ((S.followupMentions ||= {})[key] ||= []); }
 // Agents added for a message being written, by box key: { 'agent-3': spec }.
@@ -13027,10 +13049,11 @@ function wireAgentMention(ta, box, v, key) {
     ta.value = ta.value.slice(0, token.start) + value + ta.value.slice(token.end);
     const caret = token.start + value.length;
     followupMentions(key).push({ token: text, selector, ...extra });
-    S.followupDrafts[key] = ta.value;
     close();
     ta.setSelectionRange(caret, caret);
     ta.focus();
+    // As typing would: the painted text, the draft and the box's height follow.
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const choose = (item) => {
     if (!item || !token) return close();
@@ -13164,7 +13187,7 @@ function wireFollowups(v) {
       try {
         // A shared conversation addresses whoever was mentioned, in order;
         // new agents travel with the message that calls them.
-        const picked = shared ? followupMentions(key).map((m) => ({ ...m, index: text.indexOf(m.token) })).filter((m) => m.index >= 0) : [];
+        const picked = shared ? locateMentions(text, followupMentions(key)) : [];
         const mentions = shared ? [...picked, ...typedMentions(text).filter((t) => !picked.some((m) => m.index === t.index))] : [];
         const newAgents = shared ? Object.fromEntries(Object.entries(followupNewAgents(key))
           .filter(([agentKey]) => mentions.some((m) => m.selector === `agent:${agentKey}`))) : {};
