@@ -12140,7 +12140,10 @@ function taskActions(v) {
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
-  let html = `<div class="actions">`;
+  // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
+  const refreshing = v.state?.refreshingResources && v.status === 'active'
+    ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>` : '';
+  let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}`;
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' || a.name === 'openPr' ? 'primary' : a.danger ? 'danger' : '';
@@ -12157,7 +12160,7 @@ function taskActions(v) {
   // The follow-up box lives inside each agent's conversation on the Check-in tab,
   // so a human can address any agent (SPEC §5.6).
   html += `</div>`;
-  if (!acts.length) html = `<div style="color:var(--ink-3)">Nothing to do here right now.</div>`;
+  if (!acts.length && !refreshing) html = `<div style="color:var(--ink-3)">Nothing to do here right now.</div>`;
   return html;
 }
 

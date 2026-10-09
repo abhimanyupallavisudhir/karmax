@@ -732,6 +732,7 @@ async function softwareDevImpl(
   let resourceReviewSequence = carriedCount?.resourceReviewSequence ?? 0;
   let applyingResources = false;
   let stagingResources = false;
+  let refreshingResources = false;
   let resourcesApplied = carried?.resourcesApplied ?? false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
@@ -865,6 +866,9 @@ async function softwareDevImpl(
   let subtaskNags = carriedCount?.subtaskNags ?? 0;
   /** A sub-task landed since this world last took in what sub-tasks published. */
   let childLandedSinceRefresh = false;
+  /** A failed refresh is tried once more before the next turn (a deploy that
+   * restarts the worker mid-transfer ends its last attempt). */
+  let refreshRetries = 1;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   type AccountGrant = {
     accountId: string;
@@ -1243,6 +1247,7 @@ async function softwareDevImpl(
         confirmed,
         ...(applyingResources ? { applyingResources: true } : {}),
         ...(stagingResources ? { stagingResources: true } : {}),
+        ...(refreshingResources ? { refreshingResources: true } : {}),
         cancelled,
         ...(lifecycleReplacement ? { lifecycleReplacement: true } : {}),
         turnsSeen: seen,
@@ -1431,13 +1436,24 @@ async function softwareDevImpl(
    * resources this world forked, and the output it proposed. */
   async function refreshResourcesFromChildren(): Promise<void> {
     let refreshed: Awaited<ReturnType<coreActivities['refreshResourceForks']>>;
+    // A multi-GB delivery takes minutes: the task says so rather than showing
+    // the wait it left (pramana#3 read "Waiting 90 min" for hours, and a
+    // follow-up sent meanwhile seemed ignored).
+    if (patched('subtask-resource-refresh-visible-v1')) {
+      refreshingResources = true;
+      await publish();
+    }
     try { refreshed = await resourceStaging.refreshResourceForks(taskId); }
     catch (err) {
       if (isCancellation(err)) throw err;
+      const retry = patched('subtask-resource-refresh-retry-v1') && refreshRetries-- > 0;
+      if (retry) childLandedSinceRefresh = true;
       msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length,
-        text: `Could not bring sub-tasks' saved data into your world: ${innermostMessage(err)} It is kept, and comes in when the next sub-task finishes or when you are confirmed.` });
+        text: `Could not bring sub-tasks' saved data into your world: ${innermostMessage(err)} It is kept, and ${retry
+          ? 'is tried again before your next turn.' : 'comes in when the next sub-task finishes or when you are confirmed.'}` });
       return;
-    }
+    } finally { refreshingResources = false; }
+    refreshRetries = 1;
     for (const r of refreshed) {
       const text = r.conflicts
         ? `${r.path} was not updated with a sub-task's data: ${r.conflicts.length === 1 ? 'a file you changed differs' : `${r.conflicts.length} files you changed differ`} from the sub-task's (${r.conflicts.slice(0, 5).join(', ')}${r.conflicts.length > 5 ? ', …' : ''}). Keep one version (rename or remove yours); it comes in when the next sub-task finishes, and your publication fails until it does.`
